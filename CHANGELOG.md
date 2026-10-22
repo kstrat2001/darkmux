@@ -16,6 +16,19 @@ darkmux release.
 
 ### Added
 
+- **`darkmux lab submit` shares lab runs on darkmux evals (evals.darkmux.com).** It builds one
+  bundle of runs of one fixture checkout (bundle format 3) and uploads it with an upload token
+  from the site (`darkmux lab submit login`, kept in the login keychain on macOS and in a 0600
+  file elsewhere; `logout` forgets it). It refuses a run that never reached a model, did not
+  complete cleanly, has no verdict or passed before the work gate, and refuses a dirty fixture
+  checkout. A fact read now (OS, runtime, weights, darkmux) is sent only if it last changed
+  before the run, otherwise as "not reported", and the command says why. It never sends a path.
+  `--dry-run` writes the bundle and sends nothing. The weights hash is SHA-256 over the model's
+  files, the site's own hash.
+- **A run records the darkmux that ran it.** The run manifest (data version 1.1, additive) gains
+  `darkmux: {version, commit, build}`. `--version` now says `(release <sha>)` for a clean
+  checkout at its release tag, so a build from `main` never reads as the release it follows.
+
 - **Omarchy records power and board temperatures (#3331).** On Asahi, the host probe reads the
   SMC's `Heatpipe Power` sensor as the SoC package total, and the board's labeled temperatures
   and fan from hwmon. A lab run on Omarchy now reports package watts, energy while busy and

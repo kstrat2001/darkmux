@@ -95,6 +95,97 @@ impl Platform for MacPlatform {
     fn pid_namespace(&self) -> Option<String> {
         Some("macos".to_string())
     }
+
+    /// `sw_vers -productVersion`, installed when `system_profiler`'s install
+    /// history last lists `macOS <version>`. The system files' own times are
+    /// Apple's build times on the sealed volume, not when an update landed.
+    fn os_release(&self) -> Option<crate::OsRelease> {
+        let version = command_stdout("sw_vers", &["-productVersion"])?;
+        macos_release(&version, || command_stdout("system_profiler", &["SPInstallHistoryDataType", "-json"]).unwrap_or_default())
+    }
+
+    /// Apple Silicon runs local models on Metal.
+    fn gpu_api(&self) -> Option<&'static str> {
+        self.cpu_brand().filter(|b| b.starts_with("Apple M")).map(|_| "Metal")
+    }
+
+    fn secret_store(&self) -> crate::SecretStore {
+        crate::SecretStore::Keychain
+    }
+
+    /// `security -i` reads the command from stdin, so the secret is never on
+    /// an argv. It can exit 0 when the command failed: the caller reads back.
+    fn store_secret(&self, item: &str, account: &str, secret: &str) -> Result<(), String> {
+        security_interactive(&format!("add-generic-password -U -a \"{account}\" -s {item} -w \"{secret}\"\n"))
+    }
+
+    fn forget_secret(&self, item: &str, account: &str) {
+        let _ = command_stdout("security", &["delete-generic-password", "-a", account, "-s", item]);
+    }
+}
+
+/// Runs one `security -i` command line, fed on stdin.
+#[cfg(target_os = "macos")]
+fn security_interactive(line: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("security")
+        .arg("-i")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("running `security`: {e}"))?;
+    child.stdin.take().expect("piped").write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn security_interactive(_line: &str) -> Result<(), String> {
+    Err("there is no login keychain on this machine".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn command_stdout(cmd: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new(cmd).args(args).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn command_stdout(_cmd: &str, _args: &[&str]) -> Option<String> {
+    None
+}
+
+/// `macOS <version>` from `sw_vers`' answer, installed when the install
+/// history (read only for a version there is) says.
+pub(crate) fn macos_release(version: &str, history: impl FnOnce() -> String) -> Option<crate::OsRelease> {
+    let version = version.trim();
+    if version.is_empty() {
+        return None;
+    }
+    Some(crate::OsRelease { installed_at_unix_ms: macos_installed_at(&history(), version), name: format!("macOS {version}") })
+}
+
+/// The newest `install_date` among `system_profiler SPInstallHistoryDataType
+/// -json` items named `macOS <version>`. Read by scanning each item's two
+/// string fields; this crate parses no JSON otherwise.
+pub(crate) fn macos_installed_at(json: &str, version: &str) -> Option<u64> {
+    let want = format!("macOS {version}");
+    json.split('{')
+        .filter(|item| string_field(item, "_name").as_deref() == Some(want.as_str()))
+        .filter_map(|item| crate::dates::rfc3339_utc_ms(&string_field(item, "install_date")?))
+        .max()
+}
+
+/// `"key" : "value"` in a fragment of JSON, the value unescaped of nothing (dates and names here have no escapes).
+fn string_field(item: &str, key: &str) -> Option<String> {
+    let at = item.find(&format!("\"{key}\""))? + key.len() + 2;
+    let rest = item[at..].trim_start().strip_prefix(':')?.trim_start().strip_prefix('"')?;
+    Some(rest[..rest.find('"')?].to_string())
 }
 
 /// (#2917, moved here by #3200) See [`MacPlatform::process_start_stamp`].

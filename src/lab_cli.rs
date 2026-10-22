@@ -4,6 +4,7 @@
 //! `lab loop` (#986) lives in the `lab_loop` submodule.
 
 pub(crate) mod lab_loop;
+pub(crate) mod submit;
 
 use anyhow::Result;
 
@@ -73,6 +74,7 @@ pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
         }),
         LabCmd::Fixture { sub } => cmd_lab_fixture(sub),
         LabCmd::Doctor => cmd_lab_doctor(),
+        cmd @ LabCmd::Submit { .. } => submit::cmd_lab_submit(cmd),
     }
 }
 

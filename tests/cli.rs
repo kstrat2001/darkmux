@@ -2337,6 +2337,38 @@ fn lab_with_no_subcommand_reports() {
         .stderr(predicate::str::contains("not yet wired").or(predicate::str::contains("lab")));
 }
 
+/// `lab submit` refuses before reading anything: no runs named, no token
+/// stored (before any weights are hashed), a token that is not one.
+#[test]
+fn lab_submit_refuses_early_and_plainly() {
+    darkmux_cmd()
+        .args(["lab", "submit"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("name the lab runs to share"));
+    darkmux_cmd()
+        .args(["lab", "submit", "no-such-run"])
+        .assert()
+        .failure()
+        // A machine with a token stored (a maintainer's Mac, whose keychain is not isolated) gets past it to the run.
+        .stderr(
+            predicate::str::contains("no upload token stored")
+                .and(predicate::str::contains("lab submit login"))
+                .or(predicate::str::contains("no-such-run")),
+        );
+    darkmux_cmd()
+        .args(["lab", "submit", "login", "--site", "http://127.0.0.1:9"])
+        .write_stdin("not-a-token\n")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not an upload token"));
+    darkmux_cmd()
+        .args(["lab", "submit", "--dry-run", "no-such-run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no-such-run").or(predicate::str::contains("Apple Silicon")));
+}
+
 /// End-to-end: `darkmux lab run quick-q` works from a non-source CWD using the
 /// embedded built-in workload. This is the headline guarantee of the embedded
 /// approach — `cargo install --path .` produces a binary that doesn't need
@@ -14230,7 +14262,10 @@ fn liveness_markers_stay_out_of_a_terminal_but_not_out_of_logs() {
 #[cfg(unix)]
 #[test]
 fn sink_banners_stay_out_of_a_terminal_but_not_out_of_logs() {
-    let audit = TempDir::new().unwrap();
+    // Under a fixed temp root, not `$TMPDIR`: a test build writes the audit
+    // trail only under one (#2730), and the mutation lanes point `$TMPDIR`
+    // at a runner scratch directory that is not.
+    let audit = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
     let args = ["flow", "note", "--text", "quiet-banner-probe", "--source", "orchestrator"];
     let build = |extra: &[&str]| {
         let mut c = darkmux_std_cmd();

@@ -869,6 +869,7 @@ dependencies = [
  "darkmux-flow",
  "darkmux-gestalt",
  "darkmux-hardware",
+ "darkmux-platform",
  "darkmux-profiles",
  "darkmux-trajectory",
  "darkmux-types",

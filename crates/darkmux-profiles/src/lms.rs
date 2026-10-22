@@ -2,7 +2,7 @@ use crate::gestalt_host::lms_host::{run_bounded, StdoutMode, DEFAULT_LIST_BOUND}
 use crate::gestalt_host::resolved_load_deadline;
 use anyhow::{Result, bail};
 use darkmux_gestalt::Deadline;
-use crate::engine::ModelMeta;
+use crate::engine::{ModelMeta, ModelProvenance};
 use darkmux_types::LoadedModel;
 use std::process::Command;
 
@@ -264,6 +264,11 @@ fn is_ps_header(trimmed: &str) -> bool {
 /// A caller that wants "nothing listed" on failure says so with
 /// `unwrap_or_default()`.
 pub fn list_available() -> Result<Vec<ModelMeta>> {
+    Ok(ls_json()?.iter().filter_map(meta_from_json).collect())
+}
+
+/// `lms ls --json`'s rows. See [`list_available`] for what is an error.
+fn ls_json() -> Result<Vec<serde_json::Value>> {
     let mut cmd = Command::new(lms_bin());
     cmd.args(["ls", "--json"]);
     let out = run_bounded(cmd, "ls", Deadline(DEFAULT_LIST_BOUND), StdoutMode::Capture)
@@ -280,11 +285,118 @@ pub fn list_available() -> Result<Vec<ModelMeta>> {
         let detail = if stderr.is_empty() { String::new() } else { format!(" ({stderr})") };
         bail!("`lms ls --json` {how}{detail}");
     }
-    let arr = serde_json::from_str::<serde_json::Value>(&out.stdout)
+    serde_json::from_str::<serde_json::Value>(&out.stdout)
         .ok()
         .and_then(|v| v.as_array().cloned())
-        .ok_or_else(|| anyhow::anyhow!("`lms ls --json` printed something that is not a JSON list"))?;
-    Ok(arr.iter().filter_map(meta_from_json).collect())
+        .ok_or_else(|| anyhow::anyhow!("`lms ls --json` printed something that is not a JSON list"))
+}
+
+/// Where a downloaded model's weights are and what runs it: the facts a
+/// shared lab result names (`darkmux lab submit`). `Ok(None)` when LM Studio
+/// does not list the model.
+pub fn provenance(model_key: &str) -> Result<Option<ModelProvenance>> {
+    let rows = ls_json()?;
+    let models_root = dirs::home_dir().map(|h| h.join(".lmstudio").join("models"));
+    let runtimes = {
+        let mut cmd = Command::new(lms_bin());
+        cmd.args(["runtime", "ls"]);
+        run_bounded(cmd, "runtime ls", Deadline(DEFAULT_LIST_BOUND), StdoutMode::Capture)
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| o.stdout)
+            .unwrap_or_default()
+    };
+    let backends = dirs::home_dir().map(|h| h.join(".lmstudio").join("extensions").join("backends"));
+    Ok(provenance_from(&rows, model_key, models_root.as_deref(), &runtimes, backends.as_deref()))
+}
+
+/// [`provenance`] over what it read: the test seam.
+pub(crate) fn provenance_from(
+    rows: &[serde_json::Value],
+    model_key: &str,
+    models_root: Option<&std::path::Path>,
+    runtimes: &str,
+    backends_dir: Option<&std::path::Path>,
+) -> Option<ModelProvenance> {
+    let row = rows.iter().find(|r| {
+        r.get("modelKey").and_then(|v| v.as_str()) == Some(model_key)
+            || r.get("path").and_then(|v| v.as_str()) == Some(model_key)
+    })?;
+    let format = row.get("format").and_then(|v| v.as_str()).unwrap_or_default();
+    let backend = if format.to_ascii_lowercase().contains("safetensors") || format.to_ascii_lowercase().contains("mlx") {
+        Some("MLX")
+    } else if format.to_ascii_lowercase().contains("gguf") {
+        Some("llama.cpp")
+    } else {
+        None
+    };
+    let quant = match row.get("quantization") {
+        Some(serde_json::Value::String(q)) if !q.is_empty() => Some(q.clone()),
+        Some(q @ serde_json::Value::Object(_)) => q
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| q.get("bits").and_then(|b| b.as_u64()).map(|b| format!("{b}bit"))),
+        _ => None,
+    };
+    let weights_path = row
+        .get("path")
+        .and_then(|v| v.as_str())
+        .zip(models_root)
+        .map(|(p, root)| root.join(p));
+    let runtime = backend.and_then(|b| selected_runtime(runtimes, b));
+    let runtime_installed_at_ms = runtime.as_deref().zip(backends_dir).and_then(|(r, dir)| runtime_installed_at(r, dir));
+    Some(ModelProvenance {
+        backend: backend.map(str::to_string),
+        quant,
+        weights_path,
+        runtime,
+        runtime_installed_at_ms,
+    })
+}
+
+/// The selected runtime for a backend from `lms runtime ls`: the line that
+/// carries a check mark or "selected", read leniently.
+pub(crate) fn selected_runtime(text: &str, backend: &str) -> Option<String> {
+    let family = if backend == "MLX" { "mlx-llm" } else { "llama.cpp" };
+    let selected = regex_lite_word(text);
+    text.lines().zip(selected).filter(|(l, sel)| l.contains('\u{2713}') || *sel).find_map(|(line, _)| {
+        let at = line.find(family)?;
+        let word = line[at..].split_whitespace().next()?;
+        let after = word.rsplit_once('@')?.1;
+        // The leading `1.13.1` of `1.13.1-beta`, as the site's reader takes it.
+        let end = after.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(after.len());
+        let version = after[..end].trim_end_matches('.');
+        (version.contains('.') && version.split('.').all(|p| !p.is_empty())).then(|| format!("{family} {version}"))
+    })
+}
+
+/// Per line: "selected" as a whole word (not "unselected").
+fn regex_lite_word(text: &str) -> Vec<bool> {
+    text.lines()
+        .map(|l| {
+            let l = l.to_ascii_lowercase();
+            l.match_indices("selected").any(|(i, _)| {
+                let before = l[..i].chars().next_back().is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_');
+                let after = l[i + 8..].chars().next().is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_');
+                before && after
+            })
+        })
+        .collect()
+}
+
+/// The time of the runtime's folder under LM Studio's backends, found by its
+/// exact family and version (`mlx-llm-mac-arm64-apple-metal-advsimd-1.13.1`).
+fn runtime_installed_at(runtime: &str, backends_dir: &std::path::Path) -> Option<u64> {
+    let (family, version) = runtime.split_once(' ')?;
+    std::fs::read_dir(backends_dir).ok()?.flatten().find_map(|e| {
+        let name = e.file_name().to_string_lossy().into_owned();
+        (name.starts_with(&format!("{family}-")) && name.ends_with(&format!("-{version}")))
+            .then(|| e.metadata().ok()?.modified().ok())
+            .flatten()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+    })
 }
 
 fn meta_from_json(v: &serde_json::Value) -> Option<ModelMeta> {
@@ -348,6 +460,44 @@ pub(crate) fn verify_unload_outcome(success: bool, stderr: &str, identifier: &st
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn provenance_reads_the_row_the_runtime_and_its_install_time() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("mlx-llm-mac-arm64-apple-metal-advsimd-1.13.1")).unwrap();
+        let rows = vec![serde_json::json!({
+            "modelKey": "qwen3-coder-30b", "path": "lmstudio-community/Qwen3-Coder-30B-MLX-4bit",
+            "format": "safetensors", "quantization": {"name": "4bit", "bits": 4}
+        })];
+        let runtimes = "LLM ENGINE                SELECTED\nmlx-llm-mac-arm64-apple-metal-advsimd@1.12.0\nmlx-llm-mac-arm64-apple-metal-advsimd@1.13.1   \u{2713}\nllama.cpp-mac-arm64-apple-metal-advsimd@1.50.0  \u{2713}\n";
+        let p = provenance_from(&rows, "qwen3-coder-30b", Some(std::path::Path::new("/m")), runtimes, Some(tmp.path())).unwrap();
+        assert_eq!(p.backend.as_deref(), Some("MLX"));
+        assert_eq!(p.quant.as_deref(), Some("4bit"));
+        assert_eq!(p.weights_path.unwrap(), std::path::Path::new("/m/lmstudio-community/Qwen3-Coder-30B-MLX-4bit"));
+        assert_eq!(p.runtime.as_deref(), Some("mlx-llm 1.13.1"));
+        assert!(p.runtime_installed_at_ms.is_some());
+        assert!(provenance_from(&rows, "other", None, "", None).is_none());
+        assert_eq!(selected_runtime(runtimes, "llama.cpp").as_deref(), Some("llama.cpp 1.50.0"));
+        assert_eq!(selected_runtime("mlx-llm-x@1.2.0\n", "MLX"), None, "nothing selected");
+        assert_eq!(selected_runtime("mlx-llm-x@1.2.0 unselected\n", "MLX"), None);
+        assert_eq!(selected_runtime("mlx-llm-x@1.13.1-beta (selected)\n", "MLX").as_deref(), Some("mlx-llm 1.13.1"));
+    }
+
+    #[test]
+    fn provenance_names_each_format_and_quantization_shape() {
+        let rows = vec![
+            serde_json::json!({"modelKey": "a", "path": "x/a.gguf", "format": "GGUF", "quantization": "Q4_K_M"}),
+            serde_json::json!({"modelKey": "b", "format": "MLX", "quantization": {"bits": 8}}),
+            serde_json::json!({"modelKey": "c", "format": "onnx", "quantization": ""}),
+        ];
+        let a = provenance_from(&rows, "x/a.gguf", None, "", None).unwrap();
+        assert_eq!((a.backend.as_deref(), a.quant.as_deref()), (Some("llama.cpp"), Some("Q4_K_M")), "a row is found by its path too");
+        assert_eq!(a.weights_path, None, "no models root, no weights path");
+        let b = provenance_from(&rows, "b", Some(std::path::Path::new("/m")), "", None).unwrap();
+        assert_eq!((b.backend.as_deref(), b.quant.as_deref(), b.weights_path), (Some("MLX"), Some("8bit"), None));
+        let c = provenance_from(&rows, "c", None, "", None).unwrap();
+        assert_eq!((c.backend, c.quant, c.runtime), (None, None, None));
+    }
+
     use super::*;
     use crate::engine::is_not_resident;
     use serde_json::json;

@@ -114,6 +114,48 @@ impl Platform for LinuxPlatform {
     fn reclaimable_memory_bytes(&self) -> Option<u64> {
         reclaimable_from_meminfo(&read_to_string("/proc/meminfo")?)
     }
+
+    /// `/etc/os-release`'s `PRETTY_NAME`, named Omarchy where Omarchy is
+    /// installed (`~/.local/share/omarchy`). A rolling release says no
+    /// install time, so none is claimed.
+    fn os_release(&self) -> Option<crate::OsRelease> {
+        let omarchy = std::env::var_os("HOME")
+            .is_some_and(|h| std::path::Path::new(&h).join(".local/share/omarchy").is_dir());
+        let name = os_name_from_release(&read_to_string("/etc/os-release")?, omarchy)?;
+        Some(crate::OsRelease { name, installed_at_unix_ms: None })
+    }
+
+    /// Asahi's Apple GPU driver serves Vulkan.
+    fn gpu_api(&self) -> Option<&'static str> {
+        read_to_string("/proc/device-tree/compatible").and_then(|c| apple_chip_from_compatible(&c)).map(|_| "Vulkan")
+    }
+
+    fn secret_store(&self) -> crate::SecretStore {
+        crate::SecretStore::PrivateFile
+    }
+
+    /// `MemTotal` is under the size sold (firmware's share): on the Apple
+    /// chips Asahi runs on, every size sold is a multiple of 8 GB.
+    fn ram_as_sold_gb(&self) -> Option<u64> {
+        let gib = self.ram_installed_bytes()?.div_ceil(1 << 30);
+        Some(if self.gpu_api().is_some() { sold_size_on_apple(gib) } else { gib })
+    }
+}
+
+/// An M1 or M2 sold with 8, 16, 24, 32, 64, 96 or 128 GB: the next multiple of 8.
+pub(crate) fn sold_size_on_apple(gib: u64) -> u64 {
+    gib.div_ceil(8) * 8
+}
+
+/// `PRETTY_NAME` from an os-release file, as `Omarchy (<it>)` on Omarchy.
+pub(crate) fn os_name_from_release(os_release: &str, omarchy: bool) -> Option<String> {
+    let pretty = os_release.lines().find_map(|l| l.strip_prefix("PRETTY_NAME="))
+        .map(|v| v.trim().trim_matches('"').to_string())
+        .filter(|v| !v.is_empty());
+    match (omarchy, pretty) {
+        (true, p) => Some(format!("Omarchy ({})", p.as_deref().unwrap_or("Linux"))),
+        (false, p) => p,
+    }
 }
 
 /// `/proc/meminfo`'s `MemTotal`, rounded up to a whole GiB.

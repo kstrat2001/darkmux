@@ -21,6 +21,8 @@ pub use linux::LinuxPlatform;
 pub use macos::MacPlatform;
 pub use other::OtherPlatform;
 
+mod dates;
+
 /// The questions darkmux asks about the host. One method per question; the
 /// answer is data, never an OS name, so a caller can't branch on the OS.
 pub trait Platform: Send + Sync {
@@ -99,6 +101,53 @@ pub trait Platform: Send + Sync {
     /// whose answers differ cannot judge each other's pids. `None` when it
     /// cannot be read; a caller comparing pids then treats them as foreign.
     fn pid_namespace(&self) -> Option<String>;
+
+    /// The OS as a shared result names it (`macOS 15.1`, `Omarchy (Arch
+    /// Linux)`), and when that version was installed where the OS says.
+    fn os_release(&self) -> Option<OsRelease>;
+
+    /// The GPU API a local model runs on here (`Metal`, `Vulkan`); `None`
+    /// when this machine is not one darkmux can say it of.
+    fn gpu_api(&self) -> Option<&'static str>;
+
+    /// Where darkmux keeps a secret it is handed (an upload token).
+    fn secret_store(&self) -> SecretStore;
+
+    /// Stores `secret` as the login keychain's generic password `item` for
+    /// `account`, replacing one there. An error says why it was not stored;
+    /// a platform with no keychain (its [`Platform::secret_store`] is a file)
+    /// always errs. A caller reads the item back to know it was kept.
+    fn store_secret(&self, _item: &str, _account: &str, _secret: &str) -> Result<(), String> {
+        Err("this machine keeps secrets in a file, not a keychain".to_string())
+    }
+
+    /// Deletes the login keychain's generic password `item` for `account`,
+    /// if there is one. Nothing to do where there is no keychain.
+    fn forget_secret(&self, _item: &str, _account: &str) {}
+
+    /// The memory size as the machine was sold, in GB, for naming a machine
+    /// class: what [`Platform::ram_installed_bytes`] says, where that is exact.
+    fn ram_as_sold_gb(&self) -> Option<u64> {
+        self.ram_installed_bytes().map(|b| b.div_ceil(1 << 30))
+    }
+}
+
+/// See [`Platform::os_release`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OsRelease {
+    pub name: String,
+    /// When this version was installed; `None` when the OS does not say, so
+    /// a reader cannot claim it held at an earlier time.
+    pub installed_at_unix_ms: Option<u64>,
+}
+
+/// See [`Platform::secret_store`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretStore {
+    /// The login keychain, through `security`.
+    Keychain,
+    /// A file only the user can read (mode 0600) under `~/.darkmux`.
+    PrivateFile,
 }
 
 /// A battery's charge facts as the OS reports them. The lens derives its

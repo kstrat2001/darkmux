@@ -91,6 +91,10 @@ pub struct RunManifest {
     /// What the run started from, stamped by the lab after the provider finishes.
     #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     pub fixture: Option<ManifestFixture>,
+    /// The darkmux that ran it: version, commit and whether it was a release
+    /// build (run manifest 1.1). Absent on a run from before 5.4.
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    pub darkmux: Option<darkmux_types::BuildInfo>,
     /// A key this type does not name (an older run's camelCase spelling, a newer
     /// darkmux's field), kept and re-serialized flat.
     #[serde(flatten)]

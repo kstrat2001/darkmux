@@ -69,4 +69,16 @@ impl Platform for OtherPlatform {
     fn pid_namespace(&self) -> Option<String> {
         None
     }
+
+    fn os_release(&self) -> Option<crate::OsRelease> {
+        None
+    }
+
+    fn gpu_api(&self) -> Option<&'static str> {
+        None
+    }
+
+    fn secret_store(&self) -> crate::SecretStore {
+        crate::SecretStore::PrivateFile
+    }
 }

@@ -57,6 +57,8 @@ pub use endpoint::{
 ///
 ///   * `"<version> (release)"` — a packaged release (Homebrew stable stamps
 ///     `DARKMUX_RELEASE`).
+///   * `"<version> (release a1b2c3d)"` — a release that git can name: the
+///     flag with git, or a clean checkout at the tag `v<version>`.
 ///   * `"<version> (a1b2c3d✱)"` — a git build (dev / `brew install --HEAD`);
 ///     short SHA, `✱` when the tree was dirty.
 ///   * `"<version>"` — a source tarball build (no release flag, no git).
@@ -65,6 +67,71 @@ pub fn build_version() -> String {
     match option_env!("DARKMUX_BUILD_TAG") {
         Some(tag) if !tag.is_empty() => format!("{v} ({tag})"),
         _ => v.to_string(),
+    }
+}
+
+/// What built the running darkmux, as `build.rs` baked it: the record a run
+/// keeps of the darkmux that ran it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BuildInfo {
+    pub version: String,
+    /// The full commit; `None` for a build without git (a release tarball).
+    pub commit: Option<String>,
+    /// `None` when the build says neither (a source tarball without the flag).
+    pub build: Option<BuildKind>,
+}
+
+/// A release build, or any other: a main checkout, a branch, a dirty tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildKind {
+    Release,
+    Dev,
+}
+
+pub fn build_info() -> BuildInfo {
+    build_info_from(
+        env!("CARGO_PKG_VERSION"),
+        option_env!("DARKMUX_BUILD_COMMIT").unwrap_or_default(),
+        option_env!("DARKMUX_BUILD_KIND").unwrap_or_default(),
+    )
+}
+
+fn build_info_from(version: &str, commit: &str, kind: &str) -> BuildInfo {
+    BuildInfo {
+        version: version.to_string(),
+        commit: (!commit.is_empty()).then(|| commit.to_string()),
+        build: match kind {
+            "release" => Some(BuildKind::Release),
+            "dev" => Some(BuildKind::Dev),
+            _ => None,
+        },
+    }
+}
+
+#[cfg(test)]
+mod build_info_tests {
+    use super::*;
+
+    #[test]
+    fn build_info_reads_what_build_rs_baked() {
+        let b = build_info_from("5.4.0", "0123456789abcdef0123456789abcdef01234567", "release");
+        assert_eq!(b.build, Some(BuildKind::Release));
+        assert_eq!(b.commit.as_deref(), Some("0123456789abcdef0123456789abcdef01234567"));
+        let tarball = build_info_from("5.4.0", "", "");
+        assert_eq!((tarball.commit, tarball.build), (None, None));
+        assert_eq!(build_info_from("5.4.0", "abc1234", "dev").build, Some(BuildKind::Dev));
+    }
+
+    #[test]
+    fn this_build_is_consistent_with_its_tag() {
+        let b = build_info();
+        let tag = build_version();
+        match b.build {
+            Some(BuildKind::Release) => assert!(tag.contains("(release")),
+            Some(BuildKind::Dev) => assert!(!tag.contains("release")),
+            None => assert!(b.commit.is_none()),
+        }
     }
 }
 

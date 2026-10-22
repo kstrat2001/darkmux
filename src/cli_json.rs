@@ -618,6 +618,7 @@ mod tests {
         ("src/acp_panel.rs", 1, "writes the launch spec file"),
         ("src/mission_launch.rs", 2, "a spec fingerprint, and JSON quoted inside a prompt"),
         ("src/finding_cli.rs", 2, "`finding show` text mode: two free-form fields as lines of a text view"),
+        ("src/lab_cli/submit.rs", 1, "`lab submit`: the evals bundle, written to a file and uploaded, never printed"),
     ];
 
     /// The production call sites in every source file, as (relative path, calls).

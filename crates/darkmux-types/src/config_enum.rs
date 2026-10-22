@@ -1081,6 +1081,7 @@ mod tests {
             ("EndpointKind", "derived from `managed` + `url`, never written"),
             ("EngineChoice", "what `default_engine` resolved to; its values are an open set checked against profiles.json (`default_engine`), not a token list"),
             ("Lenient", "the lenient-read wrapper itself"),
+            ("BuildKind", "whether the running binary is a release or a dev build (`build_info`), baked in at build time, never a setting"),
             ("DeclaredFleetMode", "`FleetMode` as a card, presence beat or record states it, with `Unknown` for a newer value; never a setting"),
             ("EndpointSource", "runtime-only provenance, never serialized"),
             ("CredentialSource", "runtime-only resolution result, never serialized"),
