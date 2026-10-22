@@ -50,7 +50,7 @@ pub(crate) fn cmd_submit(args: SubmitArgs) -> Result<i32> {
 
     // curl reads the body from a file, removed after. It holds nothing secret.
     let body = std::env::temp_dir().join(format!("darkmux-evals-bundle-{}.json", std::process::id()));
-    std::fs::write(&body, &text)?;
+    upload::write_private(&body, text.as_bytes())?;
     let path = if args.replace { "/api/v1/uploads?replace=1" } else { "/api/v1/uploads" };
     let answer = upload::call(&args.site, "POST", path, &token, Some(&body));
     let _ = std::fs::remove_file(&body);

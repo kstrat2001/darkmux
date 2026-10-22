@@ -112,6 +112,12 @@ pub trait Platform: Send + Sync {
 
     /// Where darkmux keeps a secret it is handed (an upload token).
     fn secret_store(&self) -> SecretStore;
+
+    /// The memory size as the machine was sold, in GB, for naming a machine
+    /// class: what [`Platform::ram_installed_bytes`] says, where that is exact.
+    fn ram_as_sold_gb(&self) -> Option<u64> {
+        self.ram_installed_bytes().map(|b| b.div_ceil(1 << 30))
+    }
 }
 
 /// See [`Platform::os_release`].

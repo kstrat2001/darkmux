@@ -359,13 +359,30 @@ pub(crate) fn provenance_from(
 /// carries a check mark or "selected", read leniently.
 pub(crate) fn selected_runtime(text: &str, backend: &str) -> Option<String> {
     let family = if backend == "MLX" { "mlx-llm" } else { "llama.cpp" };
-    text.lines().filter(|l| l.contains('\u{2713}') || l.to_ascii_lowercase().contains("selected")).find_map(|line| {
+    let selected = regex_lite_word(text);
+    text.lines().zip(selected).filter(|(l, sel)| l.contains('\u{2713}') || *sel).find_map(|(line, _)| {
         let at = line.find(family)?;
         let word = line[at..].split_whitespace().next()?;
-        let version = word.rsplit_once('@')?.1;
-        (!version.is_empty() && version.split('.').all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())) && version.contains('.'))
-            .then(|| format!("{family} {version}"))
+        let after = word.rsplit_once('@')?.1;
+        // The leading `1.13.1` of `1.13.1-beta`, as the site's reader takes it.
+        let end = after.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(after.len());
+        let version = after[..end].trim_end_matches('.');
+        (version.contains('.') && version.split('.').all(|p| !p.is_empty())).then(|| format!("{family} {version}"))
     })
+}
+
+/// Per line: "selected" as a whole word (not "unselected").
+fn regex_lite_word(text: &str) -> Vec<bool> {
+    text.lines()
+        .map(|l| {
+            let l = l.to_ascii_lowercase();
+            l.match_indices("selected").any(|(i, _)| {
+                let before = l[..i].chars().next_back().is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_');
+                let after = l[i + 8..].chars().next().is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_');
+                before && after
+            })
+        })
+        .collect()
 }
 
 /// The time of the runtime's folder under LM Studio's backends, found by its
@@ -461,6 +478,8 @@ mod tests {
         assert!(provenance_from(&rows, "other", None, "", None).is_none());
         assert_eq!(selected_runtime(runtimes, "llama.cpp").as_deref(), Some("llama.cpp 1.50.0"));
         assert_eq!(selected_runtime("mlx-llm-x@1.2.0\n", "MLX"), None, "nothing selected");
+        assert_eq!(selected_runtime("mlx-llm-x@1.2.0 unselected\n", "MLX"), None);
+        assert_eq!(selected_runtime("mlx-llm-x@1.13.1-beta (selected)\n", "MLX").as_deref(), Some("mlx-llm 1.13.1"));
     }
 
     use super::*;

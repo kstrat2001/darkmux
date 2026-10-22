@@ -243,3 +243,29 @@ fn weights_are_the_model_files_under_the_folder() {
     let one = d.join("config.json");
     assert_eq!(rel_path(&one, &model_files(&one)[0]), "config.json", "one file is named by itself");
 }
+
+#[test]
+fn what_the_site_would_refuse_is_refused_here() {
+    let ran_by = RanBy { version: Some("5.4.0".into()), commit: Some("abc1234".into()), build: Some("release".into()) };
+    let good = bundle_run("r1", &manifest(), &stats(), &ran_by, &stack());
+    let fixture = json!({ "name": "pepper-grinder", "version": 2.0 });
+    let ok = assemble("kstrat2001/pepper-grinder", &"a".repeat(40), &fixture, vec![good.clone()]).unwrap();
+    assert_eq!(site_refusals(&ok), Vec::<String>::new());
+    assert_eq!(ok["fixture"]["version"], "2", "a number version reads as the site's JavaScript writes it");
+
+    let mut vm = stack();
+    vm.chip = "Apple M2 (Virtual)".into();
+    vm.quant = Some("q".repeat(41));
+    let bad_ran = RanBy { version: Some("5.4.0 beta".into()), ..Default::default() };
+    let bad = bundle_run("r2", &manifest(), &stats(), &bad_ran, &vm);
+    let both = assemble("kstrat2001/pepper-grinder", &"a".repeat(40), &fixture, vec![bad, good.clone(), good]).unwrap();
+    let refused = site_refusals(&both);
+    for want in ["runs[0].stack.chip", "runs[0].stack.quant", "runs[0].darkmuxVersion", "runs[2]: the same run twice"] {
+        assert!(refused.iter().any(|r| r.starts_with(want)), "{want} in {refused:?}");
+    }
+}
+
+#[test]
+fn a_word_boundary_is_ascii_as_in_javascript() {
+    assert!(looks_like_path("see /var\u{e9}"), "the site reads é as a boundary");
+}

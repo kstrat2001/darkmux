@@ -4,7 +4,8 @@
 //! so it alone can't tell an operator whether a daemon has their latest code
 //! — or whether it's a packaged release at all.
 //!
-//! Precedence for the tag (`darkmux_types::build_version()` reads it):
+//! Precedence for the tag (`darkmux_types::build_version()` reads it). A git
+//! checkout with changes is never a release, flag or not: it shows as in 3.
 //!   1. **release** — `DARKMUX_RELEASE` is set. The Homebrew stable formula
 //!      stamps this (it builds from a release tarball with no `.git`, so the
 //!      git fallback below would otherwise leave it indistinguishable from a
@@ -47,6 +48,26 @@ fn main() {
     for path in git_watch_paths() {
         println!("cargo:rerun-if-changed={}", path.display());
     }
+    // A release claim must not outlive an edit: HEAD and the index do not
+    // move when a tracked file is changed and left unstaged, so watch the
+    // tracked tree itself. Only for a release, so a dev rebuild stays cheap.
+    if kind == "release" && git.is_some() {
+        for path in tracked_top_level() {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+}
+
+/// The repo's tracked top-level entries (folders and files), absolute.
+fn tracked_top_level() -> Vec<PathBuf> {
+    let (Some(root), Some(files)) = (git_stdout(&["rev-parse", "--show-toplevel"]), git_stdout(&["ls-files", "--full-name", ":/"]))
+    else {
+        return Vec::new();
+    };
+    let mut tops: Vec<&str> = files.lines().filter_map(|f| f.split('/').next()).collect();
+    tops.sort_unstable();
+    tops.dedup();
+    tops.into_iter().map(|t| Path::new(&root).join(t)).filter(|p| p.exists()).collect()
 }
 
 /// The git files whose change means the tag may have moved: `HEAD` and the

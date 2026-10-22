@@ -742,3 +742,10 @@ fn only_macos_keeps_secrets_in_the_keychain() {
     assert_eq!(LinuxPlatform.secret_store(), crate::SecretStore::PrivateFile);
     assert_eq!(OtherPlatform.secret_store(), crate::SecretStore::PrivateFile);
 }
+
+#[test]
+fn an_asahi_machine_is_named_by_the_size_apple_sold() {
+    assert_eq!(crate::linux::sold_size_on_apple(8), 8);
+    assert_eq!(crate::linux::sold_size_on_apple(15), 16, "14.6 GiB of MemTotal on a 16 GB M1");
+    assert_eq!(crate::linux::sold_size_on_apple(63), 64);
+}

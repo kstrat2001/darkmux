@@ -133,6 +133,18 @@ impl Platform for LinuxPlatform {
     fn secret_store(&self) -> crate::SecretStore {
         crate::SecretStore::PrivateFile
     }
+
+    /// `MemTotal` is under the size sold (firmware's share): on the Apple
+    /// chips Asahi runs on, every size sold is a multiple of 8 GB.
+    fn ram_as_sold_gb(&self) -> Option<u64> {
+        let gib = self.ram_installed_bytes()?.div_ceil(1 << 30);
+        Some(if self.gpu_api().is_some() { sold_size_on_apple(gib) } else { gib })
+    }
+}
+
+/// An M1 or M2 sold with 8, 16, 24, 32, 64, 96 or 128 GB: the next multiple of 8.
+pub(crate) fn sold_size_on_apple(gib: u64) -> u64 {
+    gib.div_ceil(8) * 8
 }
 
 /// `PRETTY_NAME` from an os-release file, as `Omarchy (<it>)` on Omarchy.

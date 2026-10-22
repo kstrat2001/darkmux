@@ -31,8 +31,12 @@ fn token_file() -> PathBuf {
     crate::lab::paths::resolve(crate::lab::paths::ResolveScope::ForceUser).root.join("evals-token")
 }
 
+/// The keychain account: `$USER`, when it is a plain name (it reaches the `security -i` command line).
 fn user() -> String {
-    std::env::var("USER").unwrap_or_default()
+    std::env::var("USER")
+        .ok()
+        .filter(|u| !u.is_empty() && u.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)))
+        .unwrap_or_else(|| "darkmux".to_string())
 }
 
 /// The stored token, or `None` when none is stored.
@@ -42,7 +46,7 @@ pub fn read_token() -> Option<String> {
             let account = user();
             match darkmux_flow::read_keychain_bounded(
                 TOKEN_ITEM,
-                (!account.is_empty()).then_some(account.as_str()),
+                Some(account.as_str()),
                 std::time::Duration::from_secs(5),
             ) {
                 darkmux_flow::KeychainRead::Found(v) => v,
@@ -69,7 +73,7 @@ pub fn store_token(token: &str) -> Result<String> {
                 .stderr(Stdio::piped())
                 .spawn()
                 .context("running `security` to store the token in the login keychain")?;
-            let line = format!("add-generic-password -U -a \"{}\" -s {TOKEN_ITEM} -w \"{token}\"\n", user().replace('"', ""));
+            let line = format!("add-generic-password -U -a \"{}\" -s {TOKEN_ITEM} -w \"{token}\"\n", user());
             child.stdin.take().expect("piped").write_all(line.as_bytes())?;
             let out = child.wait_with_output()?;
             // `security -i` can exit 0 when its command failed: the read back is the check.
@@ -106,7 +110,7 @@ pub fn forget_token() -> Result<()> {
 }
 
 /// A file only this user can read, created that way (never widened after).
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     let _ = std::fs::remove_file(path);
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
@@ -147,8 +151,8 @@ static CFG_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// config file; a body is read from `body_file`.
 pub fn call(site: &str, method: &str, path: &str, token: &str, body_file: Option<&Path>) -> Result<Answer> {
     let url = format!("{}{path}", site.trim_end_matches('/'));
-    if !(url.starts_with("https://") || url.starts_with("http://localhost") || url.starts_with("http://127.0.0.1") || url.contains(".localhost:")) {
-        bail!("the site must be https (or a local preview): {site}");
+    if !site_is_safe(site) {
+        bail!("the site must be https (or a preview on this machine): {site}");
     }
     let n = CFG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let cfg = std::env::temp_dir().join(format!("darkmux-evals-{}-{n}.curl", std::process::id()));
@@ -164,7 +168,8 @@ pub fn call(site: &str, method: &str, path: &str, token: &str, body_file: Option
     }
     write_private(&cfg, config.as_bytes())?;
     let out = Command::new("curl")
-        .args(["-sS", "--max-time", "120", "-w", "\n%{http_code}", "-K"])
+        // `-q` first: no `~/.curlrc`, whose `verbose` would print the token.
+        .args(["-q", "-sS", "--max-time", "120", "-w", "\n%{http_code}", "-K"])
         .arg(&cfg)
         .output();
     let _ = std::fs::remove_file(&cfg);
@@ -173,6 +178,28 @@ pub fn call(site: &str, method: &str, path: &str, token: &str, body_file: Option
         bail!("could not reach {site}: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
     parse_answer(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// The token goes only over https, or plain http to this machine
+/// (`localhost`, `127.0.0.1`, a `*.localhost` preview): judged on the host
+/// itself, not on how the address starts.
+pub fn site_is_safe(site: &str) -> bool {
+    if site.starts_with("https://") {
+        return !site.contains(char::is_whitespace);
+    }
+    let Some(rest) = site.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.contains('@') {
+        return false;
+    }
+    let host = match authority.rsplit_once(':') {
+        Some((h, port)) if port.bytes().all(|b| b.is_ascii_digit()) => h,
+        _ => authority,
+    }
+    .to_ascii_lowercase();
+    host == "localhost" || host == "127.0.0.1" || (host.ends_with(".localhost") && host.len() > ".localhost".len())
 }
 
 /// curl's output with `-w "\n%{http_code}"`: the body, then the status line.
@@ -205,6 +232,22 @@ mod tests {
         let html = parse_answer("<html>bad gateway</html>\n502").unwrap();
         assert!(html.refusal().contains("not JSON"));
         assert!(parse_answer("no status").is_err());
+    }
+
+    #[test]
+    fn plain_http_only_to_this_machine() {
+        for ok in ["https://evals.darkmux.com", "http://localhost:3419", "http://de.localhost:3419", "http://127.0.0.1"] {
+            assert!(site_is_safe(ok), "{ok}");
+        }
+        for bad in [
+            "http://localhost.evil.com",
+            "http://evil.com/.localhost:",
+            "http://evil.com",
+            "http://localhost@evil.com",
+            "ftp://x",
+        ] {
+            assert!(!site_is_safe(bad), "{bad}");
+        }
     }
 
     #[test]

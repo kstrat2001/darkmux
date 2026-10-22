@@ -38,8 +38,9 @@ pub fn looks_like_path(value: &str) -> bool {
     static PATTERNS: std::sync::OnceLock<Vec<regex::Regex>> = std::sync::OnceLock::new();
     let patterns = PATTERNS.get_or_init(|| {
         [
-            r"(?i)/(?:users|home|root|private|var|tmp|opt|volumes|mnt|media|srv|library)(?:/|\b)",
-            r"(?i)\bfile:",
+            // `(?-u:\b)`: an ASCII word boundary, as in the site's JavaScript.
+            r"(?i)/(?:users|home|root|private|var|tmp|opt|volumes|mnt|media|srv|library)(?:/|(?-u:\b))",
+            r"(?i)(?-u:\b)file:",
             r"~[A-Za-z0-9._-]*/",
             r"(?:^|[^A-Za-z0-9])[A-Za-z]:[\\/]",
             r"\\\\",
@@ -426,13 +427,16 @@ pub fn assemble(repo: &str, commit_sha: &str, fixture_manifest: &Value, runs: Ve
     let name = fixture_manifest
         .get("name")
         .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|n| !n.is_empty())
+        .filter(|n| !n.trim().is_empty())
         .ok_or_else(|| anyhow!("the fixture's .fixture.json has no name"))?;
-    // darkmux reads a fixture with no version as 1.0.
+    // darkmux reads a fixture with no version as 1.0; a number reads as JavaScript writes it (2.0 is "2").
     let version = match fixture_manifest.get("version") {
         None | Some(Value::Null) => "1.0".to_string(),
         Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => match n.as_f64() {
+            Some(f) if f.fract() == 0.0 && f.abs() < 1e15 => format!("{}", f as i64),
+            _ => n.to_string(),
+        },
         Some(other) => other.to_string(),
     };
     Ok(json!({
@@ -441,6 +445,76 @@ pub fn assemble(repo: &str, commit_sha: &str, fixture_manifest: &Value, runs: Ve
         "fixture": { "repo": repo, "commitSha": commit_sha, "name": name, "version": version, "manifest": fixture_manifest },
         "runs": runs,
     }))
+}
+
+/// What the site's strict parser (`parseBundle`) would refuse in a bundle,
+/// by where: the bounds and forms a bundle written here can miss (a stated
+/// value, a chip name, a repeated run). Empty means it takes it. The site
+/// stays the authority; this saves an upload it would refuse.
+pub fn site_refusals(bundle: &Value) -> Vec<String> {
+    fn re(p: &str) -> regex::Regex {
+        regex::Regex::new(p).expect("valid pattern")
+    }
+    let semverish = re(r"^[0-9A-Za-z.+-]{1,40}$");
+    let hex64 = re(r"^[0-9a-f]{64}$");
+    let hex40 = re(r"^[0-9a-f]{40}$");
+    let commit = re(r"^[0-9a-f]{7,40}$");
+    let repo = re(r"^[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}$");
+    let apple = re(r"^Apple M\d{1,2}(?: (?:Pro|Max|Ultra))?$");
+    let os = re(r"^(?:macOS \d[0-9.]*|Omarchy\b[^\n]*)$");
+    let mut errs = Vec::new();
+    // `text()`: a non-blank string within `max` UTF-16 units, in `form` when given; null when `nullable`.
+    let mut text = |v: &Value, at: &str, max: usize, form: Option<&regex::Regex>, nullable: bool| match v {
+        Value::Null if nullable => {}
+        Value::String(s) if !s.trim().is_empty() => {
+            if s.encode_utf16().count() > max {
+                errs.push(format!("{at}: longer than {max}"));
+            } else if form.is_some_and(|f| !f.is_match(s)) {
+                errs.push(format!("{at}: not in the form the site takes ({s})"));
+            }
+        }
+        _ => errs.push(format!("{at}: expected a string{}", if nullable { " or null" } else { "" })),
+    };
+    let f = &bundle["fixture"];
+    text(&f["repo"], "fixture.repo", 200, Some(&repo), false);
+    text(&f["commitSha"], "fixture.commitSha", 200, Some(&hex40), false);
+    text(&f["name"], "fixture.name", 60, None, false);
+    text(&f["version"], "fixture.version", 200, Some(&semverish), false);
+    let mut keys = BTreeSet::new();
+    let mut numbers = Vec::new();
+    let runs = bundle["runs"].as_array().cloned().unwrap_or_default();
+    for (i, r) in runs.iter().enumerate() {
+        let at = |k: &str| format!("runs[{i}].{k}");
+        if !keys.insert(r["key"].as_str().unwrap_or_default().to_string()) {
+            numbers.push(format!("runs[{i}]: the same run twice"));
+        }
+        text(&r["darkmuxVersion"], &at("darkmuxVersion"), 200, Some(&semverish), true);
+        text(&r["darkmuxCommit"], &at("darkmuxCommit"), 200, Some(&commit), true);
+        let s = &r["stack"];
+        let st = |k: &str| format!("runs[{i}].stack.{k}");
+        text(&s["chip"], &st("chip"), 200, Some(&apple), false);
+        text(&s["accelerator"], &st("accelerator"), 32, None, true);
+        text(&s["os"], &st("os"), 80, Some(&os), true);
+        for k in ["engine", "engineBackend", "engineVersion"] {
+            text(&s[k], &st(k), 80, None, true);
+        }
+        text(&s["model"], &st("model"), 200, None, true);
+        text(&s["weightsHash"], &st("weightsHash"), 200, Some(&hex64), true);
+        text(&s["quant"], &st("quant"), 40, None, true);
+        for (k, max) in [("activeSeconds", MAX_SECONDS), ("tokensPerSecond", 100_000.0)] {
+            if r[k].as_f64().is_some_and(|n| !(0.0..=max).contains(&n)) {
+                numbers.push(format!("{}: outside 0 to {max}", at(k)));
+            }
+        }
+    }
+    errs.extend(numbers);
+    if runs.is_empty() || runs.len() > 500 {
+        errs.push("runs: 1 to 500 runs a bundle".to_string());
+    }
+    if serde_json::to_string(&f["manifest"]).map_or(0, |t| t.len()) > 64 * 1024 {
+        errs.push("fixture.manifest: larger than 64 KB".to_string());
+    }
+    errs
 }
 
 /// What the operator states by hand, for what the machine cannot say.
@@ -470,6 +544,9 @@ pub fn gather(runs: &[String], stated: &Stated, progress: &mut dyn FnMut(&str)) 
     if runs.is_empty() {
         bail!("name at least one lab run");
     }
+    if let Some(twice) = runs.iter().enumerate().find_map(|(i, r)| runs[..i].contains(r).then_some(r)) {
+        bail!("{twice} is named twice");
+    }
     let platform = darkmux_platform::current();
     let chip = platform.cpu_brand().unwrap_or_default();
     if !chip.starts_with("Apple M") {
@@ -478,7 +555,7 @@ pub fn gather(runs: &[String], stated: &Stated, progress: &mut dyn FnMut(&str)) 
             if chip.is_empty() { "no Apple chip" } else { chip.as_str() }
         );
     }
-    let ram_gb = platform.ram_installed_bytes().map(|b| (b as f64 / f64::from(1u32 << 30)).ceil() as u64);
+    let ram_gb = platform.ram_as_sold_gb();
     let os_release = platform.os_release();
     let registry = darkmux_profiles::profiles::load_registry_quiet(None).ok().map(|l| l.registry);
 
@@ -641,7 +718,11 @@ pub fn gather(runs: &[String], stated: &Stated, progress: &mut dyn FnMut(&str)) 
             // The quant is the weights': it holds for the run when they do.
             quant: match &stated.engine {
                 Some(_) => stated.quant.clone(),
-                None => as_of_run(provenance.as_ref().and_then(|p| p.quant.clone()), weights_changed, started),
+                None => as_of_run(
+                    provenance.as_ref().and_then(|p| p.quant.clone()).filter(|q| !q.trim().is_empty()),
+                    weights_changed,
+                    started,
+                ),
             },
             context_length: profile_model.and_then(|m| m.n_ctx).map(u64::from),
         };
@@ -662,6 +743,10 @@ pub fn gather(runs: &[String], stated: &Stated, progress: &mut dyn FnMut(&str)) 
     paths_in(&bundle, "bundle", &mut paths);
     if !paths.is_empty() {
         bail!("the bundle would carry a file path, which is never shared; found at {}", paths.join(", "));
+    }
+    let refused = site_refusals(&bundle);
+    if !refused.is_empty() {
+        bail!("the site would refuse this bundle:\n  {}", refused.join("\n  "));
     }
     let f = &bundle["fixture"];
     Ok(Built {
