@@ -1583,4 +1583,65 @@ pub(crate) enum LabCmd {
     /// no dispatches, no network. Doctor is the discoverability layer
     /// for the lab subsystem.
     Doctor,
+    /// Share lab runs on the darkmux evals site (evals.darkmux.com). Builds
+    /// one bundle of the runs, with no paths and nothing it cannot vouch for
+    /// as of the run, and uploads it with your upload token (`lab submit
+    /// login`). The eval must be approved on the site first. `--dry-run`
+    /// writes the bundle and sends nothing.
+    #[command(args_conflicts_with_subcommands = true)]
+    Submit {
+        #[command(subcommand)]
+        sub: Option<SubmitCmd>,
+        /// Lab run ids (or run folders), all of one fixture checkout.
+        runs: Vec<String>,
+        /// Write the bundle and send nothing.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// Also write the bundle here (default with --dry-run:
+        /// darkmux-evals-<first run>.json).
+        #[arg(long)]
+        out: Option<String>,
+        /// The site to send it to.
+        #[arg(long, default_value = darkmux_lab::lab::submit::DEFAULT_SITE)]
+        site: String,
+        /// Replace these runs where the site already has them.
+        #[arg(long)]
+        replace: bool,
+        /// The fixture commit, when the checkout's reflog no longer reaches the runs.
+        #[arg(long)]
+        commit: Option<String>,
+        /// The engine, when it is not LM Studio (LM Studio is then not read).
+        #[arg(long)]
+        engine: Option<String>,
+        /// The engine's backend, with --engine.
+        #[arg(long = "engine-backend")]
+        engine_backend: Option<String>,
+        /// The engine's version, with --engine.
+        #[arg(long = "engine-version")]
+        engine_version: Option<String>,
+        /// The quantization, with --engine.
+        #[arg(long)]
+        quant: Option<String>,
+        /// The model's weights (a folder or a file), with --engine or when
+        /// LM Studio's are not found.
+        #[arg(long = "weights-dir")]
+        weights_dir: Option<String>,
+        /// The darkmux version that ran the runs, for runs from before 5.4
+        /// made by a darkmux since replaced.
+        #[arg(long = "darkmux-version")]
+        darkmux_version: Option<String>,
+    },
+}
+
+/// `darkmux lab submit login|logout`: the upload token.
+#[derive(Subcommand)]
+pub(crate) enum SubmitCmd {
+    /// Store your upload token (made on the site's account page), read from
+    /// stdin, after checking it with the site.
+    Login {
+        #[arg(long, default_value = darkmux_lab::lab::submit::DEFAULT_SITE)]
+        site: String,
+    },
+    /// Forget the stored upload token.
+    Logout,
 }

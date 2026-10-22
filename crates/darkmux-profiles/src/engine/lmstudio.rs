@@ -89,6 +89,10 @@ impl Engine for LmStudio {
         Ok(ids)
     }
 
+    fn provenance(&self, model_key: &str) -> Result<Option<super::ModelProvenance>> {
+        lms::provenance(model_key)
+    }
+
     fn version(&self) -> Option<String> {
         // (#1939) Resolved through the one `env > config.lms_bin > "lms"`
         // precedence home, not a literal: an operator who set `lms_bin` to a

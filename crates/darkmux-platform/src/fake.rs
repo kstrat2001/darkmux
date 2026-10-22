@@ -11,6 +11,7 @@ pub struct FakePlatform {
     /// other pid reads as `None`.
     pub process_start_stamps: Vec<(u32, u64)>,
     pub pid_namespace: Option<String>,
+    pub os_release: Option<crate::OsRelease>,
 }
 
 /// Every answer at its "nothing to report" value, so a test sets only the
@@ -25,6 +26,7 @@ impl Default for FakePlatform {
             reclaimable_memory_bytes: None,
             process_start_stamps: Vec::new(),
             pid_namespace: None,
+            os_release: None,
         }
     }
 }
@@ -93,5 +95,17 @@ impl Platform for FakePlatform {
 
     fn pid_namespace(&self) -> Option<String> {
         self.pid_namespace.clone()
+    }
+
+    fn os_release(&self) -> Option<crate::OsRelease> {
+        self.os_release.clone()
+    }
+
+    fn gpu_api(&self) -> Option<&'static str> {
+        None
+    }
+
+    fn secret_store(&self) -> crate::SecretStore {
+        crate::SecretStore::PrivateFile
     }
 }

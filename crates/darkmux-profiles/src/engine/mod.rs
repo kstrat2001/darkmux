@@ -52,6 +52,20 @@ pub struct ModelMeta {
     pub model_type: String,
 }
 
+/// What [`Engine::provenance`] reports. A fact LM Studio does not say is `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelProvenance {
+    /// `MLX` or `llama.cpp`, from the model's format.
+    pub backend: Option<String>,
+    pub quant: Option<String>,
+    /// The model's folder (or file) on disk.
+    pub weights_path: Option<std::path::PathBuf>,
+    /// The selected runtime for that backend, as `mlx-llm 1.13.1`.
+    pub runtime: Option<String>,
+    /// When that runtime was installed: its folder's time.
+    pub runtime_installed_at_ms: Option<u64>,
+}
+
 /// What an engine can do, declared once by the engine and read by the core,
 /// which picks its behavior from the declaration and never from which engine
 /// it is (ENGINES.md section 3.1). An engine declares only what it really
@@ -149,6 +163,12 @@ pub trait Engine {
     /// name came from (env, config or built-in), or `None` when the engine
     /// is not reached through a local binary. The doctor's binary check.
     fn binary(&self) -> Option<(String, darkmux_types::config_access::Source)>;
+
+    /// Where a model's weights are and what runs it (`darkmux lab submit`).
+    /// `Ok(None)`: the engine does not list that model.
+    fn provenance(&self, _model_key: &str) -> Result<Option<ModelProvenance>> {
+        Err(NotReported { engine: self.name(), question: "where a model's weights are" }.into())
+    }
 }
 
 /// LM Studio, the engine a managed model runs on (a managed endpoint,

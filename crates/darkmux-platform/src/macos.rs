@@ -95,6 +95,56 @@ impl Platform for MacPlatform {
     fn pid_namespace(&self) -> Option<String> {
         Some("macos".to_string())
     }
+
+    /// `sw_vers -productVersion`, installed when `system_profiler`'s install
+    /// history last lists `macOS <version>`. The system files' own times are
+    /// Apple's build times on the sealed volume, not when an update landed.
+    fn os_release(&self) -> Option<crate::OsRelease> {
+        let version = command_stdout("sw_vers", &["-productVersion"])?.trim().to_string();
+        if version.is_empty() {
+            return None;
+        }
+        let history = command_stdout("system_profiler", &["SPInstallHistoryDataType", "-json"]).unwrap_or_default();
+        Some(crate::OsRelease { installed_at_unix_ms: macos_installed_at(&history, &version), name: format!("macOS {version}") })
+    }
+
+    /// Apple Silicon runs local models on Metal.
+    fn gpu_api(&self) -> Option<&'static str> {
+        self.cpu_brand().filter(|b| b.starts_with("Apple M")).map(|_| "Metal")
+    }
+
+    fn secret_store(&self) -> crate::SecretStore {
+        crate::SecretStore::Keychain
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn command_stdout(cmd: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new(cmd).args(args).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn command_stdout(_cmd: &str, _args: &[&str]) -> Option<String> {
+    None
+}
+
+/// The newest `install_date` among `system_profiler SPInstallHistoryDataType
+/// -json` items named `macOS <version>`. Read by scanning each item's two
+/// string fields; this crate parses no JSON otherwise.
+pub(crate) fn macos_installed_at(json: &str, version: &str) -> Option<u64> {
+    let want = format!("macOS {version}");
+    json.split('{')
+        .filter(|item| string_field(item, "_name").as_deref() == Some(want.as_str()))
+        .filter_map(|item| crate::dates::rfc3339_utc_ms(&string_field(item, "install_date")?))
+        .max()
+}
+
+/// `"key" : "value"` in a fragment of JSON, the value unescaped of nothing (dates and names here have no escapes).
+fn string_field(item: &str, key: &str) -> Option<String> {
+    let at = item.find(&format!("\"{key}\""))? + key.len() + 2;
+    let rest = item[at..].trim_start().strip_prefix(':')?.trim_start().strip_prefix('"')?;
+    Some(rest[..rest.find('"')?].to_string())
 }
 
 /// (#2917, moved here by #3200) See [`MacPlatform::process_start_stamp`].

@@ -591,6 +591,8 @@ fn enrich_manifest_with_fixture_info(
     // (v5 = "has `verify`"). An unconditional insert here silently
     // downgraded that, stamping v4 onto a manifest that really is v5.
     manifest.raise_schema_version(4);
+    // What built this darkmux, so a shared result names it (`lab submit`).
+    manifest.darkmux = Some(darkmux_types::build_info());
     manifest.write(run_dir)?;
     Ok(())
 }
@@ -1685,6 +1687,23 @@ mod tests {
         // New fixture section.
         assert_eq!(parsed["fixture"]["baseline_hash"], "blake3:source-hash");
         assert!(parsed["fixture"]["source_path"].is_string());
+    }
+
+    /// (run manifest 1.1) The enricher records the darkmux that ran the run.
+    #[test]
+    fn enrich_records_the_darkmux_build_that_ran() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run-1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(run_dir.join("manifest.json"), r#"{"schema_version": 6, "run_id": "r"}"#).unwrap();
+        enrich_manifest_with_fixture_info(&run_dir, None, tmp.path()).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(run_dir.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(parsed["darkmux"]["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            serde_json::from_value::<darkmux_types::BuildInfo>(parsed["darkmux"].clone()).unwrap(),
+            darkmux_types::build_info()
+        );
     }
 
     /// `baseline_hash: None` is recorded as JSON null (operator-visible

@@ -707,3 +707,38 @@ fn this_linux_machine_reads_its_smc_power_and_sensors_if_it_has_them() {
     assert!(MacPlatform.package_power_mw().is_none() && MacPlatform.board_sensors().is_none());
     assert!(OtherPlatform.package_power_mw().is_none() && OtherPlatform.board_sensors().is_none());
 }
+
+#[test]
+fn macos_install_time_is_the_newest_install_of_the_running_version() {
+    let json = r#"{ "SPInstallHistoryDataType" : [
+      { "_name" : "macOS 15.0", "install_date" : "2024-09-20T10:00:00Z", "package_source" : "package_source_apple" },
+      { "_name" : "macOS 15.1", "install_date" : "2024-10-28T16:10:30Z", "package_source" : "package_source_apple" },
+      { "_name" : "XProtectPlistConfigData", "install_date" : "2024-11-01T00:00:00Z" },
+      { "_name" : "macOS 15.1", "install_date" : "2024-10-29T00:00:00Z" } ] }"#;
+    assert_eq!(crate::macos::macos_installed_at(json, "15.1"), Some(1_730_160_000_000));
+    assert_eq!(crate::macos::macos_installed_at(json, "15.2"), None);
+    assert_eq!(crate::macos::macos_installed_at("not json", "15.1"), None);
+}
+
+#[test]
+fn rfc3339_reads_utc_only() {
+    assert_eq!(crate::dates::rfc3339_utc_ms("1970-01-01T00:00:00Z"), Some(0));
+    assert_eq!(crate::dates::rfc3339_utc_ms("2024-10-28T16:10:30Z"), Some(1_730_131_830_000));
+    assert_eq!(crate::dates::rfc3339_utc_ms("2024-10-28 16:10:30"), None);
+    assert_eq!(crate::dates::rfc3339_utc_ms("2024-13-28T16:10:30Z"), None);
+}
+
+#[test]
+fn linux_os_name_is_omarchy_where_omarchy_is_installed() {
+    let rel = "NAME=\"Arch Linux\"\nPRETTY_NAME=\"Arch Linux ARM\"\nID=archarm\n";
+    assert_eq!(crate::linux::os_name_from_release(rel, true).as_deref(), Some("Omarchy (Arch Linux ARM)"));
+    assert_eq!(crate::linux::os_name_from_release(rel, false).as_deref(), Some("Arch Linux ARM"));
+    assert_eq!(crate::linux::os_name_from_release("", false), None);
+}
+
+#[test]
+fn only_macos_keeps_secrets_in_the_keychain() {
+    assert_eq!(MacPlatform.secret_store(), crate::SecretStore::Keychain);
+    assert_eq!(LinuxPlatform.secret_store(), crate::SecretStore::PrivateFile);
+    assert_eq!(OtherPlatform.secret_store(), crate::SecretStore::PrivateFile);
+}

@@ -1,0 +1,90 @@
+{
+  "bundle": {
+    "format": "darkmux-evals-bundle",
+    "formatVersion": 3,
+    "fixture": {
+      "repo": "kstrat2001/pepper-grinder",
+      "commitSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "name": "pepper-grinder",
+      "version": "2.0",
+      "manifest": {
+        "name": "pepper-grinder",
+        "version": "2.0",
+        "verify_command": "pytest"
+      }
+    },
+    "runs": [
+      {
+        "key": "d42a3c3503fd23fc88596a22d9d28ca61fc7c47424344abefe34a73c76fa43d0",
+        "darkmuxVersion": "5.4.0",
+        "darkmuxCommit": "abc1234",
+        "darkmuxBuild": "release",
+        "passed": true,
+        "activeSeconds": 123.5,
+        "tokensPerSecond": 41.27,
+        "peakMemoryGb": null,
+        "startedAt": "2025-10-22T08:00:00.123Z",
+        "stack": {
+          "chip": "Apple M5 Max",
+          "ramGb": 128,
+          "accelerator": "Metal",
+          "os": "macOS 26.1",
+          "engine": "LM Studio",
+          "engineBackend": "MLX",
+          "engineVersion": "mlx-llm 1.13.1",
+          "model": "qwen3-coder-30b",
+          "weightsHash": null,
+          "quant": "4bit",
+          "contextLength": 65536,
+          "kvCacheDtype": null
+        },
+        "detail": {
+          "wallSeconds": 150,
+          "restSeconds": 26.6,
+          "turns": 12,
+          "toolCalls": 30,
+          "toolCallsFailed": 2,
+          "completionTokens": 9000,
+          "reasoningTokens": 3000,
+          "packageWatts": 31.3,
+          "cpuWatts": 5,
+          "gpuWatts": 25,
+          "gpuBusyPct": 87.5,
+          "joulesPer1kTokens": 410.3,
+          "memoryPressureMaxPct": 62,
+          "thermalStates": {
+            "nominal": 38,
+            "fair": 2
+          },
+          "cpuSpeedLimitMinPct": 100,
+          "throttledSamples": 0,
+          "verify": {
+            "summary": null,
+            "forcedFailureReason": null,
+            "baselineTests": 10,
+            "testsTotal": 14,
+            "testsPassed": 14,
+            "testsAdded": 4,
+            "testsFailed": 0,
+            "sandboxChanged": true,
+            "coveragePct": 91.2,
+            "coverageMinPct": 80,
+            "commandPassed": true
+          }
+        }
+      }
+    ]
+  },
+  "ok": true,
+  "weights": "8d53d16635cfc30e403595f59199aec7c7f774e4690b061f8a638693086a39e5",
+  "paths": [
+    true,
+    true,
+    true,
+    true,
+    true,
+    false,
+    false,
+    true
+  ]
+}

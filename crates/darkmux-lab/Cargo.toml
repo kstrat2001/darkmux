@@ -17,6 +17,8 @@ darkmux-crew = { path = "../darkmux-crew" }
 # (#1198) machine fingerprint for the scores.json fit key + RFC3339 ts.
 darkmux-flow = { path = "../darkmux-flow" }
 darkmux-hardware = { path = "../darkmux-hardware" }
+# (lab submit) The machine a shared result names, and where its token is kept.
+darkmux-platform = { path = "../darkmux-platform" }
 darkmux-profiles = { path = "../darkmux-profiles" }
 # (#1230 Packet 1) The review pipeline's model-cycling now routes through gestalt's
 # pure planner (plan_acquire/plan_release) instead of a private
