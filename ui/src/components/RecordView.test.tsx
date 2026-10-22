@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { RecordView } from "./RecordView";
+import { PageJudgementContext } from "../hooks/useJudgement";
+import { NO_PRESENCE } from "../lib/lifecycle";
 import { norm, type RawRecord } from "../testing/records";
 
 // The rules here are the ones that replace 26 per-action templates, so they
@@ -253,5 +255,19 @@ describe("arrays of objects render as nested groups, not '[object Object]'", () 
     const headers = [...document.querySelectorAll(".rv__grouphd")].map((el) => el.textContent);
     expect(headers).toContain("f1");
     expect(headers).toContain("f2");
+  });
+
+  // (#2880) A replayed record reads its age at the playhead, as a live viewer
+  // read it then: "4s ago", not the hours since on the real clock.
+  it("reads a record's age at the playhead on a replay, not on the real clock", () => {
+    const at = Date.parse(REC.ts);
+    const rec = { ...REC, payload: { ...REC.payload, started_ts: "2026-08-09T05:13:06Z" } };
+    render(
+      <PageJudgementContext.Provider value={{ playhead: at + 4000, live: NO_PRESENCE }}>
+        <RecordView record={norm(rec)} />
+      </PageJudgementContext.Provider>,
+    );
+    expect(document.querySelector(".rv__when")?.textContent).toContain("4s ago");
+    expect(screen.getByText(/1m ago/)).toBeInTheDocument();
   });
 });

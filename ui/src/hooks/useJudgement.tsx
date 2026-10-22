@@ -33,6 +33,14 @@ export function useJudgement(ticking: boolean, refresh: unknown): Judgement | nu
   );
 }
 
+/** (#2880) The page's "now" for a relative time ("4s ago"): the playhead on
+ *  a replay, so a replayed record reads its age as a live viewer read it
+ *  then; the wall clock at the live edge. */
+export function usePageNowMs(): number {
+  const { playhead } = useContext(PageJudgementContext);
+  return playhead ?? Date.now();
+}
+
 /** Provides the page's judgement inputs: `playhead` from the transport and
  *  the presence read, polled only when `live` (a replay must not ask about
  *  now). Its own component, so a presence poll re-renders only the surfaces
