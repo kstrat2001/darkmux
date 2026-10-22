@@ -36,7 +36,13 @@
           "weightsHash": null,
           "quant": "4bit",
           "contextLength": 65536,
-          "kvCacheDtype": null
+          "kvCacheDtype": null,
+          "cpuCores": [
+            { "cluster": "Super", "cores": 6 },
+            { "cluster": "Performance", "cores": 12 }
+          ],
+          "gpuCores": 40,
+          "modelId": "Mac17,7"
         },
         "detail": {
           "wallSeconds": 150,

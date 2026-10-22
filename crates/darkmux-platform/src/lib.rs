@@ -110,6 +110,11 @@ pub trait Platform: Send + Sync {
     /// when this machine is not one darkmux can say it of.
     fn gpu_api(&self) -> Option<&'static str>;
 
+    /// What this machine was bought with beyond its chip and RAM: the CPU
+    /// and GPU core counts and the model, the choices a buyer makes. What
+    /// the OS does not say is left empty, never guessed.
+    fn machine_config(&self) -> MachineConfig;
+
     /// Where darkmux keeps a secret it is handed (an upload token).
     fn secret_store(&self) -> SecretStore;
 
@@ -139,6 +144,17 @@ pub struct OsRelease {
     /// When this version was installed; `None` when the OS does not say, so
     /// a reader cannot claim it held at an earlier time.
     pub installed_at_unix_ms: Option<u64>,
+}
+
+/// See [`Platform::machine_config`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MachineConfig {
+    /// Physical cores per CPU cluster, by the OS's own cluster name
+    /// (`Super`, `Performance`, `Efficiency`), fastest first. Empty when not read.
+    pub cpu_clusters: Vec<(String, u32)>,
+    pub gpu_cores: Option<u32>,
+    /// The model identifier the Mac reports (`Mac16,5`).
+    pub model_id: Option<String>,
 }
 
 /// See [`Platform::secret_store`].

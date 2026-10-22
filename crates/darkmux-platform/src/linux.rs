@@ -130,6 +130,19 @@ impl Platform for LinuxPlatform {
         read_to_string("/proc/device-tree/compatible").and_then(|c| apple_chip_from_compatible(&c)).map(|_| "Vulkan")
     }
 
+    /// The CPU tiers [`Platform::cpu_clusters`] reads, one core per CPU
+    /// (Apple Silicon has no SMT), on Apple Silicon only. The GPU core count
+    /// and the Mac's model identifier have no source read here yet.
+    fn machine_config(&self) -> crate::MachineConfig {
+        if self.gpu_api().is_none() {
+            return crate::MachineConfig::default();
+        }
+        crate::MachineConfig {
+            cpu_clusters: self.cpu_clusters().into_iter().map(|c| (c.name, c.logical_cpus as u32)).collect(),
+            ..Default::default()
+        }
+    }
+
     fn secret_store(&self) -> crate::SecretStore {
         crate::SecretStore::PrivateFile
     }

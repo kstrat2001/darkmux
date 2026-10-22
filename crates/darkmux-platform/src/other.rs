@@ -78,6 +78,10 @@ impl Platform for OtherPlatform {
         None
     }
 
+    fn machine_config(&self) -> crate::MachineConfig {
+        crate::MachineConfig::default()
+    }
+
     fn secret_store(&self) -> crate::SecretStore {
         crate::SecretStore::PrivateFile
     }
