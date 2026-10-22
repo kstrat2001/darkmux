@@ -642,3 +642,68 @@ fn linux_pid_namespace_is_the_ns_links_inode() {
     let fake = FakePlatform { pid_namespace: Some("ns".into()), ..Default::default() };
     assert_eq!(fake.pid_namespace().as_deref(), Some("ns"));
 }
+
+// ── #3331: power and board sensors from hwmon ───────────────────────────
+
+fn hwmon(chip: &str, sensor: &str, label: Option<&str>, value: i64) -> crate::linux::HwmonInput {
+    crate::linux::HwmonInput { chip: chip.into(), sensor: sensor.into(), label: label.map(Into::into), value }
+}
+
+/// What darkbook's hwmon read on 2026-10-22 (13-inch M2 MacBook Pro, on
+/// battery, idle), trimmed to one input of each kind.
+fn darkbook_hwmon() -> Vec<crate::linux::HwmonInput> {
+    vec![
+        hwmon("macsmc_battery", "temp1", Some("temp"), 36_800),
+        hwmon("macsmc_battery", "power1", None, -10_756_000),
+        hwmon("macsmc_hwmon", "fan1", Some("Fan"), 1558),
+        hwmon("macsmc_hwmon", "power1", Some("Total System Power"), 10_517_264),
+        hwmon("macsmc_hwmon", "power4", Some("Heatpipe Power"), 5_001_028),
+        hwmon("macsmc_hwmon", "temp1", Some("NAND Flash Temperature"), 52_580),
+        hwmon("macsmc_hwmon", "temp2", Some("Battery Hotspot"), 36_799),
+        hwmon("tas2764", "temp1", None, 31_000),
+    ]
+}
+
+#[test]
+fn linux_package_power_is_the_heatpipe_sensor_in_milliwatts() {
+    assert_eq!(crate::linux::package_mw_from_hwmon(&darkbook_hwmon()), Some(5001.028));
+}
+
+#[test]
+fn no_heatpipe_sensor_is_no_package_power_never_the_system_total() {
+    let without: Vec<_> = darkbook_hwmon().into_iter().filter(|i| i.label.as_deref() != Some("Heatpipe Power")).collect();
+    assert_eq!(crate::linux::package_mw_from_hwmon(&without), None);
+    assert_eq!(crate::linux::package_mw_from_hwmon(&[hwmon("macsmc_hwmon", "power4", Some("Heatpipe Power"), -5)]), None);
+}
+
+#[test]
+fn board_sensors_are_the_labeled_temperatures_and_the_fan() {
+    let s = crate::linux::board_sensors_from_hwmon(&darkbook_hwmon()).unwrap();
+    assert_eq!(
+        s.temps_c.into_iter().collect::<Vec<_>>(),
+        vec![("Battery Hotspot".to_string(), 36.8), ("NAND Flash Temperature".to_string(), 52.6)],
+        "the battery's bare `temp` label and the unlabeled amp are skipped"
+    );
+    assert_eq!(s.fan_rpm, Some(1558));
+}
+
+#[test]
+fn a_label_two_chips_share_is_keyed_by_chip() {
+    let s = crate::linux::board_sensors_from_hwmon(&[hwmon("a", "temp1", Some("Die"), 40_000), hwmon("b", "temp1", Some("Die"), 41_000)]).unwrap();
+    assert_eq!(s.temps_c.keys().cloned().collect::<Vec<_>>(), vec!["a Die".to_string(), "b Die".to_string()]);
+    assert_eq!(s.fan_rpm, None, "fanless");
+    assert!(crate::linux::board_sensors_from_hwmon(&[hwmon("tas2764", "temp1", None, 31_000)]).is_none());
+}
+
+#[test]
+fn this_linux_machine_reads_its_smc_power_and_sensors_if_it_has_them() {
+    if std::env::consts::OS == "linux" && std::fs::read_dir("/sys/class/hwmon").is_ok_and(|d| {
+        d.flatten().any(|c| std::fs::read_to_string(c.path().join("name")).is_ok_and(|n| n.trim() == "macsmc_hwmon"))
+    }) {
+        let mw = LinuxPlatform.package_power_mw().expect("the SMC's heatpipe power");
+        assert!(mw > 0.0 && mw < 200_000.0, "{mw} mW");
+        assert!(!LinuxPlatform.board_sensors().expect("SMC sensors").temps_c.is_empty());
+    }
+    assert!(MacPlatform.package_power_mw().is_none() && MacPlatform.board_sensors().is_none());
+    assert!(OtherPlatform.package_power_mw().is_none() && OtherPlatform.board_sensors().is_none());
+}

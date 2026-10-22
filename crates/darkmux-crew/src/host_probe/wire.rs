@@ -16,7 +16,7 @@
 
 pub use darkmux_flow::payload::{
     BatteryCharge, BatteryHealthNow, CpuClusterNow, HostSampleNow, LoadWindow, MachineLoad, MetricWindow, PowerNow,
-    PowerWindowWire, ThermalNow, ThermalWindowWire,
+    PowerWindowWire, SensorsNow, ThermalNow, ThermalWindowWire,
 };
 
 use super::battery::{BatteryHealth, BatterySample};
@@ -35,7 +35,11 @@ pub fn host_sample_now(s: &HostSampleFull, sampled_at_ms: u64) -> HostSampleNow 
         gpu_mem_bytes: s.gpu_mem_bytes,
         thermal: s.thermal.as_ref().map(ThermalNow::from),
         battery: s.battery.as_ref().map(BatteryCharge::from),
-        power_mw: s.power.as_ref().map(PowerNow::from),
+        // (#3331) A reading with every rail is `power_mw`; a total with no
+        // rails is `package_power_mw`, so no rail is ever written as `0`.
+        power_mw: s.power.as_ref().and_then(rails_now),
+        package_power_mw: s.power.filter(|p| p.cpu_mw.is_none()).map(|p| p.total_mw().round() as i64),
+        sensors: s.sensors.as_ref().map(|b| SensorsNow { temps_c: b.temps_c.clone(), fan_rpm: b.fan_rpm }),
     }
 }
 
@@ -51,15 +55,14 @@ impl From<&ThermalSample> for ThermalNow {
     }
 }
 
-impl From<&PowerSample> for PowerNow {
-    fn from(p: &PowerSample) -> Self {
-        Self {
-            cpu: p.cpu_mw.round() as i64,
-            gpu: p.gpu_mw.round() as i64,
-            ane: p.ane_mw.round() as i64,
-            total: p.total_mw().round() as i64,
-        }
-    }
+/// The rails' wire shape, or `None` for a reading that has no rails.
+pub fn rails_now(p: &PowerSample) -> Option<PowerNow> {
+    Some(PowerNow {
+        cpu: p.cpu_mw?.round() as i64,
+        gpu: p.gpu_mw?.round() as i64,
+        ane: p.ane_mw?.round() as i64,
+        total: p.total_mw().round() as i64,
+    })
 }
 
 impl From<&BatterySample> for BatteryCharge {

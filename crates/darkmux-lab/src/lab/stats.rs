@@ -62,7 +62,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// Data-shape semver for [`RunStats`], per the repo's additive-minor rule.
-pub const RUN_STATS_SCHEMA_VERSION: &str = "2.1.0";
+pub const RUN_STATS_SCHEMA_VERSION: &str = "2.2.0";
 
 use darkmux_trajectory::DEGENERATE_TAIL_RATIO;
 
@@ -307,7 +307,22 @@ pub struct RunStats {
     pub gpu_w_busy: Option<f64>,
     pub cpu_w_busy: Option<f64>,
     pub pkg_w_busy: Option<f64>,
+    /// GPU utilization's duty cycle. `None` where the host reads no GPU
+    /// utilization (see [`RunStats::busy_basis`]): a duty taken from the
+    /// stream bookends is not a GPU figure.
     pub gpu_duty_pct: Option<f64>,
+    /// (#3331) What decided which samples were BUSY. `None` with no
+    /// telemetry in the run window.
+    pub busy_basis: Option<BusyBasis>,
+    /// (#3331) Each host figure above that is `None` although telemetry
+    /// landed in the run window, with why: a host that does not read it is a
+    /// different claim from a run that never measured.
+    pub host_unmeasured: BTreeMap<String, String>,
+    /// (#3331) The hottest labeled board sensor over the busy samples, in
+    /// °C, where the host reads board sensors (Omarchy). A temperature, not
+    /// a thermal pressure state: it never fills `thermal_states_busy`.
+    pub board_temp_c_max_busy: Option<f64>,
+    pub fan_rpm_max_busy: Option<u32>,
     pub samples_busy: usize,
     pub samples_idle: usize,
     /// Wall time spent busy, from the duty cycle. With `pkg_w_busy` this is
@@ -418,18 +433,43 @@ pub(crate) struct Sample {
     /// The sampler's own stamp: milliseconds since its previous sample
     /// (measured equal to the actual gap). The time this sample stands for.
     interval_ms: Option<u64>,
-    gpu_pct: u64,
-    w_gpu: f64,
-    w_cpu: f64,
+    /// `None` where the host reads no GPU utilization (Omarchy, #3331).
+    gpu_pct: Option<u64>,
+    /// `None` where the host reads no per-rail split (Omarchy).
+    w_gpu: Option<f64>,
+    w_cpu: Option<f64>,
     w_total: f64,
     thermal_state: Option<String>,
-    cpu_speed_limit_pct: u64,
+    /// `None` where the host reads no thermal state (Omarchy): "never
+    /// capped" is a reading, and nothing read it.
+    cpu_speed_limit_pct: Option<u64>,
     mem_pct: u64,
+    /// (#3331) The hottest labeled board sensor, and the fan.
+    board_temp_c_max: Option<f64>,
+    fan_rpm: Option<u32>,
+    /// Taken while one of the run's model streams was open. Set by
+    /// [`mark_in_stream`]; what decides BUSY when there is no `gpu_pct`.
+    in_stream: bool,
 }
 
 impl Sample {
+    /// GPU utilization at or above [`BUSY_GPU_PCT`] where the host reads it.
+    /// Where it doesn't (#3331), a sample is busy when it was taken while a
+    /// model stream was open: generation is the work the GPU figure stands
+    /// for, and the stream bookends are the run's own record of it.
     fn busy(&self) -> bool {
-        self.gpu_pct >= BUSY_GPU_PCT
+        match self.gpu_pct {
+            Some(pct) => pct >= BUSY_GPU_PCT,
+            None => self.in_stream,
+        }
+    }
+}
+
+/// (#3331) Mark each sample taken inside one of `streams`. A stream still
+/// open at the end of the run (it died mid-call) is open until `run_to`.
+fn mark_in_stream(samples: &mut [Sample], streams: &[darkmux_trajectory::Stream], run_to: u64) {
+    for s in samples.iter_mut() {
+        s.in_stream = streams.iter().any(|st| s.ts >= st.start_ms && s.ts <= st.end_ms.unwrap_or(run_to));
     }
 }
 
@@ -572,17 +612,23 @@ fn merge_bounds(into: &mut BTreeMap<String, darkmux_flow::payload::Knob>, record
 /// One `machine.telemetry` reading as a run sample; `None` for a reading that
 /// carries no power figure (a sampler without power access).
 fn sample_of(p: &darkmux_flow::payload::MachineTelemetryPayload, ts: u64) -> Option<Sample> {
-    let pw = p.now.power_mw.as_ref()?;
+    // (#3331) A host with no per-rail split writes its total as
+    // `package_power_mw` and leaves `power_mw` null.
+    let pw = p.now.power_mw.as_ref();
+    let total_mw = pw.map(|pw| pw.total).or(p.now.package_power_mw)?;
     Some(Sample {
         ts,
         interval_ms: p.interval_ms,
-        gpu_pct: p.now.gpu_pct.unwrap_or(0),
-        w_gpu: pw.gpu as f64 / 1000.0,
-        w_cpu: pw.cpu as f64 / 1000.0,
-        w_total: pw.total as f64 / 1000.0,
+        gpu_pct: p.now.gpu_pct,
+        w_gpu: pw.map(|pw| pw.gpu as f64 / 1000.0),
+        w_cpu: pw.map(|pw| pw.cpu as f64 / 1000.0),
+        w_total: total_mw as f64 / 1000.0,
         thermal_state: p.now.thermal.as_ref().map(|t| t.state.clone()),
-        cpu_speed_limit_pct: p.now.thermal.as_ref().map_or(100, |t| t.cpu_speed_limit_pct),
+        cpu_speed_limit_pct: p.now.thermal.as_ref().map(|t| t.cpu_speed_limit_pct),
         mem_pct: p.now.mem_pct.unwrap_or(0),
+        board_temp_c_max: p.now.sensors.as_ref().and_then(|b| b.temps_c.values().copied().reduce(f64::max)),
+        fan_rpm: p.now.sensors.as_ref().and_then(|b| b.fan_rpm),
+        in_stream: false,
     })
 }
 
@@ -799,7 +845,7 @@ pub fn compute_from_dir(run_dir: &Path, flows_dir: &Path) -> Result<RunStats> {
 pub(crate) fn derive_stats(
     run: String,
     fold: &darkmux_trajectory::TrajectoryFold,
-    flows: FlowFacts,
+    mut flows: FlowFacts,
     verify: Option<String>,
     ok: Option<bool>,
 ) -> RunStats {
@@ -821,6 +867,7 @@ pub(crate) fn derive_stats(
         .map(|v| v.to_string());
     let checkpoint = checkpoint_gate(fold, bounds_policy.clone());
     let verdict_matches_ratio = checkpoint.degenerate_turns == checkpoint.degenerate_turns_by_ratio;
+    mark_in_stream(&mut flows.samples, &fold.streams, run_to);
     let host = HostFigures::of(&flows, run_from, run_to, wall_ms);
     let mut tool_calls: BTreeMap<String, usize> = BTreeMap::new();
     for t in &fold.tools {
@@ -889,6 +936,10 @@ pub(crate) fn derive_stats(
         cpu_w_busy: host.cpu_w_busy,
         pkg_w_busy: host.pkg_w.map(|v| round(v, 1)),
         gpu_duty_pct: host.duty,
+        busy_basis: host.busy_basis,
+        host_unmeasured: host_unmeasured(&flows.samples, &host),
+        board_temp_c_max_busy: host.board_temp_c_max_busy,
+        fan_rpm_max_busy: host.fan_rpm_max_busy,
         samples_busy: host.samples_busy,
         samples_idle: flows.samples.len() - host.samples_busy,
         busy_ms: host.busy_ms,
@@ -1019,8 +1070,61 @@ fn checkpoint_gate(fold: &darkmux_trajectory::TrajectoryFold, bounds_policy: Opt
     }
 }
 
+/// (#3331) What decided which telemetry samples were BUSY.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BusyBasis {
+    /// GPU utilization at or above [`BUSY_GPU_PCT`] (macOS).
+    GpuUtilization,
+    /// No sample read GPU utilization (Omarchy): busy samples are the ones
+    /// taken while one of the run's model streams was open.
+    ModelStreams,
+    /// Some samples read GPU utilization and some did not; each was judged
+    /// by the rule its own reading allows.
+    Mixed,
+}
+
+/// (#3331) The host figures that are `None` although samples exist, and
+/// why. Empty without samples: `checks.have_telemetry_samples` says that.
+fn host_unmeasured(samples: &[Sample], host: &HostFigures) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    if samples.is_empty() {
+        return out;
+    }
+    let none_read = |what: &str| format!("no telemetry sample in the run window reported {what}");
+    let with_gpu = samples.iter().filter(|s| s.gpu_pct.is_some()).count();
+    if with_gpu == 0 {
+        out.insert("gpu_duty_pct".to_string(), none_read("GPU utilization"));
+    } else if with_gpu < samples.len() {
+        out.insert("gpu_duty_pct".to_string(), "some telemetry samples in the run window reported no GPU utilization".to_string());
+    }
+    let unread = [
+        ("gpu_w_busy", host.gpu_w_busy.is_none() && samples.iter().all(|s| s.w_gpu.is_none()), "a GPU power rail"),
+        ("cpu_w_busy", host.cpu_w_busy.is_none() && samples.iter().all(|s| s.w_cpu.is_none()), "a CPU power rail"),
+        ("thermal_states_busy", samples.iter().all(|s| s.thermal_state.is_none()), "a thermal pressure state"),
+        ("cpu_speed_limit_min", samples.iter().all(|s| s.cpu_speed_limit_pct.is_none()), "a CPU speed limit"),
+        ("board_temp_c_max_busy", samples.iter().all(|s| s.board_temp_c_max.is_none()), "board temperatures"),
+    ];
+    for (field, _, what) in unread.into_iter().filter(|(_, unread, _)| *unread) {
+        out.insert(field.to_string(), none_read(what));
+    }
+    // Every sample carries package power (a reading without it is not a
+    // sample), so the package figures are absent only when none was busy.
+    // Busy time and the energy built on it are also withheld when the
+    // samples don't cover the run; `unreconciled` says that one.
+    if host.samples_busy == 0 {
+        for field in ["pkg_w_busy", "pkg_j_busy", "pkg_j_per_1k_tokens"] {
+            out.insert(field.to_string(), "no telemetry sample in the run window was busy".to_string());
+        }
+    }
+    out
+}
+
 /// What the host telemetry inside the run's window says.
 struct HostFigures {
+    busy_basis: Option<BusyBasis>,
+    board_temp_c_max_busy: Option<f64>,
+    fan_rpm_max_busy: Option<u32>,
     samples_busy: usize,
     pkg_w: Option<f64>,
     gpu_w_busy: Option<f64>,
@@ -1052,16 +1156,28 @@ impl HostFigures {
         for st in busy.iter().filter_map(|s| s.thermal_state.as_ref()) {
             *thermal_states_busy.entry(st.clone()).or_insert(0) += 1;
         }
+        let with_gpu = flows.samples.iter().filter(|s| s.gpu_pct.is_some()).count();
+        let busy_basis = match (with_gpu, flows.samples.len()) {
+            (_, 0) => None,
+            (g, n) if g == n => Some(BusyBasis::GpuUtilization),
+            (0, _) => Some(BusyBasis::ModelStreams),
+            _ => Some(BusyBasis::Mixed),
+        };
         Self {
+            busy_basis,
+            board_temp_c_max_busy: busy.iter().filter_map(|s| s.board_temp_c_max).reduce(f64::max),
+            fan_rpm_max_busy: busy.iter().filter_map(|s| s.fan_rpm).max(),
             samples_busy: busy.len(),
             pkg_w: mean(busy.iter().map(|s| s.w_total)),
-            gpu_w_busy: mean(busy.iter().map(|s| s.w_gpu)).map(|v| round(v, 1)),
-            cpu_w_busy: mean(busy.iter().map(|s| s.w_cpu)).map(|v| round(v, 1)),
-            duty,
+            gpu_w_busy: mean(busy.iter().filter_map(|s| s.w_gpu)).map(|v| round(v, 1)),
+            cpu_w_busy: mean(busy.iter().filter_map(|s| s.w_cpu)).map(|v| round(v, 1)),
+            // A duty from stream bookends is not a GPU figure, so it is not
+            // reported as one; `busy_ms` still carries it.
+            duty: duty.filter(|_| busy_basis == Some(BusyBasis::GpuUtilization)),
             busy_ms,
             thermal_states_busy,
-            cpu_speed_limit_min: busy.iter().map(|s| s.cpu_speed_limit_pct).min(),
-            throttled_samples: busy.iter().filter(|s| s.cpu_speed_limit_pct < 100).count(),
+            cpu_speed_limit_min: busy.iter().filter_map(|s| s.cpu_speed_limit_pct).min(),
+            throttled_samples: busy.iter().filter(|s| s.cpu_speed_limit_pct.is_some_and(|p| p < 100)).count(),
             mem_pct_busy_max: busy.iter().map(|s| s.mem_pct).max(),
             max_gap_ms: cover.max_gap_ms,
             covers_run: cover.covers_run,

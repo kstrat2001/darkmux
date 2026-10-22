@@ -831,14 +831,25 @@ pub fn remove_utility_binding(registry_json: &str) -> Option<String> {
 }
 
 /// The AI headroom `init` sizes the utility window from: doctor's figure,
-/// or a test's pinned value.
+/// or a test's pinned value (in process, or the [`TEST_HEADROOM_HOOK`] a test
+/// driving the binary sets).
 fn ai_headroom_bytes() -> Option<u64> {
     #[cfg(test)]
     if let Some(v) = *AI_HEADROOM_OVERRIDE.lock().unwrap() {
         return v;
     }
+    if let Some(v) = std::env::var(TEST_HEADROOM_HOOK).ok().and_then(|v| v.trim().parse().ok()) {
+        return Some(v);
+    }
     darkmux_doctor::ai_headroom_bytes()
 }
+
+/// The TEST hook `DARKMUX_TEST_AI_HEADROOM_BYTES`: the AI headroom, in bytes,
+/// a test driving the binary pins, so `init`'s utility window reads the same
+/// on any runner. A `PATH` stub for `vm_stat` pinned it on macOS only; Linux
+/// reads `/proc/meminfo`, so an 8-12 GB CI runner read its own memory. Not an
+/// operator knob, like the other `DARKMUX_TEST_*` hooks.
+pub const TEST_HEADROOM_HOOK: &str = "DARKMUX_TEST_AI_HEADROOM_BYTES";
 
 #[cfg(test)]
 static AI_HEADROOM_OVERRIDE: std::sync::Mutex<Option<Option<u64>>> = std::sync::Mutex::new(None);

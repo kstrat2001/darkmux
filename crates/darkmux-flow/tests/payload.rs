@@ -406,3 +406,36 @@ fn a_heartbeat_carries_prompt_progress_only_when_the_engine_reported_it() {
     let written = serde_json::to_value(&older).unwrap();
     assert!(written.get("prompt_processed").is_none() && written.get("prompt_total").is_none(), "{written}");
 }
+
+/// (#2799 follow-up) `DetectorKind::as_str` is the wire word every reader
+/// that does not deserialize (the cautions index, the brief filter) compares
+/// against; it must equal serde's spelling for every kind. Also the only
+/// caller that runs every arm, which keeps the CRAP ratchet honest.
+#[test]
+fn detector_kind_as_str_is_serdes_wire_word_for_every_kind() {
+    use darkmux_flow::payload::DetectorKind as K;
+    let all = [
+        K::Cycle,
+        K::ReasoningLoop,
+        K::ToolFailure,
+        K::IntraTurnStall,
+        K::EmptyToolCalls,
+        K::PerTurnCap,
+        K::DiscardedToolCall,
+        K::MalformedToolNames,
+        K::Escalation,
+        K::Repetition,
+        K::CompactionSkipped,
+        K::Unknown,
+    ];
+    for kind in all {
+        let wire = serde_json::to_value(kind).unwrap();
+        assert_eq!(wire.as_str(), Some(kind.as_str()), "{kind:?}");
+    }
+    // Every variant is listed: a new one fails to compile here until added.
+    let _exhaustive = |k: K| match k {
+        K::Cycle | K::ReasoningLoop | K::ToolFailure | K::IntraTurnStall | K::EmptyToolCalls | K::PerTurnCap
+        | K::DiscardedToolCall | K::MalformedToolNames | K::Escalation | K::Repetition | K::CompactionSkipped
+        | K::Unknown => (),
+    };
+}

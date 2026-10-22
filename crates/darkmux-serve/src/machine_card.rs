@@ -824,6 +824,8 @@ pub(crate) mod tests {
             thermal: thermal.map(|s| ThermalNow { state: s.into(), cpu_speed_limit_pct: 90 }),
             battery,
             power_mw: None,
+            package_power_mw: None,
+            sensors: None,
         }
     }
 

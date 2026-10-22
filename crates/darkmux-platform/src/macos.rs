@@ -64,6 +64,17 @@ impl Platform for MacPlatform {
         Vec::new()
     }
 
+    /// IOReport reads a Mac's power, by rail, in darkmux-crew's probe.
+    fn package_power_mw(&self) -> Option<f64> {
+        None
+    }
+
+    /// A Mac's thermal reading is its pressure state (darkmux-crew's
+    /// `thermal` probe); its board sensors are not read.
+    fn board_sensors(&self) -> Option<crate::BoardSensors> {
+        None
+    }
+
     /// `vm_stat`'s free plus inactive pages, times the page size (`pagesize`,
     /// 16K assumed when unreadable: Apple Silicon's). The reader doctor ran
     /// before #3281, moved.

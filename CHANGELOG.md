@@ -14,6 +14,17 @@ darkmux release.
 
 ## [Unreleased]
 
+### Added
+
+- **Omarchy records power and board temperatures (#3331).** On Asahi, the host probe reads the
+  SMC's `Heatpipe Power` sensor as the SoC package total, and the board's labeled temperatures
+  and fan from hwmon. A lab run on Omarchy now reports package watts, energy while busy and
+  J per 1k tokens. Flow schema 2.5.0 adds `machine.telemetry`'s `now.package_power_mw` (a total
+  with no per-rail split; `power_mw` stays `null`, since unread rails are never written as `0`)
+  and `now.sensors`. Both are additive and written only when read, so macOS records are unchanged.
+  Asahi exposes no GPU utilization, no CPU/GPU/ANE rails and no thermal pressure state; those
+  stay `null`, and the thermal governor stays inert on Omarchy.
+
 ### Changed
 
 - **FLOW 2.4.0 (additive).** A compaction the runtime triggered and then refused
@@ -24,6 +35,13 @@ darkmux release.
   context occupancy staying high had no reason beside it. Like `repetition`, it is
   about darkmux's own machinery, so it is never injected into a dispatch's brief
   as a caution. An older reader reads the new kind as unknown (#2799).
+
+- **`darkmux run stats --json` (run stats schema 2.2.0).** New `busy_basis`
+  (`gpu_utilization`, `model_streams` or `mixed`): with no GPU utilization reading, a sample is
+  busy when it was taken inside one of the run's model streams, and `gpu_duty_pct` stays `null`.
+  New `host_unmeasured` (each host figure that is `null` although telemetry landed, with why),
+  `board_temp_c_max_busy` and `fan_rpm_max_busy`. Migration: `cpu_speed_limit_min` is now `null`,
+  not `100`, when no sample read a CPU speed limit.
 
 ## [5.3.0] - 2026-10-18
 

@@ -1371,7 +1371,8 @@ mod tests {
                     state: "nominal".into(),
                     cpu_speed_limit_pct: 100,
                 }),
-                power: Some(PowerSample { cpu_mw: 1200.0, gpu_mw: 30.0, ane_mw: 0.0 }),
+                power: Some(PowerSample::rails(1200.0, 30.0, 0.0)),
+                sensors: None,
                 // (#2705) A laptop on battery, so the `now` block's charge
                 // half is exercised by this full-shape snapshot test too.
                 battery: Some(BatterySample {
@@ -2003,7 +2004,7 @@ mod tests {
         let (prev, _) = thermal_edge(None, &thermal_sample("nominal"), 0);
         let sample = HostSampleFull {
             thermal: Some(ThermalSample { state: "serious".into(), cpu_speed_limit_pct: 62 }),
-            power: Some(PowerSample { cpu_mw: 1000.0, gpu_mw: 200.0, ane_mw: 30.0 }),
+            power: Some(PowerSample::rails(1000.0, 200.0, 30.0)),
             ..Default::default()
         };
         let (_next, rec) = thermal_edge(prev.as_deref(), &sample, 5000);
