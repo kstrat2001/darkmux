@@ -74,39 +74,7 @@ pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
         }),
         LabCmd::Fixture { sub } => cmd_lab_fixture(sub),
         LabCmd::Doctor => cmd_lab_doctor(),
-        LabCmd::Submit {
-            sub,
-            runs,
-            dry_run,
-            out,
-            site,
-            replace,
-            commit,
-            engine,
-            engine_backend,
-            engine_version,
-            quant,
-            weights_dir,
-            darkmux_version,
-        } => match sub {
-            Some(sub) => submit::cmd_submit_token(sub),
-            None => submit::cmd_submit(submit::SubmitArgs {
-                runs,
-                dry_run,
-                out,
-                site,
-                replace,
-                stated: lab::submit::Stated {
-                    engine,
-                    engine_backend,
-                    engine_version,
-                    quant,
-                    weights_dir: weights_dir.map(Into::into),
-                    darkmux_version,
-                    commit,
-                },
-            }),
-        },
+        cmd @ LabCmd::Submit { .. } => submit::cmd_lab_submit(cmd),
     }
 }
 

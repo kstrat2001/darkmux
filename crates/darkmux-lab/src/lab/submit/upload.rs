@@ -64,33 +64,37 @@ pub fn store_token(token: &str) -> Result<String> {
         bail!("that is not an upload token (they start with {TOKEN_PREFIX}); make one on the site's account page");
     }
     match darkmux_platform::current().secret_store() {
-        SecretStore::Keychain => {
-            // `security -i` reads the command from stdin, so the token is never on an argv.
-            let mut child = Command::new("security")
-                .arg("-i")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .spawn()
-                .context("running `security` to store the token in the login keychain")?;
-            let line = format!("add-generic-password -U -a \"{}\" -s {TOKEN_ITEM} -w \"{token}\"\n", user());
-            child.stdin.take().expect("piped").write_all(line.as_bytes())?;
-            let out = child.wait_with_output()?;
-            // `security -i` can exit 0 when its command failed: the read back is the check.
-            if !out.status.success() || read_token().as_deref() != Some(token) {
-                bail!("the login keychain did not keep the token: {}", String::from_utf8_lossy(&out.stderr).trim());
-            }
-            Ok("the login keychain".to_string())
-        }
-        SecretStore::PrivateFile => {
-            let path = token_file();
-            if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            write_private(&path, format!("{token}\n").as_bytes())?;
-            Ok(path.display().to_string())
-        }
+        SecretStore::Keychain => store_in_keychain(token).map(|()| "the login keychain".to_string()),
+        SecretStore::PrivateFile => store_in_file(token),
     }
+}
+
+fn store_in_keychain(token: &str) -> Result<()> {
+    // `security -i` reads the command from stdin, so the token is never on an argv.
+    let mut child = Command::new("security")
+        .arg("-i")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("running `security` to store the token in the login keychain")?;
+    let line = format!("add-generic-password -U -a \"{}\" -s {TOKEN_ITEM} -w \"{token}\"\n", user());
+    child.stdin.take().expect("piped").write_all(line.as_bytes())?;
+    let out = child.wait_with_output()?;
+    // `security -i` can exit 0 when its command failed: the read back is the check.
+    if !out.status.success() || read_token().as_deref() != Some(token) {
+        bail!("the login keychain did not keep the token: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
+}
+
+fn store_in_file(token: &str) -> Result<String> {
+    let path = token_file();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    write_private(&path, format!("{token}\n").as_bytes())?;
+    Ok(path.display().to_string())
 }
 
 pub fn forget_token() -> Result<()> {

@@ -452,62 +452,23 @@ pub fn assemble(repo: &str, commit_sha: &str, fixture_manifest: &Value, runs: Ve
 /// value, a chip name, a repeated run). Empty means it takes it. The site
 /// stays the authority; this saves an upload it would refuse.
 pub fn site_refusals(bundle: &Value) -> Vec<String> {
-    fn re(p: &str) -> regex::Regex {
-        regex::Regex::new(p).expect("valid pattern")
-    }
-    let semverish = re(r"^[0-9A-Za-z.+-]{1,40}$");
-    let hex64 = re(r"^[0-9a-f]{64}$");
-    let hex40 = re(r"^[0-9a-f]{40}$");
-    let commit = re(r"^[0-9a-f]{7,40}$");
-    let repo = re(r"^[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}$");
-    let apple = re(r"^Apple M\d{1,2}(?: (?:Pro|Max|Ultra))?$");
-    let os = re(r"^(?:macOS \d[0-9.]*|Omarchy\b[^\n]*)$");
-    let mut errs = Vec::new();
-    // `text()`: a non-blank string within `max` UTF-16 units, in `form` when given; null when `nullable`.
-    let mut text = |v: &Value, at: &str, max: usize, form: Option<&regex::Regex>, nullable: bool| match v {
-        Value::Null if nullable => {}
-        Value::String(s) if !s.trim().is_empty() => {
-            if s.encode_utf16().count() > max {
-                errs.push(format!("{at}: longer than {max}"));
-            } else if form.is_some_and(|f| !f.is_match(s)) {
-                errs.push(format!("{at}: not in the form the site takes ({s})"));
-            }
-        }
-        _ => errs.push(format!("{at}: expected a string{}", if nullable { " or null" } else { "" })),
-    };
+    let forms = Forms::new();
+    let mut r = Refusals::default();
     let f = &bundle["fixture"];
-    text(&f["repo"], "fixture.repo", 200, Some(&repo), false);
-    text(&f["commitSha"], "fixture.commitSha", 200, Some(&hex40), false);
-    text(&f["name"], "fixture.name", 60, None, false);
-    text(&f["version"], "fixture.version", 200, Some(&semverish), false);
-    let mut keys = BTreeSet::new();
-    let mut numbers = Vec::new();
+    r.text(&f["repo"], "fixture.repo", 200, Some(&forms.repo), false);
+    r.text(&f["commitSha"], "fixture.commitSha", 200, Some(&forms.hex40), false);
+    r.text(&f["name"], "fixture.name", 60, None, false);
+    r.text(&f["version"], "fixture.version", 200, Some(&forms.semverish), false);
     let runs = bundle["runs"].as_array().cloned().unwrap_or_default();
-    for (i, r) in runs.iter().enumerate() {
-        let at = |k: &str| format!("runs[{i}].{k}");
-        if !keys.insert(r["key"].as_str().unwrap_or_default().to_string()) {
-            numbers.push(format!("runs[{i}]: the same run twice"));
+    let mut keys = BTreeSet::new();
+    for (i, run) in runs.iter().enumerate() {
+        if !keys.insert(run["key"].as_str().unwrap_or_default().to_string()) {
+            r.numbers.push(format!("runs[{i}]: the same run twice"));
         }
-        text(&r["darkmuxVersion"], &at("darkmuxVersion"), 200, Some(&semverish), true);
-        text(&r["darkmuxCommit"], &at("darkmuxCommit"), 200, Some(&commit), true);
-        let s = &r["stack"];
-        let st = |k: &str| format!("runs[{i}].stack.{k}");
-        text(&s["chip"], &st("chip"), 200, Some(&apple), false);
-        text(&s["accelerator"], &st("accelerator"), 32, None, true);
-        text(&s["os"], &st("os"), 80, Some(&os), true);
-        for k in ["engine", "engineBackend", "engineVersion"] {
-            text(&s[k], &st(k), 80, None, true);
-        }
-        text(&s["model"], &st("model"), 200, None, true);
-        text(&s["weightsHash"], &st("weightsHash"), 200, Some(&hex64), true);
-        text(&s["quant"], &st("quant"), 40, None, true);
-        for (k, max) in [("activeSeconds", MAX_SECONDS), ("tokensPerSecond", 100_000.0)] {
-            if r[k].as_f64().is_some_and(|n| !(0.0..=max).contains(&n)) {
-                numbers.push(format!("{}: outside 0 to {max}", at(k)));
-            }
-        }
+        r.run(i, run, &forms);
     }
-    errs.extend(numbers);
+    let mut errs = r.errs;
+    errs.extend(r.numbers);
     if runs.is_empty() || runs.len() > 500 {
         errs.push("runs: 1 to 500 runs a bundle".to_string());
     }
@@ -515,6 +476,78 @@ pub fn site_refusals(bundle: &Value) -> Vec<String> {
         errs.push("fixture.manifest: larger than 64 KB".to_string());
     }
     errs
+}
+
+/// The forms `parseBundle` holds a bundle's strings to.
+struct Forms {
+    semverish: regex::Regex,
+    hex64: regex::Regex,
+    hex40: regex::Regex,
+    commit: regex::Regex,
+    repo: regex::Regex,
+    apple: regex::Regex,
+    os: regex::Regex,
+}
+
+impl Forms {
+    fn new() -> Self {
+        let re = |p: &str| regex::Regex::new(p).expect("valid pattern");
+        Forms {
+            semverish: re(r"^[0-9A-Za-z.+-]{1,40}$"),
+            hex64: re(r"^[0-9a-f]{64}$"),
+            hex40: re(r"^[0-9a-f]{40}$"),
+            commit: re(r"^[0-9a-f]{7,40}$"),
+            repo: re(r"^[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}$"),
+            apple: re(r"^Apple M\d{1,2}(?: (?:Pro|Max|Ultra))?$"),
+            os: re(r"^(?:macOS \d[0-9.]*|Omarchy\b[^\n]*)$"),
+        }
+    }
+}
+
+/// What `site_refusals` has found: the strings' refusals, then the numbers'.
+#[derive(Default)]
+struct Refusals {
+    errs: Vec<String>,
+    numbers: Vec<String>,
+}
+
+impl Refusals {
+    /// A non-blank string within `max` UTF-16 units, in `form` when given; null when `nullable`.
+    fn text(&mut self, v: &Value, at: &str, max: usize, form: Option<&regex::Regex>, nullable: bool) {
+        match v {
+            Value::Null if nullable => {}
+            Value::String(s) if !s.trim().is_empty() => {
+                if s.encode_utf16().count() > max {
+                    self.errs.push(format!("{at}: longer than {max}"));
+                } else if form.is_some_and(|f| !f.is_match(s)) {
+                    self.errs.push(format!("{at}: not in the form the site takes ({s})"));
+                }
+            }
+            _ => self.errs.push(format!("{at}: expected a string{}", if nullable { " or null" } else { "" })),
+        }
+    }
+
+    fn run(&mut self, i: usize, r: &Value, forms: &Forms) {
+        let at = |k: &str| format!("runs[{i}].{k}");
+        self.text(&r["darkmuxVersion"], &at("darkmuxVersion"), 200, Some(&forms.semverish), true);
+        self.text(&r["darkmuxCommit"], &at("darkmuxCommit"), 200, Some(&forms.commit), true);
+        let s = &r["stack"];
+        let st = |k: &str| format!("runs[{i}].stack.{k}");
+        self.text(&s["chip"], &st("chip"), 200, Some(&forms.apple), false);
+        self.text(&s["accelerator"], &st("accelerator"), 32, None, true);
+        self.text(&s["os"], &st("os"), 80, Some(&forms.os), true);
+        for k in ["engine", "engineBackend", "engineVersion"] {
+            self.text(&s[k], &st(k), 80, None, true);
+        }
+        self.text(&s["model"], &st("model"), 200, None, true);
+        self.text(&s["weightsHash"], &st("weightsHash"), 200, Some(&forms.hex64), true);
+        self.text(&s["quant"], &st("quant"), 40, None, true);
+        for (k, max) in [("activeSeconds", MAX_SECONDS), ("tokensPerSecond", 100_000.0)] {
+            if r[k].as_f64().is_some_and(|n| !(0.0..=max).contains(&n)) {
+                self.numbers.push(format!("{}: outside 0 to {max}", at(k)));
+            }
+        }
+    }
 }
 
 /// What the operator states by hand, for what the machine cannot say.
@@ -541,213 +574,23 @@ pub struct Built {
 
 /// Reads the runs and the machine and builds one bundle. Reads only.
 pub fn gather(runs: &[String], stated: &Stated, progress: &mut dyn FnMut(&str)) -> Result<Built> {
-    if runs.is_empty() {
-        bail!("name at least one lab run");
-    }
-    if let Some(twice) = runs.iter().enumerate().find_map(|(i, r)| runs[..i].contains(r).then_some(r)) {
-        bail!("{twice} is named twice");
-    }
-    let platform = darkmux_platform::current();
-    let chip = platform.cpu_brand().unwrap_or_default();
-    if !chip.starts_with("Apple M") {
-        bail!(
-            "darkmux evals take Apple Silicon results only (macOS, or Omarchy Linux); this machine reports {}",
-            if chip.is_empty() { "no Apple chip" } else { chip.as_str() }
-        );
-    }
-    let ram_gb = platform.ram_as_sold_gb();
-    let os_release = platform.os_release();
-    let registry = darkmux_profiles::profiles::load_registry_quiet(None).ok().map(|l| l.registry);
-
-    // Read and check every run first, so a refusal names them all.
-    let mut inputs = Vec::new();
-    let mut refused = Vec::new();
-    for run in runs {
-        let dir = crate::lab::inspect::resolve_run_dir(run);
-        let run_id = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| run.clone());
-        let manifest: Value = match std::fs::read_to_string(dir.join(crate::lab::manifest::MANIFEST_FILE)) {
-            Ok(text) => serde_json::from_str(&text).with_context(|| format!("{run_id}: reading manifest.json"))?,
-            Err(_) => {
-                refused.push(format!("{run_id}: no manifest.json, so it ended before the eval ran"));
-                continue;
-            }
-        };
-        let stats = match crate::lab::stats::compute_from_dir(&dir, &darkmux_types::config_access::flows_dir()) {
-            Ok(s) => serde_json::to_value(s)?,
-            Err(e) => {
-                refused.push(format!("{run_id}: its numbers cannot be read ({e:#})"));
-                continue;
-            }
-        };
-        match refusal_for(&manifest, &stats) {
-            Some(why) => refused.push(format!("{run_id}: {why}")),
-            None => inputs.push((run_id, manifest, stats)),
-        }
-    }
-    if !refused.is_empty() {
-        bail!("not submitted:\n  {}", refused.join("\n  "));
-    }
-
-    // One fixture checkout, one baseline.
-    let sources: BTreeSet<Option<String>> = inputs.iter().map(|(_, m, _)| fixture_field(m, "source_path")).collect();
-    let baselines: BTreeSet<Option<String>> = inputs.iter().map(|(_, m, _)| fixture_field(m, "baseline_hash")).collect();
-    let source = match sources.iter().next() {
-        Some(Some(s)) if sources.len() == 1 => PathBuf::from(s),
-        _ => bail!("submit runs of one fixture checkout at a time (each run's manifest names it)"),
-    };
-    if baselines.len() != 1 {
-        bail!("these runs started from different fixture contents; submit them separately");
-    }
-    let models: BTreeSet<Option<String>> =
-        inputs.iter().map(|(_, _, s)| model_id_from(s.get("model").and_then(Value::as_str))).collect();
-    let by_hand = stated.engine.is_some() || stated.quant.is_some() || stated.weights_dir.is_some() || stated.engine_version.is_some();
-    if by_hand && models.len() > 1 {
-        bail!(
-            "--engine, --quant and --weights-dir describe one model; these runs used {}",
-            models.iter().flatten().cloned().collect::<Vec<_>>().join(", ")
-        );
-    }
-
-    let installed = darkmux_types::build_info();
-    let installed_at = std::env::current_exe().ok().and_then(|p| std::fs::canonicalize(p).ok()).and_then(|p| mtime_ms(&p));
-    let lmstudio = darkmux_profiles::engine::lmstudio();
-    let mut provenance_cache: BTreeMap<String, Option<darkmux_profiles::engine::ModelProvenance>> = BTreeMap::new();
-    let mut weights_cache: BTreeMap<PathBuf, (Option<String>, Option<u64>)> = BTreeMap::new();
-
+    refuse_repeats(runs)?;
+    let machine = Machine::here()?;
+    let inputs = read_runs(runs)?;
+    let source = one_fixture(&inputs, stated)?;
+    let mut caches = Caches::default();
     let mut bundled = Vec::new();
     let mut notes = Vec::new();
     let mut starts = Vec::new();
-    for (run_id, manifest, stats) in &inputs {
-        let started = stats.get("started_at_unix_ms").and_then(Value::as_u64);
-        starts.extend(started);
-        let mut why = Vec::new();
-        let model_id = model_id_from(stats.get("model").and_then(Value::as_str)).unwrap_or_default();
-        let profile_model = registry.as_ref().and_then(|r| {
-            let profile = r.profiles.get(manifest.get("profile").and_then(Value::as_str)?)?;
-            profile.models.iter().find(|m| m.id == model_id || m.identifier.as_deref() == Some(model_id.as_str())).cloned()
-        });
-        // A model the profile serves from an unmanaged endpoint is not LM Studio's (contract 1).
-        let managed = profile_model.as_ref().is_none_or(|m| m.is_managed());
-        let provenance = if stated.engine.is_none() && managed {
-            provenance_cache
-                .entry(model_id.clone())
-                .or_insert_with(|| lmstudio.provenance(&model_id).ok().flatten())
-                .clone()
-        } else {
-            None
-        };
-        if stated.engine.is_none() && provenance.is_none() {
-            why.push("LM Studio does not list this model (pass --engine)".to_string());
-        }
-
-        let weights_path = stated.weights_dir.clone().or_else(|| provenance.as_ref().and_then(|p| p.weights_path.clone()));
-        let mut weights_changed = None;
-        let weights_hash = match &weights_path {
-            Some(path) => {
-                if !weights_cache.contains_key(path) {
-                    let files = model_files(path);
-                    if files.is_empty() {
-                        bail!("{run_id}: no weights found for {model_id}. Pass --weights-dir <the model's folder>");
-                    }
-                    progress(&format!("Hashing {} file(s) of {model_id} (a minute for a large model)…", files.len()));
-                    let mut hashed = Vec::new();
-                    let mut newest = Some(0u64);
-                    for f in &files {
-                        let rel = rel_path(path, f);
-                        hashed.push((rel, sha256::file_hex(f).with_context(|| format!("hashing {}", f.display()))?));
-                        newest = newest.zip(mtime_ms(f)).map(|(a, b)| a.max(b));
-                    }
-                    weights_cache.insert(path.clone(), (weights_hash_of(&hashed), newest));
-                }
-                let (hash, changed) = weights_cache[path].clone();
-                weights_changed = changed;
-                let held = as_of_run(hash, changed, started);
-                if held.is_none() {
-                    why.push("the weights changed after the run".to_string());
-                }
-                held
-            }
-            None => {
-                why.push("weights unknown (pass --weights-dir)".to_string());
-                None
-            }
-        };
-
-        let recorded = manifest.get("darkmux").and_then(|d| serde_json::from_value::<darkmux_types::BuildInfo>(d.clone()).ok());
-        let ran_by = match (&stated.darkmux_version, recorded) {
-            // A stated version says nothing of what built it.
-            (Some(v), _) => RanBy { version: Some(v.clone()), ..Default::default() },
-            (None, Some(b)) => RanBy { version: Some(b.version), commit: b.commit, build: b.build.map(build_word) },
-            (None, None) => match as_of_run(Some(&installed), installed_at, started) {
-                Some(b) => RanBy { version: Some(b.version.clone()), commit: b.commit.clone(), build: b.build.map(build_word) },
-                None => {
-                    why.push("darkmux was updated after the run (pass --darkmux-version)".to_string());
-                    RanBy::default()
-                }
-            },
-        };
-
-        let os = as_of_run(os_release.as_ref().map(|r| r.name.clone()), os_release.as_ref().and_then(|r| r.installed_at_unix_ms), started);
-        if os_release.is_some() && os.is_none() {
-            why.push("the OS may have been updated after the run".to_string());
-        }
-        let engine_version = match &stated.engine {
-            Some(_) => stated.engine_version.clone(),
-            None => {
-                let runtime = provenance.as_ref().and_then(|p| p.runtime.clone());
-                let held = as_of_run(runtime.clone(), provenance.as_ref().and_then(|p| p.runtime_installed_at_ms), started);
-                if let (Some(r), None) = (&runtime, &held) {
-                    why.push(format!("{r} may not be the runtime that ran it"));
-                }
-                held
-            }
-        };
-        let stack = Stack {
-            chip: chip.clone(),
-            ram_gb,
-            accelerator: platform.gpu_api().map(str::to_string),
-            os,
-            engine: stated.engine.clone().or_else(|| provenance.as_ref().map(|_| "LM Studio".to_string())),
-            engine_backend: match &stated.engine {
-                Some(_) => stated.engine_backend.clone(),
-                None => provenance.as_ref().and_then(|p| p.backend.clone()),
-            },
-            engine_version,
-            model: (!model_id.is_empty()).then(|| model_id.clone()),
-            weights_hash,
-            // The quant is the weights': it holds for the run when they do.
-            quant: match &stated.engine {
-                Some(_) => stated.quant.clone(),
-                None => as_of_run(
-                    provenance.as_ref().and_then(|p| p.quant.clone()).filter(|q| !q.trim().is_empty()),
-                    weights_changed,
-                    started,
-                ),
-            },
-            context_length: profile_model.and_then(|m| m.n_ctx).map(u64::from),
-        };
-        bundled.push(bundle_run(run_id, manifest, stats, &ran_by, &stack));
-        let missing = stack.unreported();
-        notes.push(format!(
-            "{run_id}: {}, {model_id}; not reported: {}{}",
-            if passed_from(manifest) { "passed" } else { "failed" },
-            missing.join(", "),
-            if why.is_empty() { String::new() } else { format!(" ({})", why.join("; ")) }
-        ));
+    for input in &inputs {
+        let (run, note) = machine.bundle_one(input, stated, &mut caches, progress)?;
+        starts.extend(input.started());
+        bundled.push(run);
+        notes.push(note);
     }
-
     let (repo, commit_sha, fixture_manifest) = fixture_at(&source, &starts, stated.commit.as_deref())?;
     let bundle = assemble(&repo, &commit_sha, &fixture_manifest, bundled)?;
-
-    let mut paths = Vec::new();
-    paths_in(&bundle, "bundle", &mut paths);
-    if !paths.is_empty() {
-        bail!("the bundle would carry a file path, which is never shared; found at {}", paths.join(", "));
-    }
-    let refused = site_refusals(&bundle);
-    if !refused.is_empty() {
-        bail!("the site would refuse this bundle:\n  {}", refused.join("\n  "));
-    }
+    refuse_unshareable(&bundle)?;
     let f = &bundle["fixture"];
     Ok(Built {
         fixture: format!(
@@ -759,6 +602,325 @@ pub fn gather(runs: &[String], stated: &Stated, progress: &mut dyn FnMut(&str)) 
         bundle,
         notes,
     })
+}
+
+fn refuse_repeats(runs: &[String]) -> Result<()> {
+    if runs.is_empty() {
+        bail!("name at least one lab run");
+    }
+    if let Some(twice) = runs.iter().enumerate().find_map(|(i, r)| runs[..i].contains(r).then_some(r)) {
+        bail!("{twice} is named twice");
+    }
+    Ok(())
+}
+
+/// A file path anywhere in it, or anything the site would refuse.
+fn refuse_unshareable(bundle: &Value) -> Result<()> {
+    let mut paths = Vec::new();
+    paths_in(bundle, "bundle", &mut paths);
+    if !paths.is_empty() {
+        bail!("the bundle would carry a file path, which is never shared; found at {}", paths.join(", "));
+    }
+    let refused = site_refusals(bundle);
+    if !refused.is_empty() {
+        bail!("the site would refuse this bundle:\n  {}", refused.join("\n  "));
+    }
+    Ok(())
+}
+
+/// One run as read: its id, its manifest, its stats.
+struct Input {
+    run_id: String,
+    manifest: Value,
+    stats: Value,
+}
+
+impl Input {
+    fn started(&self) -> Option<u64> {
+        self.stats.get("started_at_unix_ms").and_then(Value::as_u64)
+    }
+
+    fn model_id(&self) -> Option<String> {
+        model_id_from(self.stats.get("model").and_then(Value::as_str))
+    }
+}
+
+/// Reads and checks every run first, so a refusal names them all.
+fn read_runs(runs: &[String]) -> Result<Vec<Input>> {
+    let mut inputs = Vec::new();
+    let mut refused = Vec::new();
+    for run in runs {
+        match read_run(run)? {
+            Ok(input) => inputs.push(input),
+            Err(why) => refused.push(why),
+        }
+    }
+    if !refused.is_empty() {
+        bail!("not submitted:\n  {}", refused.join("\n  "));
+    }
+    Ok(inputs)
+}
+
+/// A run that can be submitted, or why not.
+fn read_run(run: &str) -> Result<std::result::Result<Input, String>> {
+    let dir = crate::lab::inspect::resolve_run_dir(run);
+    let run_id = dir.file_name().map_or_else(|| run.to_string(), |n| n.to_string_lossy().into_owned());
+    let Ok(text) = std::fs::read_to_string(dir.join(crate::lab::manifest::MANIFEST_FILE)) else {
+        return Ok(Err(format!("{run_id}: no manifest.json, so it ended before the eval ran")));
+    };
+    let manifest: Value = serde_json::from_str(&text).with_context(|| format!("{run_id}: reading manifest.json"))?;
+    let stats = match crate::lab::stats::compute_from_dir(&dir, &darkmux_types::config_access::flows_dir()) {
+        Ok(s) => serde_json::to_value(s)?,
+        Err(e) => return Ok(Err(format!("{run_id}: its numbers cannot be read ({e:#})"))),
+    };
+    Ok(match refusal_for(&manifest, &stats) {
+        Some(why) => Err(format!("{run_id}: {why}")),
+        None => Ok(Input { run_id, manifest, stats }),
+    })
+}
+
+/// The one fixture checkout the runs share; refuses runs of several, or a
+/// model stated by hand when they used several.
+fn one_fixture(inputs: &[Input], stated: &Stated) -> Result<PathBuf> {
+    let sources: BTreeSet<Option<String>> = inputs.iter().map(|i| fixture_field(&i.manifest, "source_path")).collect();
+    let baselines: BTreeSet<Option<String>> = inputs.iter().map(|i| fixture_field(&i.manifest, "baseline_hash")).collect();
+    let source = match sources.iter().next() {
+        Some(Some(s)) if sources.len() == 1 => PathBuf::from(s),
+        _ => bail!("submit runs of one fixture checkout at a time (each run's manifest names it)"),
+    };
+    if baselines.len() != 1 {
+        bail!("these runs started from different fixture contents; submit them separately");
+    }
+    let models: BTreeSet<Option<String>> = inputs.iter().map(Input::model_id).collect();
+    if stated.describes_a_model() && models.len() > 1 {
+        bail!(
+            "--engine, --quant and --weights-dir describe one model; these runs used {}",
+            models.iter().flatten().cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
+    Ok(source)
+}
+
+impl Stated {
+    /// Whether it states anything that holds for one model only.
+    fn describes_a_model(&self) -> bool {
+        [self.engine.is_some(), self.quant.is_some(), self.weights_dir.is_some(), self.engine_version.is_some()].contains(&true)
+    }
+}
+
+/// What the machine says of itself, read once.
+struct Machine {
+    chip: String,
+    ram_gb: Option<u64>,
+    accelerator: Option<String>,
+    os_release: Option<darkmux_platform::OsRelease>,
+    registry: Option<darkmux_types::ProfileRegistry>,
+    installed: darkmux_types::BuildInfo,
+    installed_at: Option<u64>,
+    lmstudio: Box<dyn darkmux_profiles::engine::Engine>,
+}
+
+impl Machine {
+    fn here() -> Result<Self> {
+        let platform = darkmux_platform::current();
+        let chip = platform.cpu_brand().unwrap_or_default();
+        if !chip.starts_with("Apple M") {
+            bail!(
+                "darkmux evals take Apple Silicon results only (macOS, or Omarchy Linux); this machine reports {}",
+                if chip.is_empty() { "no Apple chip" } else { chip.as_str() }
+            );
+        }
+        Ok(Machine {
+            chip,
+            ram_gb: platform.ram_as_sold_gb(),
+            accelerator: platform.gpu_api().map(str::to_string),
+            os_release: platform.os_release(),
+            registry: darkmux_profiles::profiles::load_registry_quiet(None).ok().map(|l| l.registry),
+            installed: darkmux_types::build_info(),
+            installed_at: std::env::current_exe().ok().and_then(|p| std::fs::canonicalize(p).ok()).and_then(|p| mtime_ms(&p)),
+            lmstudio: darkmux_profiles::engine::lmstudio(),
+        })
+    }
+
+    /// One run's bundle entry, and its note: its verdict, its model, what it does not report.
+    fn bundle_one(&self, input: &Input, stated: &Stated, caches: &mut Caches, progress: &mut dyn FnMut(&str)) -> Result<(Value, String)> {
+        let started = input.started();
+        let mut why = Vec::new();
+        let model_id = input.model_id().unwrap_or_default();
+        let profile_model = self.profile_model(&input.manifest, &model_id);
+        // A model the profile serves from an unmanaged endpoint is not LM Studio's (contract 1).
+        let managed = profile_model.as_ref().is_none_or(|m| m.is_managed());
+        let provenance = match stated.engine {
+            None if managed => caches.provenance(self.lmstudio.as_ref(), &model_id),
+            _ => None,
+        };
+        if stated.engine.is_none() && provenance.is_none() {
+            why.push("LM Studio does not list this model (pass --engine)".to_string());
+        }
+        let weights_path = stated.weights_dir.clone().or_else(|| provenance.as_ref().and_then(|p| p.weights_path.clone()));
+        let (weights_hash, weights_changed) = match &weights_path {
+            Some(path) => caches.weights(path, &input.run_id, &model_id, started, &mut why, progress)?,
+            None => {
+                why.push("weights unknown (pass --weights-dir)".to_string());
+                (None, None)
+            }
+        };
+        let ran_by = self.ran_by(&input.manifest, stated, started, &mut why);
+        let os = self.os_as_of(started, &mut why);
+        let engine = engine_of(stated, provenance.as_ref(), weights_changed, started, &mut why);
+        let stack = Stack {
+            chip: self.chip.clone(),
+            ram_gb: self.ram_gb,
+            accelerator: self.accelerator.clone(),
+            os,
+            engine: engine.engine,
+            engine_backend: engine.backend,
+            engine_version: engine.version,
+            model: (!model_id.is_empty()).then(|| model_id.clone()),
+            weights_hash,
+            quant: engine.quant,
+            context_length: profile_model.and_then(|m| m.n_ctx).map(u64::from),
+        };
+        let run = bundle_run(&input.run_id, &input.manifest, &input.stats, &ran_by, &stack);
+        Ok((run, note_for(input, &model_id, &stack, &why)))
+    }
+
+    /// The model as the run's profile declares it, when it does.
+    fn profile_model(&self, manifest: &Value, model_id: &str) -> Option<darkmux_types::ProfileModel> {
+        let profile = self.registry.as_ref()?.profiles.get(manifest.get("profile").and_then(Value::as_str)?)?;
+        profile.models.iter().find(|m| m.id == model_id || m.identifier.as_deref() == Some(model_id)).cloned()
+    }
+
+    /// The darkmux that ran it: stated, recorded in the manifest, or the
+    /// installed one when it was installed before the run.
+    fn ran_by(&self, manifest: &Value, stated: &Stated, started: Option<u64>, why: &mut Vec<String>) -> RanBy {
+        if let Some(v) = &stated.darkmux_version {
+            // A stated version says nothing of what built it.
+            return RanBy { version: Some(v.clone()), ..Default::default() };
+        }
+        let recorded = manifest.get("darkmux").and_then(|d| serde_json::from_value::<darkmux_types::BuildInfo>(d.clone()).ok());
+        let Some(b) = recorded.or_else(|| as_of_run(Some(self.installed.clone()), self.installed_at, started)) else {
+            why.push("darkmux was updated after the run (pass --darkmux-version)".to_string());
+            return RanBy::default();
+        };
+        RanBy { version: Some(b.version), commit: b.commit, build: b.build.map(build_word) }
+    }
+
+    fn os_as_of(&self, started: Option<u64>, why: &mut Vec<String>) -> Option<String> {
+        let release = self.os_release.as_ref()?;
+        let os = as_of_run(Some(release.name.clone()), release.installed_at_unix_ms, started);
+        if os.is_none() {
+            why.push("the OS may have been updated after the run".to_string());
+        }
+        os
+    }
+}
+
+/// A run's note: its verdict, its model, what it does not report and why.
+fn note_for(input: &Input, model_id: &str, stack: &Stack, why: &[String]) -> String {
+    format!(
+        "{}: {}, {model_id}; not reported: {}{}",
+        input.run_id,
+        if passed_from(&input.manifest) { "passed" } else { "failed" },
+        stack.unreported().join(", "),
+        if why.is_empty() { String::new() } else { format!(" ({})", why.join("; ")) }
+    )
+}
+
+/// The engine fields of a stack: stated by hand, or read from LM Studio and
+/// held only when they had not changed since the run.
+#[derive(Default)]
+struct EngineFields {
+    engine: Option<String>,
+    backend: Option<String>,
+    version: Option<String>,
+    quant: Option<String>,
+}
+
+fn engine_of(
+    stated: &Stated,
+    provenance: Option<&darkmux_profiles::engine::ModelProvenance>,
+    weights_changed: Option<u64>,
+    started: Option<u64>,
+    why: &mut Vec<String>,
+) -> EngineFields {
+    if stated.engine.is_some() {
+        return EngineFields {
+            engine: stated.engine.clone(),
+            backend: stated.engine_backend.clone(),
+            version: stated.engine_version.clone(),
+            quant: stated.quant.clone(),
+        };
+    }
+    let Some(p) = provenance else {
+        return EngineFields::default();
+    };
+    let version = as_of_run(p.runtime.clone(), p.runtime_installed_at_ms, started);
+    if let (Some(r), None) = (&p.runtime, &version) {
+        why.push(format!("{r} may not be the runtime that ran it"));
+    }
+    EngineFields {
+        engine: Some("LM Studio".to_string()),
+        backend: p.backend.clone(),
+        version,
+        // The quant is the weights': it holds for the run when they do.
+        quant: as_of_run(p.quant.clone().filter(|q| !q.trim().is_empty()), weights_changed, started),
+    }
+}
+
+/// What one submit has asked LM Studio and hashed, so each is done once.
+#[derive(Default)]
+struct Caches {
+    provenance: BTreeMap<String, Option<darkmux_profiles::engine::ModelProvenance>>,
+    /// A weights folder's hash, and its newest file's mtime.
+    weights: BTreeMap<PathBuf, (Option<String>, Option<u64>)>,
+}
+
+impl Caches {
+    fn provenance(&mut self, lmstudio: &dyn darkmux_profiles::engine::Engine, model_id: &str) -> Option<darkmux_profiles::engine::ModelProvenance> {
+        self.provenance
+            .entry(model_id.to_string())
+            .or_insert_with(|| lmstudio.provenance(model_id).ok().flatten())
+            .clone()
+    }
+
+    /// The weights' hash as of the run (None when they changed after it), and when they last changed.
+    fn weights(
+        &mut self,
+        path: &Path,
+        run_id: &str,
+        model_id: &str,
+        started: Option<u64>,
+        why: &mut Vec<String>,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<(Option<String>, Option<u64>)> {
+        if !self.weights.contains_key(path) {
+            let hashed = hash_weights(path, run_id, model_id, progress)?;
+            self.weights.insert(path.to_path_buf(), hashed);
+        }
+        let (hash, changed) = self.weights[path].clone();
+        let held = as_of_run(hash, changed, started);
+        if held.is_none() {
+            why.push("the weights changed after the run".to_string());
+        }
+        Ok((held, changed))
+    }
+}
+
+/// A weights folder's hash, and its newest file's mtime.
+fn hash_weights(path: &Path, run_id: &str, model_id: &str, progress: &mut dyn FnMut(&str)) -> Result<(Option<String>, Option<u64>)> {
+    let files = model_files(path);
+    if files.is_empty() {
+        bail!("{run_id}: no weights found for {model_id}. Pass --weights-dir <the model's folder>");
+    }
+    progress(&format!("Hashing {} file(s) of {model_id} (a minute for a large model)…", files.len()));
+    let mut hashed = Vec::new();
+    let mut newest = Some(0u64);
+    for f in &files {
+        hashed.push((rel_path(path, f), sha256::file_hex(f).with_context(|| format!("hashing {}", f.display()))?));
+        newest = newest.zip(mtime_ms(f)).map(|(a, b)| a.max(b));
+    }
+    Ok((weights_hash_of(&hashed), newest))
 }
 
 /// The fixture: a GitHub repo at the commit its checkout was on through the
@@ -773,14 +935,7 @@ pub fn fixture_at(source: &Path, starts: &[u64], stated_commit: Option<&str>) ->
     }
     let commit_sha = match stated_commit {
         Some(c) => c.to_string(),
-        None => {
-            let reflog = git(&["reflog", "show", "--date=unix", "--format=%H %gd", "HEAD"]).unwrap_or_default();
-            let (first, last) = match (starts.iter().min(), starts.iter().max()) {
-                (Some(a), Some(b)) => (*a, *b),
-                _ => bail!("the fixture commit: the runs carry no start time; pass --commit <sha>"),
-            };
-            commit_at_time(&reflog, first, last).map_err(|e| anyhow!("the fixture commit: {e}"))?
-        }
+        None => commit_through(&git(&["reflog", "show", "--date=unix", "--format=%H %gd", "HEAD"]).unwrap_or_default(), starts)?,
     };
     let commit_sha = git(&["rev-parse", "--verify", "--quiet", &format!("{commit_sha}^{{commit}}")])
         .map(|s| s.trim().to_string())
@@ -791,6 +946,14 @@ pub fn fixture_at(source: &Path, starts: &[u64], stated_commit: Option<&str>) ->
         .ok_or_else(|| anyhow!("the fixture has no .fixture.json at {}", &commit_sha[..7]))?;
     let manifest: Value = serde_json::from_str(&text).context("reading the fixture's .fixture.json")?;
     Ok((repo, commit_sha, manifest))
+}
+
+/// The commit HEAD was on from the first run's start to the last's, by the reflog.
+fn commit_through(reflog: &str, starts: &[u64]) -> Result<String> {
+    let (Some(first), Some(last)) = (starts.iter().min(), starts.iter().max()) else {
+        bail!("the fixture commit: the runs carry no start time; pass --commit <sha>");
+    };
+    commit_at_time(reflog, *first, *last).map_err(|e| anyhow!("the fixture commit: {e}"))
 }
 
 fn build_word(b: darkmux_types::BuildKind) -> String {
