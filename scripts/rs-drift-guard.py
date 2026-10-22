@@ -96,6 +96,15 @@ ALLOW_MARKER = "drift-guard:allow"
 
 ROOTS = ["src", "runtime/src"]  # plus crates/*/src, discovered below
 
+# (#2497) The shipped non-.rs artifacts a user or a local model reads: role
+# prompts, mission configs, workloads, skills and the example registry. Scanned
+# as PROSE (every line, no string-literal step). Lab fixtures are excluded: they
+# hold historical diffs under review that are supposed to name old verbs.
+ARTIFACT_ROOTS = ["templates/builtin"]
+ARTIFACT_FILES = ["profiles.example.json"]
+ARTIFACT_EXCLUDE = ["templates/builtin/lab-fixtures"]
+ARTIFACT_EXTS = (".md", ".json", ".txt", ".toml")
+
 _command_res = [re.compile(r"\b" + re.escape(p) + r"\b") for p in RETIRED_COMMAND_PHRASES] + [
     re.compile(r) for r in RETIRED_COMMAND_REGEXES
 ]
@@ -141,28 +150,55 @@ def find_hit(line):
     return None
 
 
-def scan():
-    findings = []
+def find_prose_hit(line):
+    """Return (matched_text, col) for the first retired verb anywhere on a
+    prose line (a shipped artifact), or None."""
+    candidates = [(m.start(), m.group(0)) for m in (cre.search(line) for cre in _command_res) if m]
+    m = _single_re.search(line)
+    if m:
+        candidates.append((m.start(), m.group(0)))
+    if not candidates:
+        return None
+    col, text = min(candidates)
+    return (text, col)
+
+
+def artifact_paths():
+    paths = [f for f in ARTIFACT_FILES if os.path.isfile(f)]
+    for root in ARTIFACT_ROOTS:
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if os.path.join(dirpath, d) not in ARTIFACT_EXCLUDE]
+            paths.extend(os.path.join(dirpath, fn) for fn in filenames if fn.endswith(ARTIFACT_EXTS))
+    return sorted(paths)
+
+
+def source_paths():
     for root in crate_src_roots():
         for dirpath, _, filenames in os.walk(root):
             for fn in filenames:
-                if not fn.endswith(".rs"):
+                if fn.endswith(".rs"):
+                    yield os.path.join(dirpath, fn), find_hit
+    for path in artifact_paths():
+        yield path, find_prose_hit
+
+
+def scan():
+    findings = []
+    for path, finder in source_paths():
+        prev = ""
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for lineno, line in enumerate(fh, 1):
+                hit = finder(line)
+                if hit is None:
+                    prev = line
                     continue
-                path = os.path.join(dirpath, fn)
-                prev = ""
-                with open(path, encoding="utf-8", errors="replace") as fh:
-                    for lineno, line in enumerate(fh, 1):
-                        hit = find_hit(line)
-                        if hit is None:
-                            prev = line
-                            continue
-                        text, _ = hit
-                        # Allowlisted on this line or the line immediately above.
-                        if ALLOW_MARKER in line or ALLOW_MARKER in prev:
-                            prev = line
-                            continue
-                        findings.append((path, lineno, text, line.rstrip()))
-                        prev = line
+                text, _ = hit
+                # Allowlisted on this line or the line immediately above.
+                if ALLOW_MARKER in line or ALLOW_MARKER in prev:
+                    prev = line
+                    continue
+                findings.append((path, lineno, text, line.rstrip()))
+                prev = line
     return findings
 
 
@@ -170,7 +206,7 @@ def main():
     findings = scan()
     if findings:
         print(
-            "::error::Retired verb in a .rs string literal (#1469) — a help/error/"
+            "::error::Retired verb in a .rs string literal or a shipped artifact (#1469, #2497) — a help/error/"
             "hint/banner string still names a verb retired on the 2.0 arc. Fix the "
             "string to the current verb, or, if this is a legitimate reference (a "
             "test asserting the retirement, a noun use), add an inline "
@@ -179,7 +215,7 @@ def main():
         for path, lineno, text, line in findings:
             print(f"{path}:{lineno}: [{text}] {line.strip()}")
         return 1
-    print("rs drift guard passed: no retired verbs in .rs string literals")
+    print("rs drift guard passed: no retired verbs in .rs string literals or shipped artifacts")
     return 0
 
 
