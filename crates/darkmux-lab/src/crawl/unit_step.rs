@@ -101,13 +101,14 @@ pub const THERMAL_STOP: &str = "thermal_stop";
 /// (the bound is not an operator's stop), so this label, embedded in the
 /// `partial` `UnitOutcome` this fn returns Err with, is still what
 /// [`errored_row`] recovers from the step's own persisted error text (via
-/// [`INTERRUPTED_MARKER`]), as it is for a step file written before the
+/// [`darkmux_crew::types::INTERRUPTED_MARKER`]), as it is for a step file written before the
 /// scheduler abandoned stopped steps.
 const INTERRUPTED_RESULT: &str = "interrupted";
 
-/// (#2594) The marker [`errored_row`] recovers the `interrupted` label by,
-/// shared with the review's scope line through `NodeStatus::outcome_word`.
-/// `run`'s `partial` `UnitOutcome` must serialize to text containing it.
+/// (#2594) The marker `NodeStatus::outcome_word` recovers the `interrupted`
+/// label by (shared with the review's scope line). `run`'s `partial`
+/// `UnitOutcome` must serialize to text containing it; the tests pin that.
+#[cfg(test)]
 use darkmux_crew::types::INTERRUPTED_MARKER;
 
 /// A rough multiple of turns per site — read the site, maybe grep around
