@@ -8318,7 +8318,7 @@ fn review_real_launch_runs_the_deliver_phase_and_writes_the_emit_file() {
     // `"noop"` a clean run gets. The scope line names the errored unit.
     assert_eq!(payload["mode"], serde_json::json!("degraded"), "{payload}");
     let body = payload["review"]["body"].as_str().unwrap();
-    assert!(body.contains("Errored:") && body.contains("unit-swallowed-error"), "{payload}");
+    assert!(body.contains("Did not finish:") && body.contains("unit-swallowed-error"), "{payload}");
 
     // (#2310 fix-loop C2 / C2-4) `review.json` declares
     // `outcome_from: "deliver"`, which is what gives the

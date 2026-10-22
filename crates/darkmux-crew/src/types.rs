@@ -732,7 +732,30 @@ impl NodeStatus {
             NodeStatus::Unknown => "unknown",
         }
     }
+
+    /// (#2594) The one word every surface uses for how a step ended: the
+    /// crawl summary's `result` and the review's scope line read the same
+    /// row the same way. `Abandoned` (an operator's stop) is `interrupted`,
+    /// and so is an `Error` whose persisted output carries
+    /// [`INTERRUPTED_MARKER`] (a failure that coincided with an interrupt);
+    /// any other `Error` is `error`. A step that never settled (`Planned`,
+    /// `Running`, or a newer darkmux's `Unknown`) is `not_run`.
+    pub fn outcome_word(&self, output: Option<&str>) -> &'static str {
+        match self {
+            NodeStatus::Complete => "complete",
+            NodeStatus::Abandoned => "interrupted",
+            NodeStatus::Error if output.is_some_and(|o| o.contains(INTERRUPTED_MARKER)) => "interrupted",
+            NodeStatus::Error => "error",
+            NodeStatus::Planned | NodeStatus::Running | NodeStatus::Unknown => "not_run",
+        }
+    }
 }
+
+/// (#2594) The exact JSON key/value a crawl unit's `partial` `UnitOutcome`
+/// serializes when its result is `interrupted`; [`NodeStatus::outcome_word`]
+/// finds it in a step's persisted error TEXT by substring (that text is
+/// free-form prose around the JSON, so it is never parsed).
+pub const INTERRUPTED_MARKER: &str = "\"result\":\"interrupted\"";
 
 /// (#1230 Packet 2, revised #1341) The smallest executable unit in the flow
 /// graph — one dispatch, one native function, or one shell command. `kind`
@@ -985,6 +1008,21 @@ pub struct Task {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (#2594) One word per ending, for every variant: the review's scope
+    /// line and the crawl summary both read a step through this.
+    #[test]
+    fn outcome_word_names_each_ending_once() {
+        let marked = format!("unit failed: {{{INTERRUPTED_MARKER},\"unit\":\"u\"}}");
+        assert_eq!(NodeStatus::Abandoned.outcome_word(None), "interrupted");
+        assert_eq!(NodeStatus::Error.outcome_word(Some(&marked)), "interrupted", "an interrupt-coincident failure");
+        assert_eq!(NodeStatus::Error.outcome_word(Some("boom")), "error");
+        assert_eq!(NodeStatus::Error.outcome_word(None), "error");
+        assert_eq!(NodeStatus::Complete.outcome_word(None), "complete");
+        for s in [NodeStatus::Planned, NodeStatus::Running, NodeStatus::Unknown] {
+            assert_eq!(s.outcome_word(None), "not_run", "{s:?}");
+        }
+    }
 
     fn skill_with(id: &str, caps: &[(Capability, f32)]) -> Skill {
         Skill {
