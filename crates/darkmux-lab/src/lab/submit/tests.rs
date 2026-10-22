@@ -191,31 +191,18 @@ fn a_long_summary_is_cut_to_what_the_site_takes() {
     assert!(cut.as_str().unwrap().ends_with('\u{2026}'));
 }
 
-fn git(dir: &Path, args: &[&str]) {
-    let ok = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
-        .args(args)
-        .output()
-        .unwrap()
-        .status
-        .success();
-    assert!(ok, "git {args:?}");
-}
-
 #[test]
 fn the_fixture_is_read_at_the_commit_not_as_it_is_now() {
     let tmp = tempfile::TempDir::new().unwrap();
     let d = tmp.path();
-    git(d, &["init", "-q"]);
+    let _ = git(d, &["init", "-q"]);
     std::fs::write(d.join(".fixture.json"), r#"{"name":"pepper-grinder","version":"2.0"}"#).unwrap();
-    git(d, &["add", "."]);
-    git(d, &["commit", "-qm", "one"]);
+    let _ = git(d, &["add", "."]);
+    let _ = git(d, &["commit", "-qm", "one"]);
     let first = String::from_utf8(Command::new("git").arg("-C").arg(d).args(["rev-parse", "HEAD"]).output().unwrap().stdout).unwrap();
     std::fs::write(d.join(".fixture.json"), r#"{"name":"pepper-grinder","version":"3.0"}"#).unwrap();
-    git(d, &["commit", "-qam", "two"]);
-    git(d, &["remote", "add", "origin", "git@github.com:kstrat2001/pepper-grinder.git"]);
+    let _ = git(d, &["commit", "-qam", "two"]);
+    let _ = git(d, &["remote", "add", "origin", "git@github.com:kstrat2001/pepper-grinder.git"]);
 
     let (repo, sha, manifest) = fixture_at(d, &[], Some(&first.trim()[..10])).unwrap();
     assert_eq!(repo, "kstrat2001/pepper-grinder");
@@ -268,4 +255,316 @@ fn what_the_site_would_refuse_is_refused_here() {
 #[test]
 fn a_word_boundary_is_ascii_as_in_javascript() {
     assert!(looks_like_path("see /var\u{e9}"), "the site reads é as a boundary");
+}
+
+// ---------------------------------------------------------------------------
+// gather_on: runs, a fixture checkout and a machine, read end to end
+// ---------------------------------------------------------------------------
+
+use darkmux_profiles::engine::ModelProvenance;
+
+/// A fixture checkout, a flows dir, a weights folder and runs, all on disk.
+struct Bench {
+    root: tempfile::TempDir,
+    fixture: PathBuf,
+    flows: PathBuf,
+    weights: PathBuf,
+    /// Run starts: a minute from now, so the fixture commit and the weights are older.
+    start: u64,
+}
+
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn bench() -> Bench {
+    let root = tempfile::tempdir().unwrap();
+    let fixture = root.path().join("fixture");
+    std::fs::create_dir(&fixture).unwrap();
+    git(&fixture, &["init", "-q"]);
+    std::fs::write(fixture.join(".fixture.json"), r#"{"name":"pepper-grinder","version":2.0}"#).unwrap();
+    git(&fixture, &["add", "."]);
+    git(&fixture, &["commit", "-qm", "fixture"]);
+    git(&fixture, &["remote", "add", "origin", "https://github.com/kstrat2001/pepper-grinder.git"]);
+    let flows = root.path().join("flows");
+    std::fs::create_dir(&flows).unwrap();
+    let weights = root.path().join("weights");
+    std::fs::create_dir_all(weights.join("sub")).unwrap();
+    std::fs::write(weights.join("model.safetensors"), b"tensor bytes").unwrap();
+    std::fs::write(weights.join("sub").join("config.json"), b"{}").unwrap();
+    std::fs::write(weights.join(".hidden.safetensors"), b"left out").unwrap();
+    std::fs::write(weights.join("README.md"), b"not a model file").unwrap();
+    let start = mtime_ms(&weights.join("model.safetensors")).unwrap() + 60_000;
+    Bench { root, fixture, flows, weights, start }
+}
+
+impl Bench {
+    /// A run of `model`, its manifest given `extra` fields; returns its path.
+    fn run(&self, name: &str, model: &str, extra: Value) -> String {
+        let dir = self.root.path().join("runs").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let trajectory = [
+            json!({"type": "dispatch.start", "ts": self.start, "model": model}),
+            json!({"type": "dispatch.complete", "ts": self.start + 10_000, "result": "stop", "wall_ms": 10_000}),
+        ];
+        std::fs::write(dir.join("trajectory.jsonl"), trajectory.iter().map(|v| format!("{v}\n")).collect::<String>()).unwrap();
+        std::fs::write(dir.join("lifecycle.json"), json!({"session_id": name}).to_string()).unwrap();
+        let mut manifest = json!({
+            "ok": true, "session_id": name, "profile": "p",
+            "verify": {"passed": true, "details": "ok"},
+            "fixture": {"source_path": self.fixture.display().to_string(), "baseline_hash": "b"},
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            manifest[k] = v.clone();
+        }
+        std::fs::write(dir.join("manifest.json"), manifest.to_string()).unwrap();
+        dir.display().to_string()
+    }
+
+    fn provenance(&self) -> ModelProvenance {
+        ModelProvenance {
+            backend: Some("MLX".into()),
+            quant: Some("4bit".into()),
+            weights_path: Some(self.weights.clone()),
+            runtime: Some("mlx-llm 1.13.1".into()),
+            runtime_installed_at_ms: Some(0),
+        }
+    }
+
+    /// An Asahi machine where everything was in place before the runs.
+    fn machine(&self, provenance: Option<ModelProvenance>) -> Machine {
+        Machine {
+            chip: "Apple M2".into(),
+            ram_gb: Some(8),
+            accelerator: Some("Vulkan".into()),
+            os_release: Some(darkmux_platform::OsRelease { name: "Omarchy (Arch Linux ARM)".into(), installed_at_unix_ms: Some(0) }),
+            registry: serde_json::from_value(json!({"profiles": {"p": {"models": [{"id": "m1", "n_ctx": 65_536}]}}})).ok(),
+            installed: darkmux_types::BuildInfo { version: "5.4.0".into(), commit: Some("c".repeat(40)), build: Some(darkmux_types::BuildKind::Dev) },
+            installed_at: Some(0),
+            provenance: Box::new(move |m| (m == "m1").then(|| provenance.clone()).flatten()),
+        }
+    }
+
+    fn gather(&self, machine: &Machine, runs: &[String], stated: &Stated) -> Result<(Built, Vec<String>)> {
+        let mut said = Vec::new();
+        let built = gather_on(machine, runs, stated, &self.flows, &mut |s| said.push(s.to_string()))?;
+        Ok((built, said))
+    }
+}
+
+#[test]
+fn gather_reads_the_runs_the_fixture_and_the_machine() {
+    let b = bench();
+    let runs = vec![
+        b.run("r1", "darkmux:m1", json!({})),
+        b.run("r2", "darkmux:m1", json!({"verify": {"passed": false, "details": "1 failed"},
+            "darkmux": {"version": "5.3.0", "commit": "a".repeat(40), "build": "release"}})),
+    ];
+    let (built, said) = b.gather(&b.machine(Some(b.provenance())), &runs, &Stated::default()).unwrap();
+    let sha = git(&b.fixture, &["rev-parse", "HEAD"]);
+    assert_eq!(built.fixture, format!("kstrat2001/pepper-grinder@{} (pepper-grinder 2)", &sha[..7]));
+    assert_eq!(built.bundle["fixture"]["commitSha"], sha);
+    assert_eq!(said.len(), 1, "one model's weights are hashed once: {said:?}");
+    let r1 = &built.bundle["runs"][0];
+    let stack = &r1["stack"];
+    assert_eq!(stack["chip"], "Apple M2");
+    assert_eq!(stack["os"], "Omarchy (Arch Linux ARM)");
+    assert_eq!(stack["engine"], "LM Studio");
+    assert_eq!(stack["engineBackend"], "MLX");
+    assert_eq!(stack["engineVersion"], "mlx-llm 1.13.1");
+    assert_eq!(stack["quant"], "4bit");
+    assert_eq!(stack["model"], "m1");
+    assert_eq!(stack["contextLength"], 65_536, "the window the run's profile declares");
+    let files = [
+        ("model.safetensors".to_string(), sha256::hex(b"tensor bytes")),
+        ("sub/config.json".to_string(), sha256::hex(b"{}")),
+    ];
+    assert_eq!(stack["weightsHash"].as_str(), weights_hash_of(&files).as_deref(), "hidden and non-model files left out");
+    assert_eq!((r1["darkmuxVersion"].as_str(), r1["darkmuxBuild"].as_str()), (Some("5.4.0"), Some("dev")), "installed before the run");
+    let r2 = &built.bundle["runs"][1];
+    assert_eq!((r2["darkmuxVersion"].as_str(), r2["darkmuxBuild"].as_str()), (Some("5.3.0"), Some("release")), "the manifest's own record wins");
+    assert_eq!(r2["passed"], false);
+    assert!(built.notes[0].starts_with("r1: passed, m1; not reported: kvCacheDtype"), "{}", built.notes[0]);
+    assert!(built.notes[1].starts_with("r2: failed, m1"), "{}", built.notes[1]);
+}
+
+#[test]
+fn what_changed_after_the_run_is_left_out_and_said() {
+    let b = bench();
+    let runs = vec![b.run("r1", "darkmux:m1", json!({}))];
+    let mut machine = b.machine(Some(ModelProvenance { runtime_installed_at_ms: Some(b.start + 1), ..b.provenance() }));
+    machine.installed_at = Some(b.start + 1);
+    machine.os_release = Some(darkmux_platform::OsRelease { name: "macOS 26.1".into(), installed_at_unix_ms: Some(b.start + 1) });
+    let (built, _) = b.gather(&machine, &runs, &Stated::default()).unwrap();
+    let r1 = &built.bundle["runs"][0];
+    assert_eq!(r1["darkmuxVersion"], Value::Null);
+    assert_eq!(r1["stack"]["os"], Value::Null);
+    assert_eq!(r1["stack"]["engineVersion"], Value::Null);
+    let note = &built.notes[0];
+    for why in ["darkmux was updated after the run", "the OS may have been updated", "mlx-llm 1.13.1 may not be the runtime"] {
+        assert!(note.contains(why), "{note}");
+    }
+
+    // Weights written after the run: neither their hash nor their quant holds.
+    let later = b.root.path().join("later.gguf");
+    std::fs::write(&later, b"newer").unwrap();
+    let mut machine = b.machine(Some(ModelProvenance { weights_path: Some(later), ..b.provenance() }));
+    machine.installed_at = None;
+    let runs = vec![b.run("r9", "darkmux:m1", json!({}))];
+    std::fs::write(
+        b.root.path().join("runs/r9/trajectory.jsonl"),
+        format!("{}\n", json!({"type": "dispatch.start", "ts": 1_000, "model": "darkmux:m1"})),
+    )
+    .unwrap();
+    let (built, _) = b.gather(&machine, &runs, &Stated { commit: Some(git(&b.fixture, &["rev-parse", "HEAD"])), ..Default::default() }).unwrap();
+    let stack = &built.bundle["runs"][0]["stack"];
+    assert_eq!((stack["weightsHash"].clone(), stack["quant"].clone()), (Value::Null, Value::Null));
+    assert!(built.notes[0].contains("the weights changed after the run"), "{}", built.notes[0]);
+}
+
+#[test]
+fn a_model_lm_studio_does_not_list_says_what_to_pass() {
+    let b = bench();
+    let runs = vec![b.run("r1", "darkmux:elsewhere", json!({}))];
+    let (built, said) = b.gather(&b.machine(None), &runs, &Stated::default()).unwrap();
+    assert!(said.is_empty(), "nothing to hash");
+    let stack = &built.bundle["runs"][0]["stack"];
+    assert_eq!((stack["engine"].clone(), stack["weightsHash"].clone(), stack["contextLength"].clone()), (Value::Null, Value::Null, Value::Null));
+    for why in ["LM Studio does not list this model (pass --engine)", "weights unknown (pass --weights-dir)"] {
+        assert!(built.notes[0].contains(why), "{}", built.notes[0]);
+    }
+}
+
+#[test]
+fn what_the_operator_states_stands_in_for_what_the_machine_cannot_say() {
+    let b = bench();
+    let runs = vec![b.run("r1", "darkmux:flint", json!({}))];
+    let stated = Stated {
+        engine: Some("rec".into()),
+        engine_backend: Some("rec-metal".into()),
+        engine_version: Some("0.9".into()),
+        quant: Some("q8".into()),
+        weights_dir: Some(b.weights.clone()),
+        darkmux_version: Some("5.3.0".into()),
+        commit: Some(git(&b.fixture, &["rev-parse", "--short", "HEAD"])),
+    };
+    let (built, _) = b.gather(&b.machine(Some(b.provenance())), &runs, &stated).unwrap();
+    let r1 = &built.bundle["runs"][0];
+    assert_eq!(r1["stack"]["engine"], "rec");
+    assert_eq!(r1["stack"]["engineBackend"], "rec-metal");
+    assert_eq!(r1["stack"]["engineVersion"], "0.9");
+    assert_eq!(r1["stack"]["quant"], "q8");
+    assert!(r1["stack"]["weightsHash"].is_string());
+    assert_eq!((r1["darkmuxVersion"].as_str(), r1["darkmuxCommit"].as_str()), (Some("5.3.0"), None), "a stated version says nothing of its build");
+    assert_eq!(built.bundle["fixture"]["commitSha"], git(&b.fixture, &["rev-parse", "HEAD"]), "a stated short sha is resolved");
+}
+
+#[test]
+fn gather_refuses_what_it_cannot_share() {
+    let b = bench();
+    let machine = b.machine(Some(b.provenance()));
+    let err = |runs: &[String], stated: &Stated| b.gather(&machine, runs, stated).unwrap_err().to_string();
+    let r1 = b.run("r1", "darkmux:m1", json!({}));
+    assert!(err(&[], &Stated::default()).contains("name at least one lab run"));
+    assert!(err(&[r1.clone(), r1.clone()], &Stated::default()).contains("named twice"));
+
+    let gone = b.root.path().join("runs/gone").display().to_string();
+    std::fs::create_dir_all(&gone).unwrap();
+    let harness = b.run("harness", "darkmux:m1", json!({"ok": false}));
+    let e = err(&[gone, harness], &Stated::default());
+    assert!(e.contains("gone: no manifest.json") && e.contains("harness: the dispatch did not complete cleanly"), "{e}");
+
+    let empty = b.root.path().join("runs/empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    std::fs::write(empty.join("manifest.json"), "{}").unwrap();
+    assert!(err(&[empty.display().to_string()], &Stated::default()).contains("its numbers cannot be read"));
+
+    let other = b.run("other", "darkmux:m1", json!({"fixture": {"source_path": "/elsewhere", "baseline_hash": "b"}}));
+    assert!(err(&[r1.clone(), other], &Stated::default()).contains("one fixture checkout at a time"));
+    let rebased = b.run("rebased", "darkmux:m1", json!({"fixture": {"source_path": b.fixture.display().to_string(), "baseline_hash": "c"}}));
+    assert!(err(&[r1.clone(), rebased], &Stated::default()).contains("different fixture contents"));
+    let m2 = b.run("m2", "darkmux:m2", json!({}));
+    let e = err(&[r1.clone(), m2], &Stated { quant: Some("4bit".into()), ..Default::default() });
+    assert!(e.contains("describe one model; these runs used m1, m2"), "{e}");
+
+    let bare = b.root.path().join("bare");
+    std::fs::create_dir(&bare).unwrap();
+    assert!(err(std::slice::from_ref(&r1), &Stated { weights_dir: Some(bare), ..Default::default() }).contains("no weights found for m1"));
+
+    std::fs::write(b.fixture.join("dirty.txt"), "x").unwrap();
+    assert!(err(&[r1], &Stated::default()).contains("uncommitted changes"));
+}
+
+#[test]
+fn only_apple_silicon_results_are_taken() {
+    assert_eq!(apple_chip(Some("Apple M5 Max".into())).unwrap(), "Apple M5 Max");
+    assert!(apple_chip(Some("Intel(R) Xeon(R)".into())).unwrap_err().to_string().contains("reports Intel(R) Xeon(R)"));
+    assert!(apple_chip(Some(String::new())).unwrap_err().to_string().contains("no Apple chip"));
+    assert!(apple_chip(None).unwrap_err().to_string().contains("no Apple chip"));
+}
+
+#[test]
+fn small_readers_say_none_rather_than_guess() {
+    assert_eq!(build_word(darkmux_types::BuildKind::Release), "release");
+    assert_eq!(build_word(darkmux_types::BuildKind::Dev), "dev");
+    assert_eq!(fixture_field(&json!({"fixture": {"source_path": "/x"}}), "source_path").as_deref(), Some("/x"));
+    assert_eq!(fixture_field(&json!({"fixture": {"source_path": 3}}), "source_path"), None);
+    assert_eq!(fixture_field(&json!({}), "source_path"), None);
+    assert_eq!(mtime_ms(Path::new("/no/such/file")), None);
+    let mut all = stack();
+    all.weights_hash = Some("h".into());
+    assert_eq!(all.unreported(), vec!["kvCacheDtype"]);
+    assert_eq!(Stack::default().unreported().len(), 10);
+}
+
+#[test]
+fn a_fixture_version_reads_as_the_site_writes_it() {
+    let version = |v: Value| assemble("o/r", &"a".repeat(40), &json!({"name": "f", "version": v}), vec![]).unwrap()["fixture"]["version"].clone();
+    assert_eq!(version(Value::Null), "1.0", "no version reads as 1.0");
+    assert_eq!(version(json!("2.1")), "2.1");
+    assert_eq!(version(json!(3)), "3");
+    assert_eq!(version(json!(2.5)), "2.5");
+    assert_eq!(version(json!(true)), "true");
+    assert_eq!(assemble("o/r", "a", &json!({"name": "f"}), vec![]).unwrap()["fixture"]["version"], "1.0");
+    for nameless in [json!({}), json!({"name": "  "}), json!({"name": 3})] {
+        assert!(assemble("o/r", "a", &nameless, vec![]).unwrap_err().to_string().contains("has no name"));
+    }
+}
+
+#[test]
+fn a_fixture_checkout_that_cannot_say_what_ran_is_refused() {
+    let b = bench();
+    let head = git(&b.fixture, &["rev-parse", "HEAD"]);
+    let _ = git(&b.fixture, &["remote", "set-url", "origin", "https://gitlab.com/o/r.git"]);
+    assert!(fixture_at(&b.fixture, &[], Some(&head)).unwrap_err().to_string().contains("not a GitHub repo"));
+    let _ = git(&b.fixture, &["remote", "set-url", "origin", "https://github.com/o/r.git"]);
+    std::fs::write(b.fixture.join(".fixture.json"), "not json").unwrap();
+    let _ = git(&b.fixture, &["commit", "-qam", "broken"]);
+    let broken = git(&b.fixture, &["rev-parse", "HEAD"]);
+    assert!(fixture_at(&b.fixture, &[], Some(&broken)).unwrap_err().to_string().contains("reading the fixture's .fixture.json"));
+    let _ = git(&b.fixture, &["rm", "-q", ".fixture.json"]);
+    let _ = git(&b.fixture, &["commit", "-qm", "gone"]);
+    let gone = git(&b.fixture, &["rev-parse", "HEAD"]);
+    assert!(fixture_at(&b.fixture, &[], Some(&gone)).unwrap_err().to_string().contains("has no .fixture.json at"));
+    assert!(fixture_at(&b.root.path().join("not-a-checkout"), &[], Some(&head)).unwrap_err().to_string().contains("not a git checkout"));
+}
+
+#[test]
+fn no_weights_where_there_is_no_folder() {
+    assert!(model_files(Path::new("/no/such/weights")).is_empty());
+}
+
+#[test]
+fn gather_here_refuses_before_it_reads_anything() {
+    let err = gather(&[], &Stated::default(), &mut |_| {}).unwrap_err().to_string();
+    // Off Apple Silicon the machine is refused first; on it, the empty list.
+    assert!(err.contains("name at least one lab run") || err.contains("Apple Silicon results only"), "{err}");
 }

@@ -100,12 +100,8 @@ impl Platform for MacPlatform {
     /// history last lists `macOS <version>`. The system files' own times are
     /// Apple's build times on the sealed volume, not when an update landed.
     fn os_release(&self) -> Option<crate::OsRelease> {
-        let version = command_stdout("sw_vers", &["-productVersion"])?.trim().to_string();
-        if version.is_empty() {
-            return None;
-        }
-        let history = command_stdout("system_profiler", &["SPInstallHistoryDataType", "-json"]).unwrap_or_default();
-        Some(crate::OsRelease { installed_at_unix_ms: macos_installed_at(&history, &version), name: format!("macOS {version}") })
+        let version = command_stdout("sw_vers", &["-productVersion"])?;
+        macos_release(&version, || command_stdout("system_profiler", &["SPInstallHistoryDataType", "-json"]).unwrap_or_default())
     }
 
     /// Apple Silicon runs local models on Metal.
@@ -116,6 +112,41 @@ impl Platform for MacPlatform {
     fn secret_store(&self) -> crate::SecretStore {
         crate::SecretStore::Keychain
     }
+
+    /// `security -i` reads the command from stdin, so the secret is never on
+    /// an argv. It can exit 0 when the command failed: the caller reads back.
+    fn keychain_store(&self, item: &str, account: &str, secret: &str) -> Result<(), String> {
+        security_interactive(&format!("add-generic-password -U -a \"{account}\" -s {item} -w \"{secret}\"\n"))
+    }
+
+    fn keychain_forget(&self, item: &str, account: &str) {
+        let _ = command_stdout("security", &["delete-generic-password", "-a", account, "-s", item]);
+    }
+}
+
+/// Runs one `security -i` command line, fed on stdin.
+#[cfg(target_os = "macos")]
+fn security_interactive(line: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("security")
+        .arg("-i")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("running `security`: {e}"))?;
+    child.stdin.take().expect("piped").write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn security_interactive(_line: &str) -> Result<(), String> {
+    Err("there is no login keychain on this machine".to_string())
 }
 
 #[cfg(target_os = "macos")]
@@ -127,6 +158,16 @@ fn command_stdout(cmd: &str, args: &[&str]) -> Option<String> {
 #[cfg(not(target_os = "macos"))]
 fn command_stdout(_cmd: &str, _args: &[&str]) -> Option<String> {
     None
+}
+
+/// `macOS <version>` from `sw_vers`' answer, installed when the install
+/// history (read only for a version there is) says.
+pub(crate) fn macos_release(version: &str, history: impl FnOnce() -> String) -> Option<crate::OsRelease> {
+    let version = version.trim();
+    if version.is_empty() {
+        return None;
+    }
+    Some(crate::OsRelease { installed_at_unix_ms: macos_installed_at(&history(), version), name: format!("macOS {version}") })
 }
 
 /// The newest `install_date` among `system_profiler SPInstallHistoryDataType

@@ -137,6 +137,16 @@ mod tests {
     }
 
     #[test]
+    fn a_file_hashes_as_its_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("weights.bin");
+        let bytes: Vec<u8> = (0..(3 << 20) + 7).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(file_hex(&path).unwrap(), hex(&bytes), "read in pieces, hashed as the whole");
+        assert!(file_hex(&dir.path().join("missing")).is_err());
+    }
+
+    #[test]
     fn pieces_hash_as_the_whole() {
         let data: Vec<u8> = (0..1000u32).map(|i| (i * 7) as u8).collect();
         let mut h = Sha256::default();

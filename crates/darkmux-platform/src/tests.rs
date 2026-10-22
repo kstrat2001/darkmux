@@ -718,6 +718,35 @@ fn macos_install_time_is_the_newest_install_of_the_running_version() {
     assert_eq!(crate::macos::macos_installed_at(json, "15.1"), Some(1_730_160_000_000));
     assert_eq!(crate::macos::macos_installed_at(json, "15.2"), None);
     assert_eq!(crate::macos::macos_installed_at("not json", "15.1"), None);
+    let release = crate::macos::macos_release("15.1\n", || json.to_string()).unwrap();
+    assert_eq!((release.name.as_str(), release.installed_at_unix_ms), ("macOS 15.1", Some(1_730_160_000_000)));
+    assert_eq!(crate::macos::macos_release(" \n", || unreachable!("no version, no history read")), None);
+    if std::env::consts::OS != "macos" {
+        assert_eq!(MacPlatform.os_release(), None, "no sw_vers off macOS");
+    }
+}
+
+#[test]
+fn linux_reads_its_release_and_ram_from_the_files_it_has() {
+    let release = LinuxPlatform.os_release();
+    if std::fs::read_to_string("/etc/os-release").is_ok_and(|r| r.contains("PRETTY_NAME=")) {
+        assert!(release.is_some_and(|r| !r.name.is_empty() && r.installed_at_unix_ms.is_none()));
+    }
+    if std::fs::metadata("/proc/meminfo").is_ok() {
+        assert!(LinuxPlatform.ram_as_sold_gb().is_some_and(|gb| gb >= 1));
+    }
+}
+
+#[test]
+fn only_the_mac_has_a_keychain_to_keep_a_secret_in() {
+    for p in [&LinuxPlatform as &dyn Platform, &OtherPlatform, &FakePlatform::default()] {
+        assert!(p.keychain_store("darkmux-test-item", "nobody", "s").is_err(), "{}", p.id());
+        p.keychain_forget("darkmux-test-item", "nobody");
+    }
+    if std::env::consts::OS != "macos" {
+        assert!(MacPlatform.keychain_store("darkmux-test-item", "nobody", "s").is_err());
+        MacPlatform.keychain_forget("darkmux-test-item", "nobody");
+    }
 }
 
 #[test]

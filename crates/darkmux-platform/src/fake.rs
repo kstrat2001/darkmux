@@ -12,6 +12,7 @@ pub struct FakePlatform {
     pub process_start_stamps: Vec<(u32, u64)>,
     pub pid_namespace: Option<String>,
     pub os_release: Option<crate::OsRelease>,
+    pub secret_store: crate::SecretStore,
 }
 
 /// Every answer at its "nothing to report" value, so a test sets only the
@@ -27,6 +28,7 @@ impl Default for FakePlatform {
             process_start_stamps: Vec::new(),
             pid_namespace: None,
             os_release: None,
+            secret_store: crate::SecretStore::PrivateFile,
         }
     }
 }
@@ -106,6 +108,6 @@ impl Platform for FakePlatform {
     }
 
     fn secret_store(&self) -> crate::SecretStore {
-        crate::SecretStore::PrivateFile
+        self.secret_store
     }
 }

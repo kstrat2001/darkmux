@@ -574,9 +574,13 @@ pub struct Built {
 
 /// Reads the runs and the machine and builds one bundle. Reads only.
 pub fn gather(runs: &[String], stated: &Stated, progress: &mut dyn FnMut(&str)) -> Result<Built> {
+    gather_on(&Machine::here()?, runs, stated, &darkmux_types::config_access::flows_dir(), progress)
+}
+
+/// [`gather`] on a given machine, reading run stats against `flows_dir`.
+pub fn gather_on(machine: &Machine, runs: &[String], stated: &Stated, flows_dir: &Path, progress: &mut dyn FnMut(&str)) -> Result<Built> {
     refuse_repeats(runs)?;
-    let machine = Machine::here()?;
-    let inputs = read_runs(runs)?;
+    let inputs = read_runs(runs, flows_dir)?;
     let source = one_fixture(&inputs, stated)?;
     let mut caches = Caches::default();
     let mut bundled = Vec::new();
@@ -646,11 +650,11 @@ impl Input {
 }
 
 /// Reads and checks every run first, so a refusal names them all.
-fn read_runs(runs: &[String]) -> Result<Vec<Input>> {
+fn read_runs(runs: &[String], flows_dir: &Path) -> Result<Vec<Input>> {
     let mut inputs = Vec::new();
     let mut refused = Vec::new();
     for run in runs {
-        match read_run(run)? {
+        match read_run(run, flows_dir)? {
             Ok(input) => inputs.push(input),
             Err(why) => refused.push(why),
         }
@@ -662,14 +666,14 @@ fn read_runs(runs: &[String]) -> Result<Vec<Input>> {
 }
 
 /// A run that can be submitted, or why not.
-fn read_run(run: &str) -> Result<std::result::Result<Input, String>> {
+fn read_run(run: &str, flows_dir: &Path) -> Result<std::result::Result<Input, String>> {
     let dir = crate::lab::inspect::resolve_run_dir(run);
     let run_id = dir.file_name().map_or_else(|| run.to_string(), |n| n.to_string_lossy().into_owned());
     let Ok(text) = std::fs::read_to_string(dir.join(crate::lab::manifest::MANIFEST_FILE)) else {
         return Ok(Err(format!("{run_id}: no manifest.json, so it ended before the eval ran")));
     };
     let manifest: Value = serde_json::from_str(&text).with_context(|| format!("{run_id}: reading manifest.json"))?;
-    let stats = match crate::lab::stats::compute_from_dir(&dir, &darkmux_types::config_access::flows_dir()) {
+    let stats = match crate::lab::stats::compute_from_dir(&dir, flows_dir) {
         Ok(s) => serde_json::to_value(s)?,
         Err(e) => return Ok(Err(format!("{run_id}: its numbers cannot be read ({e:#})"))),
     };
@@ -708,37 +712,46 @@ impl Stated {
     }
 }
 
+/// What LM Studio says of a model, by its key.
+pub type ProvenanceOf = Box<dyn Fn(&str) -> Option<darkmux_profiles::engine::ModelProvenance>>;
+
 /// What the machine says of itself, read once.
-struct Machine {
-    chip: String,
-    ram_gb: Option<u64>,
-    accelerator: Option<String>,
-    os_release: Option<darkmux_platform::OsRelease>,
-    registry: Option<darkmux_types::ProfileRegistry>,
-    installed: darkmux_types::BuildInfo,
-    installed_at: Option<u64>,
-    lmstudio: Box<dyn darkmux_profiles::engine::Engine>,
+pub struct Machine {
+    pub chip: String,
+    pub ram_gb: Option<u64>,
+    pub accelerator: Option<String>,
+    pub os_release: Option<darkmux_platform::OsRelease>,
+    pub registry: Option<darkmux_types::ProfileRegistry>,
+    /// The darkmux installed here, and when its binary was written.
+    pub installed: darkmux_types::BuildInfo,
+    pub installed_at: Option<u64>,
+    pub provenance: ProvenanceOf,
+}
+
+/// The chip, when it is Apple Silicon: the only results the site takes.
+pub fn apple_chip(brand: Option<String>) -> Result<String> {
+    match brand {
+        Some(chip) if chip.starts_with("Apple M") => Ok(chip),
+        other => bail!(
+            "darkmux evals take Apple Silicon results only (macOS, or Omarchy Linux); this machine reports {}",
+            other.filter(|c| !c.is_empty()).unwrap_or_else(|| "no Apple chip".to_string())
+        ),
+    }
 }
 
 impl Machine {
     fn here() -> Result<Self> {
         let platform = darkmux_platform::current();
-        let chip = platform.cpu_brand().unwrap_or_default();
-        if !chip.starts_with("Apple M") {
-            bail!(
-                "darkmux evals take Apple Silicon results only (macOS, or Omarchy Linux); this machine reports {}",
-                if chip.is_empty() { "no Apple chip" } else { chip.as_str() }
-            );
-        }
+        let lmstudio = darkmux_profiles::engine::lmstudio();
         Ok(Machine {
-            chip,
+            chip: apple_chip(platform.cpu_brand())?,
             ram_gb: platform.ram_as_sold_gb(),
             accelerator: platform.gpu_api().map(str::to_string),
             os_release: platform.os_release(),
             registry: darkmux_profiles::profiles::load_registry_quiet(None).ok().map(|l| l.registry),
             installed: darkmux_types::build_info(),
             installed_at: std::env::current_exe().ok().and_then(|p| std::fs::canonicalize(p).ok()).and_then(|p| mtime_ms(&p)),
-            lmstudio: darkmux_profiles::engine::lmstudio(),
+            provenance: Box::new(move |model| lmstudio.provenance(model).ok().flatten()),
         })
     }
 
@@ -751,7 +764,7 @@ impl Machine {
         // A model the profile serves from an unmanaged endpoint is not LM Studio's (contract 1).
         let managed = profile_model.as_ref().is_none_or(|m| m.is_managed());
         let provenance = match stated.engine {
-            None if managed => caches.provenance(self.lmstudio.as_ref(), &model_id),
+            None if managed => caches.provenance(&self.provenance, &model_id),
             _ => None,
         };
         if stated.engine.is_none() && provenance.is_none() {
@@ -877,11 +890,8 @@ struct Caches {
 }
 
 impl Caches {
-    fn provenance(&mut self, lmstudio: &dyn darkmux_profiles::engine::Engine, model_id: &str) -> Option<darkmux_profiles::engine::ModelProvenance> {
-        self.provenance
-            .entry(model_id.to_string())
-            .or_insert_with(|| lmstudio.provenance(model_id).ok().flatten())
-            .clone()
+    fn provenance(&mut self, of: &ProvenanceOf, model_id: &str) -> Option<darkmux_profiles::engine::ModelProvenance> {
+        self.provenance.entry(model_id.to_string()).or_insert_with(|| of(model_id)).clone()
     }
 
     /// The weights' hash as of the run (None when they changed after it), and when they last changed.

@@ -482,6 +482,22 @@ mod tests {
         assert_eq!(selected_runtime("mlx-llm-x@1.13.1-beta (selected)\n", "MLX").as_deref(), Some("mlx-llm 1.13.1"));
     }
 
+    #[test]
+    fn provenance_names_each_format_and_quantization_shape() {
+        let rows = vec![
+            serde_json::json!({"modelKey": "a", "path": "x/a.gguf", "format": "GGUF", "quantization": "Q4_K_M"}),
+            serde_json::json!({"modelKey": "b", "format": "MLX", "quantization": {"bits": 8}}),
+            serde_json::json!({"modelKey": "c", "format": "onnx", "quantization": ""}),
+        ];
+        let a = provenance_from(&rows, "x/a.gguf", None, "", None).unwrap();
+        assert_eq!((a.backend.as_deref(), a.quant.as_deref()), (Some("llama.cpp"), Some("Q4_K_M")), "a row is found by its path too");
+        assert_eq!(a.weights_path, None, "no models root, no weights path");
+        let b = provenance_from(&rows, "b", Some(std::path::Path::new("/m")), "", None).unwrap();
+        assert_eq!((b.backend.as_deref(), b.quant.as_deref(), b.weights_path), (Some("MLX"), Some("8bit"), None));
+        let c = provenance_from(&rows, "c", None, "", None).unwrap();
+        assert_eq!((c.backend, c.quant, c.runtime), (None, None, None));
+    }
+
     use super::*;
     use crate::engine::is_not_resident;
     use serde_json::json;
