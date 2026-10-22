@@ -525,6 +525,19 @@ export function ownRowOf(rows: readonly Run[], sessionId: string, missionId: str
   return rows.find((r) => r.dispatch_id === sessionId && rowIsTheSessions(r, sessionId, missionId, grain)) ?? null;
 }
 
+/** (#2868) The `/runs` row of mission `missionId` itself: a mission-backed
+ *  row (`mission`, or `dispatch` for a crew-of-one) whose id is the mission's.
+ *  A lab row can carry a mission's id too (the mission its records name), but
+ *  it is the lab run's, never the mission's. */
+export function missionRowOf(rows: readonly Run[], missionId: string): Run | null {
+  return rows.find((r) => r.id === missionId && (r.kind === "mission" || r.kind === "dispatch")) ?? null;
+}
+
+/** The status the daemon decided on `row`, as a view renders it. */
+function rowState(row: Run): RunState {
+  return row.abandoned_reason ? { status: row.status, abandonReason: row.abandoned_reason } : { status: row.status };
+}
+
 function rowIsTheSessions(r: Run, sessionId: string, missionId: string | null, grain: Grain | null): boolean {
   if (r.kind === "mission") return grain === "run" && r.id === missionId;
   return missionId === null || r.id === missionId || r.id === sessionId;
@@ -543,7 +556,7 @@ function rowIsTheSessions(r: Run, sessionId: string, missionId: string | null, g
 export function shownRunState(l: Lifecycle, row: Run | null, live: boolean): RunState {
   const own = toRunState(l);
   if (!row) return own;
-  const decided: RunState = row.abandoned_reason ? { status: row.status, abandonReason: row.abandoned_reason } : { status: row.status };
+  const decided = rowState(row);
   if (live) return decided;
   const ended = (s: RunState) => s.status !== "running" && s.status !== "planned";
   return ended(own) && ended(decided) ? decided : own;

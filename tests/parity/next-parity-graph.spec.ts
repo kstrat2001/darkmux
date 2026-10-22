@@ -50,7 +50,7 @@ const {
   extractTimelineNodesText,
   expandAllTimelineTasks,
   extractPortHeaderText,
-  headerFactsOf,
+  portHeaderFactsOf,
   extractPortEventsText,
   sectionOf,
   eventsBodyOf,
@@ -179,7 +179,7 @@ test.describe("next-parity-graph: MissionGraphLens vs. the standalone page's fro
     expect(gotEdges, "edge count must match the standalone-page golden byte-for-byte").toBe(sectionOf(CANVAS_GOLDEN, "edges"));
 
     const gotHeader = await extractPortHeaderText(page);
-    expect(gotHeader, "the port's own header must name the SAME mission id + status as the golden").toBe(headerFactsOf(CANVAS_GOLDEN));
+    expect(gotHeader, "the port's header must name the golden's mission id and the runs board's status").toBe(portHeaderFactsOf(CANVAS_GOLDEN));
 
     const gotEvents = (await extractPortEventsText(page)).join("\n");
     expect(gotEvents, "EventLogColumn's rows must carry the SAME time|action|subject triples as the standalone page's .evrow list").toBe(
@@ -230,7 +230,7 @@ test.describe("next-parity-graph: MissionGraphLens vs. the standalone page's fro
     );
 
     const gotHeader = await extractPortHeaderText(page);
-    expect(gotHeader, "the port's own header must name the SAME mission id + status as the golden").toBe(headerFactsOf(TIMELINE_GOLDEN));
+    expect(gotHeader, "the port's header must name the golden's mission id and the runs board's status").toBe(portHeaderFactsOf(TIMELINE_GOLDEN));
 
     const gotEvents = (await extractPortEventsText(page)).join("\n");
     expect(gotEvents, "EventLogColumn's rows must carry the SAME time|action|subject triples as the standalone page's .evrow list").toBe(

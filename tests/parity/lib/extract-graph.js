@@ -37,7 +37,10 @@
 // function's own doc for the one field EventLogColumn's row doesn't render
 // natively (`handle`) and how it's recovered.
 
+const { readFileSync } = require("node:fs");
+const path = require("node:path");
 const { normalize } = require("./extract-lens.js");
+const { CORPUS_DIR } = require("./paths.js");
 
 /**
  * The masthead / metrics strip (`.top`: mission id, status badge, live
@@ -287,6 +290,20 @@ function headerFactsOf(fullGoldenText) {
   return normalize(`${missionId} | ${status.toLowerCase()}`);
 }
 
+/** The port's header facts: the mission id from the standalone golden, the
+ * status from the corpus's runs board. Since #2868 the port's header shows
+ * the runs board's status (one owner for a run's status), so it no longer
+ * repeats the standalone page's lifecycle word ("finalized"); the board's
+ * row in `corpus/runs.json` is the fact it must match. */
+function portHeaderFactsOf(fullGoldenText) {
+  const [missionId] = headerFactsOf(fullGoldenText).split(" | ");
+  const runs = JSON.parse(readFileSync(path.join(CORPUS_DIR, "runs.json"), "utf8"));
+  const rows = Array.isArray(runs) ? runs : runs.runs || [];
+  const row = rows.find((r) => r.id === missionId);
+  if (!row) throw new Error(`corpus/runs.json has no row for ${missionId}`);
+  return normalize(`${missionId} | ${row.status}`);
+}
+
 /** `EventLogColumn`'s own rows (`.eventlog__rec`), normalized to the SAME
  * `time | action | subject` triple shape `extractEventRowsText` produces
  * from the standalone page's `.evrow`s. Two real differences from that
@@ -372,6 +389,7 @@ module.exports = {
   extractTimelineGolden,
   extractPortHeaderText,
   headerFactsOf,
+  portHeaderFactsOf,
   extractPortEventsText,
   sectionOf,
   eventsBodyOf,
