@@ -53,4 +53,12 @@ impl Platform for OtherPlatform {
     fn reclaimable_memory_bytes(&self) -> Option<u64> {
         None
     }
+
+    fn process_start_stamp(&self, _pid: u32) -> Option<u64> {
+        None
+    }
+
+    fn pid_namespace(&self) -> Option<String> {
+        None
+    }
 }

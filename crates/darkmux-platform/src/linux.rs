@@ -86,6 +86,18 @@ impl Platform for LinuxPlatform {
         tiers_from_policies(read_policies_with_freq(), &online_cpus()).into_iter().map(|(_, mhz)| mhz).collect()
     }
 
+    /// `/proc/<pid>/stat` field 22: the start time in clock ticks since
+    /// boot. World-readable unless `/proc` is mounted with `hidepid`.
+    fn process_start_stamp(&self, pid: u32) -> Option<u64> {
+        start_ticks_from_proc_stat(&read_to_string(&format!("/proc/{pid}/stat"))?)
+    }
+
+    /// The inode of `/proc/self/ns/pid` (its link reads `pid:[4026531836]`).
+    /// Two processes see each other's pids only when this matches.
+    fn pid_namespace(&self) -> Option<String> {
+        pid_namespace_from_link(&read_link("/proc/self/ns/pid")?)
+    }
+
     /// `/proc/meminfo`'s `MemAvailable`.
     fn reclaimable_memory_bytes(&self) -> Option<u64> {
         reclaimable_from_meminfo(&read_to_string("/proc/meminfo")?)
@@ -103,6 +115,30 @@ pub(crate) fn installed_ram_from_meminfo(meminfo: &str) -> Option<u64> {
         .parse()
         .ok()?;
     Some((kib * 1024).div_ceil(GIB) * GIB)
+}
+
+/// `/proc/<pid>/stat`'s field 22 (start time). `comm` (field 2) is
+/// parenthesized and may contain spaces; fields after the LAST `)` are
+/// space-separated, starting at field 3.
+pub(crate) fn start_ticks_from_proc_stat(stat: &str) -> Option<u64> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// `pid:[4026531836]` -> `pid:4026531836`; anything else is `None`.
+pub(crate) fn pid_namespace_from_link(link: &str) -> Option<String> {
+    let inode = link.trim().strip_prefix("pid:[")?.strip_suffix(']')?;
+    (!inode.is_empty() && inode.bytes().all(|b| b.is_ascii_digit())).then(|| format!("pid:{inode}"))
+}
+
+#[cfg(target_os = "linux")]
+fn read_link(path: &str) -> Option<String> {
+    std::fs::read_link(path).ok().map(|p| p.to_string_lossy().into_owned())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_link(_path: &str) -> Option<String> {
+    None
 }
 
 #[cfg(target_os = "linux")]

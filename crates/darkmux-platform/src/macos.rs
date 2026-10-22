@@ -70,6 +70,67 @@ impl Platform for MacPlatform {
     fn reclaimable_memory_bytes(&self) -> Option<u64> {
         reclaimable_from_vm_stat(&vm_stat()?, page_size().unwrap_or(16_384))
     }
+    /// `sysctl(CTL_KERN, KERN_PROC, KERN_PROC_PID, pid)`'s
+    /// `kinfo_proc.kp_proc.p_starttime`, in microseconds since the epoch.
+    /// Works for a process owned by ANY user, which is the point: a reused
+    /// pid after a reboot lands on launchd (pid 1) or a root daemon. (#2917
+    /// re-review M-A: `proc_pidinfo(PROC_PIDTBSDINFO)` answers nothing for
+    /// another user's process.)
+    fn process_start_stamp(&self, pid: u32) -> Option<u64> {
+        kinfo_start_stamp(pid)
+    }
+
+    /// macOS has one pid namespace per machine.
+    fn pid_namespace(&self) -> Option<String> {
+        Some("macos".to_string())
+    }
+}
+
+/// (#2917, moved here by #3200) See [`MacPlatform::process_start_stamp`].
+#[cfg(target_os = "macos")]
+fn kinfo_start_stamp(pid: u32) -> Option<u64> {
+    // `struct kinfo_proc` begins with `struct extern_proc kp_proc`, whose
+    // first member is the union `p_un`; `p_starttime` is that union's
+    // `struct timeval` arm, so it sits at offset 0 of the whole record:
+    // `tv_sec` (i64) at 0, `tv_usec` (i32 on Darwin) at 8. The libc crate
+    // does not declare `kinfo_proc` for Apple targets, so the buffer is
+    // sized by the kernel's own size probe and read at those offsets.
+    let pid = libc::pid_t::try_from(pid).ok()?;
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+    let mut len: libc::size_t = 0;
+    // SAFETY: a null destination with a valid `len` pointer is sysctl's
+    // documented "how big is it" probe.
+    let rc = unsafe {
+        libc::sysctl(mib.as_mut_ptr(), mib.len() as libc::c_uint, std::ptr::null_mut(), &mut len, std::ptr::null_mut(), 0)
+    };
+    if rc != 0 || len < 16 {
+        return None;
+    }
+    // u64 words so the i64 at offset 0 is aligned.
+    let mut buf = vec![0u64; len.div_ceil(8)];
+    let mut got = buf.len() * 8;
+    // SAFETY: `buf` is at least `len` bytes (rounded up to whole words) and
+    // `got` says exactly that; the return value and filled length are
+    // checked before anything is read.
+    let rc = unsafe {
+        libc::sysctl(mib.as_mut_ptr(), mib.len() as libc::c_uint, buf.as_mut_ptr().cast(), &mut got, std::ptr::null_mut(), 0)
+    };
+    // A pid with no process answers rc 0 with nothing filled in.
+    if rc != 0 || got < 16 {
+        return None;
+    }
+    let head: Vec<u8> = buf[..2].iter().flat_map(|w| w.to_ne_bytes()).collect();
+    let sec = i64::from_ne_bytes(head[0..8].try_into().ok()?);
+    let usec = i32::from_ne_bytes(head[8..12].try_into().ok()?);
+    if sec <= 0 || usec < 0 {
+        return None;
+    }
+    Some((sec as u64).saturating_mul(1_000_000).saturating_add(usec as u64))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn kinfo_start_stamp(_pid: u32) -> Option<u64> {
+    None
 }
 
 #[cfg(target_os = "macos")]

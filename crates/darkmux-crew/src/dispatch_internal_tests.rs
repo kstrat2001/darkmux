@@ -5273,6 +5273,7 @@
         // with compaction, allowed tools, and json mode. Asserts the
         // COMPLETE argv vector including all hardening flags (#839).
         let config = DockerRunConfig {
+            host_identity: None,
             output_schema: None,
             container_name: "darkmux-dispatch-test-123".to_string(),
             workspace: PathBuf::from("/host/workspace"),
@@ -5543,6 +5544,7 @@
     /// A minimal argv config whose only variable is the container base URL.
     fn argv_config_with_base_url(base_url: Option<String>) -> DockerRunConfig {
         DockerRunConfig {
+            host_identity: None,
             output_schema: None,
             container_name: "darkmux-dispatch-2904".to_string(),
             workspace: PathBuf::from("/tmp/ws"),
@@ -5822,6 +5824,7 @@
         // compaction, no allowed tools, no json — asserts that optional
         // flags are omitted when not set.
         let config = DockerRunConfig {
+            host_identity: None,
             output_schema: None,
             container_name: "darkmux-dispatch-min".to_string(),
             workspace: PathBuf::from("/tmp/ws"),
@@ -5966,6 +5969,7 @@
             "required": ["verdict"]
         });
         let config = DockerRunConfig {
+            host_identity: None,
             output_schema: Some(schema.clone()),
             container_name: "darkmux-dispatch-schema".to_string(),
             workspace: PathBuf::from("/tmp/ws"),
@@ -6028,6 +6032,7 @@
     /// exactly one field so the assertion isolates that branch.
     fn base_argv_config() -> DockerRunConfig {
         DockerRunConfig {
+            host_identity: None,
             output_schema: None,
             container_name: "darkmux-edge".to_string(),
             workspace: PathBuf::from("/tmp/ws"),
@@ -6064,6 +6069,24 @@
             container_host_access: darkmux_platform::ContainerHostAccess::Builtin,
             container_user: darkmux_platform::ContainerUser::Image,
         }
+    }
+
+    /// (#3200) A known host labels its container with pid, start time and
+    /// machine, before the `--` image fence; an unknown host labels nothing,
+    /// so `darkmux serve`'s reaper leaves the container alone.
+    #[test]
+    fn build_docker_run_argv_labels_the_container_with_its_host() {
+        let mut config = base_argv_config();
+        config.host_identity =
+            Some(crate::orphan_reaper::HostIdentity { pid: 42, start: 4200, machine: "MACHINE-A".into(), pid_ns: "pid:9".into() });
+        let argv = build_docker_run_argv(&config);
+        let fence = argv.iter().position(|a| a == "--").expect("image fence");
+        for label in ["darkmux.dispatch.host-pid=42", "darkmux.dispatch.host-start=4200", "darkmux.dispatch.host-machine=MACHINE-A", "darkmux.dispatch.host-pid-ns=pid:9"] {
+            let at = argv.iter().position(|a| a == label).unwrap_or_else(|| panic!("{label} missing: {argv:?}"));
+            assert_eq!(argv[at - 1], "--label");
+            assert!(at < fence, "{label} must be a docker option, not a runtime arg");
+        }
+        assert!(!build_docker_run_argv(&base_argv_config()).iter().any(|a| a == "--label"), "no host, no labels");
     }
 
     /// (#2480 review, finding 5) `--timeout` reaches the container as a
@@ -7863,6 +7886,7 @@
         // inspects the REAL Command the dispatch executes, not just
         // build_docker_run_argv's output vector (which the other tests cover).
         let config = DockerRunConfig {
+            host_identity: None,
             output_schema: None,
             container_name: "darkmux-dispatch-reg".to_string(),
             workspace: PathBuf::from("/tmp/ws"),
@@ -14985,6 +15009,7 @@
         assert!(warning.is_none());
 
         let config = DockerRunConfig {
+            host_identity: None,
             output_schema: None,
             container_name: "darkmux-dispatch-compactor-wire".to_string(),
             workspace: PathBuf::from("/tmp/ws"),

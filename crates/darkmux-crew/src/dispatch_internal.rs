@@ -2264,6 +2264,12 @@ fn apply_runtime_limit_flags(cmd: &mut Command, max_turns_override: Option<u32>)
 pub struct DockerRunConfig {
     /// Unique container name for `docker ps` debugging.
     pub container_name: String,
+    /// (#3200) The darkmux process starting this container, written as
+    /// labels (`orphan_reaper::host_label_args`) so `darkmux serve`'s reaper
+    /// can tell a container whose host died unhandled. `None` (the host
+    /// cannot read its own start time or machine uid) labels nothing, and
+    /// the reaper leaves an unlabeled container alone.
+    pub host_identity: Option<crate::orphan_reaper::HostIdentity>,
     /// Host path of the agent's workspace tree (mounted at /workspace).
     pub workspace: PathBuf,
     /// Host path for out-of-band bookkeeping (mounted at /darkmux-out).
@@ -2561,6 +2567,9 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     // `runtime/src/main.rs` about `/proc/1/mem`; see that comment's own note
     // for the now-off-by-one PID under `--init`.
     args.push("--init".to_string());
+
+    // (#3200) Who started this container, for `darkmux serve`'s reaper.
+    args.extend(config.host_identity.iter().flat_map(crate::orphan_reaper::host_label_args));
 
     // (#1187) Keep stdin open ONLY when the container needs its remote auth
     // secret piped in — every other dispatch (local, or a remote endpoint
@@ -7645,6 +7654,7 @@ fn container_run_config(
     let agentic_brain = agentic_brain_flags(agentic_pm);
     Ok(DockerRunConfig {
         container_name: container_name.to_string(),
+        host_identity: crate::orphan_reaper::HostIdentity::this_process(),
         workspace: run.workspace.clone(),
         host_out: run.host_out.clone(),
         // (#2295) The attachment directories the briefed mods want readable
