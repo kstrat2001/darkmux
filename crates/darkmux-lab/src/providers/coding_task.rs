@@ -2632,6 +2632,22 @@ mod tests {
         assert!(run_verify_command(None, tmp.path(), tmp.path()).unwrap().is_none());
     }
 
+    /// What a run resolves before it dispatches: the prompt, and no plan for
+    /// a workload with no verify command. A workload with no prompt is
+    /// refused before anything is planned.
+    #[test]
+    fn the_prompt_and_verify_plan_resolve_before_the_dispatch() {
+        let tmp = TempDir::new().unwrap();
+        let loaded = make_loaded(basic_spec(), tmp.path().to_path_buf());
+        let (prompt, plan) = prompt_and_verify_plan(&loaded, tmp.path()).unwrap();
+        assert_eq!((prompt.as_str(), plan), ("write tests", None));
+        let mut spec = basic_spec();
+        spec.prompt = None;
+        let loaded = make_loaded(spec, tmp.path().to_path_buf());
+        let err = prompt_and_verify_plan(&loaded, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("must define prompt or promptFile"), "{err}");
+    }
+
     #[test]
     fn run_verify_command_executes_command() {
         let tmp = TempDir::new().unwrap();

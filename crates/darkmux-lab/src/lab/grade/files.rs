@@ -68,21 +68,31 @@ fn walk(root: &Path) -> Result<BTreeMap<String, Entry>> {
 }
 
 fn walk_into(dir: &Path, prefix: &str, out: &mut BTreeMap<String, Entry>) -> Result<()> {
-    for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
+    for (name, path, kind) in entries(dir)? {
         if is_artifact(prefix, &name) {
             continue;
         }
         let rel = join_rel(prefix, &name);
-        let kind = entry.file_type()?;
         if kind.is_dir() {
-            walk_into(&entry.path(), &rel, out)?;
-        } else if let Some(e) = read_entry(&entry.path(), kind)? {
+            walk_into(&path, &rel, out)?;
+        } else if let Some(e) = read_entry(&path, kind)? {
             out.insert(rel, e);
         }
     }
     Ok(())
+}
+
+/// Every entry of `dir`: its name, path and type (a link's own type, never
+/// its target's).
+fn entries(dir: &Path) -> Result<Vec<(String, std::path::PathBuf, fs::FileType)>> {
+    fs::read_dir(dir)
+        .with_context(|| format!("reading {}", dir.display()))?
+        .map(|entry| {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            Ok((name, entry.path(), entry.file_type()?))
+        })
+        .collect()
 }
 
 fn join_rel(prefix: &str, name: &str) -> String {
@@ -104,14 +114,11 @@ pub(crate) fn is_artifact(prefix: &str, name: &str) -> bool {
 /// Remove every run or build dropping under `dir` (see [`is_artifact`]).
 /// Symlinks are removed as links, never followed.
 pub(crate) fn prune_artifacts(dir: &Path, prefix: &str) -> Result<()> {
-    for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let kind = entry.file_type()?;
+    for (name, path, kind) in entries(dir)? {
         if is_artifact(prefix, &name) {
-            remove(&entry.path(), kind)?;
+            remove(&path, kind)?;
         } else if kind.is_dir() {
-            prune_artifacts(&entry.path(), &join_rel(prefix, &name))?;
+            prune_artifacts(&path, &join_rel(prefix, &name))?;
         }
     }
     Ok(())

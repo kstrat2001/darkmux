@@ -411,6 +411,14 @@ fn write_refusal_manifest(run_dir: &Path, workload_id: &str, refused: &[crate::p
     }
     let mut manifest = RunManifest::read_or_default(run_dir)?;
     manifest.refused_artifacts = crate::providers::coding_task::refused_records(refused);
+    fill_refusal_defaults(&mut manifest, run_dir, workload_id);
+    manifest.write(run_dir)?;
+    crate::providers::coding_task::announce_recorded(refused);
+    Ok(())
+}
+
+/// What a refusal manifest says that the manifest does not say already.
+fn fill_refusal_defaults(manifest: &mut RunManifest, run_dir: &Path, workload_id: &str) {
     if manifest.schema_version.is_none() {
         manifest.schema_version = Some(6);
     }
@@ -430,9 +438,6 @@ fn write_refusal_manifest(run_dir: &Path, workload_id: &str, refused: &[crate::p
     if manifest.ok.is_none() {
         manifest.ok = Some(false);
     }
-    manifest.write(run_dir)?;
-    crate::providers::coding_task::announce_recorded(refused);
-    Ok(())
 }
 
 /// The trajectory of a one-call run, which has no runtime to write one: a
@@ -1547,5 +1552,30 @@ mod tests {
         assert_eq!(report.run_id, "the-canonical-id");
         assert_eq!(report.workload_id, "t");
         assert_eq!(report.walltime_ms, 42);
+    }
+
+    /// The error path's manifest: nothing refused writes nothing; a refusal
+    /// fills only what the manifest does not already say.
+    #[test]
+    fn a_refusal_manifest_fills_only_what_is_missing() {
+        let tmp = TempDir::new().unwrap();
+        let refused = [crate::providers::coding_task::RefusedArtifact { file: "trajectory.jsonl".into(), reason: "a symlink".into() }];
+        let fresh = tmp.path().join("run-7");
+        std::fs::create_dir_all(&fresh).unwrap();
+        write_refusal_manifest(&fresh, "w", &[]).unwrap();
+        assert!(!fresh.join("manifest.json").exists());
+        write_refusal_manifest(&fresh, "w", &refused).unwrap();
+        let m = RunManifest::read(&fresh).unwrap();
+        assert_eq!((m.workload.as_deref(), m.provider.as_deref(), m.run_id.as_deref(), m.ok), (Some("w"), Some("prompt"), Some("run-7"), Some(false)));
+        assert_eq!(m.schema_version, Some(6));
+        assert_eq!(m.refused_artifacts.as_ref().map(Vec::len), Some(1));
+
+        let kept = tmp.path().join("run-8");
+        std::fs::create_dir_all(&kept).unwrap();
+        std::fs::write(kept.join("manifest.json"), r#"{"workload": "x", "provider": "p", "run_id": "r", "ok": true, "schema_version": 8, "manifest_schema_version": "1.0"}"#).unwrap();
+        write_refusal_manifest(&kept, "w", &refused).unwrap();
+        let m = RunManifest::read(&kept).unwrap();
+        assert_eq!((m.workload.as_deref(), m.provider.as_deref(), m.run_id.as_deref(), m.ok), (Some("x"), Some("p"), Some("r"), Some(true)));
+        assert_eq!((m.schema_version, m.manifest_schema_version.as_deref()), (Some(8), Some("1.0")));
     }
 }

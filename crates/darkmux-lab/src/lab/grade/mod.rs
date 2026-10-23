@@ -120,27 +120,30 @@ pub(crate) fn grade(input: &GradeInput) -> Result<GradeRecord> {
     let copies = Copies::new(input.work);
     let mut checks = vec![run_finished(input.dispatch, input.result_kind)];
     checks.extend(scope_row(input, &changes));
-    let suite = match &input.spec.suite {
-        Some(spec) => Some(suite_row(input, spec, &copies)?),
-        None => None,
-    };
-    let run = suite.as_ref().map(|(row, run, spec)| {
-        checks.push(row.clone());
-        (*spec, run)
-    });
-    if let Some((spec, run)) = run {
-        checks.extend(portable_row(input, spec, run, &copies)?);
-    }
+    let (suite_checks, run) = suite_rows(input, &copies)?;
+    checks.extend(suite_checks);
     checks.extend(style_row(input, &changes)?);
-    let green = run.is_some_and(|(_, run)| run.green());
+    let green = run.as_ref().is_some_and(|run| run.green());
     checks.extend(behaviors_row(input, green, &copies)?);
     checks.extend(reply_row(input));
     Ok(GradeRecord {
         passed: checks.iter().all(|c| c.passed),
         checks,
-        tests_passed: run.and_then(|(_, run)| run.counts.as_ref().map(|c| c.passed())),
+        tests_passed: run.and_then(|run| run.counts.as_ref().map(|c| c.passed())),
         ..Default::default()
     })
+}
+
+/// The suite's row and, when declared, the portable row, with the suite's
+/// run on the result; nothing when the workload declares no suite.
+fn suite_rows(input: &GradeInput, copies: &Copies) -> Result<(Vec<GradeCheck>, Option<SuiteRun>)> {
+    let Some(spec) = &input.spec.suite else {
+        return Ok((vec![], None));
+    };
+    let (row, run, spec) = suite_row(input, spec, copies)?;
+    let mut rows = vec![row];
+    rows.extend(portable_row(input, spec, &run, copies)?);
+    Ok((rows, Some(run)))
 }
 
 fn scope_row(input: &GradeInput, changes: &files::Changes) -> Option<GradeCheck> {
@@ -516,6 +519,27 @@ fn missed_behaviors(
     if let Some(problem) = control_problem(input, spec, suite, copies, &originals)? {
         return Ok(vec![problem]);
     }
+    Ok(surviving_bugs(input, spec, suite, copies, &originals)?
+        .into_iter()
+        .map(|(b, ids)| {
+            let ids: Vec<String> = ids.iter().map(|i| format!("#{i}")).collect();
+            format!(
+                "tests stay green with a planted bug in {b} (bug {})",
+                ids.join(", ")
+            )
+        })
+        .collect())
+}
+
+/// Each behavior with a planted bug the suite stayed green through, and the
+/// numbers of those bugs.
+fn surviving_bugs(
+    input: &GradeInput,
+    spec: &crate::workloads::grade_spec::BehaviorsGrade,
+    suite: &SuiteGrade,
+    copies: &Copies,
+    originals: &std::collections::BTreeMap<String, String>,
+) -> Result<Vec<(String, Vec<usize>)>> {
     let mut survived: Vec<(String, Vec<usize>)> = Vec::new();
     for (i, mutant) in spec.mutants.iter().enumerate() {
         let original = &originals[&mutant.file];
@@ -529,16 +553,7 @@ fn missed_behaviors(
             }
         }
     }
-    Ok(survived
-        .into_iter()
-        .map(|(b, ids)| {
-            let ids: Vec<String> = ids.iter().map(|i| format!("#{i}")).collect();
-            format!(
-                "tests stay green with a planted bug in {b} (bug {})",
-                ids.join(", ")
-            )
-        })
-        .collect())
+    Ok(survived)
 }
 
 /// The control: each planted file with a blank line added, which changes no
@@ -976,16 +991,8 @@ pub struct Regrade {
 pub fn regrade(run: &str, fixture: Option<&Path>, write: bool) -> Result<Regrade> {
     let run_dir = crate::lab::inspect::resolve_run_dir(run);
     let manifest = RunManifest::read(&run_dir)?;
-    let loaded = graded_workload(&run_dir, &manifest)?;
-    let spec = declared_grade(&loaded)?;
-    let fixture_dir = run_fixture(&run_dir, &manifest, fixture)?;
-    let result = kept_result(&run_dir, &manifest)?;
-    let dispatch = kept_dispatch(&manifest);
     let ungraded = Ungraded::from_manifest(&manifest);
-    let (prompt, runner) = prompt_and_runner(&loaded)?;
-    // Any error, a signal included, ends here: a kept run's manifest is
-    // written only with a verdict the grader reached.
-    let graded = try_grade_run(&run_dir, spec, &prompt, &fixture_dir, &result, &dispatch, &runner)?;
+    let graded = grade_kept(&run_dir, &manifest, fixture)?;
     let record = if write {
         self::record(&run_dir, graded, &ungraded)?
     } else {
@@ -997,6 +1004,39 @@ pub fn regrade(run: &str, fixture: Option<&Path>, write: bool) -> Result<Regrade
         ungraded,
         recorded: write,
     })
+}
+
+/// A kept run's result graded by its workload's current grader, against the
+/// fixture it started from. Any error, a signal included, ends here: a kept
+/// run's manifest is written only with a verdict the grader reached.
+fn grade_kept(run_dir: &Path, manifest: &RunManifest, fixture: Option<&Path>) -> Result<GradeRecord> {
+    let loaded = graded_workload(run_dir, manifest)?;
+    let spec = declared_grade(&loaded)?;
+    let fixture_dir = run_fixture(run_dir, manifest, fixture)?;
+    let result = kept_result(run_dir, manifest)?;
+    let (prompt, runner) = prompt_and_runner(&loaded)?;
+    try_grade_run(run_dir, spec, &prompt, &fixture_dir, &result, &kept_dispatch(manifest), &runner)
+}
+
+/// `darkmux lab grade <run>...`: print each run's checks; 1 when any run
+/// fails or cannot be graded, else 0.
+pub fn grade_runs(runs: &[String], fixture: Option<&Path>, write: bool) -> i32 {
+    let mut code = 0;
+    for run in runs {
+        match regrade(run, fixture, write) {
+            Ok(graded) => {
+                print!("{}", render(&graded));
+                if !graded.passed() {
+                    code = 1;
+                }
+            }
+            Err(e) => {
+                eprintln!("{run}: cannot grade: {e:#}");
+                code = 1;
+            }
+        }
+    }
+    code
 }
 
 /// The prompt the model was given, and where the suite runs.
