@@ -2,15 +2,14 @@
 //! is what darklyenergized's `lab_run.ts` (`bundleRun`, `assembleBundle`,
 //! `weightsHashOf`, `looksLikePath`) produced for the inputs below, and what
 //! its `parseBundle` accepted (`ok`). A change on either side that drifts
-//! from the other fails here. Format 4's additions (the fields count and
-//! `maxCompletionTokens`, null for these inputs) were written here first, on
-//! format 3's site output; the site's own v4 output replaces it once it ships.
+//! from the other fails here. A bundle with nothing format 4 added is still
+//! format 3, so this golden holds for it unchanged.
 
 use super::*;
 use serde_json::json;
 
 fn golden() -> Value {
-    serde_json::from_str(include_str!("golden/site_bundle_v4.json")).unwrap()
+    serde_json::from_str(include_str!("golden/site_bundle_v3.json")).unwrap()
 }
 
 fn manifest() -> Value {
@@ -105,6 +104,15 @@ fn a_structured_output_run_carries_its_fields_count_and_reply_cap() {
     assert_eq!(v["fieldsMissed"], json!(["hours"]), "a name that reads as a path is never shared");
     assert_eq!(run["stack"]["maxCompletionTokens"], 31_000);
     assert_eq!(run["passed"], false);
+    let plain = bundle_run("q", &manifest(), &stats(), &RanBy::default(), &stack(), &[]);
+    let fixture = json!({ "name": "biz", "version": "1.0" });
+    let four = assemble("kstrat2001/biz", &"a".repeat(40), &fixture, vec![run, plain.clone()]).unwrap();
+    assert_eq!(four["formatVersion"], 4, "one structured run makes the bundle format 4");
+    assert!(four["runs"][1]["stack"].get("maxCompletionTokens").is_some_and(Value::is_null), "the other run says null");
+    let three = assemble("kstrat2001/biz", &"a".repeat(40), &fixture, vec![plain]).unwrap();
+    assert_eq!(three["formatVersion"], 3, "nothing format 4 added: still format 3");
+    assert!(three["runs"][0]["stack"].get("maxCompletionTokens").is_none());
+    assert!(three["runs"][0]["detail"]["verify"].get("fieldsExpected").is_none());
 }
 
 #[test]

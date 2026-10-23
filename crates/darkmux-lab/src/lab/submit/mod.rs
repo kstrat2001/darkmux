@@ -25,8 +25,12 @@ pub const BUNDLE_FORMAT: &str = "darkmux-evals-bundle";
 /// 3 adds what built darkmux (`darkmuxCommit`, `darkmuxBuild`). 4 adds the
 /// structured-output count (`detail.verify.fieldsCorrect`, `fieldsExpected`,
 /// `fieldsMissed`) and the reply cap the dispatch sent
-/// (`stack.maxCompletionTokens`), each null when the run has none.
+/// (`stack.maxCompletionTokens`). A bundle none of whose runs carries either
+/// is still written as 3, without those keys, so a site that reads only 3
+/// keeps taking every other result.
 pub const BUNDLE_FORMAT_VERSION: u64 = 4;
+/// The version a bundle with nothing format 4 added is written as.
+const BUNDLE_FORMAT_VERSION_BEFORE_FIELDS: u64 = 3;
 /// Where results are shared unless `--site` says otherwise.
 pub const DEFAULT_SITE: &str = "https://evals.darkmux.com";
 
@@ -527,12 +531,36 @@ pub fn assemble(repo: &str, commit_sha: &str, fixture_manifest: &Value, runs: Ve
         },
         Some(other) => other.to_string(),
     };
+    let (version_number, runs) = format_for(runs);
     Ok(json!({
         "format": BUNDLE_FORMAT,
-        "formatVersion": BUNDLE_FORMAT_VERSION,
+        "formatVersion": version_number,
         "fixture": { "repo": repo, "commitSha": commit_sha, "name": name, "version": version, "manifest": fixture_manifest },
         "runs": runs,
     }))
+}
+
+/// Format 4 when any run carries what 4 added; otherwise 3, with those keys
+/// (null in every run) left out.
+fn format_for(mut runs: Vec<Value>) -> (u64, Vec<Value>) {
+    let carries = |r: &Value| {
+        !r["stack"]["maxCompletionTokens"].is_null()
+            || ["fieldsCorrect", "fieldsExpected", "fieldsMissed"].iter().any(|k| !r["detail"]["verify"][*k].is_null())
+    };
+    if runs.iter().any(carries) {
+        return (BUNDLE_FORMAT_VERSION, runs);
+    }
+    for r in &mut runs {
+        if let Some(stack) = r.get_mut("stack").and_then(Value::as_object_mut) {
+            stack.remove("maxCompletionTokens");
+        }
+        if let Some(v) = r.pointer_mut("/detail/verify").and_then(Value::as_object_mut) {
+            for k in ["fieldsCorrect", "fieldsExpected", "fieldsMissed"] {
+                v.remove(k);
+            }
+        }
+    }
+    (BUNDLE_FORMAT_VERSION_BEFORE_FIELDS, runs)
 }
 
 /// What the site's strict parser (`parseBundle`) would refuse in a bundle,

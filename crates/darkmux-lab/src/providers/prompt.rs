@@ -53,7 +53,6 @@ impl WorkloadProvider for PromptProvider {
     ) -> Result<RunResult> {
         let prompt = resolve_prompt_from(loaded, prompt_base(loaded, sandbox_dir))?;
         let role = pick_role(loaded);
-        let reply_room = reply_room_tokens(loaded, profile, &role, &prompt)?;
         let session_id = SessionId::adhoc(run.clone(), &role, &loaded.manifest.workload.id);
         // (#2511) Report the id back to the lab harness BEFORE dispatching —
         // this is the ONE mint for this run, so it is the run's own
@@ -61,15 +60,24 @@ impl WorkloadProvider for PromptProvider {
         on_session_id(&session_id);
 
         let started = std::time::Instant::now();
-        let (dispatched, one_call) = dispatch_via_internal(
+        let mut opts = dispatch_opts(
             &role,
             &prompt,
             &session_id,
             loaded.manifest.workload.image.as_deref(),
             config_path,
             profile_name,
-            reply_room,
-        )?;
+        );
+        // (`replyRoom`) Worked out from the route the dispatch itself will
+        // take: its selected model's window and its own system prompt.
+        let reply_room = match loaded.manifest.workload.reply_room {
+            Some(ReplyRoom::Context) => {
+                reply_room_for(darkmux_crew::dispatch::one_call_context(&opts)?, &prompt, &loaded.manifest.workload.id)?
+            }
+            None => None,
+        };
+        opts.max_completion_tokens = reply_room;
+        let (dispatched, one_call) = dispatch_via_internal(opts)?;
         finish_run(
             &FinishInputs {
                 loaded,
@@ -261,33 +269,34 @@ fn prompt_base<'a>(loaded: &'a LoadedWorkload, sandbox_dir: &'a Path) -> &'a Pat
     }
 }
 
-/// Tokens of template and identity text a dispatch adds around the role's
-/// prompt and the message, which the character count below cannot see.
+/// Tokens of chat-template text a dispatch adds around the system prompt
+/// and the message, which the byte count below cannot see.
 const REPLY_ROOM_OVERHEAD_TOKENS: u32 = 512;
 /// Below this the window is too small to be worth a dispatch.
 const REPLY_ROOM_MIN_TOKENS: u32 = 256;
 
-/// The reply room a `replyRoom: "context"` workload asks for: the profile
-/// model's `n_ctx` minus the prompt. The host has no tokenizer, so the prompt
-/// (the role's system prompt plus the message) is over-counted at one token
-/// per three characters, plus a fixed overhead: the reply may get a little
-/// less than the true remainder, never more than the window holds. `None`
-/// when the workload does not ask.
-fn reply_room_tokens(loaded: &LoadedWorkload, profile: &Profile, role: &str, prompt: &str) -> Result<Option<u32>> {
-    let Some(ReplyRoom::Context) = loaded.manifest.workload.reply_room else { return Ok(None) };
-    let model_id = profile.default_model_id().unwrap_or_default();
-    let n_ctx = profile
-        .models
-        .iter()
-        .find(|m| m.id == model_id)
-        .and_then(|m| m.n_ctx)
-        .ok_or_else(|| anyhow!("workload \"{}\" asks for replyRoom \"context\", but the profile's model `{model_id}` declares no n_ctx", loaded.manifest.workload.id))?;
-    let system = darkmux_crew::loader::role_prompt(role).unwrap_or_default();
-    Ok(Some(reply_room_from(n_ctx, system.chars().count() + prompt.chars().count(), &loaded.manifest.workload.id)?))
+/// The reply room a `replyRoom: "context"` workload gets: the window of the
+/// model the dispatch selected minus everything it sends around the reply.
+/// `None` when the dispatch is not one call (`ctx` is `None`): the container
+/// path continues a reply in chunks and sends no cap to lift.
+fn reply_room_for(ctx: Option<darkmux_crew::dispatch::OneCallContext>, prompt: &str, workload_id: &str) -> Result<Option<u32>> {
+    let Some(ctx) = ctx else { return Ok(None) };
+    let n_ctx = ctx.n_ctx.ok_or_else(|| {
+        anyhow!(
+            "workload \"{workload_id}\" asks for replyRoom \"context\", but its model `{}` declares no n_ctx in the profile",
+            ctx.model
+        )
+    })?;
+    Ok(Some(reply_room_from(n_ctx, ctx.system_prompt_bytes + prompt.len(), workload_id)?))
 }
 
-fn reply_room_from(n_ctx: u32, prompt_chars: usize, workload_id: &str) -> Result<u32> {
-    let prompt_tokens = u32::try_from(prompt_chars.div_ceil(3)).unwrap_or(u32::MAX).saturating_add(REPLY_ROOM_OVERHEAD_TOKENS);
+/// The host has no tokenizer, so the prompt is over-counted at one token per
+/// three UTF-8 bytes (a CJK character is three bytes and about one token;
+/// English runs nearer four characters a token), plus a fixed overhead: the
+/// reply may get a little less than the true remainder, never more than the
+/// window holds.
+fn reply_room_from(n_ctx: u32, prompt_bytes: usize, workload_id: &str) -> Result<u32> {
+    let prompt_tokens = u32::try_from(prompt_bytes.div_ceil(3)).unwrap_or(u32::MAX).saturating_add(REPLY_ROOM_OVERHEAD_TOKENS);
     let room = n_ctx.saturating_sub(prompt_tokens);
     if room < REPLY_ROOM_MIN_TOKENS {
         return Err(anyhow!(
@@ -301,17 +310,23 @@ fn reply_room_from(n_ctx: u32, prompt_chars: usize, workload_id: &str) -> Result
 /// crew::dispatch substrate. The runtime emits a JSON envelope per
 /// `runtime/src/main.rs::build_json_envelope` which becomes the
 /// provider's stdout artifact.
-fn dispatch_via_internal(
+fn dispatch_via_internal(opts: darkmux_crew::dispatch::DispatchOpts) -> Result<(Dispatched, bool)> {
+    let result = darkmux_crew::dispatch::dispatch(opts).context("internal-runtime dispatch via lab harness")?;
+    // The container path mounts a bookkeeping dir; the one-call path has none.
+    let one_call = result.out_dir.is_none();
+    Ok((Dispatched { exit_code: result.exit_code, stdout: result.stdout, stderr: result.stderr }, one_call))
+}
+
+/// The lab's dispatch options for one prompt run.
+fn dispatch_opts(
     role_id: &str,
     prompt: &str,
     session_id: &SessionId,
     image: Option<&str>,
     config_path: Option<&str>,
     profile_name: &str,
-    max_completion_tokens: Option<u32>,
-) -> Result<(Dispatched, bool)> {
-    use darkmux_crew::dispatch::{dispatch, DispatchOpts};
-    let opts = DispatchOpts {
+) -> darkmux_crew::dispatch::DispatchOpts {
+    darkmux_crew::dispatch::DispatchOpts {
         finding_sites: None,
         // (#2914) The lab benchmarks candidate utility models.
         allow_utility_model: true,
@@ -352,18 +367,15 @@ fn dispatch_via_internal(
         // (#703 Slice 4) the workload's declared image, if any.
         // (#1199) Bench-only knobs; defaults preserve existing behavior.
         force_container: false,
-        // (`replyRoom`) Read only by the one-call path a tool-less role on
-        // an unmanaged endpoint takes; `None` keeps its own default.
-        max_completion_tokens,
+        // (`replyRoom`) Set by the caller; read only by the one-call path a
+        // tool-less role on an unmanaged endpoint takes. `None` keeps that
+        // path's own default.
+        max_completion_tokens: None,
         image: image.map(str::to_string),
         model_base_url_override: None,
         step_id: None, // (#1483) set on the graph-step path only
         system_prompt_override: None,
-    };
-    let result = dispatch(opts).context("internal-runtime dispatch via lab harness")?;
-    // The container path mounts a bookkeeping dir; the one-call path has none.
-    let one_call = result.out_dir.is_none();
-    Ok((Dispatched { exit_code: result.exit_code, stdout: result.stdout, stderr: result.stderr }, one_call))
+    }
 }
 
 #[cfg(test)]
@@ -436,6 +448,11 @@ pub(crate) fn run_verify(loaded: &LoadedWorkload, text: &str) -> Option<VerifyOu
 
 /// The workload's `verify.expect` check of `text`, `None` when it has none.
 pub(crate) fn expect_report(loaded: &LoadedWorkload, text: &str) -> Option<expect::FieldsReport> {
+    // Only a prompt run applies it (`lab run` refuses it on any other
+    // provider), so another provider's inspect never shows its verdict.
+    if loaded.manifest.workload.provider != PromptProvider.id() {
+        return None;
+    }
     let want = loaded.manifest.workload.verify.as_ref()?.expect.as_ref()?;
     Some(expect::grade(want, text))
 }
@@ -721,21 +738,18 @@ mod tests {
         assert!(err.contains("raise the profile's n_ctx"), "{err}");
     }
 
+    /// The room counts the dispatch's own system prompt and the message in
+    /// bytes, needs the selected model's n_ctx, and is absent on a route that
+    /// is not one call.
     #[test]
-    fn reply_room_needs_the_profile_models_n_ctx_and_is_absent_unless_asked() {
-        let tmp = TempDir::new().unwrap();
-        let mut profile = darkmux_types::Profile::default();
-        profile.models.push(darkmux_types::ProfileModel { id: "m".into(), ..Default::default() });
-        let plain = make_loaded(spec_with_prompt("x"), tmp.path().to_path_buf());
-        assert_eq!(reply_room_tokens(&plain, &profile, "no-such-role", "x").unwrap(), None);
-
-        let mut spec = spec_with_prompt("x");
-        spec.reply_room = Some(ReplyRoom::Context);
-        let asks = make_loaded(spec, tmp.path().to_path_buf());
-        let err = reply_room_tokens(&asks, &profile, "no-such-role", "x").unwrap_err().to_string();
-        assert!(err.contains("declares no n_ctx"), "{err}");
-        profile.models[0].n_ctx = Some(16_384);
-        assert_eq!(reply_room_tokens(&asks, &profile, "no-such-role", "xyz").unwrap(), Some(16_384 - 1 - REPLY_ROOM_OVERHEAD_TOKENS));
+    fn reply_room_follows_the_dispatchs_own_route() {
+        use darkmux_crew::dispatch::OneCallContext;
+        assert_eq!(reply_room_for(None, "x", "w").unwrap(), None, "the container path sends no cap");
+        let ctx = |n_ctx| Some(OneCallContext { model: "m".into(), n_ctx, system_prompt_bytes: 5_700 });
+        let err = reply_room_for(ctx(None), "x", "w").unwrap_err().to_string();
+        assert!(err.contains("`m` declares no n_ctx"), "{err}");
+        // "日本" is six bytes: two CJK characters are counted as two tokens.
+        assert_eq!(reply_room_for(ctx(Some(16_384)), "日本", "w").unwrap(), Some(16_384 - 1_902 - REPLY_ROOM_OVERHEAD_TOKENS));
     }
 
     /// A workload that binds a fixture reads its promptFile from the run's

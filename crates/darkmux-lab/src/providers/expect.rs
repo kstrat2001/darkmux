@@ -16,6 +16,9 @@
 //! - any other object: an object whose listed keys each match (keys the
 //!   expected object does not list are not checked).
 //!
+//! A one-key object named `anyOf` or `includes` is always read as the
+//! keyword, so a field of that name cannot be expected inside a value.
+//!
 //! The verdict is all or nothing (every top-level field matches); the count
 //! of fields right out of fields expected is recorded beside it, the same
 //! measure for every structured-output workload.
@@ -35,12 +38,16 @@ pub(crate) struct FieldsReport {
 
 impl FieldsReport {
     pub(crate) fn passed(&self) -> bool {
-        self.unreadable.is_none() && self.missed.is_empty()
+        // An empty expectation checks nothing, so it never reads as a pass.
+        self.unreadable.is_none() && self.missed.is_empty() && self.expected > 0
     }
 
     pub(crate) fn details(&self) -> String {
         if let Some(why) = &self.unreadable {
             return format!("fields 0/{}: {why}", self.expected);
+        }
+        if self.expected == 0 {
+            return "fields 0/0: verify.expect names no field".to_string();
         }
         if self.missed.is_empty() {
             return format!("fields {}/{}: all match", self.correct, self.expected);
@@ -81,19 +88,19 @@ pub(crate) fn grade(expect: &Map<String, Value>, reply: &str) -> FieldsReport {
     }
 }
 
-/// The first JSON object in a reply. A ```json fence around it, or prose
-/// before it, is tolerated; what follows the object is not read.
+/// The JSON object the reply opens with at its first `{`. A ```json fence
+/// or prose before it is tolerated; what follows the object is not read. If
+/// that object does not parse (a reply cut off at its cap), the reply has no
+/// answer: an object nested inside it is never graded in its place.
 fn first_object(reply: &str) -> Result<Map<String, Value>, String> {
-    let mut rest = reply;
-    while let Some(start) = rest.find('{') {
-        let candidate = &rest[start..];
-        let mut stream = serde_json::Deserializer::from_str(candidate).into_iter::<Value>();
-        if let Some(Ok(Value::Object(obj))) = stream.next() {
-            return Ok(obj);
-        }
-        rest = &candidate[1..];
+    let Some(start) = reply.find('{') else {
+        return Err("no JSON object in the reply".to_string());
+    };
+    let mut stream = serde_json::Deserializer::from_str(&reply[start..]).into_iter::<Value>();
+    match stream.next() {
+        Some(Ok(Value::Object(obj))) => Ok(obj),
+        _ => Err("the reply's JSON object does not parse (cut off?)".to_string()),
     }
-    Err("no JSON object in the reply".to_string())
 }
 
 fn matches(want: &Value, got: Option<&Value>) -> bool {
@@ -300,18 +307,40 @@ mod tests {
             "Here is the answer: {\"a\": \"1\"} hope that helps {\"a\": \"2\"}"
         )
         .passed());
-        // A brace in prose that does not open an object is skipped.
-        assert!(grade(&e, "Sure {not json} then {\"a\": \"1\"}").passed());
     }
 
     #[test]
     fn a_reply_with_no_json_object_fails_every_field_and_says_why() {
         let e = expect(json!({"a": "1", "b": "2"}));
-        for reply in ["", "no json here", "[1, 2]", "{\"a\": "] {
+        for reply in ["", "no json here", "[1, 2]"] {
             let r = grade(&e, reply);
             assert!(!r.passed(), "{reply:?}");
             assert_eq!((r.correct, r.expected), (0, 2));
             assert_eq!(r.details(), "fields 0/2: no JSON object in the reply");
         }
+    }
+
+    /// A reply cut off mid-object has no answer, even when an object nested
+    /// inside it would match on its own.
+    #[test]
+    fn a_cut_off_reply_is_never_graded_by_an_object_nested_inside_it() {
+        let e = expect(json!({"a": "1", "b": "2"}));
+        for reply in [
+            r#"{"items":[{"a":"1","b":"2"}, {"a""#,
+            r#"{"a": "#,
+            r#"Sure {not json} then {"a": "1", "b": "2"}"#,
+        ] {
+            let r = grade(&e, reply);
+            assert!(!r.passed(), "{reply:?}");
+            assert_eq!(r.details(), "fields 0/2: the reply's JSON object does not parse (cut off?)", "{reply:?}");
+        }
+    }
+
+    #[test]
+    fn an_empty_expectation_is_never_a_pass() {
+        let r = grade(&Map::new(), r#"{"a": "1"}"#);
+        assert!(!r.passed());
+        assert_eq!(r.details(), "fields 0/0: verify.expect names no field");
+        assert_eq!((r.correct, r.expected), (0, 0));
     }
 }
