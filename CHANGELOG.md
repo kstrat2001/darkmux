@@ -38,7 +38,7 @@ darkmux release.
   that fixture (the A/B context arm included), and a prompt run keeps a trajectory (the runtime's,
   including when the dispatch fails, or on the one-call path the one call's own counts), so
   `darkmux lab submit` can share it. A runtime file the run refuses to copy is recorded on the
-  run manifest.
+  run manifest, including when the dispatch fails before it can write one.
 - **`lab submit` bundle format 4** carries the fields count (`detail.verify.fieldsCorrect`,
   `fieldsExpected`, `fieldsMissed`) and `stack.maxCompletionTokens`. A bundle with neither is
   still written as format 3. Workload schema 1.1 (additive).

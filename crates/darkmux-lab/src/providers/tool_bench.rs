@@ -1265,6 +1265,7 @@ impl WorkloadProvider for ToolBenchProvider {
             ..RunManifest::default()
         }
         .write(run_dir)?;
+        crate::providers::coding_task::announce_recorded(&refused_artifacts);
 
         let infra = trial_refs.iter().filter(|t| t.score.infra_fail).count();
         let passes = trial_refs.iter().filter(|t| t.score.passed).count();

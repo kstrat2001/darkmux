@@ -254,6 +254,9 @@ pub fn write_manifest(run_dir: &Path, m: &ManifestInputs<'_>) -> Result<()> {
     m.end.record_in(&mut manifest);
     manifest.refused_artifacts = crate::providers::coding_task::refused_records(m.refused);
     manifest.write(run_dir)?;
+    // The copy already warned that the file was not copied. Say it was recorded
+    // only now, after the field is on disk.
+    crate::providers::coding_task::announce_recorded(m.refused);
     Ok(())
 }
 
@@ -357,12 +360,15 @@ fn preserve_trajectory(out_dir: Option<&Path>, run_dir: &Path) -> Vec<crate::pro
 }
 
 /// Names the out dir and arms preservation before a prompt dispatch. Drop
-/// copies the runtime's trajectory and findings into the run dir and closes
-/// an unterminated trajectory, which is the only copy a dispatch that
-/// returns `Err` gets. [`Self::keep`] is the success path: it copies, returns
-/// what was refused, and disarms before a one-call trajectory is written.
+/// copies the runtime's trajectory and findings into the run dir, closes an
+/// unterminated trajectory, and writes any refused copy onto the run manifest.
+/// That is the only copy a dispatch that returns `Err` gets: the lab writes
+/// no manifest for that outcome. [`Self::keep`] is the success path: it
+/// copies, returns what was refused, and disarms before a one-call trajectory
+/// is written, so Drop does not record the refusal a second time.
 struct PromptDispatchGuard {
     preserve: crate::providers::coding_task::TrajectoryPreserver,
+    run_dir: std::path::PathBuf,
 }
 
 impl PromptDispatchGuard {
@@ -370,7 +376,7 @@ impl PromptDispatchGuard {
         let out_dir = crate::providers::coding_task::named_out_dir(role);
         let preserve = crate::providers::coding_task::TrajectoryPreserver::new(out_dir.clone(), run_dir.to_path_buf());
         opts.host_out = Some(out_dir);
-        Self { preserve }
+        Self { preserve, run_dir: run_dir.to_path_buf() }
     }
 
     fn keep(mut self, dispatch_out: Option<&Path>, run_dir: &Path) -> Vec<crate::providers::coding_task::RefusedArtifact> {
@@ -378,6 +384,44 @@ impl PromptDispatchGuard {
         self.preserve.disarm();
         refused
     }
+}
+
+impl Drop for PromptDispatchGuard {
+    fn drop(&mut self) {
+        let preserved = self.preserve.salvage();
+        if let Err(e) = write_refusal_manifest(&self.run_dir, &preserved.refused) {
+            eprintln!("darkmux: warn: could not record a refused runtime file on the run manifest: {e}");
+        }
+    }
+}
+
+/// The error path's manifest: `finish_run` never runs, so this is the only
+/// writer. A dispatch that copied cleanly leaves no manifest. A refusal is
+/// described as recorded only after this write succeeds.
+fn write_refusal_manifest(run_dir: &Path, refused: &[crate::providers::coding_task::RefusedArtifact]) -> Result<()> {
+    if refused.is_empty() {
+        return Ok(());
+    }
+    let mut manifest = RunManifest::read_or_default(run_dir)?;
+    manifest.refused_artifacts = crate::providers::coding_task::refused_records(refused);
+    if manifest.schema_version.is_none() {
+        manifest.schema_version = Some(6);
+    }
+    if manifest.manifest_schema_version.is_none() {
+        manifest.manifest_schema_version = Some(darkmux_types::data_version::RUN_MANIFEST_SCHEMA_VERSION.to_string());
+    }
+    if manifest.provider.is_none() {
+        manifest.provider = Some(PromptProvider.id().to_string());
+    }
+    if manifest.run_id.is_none() {
+        manifest.run_id = run_dir.file_name().and_then(|n| n.to_str()).map(str::to_string);
+    }
+    if manifest.ok.is_none() {
+        manifest.ok = Some(false);
+    }
+    manifest.write(run_dir)?;
+    crate::providers::coding_task::announce_recorded(refused);
+    Ok(())
 }
 
 /// The trajectory of a one-call run, which has no runtime to write one: a
@@ -941,6 +985,41 @@ mod tests {
         let fold = darkmux_trajectory::TrajectoryFold::from_path(&run.join("trajectory.jsonl"));
         assert_eq!(fold.turns(), 1, "what completed is in the run dir");
         assert_eq!(fold.complete.expect("a terminal record").result, darkmux_trajectory::RESULT_INTERRUPTED);
+        assert!(!run.join("manifest.json").exists(), "a clean copy writes no refusal manifest");
+    }
+
+    /// A dispatch that returns `Err` never reaches `finish_run`, and the lab
+    /// writes no manifest for that outcome. A refused copy still has to land
+    /// on one: the warning used to say it had, while Drop threw the list away.
+    #[test]
+    fn a_dropped_prompt_guard_records_a_refused_copy_on_the_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let run = tmp.path().join("run");
+        fs::create_dir_all(&run).unwrap();
+        let session = SessionId::adhoc(RunId::lab("run1").unwrap(), "reviewer", "w");
+        let mut opts = dispatch_opts("reviewer", "hi", &session, None, None, "p");
+        let guard = PromptDispatchGuard::arm("reviewer", &run, &mut opts);
+        let out = opts.host_out.clone().unwrap();
+        let _remove_out = RemoveOut(out.clone());
+        fs::create_dir_all(out.join(".darkmux-runtime")).unwrap();
+        fs::write(out.join(".darkmux-runtime/trajectory.jsonl"), "{\"type\":\"dispatch.start\",\"ts\":1,\"model\":\"m\"}\n").unwrap();
+        let secret = tmp.path().join("host-secret.txt");
+        fs::write(&secret, "HOST-SECRET-2869").unwrap();
+        std::os::unix::fs::symlink(&secret, out.join(".darkmux-runtime/findings.jsonl")).unwrap();
+
+        drop(guard);
+
+        assert!(!run.join("findings.jsonl").exists(), "a refused symlink must not be copied");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(run.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["provider"], "prompt");
+        assert_eq!(manifest["ok"], false, "the dispatch did not complete");
+        assert_eq!(manifest["schema_version"], 6);
+        assert_eq!(manifest["refused_artifacts"][0]["file"], "findings.jsonl");
+        assert!(manifest["refused_artifacts"][0]["reason"].as_str().unwrap().contains("symlink"));
+        let copied = fs::read_to_string(run.join("trajectory.jsonl")).unwrap();
+        assert!(copied.contains("interrupted"), "the error path still closes the trajectory");
+        assert!(!copied.contains("HOST-SECRET-2869"));
     }
 
     /// The success path copies, records a refusal, and disarms. Disarming
