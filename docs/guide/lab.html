@@ -100,7 +100,7 @@ darkmux lab run pepper-grinder</code></pre>
       <li><code>behaviors</code>: one planted bug per behavior the baseline leaves untested (pepper, row lock, boot guard, expiry parsing), each applied to the fixture's own source in a copy; the run's tests must go red for every one. Edits that change no behavior (a blank line at the end of the file, a space added inside each planted bug's span) must leave them green, so tests that read the source text instead of running it do not count.</li>
       <li><code>reply_required</code>: the run ended with a final reply. Its content is not graded.</li>
     </ul>
-    <p>The verify command and the grader's suite runs execute on the host as your user, in a copy of the run's sandbox folder, not in the dispatch container: run fixtures you trust.</p>
+    <p>The grader's suite runs execute where the verify command does: in a container with only a copy of the run's sandbox mounted, no network and no capabilities, unless <code>runtime.tests_on_host</code> puts them on this machine as you (see "Where the verify command runs" below).</p>
     <p>The checks and their evidence are recorded under <code>verify.grade</code> in the run's manifest. <code>darkmux lab grade &lt;run&gt;...</code> grades kept runs again without re-running them, against the fixture content each run started from; <code>--record</code> writes the result into the run's manifest.</p>
   </div>
 </section>

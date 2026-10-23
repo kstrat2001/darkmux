@@ -27,9 +27,12 @@
 //! never touched: every check runs on copies, under a scratch directory in
 //! the run directory, removed afterwards.
 //!
-//! SECURITY: like the verify command (`coding_task::run_verify_command`), the
-//! suite runs on the HOST with the operator's privileges, bounded by a timeout
-//! and killed as a process group (`darkmux_crew::bounded_command`).
+//! SECURITY (#906): the suite runs the code the model wrote, so, like the
+//! verify command (`coding_task::run_verify_command`), it runs where
+//! [`Runner`] says: by default in a container with only the copy mounted, no
+//! network and no capabilities (`darkmux_crew::contained_command`); on the
+//! host as the operator only with `runtime.tests_on_host`. Either way it is
+//! bounded by a timeout and killed as a process group.
 
 mod files;
 mod junit;
@@ -37,6 +40,8 @@ mod junit;
 mod tests;
 
 use crate::lab::dispatch_end::DispatchEnd;
+use darkmux_crew::bounded_command::Bounded;
+use darkmux_crew::contained_command::{self, Placement};
 use crate::lab::manifest::{
     GradeCheck, GradeRecord, ManifestVerify, ManifestVerifyReport, RunManifest,
 };
@@ -51,6 +56,36 @@ use std::time::Duration;
 const WORK_DIR: &str = "grade-work";
 /// The default bound on one run of the suite command.
 const DEFAULT_SUITE_TIMEOUT_SECONDS: u64 = 120;
+
+/// Where the grader runs the suite, and as whom in a container.
+#[derive(Debug, Clone)]
+pub(crate) struct Runner {
+    pub placement: Placement,
+    pub user: Option<String>,
+}
+
+impl Runner {
+    /// The suite runs where the run's verify command runs: the workload's
+    /// image (else the runtime image), or the host with `runtime.tests_on_host`.
+    pub(crate) fn for_workload(loaded: &crate::workloads::types::LoadedWorkload) -> Result<Self> {
+        let placement = crate::providers::coding_task::test_placement(loaded)?;
+        let user = crate::providers::coding_task::test_user(&placement)?;
+        Ok(Self { placement, user })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn host() -> Self {
+        Self { placement: Placement::Host, user: None }
+    }
+
+    /// The path the suite sees for `root`, the directory mounted for it.
+    fn view(&self, root: &Path) -> String {
+        match self.placement {
+            Placement::Host => root.display().to_string(),
+            Placement::Container(_) => "/workspace".to_string(),
+        }
+    }
+}
 
 /// Everything one grading reads. Nothing here is written to.
 pub(crate) struct GradeInput<'a> {
@@ -70,6 +105,8 @@ pub(crate) struct GradeInput<'a> {
     pub baseline_test_count: Option<u64>,
     /// An empty scratch directory the grader may fill.
     pub work: &'a Path,
+    /// Where the suite runs.
+    pub runner: &'a Runner,
 }
 
 /// Where each suite run's copy lives: `<work>/<opaque>/result`, the opaque
@@ -150,11 +187,11 @@ fn suite_row<'s>(
     spec: &'s SuiteGrade,
     copies: &Copies,
 ) -> Result<(GradeCheck, SuiteRun, &'s SuiteGrade)> {
-    let before = run_suite(spec, input.fixture, &copies.fresh()?)?;
+    let before = run_suite(input.runner, spec, input.fixture, &copies.fresh()?, "")?;
     if before.counts.is_none() {
         bail!("the fixture's own suite run left no readable report: cannot tell which tests must still pass");
     }
-    let run = run_suite(spec, input.result, &copies.fresh()?)?;
+    let run = run_suite(input.runner, spec, input.result, &copies.fresh()?, "")?;
     let check = suite_check(spec, &run, &before, input.baseline_test_count)?;
     Ok((check, run, spec))
 }
@@ -168,7 +205,7 @@ fn portable_row(
     let Some(portable) = &input.spec.portable else {
         return Ok(None);
     };
-    let elsewhere = run_suite(spec, input.result, &copies.fresh()?.join("elsewhere"))?;
+    let elsewhere = run_suite(input.runner, spec, input.result, &copies.fresh()?, "elsewhere")?;
     let same =
         elsewhere.counts.as_ref().map(|c| c.passed()) == suite.counts.as_ref().map(|c| c.passed());
     let problems = match (elsewhere.green(), same) {
@@ -356,10 +393,11 @@ impl SuiteRun {
     }
 }
 
-/// Copy `source` to `<at>/result` and run the suite there.
-fn run_suite(spec: &SuiteGrade, source: &Path, at: &Path) -> Result<SuiteRun> {
-    let dir = copy_into(source, at)?;
-    run_suite_in(spec, &dir, &at.join("report"))
+/// Copy `source` to `<root>/<rel>/result` and run the suite there. `rel`
+/// moves the copy to another path, inside a container too.
+fn run_suite(runner: &Runner, spec: &SuiteGrade, source: &Path, root: &Path, rel: &str) -> Result<SuiteRun> {
+    copy_into(source, &root.join(rel))?;
+    run_suite_in(runner, spec, root, &Path::new(rel).join("result"))
 }
 
 /// Copy `source` to `<at>/result`, creating `at`.
@@ -375,25 +413,36 @@ fn copy_into(source: &Path, at: &Path) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Run the suite command in `dir`, its report written to `report`.
-fn run_suite_in(spec: &SuiteGrade, dir: &Path, report: &Path) -> Result<SuiteRun> {
-    let command = spec
-        .command
-        .replace("${REPORT}", &shell_quote(&report.to_string_lossy()));
-    let mut cmd = std::process::Command::new("/bin/sh");
-    cmd.arg("-c").arg(&command).current_dir(dir);
-    let seconds = spec
-        .timeout_seconds
-        .unwrap_or(DEFAULT_SUITE_TIMEOUT_SECONDS);
-    use darkmux_crew::bounded_command::{run_bounded, Bounded};
-    let outcome = match run_bounded(cmd, Duration::from_secs(seconds)) {
+/// Run the suite command in `<root>/<dir>`, its report written to
+/// `<root>/report/report.xml`. Only `root` is mounted when it runs in a
+/// container.
+fn run_suite_in(runner: &Runner, spec: &SuiteGrade, root: &Path, dir: &Path) -> Result<SuiteRun> {
+    let reports = root.join("report");
+    fs::create_dir_all(&reports).with_context(|| format!("creating {}", reports.display()))?;
+    let report = format!("{}/report/report.xml", runner.view(root));
+    let command = spec.command.replace("${REPORT}", &shell_quote(&report));
+    let seconds = spec.timeout_seconds.unwrap_or(DEFAULT_SUITE_TIMEOUT_SECONDS);
+    let run = contained_command::Run {
+        command: &command,
+        tree: root,
+        workdir: &dir.to_string_lossy(),
+        mounts: &[],
+        user: runner.user.clone(),
+        name_prefix: "darkmux-grade",
+    };
+    let ran = contained_command::run(&runner.placement, &run, Duration::from_secs(seconds));
+    if contained_command::docker_failed(&runner.placement, &ran) {
+        let Bounded::Finished { stderr, .. } = &ran else { unreachable!() };
+        bail!("the suite could not run in its container: {}", String::from_utf8_lossy(stderr).trim());
+    }
+    let outcome = match ran {
         Bounded::Finished { code, .. } => SuiteOutcome::Exited { code },
         Bounded::TimedOut { seconds } => SuiteOutcome::TimedOut { seconds },
         Bounded::Interrupted => return Err(Interrupted.into()),
         Bounded::SpawnFailed(e) => bail!("could not start the suite command `{command}`: {e}"),
     };
     let counts = match spec.report {
-        TestReport::Junit => fs::read_to_string(report)
+        TestReport::Junit => fs::read_to_string(reports.join("report.xml"))
             .ok()
             .and_then(|xml| junit::parse(&xml)),
     };
@@ -630,7 +679,7 @@ fn run_planted(
         fs::create_dir_all(parent)?;
     }
     fs::write(&target, content)?;
-    let run = run_suite_in(suite, &dir, &at.join("report"))?;
+    let run = run_suite_in(input.runner, suite, &at, Path::new("result"))?;
     let _ = fs::remove_dir_all(&at);
     Ok(run)
 }
@@ -685,6 +734,7 @@ pub(crate) fn try_grade_run(
     fixture: &Path,
     result: &Path,
     dispatch: &DispatchEnd,
+    runner: &Runner,
 ) -> Result<GradeRecord> {
     let work = run_dir.join(WORK_DIR);
     let _ = fs::remove_dir_all(&work);
@@ -703,6 +753,7 @@ pub(crate) fn try_grade_run(
                 result_kind: result_kind.as_deref(),
                 baseline_test_count: baseline_test_count(fixture),
                 work: &work,
+                runner,
             })
         });
     let _ = fs::remove_dir_all(&work);
@@ -719,8 +770,9 @@ pub(crate) fn grade_run(
     fixture: &Path,
     result: &Path,
     dispatch: &DispatchEnd,
+    runner: &Runner,
 ) -> Result<GradeRecord> {
-    match try_grade_run(run_dir, spec, prompt, fixture, result, dispatch) {
+    match try_grade_run(run_dir, spec, prompt, fixture, result, dispatch, runner) {
         Err(e) if e.downcast_ref::<Interrupted>().is_some() => Err(e),
         graded => Ok(graded.unwrap_or_else(|e| cannot_grade(&e))),
     }
@@ -865,9 +917,10 @@ pub(crate) fn apply(
         .as_ref()
         .and_then(|v| v.coverage_min_pct);
     let (ungraded, tests_added) = ungraded_verdict(spec, coverage, raw, gate);
-    let graded = match crate::providers::coding_task::dispatched_prompt(loaded) {
-        Ok(prompt) => grade_run(run_dir, spec, &prompt, fixture, result, dispatch)?,
-        Err(e) => cannot_grade(&anyhow!("resolving the prompt: {e:#}")),
+    let graded = match (crate::providers::coding_task::dispatched_prompt(loaded), Runner::for_workload(loaded)) {
+        (Ok(prompt), Ok(runner)) => grade_run(run_dir, spec, &prompt, fixture, result, dispatch, &runner)?,
+        (Err(e), _) => cannot_grade(&anyhow!("resolving the prompt: {e:#}")),
+        (_, Err(e)) => cannot_grade(&e),
     };
     let tests_added = tests_added.or_else(|| {
         let baseline = baseline_test_count(fixture)?;
@@ -954,26 +1007,15 @@ pub fn regrade(run: &str, fixture: Option<&Path>, write: bool) -> Result<Regrade
     let run_dir = crate::lab::inspect::resolve_run_dir(run);
     let manifest = RunManifest::read(&run_dir)?;
     let loaded = graded_workload(&run_dir, &manifest)?;
-    let spec = loaded
-        .manifest
-        .workload
-        .verify
-        .as_ref()
-        .and_then(|v| v.grade.as_ref())
-        .ok_or_else(|| {
-            anyhow!(
-                "workload \"{}\" declares no verify.grade",
-                loaded.manifest.workload.id
-            )
-        })?;
+    let spec = declared_grade(&loaded)?;
     let fixture_dir = run_fixture(&run_dir, &manifest, fixture)?;
     let result = kept_result(&run_dir, &manifest)?;
     let dispatch = kept_dispatch(&manifest);
     let ungraded = Ungraded::from_manifest(&manifest);
-    let prompt = crate::providers::coding_task::dispatched_prompt(&loaded)?;
+    let (prompt, runner) = prompt_and_runner(&loaded)?;
     // Any error, a signal included, ends here: a kept run's manifest is
     // written only with a verdict the grader reached.
-    let graded = try_grade_run(&run_dir, spec, &prompt, &fixture_dir, &result, &dispatch)?;
+    let graded = try_grade_run(&run_dir, spec, &prompt, &fixture_dir, &result, &dispatch, &runner)?;
     let record = if write {
         self::record(&run_dir, graded, &ungraded)?
     } else {
@@ -985,6 +1027,22 @@ pub fn regrade(run: &str, fixture: Option<&Path>, write: bool) -> Result<Regrade
         ungraded,
         recorded: write,
     })
+}
+
+/// The prompt the model was given, and where the suite runs.
+fn prompt_and_runner(loaded: &crate::workloads::types::LoadedWorkload) -> Result<(String, Runner)> {
+    Ok((crate::providers::coding_task::dispatched_prompt(loaded)?, Runner::for_workload(loaded)?))
+}
+
+/// The workload's `verify.grade`, which a regrade needs.
+fn declared_grade(loaded: &crate::workloads::types::LoadedWorkload) -> Result<&GradeSpec> {
+    loaded
+        .manifest
+        .workload
+        .verify
+        .as_ref()
+        .and_then(|v| v.grade.as_ref())
+        .ok_or_else(|| anyhow!("workload \"{}\" declares no verify.grade", loaded.manifest.workload.id))
 }
 
 /// The run's own sandbox, where the lab keeps it; the manifest's path only

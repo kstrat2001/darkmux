@@ -109,6 +109,7 @@ fn run(
         result_kind: Some(kind_of(&dispatch)),
         baseline_test_count: Some(1),
         work: &work,
+        runner: &Runner::host(),
     })
 }
 
@@ -712,10 +713,35 @@ fn the_final_reply_is_read_from_the_runtime_envelope() {
     assert_eq!(final_reply(tmp.path()), None);
 }
 
+/// (#906) The lab-run step's suites run where `runtime.tests_on_host` says;
+/// these tests run them on the host, and put the setting back.
+struct TestsOnHost(Option<String>);
+
+impl TestsOnHost {
+    fn set() -> Self {
+        let prev = std::env::var("DARKMUX_TESTS_ON_HOST").ok();
+        unsafe { std::env::set_var("DARKMUX_TESTS_ON_HOST", "true") };
+        Self(prev)
+    }
+}
+
+impl Drop for TestsOnHost {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.0 {
+                Some(v) => std::env::set_var("DARKMUX_TESTS_ON_HOST", v),
+                None => std::env::remove_var("DARKMUX_TESTS_ON_HOST"),
+            }
+        }
+    }
+}
+
 /// The lab-run step grades a workload that declares a grader, records it,
 /// and hands back the recorded verdict; a workload without one is untouched.
 #[test]
+#[serial_test::serial]
 fn the_lab_run_step_grades_records_and_returns_the_verdict() {
+    let _host = TestsOnHost::set();
     let tmp = TempDir::new().unwrap();
     let f = fixture(tmp.path());
     let r = result_from(tmp.path(), &f);
@@ -793,7 +819,9 @@ fn the_lab_run_step_grades_records_and_returns_the_verdict() {
 /// threshold), or a raw verify that failed, still leaves a recorded, graded
 /// run that fails and says why.
 #[test]
+#[serial_test::serial]
 fn the_lab_run_step_records_a_fail_when_the_gate_errs() {
+    let _host = TestsOnHost::set();
     let tmp = TempDir::new().unwrap();
     let f = fixture(tmp.path());
     let r = result_from(tmp.path(), &f);
@@ -899,6 +927,7 @@ fn a_turn_limit_or_a_missing_envelope_is_not_a_finish() {
             result_kind: kind,
             baseline_test_count: Some(1),
             work: &work,
+            runner: &Runner::host(),
         })
         .unwrap();
         assert_eq!(failed(&record), ["run_finished"], "{record:?}");
@@ -1108,4 +1137,47 @@ fn a_grader_suite_supersedes_the_node_only_work_gate() {
     no_suite.suite = None;
     let (u, _) = ungraded_verdict(&no_suite, None, Some(&raw), Ok(Some(unreadable)));
     assert!(!u.passed);
+}
+
+/// (#906) The grader in a container reaches the same verdicts as on the host:
+/// the suite, the second path and the planted bugs all run there, each copy
+/// the only thing mounted. Needs Docker and the image; run with `--ignored`.
+#[test]
+#[ignore = "needs a Docker daemon and node:22-bookworm-slim"]
+fn the_grader_in_a_container_reaches_the_hosts_verdicts() {
+    let tmp = TempDir::new().unwrap();
+    let f = fixture(tmp.path());
+    let good = result_from(tmp.path(), &f);
+    write(&good, "test/b.t", "value=1");
+    let weak = tmp.path().join("weak");
+    crate::lab::cow_clone::cow_clone_dir(&f, &weak).unwrap();
+    write(&weak, "test/b.t", "other=2");
+    let contained = Runner {
+        placement: Placement::Container("node:22-bookworm-slim".into()),
+        user: None,
+    };
+    for (result, passed) in [(&good, true), (&weak, false)] {
+        let mut verdicts = vec![];
+        for runner in [Runner::host(), contained.clone()] {
+            let work = tmp.path().join("work");
+            let _ = fs::remove_dir_all(&work);
+            fs::create_dir_all(&work).unwrap();
+            let record = grade(&GradeInput {
+                spec: &spec(),
+                prompt: PROMPT,
+                fixture: &f,
+                result,
+                dispatch: &DispatchEnd::Completed,
+                reply: Some("done"),
+                result_kind: Some("stop"),
+                baseline_test_count: Some(1),
+                work: &work,
+                runner: &runner,
+            })
+            .unwrap();
+            assert_eq!(record.passed, passed, "{record:?}");
+            verdicts.push(record.checks.iter().map(|c| (c.id.clone(), c.passed)).collect::<Vec<_>>());
+        }
+        assert_eq!(verdicts[0], verdicts[1]);
+    }
 }
