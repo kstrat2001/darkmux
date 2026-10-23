@@ -399,8 +399,9 @@ pub fn detail_from(manifest: &Value, stats: &Value, names: &[String]) -> Value {
         // (5.5.0) The model's side of the run, beside the machine's: how often
         // the context was compacted, how full it got, how long each call
         // waited for its first token (prefill), and generation speed with
-        // that wait left out. New keys in detail need no site deploy first
-        // (darklyenergized#316): the site keeps a number it does not know yet.
+        // that wait left out. The site takes them only once darklyenergized#316
+        // is deployed (it keeps a detail number it does not know yet); until
+        // then it refuses the bundle, and `site_refusals` does not catch that.
         "compactions": count(s("compactions")),
         "contextPeakTokens": count(s("context_peak_tokens")),
         "firstTokenMsMedian": count(s("first_token_ms_median")),

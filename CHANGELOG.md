@@ -22,8 +22,10 @@ darkmux release.
   `decode_tok_per_s` (billed tokens over the billed seconds after each stream's first output,
   so a long prompt no longer reads as slow generation), `prefill_ms_billed`, and
   `context_peak_tokens` (the largest prompt any one call sent). Each is null when the run
-  did not record what it needs, never guessed. `lab submit` carries them, with `compactions`,
-  in each run's `detail`.
+  did not record what it needs, never guessed. `lab submit` adds `compactions`,
+  `contextPeakTokens`, `firstTokenMsMedian`, `firstTokenMsMax` and `decodeTokensPerSecond` to
+  each run's `detail` (not `prefill_ms_billed`). evals.darkmux.com takes these keys only once
+  darklyenergized#316 is deployed; until then it refuses the bundle.
 - **Prompt workloads can grade a structured answer: `verify.expect`.** The workload names the
   answer the reply's first JSON object that parses must give, field by field. Strings compare
   exactly (only the ends are trimmed); numbers compare as the same value (`1` and `1.0` match;
