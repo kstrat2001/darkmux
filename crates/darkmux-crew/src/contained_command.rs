@@ -338,6 +338,23 @@ mod tests {
         assert!(dir.join(SENTINEL).is_file());
     }
 
+    /// A container run whose mount check has nowhere to go never starts:
+    /// a tree with no parent, or a parent that is not a directory.
+    #[test]
+    fn a_container_run_without_room_for_the_mount_check_never_starts() {
+        let contained = Placement::Container("darkmux-no-such-image:0".into());
+        let at_root = Run { tree: Path::new("/"), ..a_run(&[], None) };
+        let err = run(&contained, &at_root, Duration::from_secs(5)).unwrap_err().0;
+        assert!(err.contains("no parent directory"), "{err}");
+        let root = tempfile::TempDir::new().unwrap();
+        let file = root.path().join("not-a-dir");
+        std::fs::write(&file, "").unwrap();
+        let tree = file.join("tree");
+        let under_a_file = Run { tree: &tree, ..a_run(&[], None) };
+        let err = run(&contained, &under_a_file, Duration::from_secs(5)).unwrap_err().0;
+        assert!(err.contains("could not write the mount check"), "{err}");
+    }
+
     /// (#906) A run in a real container sees its tree and no network, and the
     /// sentinel is gone afterwards. Needs Docker and `node:22-bookworm-slim`.
     #[test]

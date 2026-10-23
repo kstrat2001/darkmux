@@ -1182,3 +1182,278 @@ fn the_grader_in_a_container_reaches_the_hosts_verdicts() {
         assert_eq!(verdicts[0], verdicts[1]);
     }
 }
+
+/// `DARKMUX_HOME` pointed at a scratch root for one test, put back after.
+struct Home(Option<std::ffi::OsString>);
+
+impl Home {
+    fn set(root: &Path) -> Self {
+        let prev = std::env::var_os("DARKMUX_HOME");
+        unsafe { std::env::set_var("DARKMUX_HOME", root) };
+        Self(prev)
+    }
+}
+
+impl Drop for Home {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.0 {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+    }
+}
+
+/// A kept run of workload `w` (declared under `DARKMUX_HOME` with `spec`):
+/// the result in the run's own `sandbox`, the fixture where the manifest
+/// says, both hashes recorded, and a finished dispatch with a reply.
+/// `edit` changes the manifest before it is written.
+fn kept_run(
+    root: &Path,
+    spec: Option<&GradeSpec>,
+    edit: impl FnOnce(&mut serde_json::Value),
+) -> (PathBuf, PathBuf) {
+    let f = fixture(root);
+    let run_dir = root.join("runs").join("r1");
+    let r = run_dir.join("sandbox");
+    fs::create_dir_all(&run_dir).unwrap();
+    crate::lab::cow_clone::cow_clone_dir(&f, &r).unwrap();
+    write(&r, "test/b.t", "value=1");
+    write(
+        Path::new(&std::env::var_os("DARKMUX_HOME").unwrap()),
+        "workloads/w.json",
+        &serde_json::json!({"workload": {"id": "w", "provider": "coding-task",
+            "prompt": PROMPT, "verify": {"command": "true", "grade": spec}}})
+        .to_string(),
+    );
+    let hash = |d: &Path| crate::lab::sandbox_hash::hash_sandbox_dir(d).unwrap();
+    let mut manifest = serde_json::json!({
+        "workload": "w",
+        "ok": true,
+        "sandbox": r.to_string_lossy(),
+        "final_hash": hash(&r),
+        "fixture": {"source_path": f.to_string_lossy(), "baseline_hash": hash(&f)},
+        "verify": {"passed": true, "details": "gate ok"},
+    });
+    edit(&mut manifest);
+    fs::write(run_dir.join("manifest.json"), manifest.to_string()).unwrap();
+    fs::write(
+        run_dir.join("qa-reply.json"),
+        r#"{"result":"stop","final_assistant":"done"}"#,
+    )
+    .unwrap();
+    (run_dir, f)
+}
+
+/// The grader a kept run declares: [`spec`], with no baseline to beat (the
+/// test fixture declares none).
+fn kept_spec() -> GradeSpec {
+    let mut s = spec();
+    s.suite.as_mut().unwrap().more_than_baseline = false;
+    s
+}
+
+fn regrade_at(run_dir: &Path, fixture: Option<&Path>, write: bool) -> Result<Regrade> {
+    regrade(run_dir.to_str().unwrap(), fixture, write)
+}
+
+/// `lab grade` grades a kept run against the fixture it started from, prints
+/// every check, and writes the manifest only when asked.
+#[test]
+#[serial_test::serial]
+fn a_kept_run_is_graded_again_and_recorded_only_when_asked() {
+    let _host = TestsOnHost::set();
+    let tmp = TempDir::new().unwrap();
+    let _home = Home::set(&tmp.path().join("home"));
+    let (run_dir, f) = kept_run(tmp.path(), Some(&kept_spec()), |_| {});
+    let before = fs::read_to_string(run_dir.join("manifest.json")).unwrap();
+
+    let graded = regrade_at(&run_dir, None, false).unwrap();
+    assert!(graded.passed(), "{:?}", graded.record);
+    assert!(!graded.recorded);
+    assert_eq!(fs::read_to_string(run_dir.join("manifest.json")).unwrap(), before);
+    let text = render(&graded);
+    assert!(text.contains("  PASS  behaviors"), "{text}");
+    assert!(text.ends_with("  verdict: pass\n"), "{text}");
+
+    // Another checkout of the same content is as good as the run's own.
+    let copy = tmp.path().join("checkout");
+    crate::lab::cow_clone::cow_clone_dir(&f, &copy).unwrap();
+    let graded = regrade_at(&run_dir, Some(&copy), true).unwrap();
+    assert!(graded.recorded);
+    assert!(render(&graded).ends_with("  verdict: pass (recorded in the run's manifest)\n"));
+    let m = RunManifest::read(&run_dir).unwrap();
+    assert_eq!(m.verify_report().unwrap().grade.as_ref().unwrap().checks.len(), 6);
+    assert!(!run_dir.join(WORK_DIR).exists());
+
+    // The CLI's exit code: 0 only when every run is graded and passes.
+    let run = run_dir.to_string_lossy().into_owned();
+    assert_eq!(grade_runs(std::slice::from_ref(&run), None, false), 0);
+    let missing = tmp.path().join("no/such/run").to_string_lossy().into_owned();
+    assert_eq!(grade_runs(&[run, missing], None, false), 1);
+}
+
+/// A run kept outside the lab (no `sandbox` beside its manifest) is graded
+/// from the manifest's sandbox path; a dispatch that escalated or failed
+/// fails `run_finished`, and a failed ungraded verdict shows as its own row.
+#[test]
+#[serial_test::serial]
+fn a_kept_runs_dispatch_and_ungraded_verdict_come_from_its_manifest() {
+    let _host = TestsOnHost::set();
+    let tmp = TempDir::new().unwrap();
+    let _home = Home::set(&tmp.path().join("home"));
+    let elsewhere = tmp.path().join("elsewhere");
+    let (run_dir, _) = kept_run(tmp.path(), Some(&kept_spec()), |m| {
+        m["escalation"] = "stuck".into();
+        m["sandbox"] = elsewhere.to_string_lossy().into();
+        m["verify"] = serde_json::json!({"passed": false, "details": "no tests added"});
+    });
+    fs::rename(run_dir.join("sandbox"), &elsewhere).unwrap();
+    let graded = regrade_at(&run_dir, None, false).unwrap();
+    assert!(!graded.passed());
+    let text = render(&graded);
+    assert!(text.contains("  FAIL  run_finished"), "{text}");
+    assert!(text.contains("  FAIL  ungraded        no tests added"), "{text}");
+    assert!(text.ends_with("  verdict: fail\n"), "{text}");
+    assert_eq!(grade_runs(&[run_dir.to_string_lossy().into_owned()], None, false), 1);
+
+    let (run_dir, _) = kept_run(&tmp.path().join("b"), Some(&kept_spec()), |m| {
+        m["ok"] = false.into();
+        m["verify"] = serde_json::json!({"passed": false, "details": ""});
+    });
+    let graded = regrade_at(&run_dir, None, false).unwrap();
+    assert!(!graded.record.checks[0].passed, "{:?}", graded.record);
+    assert!(
+        render(&graded).contains("the verify command or work gate failed"),
+        "{}",
+        render(&graded)
+    );
+}
+
+/// `lab grade` refuses, and writes nothing, when it cannot tell what the run
+/// was: no workload, no grader, no fixture, no baseline, or a fixture or
+/// sandbox whose content is no longer what the run had.
+#[test]
+#[serial_test::serial]
+fn a_kept_run_that_cannot_be_graded_is_refused() {
+    let _host = TestsOnHost::set();
+    let tmp = TempDir::new().unwrap();
+    let _home = Home::set(&tmp.path().join("home"));
+    type Edit = fn(&mut serde_json::Value);
+    let cases: [(&str, Edit, &str); 4] = [
+        ("a", |m| m["workload"] = serde_json::Value::Null, "names no workload"),
+        ("b", |m| m["fixture"]["source_path"] = serde_json::Value::Null, "names no fixture; pass --fixture"),
+        ("c", |m| m["fixture"]["baseline_hash"] = serde_json::Value::Null, "records no baseline_hash"),
+        ("d", |m| m["final_hash"] = "0".into(), "changed after the run"),
+    ];
+    for (dir, edit, want) in cases {
+        let (run_dir, _) = kept_run(&tmp.path().join(dir), Some(&kept_spec()), edit);
+        let err = regrade_at(&run_dir, None, true).err().unwrap();
+        assert!(format!("{err:#}").contains(want), "{dir}: {err:#}");
+    }
+
+    let (run_dir, f) = kept_run(&tmp.path().join("e"), Some(&kept_spec()), |_| {});
+    write(&f, "notes.txt", "moved on\n");
+    let err = regrade_at(&run_dir, None, true).err().unwrap();
+    assert!(format!("{err:#}").contains("no longer matches"), "{err:#}");
+
+    let (run_dir, _) = kept_run(&tmp.path().join("f"), Some(&kept_spec()), |_| {});
+    fs::remove_dir_all(run_dir.join("sandbox")).unwrap();
+    let err = regrade_at(&run_dir, None, true).err().unwrap();
+    assert!(format!("{err:#}").contains("sandbox is gone"), "{err:#}");
+
+    let (run_dir, _) = kept_run(&tmp.path().join("g"), None, |_| {});
+    let err = regrade_at(&run_dir, None, true).err().unwrap();
+    assert!(format!("{err:#}").contains("declares no verify.grade"), "{err:#}");
+}
+
+/// A manifest with no verify report gets one to hold the grade; one whose
+/// `verify` is not an object is refused rather than overwritten.
+#[test]
+fn recording_a_grade_makes_a_report_or_refuses_a_foreign_one() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let rec = GradeRecord {
+        passed: true,
+        ..Default::default()
+    };
+    let failed_quietly = Ungraded {
+        passed: false,
+        details: String::new(),
+    };
+    fs::write(dir.join("manifest.json"), "{}").unwrap();
+    record(dir, rec.clone(), &failed_quietly).unwrap();
+    let m = RunManifest::read(dir).unwrap();
+    assert_eq!(m.verify_passed(), Some(false));
+    assert!(
+        m.verify_report()
+            .unwrap()
+            .details
+            .starts_with("ungraded check failed; graded: pass"),
+        "{}",
+        m.verify_report().unwrap().details
+    );
+
+    fs::write(dir.join("manifest.json"), r#"{"verify": "pass"}"#).unwrap();
+    let err = record(dir, rec, &failed_quietly).unwrap_err();
+    assert!(err.to_string().contains("not a JSON object"), "{err}");
+}
+
+/// A grader without a suite grades what it declares and reports no test count.
+#[test]
+fn a_grader_without_a_suite_grades_scope_and_reply_only() {
+    let tmp = TempDir::new().unwrap();
+    let f = fixture(tmp.path());
+    let r = result_from(tmp.path(), &f);
+    write(&r, "test/b.t", "value=1");
+    let s = GradeSpec {
+        suite: None,
+        portable: None,
+        behaviors: None,
+        ..spec()
+    };
+    let record = run(&s, &f, &r, DispatchEnd::Completed, Some("done"), tmp.path()).unwrap();
+    assert!(record.passed, "{record:?}");
+    assert_eq!(record.tests_passed, None);
+    let ids: Vec<&str> = record.checks.iter().map(|c| c.id.as_str()).collect();
+    assert_eq!(ids, ["run_finished", "scope", "reply_required"]);
+}
+
+/// Bugs planted in one behavior that all survive are named once, by number.
+#[test]
+fn surviving_bugs_of_one_behavior_are_named_together() {
+    let tmp = TempDir::new().unwrap();
+    let f = fixture(tmp.path());
+    let r = result_from(tmp.path(), &f);
+    write(&r, "test/b.t", "other=2");
+    let mut s = spec();
+    let mutants = &mut s.behaviors.as_mut().unwrap().mutants;
+    mutants.push(Mutant {
+        behavior: "value".into(),
+        file: "src/a.txt".into(),
+        find: "value=1".into(),
+        replace: "value=8".into(),
+    });
+    let record = run(&s, &f, &r, DispatchEnd::Completed, Some("done"), tmp.path()).unwrap();
+    let ev = &record
+        .checks
+        .iter()
+        .find(|c| c.id == "behaviors")
+        .unwrap()
+        .evidence;
+    assert!(ev.contains("planted bug in value (bug #1, #2)"), "{ev}");
+}
+
+/// A tree the grader cannot read is an error, never an empty diff.
+#[test]
+fn an_unreadable_tree_is_an_error_not_an_empty_diff() {
+    let tmp = TempDir::new().unwrap();
+    let f = fixture(tmp.path());
+    let missing = tmp.path().join("missing");
+    for (a, b) in [(&missing, &f), (&f, &missing)] {
+        let err = super::files::compare(a, b).unwrap_err();
+        assert!(format!("{err:#}").contains("reading"), "{err:#}");
+    }
+    assert!(super::files::prune_artifacts(&missing, "").is_err());
+}
