@@ -186,6 +186,27 @@ fn apply_inject_context(
     }
 }
 
+/// The workload checks and edits that run before any run directory exists:
+/// refuse keys this provider would ignore, then splice an A/B context arm
+/// in front of the prompt, read from the bound fixture's checkout when the
+/// workload binds one.
+fn prepare_workload(
+    loaded: &mut crate::workloads::types::LoadedWorkload,
+    ctx: Option<&str>,
+    paths: &paths::DarkmuxPaths,
+) -> Result<()> {
+    refuse_keys_another_provider_ignores(loaded)?;
+    if !ctx.is_some_and(|c| !c.trim().is_empty()) {
+        return Ok(());
+    }
+    let prompt_dir = match loaded.manifest.workload.requires_fixture {
+        Some(_) => resolve_source_sandbox(loaded, paths)?,
+        None => loaded.base_dir.clone(),
+    };
+    apply_inject_context(loaded, ctx, &prompt_dir);
+    Ok(())
+}
+
 pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
     // (#2947) Bad enum config refuses before a run directory is claimed.
     // Every lab verb that runs a workload (`lab run`, `lab loop`, and the
@@ -205,14 +226,7 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
     let mut loaded_workload = loaded?;
     let paths = paths::resolve(ResolveScope::ForceUser);
     paths::ensure(&paths)?;
-    refuse_keys_another_provider_ignores(&loaded_workload)?;
-    if opts.inject_context.as_deref().is_some_and(|c| !c.trim().is_empty()) {
-        let prompt_dir = match loaded_workload.manifest.workload.requires_fixture {
-            Some(_) => resolve_source_sandbox(&loaded_workload, &paths)?,
-            None => loaded_workload.base_dir.clone(),
-        };
-        apply_inject_context(&mut loaded_workload, opts.inject_context.as_deref(), &prompt_dir);
-    }
+    prepare_workload(&mut loaded_workload, opts.inject_context.as_deref(), &paths)?;
 
     let registry_loaded = load_registry(opts.config_path.as_deref())?;
     // (#2902) With no `--profile`, the run is on the profile bound to the
