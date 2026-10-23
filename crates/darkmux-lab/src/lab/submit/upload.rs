@@ -364,10 +364,13 @@ mod tests {
             let (mut conn, _) = listener.accept().unwrap();
             let mut buf = [0u8; 4096];
             let _ = conn.read(&mut buf);
-            // Mid-call: look for any temp file that holds the token.
+            // Mid-call: look for any small temp file that holds the token.
+            // Regular files only: opening a FIFO a shared temp dir holds
+            // (macOS's does) would block this thread, and the call with it.
             let holders: Vec<String> = std::fs::read_dir(std::env::temp_dir())
                 .unwrap()
                 .flatten()
+                .filter(|e| e.metadata().is_ok_and(|m| m.is_file() && m.len() < 64 * 1024))
                 .filter(|e| std::fs::read_to_string(e.path()).is_ok_and(|t| t.contains(&secret)))
                 .map(|e| e.path().display().to_string())
                 .collect();
