@@ -878,12 +878,14 @@ fn name_words(name: &str) -> Vec<String> {
 
 /// git's `user.name`, which a run's text may carry.
 fn git_user_name() -> Option<String> {
-    let out = Command::new("git")
-        .args(["config", "--get", "user.name"])
-        .output()
-        .ok()?;
-    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (out.status.success() && !name.is_empty()).then_some(name)
+    let out = Command::new("git").args(["config", "--get", "user.name"]).output().ok()?;
+    user_name_from(out.status.success(), &out.stdout)
+}
+
+/// The name `git config --get user.name` printed: nothing when it failed or printed only space.
+fn user_name_from(success: bool, stdout: &[u8]) -> Option<String> {
+    let name = String::from_utf8_lossy(stdout).trim().to_string();
+    (success && !name.is_empty()).then_some(name)
 }
 
 /// The chip, when it is Apple Silicon: the only results the site takes.

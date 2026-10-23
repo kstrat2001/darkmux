@@ -676,3 +676,11 @@ fn a_long_text_naming_the_machine_is_left_out_not_cut() {
     assert_eq!(shareable(Some(&json!(long)), 500, &names), Value::Null);
     assert!(shareable(Some(&json!(long)), 500, &[]).as_str().is_some_and(|t| t.ends_with('\u{2026}')));
 }
+
+#[test]
+fn the_git_user_name_is_what_git_printed_trimmed_or_nothing() {
+    assert_eq!(user_name_from(true, b"Kain Osterholt\n"), Some("Kain Osterholt".to_string()));
+    assert_eq!(user_name_from(true, b"  \n"), None, "only space");
+    assert_eq!(user_name_from(true, b""), None, "no user.name set");
+    assert_eq!(user_name_from(false, b"Kain\n"), None, "git failed");
+}
