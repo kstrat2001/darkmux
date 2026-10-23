@@ -1583,6 +1583,21 @@ pub(crate) enum LabCmd {
     /// no dispatches, no network. Doctor is the discoverability layer
     /// for the lab subsystem.
     Doctor,
+    /// Grade kept runs again with their workload's `verify.grade`, without
+    /// re-running them. Prints each check; exits 1 when any run fails.
+    Grade {
+        /// Lab run ids (or run folders).
+        #[arg(required = true)]
+        runs: Vec<String>,
+        /// The fixture checkout to grade against, when the run's own has
+        /// moved on (it must hash to what the run started from).
+        #[arg(long)]
+        fixture: Option<String>,
+        /// Also write each grade into its run's manifest, so `run inspect`
+        /// and `lab submit` read the graded verdict.
+        #[arg(long)]
+        record: bool,
+    },
     /// Share lab runs on the darkmux evals site (evals.darkmux.com). Builds
     /// one bundle of the runs, with no paths and nothing it cannot vouch for
     /// as of the run, and uploads it with your upload token (`lab submit

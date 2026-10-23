@@ -21,6 +21,9 @@ pub mod cow_clone;
 pub mod dispatch_end;
 pub mod doctor;
 pub mod fixture;
+// (#3353) The grader: checks on a run's result, each tied to the prompt
+// sentence it grades (`verify.grade`).
+pub mod grade;
 pub mod fixture_cli;
 pub mod inspect;
 pub mod lifecycle;

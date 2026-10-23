@@ -1,6 +1,6 @@
 {
-  "schema_version": "1.1",
-  "_comment": "The public long-agentic workload. Binds the published pepper-grinder fixture by contract (node-pepper-grinder-js@2.0): clone github.com/kstrat2001/pepper-grinder, `darkmux lab fixture register <path>`, then `darkmux lab run pepper-grinder -p <profile>`. No dependencies; `npm test` runs the 14-test baseline in well under a second, so running the tests is the agent's feedback loop. Passing is a weak bar by design (the untouched suite passes); count tests added.",
+  "schema_version": "1.2",
+  "_comment": "The public long-agentic workload. Binds the published pepper-grinder fixture by contract (node-pepper-grinder-js@2.0): clone github.com/kstrat2001/pepper-grinder, `darkmux lab fixture register <path>`, then `darkmux lab run pepper-grinder -p <profile>`. No dependencies; `npm test` runs the 14-test baseline in well under a second, so running the tests is the agent's feedback loop. Graded by verify.grade (#3353): every check quotes the prompt sentence it grades, and the prompt itself is unchanged.",
   "workload": {
     "id": "pepper-grinder",
     "provider": "coding-task",
@@ -12,7 +12,97 @@
     "verify": {
       "command": "npm test",
       "must_contain": [],
-      "must_not_contain": []
+      "must_not_contain": [],
+      "grade": {
+        "scope": {
+          "asks": [
+            "Do not modify source code under src/. Tests only.",
+            "Do not modify existing tests — only add new ones.",
+            "(a guard on the suite itself; leave it alone)"
+          ],
+          "may_add": [
+            "test/**"
+          ],
+          "append_only": [
+            "test/tokenRotation.test.js"
+          ]
+        },
+        "suite": {
+          "asks": [
+            "Then write those tests — don't hand them back as a list of suggestions.",
+            "Final verification is the same command:"
+          ],
+          "command": "node --test --test-reporter=junit --test-reporter-destination=${REPORT} test/*.test.js",
+          "report": "junit",
+          "more_than_baseline": true
+        },
+        "portable": {
+          "asks": [
+            "Your tests must run in a DIFFERENT environment than this one"
+          ]
+        },
+        "style": {
+          "asks": [
+            "Match the existing test file style: `node:test` with `describe`/`it` and `node:assert/strict`."
+          ],
+          "files": "test/**/*.test.js",
+          "must_contain": [
+            "node:test",
+            "node:assert/strict",
+            "describe(",
+            "it("
+          ]
+        },
+        "behaviors": {
+          "asks": [
+            "Decide which behaviors of the change aren't covered and would matter to you in a real code review."
+          ],
+          "mutants": [
+            {
+              "behavior": "pepper",
+              "file": "src/tokenRotation.js",
+              "find": ".update(secret + readPepper())",
+              "replace": ".update(secret)"
+            },
+            {
+              "behavior": "row lock",
+              "file": "src/tokenRotation.js",
+              "find": "const row = await trx.lockByDigest(digest);",
+              "replace": "const row = trx.findByDigest(digest); await trx.lockByDigest(digest);"
+            },
+            {
+              "behavior": "boot guard",
+              "file": "src/tokenRotation.js",
+              "find": "const inDevMode = env === \"development\";",
+              "replace": "const inDevMode = env === \"development\" || env == null;"
+            },
+            {
+              "behavior": "boot guard",
+              "file": "src/tokenRotation.js",
+              "find": "if (!inDevMode && pepper === LOCAL_PEPPER_STANDIN)",
+              "replace": "if (false)"
+            },
+            {
+              "behavior": "expiry parsing",
+              "file": "src/tokenRotation.js",
+              "find": "!Number.isFinite(expiryMs) || ",
+              "replace": ""
+            },
+            {
+              "behavior": "expiry parsing",
+              "file": "src/tokenRotation.js",
+              "find": "const expiryMs = new Date(row.expiry).getTime();",
+              "replace": "const expiryMs = row.expiry instanceof Date ? row.expiry.getTime() : NaN;"
+            }
+          ]
+        },
+        "reply": {
+          "asks": [
+            "## Reply format"
+          ],
+          "required": true
+        }
+      }
     }
   }
 }

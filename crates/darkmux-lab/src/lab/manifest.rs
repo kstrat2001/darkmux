@@ -124,8 +124,37 @@ pub struct ManifestVerifyReport {
     pub details: String,
     #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     pub work_gate: Option<WorkGate>,
+    /// (#3353) The grader's verdict and one row per check, when the workload
+    /// declares `verify.grade`.
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    pub grade: Option<GradeRecord>,
     #[serde(flatten)]
     pub extras: Map<String, Value>,
+}
+
+/// What the grader (`crate::lab::grade`) recorded: the verdict, and each check
+/// with the prompt sentences it grades and the evidence it saw.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GradeRecord {
+    pub passed: bool,
+    pub checks: Vec<GradeCheck>,
+    /// Passing tests in the grader's own run of the suite, when it was read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tests_passed: Option<u64>,
+    /// The verdict before grading (the verify command and the work gate),
+    /// kept so grading the same run again ANDs with it, not with itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ungraded_passed: Option<bool>,
+}
+
+/// One grader check.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GradeCheck {
+    pub id: String,
+    pub passed: bool,
+    pub evidence: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub asks: Vec<String>,
 }
 
 /// What the write-the-tests work gate recorded.

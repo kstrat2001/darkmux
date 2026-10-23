@@ -74,8 +74,30 @@ pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
         }),
         LabCmd::Fixture { sub } => cmd_lab_fixture(sub),
         LabCmd::Doctor => cmd_lab_doctor(),
+        LabCmd::Grade { runs, fixture, record } => cmd_lab_grade(&runs, fixture.as_deref(), record),
         cmd @ LabCmd::Submit { .. } => submit::cmd_lab_submit(cmd),
     }
+}
+
+/// `lab grade`: each run's checks, and exit 1 when any run fails or cannot
+/// be graded.
+fn cmd_lab_grade(runs: &[String], fixture: Option<&str>, record: bool) -> Result<i32> {
+    let mut code = 0;
+    for run in runs {
+        match lab::grade::regrade(run, fixture.map(std::path::Path::new), record) {
+            Ok(graded) => {
+                print!("{}", lab::grade::render(&graded));
+                if !graded.record.passed {
+                    code = 1;
+                }
+            }
+            Err(e) => {
+                eprintln!("{run}: cannot grade: {e:#}");
+                code = 1;
+            }
+        }
+    }
+    Ok(code)
 }
 
 /// Run a lab verb that dispatches through `lab_run` under signal handling: the one exit path every such verb

@@ -248,6 +248,7 @@ pub fn write_manifest(run_dir: &Path, m: &ManifestInputs<'_>) -> Result<()> {
             passed: v.passed,
             details: v.details.clone(),
             work_gate: None,
+            grade: None,
             extras: Default::default(),
         })))),
         ..RunManifest::default()

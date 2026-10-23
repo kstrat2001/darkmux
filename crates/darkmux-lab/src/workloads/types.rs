@@ -50,6 +50,10 @@ pub(crate) struct VerifySpec {
     /// fields expected beside the verdict (`crate::providers::expect`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expect: Option<serde_json::Map<String, serde_json::Value>>,
+    /// (`coding-task`, #3353) The grader: checks on the run's result, each
+    /// tied to the prompt sentence it grades (`crate::lab::grade`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grade: Option<crate::workloads::grade_spec::GradeSpec>,
 }
 
 /// A workload's `replyRoom`.

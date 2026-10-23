@@ -637,7 +637,7 @@ fn reject_escaping_relpath(raw: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn resolve_prompt(loaded: &LoadedWorkload) -> Result<String> {
+pub(crate) fn resolve_prompt(loaded: &LoadedWorkload) -> Result<String> {
     if let Some(p) = loaded.manifest.workload.prompt.as_ref() {
         return Ok(p.clone());
     }
@@ -1241,6 +1241,7 @@ pub fn write_manifest(run_dir: &Path, m: &ManifestInputs<'_>) -> Result<()> {
             passed: v.passed,
             details: v.details.clone(),
             work_gate: None,
+            grade: None,
             extras: Default::default(),
         })))),
         session_id: Some(m.session_id.to_string()),
