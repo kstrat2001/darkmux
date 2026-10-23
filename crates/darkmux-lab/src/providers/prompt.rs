@@ -68,6 +68,9 @@ impl WorkloadProvider for PromptProvider {
             config_path,
             profile_name,
         );
+        // Named and armed before the dispatch, so a dispatch that returns
+        // `Err` still leaves its trajectory in the run dir (the guard's Drop).
+        let guard = PromptDispatchGuard::arm(&role, run_dir, &mut opts);
         // (`replyRoom`) Worked out from the route the dispatch itself will
         // take: its selected model's window and its own system prompt.
         let reply_room = match loaded.manifest.workload.reply_room {
@@ -79,7 +82,9 @@ impl WorkloadProvider for PromptProvider {
         opts.max_completion_tokens = reply_room;
         let system_chars = darkmux_crew::dispatch::one_call_context(&opts).ok().flatten().map_or(0, |c| c.system_prompt_chars);
         let (dispatched, out_dir) = dispatch_via_internal(opts)?;
-        preserve_trajectory(out_dir.as_deref(), run_dir);
+        // Disarm before the one-call trajectory is written, so the guard
+        // does not then mark that finished trajectory interrupted.
+        let refused = guard.keep(out_dir.as_deref(), run_dir);
         // The container path mounts a bookkeeping dir; the one-call path has
         // none, and its trajectory is the one call's own counts.
         let one_call = out_dir.is_none();
@@ -97,6 +102,7 @@ impl WorkloadProvider for PromptProvider {
                 // Only the one-call path sends the cap; the container path's
                 // runtime continues a reply in chunks and caps nothing.
                 reply_cap: reply_room.filter(|_| one_call),
+                refused: &refused,
             },
             &dispatched,
         )
@@ -110,7 +116,7 @@ impl WorkloadProvider for PromptProvider {
         } else {
             String::new()
         };
-        let verify_outcome = run_verify(loaded, &reply);
+        let verify_outcome = run_verify_with(loaded, &reply, hit_length_limit(run_dir));
         let run_id = meta
             .run_id
             .clone()
@@ -157,6 +163,8 @@ pub(crate) struct FinishInputs<'a> {
     /// The `max_completion_tokens` this run's dispatch actually sent, when
     /// the workload asked for `replyRoom` and the dispatch was one call.
     pub reply_cap: Option<u32>,
+    /// Runtime files the run refused to copy. Empty leaves the manifest unchanged.
+    pub refused: &'a [crate::providers::coding_task::RefusedArtifact],
 }
 
 /// Everything after the dispatch: persist its output, verify the reply, write
@@ -170,10 +178,11 @@ pub(crate) fn finish_run(f: &FinishInputs<'_>, d: &Dispatched) -> Result<RunResu
         fs::write(f.run_dir.join("qa-reply.err"), &d.stderr)?;
     }
     let reply = extract_reply_text(&d.stdout);
-    let verify = run_verify(f.loaded, &reply);
+    let hit_length = hit_length_limit(f.run_dir);
+    let verify = run_verify_with(f.loaded, &reply, hit_length);
     let recorded_verify =
         verify.as_ref().map(|v| VerifyReport { passed: v.passed, details: v.details.clone() });
-    let fields = expect_report(f.loaded, &reply);
+    let fields = expect_report_with(f.loaded, &reply, hit_length);
     write_manifest(
         f.run_dir,
         &ManifestInputs {
@@ -184,6 +193,7 @@ pub(crate) fn finish_run(f: &FinishInputs<'_>, d: &Dispatched) -> Result<RunResu
             session_id: f.session_id,
             verify: recorded_verify.as_ref(),
             end: &end,
+            refused: f.refused,
         },
     )?;
     record_structured_output(f.run_dir, fields.as_ref(), f.reply_cap)?;
@@ -208,6 +218,8 @@ pub struct ManifestInputs<'a> {
     /// How the dispatch ended; stamped onto the manifest so an escalation
     /// reads as one on every surface that reads `manifest.json`.
     pub end: &'a DispatchEnd,
+    /// Runtime files the run refused to copy. Empty leaves the manifest unchanged.
+    pub refused: &'a [crate::providers::coding_task::RefusedArtifact],
 }
 
 /// Build and write this run's `manifest.json`: the one place the prompt
@@ -241,7 +253,11 @@ pub fn write_manifest(run_dir: &Path, m: &ManifestInputs<'_>) -> Result<()> {
         ..RunManifest::default()
     };
     m.end.record_in(&mut manifest);
+    manifest.refused_artifacts = crate::providers::coding_task::refused_records(m.refused);
     manifest.write(run_dir)?;
+    // The copy already warned that the file was not copied. Say it was recorded
+    // only now, after the field is on disk.
+    crate::providers::coding_task::announce_recorded(m.refused);
     Ok(())
 }
 
@@ -306,13 +322,18 @@ fn reply_room_for(ctx: Option<darkmux_crew::dispatch::OneCallContext>, prompt: &
     }
 }
 
-/// The host has no tokenizer, so the prompt is over-counted at one token per
-/// three UTF-8 bytes (a CJK character is three bytes and about one token;
-/// English runs nearer four characters a token), plus a fixed overhead: the
-/// reply may get a little less than the true remainder, never more than the
-/// window holds.
+/// The host has no tokenizer, so the prompt is counted at one token per two
+/// UTF-8 bytes, plus a fixed overhead for the chat template. English prose
+/// runs nearer four bytes a token and HTML, JSON or code nearer two or three,
+/// so this over-counts what lab prompts are made of and the reply gets a
+/// little less than the true remainder. It is an estimate, not a bound: a
+/// prompt that tokenizes worse than two bytes a token (dense CJK, emoji runs)
+/// can leave less room than the cap asks for, and the server then refuses or
+/// truncates. One token per byte would be a bound, but it refuses a ~23 KB
+/// extraction prompt on a 16K window that actually holds it with room to
+/// spare (6,144 tokens on a 1.7B model).
 fn reply_room_from(n_ctx: u32, prompt_bytes: usize, workload_id: &str) -> Result<u32> {
-    let prompt_tokens = u32::try_from(prompt_bytes.div_ceil(3)).unwrap_or(u32::MAX).saturating_add(REPLY_ROOM_OVERHEAD_TOKENS);
+    let prompt_tokens = u32::try_from(prompt_bytes.div_ceil(2)).unwrap_or(u32::MAX).saturating_add(REPLY_ROOM_OVERHEAD_TOKENS);
     let room = n_ctx.saturating_sub(prompt_tokens);
     if room < REPLY_ROOM_MIN_TOKENS {
         return Err(anyhow!(
@@ -333,22 +354,87 @@ fn dispatch_via_internal(
     Ok((Dispatched { exit_code: result.exit_code, stdout: result.stdout, stderr: result.stderr }, result.out_dir))
 }
 
-/// Copy the runtime's trajectory into the run dir, as the coding-task
-/// provider does (#364): the run's numbers (`darkmux run stats`, `lab
-/// submit`) are read from it, and the dispatch's own out dir is a temp dir.
-/// The one-call path has no out dir and writes no trajectory.
-fn preserve_trajectory(out_dir: Option<&Path>, run_dir: &Path) {
-    if let Some(out) = out_dir {
-        crate::providers::coding_task::preserve_runtime_artifacts(out, run_dir, &["trajectory.jsonl"]);
+/// Copy the runtime's trajectory and findings into the run dir, as the
+/// coding-task provider does (#364): the run's numbers (`darkmux run stats`,
+/// `lab submit`) are read from the trajectory, and the dispatch's own out
+/// dir is a temp dir. Returns anything the copy refused, so the caller can
+/// record it. The one-call path has no out dir and writes no trajectory.
+fn preserve_trajectory(out_dir: Option<&Path>, run_dir: &Path) -> Vec<crate::providers::coding_task::RefusedArtifact> {
+    let Some(out) = out_dir else { return Vec::new() };
+    crate::providers::coding_task::preserve_runtime_artifacts(out, run_dir, &["trajectory.jsonl", "findings.jsonl"]).refused
+}
+
+/// Names the out dir and arms preservation before a prompt dispatch. Drop
+/// copies the runtime's trajectory and findings into the run dir, closes an
+/// unterminated trajectory, and writes any refused copy onto the run manifest.
+/// That is the only copy a dispatch that returns `Err` gets: the lab writes
+/// no manifest for that outcome. [`Self::keep`] is the success path: it
+/// copies, returns what was refused, and disarms before a one-call trajectory
+/// is written, so Drop does not record the refusal a second time.
+struct PromptDispatchGuard {
+    preserve: crate::providers::coding_task::TrajectoryPreserver,
+    run_dir: std::path::PathBuf,
+}
+
+impl PromptDispatchGuard {
+    fn arm(role: &str, run_dir: &Path, opts: &mut darkmux_crew::dispatch::DispatchOpts) -> Self {
+        let out_dir = crate::providers::coding_task::named_out_dir(role);
+        let preserve = crate::providers::coding_task::TrajectoryPreserver::new(out_dir.clone(), run_dir.to_path_buf());
+        opts.host_out = Some(out_dir);
+        Self { preserve, run_dir: run_dir.to_path_buf() }
     }
+
+    fn keep(mut self, dispatch_out: Option<&Path>, run_dir: &Path) -> Vec<crate::providers::coding_task::RefusedArtifact> {
+        let refused = preserve_trajectory(dispatch_out, run_dir);
+        self.preserve.disarm();
+        refused
+    }
+}
+
+impl Drop for PromptDispatchGuard {
+    fn drop(&mut self) {
+        let preserved = self.preserve.salvage();
+        if let Err(e) = write_refusal_manifest(&self.run_dir, &preserved.refused) {
+            eprintln!("darkmux: warn: could not record a refused runtime file on the run manifest: {e}");
+        }
+    }
+}
+
+/// The error path's manifest: `finish_run` never runs, so this is the only
+/// writer. A dispatch that copied cleanly leaves no manifest. A refusal is
+/// described as recorded only after this write succeeds.
+fn write_refusal_manifest(run_dir: &Path, refused: &[crate::providers::coding_task::RefusedArtifact]) -> Result<()> {
+    if refused.is_empty() {
+        return Ok(());
+    }
+    let mut manifest = RunManifest::read_or_default(run_dir)?;
+    manifest.refused_artifacts = crate::providers::coding_task::refused_records(refused);
+    if manifest.schema_version.is_none() {
+        manifest.schema_version = Some(6);
+    }
+    if manifest.manifest_schema_version.is_none() {
+        manifest.manifest_schema_version = Some(darkmux_types::data_version::RUN_MANIFEST_SCHEMA_VERSION.to_string());
+    }
+    if manifest.provider.is_none() {
+        manifest.provider = Some(PromptProvider.id().to_string());
+    }
+    if manifest.run_id.is_none() {
+        manifest.run_id = run_dir.file_name().and_then(|n| n.to_str()).map(str::to_string);
+    }
+    if manifest.ok.is_none() {
+        manifest.ok = Some(false);
+    }
+    manifest.write(run_dir)?;
+    crate::providers::coding_task::announce_recorded(refused);
+    Ok(())
 }
 
 /// The trajectory of a one-call run, which has no runtime to write one: a
 /// header, the call's start, its one `model.completed` with the usage the
 /// endpoint reported, and its completion, all from the envelope the call
-/// returned (`DirectDispatchEnvelope`). The finish reason is not in that
-/// envelope, so it is left empty rather than guessed. A reply that is not
-/// that envelope writes nothing.
+/// returned (`DirectDispatchEnvelope`). The finish reason is the envelope's,
+/// and empty when it names none, never guessed. A reply that is not that
+/// envelope writes nothing.
 fn write_one_call_trajectory(stdout: &str, system_chars: usize, prompt_chars: usize, run_dir: &Path, end_ms: u64) {
     use darkmux_trajectory::event::{DispatchComplete, DispatchStart, Header, ModelCompleted, TrajectoryEvent};
     let Ok(envelope) = serde_json::from_str::<serde_json::Value>(stdout) else { return };
@@ -366,7 +452,13 @@ fn write_one_call_trajectory(stdout: &str, system_chars: usize, prompt_chars: us
             prompt_chars: prompt_chars as u64,
             tools: Vec::new(),
         }),
-        TrajectoryEvent::ModelCompleted(ModelCompleted { seq: 1, ts: end_ms, usage: Some(usage), ..Default::default() }),
+        TrajectoryEvent::ModelCompleted(ModelCompleted {
+            seq: 1,
+            ts: end_ms,
+            finish_reason: metrics.get("finish_reason").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+            usage: Some(usage),
+            ..Default::default()
+        }),
         TrajectoryEvent::DispatchComplete(DispatchComplete { ts: end_ms, result: "stop".to_string(), wall_ms, turn_delay_effective_ms: None }),
     ];
     let lines: Vec<String> = events.iter().filter_map(|e| serde_json::to_string(e).ok()).collect();
@@ -496,8 +588,14 @@ pub(crate) fn extract_reply_text(stdout: &str) -> String {
 /// declares no verify spec: nothing was checked, which is neither a pass nor
 /// a fail (#2982). This is the one place that decides it.
 pub(crate) fn run_verify(loaded: &LoadedWorkload, text: &str) -> Option<VerifyOutcome> {
+    run_verify_with(loaded, text, false)
+}
+
+/// [`run_verify`], told whether the reply hit its length limit
+/// ([`hit_length_limit`]), so an unclosed answer is called cut off only then.
+pub(crate) fn run_verify_with(loaded: &LoadedWorkload, text: &str, hit_length: bool) -> Option<VerifyOutcome> {
     let v = loaded.manifest.workload.verify.as_ref()?;
-    let Some(fields) = expect_report(loaded, text) else { return Some(keyword_verify(v, text)) };
+    let Some(fields) = expect_report_with(loaded, text, hit_length) else { return Some(keyword_verify(v, text)) };
     // (`verify.expect`) The structured-output check, and the keyword checks
     // too when the workload also lists keywords: both must pass.
     let keywords = (!v.must_contain.is_empty() || !v.must_not_contain.is_empty()).then(|| keyword_verify(v, text));
@@ -507,14 +605,34 @@ pub(crate) fn run_verify(loaded: &LoadedWorkload, text: &str) -> Option<VerifyOu
 }
 
 /// The workload's `verify.expect` check of `text`, `None` when it has none.
+#[cfg(test)]
 pub(crate) fn expect_report(loaded: &LoadedWorkload, text: &str) -> Option<expect::FieldsReport> {
+    expect_report_with(loaded, text, false)
+}
+
+/// The workload's `verify.expect` check, told whether the reply hit its length limit.
+pub(crate) fn expect_report_with(loaded: &LoadedWorkload, text: &str, hit_length: bool) -> Option<expect::FieldsReport> {
     // Only a prompt run applies it (`lab run` refuses it on any other
     // provider), so another provider's inspect never shows its verdict.
     if loaded.manifest.workload.provider != PromptProvider.id() {
         return None;
     }
     let want = loaded.manifest.workload.verify.as_ref()?.expect.as_ref()?;
-    Some(expect::grade(want, text))
+    Some(expect::grade_with(want, text, hit_length))
+}
+
+/// Whether the run's last model call finished on its length limit, read from
+/// the run's own trajectory (the runtime's, or the one call's). A container
+/// run continues a reply cut at `length`, so its last call ends on `length`
+/// only when the window itself ran out. No trajectory, or no finish reason,
+/// is not a hit.
+fn hit_length_limit(run_dir: &Path) -> bool {
+    let Ok(raw) = fs::read_to_string(run_dir.join(darkmux_trajectory::TRAJECTORY_FILE)) else { return false };
+    raw.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .rfind(|e| e.get("type").and_then(|t| t.as_str()) == Some("model.completed"))
+        .and_then(|e| e.get("finish_reason").and_then(|f| f.as_str()).map(|f| f == "length" || f == "max_tokens"))
+        .unwrap_or(false)
 }
 
 /// The keyword checks (`must_contain` / `must_not_contain`).
@@ -663,7 +781,7 @@ mod tests {
             let run_dir = tmp.path().join(format!("run{i}"));
             fs::create_dir_all(&run_dir).unwrap();
             let d = Dispatched { exit_code, stdout: stdout.into(), stderr: "boom".into() };
-            let r = finish_run(&FinishInputs { loaded: &loaded, run_dir: &run_dir, profile: &profile, profile_name: "p", session_id: &session, duration_ms: 1, reply_cap: None }, &d).unwrap();
+            let r = finish_run(&FinishInputs { loaded: &loaded, run_dir: &run_dir, profile: &profile, profile_name: "p", session_id: &session, duration_ms: 1, reply_cap: None, refused: &[] }, &d).unwrap();
             assert_eq!(r.ok, ok, "case {i}");
             assert_eq!(r.escalation.as_deref(), escalation, "case {i}");
             assert_eq!(r.error.is_some(), errored, "case {i}: an escalation is not an error");
@@ -699,6 +817,7 @@ mod tests {
                     session_id: &session,
                     verify: None,
                     end: &end,
+                    refused: &[],
                 },
             )
             .unwrap();
@@ -767,7 +886,7 @@ mod tests {
         let run_dir = tmp.path().join("structured");
         fs::create_dir_all(&run_dir).unwrap();
         let d = Dispatched { exit_code: 0, stdout: envelope(r#"{"a": "1", "b": "x", "c": "3"}"#), stderr: String::new() };
-        let inputs = FinishInputs { loaded: &loaded, run_dir: &run_dir, profile: &profile, profile_name: "p", session_id: &session, duration_ms: 1, reply_cap: Some(30_000) };
+        let inputs = FinishInputs { loaded: &loaded, run_dir: &run_dir, profile: &profile, profile_name: "p", session_id: &session, duration_ms: 1, reply_cap: Some(30_000), refused: &[] };
         let r = finish_run(&inputs, &d).unwrap();
         assert!(!r.verify.unwrap().passed);
         let m = manifest_of(&run_dir);
@@ -781,19 +900,55 @@ mod tests {
         let run_dir = tmp.path().join("plain");
         fs::create_dir_all(&run_dir).unwrap();
         let d = Dispatched { exit_code: 0, stdout: envelope("hi"), stderr: String::new() };
-        let inputs = FinishInputs { loaded: &plain, run_dir: &run_dir, profile: &profile, profile_name: "p", session_id: &session, duration_ms: 1, reply_cap: None };
+        let inputs = FinishInputs { loaded: &plain, run_dir: &run_dir, profile: &profile, profile_name: "p", session_id: &session, duration_ms: 1, reply_cap: None, refused: &[] };
         finish_run(&inputs, &d).unwrap();
         let m = manifest_of(&run_dir);
         assert!(m.get("max_completion_tokens").is_none());
         assert!(m["verify"].is_null(), "no verify spec: not checked, as before");
     }
 
-    /// `replyRoom`: the window minus the over-counted prompt and the fixed
-    /// overhead; a window the prompt nearly fills is refused, not dispatched.
+    /// The verdict calls an unclosed object "cut off" only when the run's
+    /// trajectory says its last model call finished on `length`. A reply
+    /// that stopped on its own and left the object open says so instead.
     #[test]
-    fn reply_room_is_the_window_minus_the_over_counted_prompt() {
-        assert_eq!(reply_room_from(32_768, 3_000, "w").unwrap(), 32_768 - 1_000 - REPLY_ROOM_OVERHEAD_TOKENS);
+    fn finish_run_names_the_length_limit_only_when_the_reply_hit_it() {
+        let tmp = TempDir::new().unwrap();
+        let profile = darkmux_types::Profile::default();
+        let session = SessionId::adhoc(RunId::lab("run1").unwrap(), "coder", "w");
+        let loaded = make_loaded(spec_expecting(serde_json::json!({"a": "1"})), tmp.path().to_path_buf());
+        let stdout = serde_json::json!({"result": "stop", "final_assistant": r#"{"a": "#}).to_string();
+        for (finish, want) in [
+            ("length", "fields 0/1: the reply's JSON object is cut off: the reply hit its length limit"),
+            ("stop", "fields 0/1: the reply's JSON object ends before it closes"),
+            ("", "fields 0/1: the reply's JSON object ends before it closes"),
+        ] {
+            let run_dir = tmp.path().join(format!("run-{finish}"));
+            fs::create_dir_all(&run_dir).unwrap();
+            fs::write(
+                run_dir.join("trajectory.jsonl"),
+                format!("{{\"type\":\"model.completed\",\"seq\":1,\"ts\":1,\"finish_reason\":\"{finish}\"}}\n"),
+            )
+            .unwrap();
+            let d = Dispatched { exit_code: 0, stdout: stdout.clone(), stderr: String::new() };
+            let inputs = FinishInputs { loaded: &loaded, run_dir: &run_dir, profile: &profile, profile_name: "p", session_id: &session, duration_ms: 1, reply_cap: None, refused: &[] };
+            let r = finish_run(&inputs, &d).unwrap();
+            assert_eq!(r.verify.unwrap().details, want, "finish_reason {finish:?}");
+            let inspected = PromptProvider.inspect(&loaded, &run_dir).unwrap();
+            assert_eq!(inspected.verify.unwrap().details, want, "inspect, finish_reason {finish:?}");
+        }
+    }
+
+    /// `replyRoom`: the window minus one token per two prompt bytes and the
+    /// fixed overhead. A window the prompt nearly fills is refused, not
+    /// dispatched.
+    #[test]
+    fn reply_room_is_the_window_minus_one_token_per_two_bytes() {
+        assert_eq!(reply_room_from(32_768, 3_000, "w").unwrap(), 32_768 - 1_500 - REPLY_ROOM_OVERHEAD_TOKENS);
         assert_eq!(reply_room_from(8_192, 1, "w").unwrap(), 8_192 - 1 - REPLY_ROOM_OVERHEAD_TOKENS);
+        // A small model's 16K window must still run a ~23 KB extraction
+        // prompt (role, preamble and page). That one measured 6,144 tokens
+        // on a 1.7B model; one token per byte refused it outright.
+        assert!(reply_room_from(16_384, 22_890, "w").unwrap() >= 4_000);
         let err = reply_room_from(4_096, 11_000, "w").unwrap_err().to_string();
         assert!(err.contains("raise the profile's n_ctx"), "{err}");
     }
@@ -808,8 +963,9 @@ mod tests {
         let ctx = |n_ctx| Some(OneCallContext { model: "m".into(), n_ctx, max_output_tokens: None, system_prompt_bytes: 5_700, system_prompt_chars: 5_700 });
         let err = reply_room_for(ctx(None), "x", "w").unwrap_err().to_string();
         assert!(err.contains("`m` declares no n_ctx"), "{err}");
-        // "日本" is six bytes: two CJK characters are counted as two tokens.
-        assert_eq!(reply_room_for(ctx(Some(16_384)), "日本", "w").unwrap(), Some(16_384 - 1_902 - REPLY_ROOM_OVERHEAD_TOKENS));
+        // "日本" is six bytes, counted with the system prompt's 5,700: 5,706
+        // bytes, 2,853 tokens.
+        assert_eq!(reply_room_for(ctx(Some(16_384)), "日本", "w").unwrap(), Some(16_384 - 2_853 - REPLY_ROOM_OVERHEAD_TOKENS));
     }
 
     /// A model whose output limit is below what its window leaves gets its
@@ -820,7 +976,7 @@ mod tests {
         use darkmux_crew::dispatch::OneCallContext;
         let ctx = |max| Some(OneCallContext { model: "m".into(), n_ctx: Some(200_000), max_output_tokens: max, system_prompt_bytes: 5_700, system_prompt_chars: 5_700 });
         assert_eq!(reply_room_for(ctx(Some(128_000)), "x", "w").unwrap(), Some(128_000));
-        let room = 200_000 - 1_901 - REPLY_ROOM_OVERHEAD_TOKENS;
+        let room = 200_000 - 2_851 - REPLY_ROOM_OVERHEAD_TOKENS;
         assert_eq!(reply_room_for(ctx(Some(250_000)), "x", "w").unwrap(), Some(room));
         assert_eq!(reply_room_for(ctx(None), "x", "w").unwrap(), Some(room));
         let err = reply_room_for(ctx(Some(0)), "x", "w").unwrap_err().to_string();
@@ -847,6 +1003,20 @@ mod tests {
         let complete = fold.complete.as_ref().unwrap();
         assert_eq!((complete.result.as_str(), complete.wall_ms), ("stop", 13_100));
         crate::lab::stats::compute_from_dir(tmp.path(), &tmp.path().join("flows")).expect("the run's numbers can be read");
+        // The call's finish reason, when the envelope carries it, is the
+        // trajectory's: the grade reads it to tell a cut-off reply from one
+        // that stopped on its own.
+        let cut = TempDir::new().unwrap();
+        let stdout = serde_json::json!({"result": "stop", "final_assistant": "{", "metrics": {
+            "model": "m", "endpoint": "e", "wall_ms": 100, "turns": 1, "finish_reason": "length",
+            "prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}})
+        .to_string();
+        write_one_call_trajectory(&stdout, 1, 1, cut.path(), 1_000_000);
+        assert!(hit_length_limit(cut.path()));
+        let fold = crate::lab::inspect::checked_run_trajectory(cut.path()).unwrap();
+        assert_eq!(fold.model_calls, 1);
+        crate::lab::stats::compute_from_dir(cut.path(), &cut.path().join("flows")).expect("a cut call's numbers read too");
+        assert!(!hit_length_limit(tmp.path()), "no finish reason is not a hit");
         // A reply that is not the one-call envelope leaves no file to misread.
         let other = TempDir::new().unwrap();
         write_one_call_trajectory("plain text", 1, 1, other.path(), 1_000_000);
@@ -866,6 +1036,131 @@ mod tests {
         assert!(!run_dir.join("trajectory.jsonl").exists());
         preserve_trajectory(Some(&out), &run_dir);
         assert_eq!(fs::read_to_string(run_dir.join("trajectory.jsonl")).unwrap(), "{\"event\":\"x\"}\n");
+    }
+
+    /// The named out dir lives in the process temp directory, not under the
+    /// test's `TempDir`, so it has to be removed explicitly. Its name is the
+    /// role and the clock's microseconds, so each test arms a role of its own:
+    /// two tests running in parallel could otherwise name the same dir.
+    struct RemoveOut(std::path::PathBuf);
+    impl Drop for RemoveOut {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A dispatch that returns `Err` never reaches the success-path copy.
+    /// The guard is armed with the named out dir before the call, and its
+    /// Drop is what keeps the trajectory and closes it.
+    #[test]
+    fn an_interrupted_prompt_dispatch_keeps_and_closes_its_trajectory() {
+        let tmp = TempDir::new().unwrap();
+        let run = tmp.path().join("run");
+        fs::create_dir_all(&run).unwrap();
+        let session = SessionId::adhoc(RunId::lab("run1").unwrap(), "reviewer", "w");
+        let mut opts = dispatch_opts("reviewer", "hi", &session, None, None, "p");
+        let guard = PromptDispatchGuard::arm("reviewer-a", &run, &mut opts);
+        let out = opts.host_out.clone().expect("the out dir is named before dispatch");
+        let _remove_out = RemoveOut(out.clone());
+        fs::create_dir_all(out.join(".darkmux-runtime")).unwrap();
+        fs::write(
+            out.join(".darkmux-runtime/trajectory.jsonl"),
+            "{\"type\":\"dispatch.start\",\"ts\":1000,\"model\":\"m\"}\n\
+             {\"type\":\"model.completed\",\"seq\":1,\"ts\":2000,\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2,\"total_tokens\":6}}\n",
+        )
+        .unwrap();
+        drop(guard);
+        let fold = darkmux_trajectory::TrajectoryFold::from_path(&run.join("trajectory.jsonl"));
+        assert_eq!(fold.turns(), 1, "what completed is in the run dir");
+        assert_eq!(fold.complete.expect("a terminal record").result, darkmux_trajectory::RESULT_INTERRUPTED);
+        assert!(!run.join("manifest.json").exists(), "a clean copy writes no refusal manifest");
+    }
+
+    /// A dispatch that returns `Err` never reaches `finish_run`, and the lab
+    /// writes no manifest for that outcome. A refused copy still has to land
+    /// on one: the warning used to say it had, while Drop threw the list away.
+    #[test]
+    fn a_dropped_prompt_guard_records_a_refused_copy_on_the_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let run = tmp.path().join("run");
+        fs::create_dir_all(&run).unwrap();
+        let session = SessionId::adhoc(RunId::lab("run1").unwrap(), "reviewer", "w");
+        let mut opts = dispatch_opts("reviewer", "hi", &session, None, None, "p");
+        let guard = PromptDispatchGuard::arm("reviewer-b", &run, &mut opts);
+        let out = opts.host_out.clone().unwrap();
+        let _remove_out = RemoveOut(out.clone());
+        fs::create_dir_all(out.join(".darkmux-runtime")).unwrap();
+        fs::write(out.join(".darkmux-runtime/trajectory.jsonl"), "{\"type\":\"dispatch.start\",\"ts\":1,\"model\":\"m\"}\n").unwrap();
+        let secret = tmp.path().join("host-secret.txt");
+        fs::write(&secret, "HOST-SECRET-2869").unwrap();
+        std::os::unix::fs::symlink(&secret, out.join(".darkmux-runtime/findings.jsonl")).unwrap();
+
+        drop(guard);
+
+        assert!(!run.join("findings.jsonl").exists(), "a refused symlink must not be copied");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(run.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["provider"], "prompt");
+        assert_eq!(manifest["ok"], false, "the dispatch did not complete");
+        assert_eq!(manifest["schema_version"], 6);
+        assert_eq!(manifest["refused_artifacts"][0]["file"], "findings.jsonl");
+        assert!(manifest["refused_artifacts"][0]["reason"].as_str().unwrap().contains("symlink"));
+        let copied = fs::read_to_string(run.join("trajectory.jsonl")).unwrap();
+        assert!(copied.contains("interrupted"), "the error path still closes the trajectory");
+        assert!(!copied.contains("HOST-SECRET-2869"));
+    }
+
+    /// The success path copies, records a refusal, and disarms. Disarming
+    /// matters: the guard must not then mark the copied trajectory interrupted.
+    #[test]
+    fn a_kept_prompt_dispatch_records_a_refusal_and_does_not_close_the_trajectory() {
+        let tmp = TempDir::new().unwrap();
+        let run = tmp.path().join("run");
+        fs::create_dir_all(&run).unwrap();
+        let session = SessionId::adhoc(RunId::lab("run1").unwrap(), "reviewer", "w");
+        let mut opts = dispatch_opts("reviewer", "hi", &session, None, None, "p");
+        let guard = PromptDispatchGuard::arm("reviewer-c", &run, &mut opts);
+        let out = opts.host_out.clone().unwrap();
+        let _remove_out = RemoveOut(out.clone());
+        fs::create_dir_all(out.join(".darkmux-runtime")).unwrap();
+        // Open on purpose. The success path copies it and must not close it;
+        // closing is the error path's job, and only when the runtime didn't.
+        let body = "{\"type\":\"dispatch.start\",\"ts\":1,\"model\":\"m\"}\n";
+        fs::write(out.join(".darkmux-runtime/trajectory.jsonl"), body).unwrap();
+        let secret = tmp.path().join("host-secret.txt");
+        fs::write(&secret, "HOST-SECRET-2869").unwrap();
+        std::os::unix::fs::symlink(&secret, out.join(".darkmux-runtime/findings.jsonl")).unwrap();
+
+        let refused = guard.keep(Some(&out), &run);
+        let copied = fs::read_to_string(run.join("trajectory.jsonl")).unwrap();
+        assert_eq!(copied, body, "a disarmed guard must not append interrupted");
+        assert!(!copied.contains("interrupted"));
+        assert!(!run.join("findings.jsonl").exists(), "a refused symlink must not be copied");
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].file, "findings.jsonl");
+        assert!(refused[0].reason.contains("symlink"), "{}", refused[0].reason);
+
+        let loaded = make_loaded(spec_with_prompt("x"), tmp.path().to_path_buf());
+        let profile = darkmux_types::Profile::default();
+        let d = Dispatched { exit_code: 0, stdout: r#"{"result":"stop","final_assistant":"hi"}"#.into(), stderr: String::new() };
+        finish_run(
+            &FinishInputs {
+                loaded: &loaded,
+                run_dir: &run,
+                profile: &profile,
+                profile_name: "p",
+                session_id: &session,
+                duration_ms: 1,
+                reply_cap: None,
+                refused: &refused,
+            },
+            &d,
+        )
+        .unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&fs::read_to_string(run.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["refused_artifacts"][0]["file"], "findings.jsonl");
+        assert!(manifest["refused_artifacts"][0]["reason"].as_str().unwrap().contains("symlink"));
+        assert_eq!(fs::read_to_string(run.join("trajectory.jsonl")).unwrap(), body);
     }
 
     /// A workload that binds a fixture reads its promptFile from the run's

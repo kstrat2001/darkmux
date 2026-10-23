@@ -4661,6 +4661,11 @@ fn dispatch_unmanaged(
                 endpoint: label.clone(),
                 wall_ms,
                 turns: 1,
+                finish_reason: resp
+                    .pointer("/choices/0/finish_reason")
+                    .or_else(|| resp.get("stop_reason"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
                 tokens: crate::dispatch_envelope::DirectTokens::of(&counts),
             },
         })

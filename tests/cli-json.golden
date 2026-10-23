@@ -251,6 +251,7 @@ DirectMetrics
   endpoint: string
   wall_ms: uint64
   turns: uint32
+  finish_reason?: string | null
   prompt_tokens: uint64 | null
   completion_tokens: uint64 | null
   total_tokens: uint64 | null

@@ -4639,6 +4639,7 @@ mod tests {
                             session_id: &session,
                             verify: Some(&verify),
                             end,
+                            refused: &[],
                         },
                     )
                 } else {

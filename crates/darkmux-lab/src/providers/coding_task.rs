@@ -744,7 +744,7 @@ fn dispatch_via_internal(
 /// its own (`darkmux-out-<role>-<unix micros>`), so `darkmux doctor`'s
 /// temp-residue check treats it the same. Only the NAME is chosen here; the
 /// dispatch creates the directory and refuses one that already exists.
-fn named_out_dir(role_id: &str) -> PathBuf {
+pub(crate) fn named_out_dir(role_id: &str) -> PathBuf {
     let micros = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_micros()).unwrap_or(0);
     std::env::temp_dir().join(format!("darkmux-out-{role_id}-{micros}"))
 }
@@ -758,33 +758,43 @@ fn named_out_dir(role_id: &str) -> PathBuf {
 /// A trajectory that never got a terminal record (the container was
 /// SIGKILLed) is closed with `interrupted`, so `darkmux run stats` reports
 /// what completed and says so, rather than reading an open-ended run.
-struct TrajectoryPreserver {
+pub(crate) struct TrajectoryPreserver {
     out_dir: PathBuf,
     run_dir: PathBuf,
     armed: bool,
 }
 
 impl TrajectoryPreserver {
-    fn new(out_dir: PathBuf, run_dir: PathBuf) -> Self {
+    pub(crate) fn new(out_dir: PathBuf, run_dir: PathBuf) -> Self {
         Self { out_dir, run_dir, armed: true }
     }
 
-    fn disarm(&mut self) {
+    pub(crate) fn disarm(&mut self) {
         self.armed = false;
     }
-}
 
-impl Drop for TrajectoryPreserver {
-    fn drop(&mut self) {
+    /// Copy the runtime files, close an unterminated trajectory, and disarm.
+    /// Drop does this and discards what was refused: the coding-task error
+    /// path has no manifest to write it on. The prompt guard calls this
+    /// itself and records the refusal.
+    pub(crate) fn salvage(&mut self) -> PreservedArtifacts {
         if !self.armed {
-            return;
+            return PreservedArtifacts::default();
         }
+        self.armed = false;
         let preserved = preserve_runtime_artifacts(&self.out_dir, &self.run_dir, &["trajectory.jsonl", "findings.jsonl"]);
         if preserved.copied.iter().any(|n| n == "trajectory.jsonl") {
             if let Err(e) = darkmux_trajectory::close_if_unterminated(&self.run_dir.join("trajectory.jsonl")) {
                 eprintln!("darkmux: warn: could not mark the preserved trajectory interrupted: {e}");
             }
         }
+        preserved
+    }
+}
+
+impl Drop for TrajectoryPreserver {
+    fn drop(&mut self) {
+        let _ = self.salvage();
     }
 }
 
@@ -1115,9 +1125,11 @@ fn classify_mode(walltime_ms: u128, loaded: &LoadedWorkload) -> Option<RunMode> 
 
 
 /// (#2869) One runtime bookkeeping file the host declined to copy out of
-/// the dispatch's out-dir, and why. Recorded in the run's `manifest.json`
-/// (`refused_artifacts`) as well as warned on stderr, so a refusal is never
-/// a silent gap in the run artifact.
+/// the dispatch's out-dir, and why. Warned on stderr when the copy is
+/// refused, and recorded in the run's `manifest.json` (`refused_artifacts`)
+/// by the caller that writes one. The warning does not say it was recorded
+/// until that write has happened, so a path that discards the list cannot
+/// claim a record it did not make.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefusedArtifact {
     pub file: String,
@@ -1253,6 +1265,7 @@ pub fn write_manifest(run_dir: &Path, m: &ManifestInputs<'_>) -> Result<()> {
     m.end.record_in(&mut manifest);
     manifest.refused_artifacts = refused_records(m.refused_artifacts);
     manifest.write(run_dir)?;
+    announce_recorded(m.refused_artifacts);
     Ok(())
 }
 
@@ -1264,6 +1277,24 @@ pub(crate) fn refused_records(refused: &[RefusedArtifact]) -> Option<Vec<Refused
         return None;
     }
     Some(refused.iter().map(|r| RefusedArtifactRecord { file: r.file.clone(), reason: r.reason.clone() }).collect())
+}
+
+/// The copy was refused. This does not say the refusal was recorded: that
+/// sentence is [`recorded_notice`], printed only after the manifest write.
+fn refusal_notice(name: &str, reason: &str) -> String {
+    format!("darkmux: runtime {name} NOT copied into the run dir: {reason}")
+}
+
+/// Printed only after `refused_artifacts` is on the run manifest.
+fn recorded_notice(name: &str, reason: &str) -> String {
+    format!("darkmux: runtime {name} recorded as refused_artifacts in the run manifest: {reason}")
+}
+
+/// Say each refusal is on the manifest. Callers run this only after the write.
+pub(crate) fn announce_recorded(refused: &[RefusedArtifact]) {
+    for r in refused {
+        eprintln!("{}", darkmux_types::style::warn(&recorded_notice(&r.file, &r.reason)));
+    }
 }
 
 /// What [`preserve_runtime_artifacts`] did: the names it copied, and the
@@ -1297,13 +1328,7 @@ pub(crate) fn preserve_runtime_artifacts(
             Ok(_) => out.copied.push((*name).to_string()),
             Err(ContainedFileError::NotFound) => {}
             Err(ContainedFileError::Refused(reason)) => {
-                eprintln!(
-                    "{}",
-                    darkmux_types::style::warn(&format!(
-                        "darkmux: runtime {name} NOT copied into the run dir: {reason}; \
-                         recorded as refused_artifacts in the run manifest"
-                    ))
-                );
+                eprintln!("{}", darkmux_types::style::warn(&refusal_notice(name, &reason)));
                 out.refused.push(RefusedArtifact { file: (*name).to_string(), reason });
             }
             Err(ContainedFileError::Io(e)) => {
@@ -1803,6 +1828,30 @@ mod tests {
         let v = serde_json::to_value(&m).unwrap();
         assert_eq!(v["refused_artifacts"][0]["file"], "findings.jsonl");
         assert!(v["refused_artifacts"][0]["reason"].as_str().unwrap().contains("symlink"));
+    }
+
+    /// The copy warning names the refusal and stops there. "Recorded on the
+    /// run manifest" is a different sentence, printed only after the write.
+    #[test]
+    fn a_refusal_notice_does_not_claim_the_manifest_until_the_write() {
+        let notice = refusal_notice("findings.jsonl", "`findings.jsonl` is a symlink (not followed)");
+        assert!(notice.contains("NOT copied"), "{notice}");
+        assert!(!notice.contains("recorded"), "{notice}");
+        assert!(!notice.contains("run manifest"), "{notice}");
+        let recorded = recorded_notice("findings.jsonl", "`findings.jsonl` is a symlink (not followed)");
+        assert!(recorded.contains("recorded as refused_artifacts in the run manifest"), "{recorded}");
+    }
+
+    /// Coding-task's error path has no manifest writer. Drop keeps the
+    /// trajectory and does not invent a manifest to hold the refusal; the
+    /// prompt guard is the one that records a refusal from Drop.
+    #[test]
+    fn a_dropped_coding_task_guard_does_not_invent_a_manifest_for_a_refusal() {
+        let (_tmp, out, run, secret) = out_dir_with_secret();
+        std::os::unix::fs::symlink(&secret, out.join(".darkmux-runtime/findings.jsonl")).unwrap();
+        drop(TrajectoryPreserver::new(out, run.clone()));
+        assert!(!run.join("findings.jsonl").exists(), "a refused symlink must not be copied");
+        assert!(!run.join("manifest.json").exists(), "coding-task's error path writes no manifest");
     }
 
     #[test]

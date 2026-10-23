@@ -10,7 +10,8 @@
 //!
 //! An expected value is one of:
 //! - a string, boolean or null: equal to the reply's value;
-//! - a number: the same number (`1` and `1.0` are one value);
+//! - a number: the same number (`1` and `1.0` are one value; an integer past
+//!   2^53 is not the float it rounds to);
 //! - `{"anyOf": [v, ...]}`: any one of the listed values;
 //! - `{"includes": [v, ...]}`: a list holding each listed item, extras allowed;
 //! - `{"items": [v, ...], "optional": [v, ...]}`: a list holding each of
@@ -70,8 +71,17 @@ impl FieldsReport {
     }
 }
 
-/// Compare the reply's first JSON object against `expect`.
+/// Compare the reply's first JSON object against `expect`, for a reply not
+/// known to have hit its length limit.
+#[cfg(test)]
 pub(crate) fn grade(expect: &Map<String, Value>, reply: &str) -> FieldsReport {
+    grade_with(expect, reply, false)
+}
+
+/// Compare the reply's first JSON object against `expect`, told whether the
+/// reply hit its length limit (its last model call finished on `length`).
+/// Only then is an object that ends before it closes called cut off.
+pub(crate) fn grade_with(expect: &Map<String, Value>, reply: &str, hit_length: bool) -> FieldsReport {
     let expected = expect.len();
     let answer = match first_object(reply) {
         Ok(a) => a,
@@ -80,7 +90,7 @@ pub(crate) fn grade(expect: &Map<String, Value>, reply: &str) -> FieldsReport {
                 correct: 0,
                 expected,
                 missed: expect.keys().cloned().collect(),
-                unreadable: Some(why),
+                unreadable: Some(why.describe(hit_length).to_string()),
             }
         }
     };
@@ -97,18 +107,51 @@ pub(crate) fn grade(expect: &Map<String, Value>, reply: &str) -> FieldsReport {
     }
 }
 
-/// The JSON object the reply opens with at its first `{`. A ```json fence
-/// or prose before it is tolerated; what follows the object is not read. If
-/// that object does not parse (a reply cut off at its cap), the reply has no
-/// answer: an object nested inside it is never graded in its place.
-fn first_object(reply: &str) -> Result<Map<String, Value>, String> {
-    let Some(start) = reply.find('{') else {
-        return Err("no JSON object in the reply".to_string());
-    };
-    let mut stream = serde_json::Deserializer::from_str(&reply[start..]).into_iter::<Value>();
-    match stream.next() {
-        Some(Ok(Value::Object(obj))) => Ok(obj),
-        _ => Err("the reply's JSON object does not parse (cut off?)".to_string()),
+/// Why a reply has no answer to grade.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Unparsed {
+    /// No `{` in the reply at all.
+    NoObject,
+    /// Every `{` began something that is not JSON.
+    Malformed,
+    /// A `{` began an object the reply ends inside.
+    Incomplete,
+}
+
+impl Unparsed {
+    fn describe(self, hit_length: bool) -> &'static str {
+        match self {
+            Unparsed::NoObject => "no JSON object in the reply",
+            Unparsed::Malformed => "the reply's JSON object does not parse",
+            Unparsed::Incomplete if hit_length => "the reply's JSON object is cut off: the reply hit its length limit",
+            Unparsed::Incomplete => "the reply's JSON object ends before it closes",
+        }
+    }
+}
+
+/// The first JSON object in the reply that parses. A ```json fence or prose
+/// before it is tolerated, including a `{` that is not itself JSON. A `{`
+/// that begins an object the reply ends inside is the reply's answer, and it
+/// has none: an object nested inside it is never graded in its place. What
+/// follows a parsed object is not read.
+fn first_object(reply: &str) -> Result<Map<String, Value>, Unparsed> {
+    let mut rest = reply;
+    let mut malformed = false;
+    loop {
+        let Some(rel) = rest.find('{') else {
+            return Err(if malformed { Unparsed::Malformed } else { Unparsed::NoObject });
+        };
+        // `{` is one byte, and `find` returns a char boundary.
+        let candidate = &rest[rel..];
+        let mut stream = serde_json::Deserializer::from_str(candidate).into_iter::<Value>();
+        match stream.next() {
+            Some(Ok(Value::Object(obj))) => return Ok(obj),
+            Some(Err(e)) if e.is_eof() => return Err(Unparsed::Incomplete),
+            _ => {
+                malformed = true;
+                rest = &candidate['{'.len_utf8()..];
+            }
+        }
     }
 }
 
@@ -123,10 +166,44 @@ fn matches(want: &Value, got: Option<&Value>) -> bool {
             w.len() == g.len() && pair_off(w, g, &mut vec![false; g.len()])
         }
         (Value::Object(w), Value::Object(g)) => w.iter().all(|(k, v)| matches(v, g.get(k))),
-        (Value::Number(w), Value::Number(g)) => w.as_f64() == g.as_f64(),
+        (Value::Number(w), Value::Number(g)) => numbers_equal(w, g),
         (Value::Array(_) | Value::Object(_) | Value::String(_) | Value::Number(_), _) => false,
         (w, g) => w == g,
     }
+}
+
+/// Two JSON numbers are the same value. Integers compare as integers, so
+/// values past 2^53 (where `f64` can no longer tell neighbors apart) stay
+/// distinct. A float matches an integer only when the integer is exactly
+/// that float (`1` and `1.0`, `0.5` and `5e-1`).
+fn numbers_equal(want: &serde_json::Number, got: &serde_json::Number) -> bool {
+    if let (Some(a), Some(b)) = (want.as_i64(), got.as_i64()) {
+        return a == b;
+    }
+    if let (Some(a), Some(b)) = (want.as_u64(), got.as_u64()) {
+        return a == b;
+    }
+    match (exact_f64(want), exact_f64(got)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// The number as an `f64` only when that `f64` is exactly the same value.
+/// An integer that does not round-trip through `f64` is `None`, so it cannot
+/// compare equal to the float it collapses into. `as i64` saturates, so the
+/// check uses a wider integer: `i64::MAX as f64 as i64` is `i64::MAX` even
+/// though the float is 2^63.
+fn exact_f64(n: &serde_json::Number) -> Option<f64> {
+    if let Some(i) = n.as_i64() {
+        let f = i as f64;
+        return (f as i128 == i128::from(i)).then_some(f);
+    }
+    if let Some(u) = n.as_u64() {
+        let f = u as f64;
+        return (f as u128 == u128::from(u)).then_some(f);
+    }
+    n.as_f64().filter(|f| f.is_finite())
 }
 
 /// The verdict of an expected value written as a keyword (`anyOf`,
@@ -376,11 +453,39 @@ mod tests {
             grade(&expect(json!({"none": null})), "{}").missed,
             vec!["none"]
         );
-        // A number is its value, however the JSON spells it.
+        // A number is its value, however the JSON spells it, when that
+        // spelling is exact. `1` and `1.0` are one value; so are `0.5` and
+        // `5e-1`.
         let one = expect(json!({"n": 1}));
         assert!(grade(&one, r#"{"n": 1.0}"#).passed());
+        assert!(grade(&expect(json!({"n": 1.0})), r#"{"n": 1}"#).passed());
         assert!(!grade(&one, r#"{"n": 1.5}"#).passed());
         assert!(grade(&expect(json!({"n": 0.5})), r#"{"n": 5e-1}"#).passed());
+    }
+
+    /// Past 2^53 a JSON integer is not the f64 it rounds to. Two integers
+    /// one apart must not compare equal, and neither equals the float the
+    /// other collapses into.
+    #[test]
+    fn integers_past_the_f64_mantissa_stay_distinct() {
+        let big = "9007199254740993"; // 2^53 + 1
+        let prev = "9007199254740992"; // 2^53
+        let e = expect(json!({"n": 9007199254740993_i64}));
+        assert!(grade(&e, &format!(r#"{{"n": {big}}}"#)).passed(), "the same integer matches");
+        assert!(!grade(&e, &format!(r#"{{"n": {prev}}}"#)).passed(), "one apart is not equal");
+        assert!(!grade(&e, &format!(r#"{{"n": {prev}.0}}"#)).passed(), "the float 2^53 is not the integer 2^53+1");
+        // 2^53 itself is exactly a float, so the two spellings are one value.
+        assert!(grade(&expect(json!({"n": 9007199254740992_i64})), r#"{"n": 9007199254740992.0}"#).passed());
+        // `as i64` saturates, which would make i64::MAX look equal to 2^63.
+        assert!(!grade(&expect(json!({"n": 9223372036854775807_i64})), r#"{"n": 9223372036854775808.0}"#).passed());
+        assert!(grade(&expect(json!({"n": 9223372036854775807_i64})), r#"{"n": 9223372036854775807}"#).passed());
+        let huge = "18446744073709551615"; // u64::MAX
+        let one_less = "18446744073709551614";
+        let u = expect(json!({"n": 18446744073709551615_u64}));
+        assert!(grade(&u, &format!(r#"{{"n": {huge}}}"#)).passed());
+        assert!(!grade(&u, &format!(r#"{{"n": {one_less}}}"#)).passed());
+        // Same saturation on the u64 side: u64::MAX's f64 is 2^64.
+        assert!(!grade(&u, r#"{"n": 18446744073709551616.0}"#).passed());
     }
 
     #[test]
@@ -433,19 +538,45 @@ mod tests {
     }
 
     /// A reply cut off mid-object has no answer, even when an object nested
-    /// inside it would match on its own.
+    /// inside it would match on its own. A `{` that is not JSON is not that
+    /// object: the reply's answer is the first object that parses.
     #[test]
     fn a_cut_off_reply_is_never_graded_by_an_object_nested_inside_it() {
         let e = expect(json!({"a": "1", "b": "2"}));
         for reply in [
             r#"{"items":[{"a":"1","b":"2"}, {"a""#,
             r#"{"a": "#,
-            r#"Sure {not json} then {"a": "1", "b": "2"}"#,
+            r#"Sure {not json} then {"a": "#,
         ] {
             let r = grade(&e, reply);
             assert!(!r.passed(), "{reply:?}");
-            assert_eq!(r.details(), "fields 0/2: the reply's JSON object does not parse (cut off?)", "{reply:?}");
+            assert_eq!(r.details(), "fields 0/2: the reply's JSON object ends before it closes", "{reply:?}");
+            let r = grade_with(&e, reply, true);
+            assert!(!r.passed(), "{reply:?}");
+            assert_eq!(r.details(), "fields 0/2: the reply's JSON object is cut off: the reply hit its length limit", "{reply:?}");
         }
+    }
+
+    /// A reply that stopped on its own and wrote broken JSON is not "cut
+    /// off", and it is not "no JSON object" either: it is an object that
+    /// does not parse. The length limit is named only when the reply hit it.
+    #[test]
+    fn a_reply_that_stopped_with_broken_json_is_not_called_cut_off() {
+        let e = expect(json!({"a": "1"}));
+        let broken = r#"{"a": "1", "prices": [ "Basic tune-up": "$79" ]}"#;
+        for hit_length in [false, true] {
+            let r = grade_with(&e, broken, hit_length);
+            assert!(!r.passed());
+            assert_eq!(r.details(), "fields 0/1: the reply's JSON object does not parse");
+        }
+        assert_eq!(grade(&e, "no braces here").details(), "fields 0/1: no JSON object in the reply");
+    }
+
+    #[test]
+    fn a_brace_that_is_not_json_does_not_hide_the_answer_after_it() {
+        let e = expect(json!({"a": "1", "b": "2"}));
+        assert!(grade(&e, r#"Sure {not json} then {"a": "1", "b": "2"}"#).passed());
+        assert!(!grade(&expect(json!({"a": "1"})), "{not json}").passed());
     }
 
     #[test]

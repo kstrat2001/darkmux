@@ -261,6 +261,10 @@ pub struct DirectMetrics {
     pub wall_ms: u64,
     /// Always 1: one call is one turn.
     pub turns: u32,
+    /// Why the call stopped, as the endpoint said it (`stop`, `length`, a
+    /// Messages `max_tokens`). Absent when the reply named none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
     #[serde(flatten)]
     pub tokens: DirectTokens,
 }
