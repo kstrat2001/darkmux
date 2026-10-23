@@ -63,37 +63,46 @@ fn walk_into(dir: &Path, prefix: &str, out: &mut BTreeMap<String, Entry>) -> Res
     for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        let rel = if prefix.is_empty() {
-            name.clone()
-        } else {
-            format!("{prefix}/{name}")
-        };
+        let rel = join_rel(prefix, &name);
         let kind = entry.file_type()?;
-        if kind.is_symlink() {
-            out.insert(
-                rel,
-                Entry::Symlink(fs::read_link(entry.path())?.to_string_lossy().into_owned()),
-            );
-        } else if kind.is_dir() {
-            // Skipped at the top only, as the suite's copy skips them: a
-            // nested one is in what the suite runs, so scope sees it.
-            let skipped = prefix.is_empty()
-                && (RUN_ARTIFACT_DIRS.contains(&name.as_str())
-                    || HASH_ONLY_EXCLUDES.contains(&name.as_str()));
-            if !skipped {
+        if kind.is_dir() {
+            if !skipped_dir(prefix, &name) {
                 walk_into(&entry.path(), &rel, out)?;
             }
-        } else if kind.is_file() {
-            out.insert(
-                rel,
-                Entry::File(
-                    fs::read(entry.path())
-                        .with_context(|| format!("reading {}", entry.path().display()))?,
-                ),
-            );
+        } else if let Some(e) = read_entry(&entry.path(), kind)? {
+            out.insert(rel, e);
         }
     }
     Ok(())
+}
+
+fn join_rel(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{prefix}/{name}")
+    }
+}
+
+/// Run-artifact and dependency dirs are skipped at the top only, as the
+/// suite's copy skips them: a nested one is in what the suite runs, so scope
+/// sees it.
+fn skipped_dir(prefix: &str, name: &str) -> bool {
+    prefix.is_empty() && (RUN_ARTIFACT_DIRS.contains(&name) || HASH_ONLY_EXCLUDES.contains(&name))
+}
+
+/// A file's bytes or a symlink's target; `None` for anything else.
+fn read_entry(path: &Path, kind: fs::FileType) -> Result<Option<Entry>> {
+    if kind.is_symlink() {
+        return Ok(Some(Entry::Symlink(
+            fs::read_link(path)?.to_string_lossy().into_owned(),
+        )));
+    }
+    if kind.is_file() {
+        let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        return Ok(Some(Entry::File(bytes)));
+    }
+    Ok(None)
 }
 
 /// `scope`'s problems: a delete, a new file outside `may_add`, an existing

@@ -104,102 +104,131 @@ impl<'a> Copies<'a> {
 /// a suite that could not be started): the caller fails the run closed.
 pub(crate) fn grade(input: &GradeInput) -> Result<GradeRecord> {
     check_asks(input.spec, input.prompt)?;
-    let spec = input.spec;
-    let mut checks = vec![run_finished(input.dispatch)];
     let changes = files::compare(input.fixture, input.result)?;
-    if let Some(scope) = &spec.scope {
-        checks.push(row(
-            "scope",
-            &scope.asks,
-            files::scope_violations(&changes, scope),
-            "only allowed files changed",
-        ));
-    }
-
     let copies = Copies::new(input.work);
-    let suite = match &spec.suite {
-        Some(suite_spec) => {
-            // The fixture's own suite names the tests that must still pass.
-            let before = run_suite(suite_spec, input.fixture, &copies.fresh()?)?;
-            let run = run_suite(suite_spec, input.result, &copies.fresh()?)?;
-            checks.push(suite_check(
-                suite_spec,
-                &run,
-                &before,
-                input.baseline_test_count,
-            )?);
-            Some((suite_spec, run))
-        }
+    let mut checks = vec![run_finished(input.dispatch)];
+    checks.extend(scope_row(input, &changes));
+    let suite = match &input.spec.suite {
+        Some(spec) => Some(suite_row(input, spec, &copies)?),
         None => None,
     };
-    let suite_green = suite.as_ref().is_some_and(|(_, run)| run.green());
-
-    if let (Some(portable), Some((suite_spec, suite))) = (&spec.portable, &suite) {
-        let elsewhere = run_suite(suite_spec, input.result, &copies.fresh()?.join("elsewhere"))?;
-        let same = elsewhere.counts.as_ref().map(|c| c.passed())
-            == suite.counts.as_ref().map(|c| c.passed());
-        let problems = match (elsewhere.green(), same) {
-            (true, true) => vec![],
-            (true, false) => vec![format!(
-                "green, but {} passing there against {} here",
-                elsewhere.passed_text(),
-                suite.passed_text()
-            )],
-            (false, _) => vec![format!("red from another path: {}", elsewhere.describe())],
-        };
-        checks.push(row(
-            "portable",
-            &portable.asks,
-            problems,
-            "green from a second copy at another path",
-        ));
+    let run = suite.as_ref().map(|(row, run, spec)| {
+        checks.push(row.clone());
+        (*spec, run)
+    });
+    if let Some((spec, run)) = run {
+        checks.extend(portable_row(input, spec, run, &copies)?);
     }
-
-    if let Some(style) = &spec.style {
-        checks.push(row(
-            "style",
-            &style.asks,
-            files::style_violations(&changes, input.result, style)?,
-            "every new file matches",
-        ));
-    }
-
-    if let Some(behaviors) = &spec.behaviors {
-        let problems = if suite_green {
-            missed_behaviors(input, behaviors, &copies)?
-        } else {
-            vec!["not graded: the suite is red without any planted bug".to_string()]
-        };
-        let caught = format!(
-            "every planted bug turns the suite red ({})",
-            behavior_names(behaviors).join(", ")
-        );
-        checks.push(row("behaviors", &behaviors.asks, problems, &caught));
-    }
-
-    if let Some(reply) = spec.reply.as_ref().filter(|r| r.required) {
-        let present = input.reply.is_some_and(|r| !r.trim().is_empty());
-        let problems = if present {
-            vec![]
-        } else {
-            vec!["no final reply".to_string()]
-        };
-        checks.push(row(
-            "reply_required",
-            &reply.asks,
-            problems,
-            "a final reply is present (its content is not graded)",
-        ));
-    }
-
+    checks.extend(style_row(input, &changes)?);
+    let green = run.is_some_and(|(_, run)| run.green());
+    checks.extend(behaviors_row(input, green, &copies)?);
+    checks.extend(reply_row(input));
     Ok(GradeRecord {
         passed: checks.iter().all(|c| c.passed),
         checks,
-        tests_passed: suite
-            .as_ref()
-            .and_then(|(_, run)| run.counts.as_ref().map(|c| c.passed())),
+        tests_passed: run.and_then(|(_, run)| run.counts.as_ref().map(|c| c.passed())),
         ungraded_passed: None,
     })
+}
+
+fn scope_row(input: &GradeInput, changes: &files::Changes) -> Option<GradeCheck> {
+    let scope = input.spec.scope.as_ref()?;
+    Some(row(
+        "scope",
+        &scope.asks,
+        files::scope_violations(changes, scope),
+        "only allowed files changed",
+    ))
+}
+
+/// The suite on the result, judged against the fixture's own run of it,
+/// which names the tests that must still pass.
+fn suite_row<'s>(
+    input: &GradeInput,
+    spec: &'s SuiteGrade,
+    copies: &Copies,
+) -> Result<(GradeCheck, SuiteRun, &'s SuiteGrade)> {
+    let before = run_suite(spec, input.fixture, &copies.fresh()?)?;
+    let run = run_suite(spec, input.result, &copies.fresh()?)?;
+    let check = suite_check(spec, &run, &before, input.baseline_test_count)?;
+    Ok((check, run, spec))
+}
+
+fn portable_row(
+    input: &GradeInput,
+    spec: &SuiteGrade,
+    suite: &SuiteRun,
+    copies: &Copies,
+) -> Result<Option<GradeCheck>> {
+    let Some(portable) = &input.spec.portable else {
+        return Ok(None);
+    };
+    let elsewhere = run_suite(spec, input.result, &copies.fresh()?.join("elsewhere"))?;
+    let same =
+        elsewhere.counts.as_ref().map(|c| c.passed()) == suite.counts.as_ref().map(|c| c.passed());
+    let problems = match (elsewhere.green(), same) {
+        (true, true) => vec![],
+        (true, false) => vec![format!(
+            "green, but {} passing there against {} here",
+            elsewhere.passed_text(),
+            suite.passed_text()
+        )],
+        (false, _) => vec![format!("red from another path: {}", elsewhere.describe())],
+    };
+    Ok(Some(row(
+        "portable",
+        &portable.asks,
+        problems,
+        "green from a second copy at another path",
+    )))
+}
+
+fn style_row(input: &GradeInput, changes: &files::Changes) -> Result<Option<GradeCheck>> {
+    let Some(style) = &input.spec.style else {
+        return Ok(None);
+    };
+    Ok(Some(row(
+        "style",
+        &style.asks,
+        files::style_violations(changes, input.result, style)?,
+        "every new file matches",
+    )))
+}
+
+fn behaviors_row(
+    input: &GradeInput,
+    suite_green: bool,
+    copies: &Copies,
+) -> Result<Option<GradeCheck>> {
+    let Some(behaviors) = &input.spec.behaviors else {
+        return Ok(None);
+    };
+    let problems = if suite_green {
+        missed_behaviors(input, behaviors, copies)?
+    } else {
+        vec!["not graded: the suite is red without any planted bug".to_string()]
+    };
+    let caught = format!(
+        "every planted bug turns the suite red ({})",
+        behavior_names(behaviors).join(", ")
+    );
+    Ok(Some(row("behaviors", &behaviors.asks, problems, &caught)))
+}
+
+fn reply_row(input: &GradeInput) -> Option<GradeCheck> {
+    let reply = input.spec.reply.as_ref().filter(|r| r.required)?;
+    let present = input.reply.is_some_and(|r| !r.trim().is_empty());
+    let problems = if present {
+        vec![]
+    } else {
+        vec!["no final reply".to_string()]
+    };
+    Some(row(
+        "reply_required",
+        &reply.asks,
+        problems,
+        "a final reply is present (its content is not graded)",
+    ))
 }
 
 /// Every declared check quotes the prompt, word for word.
@@ -435,57 +464,22 @@ fn missed_behaviors(
     spec: &crate::workloads::grade_spec::BehaviorsGrade,
     copies: &Copies,
 ) -> Result<Vec<String>> {
-    if spec.mutants.is_empty() {
-        bail!("verify.grade.behaviors declares no mutants");
-    }
     let suite = input
         .spec
         .suite
         .as_ref()
         .ok_or_else(|| anyhow!("verify.grade.behaviors needs a suite"))?;
-    let mut originals: Vec<(&str, String)> = Vec::new();
-    for (i, mutant) in spec.mutants.iter().enumerate() {
-        let original = fs::read_to_string(input.fixture.join(&mutant.file))
-            .with_context(|| format!("reading the fixture's {} for a planted bug", mutant.file))?;
-        if original.matches(&mutant.find).count() != 1 {
-            bail!(
-                "planted bug {} ({}) no longer applies: its text is not in the fixture's {} exactly once",
-                i + 1,
-                mutant.behavior,
-                mutant.file
-            );
-        }
-        if !originals.iter().any(|(f, _)| *f == mutant.file) {
-            originals.push((&mutant.file, original));
-        }
-    }
-    for (file, original) in &originals {
-        let run = run_planted(input, suite, copies, file, &format!("{original}\n"))?;
-        if !run.green() {
-            return Ok(vec![format!(
-                "the tests fail on an edit that changes no behavior (a blank line added to the end of {file}): \
-                 they check the source text, not its behavior ({})",
-                run.describe()
-            )]);
-        }
+    let originals = planted_files(input.fixture, spec)?;
+    if let Some(problem) = control_problem(input, suite, copies, &originals)? {
+        return Ok(vec![problem]);
     }
     let mut survived: Vec<(String, Vec<usize>)> = Vec::new();
     for (i, mutant) in spec.mutants.iter().enumerate() {
-        let original = &originals
-            .iter()
-            .find(|(f, _)| *f == mutant.file)
-            .expect("read above")
-            .1;
-        let run = run_planted(
-            input,
-            suite,
-            copies,
-            &mutant.file,
-            &original.replacen(&mutant.find, &mutant.replace, 1),
-        )?;
+        let original = &originals[&mutant.file];
+        let planted = original.replacen(&mutant.find, &mutant.replace, 1);
         // A timeout counts as caught: the suite did not pass with the bug in
         // (and the control above shows the tests do not tell an edit apart).
-        if run.green() {
+        if run_planted(input, suite, copies, &mutant.file, &planted)?.green() {
             match survived.iter_mut().find(|(b, _)| *b == mutant.behavior) {
                 Some((_, ids)) => ids.push(i + 1),
                 None => survived.push((mutant.behavior.clone(), vec![i + 1])),
@@ -502,6 +496,53 @@ fn missed_behaviors(
             )
         })
         .collect())
+}
+
+/// The control: each planted file with a blank line added, which changes no
+/// behavior. A suite that fails on it tests the source text.
+fn control_problem(
+    input: &GradeInput,
+    suite: &SuiteGrade,
+    copies: &Copies,
+    originals: &std::collections::BTreeMap<String, String>,
+) -> Result<Option<String>> {
+    for (file, original) in originals {
+        let run = run_planted(input, suite, copies, file, &format!("{original}\n"))?;
+        if !run.green() {
+            return Ok(Some(format!(
+                "the tests fail on an edit that changes no behavior (a blank line added to the end of {file}): \
+                 they check the source text, not its behavior ({})",
+                run.describe()
+            )));
+        }
+    }
+    Ok(None)
+}
+
+/// The fixture's text of every file a bug is planted in, each bug's text
+/// checked to be there exactly once.
+fn planted_files(
+    fixture: &Path,
+    spec: &crate::workloads::grade_spec::BehaviorsGrade,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    if spec.mutants.is_empty() {
+        bail!("verify.grade.behaviors declares no mutants");
+    }
+    let mut originals = std::collections::BTreeMap::new();
+    for (i, mutant) in spec.mutants.iter().enumerate() {
+        let original = fs::read_to_string(fixture.join(&mutant.file))
+            .with_context(|| format!("reading the fixture's {} for a planted bug", mutant.file))?;
+        if original.matches(&mutant.find).count() != 1 {
+            bail!(
+                "planted bug {} ({}) no longer applies: its text is not in the fixture's {} exactly once",
+                i + 1,
+                mutant.behavior,
+                mutant.file
+            );
+        }
+        originals.insert(mutant.file.clone(), original);
+    }
+    Ok(originals)
 }
 
 /// Copy the result, put `content` at `file` (the fixture's file, edited), and
@@ -770,14 +811,72 @@ pub struct Regrade {
 pub fn regrade(run: &str, fixture: Option<&Path>, write: bool) -> Result<Regrade> {
     let run_dir = crate::lab::inspect::resolve_run_dir(run);
     let manifest = RunManifest::read(&run_dir)?;
+    let loaded = graded_workload(&run_dir, &manifest)?;
+    let spec = loaded
+        .manifest
+        .workload
+        .verify
+        .as_ref()
+        .and_then(|v| v.grade.as_ref())
+        .ok_or_else(|| {
+            anyhow!(
+                "workload \"{}\" declares no verify.grade",
+                loaded.manifest.workload.id
+            )
+        })?;
+    let fixture_dir = run_fixture(&run_dir, &manifest, fixture)?;
+    let result = kept_result(&run_dir, &manifest);
+    let dispatch = kept_dispatch(&manifest);
+    let ungraded = Ungraded::from_manifest(&manifest);
+    let prompt = crate::providers::coding_task::resolve_prompt(&loaded)?;
+    let graded = grade_run(&run_dir, spec, &prompt, &fixture_dir, &result, &dispatch);
+    let record = if write {
+        self::record(&run_dir, graded, &ungraded)?
+    } else {
+        graded
+    };
+    Ok(Regrade {
+        run_dir,
+        record,
+        recorded: write,
+    })
+}
+
+/// The run's own sandbox, where the lab keeps it; the manifest's path only
+/// for a run kept elsewhere (a run folder copied between machines still
+/// carries the first machine's path).
+fn kept_result(run_dir: &Path, manifest: &RunManifest) -> PathBuf {
+    let kept = run_dir.join("sandbox");
+    if kept.is_dir() {
+        return kept;
+    }
+    manifest.sandbox.clone().map(PathBuf::from).unwrap_or(kept)
+}
+
+/// How a kept run's dispatch ended, from its manifest.
+fn kept_dispatch(manifest: &RunManifest) -> DispatchEnd {
+    match (&manifest.escalation, manifest.ok) {
+        (Some(reason), _) => DispatchEnd::Escalated {
+            reason: reason.clone(),
+        },
+        (None, Some(true)) => DispatchEnd::Completed,
+        _ => DispatchEnd::Failed,
+    }
+}
+
+/// The workload a kept run names, loaded after the same unknown-key refusal a
+/// lab run gives (contract 7): a typo in `verify.grade` must not grade with a
+/// check left out.
+fn graded_workload(
+    run_dir: &Path,
+    manifest: &RunManifest,
+) -> Result<crate::workloads::types::LoadedWorkload> {
     let workload_id = manifest
         .workload
         .clone()
         .ok_or_else(|| anyhow!("{}: the manifest names no workload", run_dir.display()))?;
     let user_root = crate::lab::paths::resolve(crate::lab::paths::ResolveScope::ForceUser).root;
     let loaded = crate::workloads::load::load(&workload_id, Some(&user_root));
-    // The same unknown-key refusal a lab run gives (contract 7): a typo in
-    // the workload's `verify.grade` must not grade with a check left out.
     let binds = loaded
         .as_ref()
         .ok()
@@ -787,14 +886,13 @@ pub fn regrade(run: &str, fixture: Option<&Path>, write: bool) -> Result<Regrade
         None,
         binds.as_deref(),
     )?;
-    let loaded = loaded?;
-    let spec = loaded
-        .manifest
-        .workload
-        .verify
-        .as_ref()
-        .and_then(|v| v.grade.as_ref())
-        .ok_or_else(|| anyhow!("workload \"{workload_id}\" declares no verify.grade"))?;
+    loaded
+}
+
+/// The fixture a kept run is graded against: its own (`fixture.source_path`)
+/// unless `fixture` names another checkout, and either way hashing to the
+/// run's recorded `baseline_hash`.
+fn run_fixture(run_dir: &Path, manifest: &RunManifest, fixture: Option<&Path>) -> Result<PathBuf> {
     let fixture_dir = match fixture {
         Some(f) => f.to_path_buf(),
         None => manifest
@@ -823,35 +921,7 @@ pub fn regrade(run: &str, fixture: Option<&Path>, write: bool) -> Result<Regrade
             fixture_dir.display()
         );
     }
-    // The run's own sandbox, where the lab keeps it; the manifest's path
-    // only for a run kept elsewhere (a run folder copied between machines
-    // still carries the first machine's path).
-    let kept = run_dir.join("sandbox");
-    let result = if kept.is_dir() {
-        kept
-    } else {
-        manifest.sandbox.clone().map(PathBuf::from).unwrap_or(kept)
-    };
-    let dispatch = match (&manifest.escalation, manifest.ok) {
-        (Some(reason), _) => DispatchEnd::Escalated {
-            reason: reason.clone(),
-        },
-        (None, Some(true)) => DispatchEnd::Completed,
-        _ => DispatchEnd::Failed,
-    };
-    let ungraded = Ungraded::from_manifest(&manifest);
-    let prompt = crate::providers::coding_task::resolve_prompt(&loaded)?;
-    let graded = grade_run(&run_dir, spec, &prompt, &fixture_dir, &result, &dispatch);
-    let record = if write {
-        self::record(&run_dir, graded, &ungraded)?
-    } else {
-        graded
-    };
-    Ok(Regrade {
-        run_dir,
-        record,
-        recorded: write,
-    })
+    Ok(fixture_dir)
 }
 
 /// The text `lab grade` prints for one run.
