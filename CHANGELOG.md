@@ -26,10 +26,13 @@ darkmux release.
   the host. A run passes when every field matches, and records
   `fields_correct`, `fields_expected` and `fields_missed` beside the verdict. A `{` in preamble
   prose is not the answer. A reply cut off mid-object has no answer, and an object nested inside
-  it is not graded in its place.
+  it is not graded in its place. The verdict calls an unclosed answer cut off only when the
+  reply's last model call finished on its length limit; broken JSON says it does not parse.
+- The `--json` envelope of a hosted-endpoint dispatch gains `metrics.finish_reason`, the
+  endpoint's own stop reason (additive; absent when the reply names none).
 - **`replyRoom: "context"`** gives a prompt run's reply the rest of its model's window
-  (`n_ctx` minus the prompt, counted at one token per byte, plus a fixed overhead, so the cap
-  never exceeds the window) on the one-call path a tool-less role on an unmanaged endpoint takes,
+  (`n_ctx` minus the prompt, estimated at one token per two bytes plus a fixed overhead, which
+  over-counts prose, HTML and JSON) on the one-call path a tool-less role on an unmanaged endpoint takes,
   and records the cap it sent. LM Studio runs already continue a reply without a cap. A profile
   model can declare `max_output_tokens` (a hosted model's output limit below its window), and the
   reply asks for no more than that. Profile models in `--json` output gain the optional

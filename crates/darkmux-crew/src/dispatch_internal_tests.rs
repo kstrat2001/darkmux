@@ -3627,6 +3627,48 @@
         );
     }
 
+    /// The one call's envelope carries the endpoint's finish reason, so a
+    /// reader can tell a reply cut at its cap from one that stopped on its
+    /// own. A reply that names none carries no key.
+    #[test]
+    #[serial]
+    fn the_one_call_envelope_carries_the_finish_reason() {
+        let crew_dir = TempDir::new().unwrap();
+        let flows_dir = TempDir::new().unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", crew_dir.path());
+            std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
+        }
+        let mut seen = Vec::new();
+        for reply in [
+            r#"{"choices":[{"message":{"content":"{\"a\":"},"finish_reason":"length"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+            r#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+        ] {
+            let (base_url, _rx) = one_shot_http_mock(reply);
+            let mut opts = dispatch_preflight_probe_opts();
+            opts.role_id = "pr-reviewer".to_string();
+            opts.json = true;
+            let pm = darkmux_types::ProfileModel::hosted_for_test("gpt-remote", Some(100000), serde_json::json!({"url": base_url}));
+            let result = dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), &quarantine_test_role(), "system prompt", &crate::target::target_for("p".into(), Default::default(), pm).unwrap())
+                .expect("dispatch_unmanaged must succeed");
+            let envelope: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
+            seen.push(envelope["metrics"].get("finish_reason").cloned());
+        }
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+            match prev_flows {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+        assert_eq!(seen, vec![Some(serde_json::json!("length")), None]);
+    }
+
     /// The error the PRODUCTION mapping raises for a reply with HTTP `status`
     /// and `body`: [`classify_hosted_response`], then, for a retried class,
     /// the error [`exhausted_hosted_error`] gives once the retries ran out.

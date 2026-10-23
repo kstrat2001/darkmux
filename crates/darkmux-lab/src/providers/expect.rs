@@ -71,8 +71,16 @@ impl FieldsReport {
     }
 }
 
-/// Compare the reply's first JSON object against `expect`.
+/// Compare the reply's first JSON object against `expect`, for a reply not
+/// known to have hit its length limit.
 pub(crate) fn grade(expect: &Map<String, Value>, reply: &str) -> FieldsReport {
+    grade_with(expect, reply, false)
+}
+
+/// [`grade`], told whether the reply hit its length limit (its last model
+/// call finished on `length`). Only then is an object that ends before it
+/// closes called cut off.
+pub(crate) fn grade_with(expect: &Map<String, Value>, reply: &str, hit_length: bool) -> FieldsReport {
     let expected = expect.len();
     let answer = match first_object(reply) {
         Ok(a) => a,
@@ -81,7 +89,7 @@ pub(crate) fn grade(expect: &Map<String, Value>, reply: &str) -> FieldsReport {
                 correct: 0,
                 expected,
                 missed: expect.keys().cloned().collect(),
-                unreadable: Some(why),
+                unreadable: Some(why.describe(hit_length).to_string()),
             }
         }
     };
@@ -98,26 +106,50 @@ pub(crate) fn grade(expect: &Map<String, Value>, reply: &str) -> FieldsReport {
     }
 }
 
+/// Why a reply has no answer to grade.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Unparsed {
+    /// No `{` in the reply at all.
+    NoObject,
+    /// Every `{` began something that is not JSON.
+    Malformed,
+    /// A `{` began an object the reply ends inside.
+    Incomplete,
+}
+
+impl Unparsed {
+    fn describe(self, hit_length: bool) -> &'static str {
+        match self {
+            Unparsed::NoObject => "no JSON object in the reply",
+            Unparsed::Malformed => "the reply's JSON object does not parse",
+            Unparsed::Incomplete if hit_length => "the reply's JSON object is cut off: the reply hit its length limit",
+            Unparsed::Incomplete => "the reply's JSON object ends before it closes",
+        }
+    }
+}
+
 /// The first JSON object in the reply that parses. A ```json fence or prose
 /// before it is tolerated, including a `{` that is not itself JSON. A `{`
-/// that begins an object cut off mid-parse is the reply's answer, and it has
-/// none: an object nested inside it is never graded in its place. What
+/// that begins an object the reply ends inside is the reply's answer, and it
+/// has none: an object nested inside it is never graded in its place. What
 /// follows a parsed object is not read.
-fn first_object(reply: &str) -> Result<Map<String, Value>, String> {
+fn first_object(reply: &str) -> Result<Map<String, Value>, Unparsed> {
     let mut rest = reply;
+    let mut malformed = false;
     loop {
         let Some(rel) = rest.find('{') else {
-            return Err("no JSON object in the reply".to_string());
+            return Err(if malformed { Unparsed::Malformed } else { Unparsed::NoObject });
         };
         // `{` is one byte, and `find` returns a char boundary.
         let candidate = &rest[rel..];
         let mut stream = serde_json::Deserializer::from_str(candidate).into_iter::<Value>();
         match stream.next() {
             Some(Ok(Value::Object(obj))) => return Ok(obj),
-            Some(Err(e)) if e.is_eof() => {
-                return Err("the reply's JSON object does not parse (cut off?)".to_string());
+            Some(Err(e)) if e.is_eof() => return Err(Unparsed::Incomplete),
+            _ => {
+                malformed = true;
+                rest = &candidate['{'.len_utf8()..];
             }
-            _ => rest = &candidate['{'.len_utf8()..],
         }
     }
 }
@@ -517,8 +549,26 @@ mod tests {
         ] {
             let r = grade(&e, reply);
             assert!(!r.passed(), "{reply:?}");
-            assert_eq!(r.details(), "fields 0/2: the reply's JSON object does not parse (cut off?)", "{reply:?}");
+            assert_eq!(r.details(), "fields 0/2: the reply's JSON object ends before it closes", "{reply:?}");
+            let r = grade_with(&e, reply, true);
+            assert!(!r.passed(), "{reply:?}");
+            assert_eq!(r.details(), "fields 0/2: the reply's JSON object is cut off: the reply hit its length limit", "{reply:?}");
         }
+    }
+
+    /// A reply that stopped on its own and wrote broken JSON is not "cut
+    /// off", and it is not "no JSON object" either: it is an object that
+    /// does not parse. The length limit is named only when the reply hit it.
+    #[test]
+    fn a_reply_that_stopped_with_broken_json_is_not_called_cut_off() {
+        let e = expect(json!({"a": "1"}));
+        let broken = r#"{"a": "1", "prices": [ "Basic tune-up": "$79" ]}"#;
+        for hit_length in [false, true] {
+            let r = grade_with(&e, broken, hit_length);
+            assert!(!r.passed());
+            assert_eq!(r.details(), "fields 0/1: the reply's JSON object does not parse");
+        }
+        assert_eq!(grade(&e, "no braces here").details(), "fields 0/1: no JSON object in the reply");
     }
 
     #[test]
