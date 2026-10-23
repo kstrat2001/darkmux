@@ -735,23 +735,7 @@ export function MissionGraphLens({
     }
 
     if (!graphQuery.data.ok) {
-      const notFound = graphQuery.data.status === 404;
-      const msg = notFound
-        ? ownedBy
-          ? `This mission ran on \`${ownedBy}\`, not on this machine. Its graph is built from local mission data, so open darkmux on \`${ownedBy}\` to see it.`
-          : "This mission's graph data isn't available — it may have been an ephemeral or cleared run."
-        : `darkmux mission graph: ${graphQuery.data.message}`;
-      return (
-        <div className="missionlens" data-state="error">
-          <div className="stagehdr">mission graph</div>
-          <div className="msg none" role="alert">
-            {msg}
-          </div>
-          <button type="button" className="evbtn" title="retry — refetch graph" onClick={refresh}>
-            ↻
-          </button>
-        </div>
-      );
+      return <GraphUnavailable failure={graphQuery.data} ownedBy={ownedBy} onRetry={refresh} />;
     }
   } else {
     // (#2032 packet 2) `graphQuery` never runs on a static build (`enabled:
@@ -894,6 +878,39 @@ export function MissionGraphLens({
           />
         )}
       </div>
+    </div>
+  );
+}
+
+/** The daemon-backed graph fetch did not succeed. A 404 is an answer, not a
+ *  failure: the backstop poll keeps asking, so a manual retry could only
+ *  repeat it. Only a real failure offers one. */
+function GraphUnavailable({
+  failure,
+  ownedBy,
+  onRetry,
+}: {
+  failure: { status: number | null; message: string };
+  ownedBy: string | null | undefined;
+  onRetry: () => void;
+}) {
+  const notFound = failure.status === 404;
+  const msg = notFound
+    ? ownedBy
+      ? `This mission ran on \`${ownedBy}\`, not on this machine. Its graph is built from local mission data, so open darkmux on \`${ownedBy}\` to see it.`
+      : "This mission's graph data isn't available — it may have been an ephemeral or cleared run."
+    : `darkmux mission graph: ${failure.message}`;
+  return (
+    <div className="missionlens" data-state="error">
+      <div className="stagehdr">mission graph</div>
+      <div className="msg none" role="alert">
+        {msg}
+      </div>
+      {!notFound && (
+        <button type="button" className="evbtn retrybtn" title="retry — refetch graph" onClick={onRetry}>
+          ↻ retry
+        </button>
+      )}
     </div>
   );
 }
