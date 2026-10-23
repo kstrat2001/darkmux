@@ -90,7 +90,18 @@
     <pre><code>git clone https://github.com/kstrat2001/pepper-grinder
 darkmux lab fixture register ./pepper-grinder
 darkmux lab run pepper-grinder</code></pre>
-    <p>The untouched suite already passes (14 tests), so a green result on its own is a weak bar. The useful signal is how many tests the run added, which <code>run stats</code> reports.</p>
+    <p>The untouched suite already passes (14 tests), so a green suite on its own is a weak bar. The workload declares a grader (<code>verify.grade</code>), and a run passes only when every check does. Each check quotes the prompt sentence it grades, and the grader refuses to run one the prompt does not say word for word:</p>
+    <ul>
+      <li><code>run_finished</code>: the model stopped on its own (the runtime says <code>stop</code>; an error, an escalation or a turn limit is not a finish).</li>
+      <li><code>scope</code>: <code>src/</code> and <code>test/portability.test.js</code> unchanged, nothing deleted, and the existing test file may only gain lines (a comment may go).</li>
+      <li><code>suite</code>: the grader's own run of the tests on a copy, read from a JUnit report: green, with more passing tests than the baseline, and every test the untouched fixture passes still passing by name.</li>
+      <li><code>portable</code>: green from a second copy at another path.</li>
+      <li><code>style</code>: new test files use <code>node:test</code>, <code>node:assert/strict</code>, <code>describe</code> and <code>it</code>.</li>
+      <li><code>behaviors</code>: one planted bug per behavior the baseline leaves untested (pepper, row lock, boot guard, expiry parsing), each applied to the fixture's own source in a copy; the run's tests must go red for every one. Edits that change no behavior (a blank line at the end of the file, a space added inside each planted bug's span) must leave them green, so tests that read the source text instead of running it do not count.</li>
+      <li><code>reply_required</code>: the run ended with a final reply. Its content is not graded.</li>
+    </ul>
+    <p>The grader's suite runs execute where the verify command does: in a container with only a copy of the run's sandbox mounted, no network and no capabilities, unless <code>runtime.tests_on_host</code> puts them on this machine as you (see "Where the verify command runs" below).</p>
+    <p>The checks and their evidence are recorded under <code>verify.grade</code> in the run's manifest. <code>darkmux lab grade &lt;run&gt;...</code> grades kept runs again without re-running them, against the fixture content each run started from; <code>--record</code> writes the result into the run's manifest.</p>
   </div>
 </section>
 

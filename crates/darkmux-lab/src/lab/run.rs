@@ -125,11 +125,21 @@ pub fn exit_code(outcomes: &[RunOutcome]) -> i32 {
     }
 }
 
-/// `replyRoom` and `verify.expect` are the prompt provider's: any other
-/// provider would run without them, so a workload that sets one there is
-/// refused rather than run as if it had been checked.
+/// `replyRoom` and `verify.expect` are the prompt provider's, and
+/// `verify.grade` the coding-task provider's: any other provider would run
+/// without them, so a workload that sets one there is refused rather than run
+/// as if it had been checked.
 fn refuse_keys_another_provider_ignores(loaded: &crate::workloads::types::LoadedWorkload) -> Result<()> {
     let w = &loaded.manifest.workload;
+    // (#3353) The grader is wired into the coding-task provider only so far:
+    // anywhere else it would never run.
+    if w.provider != "coding-task" && w.verify.as_ref().is_some_and(|v| v.grade.is_some()) {
+        return Err(anyhow!(
+            "workload \"{}\": verify.grade is graded for the `coding-task` provider only so far; this workload's provider is `{}`",
+            w.id,
+            w.provider
+        ));
+    }
     if w.provider == "prompt" {
         return Ok(());
     }
@@ -362,6 +372,20 @@ impl OneRun<'_> {
             result.end(),
             coverage_min_pct,
         );
+        // (#3353) The grader, when the workload declares one, on top of the gate.
+        let gate = crate::lab::grade::apply(
+            run_dir,
+            source,
+            sandbox,
+            &result.end(),
+            result.verify.as_ref(),
+            self.workload,
+            gate,
+        );
+        // A graded run has a verdict even with no verify command of its own.
+        if result.verify.is_none() && self.workload.manifest.workload.verify.as_ref().is_some_and(|v| v.grade.is_some()) {
+            result.verify = Some(crate::workloads::types::VerifyOutcome { passed: true, details: String::new() });
+        }
         if let Some(w) = settle_verify(result.verify.as_mut(), gate) {
             warn(self.opts.quiet, &w);
         }
@@ -2263,6 +2287,27 @@ mod tests {
         assert!(refuse_keys_another_provider_ignores(&doc("prompt")).is_ok());
         let err = refuse_keys_another_provider_ignores(&doc("coding-task")).unwrap_err().to_string();
         assert!(err.contains("replyRoom and verify.expect applies only to the `prompt` provider"), "{err}");
+    }
+
+    /// (#3353) `verify.grade` is wired into the coding-task provider only, so
+    /// any other provider refuses it rather than running ungraded.
+    #[test]
+    fn a_grader_is_refused_outside_the_coding_task_provider() {
+        let doc = |provider: &str| -> crate::workloads::types::LoadedWorkload {
+            let text = serde_json::json!({"workload": {"id": "w", "provider": provider, "prompt": "x",
+                "verify": {"grade": {"reply": {"asks": ["x"], "required": true}}}}})
+            .to_string();
+            crate::workloads::types::LoadedWorkload {
+                manifest: serde_json::from_str(&text).unwrap(),
+                base_dir: std::path::PathBuf::from("/nonexistent"),
+                source: crate::workloads::types::WorkloadSource::OnDisk,
+            }
+        };
+        assert!(refuse_keys_another_provider_ignores(&doc("coding-task")).is_ok());
+        for provider in ["prompt", "tool-bench"] {
+            let err = refuse_keys_another_provider_ignores(&doc(provider)).unwrap_err().to_string();
+            assert!(err.contains("verify.grade is graded for the `coding-task` provider only so far"), "{err}");
+        }
     }
 
     /// The with-context arm reads `promptFile` from the directory it is given

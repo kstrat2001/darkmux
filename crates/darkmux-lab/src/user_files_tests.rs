@@ -69,6 +69,7 @@ fn a_workload_with_an_unknown_key_is_refused_by_the_lab_preflight() {
         (with_key(quick_q(), "/workload", "promt"), "workload.promt", "workload.prompt"),
         (with_key(quick_q(), "/workload", "replyRom"), "workload.replyRom", "workload.replyRoom"),
         (with_key(quick_q(), "/workload/verify", "expct"), "workload.verify.expct", "workload.verify.expect"),
+        (with_key(quick_q(), "/workload/verify", "grde"), "workload.verify.grde", "workload.verify.grade"),
     ];
     for (doc, key, closest) in probes {
         let state = IsolatedState::new();
@@ -233,6 +234,28 @@ fn a_structured_output_workload_passes_and_a_bad_reply_room_is_refused() {
     write_workload(&state, &wl);
     let refusal = preflight_with(Scope::LabRun, None, Some(PROBE_FIXTURE)).unwrap_err().to_string();
     assert!(refusal.contains("workload.replyRoom"), "{refusal}");
+}
+
+/// (#3353) A grader's keys are checked like every other key, nested ones
+/// included, and an unregistered report format is refused.
+#[test]
+#[serial_test::serial]
+fn a_grader_with_a_mistyped_key_or_an_unknown_report_is_refused() {
+    let state = IsolatedState::new();
+    let mut wl = quick_q();
+    wl["workload"]["provider"] = json!("coding-task");
+    let suite = json!({"asks": ["a"], "command": "sh t.sh ${REPORT}", "report": "junit"});
+    wl["workload"]["verify"] = json!({"grade": {"suite": suite}});
+    write_workload(&state, &wl);
+    assert_eq!(preflight_with(Scope::LabRun, None, Some(PROBE_FIXTURE)), Ok(()));
+    wl["workload"]["verify"]["grade"]["suite"]["comand"] = json!("x");
+    write_workload(&state, &wl);
+    let refusal = preflight_with(Scope::LabRun, None, Some(PROBE_FIXTURE)).unwrap_err().to_string();
+    assert!(refusal.contains("workload.verify.grade.suite.comand"), "{refusal}");
+    wl["workload"]["verify"] = json!({"grade": {"suite": {"asks": ["a"], "command": "x", "report": "tap"}}});
+    write_workload(&state, &wl);
+    let refusal = preflight_with(Scope::LabRun, None, Some(PROBE_FIXTURE)).unwrap_err().to_string();
+    assert!(refusal.contains("workload.verify.grade.suite.report"), "{refusal}");
 }
 
 // ── (review C1) the gate and the loader never disagree ──

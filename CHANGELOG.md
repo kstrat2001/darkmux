@@ -16,6 +16,30 @@ darkmux release.
 
 ### Added
 
+- **A grader for coding runs: `verify.grade` (#3353).** A workload names checks on the run's
+  result, and every check quotes the prompt sentence it grades; a sentence the prompt does not
+  hold word for word refuses to grade. `run_finished` always runs (an errored, escalated or cut-off
+  dispatch fails). `scope` compares the result with the pristine fixture: new files only where
+  `may_add` allows, `append_only` files may only gain lines (comment lines may go when
+  `comment_prefixes` names the marker), nothing else changed or deleted. `suite` runs a declared
+  command on a copy of the result and reads a JUnit report: green, and with `more_than_baseline`
+  more passing tests than the fixture's `baseline.test_count`. `portable` runs it again from a
+  second copy at another path. `style` names strings each new file of a kind must contain.
+  `behaviors` plants bugs, each in the fixture's own copy of a file inside a copy of the result,
+  and the suite must go red for every one; it is one pass/fail whose evidence names the behaviors
+  whose bugs survived. `reply_required` needs a final reply and never grades its content. The
+  verdict is the ungraded one (the verify command and the work gate) and the grader's, recorded
+  with every check's evidence under `verify.grade` in the run manifest (v9). The model's side is
+  never touched: every check runs on copies, removed afterwards. Workload schema 1.2. Wired into
+  the `coding-task` provider; any other provider refuses `verify.grade`.
+- **`darkmux lab grade <run>...`** grades kept runs again with their workload's current grader,
+  without re-running them, against the fixture content each run started from (`--fixture` names
+  another checkout, which must hash to the run's `baseline_hash`). `--record` writes the grade
+  into the run's manifest, so `run inspect` and `lab submit` read the graded verdict.
+- **pepper-grinder is graded.** Its prompt is byte-identical; the workload adds a grader with
+  scope, suite, portable, style, behaviors (pepper, row lock, boot guard, expiry parsing) and
+  reply_required. Graded again, 7 of the 33 kept pepper-grinder runs on one machine pass, where the
+  old rule passed 30.
 - **Run stats 2.3.0: time to first token, generation speed without prefill, and context peak.**
   `run stats` now reports `first_token_ms_median` and `first_token_ms_max` (the wait from a
   stream's start to its first output, which is the prompt's processing plus transport),

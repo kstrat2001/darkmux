@@ -626,7 +626,13 @@ fn reject_escaping_relpath(raw: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn resolve_prompt(loaded: &LoadedWorkload) -> Result<String> {
+/// The prompt as the dispatch gives it to the model: the sandbox
+/// placeholders expanded to the container's `/workspace`.
+pub(crate) fn dispatched_prompt(loaded: &LoadedWorkload) -> Result<String> {
+    Ok(expand_placeholders_with(&resolve_prompt(loaded)?, "/workspace"))
+}
+
+pub(crate) fn resolve_prompt(loaded: &LoadedWorkload) -> Result<String> {
     if let Some(p) = loaded.manifest.workload.prompt.as_ref() {
         return Ok(p.clone());
     }
@@ -1092,8 +1098,7 @@ pub(crate) struct VerifyPlan {
 /// The prompt as dispatched, and the verify plan: everything a run resolves
 /// before it dispatches.
 fn prompt_and_verify_plan(loaded: &LoadedWorkload, sandbox_dir: &Path) -> Result<(String, Option<VerifyPlan>)> {
-    // The runtime mounts the sandbox at /workspace, so the prompt names it there.
-    let prompt = expand_placeholders_with(&resolve_prompt(loaded)?, "/workspace");
+    let prompt = dispatched_prompt(loaded)?;
     Ok((prompt, verify_plan(loaded, sandbox_dir, TestRunner::for_workload)?))
 }
 
@@ -1351,6 +1356,7 @@ pub fn write_manifest(run_dir: &Path, m: &ManifestInputs<'_>) -> Result<()> {
             passed: v.passed,
             details: v.details.clone(),
             work_gate: None,
+            grade: None,
             extras: Default::default(),
         })))),
         session_id: Some(m.session_id.to_string()),

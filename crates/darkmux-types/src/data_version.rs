@@ -38,8 +38,9 @@ pub const CREW_SCHEMA_VERSION: &str = "1.0";
 /// Rule file (`rules/<id>.json`).
 pub const RULE_SCHEMA_VERSION: &str = "1.0";
 /// Workload manifest (`workloads/<id>.json`). 1.1 adds `replyRoom` and
-/// `verify.expect` (the `prompt` provider's structured-output check).
-pub const WORKLOAD_SCHEMA_VERSION: &str = "1.1";
+/// `verify.expect` (the `prompt` provider's structured-output check); 1.2
+/// adds `verify.grade` (the grader, #3353).
+pub const WORKLOAD_SCHEMA_VERSION: &str = "1.2";
 /// Lab fixture manifest (`.fixture.json`).
 pub const LAB_FIXTURE_SCHEMA_VERSION: &str = "1.0";
 /// `mission.json`.
