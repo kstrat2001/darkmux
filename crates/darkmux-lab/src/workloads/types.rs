@@ -41,6 +41,21 @@ pub(crate) struct VerifySpec {
     /// FAILURE with an explicit reason — never a silent pass.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coverage_min_pct: Option<f32>,
+    /// (`prompt`) The answer the reply's first JSON object must give, field
+    /// by field: exact values, `{"anyOf": [...]}` for each accepted answer,
+    /// `{"includes": [...]}` for a list that may hold extras. The run passes
+    /// when every field matches and records fields right out of fields
+    /// expected beside the verdict (`crate::providers::expect`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// A workload's `replyRoom`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ReplyRoom {
+    /// The rest of the context window after the prompt.
+    Context,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
@@ -157,6 +172,11 @@ pub(crate) struct WorkloadSpec {
     /// env-var fallback ships.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requires_fixture: Option<String>,
+    /// (`prompt`) How much room the reply gets. `context`: the profile
+    /// model's `n_ctx` minus the prompt, sent as the dispatch's
+    /// `max_completion_tokens`. Absent: the dispatch's own default, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "replyRoom")]
+    pub reply_room: Option<ReplyRoom>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verify: Option<VerifySpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

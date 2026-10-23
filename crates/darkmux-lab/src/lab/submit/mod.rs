@@ -22,8 +22,15 @@ use std::process::Command;
 use std::time::UNIX_EPOCH;
 
 pub const BUNDLE_FORMAT: &str = "darkmux-evals-bundle";
-/// 3 adds what built darkmux (`darkmuxCommit`, `darkmuxBuild`).
-pub const BUNDLE_FORMAT_VERSION: u64 = 3;
+/// 3 adds what built darkmux (`darkmuxCommit`, `darkmuxBuild`). 4 adds the
+/// structured-output count (`detail.verify.fieldsCorrect`, `fieldsExpected`,
+/// `fieldsMissed`) and the reply cap the dispatch sent
+/// (`stack.maxCompletionTokens`). A bundle none of whose runs carries either
+/// is still written as 3, without those keys, so a site that reads only 3
+/// keeps taking every other result.
+pub const BUNDLE_FORMAT_VERSION: u64 = 4;
+/// The version a bundle with nothing format 4 added is written as.
+const BUNDLE_FORMAT_VERSION_BEFORE_FIELDS: u64 = 3;
 /// Where results are shared unless `--site` says otherwise.
 pub const DEFAULT_SITE: &str = "https://evals.darkmux.com";
 
@@ -309,6 +316,7 @@ pub fn verify_detail_from(manifest: &Value, names: &[String]) -> Value {
     let empty = Value::Object(Map::new());
     let g = v.get("work_gate").filter(|g| g.is_object()).unwrap_or(&empty);
     let added = g.get("tests_added").and_then(Value::as_f64).filter(|n| n.fract() == 0.0 && n.abs() <= MAX_COUNT);
+    let (fields_correct, fields_expected, fields_missed) = fields_count(v);
     json!({
         "summary": shareable(v.get("details"), 500, names),
         "forcedFailureReason": shareable(g.get("forced_failure_reason"), 500, names),
@@ -321,7 +329,34 @@ pub fn verify_detail_from(manifest: &Value, names: &[String]) -> Value {
         "coveragePct": measure(g.get("coverage_pct"), 100.0),
         "coverageMinPct": measure(g.get("coverage_min_pct"), 100.0),
         "commandPassed": flag(g.get("command_passed")),
+        // A structured-output workload's count (`verify.expect`), the same
+        // names for every one; null for any other workload.
+        "fieldsCorrect": fields_correct,
+        "fieldsExpected": fields_expected,
+        "fieldsMissed": fields_missed,
     })
+}
+
+/// A structured-output run's count as the site takes it: all three, or all
+/// three null when they do not add up (`correct` over `expected`, no field
+/// expected, a missed list that is not `expected - correct` distinct names,
+/// or a name outside `[A-Za-z0-9_.-]{1,60}`, which also keeps any path or
+/// personal text out).
+fn fields_count(v: &Value) -> (Value, Value, Value) {
+    static NAME: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let name = NAME.get_or_init(|| regex::Regex::new(r"^[A-Za-z0-9_.-]{1,60}$").expect("valid pattern"));
+    let none = (Value::Null, Value::Null, Value::Null);
+    let (Some(correct), Some(expected)) = (count(v.get("fields_correct")).as_u64(), count(v.get("fields_expected")).as_u64())
+    else {
+        return none;
+    };
+    let Some(missed) = v.get("fields_missed").and_then(Value::as_array) else { return none };
+    let names: Vec<&str> = missed.iter().filter_map(Value::as_str).filter(|n| name.is_match(n)).collect();
+    let distinct = names.iter().collect::<BTreeSet<_>>().len();
+    if expected < 1 || correct > expected || names.len() != missed.len() || distinct != names.len() || names.len() as u64 != expected - correct {
+        return none;
+    }
+    (json!(correct), json!(expected), json!(names))
 }
 
 /// The detail beyond the basics. Host figures need busy samples: with none
@@ -461,9 +496,16 @@ pub fn bundle_run(run_id: &str, manifest: &Value, stats: &Value, ran_by: &RanBy,
         // darkmux reports machine-wide memory pressure, not the run's own peak.
         "peakMemoryGb": null,
         "startedAt": started.map(iso_utc),
-        "stack": stack.to_json(),
+        "stack": with_reply_cap(stack.to_json(), manifest),
         "detail": detail_from(manifest, stats, names),
     })
+}
+
+/// The stack with the reply cap the run's dispatch sent (`replyRoom`), null
+/// when darkmux sent none of its own.
+fn with_reply_cap(mut stack: Value, manifest: &Value) -> Value {
+    stack["maxCompletionTokens"] = count(manifest.get("max_completion_tokens"));
+    stack
 }
 
 /// Unix milliseconds as `2026-10-22T08:02:00.000Z` (JavaScript's `toISOString`).
@@ -505,12 +547,36 @@ pub fn assemble(repo: &str, commit_sha: &str, fixture_manifest: &Value, runs: Ve
         },
         Some(other) => other.to_string(),
     };
+    let (version_number, runs) = format_for(runs);
     Ok(json!({
         "format": BUNDLE_FORMAT,
-        "formatVersion": BUNDLE_FORMAT_VERSION,
+        "formatVersion": version_number,
         "fixture": { "repo": repo, "commitSha": commit_sha, "name": name, "version": version, "manifest": fixture_manifest },
         "runs": runs,
     }))
+}
+
+/// Format 4 when any run carries what 4 added; otherwise 3, with those keys
+/// (null in every run) left out.
+fn format_for(mut runs: Vec<Value>) -> (u64, Vec<Value>) {
+    let carries = |r: &Value| {
+        !r["stack"]["maxCompletionTokens"].is_null()
+            || ["fieldsCorrect", "fieldsExpected", "fieldsMissed"].iter().any(|k| !r["detail"]["verify"][*k].is_null())
+    };
+    if runs.iter().any(carries) {
+        return (BUNDLE_FORMAT_VERSION, runs);
+    }
+    for r in &mut runs {
+        if let Some(stack) = r.get_mut("stack").and_then(Value::as_object_mut) {
+            stack.remove("maxCompletionTokens");
+        }
+        if let Some(v) = r.pointer_mut("/detail/verify").and_then(Value::as_object_mut) {
+            for k in ["fieldsCorrect", "fieldsExpected", "fieldsMissed"] {
+                v.remove(k);
+            }
+        }
+    }
+    (BUNDLE_FORMAT_VERSION_BEFORE_FIELDS, runs)
 }
 
 /// What the site's strict parser (`parseBundle`) would refuse in a bundle,

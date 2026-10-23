@@ -1,8 +1,9 @@
-//! `lab submit` against the site's own reading. `golden/site_bundle_v3.json`
+//! `lab submit` against the site's own reading. `golden/site_bundle_v4.json`
 //! is what darklyenergized's `lab_run.ts` (`bundleRun`, `assembleBundle`,
 //! `weightsHashOf`, `looksLikePath`) produced for the inputs below, and what
 //! its `parseBundle` accepted (`ok`). A change on either side that drifts
-//! from the other fails here.
+//! from the other fails here. A bundle with nothing format 4 added is still
+//! format 3, so this golden holds for it unchanged.
 
 use super::*;
 use serde_json::json;
@@ -87,6 +88,68 @@ fn the_bundle_is_the_one_the_site_writes_and_accepts() {
     )
     .unwrap();
     same(&bundle, &g["bundle"], "bundle");
+}
+
+/// (format 4) The site's own bundle for a structured-output run
+/// (`golden/site_bundle_v4.json`, written by its `lab_run.ts` for these
+/// inputs and accepted by its `parseBundle`): the fields count in the verify
+/// detail, the reply cap in the stack.
+#[test]
+fn a_structured_output_bundle_is_the_one_the_site_writes_and_accepts() {
+    let g: Value = serde_json::from_str(include_str!("golden/site_bundle_v4.json")).unwrap();
+    assert_eq!(g["ok"], true, "the site's parser accepted its own bundle");
+    let mut m = manifest();
+    m["verify"] = json!({"passed": false, "details": "7/8 fields in /Users/kain/x",
+        "fields_correct": 7, "fields_expected": 8, "fields_missed": ["hours"]});
+    m["max_completion_tokens"] = json!(2048);
+    m.as_object_mut().unwrap().remove("fixture");
+    let mut st = stats();
+    st["verify"] = json!("fail");
+    let ran_by = RanBy { version: Some("5.4.0".into()), commit: Some("abc1234".into()), build: Some("release".into()) };
+    let run = bundle_run("biz-scrape-easy-p-1761120000-1", &m, &st, &ran_by, &stack(), &[]);
+    let fixture = json!({ "name": "biz-scrape-fixture", "version": "1.0", "satisfies": "biz-scrape-easy@1.0" });
+    let bundle = assemble("kstrat2001/biz-scrape-fixture", &"a".repeat(40), &fixture, vec![run]).unwrap();
+    same(&bundle, &g["bundle"], "bundle");
+}
+
+/// A bundle mixing a structured run with another is format 4 (the other run
+/// says null); a bundle with neither a count nor a cap stays format 3.
+#[test]
+fn format_4_only_when_a_run_carries_what_it_added() {
+    let mut m = manifest();
+    m["verify"] = json!({"passed": true, "details": "d", "fields_correct": 2, "fields_expected": 2, "fields_missed": []});
+    let structured = bundle_run("r", &m, &stats(), &RanBy::default(), &stack(), &[]);
+    let plain = bundle_run("q", &manifest(), &stats(), &RanBy::default(), &stack(), &[]);
+    let fixture = json!({ "name": "biz", "version": "1.0" });
+    let four = assemble("kstrat2001/biz", &"a".repeat(40), &fixture, vec![structured, plain.clone()]).unwrap();
+    assert_eq!(four["formatVersion"], 4);
+    assert!(four["runs"][1]["stack"].get("maxCompletionTokens").is_some_and(Value::is_null), "the other run says null");
+    let three = assemble("kstrat2001/biz", &"a".repeat(40), &fixture, vec![plain]).unwrap();
+    assert_eq!(three["formatVersion"], 3, "nothing format 4 added: still format 3");
+    assert!(three["runs"][0]["stack"].get("maxCompletionTokens").is_none());
+    assert!(three["runs"][0]["detail"]["verify"].get("fieldsExpected").is_none());
+}
+
+/// Counts that do not add up are sent as nothing, the site's own rule.
+#[test]
+fn a_fields_count_that_does_not_add_up_is_left_out() {
+    let detail = |c: Value, e: Value, m: Value| {
+        let v = json!({"passed": false, "fields_correct": c, "fields_expected": e, "fields_missed": m});
+        let d = verify_detail_from(&json!({ "verify": v }), &[]);
+        (d["fieldsCorrect"].clone(), d["fieldsExpected"].clone(), d["fieldsMissed"].clone())
+    };
+    assert_eq!(detail(json!(7), json!(8), json!(["hours"])), (json!(7), json!(8), json!(["hours"])));
+    let null = (Value::Null, Value::Null, Value::Null);
+    for (c, e, m) in [
+        (json!(9), json!(8), json!([])),
+        (json!(0), json!(0), json!([])),
+        (json!(6), json!(8), json!(["hours"])),
+        (json!(6), json!(8), json!(["hours", "hours"])),
+        (json!(7), json!(8), json!(["/Users/kain/x"])),
+        (json!(7), json!(8), Value::Null),
+    ] {
+        assert_eq!(detail(c.clone(), e.clone(), m.clone()), null, "{c} {e} {m}");
+    }
 }
 
 #[test]

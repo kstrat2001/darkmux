@@ -3290,6 +3290,54 @@
         }
     }
 
+    /// `one_call_context` answers from the route `dispatch` takes: a
+    /// tool-less role on an unmanaged endpoint is one call, with the selected
+    /// model's window and the system prompt it would send (the specialist
+    /// preamble included); a forced container or a managed target is not.
+    #[test]
+    #[serial]
+    fn one_call_context_follows_the_dispatch_route() {
+        let home = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+        let tmp = TempDir::new().unwrap();
+        let pf = tmp.path().join("profiles.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{
+                    "cloud":{"models":[{"id":"gpt-remote","n_ctx":100000,"endpoint":"mock"}]},
+                    "local":{"models":[{"id":"qwen3-1.7b","n_ctx":32768}]}},
+                "endpoints":{"mock":{"url":"http://127.0.0.1:1/v1"}},
+                "default_profile":"cloud"}"#,
+        )
+        .unwrap();
+        let opts = || {
+            let mut o = dispatch_preflight_probe_opts();
+            o.role_id = "pr-reviewer".to_string(); // built-in, tool-less
+            o.config_path = Some(pf.to_str().unwrap().to_string());
+            o
+        };
+        let one_call = one_call_context(&opts());
+        let mut forced = opts();
+        forced.force_container = true;
+        let forced = one_call_context(&forced);
+        let mut local = opts();
+        local.profile_name = Some("local".into());
+        let local = one_call_context(&local);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        let ctx = one_call.unwrap().expect("a tool-less role on an unmanaged endpoint is one call");
+        assert_eq!((ctx.model.as_str(), ctx.n_ctx), ("gpt-remote", Some(100_000)));
+        let role_prompt = crate::loader::role_prompt("pr-reviewer").unwrap();
+        assert!(ctx.system_prompt_bytes > role_prompt.len(), "the preamble is counted too: {ctx:?}");
+        assert_eq!(forced.unwrap(), None, "a forced container is not one call");
+        assert_eq!(local.unwrap(), None, "a managed target runs in the container");
+    }
+
     // ─── #1645 fix-pass MUST FIX 1 (fuller fix): dispatch_unmanaged itself ──
 
     /// (#1645 fix-pass review) `build_unmanaged_record_threads_mission_id_
@@ -8162,7 +8210,7 @@
             extras: Default::default(),
             description: None,
             default_model: None,
-            models: vec![ProfileModel {
+            models: vec![ProfileModel { max_output_tokens: None,
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary".into(),
@@ -8204,7 +8252,7 @@
             extras: Default::default(),
             description: None,
             default_model: None,
-            models: vec![ProfileModel {
+            models: vec![ProfileModel { max_output_tokens: None,
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
@@ -8244,7 +8292,7 @@
             extras: Default::default(),
             description: None,
             default_model: None,
-            models: vec![ProfileModel {
+            models: vec![ProfileModel { max_output_tokens: None,
                 endpoint: Some(ModelEndpoint {
                     url: Some("https://example.azure.com/openai".into()),
                     ..Default::default()
@@ -8333,7 +8381,7 @@
             extras: Default::default(),
             description: None,
             default_model: None,
-            models: vec![ProfileModel {
+            models: vec![ProfileModel { max_output_tokens: None,
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
@@ -8369,7 +8417,7 @@
             extras: Default::default(),
             description: None,
             default_model: None,
-            models: vec![ProfileModel {
+            models: vec![ProfileModel { max_output_tokens: None,
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
@@ -8419,7 +8467,7 @@
             extras: Default::default(),
             description: None,
             default_model: None,
-            models: vec![ProfileModel {
+            models: vec![ProfileModel { max_output_tokens: None,
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
@@ -8473,7 +8521,7 @@
             extras: Default::default(),
             description: None,
             default_model: None,
-            models: vec![ProfileModel {
+            models: vec![ProfileModel { max_output_tokens: None,
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
@@ -8515,7 +8563,7 @@
             extras: Default::default(),
             description: None,
             default_model: None,
-            models: vec![ProfileModel {
+            models: vec![ProfileModel { max_output_tokens: None,
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
@@ -8571,7 +8619,7 @@
             extras: Default::default(),
             description: None,
             default_model: None,
-            models: vec![ProfileModel {
+            models: vec![ProfileModel { max_output_tokens: None,
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
@@ -8608,7 +8656,7 @@
             extras: Default::default(),
             description: None,
             default_model: None,
-            models: vec![ProfileModel {
+            models: vec![ProfileModel { max_output_tokens: None,
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
@@ -15192,7 +15240,7 @@
             extras: Default::default(),
             description: None,
             default_model: None,
-            models: vec![ProfileModel {
+            models: vec![ProfileModel { max_output_tokens: None,
                 endpoint: None,
                 extras: Default::default(),
                 id: bare_key.into(),
@@ -15587,7 +15635,7 @@ fn dispatch_wire_model_id_namespaces_a_plain_profile_model() {
         extras: Default::default(),
         description: None,
         default_model: None,
-        models: vec![ProfileModel {
+        models: vec![ProfileModel { max_output_tokens: None,
             endpoint: None,
             extras: Default::default(),
             id: "qwen3-4b-instruct-2507".into(),
@@ -15615,7 +15663,7 @@ fn dispatch_wire_model_id_passes_through_an_explicit_identifier() {
         extras: Default::default(),
         description: None,
         default_model: None,
-        models: vec![ProfileModel {
+        models: vec![ProfileModel { max_output_tokens: None,
             endpoint: None,
             extras: Default::default(),
             id: "qwen3-4b-instruct-2507".into(),

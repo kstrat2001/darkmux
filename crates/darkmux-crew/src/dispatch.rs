@@ -784,6 +784,32 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
     crate::dispatch_internal::dispatch_local_single_shot(opts)
 }
 
+/// What a one-call dispatch with these options would send around the
+/// message: the resolved model's declared context window and the system
+/// prompt's length in UTF-8 bytes. `None` when the dispatch would not be one
+/// call (the container path, a role that grants tools, a forced container),
+/// where no completion cap is sent. See
+/// `dispatch_internal::one_call_context`.
+pub fn one_call_context(opts: &DispatchOpts) -> Result<Option<OneCallContext>> {
+    crate::dispatch_internal::one_call_context(opts)
+}
+
+/// The window and prompt size of a one-call dispatch ([`one_call_context`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OneCallContext {
+    /// The selected model's id.
+    pub model: String,
+    /// The window the profile declares for that model, when it declares one.
+    pub n_ctx: Option<u32>,
+    /// The most output tokens the profile says that model may return in one
+    /// reply, when it says.
+    pub max_output_tokens: Option<u32>,
+    /// The system prompt the call would send, in UTF-8 bytes.
+    pub system_prompt_bytes: usize,
+    /// The same system prompt, in characters.
+    pub system_prompt_chars: usize,
+}
+
 /// (#1698 Packet B2 gate) True when a dispatch with this (role, profile)
 /// would send the conversation off this machine (an unmanaged endpoint, other
 /// than the default engine on loopback, #316) — the data-boundary question a caller

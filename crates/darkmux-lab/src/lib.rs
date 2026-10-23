@@ -39,7 +39,16 @@ mod live_channel_conformance {
                     continue;
                 }
                 let text = std::fs::read_to_string(&path).unwrap();
-                let opts = text.matches("DispatchOpts {").count();
+                // A struct literal, not a fn's `-> …::DispatchOpts {` return type.
+                let opts = text
+                    .match_indices("DispatchOpts {")
+                    .filter(|(i, _)| {
+                        !text[..*i]
+                            .trim_end_matches(|c: char| c.is_alphanumeric() || c == ':' || c == '_')
+                            .trim_end()
+                            .ends_with("->")
+                    })
+                    .count();
                 if opts == 0 {
                     continue;
                 }

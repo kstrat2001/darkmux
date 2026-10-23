@@ -226,7 +226,7 @@ mod tests {
 
     #[test]
     fn from_profile_model_maps_fields() {
-        let pm = darkmux_types::ProfileModel {
+        let pm = darkmux_types::ProfileModel { max_output_tokens: None,
             id: "qwen3.6-35b-a3b".into(),
             n_ctx: Some(100_000),
             identifier: Some("my-alias".into()),
@@ -247,7 +247,7 @@ mod tests {
     /// MissingNCtx quarantine at ingest — the batch survives.
     #[test]
     fn from_profile_model_passes_missing_n_ctx_through_to_ingest_quarantine() {
-        let pm = darkmux_types::ProfileModel {
+        let pm = darkmux_types::ProfileModel { max_output_tokens: None,
             id: "ctxless-local".into(),
             n_ctx: None,
             identifier: None,
@@ -266,7 +266,7 @@ mod tests {
 
     #[test]
     fn from_profile_model_detects_unmanaged_endpoint() {
-        let pm = darkmux_types::ProfileModel {
+        let pm = darkmux_types::ProfileModel { max_output_tokens: None,
             id: "gpt-4o".into(),
             n_ctx: Some(128_000),
             identifier: None,

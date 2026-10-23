@@ -221,7 +221,7 @@ mod tests {
 
     fn profile_with_primary(model_id: &str) -> Profile {
         Profile {
-            models: vec![ProfileModel {
+            models: vec![ProfileModel { max_output_tokens: None,
                 endpoint: None,
                 extras: Default::default(),
                 id: model_id.into(),
@@ -250,7 +250,7 @@ mod tests {
     }
 
     fn model_with(id: &str, caps: &[(Capability, f32)]) -> ProfileModel {
-        ProfileModel {
+        ProfileModel { max_output_tokens: None,
             endpoint: None,
             extras: Default::default(),
             id: id.into(),

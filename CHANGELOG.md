@@ -14,6 +14,30 @@ darkmux release.
 
 ## [Unreleased]
 
+### Added
+
+- **Prompt workloads can grade a structured answer: `verify.expect`.** The workload names the
+  answer the reply's first JSON object must give, field by field. Strings compare exactly (only
+  the ends are trimmed); `{"anyOf": [...]}` lists each accepted answer, a plain list is an exact
+  set in any order, `{"includes": [...]}` allows extras, and nested objects check the keys they
+  list. `{"items": [...], "optional": [...]}` names the answers a list must hold and the
+  true-but-not-asked-for ones it may also hold; anything else fails. No fixture code runs on
+  the host. A run passes when every field matches, and records
+  `fields_correct`, `fields_expected` and `fields_missed` beside the verdict. A reply cut off
+  mid-object has no answer.
+- **`replyRoom: "context"`** gives a prompt run's reply the rest of its model's window
+  (`n_ctx` minus the prompt, over-counted at one token per three bytes) on the one-call path a
+  tool-less role on an unmanaged endpoint takes, and records the cap it sent. LM Studio runs
+  already continue a reply without a cap. A profile model can declare `max_output_tokens`
+  (a hosted model's output limit below its window), and the reply asks for no more than that. Profile
+  models in `--json` output gain the optional `max_output_tokens` key (additive).
+- A prompt workload that sets `requires_fixture` reads its `promptFile` from the run's copy of
+  that fixture (the A/B context arm included), and a prompt run keeps a trajectory (the runtime's,
+  or on the one-call path the one call's own counts), so `darkmux lab submit` can share it.
+- **`lab submit` bundle format 4** carries the fields count (`detail.verify.fieldsCorrect`,
+  `fieldsExpected`, `fieldsMissed`) and `stack.maxCompletionTokens`. A bundle with neither is
+  still written as format 3. Workload schema 1.1 (additive).
+
 ## [5.4.0] - 2026-10-23
 
 `darkmux lab submit` shares lab runs on darkmux evals: one bundle of runs from one fixture

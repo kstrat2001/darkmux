@@ -173,7 +173,7 @@ mod tests {
 
     #[test]
     fn namespaced_identifier_uses_prefix_when_no_override() {
-        let m = ProfileModel {
+        let m = ProfileModel { max_output_tokens: None,
             endpoint: None,
             extras: Default::default(),
             id: "qwen3.6-35b-a3b".into(),
@@ -186,7 +186,7 @@ mod tests {
 
     #[test]
     fn namespaced_identifier_passes_through_explicit_id() {
-        let m = ProfileModel {
+        let m = ProfileModel { max_output_tokens: None,
             endpoint: None,
             extras: Default::default(),
             id: "qwen3.6-35b-a3b".into(),

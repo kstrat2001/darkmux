@@ -812,6 +812,7 @@ ProfileList
 ProfileModel
   id: string
   n_ctx?: uint32 | null
+  max_output_tokens?: uint32 | null
   identifier?: string | null
   capabilities: CapabilityProfile
   endpoint?: EndpointField | null

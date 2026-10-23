@@ -3232,6 +3232,26 @@ fn unmanaged_system_prompt(opts: &DispatchOpts, role: &crate::types::Role) -> Re
     })
 }
 
+/// `crate::dispatch::one_call_context`: the same route resolution
+/// `dispatch` makes, stopped before anything is sent. A one-call dispatch is
+/// an unmanaged target with a role that needs no container.
+pub fn one_call_context(opts: &DispatchOpts) -> Result<Option<crate::dispatch::OneCallContext>> {
+    Ok(match route_dispatch(opts)? {
+        Some(DispatchRoute::Unmanaged { role, system_prompt, target })
+            if !container_path_required(&role, opts.force_container) =>
+        {
+            Some(crate::dispatch::OneCallContext {
+                model: target.model.id.clone(),
+                n_ctx: target.model.n_ctx,
+                max_output_tokens: target.model.max_output_tokens,
+                system_prompt_bytes: system_prompt.len(),
+                system_prompt_chars: system_prompt.chars().count(),
+            })
+        }
+        _ => None,
+    })
+}
+
 /// How a dispatch's resolved target routes: hosted (an endpoint darkmux only
 /// sends requests to) or through the container/local path (a managed one).
 enum DispatchRoute {
