@@ -1,14 +1,16 @@
-//! `lab submit` against the site's own reading. `golden/site_bundle_v3.json`
+//! `lab submit` against the site's own reading. `golden/site_bundle_v4.json`
 //! is what darklyenergized's `lab_run.ts` (`bundleRun`, `assembleBundle`,
 //! `weightsHashOf`, `looksLikePath`) produced for the inputs below, and what
 //! its `parseBundle` accepted (`ok`). A change on either side that drifts
-//! from the other fails here.
+//! from the other fails here. Format 4's additions (the fields count and
+//! `maxCompletionTokens`, null for these inputs) were written here first, on
+//! format 3's site output; the site's own v4 output replaces it once it ships.
 
 use super::*;
 use serde_json::json;
 
 fn golden() -> Value {
-    serde_json::from_str(include_str!("golden/site_bundle_v3.json")).unwrap()
+    serde_json::from_str(include_str!("golden/site_bundle_v4.json")).unwrap()
 }
 
 fn manifest() -> Value {
@@ -87,6 +89,22 @@ fn the_bundle_is_the_one_the_site_writes_and_accepts() {
     )
     .unwrap();
     same(&bundle, &g["bundle"], "bundle");
+}
+
+/// (format 4) A structured-output run carries its fields count in the
+/// verify detail and the reply cap its dispatch sent in the stack.
+#[test]
+fn a_structured_output_run_carries_its_fields_count_and_reply_cap() {
+    let mut m = manifest();
+    m["verify"] = json!({"passed": false, "details": "fields 7/8: missed hours",
+        "fields_correct": 7, "fields_expected": 8, "fields_missed": ["hours", "/Users/kain/secret"]});
+    m["max_completion_tokens"] = json!(31_000);
+    let run = bundle_run("r", &m, &stats(), &RanBy::default(), &stack(), &[]);
+    let v = &run["detail"]["verify"];
+    assert_eq!((v["fieldsCorrect"].clone(), v["fieldsExpected"].clone()), (json!(7), json!(8)));
+    assert_eq!(v["fieldsMissed"], json!(["hours"]), "a name that reads as a path is never shared");
+    assert_eq!(run["stack"]["maxCompletionTokens"], 31_000);
+    assert_eq!(run["passed"], false);
 }
 
 #[test]

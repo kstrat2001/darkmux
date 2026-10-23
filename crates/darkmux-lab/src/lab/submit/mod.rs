@@ -22,8 +22,11 @@ use std::process::Command;
 use std::time::UNIX_EPOCH;
 
 pub const BUNDLE_FORMAT: &str = "darkmux-evals-bundle";
-/// 3 adds what built darkmux (`darkmuxCommit`, `darkmuxBuild`).
-pub const BUNDLE_FORMAT_VERSION: u64 = 3;
+/// 3 adds what built darkmux (`darkmuxCommit`, `darkmuxBuild`). 4 adds the
+/// structured-output count (`detail.verify.fieldsCorrect`, `fieldsExpected`,
+/// `fieldsMissed`) and the reply cap the dispatch sent
+/// (`stack.maxCompletionTokens`), each null when the run has none.
+pub const BUNDLE_FORMAT_VERSION: u64 = 4;
 /// Where results are shared unless `--site` says otherwise.
 pub const DEFAULT_SITE: &str = "https://evals.darkmux.com";
 
@@ -321,7 +324,19 @@ pub fn verify_detail_from(manifest: &Value, names: &[String]) -> Value {
         "coveragePct": measure(g.get("coverage_pct"), 100.0),
         "coverageMinPct": measure(g.get("coverage_min_pct"), 100.0),
         "commandPassed": flag(g.get("command_passed")),
+        // A structured-output workload's count (`verify.expect`), the same
+        // names for every one; null for any other workload.
+        "fieldsCorrect": count(v.get("fields_correct")),
+        "fieldsExpected": count(v.get("fields_expected")),
+        "fieldsMissed": field_names(v.get("fields_missed"), names),
     })
+}
+
+/// The fields a structured-output run missed, as the site takes them: at
+/// most 100 names, each shareable text, or null when the run has no count.
+fn field_names(v: Option<&Value>, names: &[String]) -> Value {
+    let Some(list) = v.and_then(Value::as_array) else { return Value::Null };
+    json!(list.iter().take(100).map(|n| shareable(Some(n), 100, names)).filter(|n| !n.is_null()).collect::<Vec<_>>())
 }
 
 /// The detail beyond the basics. Host figures need busy samples: with none
@@ -461,9 +476,16 @@ pub fn bundle_run(run_id: &str, manifest: &Value, stats: &Value, ran_by: &RanBy,
         // darkmux reports machine-wide memory pressure, not the run's own peak.
         "peakMemoryGb": null,
         "startedAt": started.map(iso_utc),
-        "stack": stack.to_json(),
+        "stack": with_reply_cap(stack.to_json(), manifest),
         "detail": detail_from(manifest, stats, names),
     })
+}
+
+/// The stack with the reply cap the run's dispatch sent (`replyRoom`), null
+/// when darkmux sent none of its own.
+fn with_reply_cap(mut stack: Value, manifest: &Value) -> Value {
+    stack["maxCompletionTokens"] = count(manifest.get("max_completion_tokens"));
+    stack
 }
 
 /// Unix milliseconds as `2026-10-22T08:02:00.000Z` (JavaScript's `toISOString`).

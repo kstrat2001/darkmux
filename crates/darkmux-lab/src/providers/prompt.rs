@@ -1,13 +1,15 @@
 //! Trivial workload provider: "just answer this prompt."
-//! No sandbox; optional must_contain / must_not_contain keyword checks.
+//! No sandbox; optional must_contain / must_not_contain keyword checks, and
+//! an optional structured-output check of the reply (`verify.expect`).
 //!
 //! Dispatches via darkmux's in-house internal runtime.
 
 use darkmux_types::Profile;
 use crate::lab::dispatch_end::{DispatchEnd, Dispatched};
 use crate::lab::manifest::{ManifestVerify, ManifestVerifyReport, RunManifest};
+use crate::providers::expect;
 use crate::workloads::types::{
-    InspectionReport, LoadedWorkload, RunResult, VerifyOutcome, VerifyReport, WorkloadProvider,
+    InspectionReport, LoadedWorkload, ReplyRoom, RunResult, VerifyOutcome, VerifyReport, WorkloadProvider,
 };
 use anyhow::{anyhow, Context, Result};
 use darkmux_types::session_id::{RunId, SessionId};
@@ -38,7 +40,7 @@ impl WorkloadProvider for PromptProvider {
         &self,
         loaded: &LoadedWorkload,
         run_dir: &Path,
-        _sandbox_dir: &Path,
+        sandbox_dir: &Path,
         profile: &Profile,
         profile_name: &str,
         config_path: Option<&str>,
@@ -49,8 +51,9 @@ impl WorkloadProvider for PromptProvider {
         run: &RunId,
         on_session_id: &mut dyn FnMut(&SessionId),
     ) -> Result<RunResult> {
-        let prompt = resolve_prompt(loaded)?;
+        let prompt = resolve_prompt_from(loaded, prompt_base(loaded, sandbox_dir))?;
         let role = pick_role(loaded);
+        let reply_room = reply_room_tokens(loaded, profile, &role, &prompt)?;
         let session_id = SessionId::adhoc(run.clone(), &role, &loaded.manifest.workload.id);
         // (#2511) Report the id back to the lab harness BEFORE dispatching —
         // this is the ONE mint for this run, so it is the run's own
@@ -58,13 +61,14 @@ impl WorkloadProvider for PromptProvider {
         on_session_id(&session_id);
 
         let started = std::time::Instant::now();
-        let dispatched = dispatch_via_internal(
+        let (dispatched, one_call) = dispatch_via_internal(
             &role,
             &prompt,
             &session_id,
             loaded.manifest.workload.image.as_deref(),
             config_path,
             profile_name,
+            reply_room,
         )?;
         finish_run(
             &FinishInputs {
@@ -74,6 +78,9 @@ impl WorkloadProvider for PromptProvider {
                 profile_name,
                 session_id: &session_id,
                 duration_ms: started.elapsed().as_millis(),
+                // Only the one-call path sends the cap; the container path's
+                // runtime continues a reply in chunks and caps nothing.
+                reply_cap: reply_room.filter(|_| one_call),
             },
             &dispatched,
         )
@@ -131,6 +138,9 @@ pub(crate) struct FinishInputs<'a> {
     pub profile_name: &'a str,
     pub session_id: &'a SessionId,
     pub duration_ms: u128,
+    /// The `max_completion_tokens` this run's dispatch actually sent, when
+    /// the workload asked for `replyRoom` and the dispatch was one call.
+    pub reply_cap: Option<u32>,
 }
 
 /// Everything after the dispatch: persist its output, verify the reply, write
@@ -147,6 +157,7 @@ pub(crate) fn finish_run(f: &FinishInputs<'_>, d: &Dispatched) -> Result<RunResu
     let verify = run_verify(f.loaded, &reply);
     let recorded_verify =
         verify.as_ref().map(|v| VerifyReport { passed: v.passed, details: v.details.clone() });
+    let fields = expect_report(f.loaded, &reply);
     write_manifest(
         f.run_dir,
         &ManifestInputs {
@@ -159,6 +170,7 @@ pub(crate) fn finish_run(f: &FinishInputs<'_>, d: &Dispatched) -> Result<RunResu
             end: &end,
         },
     )?;
+    record_structured_output(f.run_dir, fields.as_ref(), f.reply_cap)?;
     Ok(RunResult {
         escalation: end.escalation().map(str::to_string),
         ok: end.ok(),
@@ -217,6 +229,74 @@ pub fn write_manifest(run_dir: &Path, m: &ManifestInputs<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Stamp the structured-output count and the reply cap onto the manifest
+/// `write_manifest` just wrote. The count sits in the verify object under the
+/// same names for every structured-output workload (`fields_correct`,
+/// `fields_expected`, `fields_missed`); the cap is top-level
+/// `max_completion_tokens`. A run with neither is left as written.
+fn record_structured_output(run_dir: &Path, fields: Option<&expect::FieldsReport>, reply_cap: Option<u32>) -> Result<()> {
+    if fields.is_none() && reply_cap.is_none() {
+        return Ok(());
+    }
+    let mut manifest = RunManifest::read(run_dir)?;
+    if let (Some(f), Some(Some(ManifestVerify::Report(v)))) = (fields, manifest.verify.as_mut()) {
+        v.extras.insert("fields_correct".into(), f.correct.into());
+        v.extras.insert("fields_expected".into(), f.expected.into());
+        v.extras.insert("fields_missed".into(), f.missed.clone().into());
+    }
+    if let Some(cap) = reply_cap {
+        manifest.extras.insert("max_completion_tokens".into(), cap.into());
+    }
+    manifest.write(run_dir)?;
+    Ok(())
+}
+
+/// Where a `promptFile` resolves: the run's own copy of the fixture when the
+/// workload binds one (so the input is the one the recorded fixture commit
+/// holds), else beside the workload document.
+fn prompt_base<'a>(loaded: &'a LoadedWorkload, sandbox_dir: &'a Path) -> &'a Path {
+    match loaded.manifest.workload.requires_fixture {
+        Some(_) => sandbox_dir,
+        None => &loaded.base_dir,
+    }
+}
+
+/// Tokens of template and identity text a dispatch adds around the role's
+/// prompt and the message, which the character count below cannot see.
+const REPLY_ROOM_OVERHEAD_TOKENS: u32 = 512;
+/// Below this the window is too small to be worth a dispatch.
+const REPLY_ROOM_MIN_TOKENS: u32 = 256;
+
+/// The reply room a `replyRoom: "context"` workload asks for: the profile
+/// model's `n_ctx` minus the prompt. The host has no tokenizer, so the prompt
+/// (the role's system prompt plus the message) is over-counted at one token
+/// per three characters, plus a fixed overhead: the reply may get a little
+/// less than the true remainder, never more than the window holds. `None`
+/// when the workload does not ask.
+fn reply_room_tokens(loaded: &LoadedWorkload, profile: &Profile, role: &str, prompt: &str) -> Result<Option<u32>> {
+    let Some(ReplyRoom::Context) = loaded.manifest.workload.reply_room else { return Ok(None) };
+    let model_id = profile.default_model_id().unwrap_or_default();
+    let n_ctx = profile
+        .models
+        .iter()
+        .find(|m| m.id == model_id)
+        .and_then(|m| m.n_ctx)
+        .ok_or_else(|| anyhow!("workload \"{}\" asks for replyRoom \"context\", but the profile's model `{model_id}` declares no n_ctx", loaded.manifest.workload.id))?;
+    let system = darkmux_crew::loader::role_prompt(role).unwrap_or_default();
+    Ok(Some(reply_room_from(n_ctx, system.chars().count() + prompt.chars().count(), &loaded.manifest.workload.id)?))
+}
+
+fn reply_room_from(n_ctx: u32, prompt_chars: usize, workload_id: &str) -> Result<u32> {
+    let prompt_tokens = u32::try_from(prompt_chars.div_ceil(3)).unwrap_or(u32::MAX).saturating_add(REPLY_ROOM_OVERHEAD_TOKENS);
+    let room = n_ctx.saturating_sub(prompt_tokens);
+    if room < REPLY_ROOM_MIN_TOKENS {
+        return Err(anyhow!(
+            "workload \"{workload_id}\": the prompt (~{prompt_tokens} tokens counted) leaves {room} of the model's {n_ctx}-token window for the reply; raise the profile's n_ctx"
+        ));
+    }
+    Ok(room)
+}
+
 /// Dispatch via darkmux's internal Docker-bounded runtime through the
 /// crew::dispatch substrate. The runtime emits a JSON envelope per
 /// `runtime/src/main.rs::build_json_envelope` which becomes the
@@ -228,7 +308,8 @@ fn dispatch_via_internal(
     image: Option<&str>,
     config_path: Option<&str>,
     profile_name: &str,
-) -> Result<Dispatched> {
+    max_completion_tokens: Option<u32>,
+) -> Result<(Dispatched, bool)> {
     use darkmux_crew::dispatch::{dispatch, DispatchOpts};
     let opts = DispatchOpts {
         finding_sites: None,
@@ -271,22 +352,31 @@ fn dispatch_via_internal(
         // (#703 Slice 4) the workload's declared image, if any.
         // (#1199) Bench-only knobs; defaults preserve existing behavior.
         force_container: false,
-        max_completion_tokens: None,
+        // (`replyRoom`) Read only by the one-call path a tool-less role on
+        // an unmanaged endpoint takes; `None` keeps its own default.
+        max_completion_tokens,
         image: image.map(str::to_string),
         model_base_url_override: None,
         step_id: None, // (#1483) set on the graph-step path only
         system_prompt_override: None,
     };
     let result = dispatch(opts).context("internal-runtime dispatch via lab harness")?;
-    Ok(Dispatched { exit_code: result.exit_code, stdout: result.stdout, stderr: result.stderr })
+    // The container path mounts a bookkeeping dir; the one-call path has none.
+    let one_call = result.out_dir.is_none();
+    Ok((Dispatched { exit_code: result.exit_code, stdout: result.stdout, stderr: result.stderr }, one_call))
 }
 
+#[cfg(test)]
 fn resolve_prompt(loaded: &LoadedWorkload) -> Result<String> {
+    resolve_prompt_from(loaded, &loaded.base_dir)
+}
+
+fn resolve_prompt_from(loaded: &LoadedWorkload, base: &Path) -> Result<String> {
     if let Some(p) = loaded.manifest.workload.prompt.as_ref() {
         return Ok(p.clone());
     }
     if let Some(rel) = loaded.manifest.workload.prompt_file.as_ref() {
-        let path = loaded.base_dir.join(rel);
+        let path = base.join(rel);
         return fs::read_to_string(&path)
             .with_context(|| format!("reading promptFile at {}", path.display()));
     }
@@ -335,6 +425,23 @@ pub(crate) fn extract_reply_text(stdout: &str) -> String {
 /// a fail (#2982). This is the one place that decides it.
 pub(crate) fn run_verify(loaded: &LoadedWorkload, text: &str) -> Option<VerifyOutcome> {
     let v = loaded.manifest.workload.verify.as_ref()?;
+    let Some(fields) = expect_report(loaded, text) else { return Some(keyword_verify(v, text)) };
+    // (`verify.expect`) The structured-output check, and the keyword checks
+    // too when the workload also lists keywords: both must pass.
+    let keywords = (!v.must_contain.is_empty() || !v.must_not_contain.is_empty()).then(|| keyword_verify(v, text));
+    let passed = fields.passed() && keywords.as_ref().is_none_or(|k| k.passed);
+    let details = [Some(fields.details()), keywords.map(|k| k.details)].into_iter().flatten().collect::<Vec<_>>().join("; ");
+    Some(VerifyOutcome { passed, details })
+}
+
+/// The workload's `verify.expect` check of `text`, `None` when it has none.
+pub(crate) fn expect_report(loaded: &LoadedWorkload, text: &str) -> Option<expect::FieldsReport> {
+    let want = loaded.manifest.workload.verify.as_ref()?.expect.as_ref()?;
+    Some(expect::grade(want, text))
+}
+
+/// The keyword checks (`must_contain` / `must_not_contain`).
+fn keyword_verify(v: &crate::workloads::types::VerifySpec, text: &str) -> VerifyOutcome {
     // (#2493, corrected by frontier review) Case sensitivity is a property
     // of WHAT is being matched, never a blanket policy — the original fix
     // lowercased unconditionally, which silently re-scoped every workload
@@ -376,10 +483,10 @@ pub(crate) fn run_verify(loaded: &LoadedWorkload, text: &str) -> Option<VerifyOu
         .filter(|s| matches(text, s))
         .collect();
     if missing.is_empty() && present.is_empty() {
-        return Some(VerifyOutcome {
+        return VerifyOutcome {
             passed: true,
             details: "all keyword checks passed".into(),
-        });
+        };
     }
     let mut bits = Vec::new();
     if !missing.is_empty() {
@@ -402,10 +509,10 @@ pub(crate) fn run_verify(loaded: &LoadedWorkload, text: &str) -> Option<VerifyOu
                 .join(", ")
         ));
     }
-    Some(VerifyOutcome {
+    VerifyOutcome {
         passed: false,
         details: bits.join("; "),
-    })
+    }
 }
 
 /// The inspect note for a keyword verify outcome, shared by every provider
@@ -452,6 +559,7 @@ mod tests {
             trials: None,
             task_timeout_seconds: None,
             chain_depths: None,
+            reply_room: None,
             seed: None,
             extras: BTreeMap::new(),
         }
@@ -478,7 +586,7 @@ mod tests {
             let run_dir = tmp.path().join(format!("run{i}"));
             fs::create_dir_all(&run_dir).unwrap();
             let d = Dispatched { exit_code, stdout: stdout.into(), stderr: "boom".into() };
-            let r = finish_run(&FinishInputs { loaded: &loaded, run_dir: &run_dir, profile: &profile, profile_name: "p", session_id: &session, duration_ms: 1 }, &d).unwrap();
+            let r = finish_run(&FinishInputs { loaded: &loaded, run_dir: &run_dir, profile: &profile, profile_name: "p", session_id: &session, duration_ms: 1, reply_cap: None }, &d).unwrap();
             assert_eq!(r.ok, ok, "case {i}");
             assert_eq!(r.escalation.as_deref(), escalation, "case {i}");
             assert_eq!(r.error.is_some(), errored, "case {i}: an escalation is not an error");
@@ -521,6 +629,133 @@ mod tests {
             let found = notes.iter().find(|n| n.starts_with("outcome=")).map(String::as_str);
             assert_eq!(found, want, "{notes:?}");
         }
+    }
+
+    fn spec_expecting(expect: serde_json::Value) -> WorkloadSpec {
+        let mut spec = spec_with_prompt("x");
+        spec.verify = Some(VerifySpec { expect: Some(expect.as_object().unwrap().clone()), ..Default::default() });
+        spec
+    }
+
+    /// (`verify.expect`) The structured-output check decides the verdict and
+    /// names the fields count in the details.
+    #[test]
+    fn run_verify_grades_the_reply_against_verify_expect() {
+        let tmp = TempDir::new().unwrap();
+        let loaded = make_loaded(spec_expecting(serde_json::json!({"a": "1", "b": "2"})), tmp.path().to_path_buf());
+        let pass = run_verify(&loaded, r#"{"a": "1", "b": "2"}"#).unwrap();
+        assert_eq!((pass.passed, pass.details.as_str()), (true, "fields 2/2: all match"));
+        let fail = run_verify(&loaded, r#"{"a": "1", "b": "B"}"#).unwrap();
+        assert_eq!((fail.passed, fail.details.as_str()), (false, "fields 1/2: missed b"));
+    }
+
+    /// Keywords beside `expect`: both must pass.
+    #[test]
+    fn run_verify_with_expect_and_keywords_needs_both() {
+        let tmp = TempDir::new().unwrap();
+        let mut spec = spec_expecting(serde_json::json!({"a": "1"}));
+        spec.verify.as_mut().unwrap().must_not_contain = vec!["sorry".into()];
+        let loaded = make_loaded(spec, tmp.path().to_path_buf());
+        assert!(run_verify(&loaded, r#"{"a": "1"}"#).unwrap().passed);
+        let v = run_verify(&loaded, r#"sorry {"a": "1"}"#).unwrap();
+        assert!(!v.passed);
+        assert_eq!(v.details, "fields 1/1: all match; disallowed keywords found: sorry");
+    }
+
+    /// A workload without `expect` verifies exactly as before.
+    #[test]
+    fn run_verify_without_expect_is_the_keyword_check_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let mut spec = spec_with_prompt("x");
+        spec.verify = Some(VerifySpec::default());
+        let loaded = make_loaded(spec, tmp.path().to_path_buf());
+        let v = run_verify(&loaded, "anything").unwrap();
+        assert_eq!((v.passed, v.details.as_str()), (true, "all keyword checks passed"));
+        assert!(expect_report(&loaded, "anything").is_none());
+    }
+
+    /// The run's manifest carries the fields count in its verify object and
+    /// the reply cap the dispatch sent; a run with neither carries neither key.
+    #[test]
+    fn finish_run_records_the_fields_count_and_the_reply_cap() {
+        let tmp = TempDir::new().unwrap();
+        let profile = darkmux_types::Profile::default();
+        let session = SessionId::adhoc(RunId::lab("run1").unwrap(), "coder", "w");
+        let envelope = |reply: &str| serde_json::json!({"result": "stop", "final_assistant": reply}).to_string();
+        let manifest_of = |dir: &Path| -> serde_json::Value {
+            serde_json::from_str(&fs::read_to_string(dir.join("manifest.json")).unwrap()).unwrap()
+        };
+
+        let loaded = make_loaded(spec_expecting(serde_json::json!({"a": "1", "b": "2", "c": "3"})), tmp.path().to_path_buf());
+        let run_dir = tmp.path().join("structured");
+        fs::create_dir_all(&run_dir).unwrap();
+        let d = Dispatched { exit_code: 0, stdout: envelope(r#"{"a": "1", "b": "x", "c": "3"}"#), stderr: String::new() };
+        let inputs = FinishInputs { loaded: &loaded, run_dir: &run_dir, profile: &profile, profile_name: "p", session_id: &session, duration_ms: 1, reply_cap: Some(30_000) };
+        let r = finish_run(&inputs, &d).unwrap();
+        assert!(!r.verify.unwrap().passed);
+        let m = manifest_of(&run_dir);
+        assert_eq!(m["verify"]["passed"], false);
+        assert_eq!(m["verify"]["fields_correct"], 2);
+        assert_eq!(m["verify"]["fields_expected"], 3);
+        assert_eq!(m["verify"]["fields_missed"], serde_json::json!(["b"]));
+        assert_eq!(m["max_completion_tokens"], 30_000);
+
+        let plain = make_loaded(spec_with_prompt("x"), tmp.path().to_path_buf());
+        let run_dir = tmp.path().join("plain");
+        fs::create_dir_all(&run_dir).unwrap();
+        let d = Dispatched { exit_code: 0, stdout: envelope("hi"), stderr: String::new() };
+        let inputs = FinishInputs { loaded: &plain, run_dir: &run_dir, profile: &profile, profile_name: "p", session_id: &session, duration_ms: 1, reply_cap: None };
+        finish_run(&inputs, &d).unwrap();
+        let m = manifest_of(&run_dir);
+        assert!(m.get("max_completion_tokens").is_none());
+        assert!(m["verify"].is_null(), "no verify spec: not checked, as before");
+    }
+
+    /// `replyRoom`: the window minus the over-counted prompt and the fixed
+    /// overhead; a window the prompt nearly fills is refused, not dispatched.
+    #[test]
+    fn reply_room_is_the_window_minus_the_over_counted_prompt() {
+        assert_eq!(reply_room_from(32_768, 3_000, "w").unwrap(), 32_768 - 1_000 - REPLY_ROOM_OVERHEAD_TOKENS);
+        assert_eq!(reply_room_from(8_192, 1, "w").unwrap(), 8_192 - 1 - REPLY_ROOM_OVERHEAD_TOKENS);
+        let err = reply_room_from(4_096, 11_000, "w").unwrap_err().to_string();
+        assert!(err.contains("raise the profile's n_ctx"), "{err}");
+    }
+
+    #[test]
+    fn reply_room_needs_the_profile_models_n_ctx_and_is_absent_unless_asked() {
+        let tmp = TempDir::new().unwrap();
+        let mut profile = darkmux_types::Profile::default();
+        profile.models.push(darkmux_types::ProfileModel { id: "m".into(), ..Default::default() });
+        let plain = make_loaded(spec_with_prompt("x"), tmp.path().to_path_buf());
+        assert_eq!(reply_room_tokens(&plain, &profile, "no-such-role", "x").unwrap(), None);
+
+        let mut spec = spec_with_prompt("x");
+        spec.reply_room = Some(ReplyRoom::Context);
+        let asks = make_loaded(spec, tmp.path().to_path_buf());
+        let err = reply_room_tokens(&asks, &profile, "no-such-role", "x").unwrap_err().to_string();
+        assert!(err.contains("declares no n_ctx"), "{err}");
+        profile.models[0].n_ctx = Some(16_384);
+        assert_eq!(reply_room_tokens(&asks, &profile, "no-such-role", "xyz").unwrap(), Some(16_384 - 1 - REPLY_ROOM_OVERHEAD_TOKENS));
+    }
+
+    /// A workload that binds a fixture reads its promptFile from the run's
+    /// copy of that fixture; one that does not, from beside the document.
+    #[test]
+    fn prompt_file_resolves_in_the_fixture_copy_when_the_workload_binds_one() {
+        let tmp = TempDir::new().unwrap();
+        let (doc_dir, sandbox) = (tmp.path().join("doc"), tmp.path().join("sandbox"));
+        fs::create_dir_all(&doc_dir).unwrap();
+        fs::create_dir_all(&sandbox).unwrap();
+        fs::write(doc_dir.join("in.txt"), "beside the document").unwrap();
+        fs::write(sandbox.join("in.txt"), "from the fixture").unwrap();
+        let mut spec = spec_with_prompt("");
+        spec.prompt = None;
+        spec.prompt_file = Some("in.txt".into());
+        let unbound = make_loaded(spec.clone(), doc_dir.clone());
+        assert_eq!(resolve_prompt_from(&unbound, prompt_base(&unbound, &sandbox)).unwrap(), "beside the document");
+        spec.requires_fixture = Some("biz@1.0".into());
+        let bound = make_loaded(spec, doc_dir);
+        assert_eq!(resolve_prompt_from(&bound, prompt_base(&bound, &sandbox)).unwrap(), "from the fixture");
     }
 
     #[test]

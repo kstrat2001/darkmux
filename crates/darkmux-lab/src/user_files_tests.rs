@@ -67,6 +67,8 @@ fn a_workload_with_an_unknown_key_is_refused_by_the_lab_preflight() {
         (with_key(quick_q(), "", "zzz_bogus"), "zzz_bogus", ""),
         (with_key(quick_q(), "/workload/verify", "comand"), "workload.verify.comand", "workload.verify.command"),
         (with_key(quick_q(), "/workload", "promt"), "workload.promt", "workload.prompt"),
+        (with_key(quick_q(), "/workload", "replyRom"), "workload.replyRom", "workload.replyRoom"),
+        (with_key(quick_q(), "/workload/verify", "expct"), "workload.verify.expct", "workload.verify.expect"),
     ];
     for (doc, key, closest) in probes {
         let state = IsolatedState::new();
@@ -214,6 +216,23 @@ fn a_mistyped_workload_value_is_refused() {
     write_workload(&state, &wl);
     let refusal = preflight_with(Scope::LabRun, None, Some(PROBE_FIXTURE)).unwrap_err().to_string();
     assert!(refusal.contains("`workload.verify.must_contain` must be a list, got \"four\""), "{refusal}");
+}
+
+/// (`verify.expect`, `replyRoom`) The answer a workload expects is data, so
+/// its own keys are never gated; an unregistered `replyRoom` is refused.
+#[test]
+#[serial_test::serial]
+fn a_structured_output_workload_passes_and_a_bad_reply_room_is_refused() {
+    let state = IsolatedState::new();
+    let mut wl = quick_q();
+    wl["workload"]["verify"] = json!({"expect": {"business_name": {"anyOf": ["A", "A LLC"]}, "zzz_any_field": [1, {"k": "v"}]}});
+    wl["workload"]["replyRoom"] = json!("context");
+    write_workload(&state, &wl);
+    assert_eq!(preflight_with(Scope::LabRun, None, Some(PROBE_FIXTURE)), Ok(()));
+    wl["workload"]["replyRoom"] = json!("whole");
+    write_workload(&state, &wl);
+    let refusal = preflight_with(Scope::LabRun, None, Some(PROBE_FIXTURE)).unwrap_err().to_string();
+    assert!(refusal.contains("workload.replyRoom"), "{refusal}");
 }
 
 // ── (review C1) the gate and the loader never disagree ──

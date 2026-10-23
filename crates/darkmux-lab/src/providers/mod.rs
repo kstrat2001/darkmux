@@ -1,4 +1,5 @@
 pub mod coding_task;
+pub(crate) mod expect;
 pub mod prompt;
 pub mod tool_bench;
 pub mod workspace_delta;

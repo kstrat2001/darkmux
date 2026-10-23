@@ -1380,6 +1380,7 @@ mod tests {
             trials: None,
             task_timeout_seconds: None,
             chain_depths: None,
+            reply_room: None,
             seed: None,
             extras: BTreeMap::new(),
         }

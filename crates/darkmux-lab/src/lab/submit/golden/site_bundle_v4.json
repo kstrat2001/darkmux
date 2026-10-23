@@ -1,7 +1,7 @@
 {
   "bundle": {
     "format": "darkmux-evals-bundle",
-    "formatVersion": 3,
+    "formatVersion": 4,
     "fixture": {
       "repo": "kstrat2001/pepper-grinder",
       "commitSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -38,11 +38,18 @@
           "contextLength": 65536,
           "kvCacheDtype": null,
           "cpuCores": [
-            { "cluster": "Super", "cores": 6 },
-            { "cluster": "Performance", "cores": 12 }
+            {
+              "cluster": "Super",
+              "cores": 6
+            },
+            {
+              "cluster": "Performance",
+              "cores": 12
+            }
           ],
           "gpuCores": 40,
-          "modelId": "Mac17,7"
+          "modelId": "Mac17,7",
+          "maxCompletionTokens": null
         },
         "detail": {
           "wallSeconds": 150,
@@ -75,7 +82,10 @@
             "sandboxChanged": true,
             "coveragePct": 91.2,
             "coverageMinPct": 80,
-            "commandPassed": true
+            "commandPassed": true,
+            "fieldsCorrect": null,
+            "fieldsExpected": null,
+            "fieldsMissed": null
           }
         }
       }
