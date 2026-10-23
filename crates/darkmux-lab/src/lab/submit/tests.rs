@@ -48,6 +48,9 @@ fn stack() -> Stack {
         weights_hash: None,
         quant: Some("4bit".into()),
         context_length: Some(65_536),
+        cpu_cores: vec![("Super".into(), 6), ("Performance".into(), 12)],
+        gpu_cores: Some(40),
+        model_id: Some("Mac17,7".into()),
     }
 }
 
@@ -243,11 +246,23 @@ fn what_the_site_would_refuse_is_refused_here() {
     let mut vm = stack();
     vm.chip = "Apple M2 (Virtual)".into();
     vm.quant = Some("q".repeat(41));
+    vm.cpu_cores = (0..5).map(|i| (if i == 0 { "super core".to_string() } else { "Performance".to_string() }, 4)).collect();
+    vm.gpu_cores = Some(5000);
+    vm.model_id = Some("kains-macbook".into());
     let bad_ran = RanBy { version: Some("5.4.0 beta".into()), ..Default::default() };
     let bad = bundle_run("r2", &manifest(), &stats(), &bad_ran, &vm);
     let both = assemble("kstrat2001/pepper-grinder", &"a".repeat(40), &fixture, vec![bad, good.clone(), good]).unwrap();
     let refused = site_refusals(&both);
-    for want in ["runs[0].stack.chip", "runs[0].stack.quant", "runs[0].darkmuxVersion", "runs[2]: the same run twice"] {
+    for want in [
+        "runs[0].stack.chip",
+        "runs[0].stack.quant",
+        "runs[0].stack.cpuCores: expected 1 to 4",
+        "runs[0].stack.cpuCores[0].cluster",
+        "runs[0].stack.gpuCores: outside",
+        "runs[0].stack.modelId",
+        "runs[0].darkmuxVersion",
+        "runs[2]: the same run twice",
+    ] {
         assert!(refused.iter().any(|r| r.starts_with(want)), "{want} in {refused:?}");
     }
 }
@@ -345,6 +360,10 @@ impl Bench {
             chip: "Apple M2".into(),
             ram_gb: Some(8),
             accelerator: Some("Vulkan".into()),
+            config: darkmux_platform::MachineConfig {
+                cpu_clusters: vec![("Performance".into(), 4), ("Efficiency".into(), 4)],
+                ..Default::default()
+            },
             os_release: Some(darkmux_platform::OsRelease { name: "Omarchy (Arch Linux ARM)".into(), installed_at_unix_ms: Some(0) }),
             registry: serde_json::from_value(json!({"profiles": {"p": {"models": [{"id": "m1", "n_ctx": 65_536}]}}})).ok(),
             installed: darkmux_types::BuildInfo { version: "5.4.0".into(), commit: Some("c".repeat(40)), build: Some(darkmux_types::BuildKind::Dev) },
@@ -383,6 +402,8 @@ fn gather_reads_the_runs_the_fixture_and_the_machine() {
     assert_eq!(stack["quant"], "4bit");
     assert_eq!(stack["model"], "m1");
     assert_eq!(stack["contextLength"], 65_536, "the window the run's profile declares");
+    assert_eq!(stack["cpuCores"], json!([{"cluster": "Performance", "cores": 4}, {"cluster": "Efficiency", "cores": 4}]));
+    assert_eq!((&stack["gpuCores"], &stack["modelId"]), (&Value::Null, &Value::Null), "what the machine does not say stays null");
     let files = [
         ("model.safetensors".to_string(), sha256::hex(b"tensor bytes")),
         ("sub/config.json".to_string(), sha256::hex(b"{}")),
@@ -392,7 +413,7 @@ fn gather_reads_the_runs_the_fixture_and_the_machine() {
     let r2 = &built.bundle["runs"][1];
     assert_eq!((r2["darkmuxVersion"].as_str(), r2["darkmuxBuild"].as_str()), (Some("5.3.0"), Some("release")), "the manifest's own record wins");
     assert_eq!(r2["passed"], false);
-    assert!(built.notes[0].starts_with("r1: passed, m1; not reported: kvCacheDtype"), "{}", built.notes[0]);
+    assert!(built.notes[0].starts_with("r1: passed, m1; not reported: gpuCores, modelId, kvCacheDtype"), "{}", built.notes[0]);
     assert!(built.notes[1].starts_with("r2: failed, m1"), "{}", built.notes[1]);
 }
 
@@ -522,7 +543,7 @@ fn small_readers_say_none_rather_than_guess() {
     let mut all = stack();
     all.weights_hash = Some("h".into());
     assert_eq!(all.unreported(), vec!["kvCacheDtype"]);
-    assert_eq!(Stack::default().unreported().len(), 10);
+    assert_eq!(Stack::default().unreported().len(), 13);
 }
 
 #[test]

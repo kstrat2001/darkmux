@@ -778,3 +778,30 @@ fn an_asahi_machine_is_named_by_the_size_apple_sold() {
     assert_eq!(crate::linux::sold_size_on_apple(15), 16, "14.6 GiB of MemTotal on a 16 GB M1");
     assert_eq!(crate::linux::sold_size_on_apple(63), 64);
 }
+
+/// A Mac's buy-time config as `sysctl` and `ioreg` print it on an M5 Max:
+/// level 0 is its six Super cores, level 1 its twelve Performance cores.
+#[test]
+fn macos_machine_config_reads_perf_levels_gpu_cores_and_model() {
+    let head = "hw.model: Mac17,7\nhw.nperflevels: 2\n";
+    assert_eq!(crate::macos::sysctl_value(head, "hw.model"), Some("Mac17,7"));
+    assert_eq!(crate::macos::sysctl_value(head, "hw.nperflevels"), Some("2"));
+    assert_eq!(crate::macos::sysctl_value(head, "hw.memsize"), None);
+    let levels = "hw.perflevel0.name: Super\nhw.perflevel0.physicalcpu: 6\nhw.perflevel1.name: Performance\nhw.perflevel1.physicalcpu: 12\n";
+    assert_eq!(crate::macos::perf_levels_from_sysctl(levels, 2), vec![("Super".to_string(), 6), ("Performance".to_string(), 12)]);
+    // A level with no core count is not reported as zero, and with one level
+    // unread the rest is not reported as the whole machine.
+    assert_eq!(crate::macos::perf_levels_from_sysctl("hw.perflevel0.name: Super\n", 1), vec![]);
+    assert_eq!(crate::macos::perf_levels_from_sysctl("hw.perflevel0.name: Super\nhw.perflevel0.physicalcpu: 6\n", 2), vec![]);
+    let ioreg = "+-o AGXAcceleratorG17X  <class AGXAcceleratorG17X, id 0x1000003a5>\n    {\n      \"gpu-core-count\" = 40\n      \"IOClass\" = \"AGXAcceleratorG17X\"\n    }\n";
+    assert_eq!(crate::macos::gpu_cores_from_ioreg(ioreg), Some(40));
+    assert_eq!(crate::macos::gpu_cores_from_ioreg("\"gpu-core-count\" = 0\n"), None);
+    assert_eq!(crate::macos::gpu_cores_from_ioreg(""), None);
+}
+
+#[test]
+fn other_platforms_report_no_machine_config() {
+    assert_eq!(crate::other::OtherPlatform.machine_config(), MachineConfig::default());
+    let config = MachineConfig { gpu_cores: Some(10), ..Default::default() };
+    assert_eq!(FakePlatform { machine_config: config.clone(), ..FakePlatform::default() }.machine_config(), config);
+}

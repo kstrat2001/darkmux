@@ -25,6 +25,10 @@ darkmux release.
   before the run, otherwise as "not reported", and the command says why. It never sends a path.
   `--dry-run` writes the bundle and sends nothing. The weights hash is SHA-256 over the model's
   files, the site's own hash.
+  Each run also carries the Mac's buy-time configuration, read by the machine and never typed:
+  physical cores per CPU cluster by the OS's own name (an M5 Max reads Super 6, Performance 12),
+  the GPU core count and the model identifier (`Mac17,7`). On Omarchy only the CPU clusters are
+  read yet; the rest is "not reported" (#3343).
 - **A run records the darkmux that ran it.** The run manifest (data version 1.1, additive) gains
   `darkmux: {version, commit, build}`. `--version` now says `(release <sha>)` for a clean
   checkout at its release tag, so a build from `main` never reads as the release it follows.

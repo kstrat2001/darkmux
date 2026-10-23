@@ -335,6 +335,11 @@ pub struct Stack {
     pub weights_hash: Option<String>,
     pub quant: Option<String>,
     pub context_length: Option<u64>,
+    /// Physical cores per CPU cluster by the OS's name, fastest first; empty when not read.
+    pub cpu_cores: Vec<(String, u32)>,
+    pub gpu_cores: Option<u32>,
+    /// The Mac's model identifier (`Mac16,5`).
+    pub model_id: Option<String>,
 }
 
 impl Stack {
@@ -352,6 +357,11 @@ impl Stack {
             "quant": self.quant,
             "contextLength": self.context_length,
             "kvCacheDtype": null,
+            "cpuCores": (!self.cpu_cores.is_empty()).then(|| {
+                self.cpu_cores.iter().map(|(cluster, cores)| json!({ "cluster": cluster, "cores": cores })).collect::<Vec<_>>()
+            }),
+            "gpuCores": self.gpu_cores,
+            "modelId": self.model_id,
         })
     }
 
@@ -368,6 +378,9 @@ impl Stack {
             ("weightsHash", self.weights_hash.is_none()),
             ("quant", self.quant.is_none()),
             ("contextLength", self.context_length.is_none()),
+            ("cpuCores", self.cpu_cores.is_empty()),
+            ("gpuCores", self.gpu_cores.is_none()),
+            ("modelId", self.model_id.is_none()),
         ] {
             if missing {
                 out.push(name);
@@ -487,6 +500,8 @@ struct Forms {
     repo: regex::Regex,
     apple: regex::Regex,
     os: regex::Regex,
+    model_id: regex::Regex,
+    cluster: regex::Regex,
 }
 
 impl Forms {
@@ -500,6 +515,8 @@ impl Forms {
             repo: re(r"^[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}$"),
             apple: re(r"^Apple M\d{1,2}(?: (?:Pro|Max|Ultra))?$"),
             os: re(r"^(?:macOS \d[0-9.]*|Omarchy\b[^\n]*)$"),
+            model_id: re(r"^[A-Za-z]{1,20}\d{1,3},\d{1,3}$"),
+            cluster: re(r"^[A-Z][A-Za-z]{0,19}$"),
         }
     }
 }
@@ -542,6 +559,21 @@ impl Refusals {
         self.text(&s["model"], &st("model"), 200, None, true);
         self.text(&s["weightsHash"], &st("weightsHash"), 200, Some(&forms.hex64), true);
         self.text(&s["quant"], &st("quant"), 40, None, true);
+        self.text(&s["modelId"], &st("modelId"), 40, Some(&forms.model_id), true);
+        if let Some(clusters) = s["cpuCores"].as_array() {
+            if !(1..=4).contains(&clusters.len()) {
+                self.errs.push(format!("{}: expected 1 to 4 CPU clusters, or null", st("cpuCores")));
+            }
+            for (j, c) in clusters.iter().enumerate() {
+                self.text(&c["cluster"], &st(&format!("cpuCores[{j}].cluster")), 20, Some(&forms.cluster), false);
+                if c["cores"].as_u64().is_none_or(|n| n > 1000) {
+                    self.numbers.push(format!("{}: outside 0 to 1000", st(&format!("cpuCores[{j}].cores"))));
+                }
+            }
+        }
+        if s["gpuCores"].as_u64().is_some_and(|n| n > 1000) {
+            self.numbers.push(format!("{}: outside 0 to 1000", st("gpuCores")));
+        }
         for (k, max) in [("activeSeconds", MAX_SECONDS), ("tokensPerSecond", 100_000.0)] {
             if r[k].as_f64().is_some_and(|n| !(0.0..=max).contains(&n)) {
                 self.numbers.push(format!("{}: outside 0 to {max}", at(k)));
@@ -720,6 +752,7 @@ pub struct Machine {
     pub chip: String,
     pub ram_gb: Option<u64>,
     pub accelerator: Option<String>,
+    pub config: darkmux_platform::MachineConfig,
     pub os_release: Option<darkmux_platform::OsRelease>,
     pub registry: Option<darkmux_types::ProfileRegistry>,
     /// The darkmux installed here, and when its binary was written.
@@ -747,6 +780,7 @@ impl Machine {
             chip: apple_chip(platform.cpu_brand())?,
             ram_gb: platform.ram_as_sold_gb(),
             accelerator: platform.gpu_api().map(str::to_string),
+            config: platform.machine_config(),
             os_release: platform.os_release(),
             registry: darkmux_profiles::profiles::load_registry_quiet(None).ok().map(|l| l.registry),
             installed: darkmux_types::build_info(),
@@ -793,6 +827,9 @@ impl Machine {
             weights_hash,
             quant: engine.quant,
             context_length: profile_model.and_then(|m| m.n_ctx).map(u64::from),
+            cpu_cores: self.config.cpu_clusters.clone(),
+            gpu_cores: self.config.gpu_cores,
+            model_id: self.config.model_id.clone(),
         };
         let run = bundle_run(&input.run_id, &input.manifest, &input.stats, &ran_by, &stack);
         Ok((run, note_for(input, &model_id, &stack, &why)))

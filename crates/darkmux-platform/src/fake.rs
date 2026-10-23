@@ -13,6 +13,7 @@ pub struct FakePlatform {
     pub pid_namespace: Option<String>,
     pub os_release: Option<crate::OsRelease>,
     pub secret_store: crate::SecretStore,
+    pub machine_config: crate::MachineConfig,
 }
 
 /// Every answer at its "nothing to report" value, so a test sets only the
@@ -29,6 +30,7 @@ impl Default for FakePlatform {
             pid_namespace: None,
             os_release: None,
             secret_store: crate::SecretStore::PrivateFile,
+            machine_config: crate::MachineConfig::default(),
         }
     }
 }
@@ -105,6 +107,10 @@ impl Platform for FakePlatform {
 
     fn gpu_api(&self) -> Option<&'static str> {
         None
+    }
+
+    fn machine_config(&self) -> crate::MachineConfig {
+        self.machine_config.clone()
     }
 
     fn secret_store(&self) -> crate::SecretStore {

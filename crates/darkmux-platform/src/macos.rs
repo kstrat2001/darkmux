@@ -109,6 +109,28 @@ impl Platform for MacPlatform {
         self.cpu_brand().filter(|b| b.starts_with("Apple M")).map(|_| "Metal")
     }
 
+    /// `hw.perflevelN.name` / `.physicalcpu` (level 0 is the fastest),
+    /// `hw.model`, and the GPU's `gpu-core-count` from the AGX accelerator
+    /// in the IORegistry. None of them needs root.
+    fn machine_config(&self) -> crate::MachineConfig {
+        // Separate calls: sysctl exits non-zero when any one key is unknown.
+        let model = command_stdout("sysctl", &["hw.model"]).unwrap_or_default();
+        let head = command_stdout("sysctl", &["hw.nperflevels"]).unwrap_or_default();
+        let levels = sysctl_value(&head, "hw.nperflevels").and_then(|n| n.parse::<usize>().ok()).unwrap_or(0).min(8);
+        let keys: Vec<String> =
+            (0..levels).flat_map(|i| [format!("hw.perflevel{i}.name"), format!("hw.perflevel{i}.physicalcpu")]).collect();
+        let per_level = if levels == 0 {
+            String::new()
+        } else {
+            command_stdout("sysctl", &keys.iter().map(String::as_str).collect::<Vec<_>>()).unwrap_or_default()
+        };
+        crate::MachineConfig {
+            cpu_clusters: perf_levels_from_sysctl(&per_level, levels),
+            gpu_cores: command_stdout("ioreg", &["-rc", "AGXAccelerator", "-d1"]).as_deref().and_then(gpu_cores_from_ioreg),
+            model_id: sysctl_value(&model, "hw.model").map(str::to_string),
+        }
+    }
+
     fn secret_store(&self) -> crate::SecretStore {
         crate::SecretStore::Keychain
     }
@@ -250,6 +272,29 @@ fn sysctl_memsize() -> Option<String> {
 #[cfg(not(target_os = "macos"))]
 fn sysctl_memsize() -> Option<String> {
     None
+}
+
+/// The value of `key` in `sysctl <key>...` output (`key: value` lines).
+pub(crate) fn sysctl_value<'a>(output: &'a str, key: &str) -> Option<&'a str> {
+    output.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix(':')).map(str::trim).filter(|v| !v.is_empty())
+}
+
+/// `(name, physical cores)` per perf level, level 0 first. When any level
+/// reads no name or no cores, nothing: part of a machine is not its config.
+pub(crate) fn perf_levels_from_sysctl(output: &str, levels: usize) -> Vec<(String, u32)> {
+    (0..levels)
+        .map(|i| {
+            let name = sysctl_value(output, &format!("hw.perflevel{i}.name"))?;
+            let cores = sysctl_value(output, &format!("hw.perflevel{i}.physicalcpu"))?.parse::<u32>().ok()?;
+            (cores > 0).then(|| (name.to_string(), cores))
+        })
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default()
+}
+
+/// `"gpu-core-count" = 40` in `ioreg -rc AGXAccelerator -d1` output.
+pub(crate) fn gpu_cores_from_ioreg(output: &str) -> Option<u32> {
+    output.lines().find_map(|l| l.trim().strip_prefix("\"gpu-core-count\" = ")?.trim().parse().ok()).filter(|n| *n > 0)
 }
 
 /// `sysctl -n hw.memsize` output: installed bytes.
