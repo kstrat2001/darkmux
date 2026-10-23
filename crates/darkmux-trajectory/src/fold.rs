@@ -232,17 +232,7 @@ impl TrajectoryFold {
                     open.end_ms = Some(s.ts);
                 }
             }
-            E::Partial(p) => {
-                self.partial(p.seq, p.cumulative_chars);
-                // An older runtime sends no `generated_chars`; its answer
-                // chars are then the only output it can show.
-                let produced = p.generated_chars.unwrap_or(p.cumulative_chars) > 0 || p.delta_chars > 0 || p.tool_calls_present;
-                if produced {
-                    if let Some(s) = self.streams.iter_mut().rev().find(|s| s.seq == p.seq) {
-                        s.first_output_ms.get_or_insert(p.ts);
-                    }
-                }
-            }
+            E::Partial(p) => self.partial(p),
             E::Reasoning(r) => {
                 let t = self.turn_detail.entry(r.seq).or_default();
                 t.reasoning_chars = t.reasoning_chars.saturating_add(r.reasoning_chars);
@@ -338,11 +328,18 @@ impl TrajectoryFold {
         t.reasoning_tokens = t.reasoning_tokens.saturating_add(counts.reasoning.unwrap_or(0));
     }
 
-    fn partial(&mut self, seq: u64, cumulative_chars: u64) {
+    fn partial(&mut self, p: &crate::event::Partial) {
+        let (seq, cumulative_chars) = (p.seq, p.cumulative_chars);
+        // An older runtime sends no `generated_chars`; its answer chars are
+        // then the only output it can show.
+        let produced = p.generated_chars.unwrap_or(cumulative_chars) > 0 || p.delta_chars > 0 || p.tool_calls_present;
         // Cumulative within ONE stream, so it belongs to the latest stream
         // on this seq and is summed across streams.
         if let Some(s) = self.streams.iter_mut().rev().find(|s| s.seq == seq) {
             s.content_chars = s.content_chars.max(cumulative_chars);
+            if produced {
+                s.first_output_ms.get_or_insert(p.ts);
+            }
         } else {
             let t = self.turn_detail.entry(seq).or_default();
             t.content_chars = t.content_chars.max(cumulative_chars);
