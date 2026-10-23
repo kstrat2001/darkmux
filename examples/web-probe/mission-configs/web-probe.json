@@ -1,0 +1,82 @@
+{
+  "id": "web-probe",
+  "name": "Web probe",
+  "description": "Probe one business's website the way an AI that reads only the site would, and answer fixed questions about it as JSON: name, trade, services, prices, area served, contact details, hours, next step for a customer, trust signals, structured data, inconsistencies, a clarity score, a short summary, and what the site leaves out. The fetch step runs `~/.darkmux/scripts/web-probe-fetch.sh` (curl, plus textutil on macOS) on this machine and reads the home page and up to four linked pages on the same site; no model touches the network. The probe task hands that text to the tool-less web-probe role, whose answer is held to its JSON schema, then prints it, writes it to `out` when given, and makes it the run's close payload.",
+  "schema_version": "4.0",
+  "inputs": [
+    {
+      "name": "url",
+      "description": "The site to probe: `https://example.com/`, or a bare `example.com` (read as https).",
+      "required": true
+    },
+    {
+      "name": "out",
+      "description": "A file to write the JSON answer to. Absent, the answer is only printed and kept as the run's close payload.",
+      "required": false
+    },
+    {
+      "name": "dry_run",
+      "description": "The generic `mission launch --dry-run` flag, injected by the CLI layer, never set by hand.",
+      "required": false
+    }
+  ],
+  "phases": [
+    {
+      "id": "fetch",
+      "display_name": "Fetch",
+      "description": "Fetch the site's home page and its linked pricing, services, contact and about pages on this machine.",
+      "tasks": [
+        {
+          "id": "fetch-site",
+          "display_name": "Fetch the site",
+          "steps": [
+            {
+              "id": "fetch",
+              "kind": "procedural.shell",
+              "config": {
+                "command": "sh \"$HOME/.darkmux/scripts/web-probe-fetch.sh\" \"$URL\"",
+                "env": {
+                  "URL": "{{url}}"
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "probe",
+      "display_name": "Probe",
+      "description": "The web-probe role answers the fixed questions; the second step delivers the answer.",
+      "tasks": [
+        {
+          "id": "probe-site",
+          "display_name": "Probe the site",
+          "role_id": "web-probe",
+          "depends_on": [
+            "fetch-site"
+          ],
+          "steps": [
+            {
+              "id": "probe",
+              "kind": "dispatch.internal",
+              "config": {
+                "message": "A business's website is above, as one or more `<web-page>` blocks. Answer the questions in your instructions about this business, using only what those pages say, as one JSON object."
+              }
+            },
+            {
+              "id": "deliver",
+              "kind": "procedural.shell",
+              "config": {
+                "command": "printf '%s\\n' \"$DARKMUX_STEP_INPUT_PROBE\"\nif [ -n \"$OUT\" ]; then printf '%s\\n' \"$DARKMUX_STEP_INPUT_PROBE\" > \"$OUT\"; fi",
+                "env": {
+                  "OUT": "{{out}}"
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

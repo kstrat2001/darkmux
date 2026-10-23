@@ -1,0 +1,195 @@
+{
+  "schema_version": "1.0",
+  "id": "web-probe",
+  "role_family": "specialist",
+  "description": "Tool-less web probe: is handed one business's website as plain text (its home page, plus its pricing, services, contact and about pages when linked), fetched on this machine by the web-probe mission's script, never by the model. Answers fixed questions as JSON: who the business is, what it does and charges, where, how to reach it, what builds trust, what is inconsistent or missing, and how clearly an AI could describe it. Every fact must be stated on the pages; anything they do not say is null.",
+  "skills": [],
+  "tool_palette": {
+    "allow": [],
+    "deny": [
+      "read",
+      "write",
+      "edit",
+      "exec",
+      "process",
+      "update_plan"
+    ]
+  },
+  "escalation_contract": "bail-with-explanation",
+  "output_schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "business_name": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "trade": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "services": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "area_served": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "phone": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "email": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "address": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "hours": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "prices": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "item": {
+              "type": "string"
+            },
+            "price": {
+              "type": "string"
+            },
+            "page": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "item",
+            "price",
+            "page"
+          ]
+        }
+      },
+      "pricing_note": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "next_step": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "trust_signals": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "structured_data_types": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "inconsistencies": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "clarity": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 5
+      },
+      "clarity_reason": {
+        "type": "string"
+      },
+      "summary": {
+        "type": "string"
+      },
+      "missing": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      }
+    },
+    "required": [
+      "business_name",
+      "trade",
+      "services",
+      "area_served",
+      "phone",
+      "email",
+      "address",
+      "hours",
+      "prices",
+      "pricing_note",
+      "next_step",
+      "trust_signals",
+      "structured_data_types",
+      "inconsistencies",
+      "clarity",
+      "clarity_reason",
+      "summary",
+      "missing"
+    ]
+  }
+}
