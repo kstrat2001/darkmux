@@ -41,11 +41,13 @@ pub(crate) struct VerifySpec {
     /// FAILURE with an explicit reason — never a silent pass.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coverage_min_pct: Option<f32>,
-    /// (`prompt`) The answer the reply's first JSON object must give, field
-    /// by field: exact values, `{"anyOf": [...]}` for each accepted answer,
-    /// `{"includes": [...]}` for a list that may hold extras. The run passes
-    /// when every field matches and records fields right out of fields
-    /// expected beside the verdict (`crate::providers::expect`).
+    /// (`prompt`) The answer the reply's first JSON object that parses must
+    /// give, field by field: exact values, `{"anyOf": [...]}` for each
+    /// accepted answer, `{"includes": [...]}` for a list that may hold
+    /// extras. A `{` that is not itself JSON is skipped; a reply cut off
+    /// mid-object is not graded from an object nested inside it. The run
+    /// passes when every field matches and records fields right out of
+    /// fields expected beside the verdict (`crate::providers::expect`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expect: Option<serde_json::Map<String, serde_json::Value>>,
 }

@@ -48,6 +48,7 @@ use crate::lab::fixture::FixtureManifest;
 use anyhow::{anyhow, Result};
 use crate::lab::dispatch_end::DispatchEnd;
 use crate::lab::manifest::{ManifestVerify, ManifestVerifyReport, RunManifest, WorkGate, WorkGateEvidence};
+use crate::workloads::types::WorkloadProvider;
 use std::fs;
 use std::path::Path;
 
@@ -635,6 +636,12 @@ fn run_full_gate(
     Ok(Some(gate_result))
 }
 
+/// Whether this run's manifest names the prompt provider. `false` when the
+/// manifest is missing or unreadable, so a gate that cannot tell still runs.
+fn prompt_provider(run_dir: &Path) -> bool {
+    RunManifest::read(run_dir).ok().and_then(|m| m.provider).as_deref() == Some(crate::providers::prompt::PromptProvider.id())
+}
+
 /// The I/O wrapper `lab::run::lab_run` calls once per run, right after
 /// `enrich_manifest_with_fixture_info` has written `final_hash` (top-level,
 /// from the provider) and `fixture.baseline_hash` (from the enricher) into
@@ -668,6 +675,14 @@ pub fn apply(
     dispatch: DispatchEnd,
     coverage_min_pct: Option<f32>,
 ) -> Result<Option<WorkGateResult>> {
+    // A prompt run writes no test output (no `verify-output.txt`). Running
+    // the gate would replace its keyword or structured verdict with
+    // "passing-test count is unreadable". A missing or unreadable manifest
+    // is not treated as a prompt run: the declaration match below still
+    // decides, including its fail-closed arm.
+    if prompt_provider(run_dir) {
+        return Ok(None);
+    }
     match fixture_baseline_declaration(source_sandbox_dir) {
         BaselineDeclaration::NotDeclared => {
             warn_coverage_declared_without_baseline(run_dir, coverage_min_pct)
@@ -1364,6 +1379,29 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("no tests added"));
+    }
+
+    /// A prompt run never writes `verify-output.txt`. A fixture that declares
+    /// `baseline.test_count` must not replace its verdict — keyword or
+    /// structured — with "passing-test count is unreadable".
+    #[test]
+    fn apply_leaves_a_prompt_runs_verdict_alone() {
+        let run = TempDir::new().unwrap();
+        let fixture = TempDir::new().unwrap();
+        write_fixture(fixture.path(), 5);
+        write_manifest(
+            run.path(),
+            r#"{"schema_version":6,"provider":"prompt","verify":{"passed":true,"details":"fields 2/2: all match","fields_correct":2,"fields_expected":2,"fields_missed":[]}}"#,
+        );
+        let gated = apply(run.path(), fixture.path(), fixture.path(), DispatchEnd::Completed, None).unwrap();
+        assert!(gated.is_none(), "a prompt run is not a write-the-tests gate");
+        let raw = fs::read_to_string(run.path().join("manifest.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["verify"]["passed"], true);
+        assert_eq!(v["verify"]["details"], "fields 2/2: all match");
+        assert_eq!(v["verify"]["fields_correct"], 2);
+        assert_eq!(v["verify"]["fields_missed"], serde_json::json!([]));
+        assert!(v["verify"].get("work_gate").is_none());
     }
 
     #[test]

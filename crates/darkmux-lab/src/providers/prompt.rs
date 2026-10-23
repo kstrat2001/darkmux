@@ -68,6 +68,9 @@ impl WorkloadProvider for PromptProvider {
             config_path,
             profile_name,
         );
+        // Named and armed before the dispatch, so a dispatch that returns
+        // `Err` still leaves its trajectory in the run dir (the guard's Drop).
+        let guard = PromptDispatchGuard::arm(&role, run_dir, &mut opts);
         // (`replyRoom`) Worked out from the route the dispatch itself will
         // take: its selected model's window and its own system prompt.
         let reply_room = match loaded.manifest.workload.reply_room {
@@ -79,7 +82,9 @@ impl WorkloadProvider for PromptProvider {
         opts.max_completion_tokens = reply_room;
         let system_chars = darkmux_crew::dispatch::one_call_context(&opts).ok().flatten().map_or(0, |c| c.system_prompt_chars);
         let (dispatched, out_dir) = dispatch_via_internal(opts)?;
-        preserve_trajectory(out_dir.as_deref(), run_dir);
+        // Disarm before the one-call trajectory is written, so the guard
+        // does not then mark that finished trajectory interrupted.
+        let refused = guard.keep(out_dir.as_deref(), run_dir);
         // The container path mounts a bookkeeping dir; the one-call path has
         // none, and its trajectory is the one call's own counts.
         let one_call = out_dir.is_none();
@@ -97,6 +102,7 @@ impl WorkloadProvider for PromptProvider {
                 // Only the one-call path sends the cap; the container path's
                 // runtime continues a reply in chunks and caps nothing.
                 reply_cap: reply_room.filter(|_| one_call),
+                refused: &refused,
             },
             &dispatched,
         )
@@ -157,6 +163,8 @@ pub(crate) struct FinishInputs<'a> {
     /// The `max_completion_tokens` this run's dispatch actually sent, when
     /// the workload asked for `replyRoom` and the dispatch was one call.
     pub reply_cap: Option<u32>,
+    /// Runtime files the run refused to copy. Empty leaves the manifest unchanged.
+    pub refused: &'a [crate::providers::coding_task::RefusedArtifact],
 }
 
 /// Everything after the dispatch: persist its output, verify the reply, write
@@ -184,6 +192,7 @@ pub(crate) fn finish_run(f: &FinishInputs<'_>, d: &Dispatched) -> Result<RunResu
             session_id: f.session_id,
             verify: recorded_verify.as_ref(),
             end: &end,
+            refused: f.refused,
         },
     )?;
     record_structured_output(f.run_dir, fields.as_ref(), f.reply_cap)?;
@@ -208,6 +217,8 @@ pub struct ManifestInputs<'a> {
     /// How the dispatch ended; stamped onto the manifest so an escalation
     /// reads as one on every surface that reads `manifest.json`.
     pub end: &'a DispatchEnd,
+    /// Runtime files the run refused to copy. Empty leaves the manifest unchanged.
+    pub refused: &'a [crate::providers::coding_task::RefusedArtifact],
 }
 
 /// Build and write this run's `manifest.json`: the one place the prompt
@@ -241,6 +252,7 @@ pub fn write_manifest(run_dir: &Path, m: &ManifestInputs<'_>) -> Result<()> {
         ..RunManifest::default()
     };
     m.end.record_in(&mut manifest);
+    manifest.refused_artifacts = crate::providers::coding_task::refused_records(m.refused);
     manifest.write(run_dir)?;
     Ok(())
 }
@@ -306,13 +318,14 @@ fn reply_room_for(ctx: Option<darkmux_crew::dispatch::OneCallContext>, prompt: &
     }
 }
 
-/// The host has no tokenizer, so the prompt is over-counted at one token per
-/// three UTF-8 bytes (a CJK character is three bytes and about one token;
-/// English runs nearer four characters a token), plus a fixed overhead: the
-/// reply may get a little less than the true remainder, never more than the
-/// window holds.
+/// The host has no tokenizer, so the prompt is counted at one token per
+/// UTF-8 byte. A byte-level tokenizer cannot emit more tokens than there
+/// are bytes, so the reply may get a little less than the true remainder
+/// and never more than the window holds. One token per character is not
+/// that bound: a character can be several bytes, and each byte can be its
+/// own token.
 fn reply_room_from(n_ctx: u32, prompt_bytes: usize, workload_id: &str) -> Result<u32> {
-    let prompt_tokens = u32::try_from(prompt_bytes.div_ceil(3)).unwrap_or(u32::MAX).saturating_add(REPLY_ROOM_OVERHEAD_TOKENS);
+    let prompt_tokens = u32::try_from(prompt_bytes).unwrap_or(u32::MAX).saturating_add(REPLY_ROOM_OVERHEAD_TOKENS);
     let room = n_ctx.saturating_sub(prompt_tokens);
     if room < REPLY_ROOM_MIN_TOKENS {
         return Err(anyhow!(
@@ -333,13 +346,37 @@ fn dispatch_via_internal(
     Ok((Dispatched { exit_code: result.exit_code, stdout: result.stdout, stderr: result.stderr }, result.out_dir))
 }
 
-/// Copy the runtime's trajectory into the run dir, as the coding-task
-/// provider does (#364): the run's numbers (`darkmux run stats`, `lab
-/// submit`) are read from it, and the dispatch's own out dir is a temp dir.
-/// The one-call path has no out dir and writes no trajectory.
-fn preserve_trajectory(out_dir: Option<&Path>, run_dir: &Path) {
-    if let Some(out) = out_dir {
-        crate::providers::coding_task::preserve_runtime_artifacts(out, run_dir, &["trajectory.jsonl"]);
+/// Copy the runtime's trajectory and findings into the run dir, as the
+/// coding-task provider does (#364): the run's numbers (`darkmux run stats`,
+/// `lab submit`) are read from the trajectory, and the dispatch's own out
+/// dir is a temp dir. Returns anything the copy refused, so the caller can
+/// record it. The one-call path has no out dir and writes no trajectory.
+fn preserve_trajectory(out_dir: Option<&Path>, run_dir: &Path) -> Vec<crate::providers::coding_task::RefusedArtifact> {
+    let Some(out) = out_dir else { return Vec::new() };
+    crate::providers::coding_task::preserve_runtime_artifacts(out, run_dir, &["trajectory.jsonl", "findings.jsonl"]).refused
+}
+
+/// Names the out dir and arms preservation before a prompt dispatch. Drop
+/// copies the runtime's trajectory and findings into the run dir and closes
+/// an unterminated trajectory, which is the only copy a dispatch that
+/// returns `Err` gets. [`Self::keep`] is the success path: it copies, returns
+/// what was refused, and disarms before a one-call trajectory is written.
+struct PromptDispatchGuard {
+    preserve: crate::providers::coding_task::TrajectoryPreserver,
+}
+
+impl PromptDispatchGuard {
+    fn arm(role: &str, run_dir: &Path, opts: &mut darkmux_crew::dispatch::DispatchOpts) -> Self {
+        let out_dir = crate::providers::coding_task::named_out_dir(role);
+        let preserve = crate::providers::coding_task::TrajectoryPreserver::new(out_dir.clone(), run_dir.to_path_buf());
+        opts.host_out = Some(out_dir);
+        Self { preserve }
+    }
+
+    fn keep(mut self, dispatch_out: Option<&Path>, run_dir: &Path) -> Vec<crate::providers::coding_task::RefusedArtifact> {
+        let refused = preserve_trajectory(dispatch_out, run_dir);
+        self.preserve.disarm();
+        refused
     }
 }
 
@@ -663,7 +700,7 @@ mod tests {
             let run_dir = tmp.path().join(format!("run{i}"));
             fs::create_dir_all(&run_dir).unwrap();
             let d = Dispatched { exit_code, stdout: stdout.into(), stderr: "boom".into() };
-            let r = finish_run(&FinishInputs { loaded: &loaded, run_dir: &run_dir, profile: &profile, profile_name: "p", session_id: &session, duration_ms: 1, reply_cap: None }, &d).unwrap();
+            let r = finish_run(&FinishInputs { loaded: &loaded, run_dir: &run_dir, profile: &profile, profile_name: "p", session_id: &session, duration_ms: 1, reply_cap: None, refused: &[] }, &d).unwrap();
             assert_eq!(r.ok, ok, "case {i}");
             assert_eq!(r.escalation.as_deref(), escalation, "case {i}");
             assert_eq!(r.error.is_some(), errored, "case {i}: an escalation is not an error");
@@ -699,6 +736,7 @@ mod tests {
                     session_id: &session,
                     verify: None,
                     end: &end,
+                    refused: &[],
                 },
             )
             .unwrap();
@@ -767,7 +805,7 @@ mod tests {
         let run_dir = tmp.path().join("structured");
         fs::create_dir_all(&run_dir).unwrap();
         let d = Dispatched { exit_code: 0, stdout: envelope(r#"{"a": "1", "b": "x", "c": "3"}"#), stderr: String::new() };
-        let inputs = FinishInputs { loaded: &loaded, run_dir: &run_dir, profile: &profile, profile_name: "p", session_id: &session, duration_ms: 1, reply_cap: Some(30_000) };
+        let inputs = FinishInputs { loaded: &loaded, run_dir: &run_dir, profile: &profile, profile_name: "p", session_id: &session, duration_ms: 1, reply_cap: Some(30_000), refused: &[] };
         let r = finish_run(&inputs, &d).unwrap();
         assert!(!r.verify.unwrap().passed);
         let m = manifest_of(&run_dir);
@@ -781,18 +819,20 @@ mod tests {
         let run_dir = tmp.path().join("plain");
         fs::create_dir_all(&run_dir).unwrap();
         let d = Dispatched { exit_code: 0, stdout: envelope("hi"), stderr: String::new() };
-        let inputs = FinishInputs { loaded: &plain, run_dir: &run_dir, profile: &profile, profile_name: "p", session_id: &session, duration_ms: 1, reply_cap: None };
+        let inputs = FinishInputs { loaded: &plain, run_dir: &run_dir, profile: &profile, profile_name: "p", session_id: &session, duration_ms: 1, reply_cap: None, refused: &[] };
         finish_run(&inputs, &d).unwrap();
         let m = manifest_of(&run_dir);
         assert!(m.get("max_completion_tokens").is_none());
         assert!(m["verify"].is_null(), "no verify spec: not checked, as before");
     }
 
-    /// `replyRoom`: the window minus the over-counted prompt and the fixed
-    /// overhead; a window the prompt nearly fills is refused, not dispatched.
+    /// `replyRoom`: the window minus one token per prompt byte and the fixed
+    /// overhead. A byte-level tokenizer cannot emit more tokens than bytes,
+    /// so the reply never asks for more than the window holds. A window the
+    /// prompt nearly fills is refused, not dispatched.
     #[test]
-    fn reply_room_is_the_window_minus_the_over_counted_prompt() {
-        assert_eq!(reply_room_from(32_768, 3_000, "w").unwrap(), 32_768 - 1_000 - REPLY_ROOM_OVERHEAD_TOKENS);
+    fn reply_room_is_the_window_minus_one_token_per_byte() {
+        assert_eq!(reply_room_from(32_768, 3_000, "w").unwrap(), 32_768 - 3_000 - REPLY_ROOM_OVERHEAD_TOKENS);
         assert_eq!(reply_room_from(8_192, 1, "w").unwrap(), 8_192 - 1 - REPLY_ROOM_OVERHEAD_TOKENS);
         let err = reply_room_from(4_096, 11_000, "w").unwrap_err().to_string();
         assert!(err.contains("raise the profile's n_ctx"), "{err}");
@@ -808,8 +848,8 @@ mod tests {
         let ctx = |n_ctx| Some(OneCallContext { model: "m".into(), n_ctx, max_output_tokens: None, system_prompt_bytes: 5_700, system_prompt_chars: 5_700 });
         let err = reply_room_for(ctx(None), "x", "w").unwrap_err().to_string();
         assert!(err.contains("`m` declares no n_ctx"), "{err}");
-        // "日本" is six bytes: two CJK characters are counted as two tokens.
-        assert_eq!(reply_room_for(ctx(Some(16_384)), "日本", "w").unwrap(), Some(16_384 - 1_902 - REPLY_ROOM_OVERHEAD_TOKENS));
+        // "日本" is six bytes, counted as six tokens, plus the system prompt's bytes.
+        assert_eq!(reply_room_for(ctx(Some(16_384)), "日本", "w").unwrap(), Some(16_384 - 5_706 - REPLY_ROOM_OVERHEAD_TOKENS));
     }
 
     /// A model whose output limit is below what its window leaves gets its
@@ -820,7 +860,7 @@ mod tests {
         use darkmux_crew::dispatch::OneCallContext;
         let ctx = |max| Some(OneCallContext { model: "m".into(), n_ctx: Some(200_000), max_output_tokens: max, system_prompt_bytes: 5_700, system_prompt_chars: 5_700 });
         assert_eq!(reply_room_for(ctx(Some(128_000)), "x", "w").unwrap(), Some(128_000));
-        let room = 200_000 - 1_901 - REPLY_ROOM_OVERHEAD_TOKENS;
+        let room = 200_000 - 5_701 - REPLY_ROOM_OVERHEAD_TOKENS;
         assert_eq!(reply_room_for(ctx(Some(250_000)), "x", "w").unwrap(), Some(room));
         assert_eq!(reply_room_for(ctx(None), "x", "w").unwrap(), Some(room));
         let err = reply_room_for(ctx(Some(0)), "x", "w").unwrap_err().to_string();
@@ -866,6 +906,94 @@ mod tests {
         assert!(!run_dir.join("trajectory.jsonl").exists());
         preserve_trajectory(Some(&out), &run_dir);
         assert_eq!(fs::read_to_string(run_dir.join("trajectory.jsonl")).unwrap(), "{\"event\":\"x\"}\n");
+    }
+
+    /// The named out dir lives in the process temp directory, not under the
+    /// test's `TempDir`, so it has to be removed explicitly.
+    struct RemoveOut(std::path::PathBuf);
+    impl Drop for RemoveOut {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A dispatch that returns `Err` never reaches the success-path copy.
+    /// The guard is armed with the named out dir before the call, and its
+    /// Drop is what keeps the trajectory and closes it.
+    #[test]
+    fn an_interrupted_prompt_dispatch_keeps_and_closes_its_trajectory() {
+        let tmp = TempDir::new().unwrap();
+        let run = tmp.path().join("run");
+        fs::create_dir_all(&run).unwrap();
+        let session = SessionId::adhoc(RunId::lab("run1").unwrap(), "reviewer", "w");
+        let mut opts = dispatch_opts("reviewer", "hi", &session, None, None, "p");
+        let guard = PromptDispatchGuard::arm("reviewer", &run, &mut opts);
+        let out = opts.host_out.clone().expect("the out dir is named before dispatch");
+        let _remove_out = RemoveOut(out.clone());
+        fs::create_dir_all(out.join(".darkmux-runtime")).unwrap();
+        fs::write(
+            out.join(".darkmux-runtime/trajectory.jsonl"),
+            "{\"type\":\"dispatch.start\",\"ts\":1000,\"model\":\"m\"}\n\
+             {\"type\":\"model.completed\",\"seq\":1,\"ts\":2000,\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2,\"total_tokens\":6}}\n",
+        )
+        .unwrap();
+        drop(guard);
+        let fold = darkmux_trajectory::TrajectoryFold::from_path(&run.join("trajectory.jsonl"));
+        assert_eq!(fold.turns(), 1, "what completed is in the run dir");
+        assert_eq!(fold.complete.expect("a terminal record").result, darkmux_trajectory::RESULT_INTERRUPTED);
+    }
+
+    /// The success path copies, records a refusal, and disarms. Disarming
+    /// matters: the guard must not then mark the copied trajectory interrupted.
+    #[test]
+    fn a_kept_prompt_dispatch_records_a_refusal_and_does_not_close_the_trajectory() {
+        let tmp = TempDir::new().unwrap();
+        let run = tmp.path().join("run");
+        fs::create_dir_all(&run).unwrap();
+        let session = SessionId::adhoc(RunId::lab("run1").unwrap(), "reviewer", "w");
+        let mut opts = dispatch_opts("reviewer", "hi", &session, None, None, "p");
+        let guard = PromptDispatchGuard::arm("reviewer", &run, &mut opts);
+        let out = opts.host_out.clone().unwrap();
+        let _remove_out = RemoveOut(out.clone());
+        fs::create_dir_all(out.join(".darkmux-runtime")).unwrap();
+        // Open on purpose. The success path copies it and must not close it;
+        // closing is the error path's job, and only when the runtime didn't.
+        let body = "{\"type\":\"dispatch.start\",\"ts\":1,\"model\":\"m\"}\n";
+        fs::write(out.join(".darkmux-runtime/trajectory.jsonl"), body).unwrap();
+        let secret = tmp.path().join("host-secret.txt");
+        fs::write(&secret, "HOST-SECRET-2869").unwrap();
+        std::os::unix::fs::symlink(&secret, out.join(".darkmux-runtime/findings.jsonl")).unwrap();
+
+        let refused = guard.keep(Some(&out), &run);
+        let copied = fs::read_to_string(run.join("trajectory.jsonl")).unwrap();
+        assert_eq!(copied, body, "a disarmed guard must not append interrupted");
+        assert!(!copied.contains("interrupted"));
+        assert!(!run.join("findings.jsonl").exists(), "a refused symlink must not be copied");
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].file, "findings.jsonl");
+        assert!(refused[0].reason.contains("symlink"), "{}", refused[0].reason);
+
+        let loaded = make_loaded(spec_with_prompt("x"), tmp.path().to_path_buf());
+        let profile = darkmux_types::Profile::default();
+        let d = Dispatched { exit_code: 0, stdout: r#"{"result":"stop","final_assistant":"hi"}"#.into(), stderr: String::new() };
+        finish_run(
+            &FinishInputs {
+                loaded: &loaded,
+                run_dir: &run,
+                profile: &profile,
+                profile_name: "p",
+                session_id: &session,
+                duration_ms: 1,
+                reply_cap: None,
+                refused: &refused,
+            },
+            &d,
+        )
+        .unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&fs::read_to_string(run.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["refused_artifacts"][0]["file"], "findings.jsonl");
+        assert!(manifest["refused_artifacts"][0]["reason"].as_str().unwrap().contains("symlink"));
+        assert_eq!(fs::read_to_string(run.join("trajectory.jsonl")).unwrap(), body);
     }
 
     /// A workload that binds a fixture reads its promptFile from the run's

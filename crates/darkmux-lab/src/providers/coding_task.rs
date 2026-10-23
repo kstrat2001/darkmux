@@ -744,7 +744,7 @@ fn dispatch_via_internal(
 /// its own (`darkmux-out-<role>-<unix micros>`), so `darkmux doctor`'s
 /// temp-residue check treats it the same. Only the NAME is chosen here; the
 /// dispatch creates the directory and refuses one that already exists.
-fn named_out_dir(role_id: &str) -> PathBuf {
+pub(crate) fn named_out_dir(role_id: &str) -> PathBuf {
     let micros = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_micros()).unwrap_or(0);
     std::env::temp_dir().join(format!("darkmux-out-{role_id}-{micros}"))
 }
@@ -758,18 +758,18 @@ fn named_out_dir(role_id: &str) -> PathBuf {
 /// A trajectory that never got a terminal record (the container was
 /// SIGKILLed) is closed with `interrupted`, so `darkmux run stats` reports
 /// what completed and says so, rather than reading an open-ended run.
-struct TrajectoryPreserver {
+pub(crate) struct TrajectoryPreserver {
     out_dir: PathBuf,
     run_dir: PathBuf,
     armed: bool,
 }
 
 impl TrajectoryPreserver {
-    fn new(out_dir: PathBuf, run_dir: PathBuf) -> Self {
+    pub(crate) fn new(out_dir: PathBuf, run_dir: PathBuf) -> Self {
         Self { out_dir, run_dir, armed: true }
     }
 
-    fn disarm(&mut self) {
+    pub(crate) fn disarm(&mut self) {
         self.armed = false;
     }
 }
