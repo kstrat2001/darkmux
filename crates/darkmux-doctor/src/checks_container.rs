@@ -53,9 +53,52 @@ fn who(user: ContainerUser) -> String {
 
 const NAME: &str = "container user";
 
+/// (#906) Where a lab run's model-written tests (its verify command and
+/// grader suites) run. In a container passes; on the host warns, because
+/// code a model wrote then runs as the operator, with their files and
+/// network.
+pub fn check_lab_tests_placement() -> Check {
+    let (on_host, source) = darkmux_types::config_access::tests_on_host_with_source();
+    describe_tests_placement(on_host, source)
+}
+
+fn describe_tests_placement(on_host: bool, source: Source) -> Check {
+    let name = "lab tests".to_string();
+    if !on_host {
+        return Check {
+            name,
+            status: Status::Pass,
+            message: "a lab run's verify command and grader suites run in a container: no network, only the run's tree mounted".into(),
+            hint: None,
+        };
+    }
+    let setting = if source == Source::Env { "DARKMUX_TESTS_ON_HOST" } else { "runtime.tests_on_host" };
+    Check {
+        name,
+        status: Status::Warn,
+        message: format!(
+            "a lab run's verify command and grader suites run on this machine as you (`{setting}` is on): \
+             code a model wrote runs with your files and network"
+        ),
+        hint: Some("Only for fixtures and models you trust. `darkmux config set runtime.tests_on_host false` puts them back in a container.".into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (#906) Tests in a container pass; on the host warns, naming the
+    /// setting the operator turned on.
+    #[test]
+    fn lab_tests_on_the_host_warn_naming_the_setting() {
+        assert_eq!(describe_tests_placement(false, Source::BuiltIn).status, Status::Pass);
+        let config = describe_tests_placement(true, Source::Config);
+        assert_eq!(config.status, Status::Warn);
+        assert!(config.message.contains("runtime.tests_on_host"), "{}", config.message);
+        let env = describe_tests_placement(true, Source::Env);
+        assert!(env.message.contains("DARKMUX_TESTS_ON_HOST"), "{}", env.message);
+    }
     use darkmux_platform::FakePlatform;
     use darkmux_types::config_access::Source;
 

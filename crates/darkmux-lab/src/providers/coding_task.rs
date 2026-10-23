@@ -22,7 +22,8 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::process::Command;
+use darkmux_crew::bounded_command::Bounded;
+use darkmux_crew::contained_command::{self, Placement};
 
 pub(crate) struct CodingTaskProvider;
 
@@ -339,7 +340,7 @@ impl WorkloadProvider for CodingTaskProvider {
         }
         preserve.disarm();
 
-        let verify_outcome = run_verify_command(loaded, run_dir, sandbox_dir)?;
+        let verify_outcome = run_verify_command(loaded, run_dir, sandbox_dir, test_placement)?;
 
         // (#420) Verify-claim disagreement detection — the "agent
         // thinks it's done; it isn't" failure mode. Compares the
@@ -498,27 +499,13 @@ impl WorkloadProvider for CodingTaskProvider {
     }
 }
 
-/// Substitute `${SANDBOX_DIR}` and `${SANDBOX}` in a workload prompt or
-/// command with the resolved sandbox path. This is what lets a workload
-/// manifest be portable — the manifest references `${SANDBOX_DIR}` and the
-/// runtime supplies the actual on-disk path (which may come from the
-/// `DARKMUX_SANDBOX_<workload>` env var).
-///
-/// For prompts dispatched through the internal Docker-bounded runtime
-/// (where `sandbox_dir` is mounted at `/workspace` inside the container —
-/// see `src/crew/dispatch_internal.rs:99`), callers should use
-/// `expand_placeholders_with("/workspace")` instead. Otherwise the agent
-/// reads the prompt's host path, can't find files at that path inside
-/// the container, and produces an empty trajectory. Verify commands
-/// run on the host and continue to use the host path.
-fn expand_placeholders(input: &str, sandbox_dir: &Path) -> String {
-    expand_placeholders_with(input, &sandbox_dir.display().to_string())
-}
-
-/// Lower-level helper: substitute `${SANDBOX_DIR}` / `${SANDBOX}` with
-/// an explicit view-path string. Used to swap between host paths
-/// (verify commands) and container-internal paths (internal runtime
-/// agent prompts) at the call site.
+/// Substitute `${SANDBOX_DIR}` / `${SANDBOX}` in a workload prompt or
+/// command with the sandbox's path as its reader sees it. This is what lets
+/// a workload manifest be portable: it names `${SANDBOX_DIR}` and the run
+/// supplies the path. A dispatched prompt and a contained verify command see
+/// the sandbox at `/workspace` (where the container mounts it; a host path
+/// there is a file the agent cannot find, and an empty trajectory); a verify
+/// command on the host sees the host path (`sandbox_view`).
 fn expand_placeholders_with(input: &str, view_path: &str) -> String {
     input
         .replace("${SANDBOX_DIR}", view_path)
@@ -1065,16 +1052,19 @@ fn augment_qa_reply_with_workspace_delta(
 
 /// Run the workload's verify command and capture its outcome.
 ///
-/// SECURITY (#906): the command runs on the HOST shell (`/bin/sh -c`) with
-/// the operator's privileges — NOT inside the dispatch container that bounds
-/// the agent. A workload/fixture from an untrusted source could carry a
-/// hostile `verify.command`. `darkmux lab register` warns at register time
-/// when a fixture declares one (the trust-establishment point); running
-/// verify inside the declared `--image` is a deferred hardening step.
+/// SECURITY (#906): the command runs whatever the model wrote into the
+/// sandbox, so it runs where `placement` resolves (`test_placement` in a
+/// run): by default in a container with only the sandbox mounted (at
+/// `/workspace`), no network and no capabilities
+/// (`darkmux_crew::contained_command`); on the host as the operator only when
+/// they opt in with `runtime.tests_on_host`. `${SANDBOX_DIR}` in the command
+/// and `cwd` names the sandbox as that placement sees it. `darkmux lab
+/// fixture register` says where a fixture's verify command will run.
 fn run_verify_command(
     loaded: &LoadedWorkload,
     run_dir: &Path,
     sandbox_dir: &Path,
+    placement: impl FnOnce(&LoadedWorkload) -> Result<Placement>,
 ) -> Result<Option<crate::workloads::types::VerifyOutcome>> {
     let Some(spec) = loaded.manifest.workload.verify.as_ref() else {
         return Ok(None);
@@ -1082,34 +1072,94 @@ fn run_verify_command(
     let Some(cmd_raw) = spec.command.as_ref() else {
         return Ok(None);
     };
-    // Same ${SANDBOX_DIR} substitution as the prompt — verify commands
-    // commonly need to cd into the sandbox or reference files there.
-    let cmd = expand_placeholders(cmd_raw, sandbox_dir);
-    let cwd = if let Some(rel) = spec.cwd.as_ref() {
-        sandbox_dir.join(expand_placeholders(rel, sandbox_dir))
-    } else {
-        sandbox_dir.to_path_buf()
+    // Resolved only for a declared command: no Docker check without one.
+    let placement = &placement(loaded)?;
+    let view = sandbox_view(placement, sandbox_dir);
+    let cmd = expand_placeholders_with(cmd_raw, &view);
+    let workdir = verify_workdir(spec.cwd.as_deref(), &view);
+    let run = contained_command::Run {
+        command: &cmd,
+        tree: sandbox_dir,
+        workdir: &workdir,
+        mounts: &[],
+        user: test_user(placement)?,
+        name_prefix: "darkmux-verify",
     };
-    let output = Command::new("/bin/sh")
-        .arg("-c")
-        .arg(&cmd)
-        .current_dir(&cwd)
-        .output()
-        .with_context(|| format!("running verify command: {cmd}"))?;
-    let merged = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    fs::write(run_dir.join("verify-output.txt"), &merged)?;
-    Ok(Some(crate::workloads::types::VerifyOutcome {
-        passed: output.status.success(),
-        details: if output.status.success() {
-            "verify command exited 0".into()
-        } else {
-            format!("exit {}", output.status.code().unwrap_or(-1))
-        },
-    }))
+    let ran = contained_command::run(placement, &run, darkmux_crew::bounded_command::configured_timeout());
+    let (passed, details, output) = verify_result(placement, ran, &cmd)?;
+    fs::write(run_dir.join("verify-output.txt"), &output)?;
+    Ok(Some(crate::workloads::types::VerifyOutcome { passed, details }))
+}
+
+/// (#906) Where a lab run's model-written tests run: in a container on the
+/// workload's image (else the runtime image), unless the operator opted in
+/// to the host with `runtime.tests_on_host`.
+pub(crate) fn test_placement(loaded: &LoadedWorkload) -> Result<Placement> {
+    if darkmux_types::config_access::tests_on_host() {
+        return Ok(Placement::Host);
+    }
+    let image = contained_command::lab_test_image(loaded.manifest.workload.image.as_deref())?;
+    Ok(Placement::Container(image))
+}
+
+/// The container's user for a contained run; a host run has none.
+pub(crate) fn test_user(placement: &Placement) -> Result<Option<String>> {
+    match placement {
+        Placement::Host => Ok(None),
+        Placement::Container(_) => contained_command::lab_test_user(),
+    }
+}
+
+/// The sandbox's path as `placement` sees it.
+fn sandbox_view(placement: &Placement, sandbox_dir: &Path) -> String {
+    match placement {
+        Placement::Host => sandbox_dir.display().to_string(),
+        Placement::Container(_) => "/workspace".to_string(),
+    }
+}
+
+/// `verify.cwd`, expanded and made relative to the sandbox: a manifest may
+/// write it relative (`app`) or through the placeholder (`${SANDBOX_DIR}/app`).
+fn verify_workdir(cwd: Option<&str>, view: &str) -> String {
+    let Some(rel) = cwd else {
+        return String::new();
+    };
+    let expanded = expand_placeholders_with(rel, view);
+    let inside = expanded.strip_prefix(view).unwrap_or(&expanded);
+    inside.trim_start_matches('/').to_string()
+}
+
+/// A verify run's (passed, details, captured output). Docker failing to run
+/// the container, a spawn failure or an interrupt is an error, never a
+/// failed verify: none of them says anything about the model's work.
+fn verify_result(placement: &Placement, ran: Bounded, cmd: &str) -> Result<(bool, String, String)> {
+    if contained_command::docker_failed(placement, &ran) {
+        let Bounded::Finished { stderr, .. } = &ran else { unreachable!() };
+        bail!(
+            "verify command could not run in its container: {}\n\
+             model-written tests run in a container, so they need Docker; \
+             to run them on this machine as your user instead, \
+             `darkmux config set runtime.tests_on_host true`",
+            String::from_utf8_lossy(stderr).trim()
+        );
+    }
+    match ran {
+        Bounded::Finished { success, code, stdout, stderr } => {
+            let output = format!("{}{}", String::from_utf8_lossy(&stdout), String::from_utf8_lossy(&stderr));
+            let details = if success {
+                "verify command exited 0".into()
+            } else {
+                format!("exit {}", code.unwrap_or(-1))
+            };
+            Ok((success, details, output))
+        }
+        Bounded::TimedOut { seconds } => {
+            let details = format!("timed out after {seconds}s");
+            Ok((false, details.clone(), format!("verify command {details}\n")))
+        }
+        Bounded::Interrupted => bail!("interrupted while running the verify command"),
+        Bounded::SpawnFailed(e) => Err(anyhow!(e)).with_context(|| format!("running verify command: {cmd}")),
+    }
 }
 
 fn classify_mode(walltime_ms: u128, loaded: &LoadedWorkload) -> Option<RunMode> {
@@ -2506,7 +2556,7 @@ mod tests {
         let mut spec = basic_spec();
         spec.verify = Some(VerifySpec::default());
         let loaded = make_loaded(spec, tmp.path().to_path_buf());
-        let result = run_verify_command(&loaded, &run_dir, tmp.path()).unwrap();
+        let result = run_verify_command(&loaded, &run_dir, tmp.path(), |_| Ok(Placement::Host)).unwrap();
         assert!(result.is_none());
     }
 
@@ -2521,7 +2571,7 @@ mod tests {
             ..Default::default()
         });
         let loaded = make_loaded(spec, tmp.path().to_path_buf());
-        let result = run_verify_command(&loaded, &run_dir, tmp.path())
+        let result = run_verify_command(&loaded, &run_dir, tmp.path(), |_| Ok(Placement::Host))
             .unwrap()
             .unwrap();
         assert!(result.passed);
@@ -2538,11 +2588,95 @@ mod tests {
             ..Default::default()
         });
         let loaded = make_loaded(spec, tmp.path().to_path_buf());
-        let result = run_verify_command(&loaded, &run_dir, tmp.path())
+        let result = run_verify_command(&loaded, &run_dir, tmp.path(), |_| Ok(Placement::Host))
             .unwrap()
             .unwrap();
         assert!(!result.passed);
         assert!(result.details.contains("exit"));
+    }
+
+    /// (#906) A contained verify command sees the sandbox at `/workspace`,
+    /// in its command and its `cwd`; a host one sees the host path.
+    #[test]
+    fn verify_paths_name_the_sandbox_as_the_placement_sees_it() {
+        let sandbox = Path::new("/tmp/sb");
+        let contained = Placement::Container("img".into());
+        assert_eq!(sandbox_view(&contained, sandbox), "/workspace");
+        assert_eq!(sandbox_view(&Placement::Host, sandbox), "/tmp/sb");
+        assert_eq!(verify_workdir(Some("${SANDBOX_DIR}/app"), "/workspace"), "app");
+        assert_eq!(verify_workdir(Some("app/sub"), "/workspace"), "app/sub");
+        assert_eq!(verify_workdir(Some("${SANDBOX}"), "/tmp/sb"), "");
+        assert_eq!(verify_workdir(None, "/workspace"), "");
+    }
+
+    /// (#906) Docker failing to run the container is an error naming the
+    /// opt-out, never a failed verify; a timeout is a failed verify.
+    #[test]
+    fn a_docker_failure_refuses_and_a_timeout_fails() {
+        let contained = Placement::Container("img".into());
+        let docker = Bounded::Finished { success: false, code: Some(125), stdout: vec![], stderr: b"no such image".to_vec() };
+        let err = verify_result(&contained, docker, "npm test").unwrap_err().to_string();
+        assert!(err.contains("no such image") && err.contains("runtime.tests_on_host"), "{err}");
+        let host_125 = Bounded::Finished { success: false, code: Some(125), stdout: vec![], stderr: vec![] };
+        let (passed, details, _) = verify_result(&Placement::Host, host_125, "x").unwrap();
+        assert!(!passed && details == "exit 125", "a host exit 125 is the command's own");
+        let (passed, details, output) = verify_result(&contained, Bounded::TimedOut { seconds: 7 }, "x").unwrap();
+        assert!(!passed && details.contains("7s") && output.contains("7s"));
+        assert!(verify_result(&contained, Bounded::Interrupted, "x").is_err());
+    }
+
+    /// (#906) Without the opt-in, a workload's tests run in a container on
+    /// the image it declares; with it, on the host.
+    #[test]
+    #[serial_test::serial]
+    fn tests_run_in_the_workload_image_unless_the_operator_opts_in() {
+        let tmp = TempDir::new().unwrap();
+        let mut spec = basic_spec();
+        spec.image = Some("node:22-bookworm-slim".into());
+        let loaded = make_loaded(spec, tmp.path().to_path_buf());
+        let prev = env::var("DARKMUX_TESTS_ON_HOST").ok();
+        unsafe { env::set_var("DARKMUX_TESTS_ON_HOST", "false") };
+        assert_eq!(test_placement(&loaded).unwrap(), Placement::Container("node:22-bookworm-slim".into()));
+        unsafe { env::set_var("DARKMUX_TESTS_ON_HOST", "true") };
+        assert_eq!(test_placement(&loaded).unwrap(), Placement::Host);
+        unsafe {
+            match prev {
+                Some(v) => env::set_var("DARKMUX_TESTS_ON_HOST", v),
+                None => env::remove_var("DARKMUX_TESTS_ON_HOST"),
+            }
+        }
+    }
+
+    /// (#906) The verify command really runs in the container: it sees the
+    /// sandbox at `/workspace`, honors `cwd`, has no network, and its exit
+    /// decides the outcome. Needs Docker and the image; run with
+    /// `--ignored`.
+    #[test]
+    #[ignore = "needs a Docker daemon and node:22-bookworm-slim"]
+    fn a_contained_verify_runs_in_the_sandbox_with_no_network() {
+        let tmp = TempDir::new().unwrap();
+        let sandbox = tmp.path().join("sb");
+        fs::create_dir_all(sandbox.join("app")).unwrap();
+        fs::write(sandbox.join("app/marker"), "here").unwrap();
+        let run_dir = tmp.path().join("run");
+        fs::create_dir_all(&run_dir).unwrap();
+        let mut spec = basic_spec();
+        spec.verify = Some(VerifySpec {
+            command: Some(
+                "pwd; cat marker; test \"$(pwd)\" = ${SANDBOX_DIR}/app && \
+                 ! node -e \"require('http').get('http://1.1.1.1',()=>{}).on('error',e=>{console.log(e.code);process.exit(1)})\""
+                    .into(),
+            ),
+            cwd: Some("app".into()),
+            ..Default::default()
+        });
+        let loaded = make_loaded(spec, tmp.path().to_path_buf());
+        let placement = |_: &LoadedWorkload| Ok(Placement::Container("node:22-bookworm-slim".into()));
+        let outcome = run_verify_command(&loaded, &run_dir, &sandbox, placement).unwrap().unwrap();
+        let output = fs::read_to_string(run_dir.join("verify-output.txt")).unwrap();
+        assert!(outcome.passed, "{output}");
+        assert!(output.contains("/workspace/app") && output.contains("here"), "{output}");
+        assert!(!sandbox.join(contained_command::SENTINEL).exists(), "the sentinel is removed");
     }
 
     // ─── #420: verify-claim disagreement detection ──────────────────────
@@ -2840,3 +2974,4 @@ mod tests {
         assert_eq!(parsed["result"], "stop");
     }
 }
+
