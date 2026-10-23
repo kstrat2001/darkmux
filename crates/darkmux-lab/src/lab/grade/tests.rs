@@ -12,10 +12,19 @@ use tempfile::TempDir;
 
 const PROMPT: &str = "Write tests. Do not modify src/. Tests must pass. Say what you did.";
 
+/// A test reading `skip…` is switched off (it reports nothing); one reading
+/// `exact` passes only while `src/a.txt` is byte-identical to `test/exact.copy`
+/// (a test of the source text, not of what it says).
 const SUITE_SH: &str = r#"report="$1"
 pass=0; fail=0; cases=""
 for t in test/*.t; do
-  if grep -qx "$(cat "$t")" src/a.txt; then cases="$cases<testcase name=\"$t\"/>"
+  want="$(cat "$t")"
+  case "$want" in
+    skip*) continue;;
+    exact) cmp -s src/a.txt test/exact.copy; ok=$?;;
+    *) grep -qx "$want" src/a.txt; ok=$?;;
+  esac
+  if [ $ok = 0 ]; then cases="$cases<testcase name=\"$t\"/>"
   else cases="$cases<testcase name=\"$t\"><failure message=\"x\"/></testcase>"; fail=1; fi
 done
 printf '<?xml version="1.0"?><testsuites><testsuite name="s">%s</testsuite></testsuites>' "$cases" > "$report"
@@ -474,10 +483,10 @@ fn junit_counts_testcases_and_ignores_comments_and_cdata() {
     );
 }
 
-/// The record ANDs the ungraded verdict with the grader's, and grading again
-/// ANDs with the ungraded verdict the first grading saw, never with itself.
+/// The record ANDs the ungraded verdict with the grader's, and a regrade
+/// takes the ungraded verdict the first grading recorded, never its own.
 #[test]
-fn recording_a_grade_keeps_the_ungraded_verdict() {
+fn recording_a_grade_ands_the_ungraded_verdict() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path();
     fs::write(
@@ -496,14 +505,20 @@ fn recording_a_grade_keeps_the_ungraded_verdict() {
         tests_passed: None,
         ungraded_passed: None,
     };
-    record(dir, rec(false)).unwrap();
+    let ok = Ungraded::from_manifest(&RunManifest::read(dir).unwrap());
+    assert!(ok.passed);
+    record(dir, rec(false), &ok).unwrap();
     let m = RunManifest::read(dir).unwrap();
     assert_eq!(m.verify_passed(), Some(false));
     assert_eq!(
         m.verify_report().unwrap().details,
         "graded: fail (suite: e)"
     );
-    record(dir, rec(true)).unwrap();
+    // Graded again: the ungraded verdict is the recorded one, not the
+    // failed verdict the first grading wrote.
+    let again = Ungraded::from_manifest(&m);
+    assert!(again.passed);
+    record(dir, rec(true), &again).unwrap();
     let m = RunManifest::read(dir).unwrap();
     assert_eq!(m.verify_passed(), Some(true));
     assert_eq!(
@@ -517,18 +532,136 @@ fn recording_a_grade_keeps_the_ungraded_verdict() {
     );
     assert_eq!(m.schema_version, Some(9));
 
-    fs::write(
-        dir.join("manifest.json"),
-        r#"{"verify": {"passed": false, "details": "no tests added"}}"#,
-    )
-    .unwrap();
-    record(dir, rec(true)).unwrap();
+    let failed_gate = Ungraded {
+        passed: false,
+        details: "no tests added".into(),
+    };
+    record(dir, rec(true), &failed_gate).unwrap();
     let m = RunManifest::read(dir).unwrap();
     assert_eq!(m.verify_passed(), Some(false));
     assert_eq!(
         m.verify_report().unwrap().details,
         "no tests added; graded: pass (1 checks)"
     );
+    assert!(!Ungraded::from_manifest(&m).passed);
+}
+
+/// A test that checks the source text (here, a byte-for-byte copy) catches
+/// every planted bug for that reason alone. The control edit, which changes
+/// no behavior, shows it up.
+#[test]
+fn tests_of_the_source_text_do_not_count_as_catching_bugs() {
+    let tmp = TempDir::new().unwrap();
+    let f = fixture(tmp.path());
+    let r = result_from(tmp.path(), &f);
+    write(&r, "test/b.t", "exact");
+    fs::copy(f.join("src/a.txt"), r.join("test/exact.copy")).unwrap();
+    let record = run(
+        &spec(),
+        &f,
+        &r,
+        DispatchEnd::Completed,
+        Some("done"),
+        tmp.path(),
+    )
+    .unwrap();
+    assert_eq!(failed(&record), ["behaviors"], "{record:?}");
+    let ev = &record
+        .checks
+        .iter()
+        .find(|c| c.id == "behaviors")
+        .unwrap()
+        .evidence;
+    assert!(ev.contains("check the source text"), "{ev}");
+}
+
+/// Every copy the suite runs in sits under an opaque name, so a test cannot
+/// tell a planted-bug run from the real one by its path.
+#[test]
+fn suite_copies_have_opaque_names() {
+    let tmp = TempDir::new().unwrap();
+    let f = fixture(tmp.path());
+    let r = result_from(tmp.path(), &f);
+    write(&r, "test/b.t", "value=1");
+    let log = tmp.path().join("cwd.log");
+    let mut s = spec();
+    s.suite.as_mut().unwrap().command = format!(
+        "sh run.sh ${{REPORT}}; s=$?; pwd >> '{}'; exit $s",
+        log.display()
+    );
+    let record = run(&s, &f, &r, DispatchEnd::Completed, Some("done"), tmp.path()).unwrap();
+    assert!(record.passed, "{record:?}");
+    let dirs: Vec<String> = fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(String::from)
+        .collect();
+    // fixture, result, elsewhere, control, one planted bug
+    assert_eq!(dirs.len(), 5, "{dirs:?}");
+    for d in &dirs {
+        let rel = d.split("/work/").nth(1).unwrap_or_else(|| panic!("{d}"));
+        let opaque = rel.split('/').next().unwrap();
+        assert!(
+            opaque.len() == 16 && opaque.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{d}"
+        );
+        assert!(
+            rel == format!("{opaque}/result") || rel == format!("{opaque}/elsewhere/result"),
+            "{d}"
+        );
+    }
+}
+
+/// A planted bug is never written through a symlink: the link could lead
+/// out of the copy, into the run's own sandbox.
+#[cfg(unix)]
+#[test]
+fn a_planted_bug_is_never_written_through_a_symlink() {
+    let tmp = TempDir::new().unwrap();
+    let f = fixture(tmp.path());
+    let r = result_from(tmp.path(), &f);
+    write(&r, "test/b.t", "value=1");
+    let outside = tmp.path().join("outside");
+    write(&outside, "a.txt", "value=1\nother=2\n");
+    fs::remove_dir_all(r.join("src")).unwrap();
+    std::os::unix::fs::symlink(&outside, r.join("src")).unwrap();
+    let err = run(
+        &spec(),
+        &f,
+        &r,
+        DispatchEnd::Completed,
+        Some("done"),
+        tmp.path(),
+    )
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("symlink"), "{err:#}");
+    assert_eq!(
+        fs::read_to_string(outside.join("a.txt")).unwrap(),
+        "value=1\nother=2\n"
+    );
+}
+
+/// A test switched off inside a file that may only gain lines keeps every
+/// line, so scope passes it; the suite sees the test is gone.
+#[test]
+fn an_existing_test_switched_off_fails_the_suite() {
+    let tmp = TempDir::new().unwrap();
+    let f = fixture(tmp.path());
+    let r = result_from(tmp.path(), &f);
+    write(&r, "test/b.t", "value=1");
+    write(&r, "test/c.t", "value=1");
+    write(&r, "test/a.t", "skip\nother=2");
+    let mut s = spec();
+    s.scope.as_mut().unwrap().append_only = vec!["test/a.t".into()];
+    let record = run(&s, &f, &r, DispatchEnd::Completed, Some("done"), tmp.path()).unwrap();
+    assert_eq!(failed(&record), ["suite"], "{record:?}");
+    let ev = &record
+        .checks
+        .iter()
+        .find(|c| c.id == "suite")
+        .unwrap()
+        .evidence;
+    assert!(ev.contains("\"test/a.t\""), "{ev}");
 }
 
 /// The shipped pepper-grinder grader quotes its prompt word for word, so it
@@ -580,24 +713,153 @@ fn the_lab_run_step_grades_records_and_returns_the_verdict() {
     write(&r, "test/b.t", "other=2");
     let run_dir = tmp.path().join("run");
     fs::create_dir_all(&run_dir).unwrap();
-    fs::write(run_dir.join("manifest.json"), r#"{"verify": {"passed": true, "details": "gate ok"}}"#).unwrap();
-    fs::write(run_dir.join("qa-reply.json"), r#"{"result":"stop","final_assistant":"done"}"#).unwrap();
+    fs::write(
+        run_dir.join("manifest.json"),
+        r#"{"verify": {"passed": true, "details": "gate ok"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        run_dir.join("qa-reply.json"),
+        r#"{"result":"stop","final_assistant":"done"}"#,
+    )
+    .unwrap();
     let loaded = |grade: Option<&GradeSpec>| crate::workloads::types::LoadedWorkload {
-        manifest: serde_json::from_value(serde_json::json!({"workload": {"id": "w", "provider": "coding-task",
-            "prompt": PROMPT, "verify": {"command": "true", "grade": grade}}}))
+        manifest: serde_json::from_value(
+            serde_json::json!({"workload": {"id": "w", "provider": "coding-task",
+            "prompt": PROMPT, "verify": {"command": "true", "grade": grade}}}),
+        )
         .unwrap(),
         base_dir: tmp.path().to_path_buf(),
         source: crate::workloads::types::WorkloadSource::OnDisk,
     };
     let mut s = spec();
     s.suite.as_mut().unwrap().more_than_baseline = false;
-    let untouched = apply(&run_dir, &f, &r, &DispatchEnd::Completed, &loaded(None), Ok(None)).unwrap();
+    let untouched = apply(
+        &run_dir,
+        &f,
+        &r,
+        &DispatchEnd::Completed,
+        None,
+        &loaded(None),
+        Ok(None),
+    )
+    .unwrap();
     assert!(untouched.is_none());
-    let graded = apply(&run_dir, &f, &r, &DispatchEnd::Completed, &loaded(Some(&s)), Ok(None)).unwrap().unwrap();
+    let graded = apply(
+        &run_dir,
+        &f,
+        &r,
+        &DispatchEnd::Completed,
+        None,
+        &loaded(Some(&s)),
+        Ok(None),
+    )
+    .unwrap()
+    .unwrap();
     assert!(!graded.passed);
-    assert!(graded.details.starts_with("graded: fail (behaviors:"), "{}", graded.details);
+    assert!(
+        graded.details.starts_with("graded: fail (behaviors:"),
+        "{}",
+        graded.details
+    );
     let m = RunManifest::read(&run_dir).unwrap();
     assert_eq!(m.verify_passed(), Some(false));
-    assert_eq!(m.verify_report().unwrap().grade.as_ref().unwrap().checks.len(), 6);
-    assert!(!run_dir.join(WORK_DIR).exists(), "the scratch copies are removed");
+    assert_eq!(
+        m.verify_report()
+            .unwrap()
+            .grade
+            .as_ref()
+            .unwrap()
+            .checks
+            .len(),
+        6
+    );
+    assert!(
+        !run_dir.join(WORK_DIR).exists(),
+        "the scratch copies are removed"
+    );
+}
+
+/// A gate that could not be applied, or a raw verify that failed, still
+/// leaves a recorded, graded run that fails and says why.
+#[test]
+fn the_lab_run_step_records_a_fail_when_the_gate_errs() {
+    let tmp = TempDir::new().unwrap();
+    let f = fixture(tmp.path());
+    let r = result_from(tmp.path(), &f);
+    write(&r, "test/b.t", "value=1");
+    let run_dir = tmp.path().join("run");
+    fs::create_dir_all(&run_dir).unwrap();
+    fs::write(
+        run_dir.join("manifest.json"),
+        r#"{"verify": {"passed": true, "details": "x"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        run_dir.join("qa-reply.json"),
+        r#"{"result":"stop","final_assistant":"done"}"#,
+    )
+    .unwrap();
+    let mut s = spec();
+    s.suite.as_mut().unwrap().more_than_baseline = false;
+    let loaded = crate::workloads::types::LoadedWorkload {
+        manifest: serde_json::from_value(
+            serde_json::json!({"workload": {"id": "w", "provider": "coding-task",
+            "prompt": PROMPT, "verify": {"command": "true", "grade": s}}}),
+        )
+        .unwrap(),
+        base_dir: tmp.path().to_path_buf(),
+        source: crate::workloads::types::WorkloadSource::OnDisk,
+    };
+    let got = apply(
+        &run_dir,
+        &f,
+        &r,
+        &DispatchEnd::Completed,
+        None,
+        &loaded,
+        Err(anyhow!("boom")),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(!got.passed);
+    assert!(
+        got.details
+            .starts_with("verify gate could not be applied: boom; graded: pass"),
+        "{}",
+        got.details
+    );
+    let m = RunManifest::read(&run_dir).unwrap();
+    assert_eq!(m.verify_passed(), Some(false));
+    assert_eq!(
+        m.verify_report()
+            .unwrap()
+            .grade
+            .as_ref()
+            .unwrap()
+            .ungraded_passed,
+        Some(false)
+    );
+
+    let raw = crate::workloads::types::VerifyOutcome {
+        passed: false,
+        details: "npm test failed".into(),
+    };
+    let got = apply(
+        &run_dir,
+        &f,
+        &r,
+        &DispatchEnd::Completed,
+        Some(&raw),
+        &loaded,
+        Ok(None),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(!got.passed);
+    assert!(
+        got.details.starts_with("npm test failed; graded: pass"),
+        "{}",
+        got.details
+    );
 }

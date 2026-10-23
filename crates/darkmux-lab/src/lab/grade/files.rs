@@ -1,8 +1,8 @@
 //! What a result changed against the pristine fixture, and the two checks
 //! that read it: `scope` (which files may change, and how) and `style`
 //! (what a new file must contain). Paths are relative and `/`-separated;
-//! the run-artifact and dependency directories the sandbox hash skips
-//! (`crate::lab::artifact_dirs`) are skipped here too.
+//! the run-artifact and dependency directories (`crate::lab::artifact_dirs`)
+//! are skipped at the top level, where the suite's copy skips them.
 
 use crate::lab::artifact_dirs::{HASH_ONLY_EXCLUDES, RUN_ARTIFACT_DIRS};
 use crate::workloads::grade_spec::{ScopeGrade, StyleGrade};
@@ -75,9 +75,12 @@ fn walk_into(dir: &Path, prefix: &str, out: &mut BTreeMap<String, Entry>) -> Res
                 Entry::Symlink(fs::read_link(entry.path())?.to_string_lossy().into_owned()),
             );
         } else if kind.is_dir() {
-            if !RUN_ARTIFACT_DIRS.contains(&name.as_str())
-                && !HASH_ONLY_EXCLUDES.contains(&name.as_str())
-            {
+            // Skipped at the top only, as the suite's copy skips them: a
+            // nested one is in what the suite runs, so scope sees it.
+            let skipped = prefix.is_empty()
+                && (RUN_ARTIFACT_DIRS.contains(&name.as_str())
+                    || HASH_ONLY_EXCLUDES.contains(&name.as_str()));
+            if !skipped {
                 walk_into(&entry.path(), &rel, out)?;
             }
         } else if kind.is_file() {

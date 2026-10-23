@@ -5,11 +5,13 @@
 //! Comments and CDATA are dropped first, so a test's own output or a
 //! summary comment can never add a testcase.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct Counts {
     pub tests: u64,
     pub failed: u64,
     pub skipped: u64,
+    /// Each passing testcase's `name`, as the report spells it.
+    pub passing: Vec<String>,
 }
 
 impl Counts {
@@ -30,22 +32,54 @@ pub(crate) fn parse(xml: &str) -> Option<Counts> {
     while let Some(start) = find_tag(rest, "testcase") {
         let after = &rest[start..];
         let end = tag_end(after)?;
+        let tag = &after[..end];
         counts.tests += 1;
-        let self_closing = after[..end].trim_end_matches('>').trim_end().ends_with('/');
-        if self_closing {
-            rest = &after[end..];
-            continue;
-        }
-        let body_end = after.find("</testcase>")?;
-        let body = &after[end..body_end];
-        if has_tag(body, "failure") || has_tag(body, "error") {
+        let self_closing = tag.trim_end_matches('>').trim_end().ends_with('/');
+        let (failed, skipped, next) = if self_closing {
+            (false, false, end)
+        } else {
+            let body_end = after.find("</testcase>")?;
+            let body = &after[end..body_end];
+            (
+                has_tag(body, "failure") || has_tag(body, "error"),
+                has_tag(body, "skipped"),
+                body_end,
+            )
+        };
+        if failed {
             counts.failed += 1;
-        } else if has_tag(body, "skipped") {
+        } else if skipped {
             counts.skipped += 1;
+        } else {
+            counts
+                .passing
+                .push(attribute(tag, "name").unwrap_or_default());
         }
-        rest = &after[body_end..];
+        rest = &after[next..];
     }
     Some(counts)
+}
+
+/// A quoted attribute's raw value in one tag.
+fn attribute(tag: &str, name: &str) -> Option<String> {
+    let mut from = 0;
+    while let Some(i) = tag[from..].find(name) {
+        let at = from + i;
+        let before = tag[..at].chars().last();
+        let rest = tag[at + name.len()..].trim_start();
+        if before.is_some_and(char::is_whitespace) {
+            if let Some(rest) = rest.strip_prefix('=') {
+                let rest = rest.trim_start();
+                let quote = rest.chars().next()?;
+                if quote == '"' || quote == '\'' {
+                    let value = &rest[1..];
+                    return value.find(quote).map(|e| value[..e].to_string());
+                }
+            }
+        }
+        from = at + name.len();
+    }
+    None
 }
 
 /// Remove every `open … close` span.

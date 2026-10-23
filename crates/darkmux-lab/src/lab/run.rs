@@ -373,7 +373,19 @@ impl OneRun<'_> {
             coverage_min_pct,
         );
         // (#3353) The grader, when the workload declares one, on top of the gate.
-        let gate = crate::lab::grade::apply(run_dir, source, sandbox, &result.end(), self.workload, gate);
+        let gate = crate::lab::grade::apply(
+            run_dir,
+            source,
+            sandbox,
+            &result.end(),
+            result.verify.as_ref(),
+            self.workload,
+            gate,
+        );
+        // A graded run has a verdict even with no verify command of its own.
+        if result.verify.is_none() && self.workload.manifest.workload.verify.as_ref().is_some_and(|v| v.grade.is_some()) {
+            result.verify = Some(crate::workloads::types::VerifyOutcome { passed: true, details: String::new() });
+        }
         if let Some(w) = settle_verify(result.verify.as_mut(), gate) {
             warn(self.opts.quiet, &w);
         }
