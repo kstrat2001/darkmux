@@ -27,8 +27,10 @@ impl Platform for MacPlatform {
         parse_io_platform_uuid(&ioreg_platform_expert()?)
     }
 
-    /// The `IOPlatformUUID` and `IOPlatformSerialNumber`, and the names
-    /// `scutil` knows the Mac by (`ComputerName`, `LocalHostName`, `HostName`).
+    /// The `IOPlatformUUID` and `IOPlatformSerialNumber`, the names `scutil`
+    /// knows the Mac by (`ComputerName`, `LocalHostName`, `HostName`), the
+    /// kernel's host name (`kern.hostname`, which a network may assign) and
+    /// the user's full name (`id -F`).
     fn identifying_strings(&self) -> Vec<String> {
         let expert = ioreg_platform_expert().unwrap_or_default();
         let mut out: Vec<String> = ["IOPlatformUUID", "IOPlatformSerialNumber"]
@@ -36,6 +38,7 @@ impl Platform for MacPlatform {
             .filter_map(|k| parse_io_platform_value(&expert, k))
             .collect();
         out.extend(["ComputerName", "LocalHostName", "HostName"].iter().filter_map(|k| scutil_get(k)));
+        out.extend([run_trimmed("sysctl", &["-n", "kern.hostname"]), run_trimmed("id", &["-F"])].into_iter().flatten());
         out
     }
 
@@ -371,9 +374,14 @@ pub(crate) fn parse_io_platform_value(ioreg_output: &str, key: &str) -> Option<S
     crate::trimmed(line[eq + 1..].trim().trim_matches('"'))
 }
 
-#[cfg(target_os = "macos")]
 fn scutil_get(key: &str) -> Option<String> {
-    let out = std::process::Command::new("scutil").args(["--get", key]).output().ok()?;
+    run_trimmed("scutil", &["--get", key])
+}
+
+/// A command's output, trimmed; nothing when it fails or says nothing.
+#[cfg(target_os = "macos")]
+fn run_trimmed(program: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new(program).args(args).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -381,7 +389,7 @@ fn scutil_get(key: &str) -> Option<String> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn scutil_get(_key: &str) -> Option<String> {
+fn run_trimmed(_program: &str, _args: &[&str]) -> Option<String> {
     None
 }
 
