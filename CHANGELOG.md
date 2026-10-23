@@ -14,6 +14,26 @@ darkmux release.
 
 ## [Unreleased]
 
+### Added
+
+- **Prompt workloads can grade a structured answer: `verify.expect`.** The workload names the
+  answer the reply's first JSON object must give, field by field. Strings compare exactly (only
+  the ends are trimmed); `{"anyOf": [...]}` lists each accepted answer, a plain list is an exact
+  set in any order, `{"includes": [...]}` allows extras, and nested objects check the keys they
+  list. No fixture code runs on the host. A run passes when every field matches, and records
+  `fields_correct`, `fields_expected` and `fields_missed` beside the verdict. A reply cut off
+  mid-object has no answer.
+- **`replyRoom: "context"`** gives a prompt run's reply the rest of its model's window
+  (`n_ctx` minus the prompt, over-counted at one token per three bytes) on the one-call path a
+  tool-less role on an unmanaged endpoint takes, and records the cap it sent. LM Studio runs
+  already continue a reply without a cap.
+- A prompt workload that sets `requires_fixture` reads its `promptFile` from the run's copy of
+  that fixture, and a prompt run keeps its runtime trajectory, so `darkmux lab submit` can share
+  it.
+- **`lab submit` bundle format 4** carries the fields count (`detail.verify.fieldsCorrect`,
+  `fieldsExpected`, `fieldsMissed`) and `stack.maxCompletionTokens`. A bundle with neither is
+  still written as format 3. Workload schema 1.1 (additive).
+
 ## [5.4.0] - 2026-10-23
 
 `darkmux lab submit` shares lab runs on darkmux evals: one bundle of runs from one fixture
