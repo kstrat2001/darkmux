@@ -77,7 +77,10 @@ impl WorkloadProvider for PromptProvider {
             None => None,
         };
         opts.max_completion_tokens = reply_room;
-        let (dispatched, one_call) = dispatch_via_internal(opts)?;
+        let (dispatched, out_dir) = dispatch_via_internal(opts)?;
+        preserve_trajectory(out_dir.as_deref(), run_dir);
+        // The container path mounts a bookkeeping dir; the one-call path has none.
+        let one_call = out_dir.is_none();
         finish_run(
             &FinishInputs {
                 loaded,
@@ -310,11 +313,21 @@ fn reply_room_from(n_ctx: u32, prompt_bytes: usize, workload_id: &str) -> Result
 /// crew::dispatch substrate. The runtime emits a JSON envelope per
 /// `runtime/src/main.rs::build_json_envelope` which becomes the
 /// provider's stdout artifact.
-fn dispatch_via_internal(opts: darkmux_crew::dispatch::DispatchOpts) -> Result<(Dispatched, bool)> {
+fn dispatch_via_internal(
+    opts: darkmux_crew::dispatch::DispatchOpts,
+) -> Result<(Dispatched, Option<std::path::PathBuf>)> {
     let result = darkmux_crew::dispatch::dispatch(opts).context("internal-runtime dispatch via lab harness")?;
-    // The container path mounts a bookkeeping dir; the one-call path has none.
-    let one_call = result.out_dir.is_none();
-    Ok((Dispatched { exit_code: result.exit_code, stdout: result.stdout, stderr: result.stderr }, one_call))
+    Ok((Dispatched { exit_code: result.exit_code, stdout: result.stdout, stderr: result.stderr }, result.out_dir))
+}
+
+/// Copy the runtime's trajectory into the run dir, as the coding-task
+/// provider does (#364): the run's numbers (`darkmux run stats`, `lab
+/// submit`) are read from it, and the dispatch's own out dir is a temp dir.
+/// The one-call path has no out dir and writes no trajectory.
+fn preserve_trajectory(out_dir: Option<&Path>, run_dir: &Path) {
+    if let Some(out) = out_dir {
+        crate::providers::coding_task::preserve_runtime_artifacts(out, run_dir, &["trajectory.jsonl"]);
+    }
 }
 
 /// The lab's dispatch options for one prompt run.
@@ -750,6 +763,21 @@ mod tests {
         assert!(err.contains("`m` declares no n_ctx"), "{err}");
         // "日本" is six bytes: two CJK characters are counted as two tokens.
         assert_eq!(reply_room_for(ctx(Some(16_384)), "日本", "w").unwrap(), Some(16_384 - 1_902 - REPLY_ROOM_OVERHEAD_TOKENS));
+    }
+
+    /// The runtime's trajectory lands in the run dir, where `run stats` and
+    /// `lab submit` read a run's numbers; no out dir copies nothing.
+    #[test]
+    fn the_runtime_trajectory_is_kept_in_the_run_dir() {
+        let tmp = TempDir::new().unwrap();
+        let (out, run_dir) = (tmp.path().join("out"), tmp.path().join("run"));
+        fs::create_dir_all(out.join(".darkmux-runtime")).unwrap();
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::write(out.join(".darkmux-runtime/trajectory.jsonl"), "{\"event\":\"x\"}\n").unwrap();
+        preserve_trajectory(None, &run_dir);
+        assert!(!run_dir.join("trajectory.jsonl").exists());
+        preserve_trajectory(Some(&out), &run_dir);
+        assert_eq!(fs::read_to_string(run_dir.join("trajectory.jsonl")).unwrap(), "{\"event\":\"x\"}\n");
     }
 
     /// A workload that binds a fixture reads its promptFile from the run's
