@@ -29,7 +29,8 @@ darkmux release.
   (`n_ctx` minus the prompt, over-counted at one token per three bytes) on the one-call path a
   tool-less role on an unmanaged endpoint takes, and records the cap it sent. LM Studio runs
   already continue a reply without a cap. A profile model can declare `max_output_tokens`
-  (a hosted model's output limit below its window), and the reply asks for no more than that.
+  (a hosted model's output limit below its window), and the reply asks for no more than that. Profile
+  models in `--json` output gain the optional `max_output_tokens` key (additive).
 - A prompt workload that sets `requires_fixture` reads its `promptFile` from the run's copy of
   that fixture (the A/B context arm included), and a prompt run keeps a trajectory (the runtime's,
   or on the one-call path the one call's own counts), so `darkmux lab submit` can share it.
