@@ -14,6 +14,7 @@ pub struct FakePlatform {
     pub os_release: Option<crate::OsRelease>,
     pub secret_store: crate::SecretStore,
     pub machine_config: crate::MachineConfig,
+    pub identifying_strings: Vec<String>,
 }
 
 /// Every answer at its "nothing to report" value, so a test sets only the
@@ -31,6 +32,7 @@ impl Default for FakePlatform {
             os_release: None,
             secret_store: crate::SecretStore::PrivateFile,
             machine_config: crate::MachineConfig::default(),
+            identifying_strings: Vec::new(),
         }
     }
 }
@@ -111,6 +113,10 @@ impl Platform for FakePlatform {
 
     fn machine_config(&self) -> crate::MachineConfig {
         self.machine_config.clone()
+    }
+
+    fn identifying_strings(&self) -> Vec<String> {
+        self.identifying_strings.clone()
     }
 
     fn secret_store(&self) -> crate::SecretStore {

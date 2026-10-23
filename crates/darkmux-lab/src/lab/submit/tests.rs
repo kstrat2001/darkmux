@@ -78,7 +78,7 @@ fn the_bundle_is_the_one_the_site_writes_and_accepts() {
     let g = golden();
     assert_eq!(g["ok"], true, "the site's parser accepted its own bundle");
     let ran_by = RanBy { version: Some("5.4.0".into()), commit: Some("abc1234".into()), build: Some("release".into()) };
-    let run = bundle_run("pepper-grinder-p-1761120000-1", &manifest(), &stats(), &ran_by, &stack());
+    let run = bundle_run("pepper-grinder-p-1761120000-1", &manifest(), &stats(), &ran_by, &stack(), &[]);
     let bundle = assemble(
         "kstrat2001/pepper-grinder",
         &"a".repeat(40),
@@ -115,7 +115,7 @@ fn paths_are_found_as_the_site_finds_them() {
 fn a_rate_over_part_of_the_generation_is_not_quoted() {
     let mut s = stats();
     s["checks"]["all_streams_billed"] = json!(false);
-    let run = bundle_run("r", &manifest(), &s, &RanBy::default(), &stack());
+    let run = bundle_run("r", &manifest(), &s, &RanBy::default(), &stack(), &[]);
     assert_eq!(run["tokensPerSecond"], Value::Null);
     assert_eq!(run["darkmuxVersion"], Value::Null);
 }
@@ -124,7 +124,7 @@ fn a_rate_over_part_of_the_generation_is_not_quoted() {
 fn host_figures_need_busy_samples() {
     let mut s = stats();
     s["samples_busy"] = json!(0);
-    let d = detail_from(&manifest(), &s);
+    let d = detail_from(&manifest(), &s, &[]);
     for k in ["packageWatts", "gpuWatts", "thermalStates", "throttledSamples"] {
         assert_eq!(d[k], Value::Null, "{k}");
     }
@@ -189,7 +189,7 @@ fn small_readings() {
 #[test]
 fn a_long_summary_is_cut_to_what_the_site_takes() {
     let long = "x".repeat(600);
-    let cut = shareable(Some(&json!(long)), 500);
+    let cut = shareable(Some(&json!(long)), 500, &[]);
     assert_eq!(cut.as_str().unwrap().chars().count(), 500);
     assert!(cut.as_str().unwrap().ends_with('\u{2026}'));
 }
@@ -237,7 +237,7 @@ fn weights_are_the_model_files_under_the_folder() {
 #[test]
 fn what_the_site_would_refuse_is_refused_here() {
     let ran_by = RanBy { version: Some("5.4.0".into()), commit: Some("abc1234".into()), build: Some("release".into()) };
-    let good = bundle_run("r1", &manifest(), &stats(), &ran_by, &stack());
+    let good = bundle_run("r1", &manifest(), &stats(), &ran_by, &stack(), &[]);
     let fixture = json!({ "name": "pepper-grinder", "version": 2.0 });
     let ok = assemble("kstrat2001/pepper-grinder", &"a".repeat(40), &fixture, vec![good.clone()]).unwrap();
     assert_eq!(site_refusals(&ok), Vec::<String>::new());
@@ -250,7 +250,7 @@ fn what_the_site_would_refuse_is_refused_here() {
     vm.gpu_cores = Some(5000);
     vm.model_id = Some("kains-macbook".into());
     let bad_ran = RanBy { version: Some("5.4.0 beta".into()), ..Default::default() };
-    let bad = bundle_run("r2", &manifest(), &stats(), &bad_ran, &vm);
+    let bad = bundle_run("r2", &manifest(), &stats(), &bad_ran, &vm, &[]);
     let both = assemble("kstrat2001/pepper-grinder", &"a".repeat(40), &fixture, vec![bad, good.clone(), good]).unwrap();
     let refused = site_refusals(&both);
     for want in [
@@ -369,6 +369,7 @@ impl Bench {
             installed: darkmux_types::BuildInfo { version: "5.4.0".into(), commit: Some("c".repeat(40)), build: Some(darkmux_types::BuildKind::Dev) },
             installed_at: Some(0),
             provenance: Box::new(move |m| (m == "m1").then(|| provenance.clone()).flatten()),
+            identifying: Vec::new(),
         }
     }
 
@@ -588,4 +589,90 @@ fn gather_here_refuses_before_it_reads_anything() {
     let err = gather(&[], &Stated::default(), &mut |_| {}).unwrap_err().to_string();
     // Off Apple Silicon the machine is refused first; on it, the empty list.
     assert!(err.contains("name at least one lab run") || err.contains("Apple Silicon results only"), "{err}");
+}
+
+/// What identifies the machine and its user never leaves it (Kain, 2026-10-23):
+/// free text that names them is left out, and anything else that does refuses
+/// the bundle, saying where but never what. The fixture is a public repo's.
+#[test]
+fn nothing_that_identifies_the_machine_or_its_user_is_shared() {
+    let b = bench();
+    let serial = "C02XYZ123AB";
+    let uuid = "00000000-0000-4000-8000-ABCDEF000009";
+    let mut machine = b.machine(Some(b.provenance()));
+    machine.identifying = vec![serial.into(), uuid.into(), "Kains-MacBook-Pro".into(), "kstrat2001".into(), "ab".into()];
+    let runs = vec![
+        b.run("r1", "darkmux:m1", json!({"verify": {"passed": true, "details": "ran on Kains-MacBook-Pro.local"}})),
+        b.run("r2", "darkmux:m1", json!({"verify": {"passed": false, "details": "mail kain@example.com for the logs",
+            "work_gate": {"forced_failure_reason": format!("board {serial} timed out")}}})),
+        b.run("r3", "darkmux:m1", json!({"verify": {"passed": true, "details": "lab ab 3 of 5"}})),
+    ];
+    let (built, _) = b.gather(&machine, &runs, &Stated::default()).unwrap();
+    let text = serde_json::to_string(&built.bundle["runs"]).unwrap();
+    for gone in [serial, uuid, "Kains-MacBook-Pro", "kain@example.com"] {
+        assert!(!text.contains(gone), "{gone} reached the bundle: {text}");
+    }
+    let verify = |i: usize| built.bundle["runs"][i]["detail"]["verify"].clone();
+    assert_eq!((verify(0)["summary"].clone(), verify(1)["summary"].clone()), (Value::Null, Value::Null));
+    assert_eq!(verify(1)["forcedFailureReason"], Value::Null);
+    assert_eq!(verify(2)["summary"], "lab ab 3 of 5", "a two-letter name is too common to judge by");
+    assert_eq!(built.bundle["fixture"]["repo"], "kstrat2001/pepper-grinder", "the fixture's public repo is shared as it is");
+
+    // A name anywhere else is not edited out: the bundle is refused, naming where.
+    let named = vec![b.run("r4", "darkmux:Kains-MacBook-Pro-model", json!({}))];
+    let err = b.gather(&machine, &named, &Stated { engine: Some("LM Studio".into()), ..Default::default() }).unwrap_err().to_string();
+    assert!(err.contains("identifies this machine or you") && err.contains("bundle.runs[0].stack.model"), "{err}");
+    assert!(!err.contains("Kains-MacBook-Pro"), "the refusal never repeats the name: {err}");
+}
+
+#[test]
+fn personal_text_is_an_email_an_address_or_a_uuid() {
+    for yes in ["kain@example.com", "from 192.168.1.20", "a4:83:e7:0b:12:9f", "a4-83-e7-0b-12-9f", "fe80:0:0:0:a483:e7ff:fe0b:129f", "id 00000000-0000-4000-8000-ABCDEF000009"] {
+        assert!(looks_personal(yes), "{yes}");
+    }
+    for no in ["mlx-llm 1.13.1", "14 of 14 passed", "qwen/qwen3.8-27b", "@decorator", "v5.4.0", "at 12:30:45", "std::fmt"] {
+        assert!(!looks_personal(no), "{no}");
+    }
+}
+
+#[test]
+fn a_name_counts_as_a_whole_word_in_any_case() {
+    let names = vec!["kain".to_string(), "macbook-dm-5".to_string(), "ab".to_string()];
+    assert!(names_any("built by Kain today", &names));
+    assert!(names_any("host MACBOOK-DM-5.local", &names));
+    assert!(!names_any("the kainite crystal", &names), "inside a longer word");
+    assert!(!names_any("ab ab ab", &names), "too short to judge by");
+    assert!(!names_any("macbook-dm-50", &names));
+    let mut found = Vec::new();
+    names_in(&json!({"a": ["x", "kain"], "kain": 1}), "v", &names, &mut found);
+    assert_eq!(found, vec!["v.a[1]".to_string(), "v.kain".to_string()]);
+}
+
+#[test]
+fn the_user_is_named_by_login_home_folder_and_real_name_and_by_their_words() {
+    let got = identifying_here(
+        vec!["C02XYZ".into(), "Kain\u{2019}s MacBook Pro".into()],
+        Some("kain".into()),
+        Some("kain".into()),
+        Some(PathBuf::from("/Users/kosterholt")),
+        Some("Kain Osterholt".into()),
+    );
+    assert_eq!(
+        got,
+        ["C02XYZ", "Kain\u{2019}s MacBook Pro", "Kain", "kain", "kosterholt", "Kain Osterholt", "Osterholt"].map(String::from).to_vec()
+    );
+    assert!(identifying_here(Vec::new(), Some(" ".into()), None, None, None).is_empty());
+    assert_eq!(name_words("lab-server_01.local"), vec!["lab".to_string(), "server".to_string()], "digits-only and product words are not names");
+    // Free text names the computer with a plain apostrophe, macOS with a curly one.
+    assert!(names_any("built on Kain's MacBook Pro", &got));
+}
+
+/// A name is judged on the whole text, before it is cut to the site's limit:
+/// a name cut in half no longer reads as one, and must not ship as half.
+#[test]
+fn a_long_text_naming_the_machine_is_left_out_not_cut() {
+    let names = vec!["Kains-MacBook-Pro".to_string()];
+    let long = format!("{} Kains-MacBook-Pro", "x".repeat(492));
+    assert_eq!(shareable(Some(&json!(long)), 500, &names), Value::Null);
+    assert!(shareable(Some(&json!(long)), 500, &[]).as_str().is_some_and(|t| t.ends_with('\u{2026}')));
 }

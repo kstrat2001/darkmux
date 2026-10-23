@@ -180,6 +180,38 @@ fn parse_uuid_none_when_absent() {
     );
 }
 
+/// What would identify a Mac is read from the same `ioreg` output: its
+/// serial as well as its UUID, each only when it has a value.
+#[test]
+fn reads_a_serial_number_beside_the_uuid() {
+    let sample = "    \"IOPlatformUUIDExtra\" = \"nope\"\n    \"IOPlatformSerialNumber\" = \"C02XYZ123\"\n";
+    assert_eq!(crate::macos::parse_io_platform_value(sample, "IOPlatformSerialNumber").as_deref(), Some("C02XYZ123"));
+    assert_eq!(crate::macos::parse_io_platform_value(sample, "IOPlatformUUID"), None);
+    assert_eq!(crate::macos::parse_io_platform_value("\"IOPlatformSerialNumber\" = \"  \"", "IOPlatformSerialNumber"), None);
+    assert_eq!(crate::macos::parse_io_platform_value("\"IOPlatformSerialNumber\" without a value", "IOPlatformSerialNumber"), None);
+}
+
+/// A device-tree string ends in NUL; a command's output in a newline. Neither is part of the value.
+#[test]
+fn trimmed_drops_nul_and_whitespace_and_reads_empty_as_nothing() {
+    assert_eq!(crate::trimmed("C02XYZ123\0").as_deref(), Some("C02XYZ123"));
+    assert_eq!(crate::trimmed("  macbook-dm-5\n").as_deref(), Some("macbook-dm-5"));
+    assert_eq!(crate::trimmed("\0\n"), None);
+}
+
+/// Only a fake that is told what identifies it says so; an OS with no strategy reads nothing.
+#[test]
+fn identifying_strings_come_from_the_platform() {
+    let fake = crate::fake::FakePlatform { identifying_strings: vec!["C02XYZ123".into()], ..Default::default() };
+    assert_eq!(fake.identifying_strings(), vec!["C02XYZ123".to_string()]);
+    assert!(crate::fake::FakePlatform::default().identifying_strings().is_empty());
+    assert!(crate::other::OtherPlatform.identifying_strings().is_empty());
+    // Each OS's own reading, wherever the tests run: never a blank or padded value.
+    for found in [crate::macos::MacPlatform.identifying_strings(), crate::linux::LinuxPlatform.identifying_strings()] {
+        assert!(found.iter().all(|s| crate::trimmed(s).as_deref() == Some(s.as_str())), "{found:?}");
+    }
+}
+
 /// Linux's identity is the install's `/etc/machine-id`: 32 lowercase hex
 /// characters. Anything else is no identity, never a guess.
 #[test]

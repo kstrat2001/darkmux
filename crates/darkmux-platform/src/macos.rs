@@ -27,6 +27,21 @@ impl Platform for MacPlatform {
         parse_io_platform_uuid(&ioreg_platform_expert()?)
     }
 
+    /// The `IOPlatformUUID` and `IOPlatformSerialNumber`, the names `scutil`
+    /// knows the Mac by (`ComputerName`, `LocalHostName`, `HostName`), the
+    /// kernel's host name (`kern.hostname`, which a network may assign) and
+    /// the user's full name (`id -F`).
+    fn identifying_strings(&self) -> Vec<String> {
+        let expert = ioreg_platform_expert().unwrap_or_default();
+        let mut out: Vec<String> = ["IOPlatformUUID", "IOPlatformSerialNumber"]
+            .iter()
+            .filter_map(|k| parse_io_platform_value(&expert, k))
+            .collect();
+        out.extend(["ComputerName", "LocalHostName", "HostName"].iter().filter_map(|k| scutil_get(k)));
+        out.extend([run_trimmed("sysctl", &["-n", "kern.hostname"]), run_trimmed("id", &["-F"])].into_iter().flatten());
+        out
+    }
+
     /// `sysctl machdep.cpu.brand_string`.
     fn cpu_brand(&self) -> Option<String> {
         parse_brand_string(&sysctl_brand_string()?)
@@ -347,18 +362,34 @@ fn ioreg_platform_expert() -> Option<String> {
 /// `    "IOPlatformUUID" = "XXXXXXXX-...."`). Pure — testable without
 /// shelling out.
 pub(crate) fn parse_io_platform_uuid(ioreg_output: &str) -> Option<String> {
-    for line in ioreg_output.lines() {
-        // Match the quoted key so a hypothetical sibling like
-        // `"IOPlatformUUIDExtra"` can't grab the value.
-        if line.contains("\"IOPlatformUUID\"") {
-            if let Some(eq) = line.find('=') {
-                let uuid = line[eq + 1..].trim().trim_matches('"').trim();
-                if !uuid.is_empty() {
-                    return Some(uuid.to_string());
-                }
-            }
-        }
+    parse_io_platform_value(ioreg_output, "IOPlatformUUID")
+}
+
+/// A string property of that output by its key. The quoted key is matched,
+/// so a sibling like `"IOPlatformUUIDExtra"` can't grab the value.
+pub(crate) fn parse_io_platform_value(ioreg_output: &str, key: &str) -> Option<String> {
+    let quoted = format!("\"{key}\"");
+    let line = ioreg_output.lines().find(|l| l.contains(&quoted))?;
+    let eq = line.find('=')?;
+    crate::trimmed(line[eq + 1..].trim().trim_matches('"'))
+}
+
+fn scutil_get(key: &str) -> Option<String> {
+    run_trimmed("scutil", &["--get", key])
+}
+
+/// A command's output, trimmed; nothing when it fails or says nothing.
+#[cfg(target_os = "macos")]
+fn run_trimmed(program: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new(program).args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
     }
+    crate::trimmed(&String::from_utf8_lossy(&out.stdout))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_trimmed(_program: &str, _args: &[&str]) -> Option<String> {
     None
 }
 
