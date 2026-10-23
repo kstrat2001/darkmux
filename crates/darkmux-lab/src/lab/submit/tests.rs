@@ -222,9 +222,21 @@ fn the_commit_is_the_one_checked_out_through_the_runs() {
     // Newest first: b checked out at 2000s, a at 1000s.
     let reflog = format!("{b} HEAD@{{2000}}\n{a} HEAD@{{1000}}\n");
     assert_eq!(commit_at_time(&reflog, 1_500_000, 1_900_000), Ok(a.clone()));
-    assert_eq!(commit_at_time(&reflog, 2_100_000, 2_100_000), Ok(b));
+    assert_eq!(commit_at_time(&reflog, 2_100_000, 2_100_000), Ok(b.clone()));
     assert!(commit_at_time(&reflog, 1_500_000, 2_100_000).unwrap_err().contains("moved between"));
     assert!(commit_at_time(&reflog, 500_000, 600_000).unwrap_err().contains("--commit"));
+    // Checked out b and back to a between the runs: the ends agree, the
+    // middle run did not run on a.
+    let away_and_back = format!("{a} HEAD@{{3000}}\n{b} HEAD@{{2000}}\n{a} HEAD@{{1000}}\n");
+    assert!(commit_at_time(&away_and_back, 1_500_000, 3_500_000).unwrap_err().contains("moved between"));
+    // Checking out the same commit again moves nothing.
+    let again = format!("{a} HEAD@{{2000}}\n{a} HEAD@{{1000}}\n");
+    assert_eq!(commit_at_time(&again, 1_500_000, 2_500_000), Ok(a.clone()));
+    // Every run needs a start time to be placed, not just some of them.
+    let reflog_a = format!("{a} HEAD@{{1000}}\n");
+    assert_eq!(commit_through(&reflog_a, &[Some(1_500_000), Some(1_600_000)]).unwrap(), a);
+    let err = commit_through(&reflog_a, &[Some(1_500_000), None]).unwrap_err().to_string();
+    assert!(err.contains("--commit"), "{err}");
 }
 
 #[test]

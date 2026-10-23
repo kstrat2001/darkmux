@@ -198,14 +198,17 @@ pub fn commit_at_time(reflog: &str, first_start_ms: u64, last_start_ms: u64) -> 
         .filter_map(|l| re.captures(l.trim()))
         .filter_map(|c| Some((c[1].to_string(), c[2].parse::<u64>().ok()? * 1000)))
         .collect();
-    let at = |t: u64| entries.iter().find(|(_, when)| *when <= t).map(|(sha, _)| sha.clone());
-    let Some(first) = at(first_start_ms) else {
+    let Some(first) = entries.iter().position(|(_, when)| *when <= first_start_ms) else {
         return Err("the reflog does not reach back to these runs; pass --commit <sha>".into());
     };
-    if at(last_start_ms).as_deref() != Some(first.as_str()) {
+    // Every entry from the first run's to the last's: a checkout away and
+    // back between them leaves the ends agreeing and a middle run elsewhere.
+    let last = entries.iter().position(|(_, when)| *when <= last_start_ms).unwrap_or(first);
+    let sha = &entries[first].0;
+    if entries[last.min(first)..=first].iter().any(|(s, _)| s != sha) {
         return Err("the fixture checkout moved between these runs; submit them separately".into());
     }
-    Ok(first)
+    Ok(sha.clone())
 }
 
 /// The files the weights hash covers: tensors and the model's own config,
@@ -739,7 +742,7 @@ pub fn gather_on(machine: &Machine, runs: &[String], stated: &Stated, flows_dir:
     let mut starts = Vec::new();
     for input in &inputs {
         let (run, note) = machine.bundle_one(input, stated, &mut caches, progress)?;
-        starts.extend(input.started());
+        starts.push(input.started());
         bundled.push(run);
         notes.push(note);
     }
@@ -1172,7 +1175,7 @@ fn hash_weights(path: &Path, run_id: &str, model_id: &str, progress: &mut dyn Fn
 
 /// The fixture: a GitHub repo at the commit its checkout was on through the
 /// runs, and its `.fixture.json` as it was at that commit.
-pub fn fixture_at(source: &Path, starts: &[u64], stated_commit: Option<&str>) -> Result<(String, String, Value)> {
+pub fn fixture_at(source: &Path, starts: &[Option<u64>], stated_commit: Option<&str>) -> Result<(String, String, Value)> {
     let git = |args: &[&str]| -> Option<String> {
         let out = Command::new("git").arg("-C").arg(source).args(args).output().ok()?;
         out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
@@ -1195,8 +1198,12 @@ pub fn fixture_at(source: &Path, starts: &[u64], stated_commit: Option<&str>) ->
     Ok((repo, commit_sha, manifest))
 }
 
-/// The commit HEAD was on from the first run's start to the last's, by the reflog.
-fn commit_through(reflog: &str, starts: &[u64]) -> Result<String> {
+/// The commit HEAD was on from the first run's start to the last's, by the
+/// reflog. A run with no start time cannot be placed, so it is refused.
+fn commit_through(reflog: &str, starts: &[Option<u64>]) -> Result<String> {
+    let Some(starts) = starts.iter().copied().collect::<Option<Vec<u64>>>() else {
+        bail!("the fixture commit: a run carries no start time; pass --commit <sha>");
+    };
     let (Some(first), Some(last)) = (starts.iter().min(), starts.iter().max()) else {
         bail!("the fixture commit: the runs carry no start time; pass --commit <sha>");
     };
