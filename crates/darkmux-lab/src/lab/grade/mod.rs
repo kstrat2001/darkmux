@@ -616,11 +616,15 @@ pub fn regrade(run: &str, fixture: Option<&Path>, write: bool) -> Result<Regrade
             fixture_dir.display()
         );
     }
-    let result = manifest
-        .sandbox
-        .clone()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| run_dir.join("sandbox"));
+    // The run's own sandbox, where the lab keeps it; the manifest's path
+    // only for a run kept elsewhere (a run folder copied between machines
+    // still carries the first machine's path).
+    let kept = run_dir.join("sandbox");
+    let result = if kept.is_dir() {
+        kept
+    } else {
+        manifest.sandbox.clone().map(PathBuf::from).unwrap_or(kept)
+    };
     let dispatch = match (&manifest.escalation, manifest.ok) {
         (Some(reason), _) => DispatchEnd::Escalated {
             reason: reason.clone(),

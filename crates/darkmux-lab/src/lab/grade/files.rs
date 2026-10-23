@@ -18,13 +18,17 @@ enum Entry {
     Symlink(String),
 }
 
+/// A modified path, with the fixture's and the result's bytes (`None` for a
+/// symlink side).
+pub(crate) type Modified = (String, Option<Vec<u8>>, Option<Vec<u8>>);
+
 /// How the result differs from the fixture.
 #[derive(Debug, Default)]
 pub(crate) struct Changes {
     pub added: Vec<String>,
     pub deleted: Vec<String>,
     /// Modified files, with both sides' bytes (`None` for a symlink side).
-    pub modified: Vec<(String, Option<Vec<u8>>, Option<Vec<u8>>)>,
+    pub modified: Vec<Modified>,
 }
 
 pub(crate) fn compare(fixture: &Path, result: &Path) -> Result<Changes> {
@@ -111,9 +115,11 @@ pub(crate) fn scope_violations(changes: &Changes, spec: &ScopeGrade) -> Vec<Stri
             continue;
         }
         let kept = match (old, new) {
-            (Some(old), Some(new)) => {
-                lines_kept(&String::from_utf8_lossy(old), &String::from_utf8_lossy(new))
-            }
+            (Some(old), Some(new)) => lines_kept(
+                &String::from_utf8_lossy(old),
+                &String::from_utf8_lossy(new),
+                &spec.comment_prefixes,
+            ),
             _ => false,
         };
         if !kept {
@@ -125,10 +131,19 @@ pub(crate) fn scope_violations(changes: &Changes, spec: &ScopeGrade) -> Vec<Stri
     problems
 }
 
-/// Whether every line of `old` appears in `new`, in order.
-pub(crate) fn lines_kept(old: &str, new: &str) -> bool {
+/// Whether every line of `old` appears in `new`, in order, except blank
+/// lines and comment lines (starting with one of `comment_prefixes` after
+/// indentation) when any prefix is named.
+pub(crate) fn lines_kept(old: &str, new: &str, comment_prefixes: &[String]) -> bool {
+    let may_go = |line: &str| {
+        let t = line.trim_start();
+        !comment_prefixes.is_empty()
+            && (t.is_empty() || comment_prefixes.iter().any(|p| t.starts_with(p.as_str())))
+    };
     let mut new_lines = new.lines();
-    old.lines().all(|line| new_lines.any(|n| n == line))
+    old.lines()
+        .filter(|l| !may_go(l))
+        .all(|line| new_lines.any(|n| n == line))
 }
 
 /// `style`'s problems: a new file matching `files` that lacks a required string.

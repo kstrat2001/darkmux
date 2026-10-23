@@ -25,6 +25,9 @@
           ],
           "append_only": [
             "test/tokenRotation.test.js"
+          ],
+          "comment_prefixes": [
+            "//"
           ]
         },
         "suite": {

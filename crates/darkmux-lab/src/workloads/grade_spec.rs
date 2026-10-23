@@ -69,6 +69,11 @@ pub(crate) struct ScopeGrade {
     pub may_add: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub append_only: Vec<String>,
+    /// In an `append_only` file, an original line that is blank or starts
+    /// (after its indentation) with one of these may go: a comment is not a
+    /// test, and a `TODO` comment often invites the very test that replaces it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub comment_prefixes: Vec<String>,
 }
 
 /// A check that needs nothing but the prompt sentence it grades.

@@ -57,6 +57,7 @@ fn spec() -> GradeSpec {
             asks: vec!["Do not modify src/.".into()],
             may_add: vec!["test/**".into()],
             append_only: vec![],
+            comment_prefixes: vec![],
         }),
         portable: Some(AsksOnly {
             asks: vec!["Write tests.".into()],
@@ -342,7 +343,9 @@ fn a_planted_bug_is_applied_to_the_fixtures_file_not_the_results() {
     let f = fixture(tmp.path());
     let r = result_from(tmp.path(), &f);
     write(&r, "test/b.t", "value=1");
-    write(&r, "src/a.txt", "value=1\nother=2\nnote=3\n");
+    // The result's own file holds the line twice, so the bug planted in
+    // ITS copy would leave one behind and survive; the fixture's does not.
+    write(&r, "src/a.txt", "value=1\nother=2\nvalue=1\n");
     let record = run(
         &spec(),
         &f,
@@ -386,13 +389,29 @@ fn style_reads_new_files_only() {
 
 #[test]
 fn append_only_files_may_gain_lines_but_never_lose_or_change_one() {
-    assert!(lines_kept("a\nb\nc\n", "x\na\nb\ny\nc\nz\n"));
-    assert!(!lines_kept("a\nb\nc\n", "a\nc\nb\n"));
-    assert!(!lines_kept("a\nb\n", "a\nB\n"));
+    assert!(lines_kept("a\nb\nc\n", "x\na\nb\ny\nc\nz\n", &[]));
+    assert!(!lines_kept("a\nb\nc\n", "a\nc\nb\n", &[]));
+    assert!(!lines_kept("a\nb\n", "a\nB\n", &[]));
+    // A comment or a blank line may go when the grader names the comment
+    // marker (a TODO replaced by its test); nothing else may.
+    let slashes = ["//".to_string()];
+    assert!(lines_kept(
+        "a\n  // TODO: test b\n\nc\n",
+        "a\nit(b)\nc\n",
+        &slashes
+    ));
+    assert!(!lines_kept(
+        "a\n  // TODO: test b\n\nc\n",
+        "a\nit(b)\nc\n",
+        &[]
+    ));
+    assert!(!lines_kept("a\n// x\nc\n", "a\n// x\n", &slashes));
+    assert!(!lines_kept("a\n\nb\n", "a\nb\n", &[]));
     let spec = ScopeGrade {
         asks: vec![],
         may_add: vec![],
         append_only: vec!["test/*.js".into()],
+        comment_prefixes: vec![],
     };
     let changes = Changes {
         modified: vec![
@@ -549,4 +568,36 @@ fn the_final_reply_is_read_from_the_runtime_envelope() {
     assert_eq!(final_reply(tmp.path()).as_deref(), Some("# pass 23"));
     fs::write(tmp.path().join("qa-reply.json"), "{\"result\":\"error\"}").unwrap();
     assert_eq!(final_reply(tmp.path()), None);
+}
+
+/// The lab-run step grades a workload that declares a grader, records it,
+/// and hands back the recorded verdict; a workload without one is untouched.
+#[test]
+fn the_lab_run_step_grades_records_and_returns_the_verdict() {
+    let tmp = TempDir::new().unwrap();
+    let f = fixture(tmp.path());
+    let r = result_from(tmp.path(), &f);
+    write(&r, "test/b.t", "other=2");
+    let run_dir = tmp.path().join("run");
+    fs::create_dir_all(&run_dir).unwrap();
+    fs::write(run_dir.join("manifest.json"), r#"{"verify": {"passed": true, "details": "gate ok"}}"#).unwrap();
+    fs::write(run_dir.join("qa-reply.json"), r#"{"result":"stop","final_assistant":"done"}"#).unwrap();
+    let loaded = |grade: Option<&GradeSpec>| crate::workloads::types::LoadedWorkload {
+        manifest: serde_json::from_value(serde_json::json!({"workload": {"id": "w", "provider": "coding-task",
+            "prompt": PROMPT, "verify": {"command": "true", "grade": grade}}}))
+        .unwrap(),
+        base_dir: tmp.path().to_path_buf(),
+        source: crate::workloads::types::WorkloadSource::OnDisk,
+    };
+    let mut s = spec();
+    s.suite.as_mut().unwrap().more_than_baseline = false;
+    let untouched = apply(&run_dir, &f, &r, &DispatchEnd::Completed, &loaded(None), Ok(None)).unwrap();
+    assert!(untouched.is_none());
+    let graded = apply(&run_dir, &f, &r, &DispatchEnd::Completed, &loaded(Some(&s)), Ok(None)).unwrap().unwrap();
+    assert!(!graded.passed);
+    assert!(graded.details.starts_with("graded: fail (behaviors:"), "{}", graded.details);
+    let m = RunManifest::read(&run_dir).unwrap();
+    assert_eq!(m.verify_passed(), Some(false));
+    assert_eq!(m.verify_report().unwrap().grade.as_ref().unwrap().checks.len(), 6);
+    assert!(!run_dir.join(WORK_DIR).exists(), "the scratch copies are removed");
 }
