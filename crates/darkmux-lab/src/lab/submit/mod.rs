@@ -198,14 +198,17 @@ pub fn commit_at_time(reflog: &str, first_start_ms: u64, last_start_ms: u64) -> 
         .filter_map(|l| re.captures(l.trim()))
         .filter_map(|c| Some((c[1].to_string(), c[2].parse::<u64>().ok()? * 1000)))
         .collect();
-    let at = |t: u64| entries.iter().find(|(_, when)| *when <= t).map(|(sha, _)| sha.clone());
-    let Some(first) = at(first_start_ms) else {
+    let Some(first) = entries.iter().position(|(_, when)| *when <= first_start_ms) else {
         return Err("the reflog does not reach back to these runs; pass --commit <sha>".into());
     };
-    if at(last_start_ms).as_deref() != Some(first.as_str()) {
+    // Every entry from the first run's to the last's: a checkout away and
+    // back between them leaves the ends agreeing and a middle run elsewhere.
+    let last = entries.iter().position(|(_, when)| *when <= last_start_ms).unwrap_or(first);
+    let sha = &entries[first].0;
+    if entries[last.min(first)..=first].iter().any(|(s, _)| s != sha) {
         return Err("the fixture checkout moved between these runs; submit them separately".into());
     }
-    Ok(first)
+    Ok(sha.clone())
 }
 
 /// The files the weights hash covers: tensors and the model's own config,
@@ -361,6 +364,12 @@ fn fields_count(v: &Value) -> (Value, Value, Value) {
 
 /// The detail beyond the basics. Host figures need busy samples: with none
 /// they are null, never zero.
+/// Whether every stream's tokens were billed: a rate over only some of the
+/// generation is not quoted.
+fn all_streams_billed(stats: &Value) -> bool {
+    stats.get("checks").and_then(|c| c.get("all_streams_billed")) != Some(&Value::Bool(false))
+}
+
 pub fn detail_from(manifest: &Value, stats: &Value, names: &[String]) -> Value {
     let sampled = stats.get("samples_busy").and_then(Value::as_u64).is_some_and(|n| n > 0);
     let host = |v: Value| if sampled { v } else { Value::Null };
@@ -396,6 +405,17 @@ pub fn detail_from(manifest: &Value, stats: &Value, names: &[String]) -> Value {
         "thermalStates": host(thermal.filter(|t| !t.is_empty()).map_or(Value::Null, Value::Object)),
         "cpuSpeedLimitMinPct": host(count(s("cpu_speed_limit_min"))),
         "throttledSamples": host(count(s("throttled_samples"))),
+        // (5.5.0) The model's side of the run, beside the machine's: how often
+        // the context was compacted, how full it got, how long each call
+        // waited for its first token (prefill), and generation speed with
+        // that wait left out. The site takes them only once darklyenergized#316
+        // is deployed (it keeps a detail number it does not know yet); until
+        // then it refuses the bundle, and `site_refusals` does not catch that.
+        "compactions": count(s("compactions")),
+        "contextPeakTokens": count(s("context_peak_tokens")),
+        "firstTokenMsMedian": count(s("first_token_ms_median")),
+        "firstTokenMsMax": count(s("first_token_ms_max")),
+        "decodeTokensPerSecond": if all_streams_billed(stats) { measure(s("decode_tok_per_s"), 100_000.0) } else { Value::Null },
         "verify": verify_detail_from(manifest, names),
     })
 }
@@ -482,7 +502,7 @@ impl Stack {
 /// One run as the site takes it.
 pub fn bundle_run(run_id: &str, manifest: &Value, stats: &Value, ran_by: &RanBy, stack: &Stack, names: &[String]) -> Value {
     let active = stats.get("active_ms").and_then(Value::as_f64).filter(|n| *n > 0.0);
-    let all_billed = stats.get("checks").and_then(|c| c.get("all_streams_billed")) != Some(&Value::Bool(false));
+    let all_billed = all_streams_billed(stats);
     let started = stats.get("started_at_unix_ms").and_then(Value::as_u64);
     json!({
         "key": sha256::hex(run_id.as_bytes()),
@@ -739,7 +759,7 @@ pub fn gather_on(machine: &Machine, runs: &[String], stated: &Stated, flows_dir:
     let mut starts = Vec::new();
     for input in &inputs {
         let (run, note) = machine.bundle_one(input, stated, &mut caches, progress)?;
-        starts.extend(input.started());
+        starts.push(input.started());
         bundled.push(run);
         notes.push(note);
     }
@@ -1172,7 +1192,7 @@ fn hash_weights(path: &Path, run_id: &str, model_id: &str, progress: &mut dyn Fn
 
 /// The fixture: a GitHub repo at the commit its checkout was on through the
 /// runs, and its `.fixture.json` as it was at that commit.
-pub fn fixture_at(source: &Path, starts: &[u64], stated_commit: Option<&str>) -> Result<(String, String, Value)> {
+pub fn fixture_at(source: &Path, starts: &[Option<u64>], stated_commit: Option<&str>) -> Result<(String, String, Value)> {
     let git = |args: &[&str]| -> Option<String> {
         let out = Command::new("git").arg("-C").arg(source).args(args).output().ok()?;
         out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
@@ -1195,8 +1215,12 @@ pub fn fixture_at(source: &Path, starts: &[u64], stated_commit: Option<&str>) ->
     Ok((repo, commit_sha, manifest))
 }
 
-/// The commit HEAD was on from the first run's start to the last's, by the reflog.
-fn commit_through(reflog: &str, starts: &[u64]) -> Result<String> {
+/// The commit HEAD was on from the first run's start to the last's, by the
+/// reflog. A run with no start time cannot be placed, so it is refused.
+fn commit_through(reflog: &str, starts: &[Option<u64>]) -> Result<String> {
+    let Some(starts) = starts.iter().copied().collect::<Option<Vec<u64>>>() else {
+        bail!("the fixture commit: a run carries no start time; pass --commit <sha>");
+    };
     let (Some(first), Some(last)) = (starts.iter().min(), starts.iter().max()) else {
         bail!("the fixture commit: the runs carry no start time; pass --commit <sha>");
     };

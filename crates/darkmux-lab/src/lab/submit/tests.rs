@@ -32,6 +32,8 @@ fn stats() -> Value {
         "cpu_w_busy": 5.04, "gpu_w_busy": 24.95, "gpu_duty_pct": 87.5, "pkg_j_per_1k_tokens": 410.33,
         "mem_pct_busy_max": 62, "thermal_states_busy": { "nominal": 38, "fair": 2, "Bad": 1 },
         "cpu_speed_limit_min": 100, "throttled_samples": 0,
+        "compactions": 2, "context_peak_tokens": 48_211, "first_token_ms_median": 1_840,
+        "first_token_ms_max": 9_120, "decode_tok_per_s": 58.44,
         "checks": { "all_streams_billed": true },
     })
 }
@@ -181,6 +183,11 @@ fn a_rate_over_part_of_the_generation_is_not_quoted() {
     let run = bundle_run("r", &manifest(), &s, &RanBy::default(), &stack(), &[]);
     assert_eq!(run["tokensPerSecond"], Value::Null);
     assert_eq!(run["darkmuxVersion"], Value::Null);
+    // (Argon review) Decode speed is a rate over the generation too.
+    s["decode_tok_per_s"] = json!(80.0);
+    assert_eq!(detail_from(&manifest(), &s, &[])["decodeTokensPerSecond"], Value::Null);
+    s["checks"]["all_streams_billed"] = json!(true);
+    assert_eq!(detail_from(&manifest(), &s, &[])["decodeTokensPerSecond"], json!(80.0));
 }
 
 #[test]
@@ -222,9 +229,21 @@ fn the_commit_is_the_one_checked_out_through_the_runs() {
     // Newest first: b checked out at 2000s, a at 1000s.
     let reflog = format!("{b} HEAD@{{2000}}\n{a} HEAD@{{1000}}\n");
     assert_eq!(commit_at_time(&reflog, 1_500_000, 1_900_000), Ok(a.clone()));
-    assert_eq!(commit_at_time(&reflog, 2_100_000, 2_100_000), Ok(b));
+    assert_eq!(commit_at_time(&reflog, 2_100_000, 2_100_000), Ok(b.clone()));
     assert!(commit_at_time(&reflog, 1_500_000, 2_100_000).unwrap_err().contains("moved between"));
     assert!(commit_at_time(&reflog, 500_000, 600_000).unwrap_err().contains("--commit"));
+    // Checked out b and back to a between the runs: the ends agree, the
+    // middle run did not run on a.
+    let away_and_back = format!("{a} HEAD@{{3000}}\n{b} HEAD@{{2000}}\n{a} HEAD@{{1000}}\n");
+    assert!(commit_at_time(&away_and_back, 1_500_000, 3_500_000).unwrap_err().contains("moved between"));
+    // Checking out the same commit again moves nothing.
+    let again = format!("{a} HEAD@{{2000}}\n{a} HEAD@{{1000}}\n");
+    assert_eq!(commit_at_time(&again, 1_500_000, 2_500_000), Ok(a.clone()));
+    // Every run needs a start time to be placed, not just some of them.
+    let reflog_a = format!("{a} HEAD@{{1000}}\n");
+    assert_eq!(commit_through(&reflog_a, &[Some(1_500_000), Some(1_600_000)]).unwrap(), a);
+    let err = commit_through(&reflog_a, &[Some(1_500_000), None]).unwrap_err().to_string();
+    assert!(err.contains("--commit"), "{err}");
 }
 
 #[test]

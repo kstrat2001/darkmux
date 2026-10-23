@@ -70,7 +70,7 @@ impl WorkloadProvider for PromptProvider {
         );
         // Named and armed before the dispatch, so a dispatch that returns
         // `Err` still leaves its trajectory in the run dir (the guard's Drop).
-        let guard = PromptDispatchGuard::arm(&role, run_dir, &mut opts);
+        let guard = PromptDispatchGuard::arm(&role, &loaded.manifest.workload.id, run_dir, &mut opts);
         // (`replyRoom`) Worked out from the route the dispatch itself will
         // take: its selected model's window and its own system prompt.
         let reply_room = match loaded.manifest.workload.reply_room {
@@ -375,14 +375,15 @@ fn preserve_trajectory(out_dir: Option<&Path>, run_dir: &Path) -> Vec<crate::pro
 struct PromptDispatchGuard {
     preserve: crate::providers::coding_task::TrajectoryPreserver,
     run_dir: std::path::PathBuf,
+    workload_id: String,
 }
 
 impl PromptDispatchGuard {
-    fn arm(role: &str, run_dir: &Path, opts: &mut darkmux_crew::dispatch::DispatchOpts) -> Self {
+    fn arm(role: &str, workload_id: &str, run_dir: &Path, opts: &mut darkmux_crew::dispatch::DispatchOpts) -> Self {
         let out_dir = crate::providers::coding_task::named_out_dir(role);
         let preserve = crate::providers::coding_task::TrajectoryPreserver::new(out_dir.clone(), run_dir.to_path_buf());
         opts.host_out = Some(out_dir);
-        Self { preserve, run_dir: run_dir.to_path_buf() }
+        Self { preserve, run_dir: run_dir.to_path_buf(), workload_id: workload_id.to_string() }
     }
 
     fn keep(mut self, dispatch_out: Option<&Path>, run_dir: &Path) -> Vec<crate::providers::coding_task::RefusedArtifact> {
@@ -395,7 +396,7 @@ impl PromptDispatchGuard {
 impl Drop for PromptDispatchGuard {
     fn drop(&mut self) {
         let preserved = self.preserve.salvage();
-        if let Err(e) = write_refusal_manifest(&self.run_dir, &preserved.refused) {
+        if let Err(e) = write_refusal_manifest(&self.run_dir, &self.workload_id, &preserved.refused) {
             eprintln!("darkmux: warn: could not record a refused runtime file on the run manifest: {e}");
         }
     }
@@ -404,7 +405,7 @@ impl Drop for PromptDispatchGuard {
 /// The error path's manifest: `finish_run` never runs, so this is the only
 /// writer. A dispatch that copied cleanly leaves no manifest. A refusal is
 /// described as recorded only after this write succeeds.
-fn write_refusal_manifest(run_dir: &Path, refused: &[crate::providers::coding_task::RefusedArtifact]) -> Result<()> {
+fn write_refusal_manifest(run_dir: &Path, workload_id: &str, refused: &[crate::providers::coding_task::RefusedArtifact]) -> Result<()> {
     if refused.is_empty() {
         return Ok(());
     }
@@ -415,6 +416,10 @@ fn write_refusal_manifest(run_dir: &Path, refused: &[crate::providers::coding_ta
     }
     if manifest.manifest_schema_version.is_none() {
         manifest.manifest_schema_version = Some(darkmux_types::data_version::RUN_MANIFEST_SCHEMA_VERSION.to_string());
+    }
+    // `lab inspect` resolves a manifest's workload to read it.
+    if manifest.workload.is_none() {
+        manifest.workload = Some(workload_id.to_string());
     }
     if manifest.provider.is_none() {
         manifest.provider = Some(PromptProvider.id().to_string());
@@ -437,22 +442,34 @@ fn write_refusal_manifest(run_dir: &Path, refused: &[crate::providers::coding_ta
 /// and empty when it names none, never guessed. A reply that is not that
 /// envelope writes nothing.
 fn write_one_call_trajectory(stdout: &str, system_chars: usize, prompt_chars: usize, run_dir: &Path, end_ms: u64) {
-    use darkmux_trajectory::event::{DispatchComplete, DispatchStart, Header, ModelCompleted, TrajectoryEvent};
+    use darkmux_trajectory::event::{DispatchComplete, DispatchStart, Header, ModelCompleted, StreamingEnd, StreamingStart, TrajectoryEvent};
     let Ok(envelope) = serde_json::from_str::<serde_json::Value>(stdout) else { return };
     let Some(metrics) = envelope.get("metrics") else { return };
     let (Some(model), Some(wall_ms)) = (metrics.get("model").and_then(|v| v.as_str()), metrics.get("wall_ms").and_then(|v| v.as_u64())) else {
         return;
     };
     let usage: darkmux_trajectory::usage::Usage = serde_json::from_value(metrics.clone()).unwrap_or_default();
+    let start_ms = end_ms.saturating_sub(wall_ms);
+    let reply_chars = envelope.get("final_assistant").and_then(|v| v.as_str()).map_or(0, |s| s.chars().count() as u64);
     let events = [
         TrajectoryEvent::Header(Header { schema_version: darkmux_trajectory::TRAJECTORY_SCHEMA_VERSION.to_string() }),
         TrajectoryEvent::DispatchStart(DispatchStart {
-            ts: end_ms.saturating_sub(wall_ms),
+            ts: start_ms,
             model: model.to_string(),
             system_chars: system_chars as u64,
             prompt_chars: prompt_chars as u64,
             tools: Vec::new(),
         }),
+        // The call is one stream, request to reply, as a runtime stream is
+        // timed: without it the run has no generation time, so no rate, and
+        // its one usage frame pairs with nothing.
+        TrajectoryEvent::StreamingStart(StreamingStart {
+            seq: 1,
+            ts: start_ms,
+            system_chars: system_chars as u64,
+            prompt_chars: prompt_chars as u64,
+        }),
+        TrajectoryEvent::StreamingEnd(StreamingEnd { seq: 1, ts: end_ms, total_content_chars: reply_chars, ..Default::default() }),
         TrajectoryEvent::ModelCompleted(ModelCompleted {
             seq: 1,
             ts: end_ms,
@@ -995,7 +1012,7 @@ mod tests {
         .to_string();
         write_one_call_trajectory(&stdout, 5_700, 21_000, tmp.path(), 1_000_000);
         let fold = crate::lab::inspect::checked_run_trajectory(tmp.path()).unwrap();
-        assert_eq!(fold.events, 3, "the header is a marker, not an event");
+        assert_eq!(fold.events, 5, "the header is a marker, not an event");
         assert_eq!(fold.schema_version.as_deref(), Some(darkmux_trajectory::TRAJECTORY_SCHEMA_VERSION));
         assert_eq!(fold.model_calls, 1);
         assert_eq!(fold.frames, vec![Some(900)]);
@@ -1003,7 +1020,14 @@ mod tests {
         assert_eq!((start.model.as_str(), start.system_chars, start.prompt_chars, start.ts), ("m", 5_700, 21_000, 1_000_000 - 13_100));
         let complete = fold.complete.as_ref().unwrap();
         assert_eq!((complete.result.as_str(), complete.wall_ms), ("stop", 13_100));
-        crate::lab::stats::compute_from_dir(tmp.path(), &tmp.path().join("flows")).expect("the run's numbers can be read");
+        let stats = crate::lab::stats::compute_from_dir(tmp.path(), &tmp.path().join("flows")).expect("the run's numbers can be read");
+        // The call is one stream, start to end, so the run has a rate and
+        // reconciles: no rate means `lab submit` uploads tokensPerSecond null.
+        assert_eq!(fold.streams.len(), 1);
+        assert_eq!(fold.streams[0].ms(), 13_100);
+        assert_eq!(stats.tok_per_s, Some(68.7));
+        assert!(stats.checks.frames_match_streams && stats.checks.all_streams_billed);
+        assert!(!stats.unreconciled().iter().any(|w| w.contains("streams")), "{:?}", stats.unreconciled());
         // The call's finish reason, when the envelope carries it, is the
         // trajectory's: the grade reads it to tell a cut-off reply from one
         // that stopped on its own.
@@ -1060,7 +1084,7 @@ mod tests {
         fs::create_dir_all(&run).unwrap();
         let session = SessionId::adhoc(RunId::lab("run1").unwrap(), "reviewer", "w");
         let mut opts = dispatch_opts("reviewer", "hi", &session, None, None, "p");
-        let guard = PromptDispatchGuard::arm("reviewer-a", &run, &mut opts);
+        let guard = PromptDispatchGuard::arm("reviewer-a", "w", &run, &mut opts);
         let out = opts.host_out.clone().expect("the out dir is named before dispatch");
         let _remove_out = RemoveOut(out.clone());
         fs::create_dir_all(out.join(".darkmux-runtime")).unwrap();
@@ -1087,7 +1111,7 @@ mod tests {
         fs::create_dir_all(&run).unwrap();
         let session = SessionId::adhoc(RunId::lab("run1").unwrap(), "reviewer", "w");
         let mut opts = dispatch_opts("reviewer", "hi", &session, None, None, "p");
-        let guard = PromptDispatchGuard::arm("reviewer-b", &run, &mut opts);
+        let guard = PromptDispatchGuard::arm("reviewer-b", "w", &run, &mut opts);
         let out = opts.host_out.clone().unwrap();
         let _remove_out = RemoveOut(out.clone());
         fs::create_dir_all(out.join(".darkmux-runtime")).unwrap();
@@ -1102,6 +1126,8 @@ mod tests {
         let manifest: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(run.join("manifest.json")).unwrap()).unwrap();
         assert_eq!(manifest["provider"], "prompt");
+        // `lab inspect` reads a manifest by its workload; without one it errors.
+        assert_eq!(manifest["workload"], "w");
         assert_eq!(manifest["ok"], false, "the dispatch did not complete");
         assert_eq!(manifest["schema_version"], 6);
         assert_eq!(manifest["refused_artifacts"][0]["file"], "findings.jsonl");
@@ -1120,7 +1146,7 @@ mod tests {
         fs::create_dir_all(&run).unwrap();
         let session = SessionId::adhoc(RunId::lab("run1").unwrap(), "reviewer", "w");
         let mut opts = dispatch_opts("reviewer", "hi", &session, None, None, "p");
-        let guard = PromptDispatchGuard::arm("reviewer-c", &run, &mut opts);
+        let guard = PromptDispatchGuard::arm("reviewer-c", "w", &run, &mut opts);
         let out = opts.host_out.clone().unwrap();
         let _remove_out = RemoveOut(out.clone());
         fs::create_dir_all(out.join(".darkmux-runtime")).unwrap();

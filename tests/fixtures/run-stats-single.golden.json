@@ -1,5 +1,5 @@
 {
-  "schema_version": "2.2.0",
+  "schema_version": "2.3.0",
   "run": "run-a",
   "model": "m",
   "result": "stop",
@@ -36,6 +36,11 @@
   "unbilled_gen_ms": 0,
   "billed_gen_fraction": 1.0,
   "tok_per_s": 100.0,
+  "decode_tok_per_s": null,
+  "prefill_ms_billed": null,
+  "first_token_ms_median": null,
+  "first_token_ms_max": null,
+  "context_peak_tokens": null,
   "reasoning_chars_per_s": null,
   "gates": {
     "stream": {

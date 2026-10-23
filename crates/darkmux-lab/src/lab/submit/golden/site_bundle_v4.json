@@ -71,6 +71,11 @@
           },
           "cpuSpeedLimitMinPct": 100,
           "throttledSamples": 0,
+          "compactions": 2,
+          "contextPeakTokens": 48211,
+          "firstTokenMsMedian": 1840,
+          "firstTokenMsMax": 9120,
+          "decodeTokensPerSecond": 58.4,
           "verify": {
             "summary": null,
             "forcedFailureReason": null,
