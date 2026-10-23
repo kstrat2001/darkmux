@@ -13245,6 +13245,12 @@ fn status_for_plan(plan: Result<crate::runtime_image::DefaultImagePlan>) -> Dock
 /// role-load / model-probe / workspace setup so a new user without Docker gets
 /// a clean, operator-actionable bail, and a `brew install` user without a
 /// local image gets a one-time pull instead of a "build from source" dead-end.
+/// (#906) The darkmux runtime image, resolved for running a lab run's tests
+/// in it: the same preflight and version check a dispatch gets.
+pub(crate) fn test_runtime_image() -> Result<String> {
+    check_docker_preflight(None).map(|image| image.reference)
+}
+
 fn check_docker_preflight(explicit: Option<&str>) -> Result<crate::runtime_image::ResolvedImage> {
     match docker_runtime_status() {
         // Daemon up (image present OR absent) — resolve the darkmux image,

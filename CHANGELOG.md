@@ -46,6 +46,19 @@ darkmux release.
   `fieldsExpected`, `fieldsMissed`) and `stack.maxCompletionTokens`. A bundle with neither is
   still written as format 3. Workload schema 1.1 (additive).
 
+### Changed
+
+- **A lab run's verify command runs in a container (#906).** It runs the tests the model
+  wrote, so it no longer runs on your machine as you: it runs in the workload's `image`, else
+  the darkmux runtime image, with only the run's sandbox mounted at `/workspace`, no network,
+  no capabilities, the dispatch container's user, and the step-command timeout.
+  `${SANDBOX_DIR}` in the command and its `cwd` names `/workspace` there. A verify command
+  that needs a tool the image lacks fails; a fixture names the image it needs with `image`.
+  Without Docker, the run is refused, naming the opt-in: `darkmux config set
+  runtime.tests_on_host true` (or `DARKMUX_TESTS_ON_HOST`) runs it on the host as before.
+  `darkmux doctor` shows which, and warns when it is the host. Config schema 2.6 (additive;
+  an older binary refuses a config carrying the new key).
+
 ### Fixed
 
 - The write-the-tests work gate leaves a prompt run's verify alone. A prompt run writes no test

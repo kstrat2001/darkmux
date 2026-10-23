@@ -47,6 +47,9 @@ pub mod bounded_command;
 pub mod brief_refs;
 pub mod channel_markup;
 pub mod concurrent_dispatch;
+/// (#2973, #906) Model-written code (a mod's tests, a lab run's verify and
+/// grader suites) run in a locked-down container, or on the host by choice.
+pub mod contained_command;
 /// (#2869) No-follow, regular-file-only reads out of a directory a
 /// container can write (the out-dir, the workspace).
 pub mod contained_file;

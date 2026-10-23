@@ -449,20 +449,11 @@ fn document_skip_reason(test_command: Option<&str>, placement: &Result<GatePlace
 /// a finished run is a real outcome (pass or fail); a deadline, an
 /// interrupt or a command that could not start is a named skip.
 fn run_gate_command(placement: &GatePlacement, command: &str, scratch_checkout: &Path) -> (Option<GateOutcome>, Option<String>) {
-    if let GatePlacement::Container(_) = placement {
-        reap_orphaned_gate_containers();
-        if let Err(e) = std::fs::write(scratch_checkout.join(GATE_SENTINEL), b"") {
-            return (None, Some(format!("could not mark the scratch copy for the container: {e}")));
-        }
-    }
-    let (test_cmd, container) = gate_test_command(placement, command, scratch_checkout);
-    let ran = crate::bounded_command::run_bounded(test_cmd, crate::bounded_command::configured_timeout());
-    if let (Some(name), crate::bounded_command::Bounded::TimedOut { .. } | crate::bounded_command::Bounded::Interrupted) =
-        (&container, &ran)
-    {
-        // Killing the `docker run` client does not stop its container.
-        remove_container(name);
-    }
+    let ran = crate::contained_command::run(
+        &placement.contained(),
+        &gate_run(command, scratch_checkout),
+        crate::bounded_command::configured_timeout(),
+    );
     gate_result(placement, command, scratch_checkout, ran)
 }
 
@@ -496,42 +487,15 @@ fn gate_result(
 }
 
 /// `docker run`'s exit code for "the container could not be run".
-const DOCKER_RUN_FAILED: i32 = 125;
+const DOCKER_RUN_FAILED: i32 = crate::contained_command::DOCKER_RUN_FAILED;
 
-/// (#2973 review) A file the gate writes into the scratch copy and the
-/// container checks for before running anything: a Docker daemon that
-/// cannot see the scratch dir (remote, or a VM without that share) mounts
-/// an empty directory, where a permissive `test_command` would pass.
-const GATE_SENTINEL: &str = ".darkmux-gate";
+/// See [`crate::contained_command::SENTINEL`].
+#[cfg(test)]
+const GATE_SENTINEL: &str = crate::contained_command::SENTINEL;
 
-/// The label a gate container carries: the darkmux process that started it.
-const GATE_PID_LABEL: &str = "darkmux.gate.pid";
-
-/// (#2973 review) The gate containers to remove: those whose owning
-/// darkmux process is gone (a crash or SIGKILL kills the `docker run`
-/// client, never its container). A live owner's container is left alone.
-fn orphaned_gate_containers(listed: &[(String, Option<u32>)], alive: impl Fn(u32) -> bool) -> Vec<String> {
-    listed.iter().filter(|(_, pid)| pid.is_some_and(|p| !alive(p))).map(|(name, _)| name.clone()).collect()
-}
-
-/// Remove gate containers whose owner is gone. Best effort and bounded: a
-/// Docker that cannot list them is the next `docker run`'s failure to name.
-fn reap_orphaned_gate_containers() {
-    let mut ps = std::process::Command::new("docker");
-    ps.args(["ps", "-a", "--filter", &format!("label={GATE_PID_LABEL}"), "--format", &format!("{{{{.Names}}}}\t{{{{.Label \"{GATE_PID_LABEL}\"}}}}")]);
-    let crate::bounded_command::Bounded::Finished { success: true, stdout, .. } =
-        crate::bounded_command::run_bounded(ps, std::time::Duration::from_secs(30))
-    else {
-        return;
-    };
-    let listed: Vec<(String, Option<u32>)> = String::from_utf8_lossy(&stdout)
-        .lines()
-        .filter_map(|l| l.split_once('\t').map(|(n, p)| (n.to_string(), p.trim().parse().ok())))
-        .collect();
-    for name in orphaned_gate_containers(&listed, crate::host_sampler_lock::pid_alive) {
-        remove_container(&name);
-    }
-}
+/// See [`crate::contained_command::PID_LABEL`].
+#[cfg(test)]
+const GATE_PID_LABEL: &str = crate::contained_command::PID_LABEL;
 
 /// (#2973) Where a gate's `test_command` runs. It executes model-written
 /// code (a kit can edit `build.rs`, `package.json` scripts, a Makefile), so
@@ -561,64 +525,26 @@ fn gate_placement(image: Option<&str>, on_host: bool) -> Result<GatePlacement, S
     }
 }
 
-/// (#2973) `docker run` arguments for a gate in a container: the patched
-/// scratch copy at `/workspace` and nothing else mounted, no network, no
-/// capabilities, no new privileges, removed when it exits, and `sh` as the
-/// entrypoint whatever the image declares.
-fn gate_container_args(image: &str, name: &str, checkout: &Path, command: &str) -> Vec<String> {
-    use crate::dispatch_internal::{DOCKER_CAP_DROP, DOCKER_MEMORY, DOCKER_PIDS_LIMIT, DOCKER_SECURITY_OPT};
-    ["run", "--rm", "--init", "--name", name, "--network", "none"]
-    .iter()
-    .map(|s| s.to_string())
-    .chain([
-        // (#2973 review) The coder container's own limits: model-written
-        // code here is no more trusted than the coder's.
-        format!("--cap-drop={DOCKER_CAP_DROP}"),
-        format!("--security-opt={DOCKER_SECURITY_OPT}"),
-        format!("--pids-limit={DOCKER_PIDS_LIMIT}"),
-        format!("--memory={DOCKER_MEMORY}"),
-        "--label".to_string(),
-        format!("{GATE_PID_LABEL}={}", std::process::id()),
-        "-v".to_string(),
-        format!("{}:/workspace", checkout.display()),
-        "-w".to_string(),
-        "/workspace".to_string(),
-        // The image's own entrypoint never wraps the command (the darkmux
-        // runtime image's would take `sh -c` as its arguments).
-        "--entrypoint".to_string(),
-        "sh".to_string(),
-        image.to_string(),
-        "-c".to_string(),
-        format!("test -f /workspace/{GATE_SENTINEL} || exit {DOCKER_RUN_FAILED}\n{command}"),
-    ])
-    .collect()
+/// The shape of one gate run: the scratch copy, no other mount, the image's
+/// own user.
+fn gate_run<'a>(command: &'a str, checkout: &'a Path) -> crate::contained_command::Run<'a> {
+    crate::contained_command::Run { command, tree: checkout, workdir: "", mounts: &[], user: None, name_prefix: "darkmux-gate" }
 }
 
-/// The command a gate runs, and the container's name when it runs in one.
-fn gate_test_command(placement: &GatePlacement, command: &str, checkout: &Path) -> (std::process::Command, Option<String>) {
-    match placement {
-        GatePlacement::Host => {
-            let mut cmd = std::process::Command::new("sh");
-            cmd.arg("-c").arg(command).current_dir(checkout);
-            (cmd, None)
-        }
-        GatePlacement::Container(image) => {
-            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let name = format!("darkmux-gate-{}-{n}", std::process::id());
-            let mut cmd = std::process::Command::new("docker");
-            cmd.args(gate_container_args(image, &name, checkout, command));
-            (cmd, Some(name))
+impl GatePlacement {
+    fn contained(&self) -> crate::contained_command::Placement {
+        match self {
+            GatePlacement::Container(image) => crate::contained_command::Placement::Container(image.clone()),
+            GatePlacement::Host => crate::contained_command::Placement::Host,
         }
     }
 }
 
-/// Stop and remove a gate container whose `docker run` client was killed.
-/// Best effort: a container already gone is the goal, not an error.
-fn remove_container(name: &str) {
-    let mut rm = std::process::Command::new("docker");
-    rm.args(["rm", "-f", name]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-    let _ = crate::bounded_command::run_bounded(rm, std::time::Duration::from_secs(30));
+/// (#2973) `docker run` arguments for a gate in a container
+/// ([`crate::contained_command::container_args`]).
+#[cfg(test)]
+fn gate_container_args(image: &str, name: &str, checkout: &Path, command: &str) -> Vec<String> {
+    crate::contained_command::container_args(image, name, &gate_run(command, checkout))
 }
 
 /// Remove a copied `.git` — a FILE for a linked worktree, a directory for
@@ -921,7 +847,7 @@ mod tests {
     #[test]
     fn only_gate_containers_whose_owner_is_gone_are_reaped() {
         let listed = vec![("darkmux-gate-1-0".to_string(), Some(111)), ("darkmux-gate-2-0".to_string(), Some(222)), ("x".to_string(), None)];
-        let orphans = orphaned_gate_containers(&listed, |pid| pid == 222);
+        let orphans = crate::contained_command::orphaned_containers(&listed, |pid| pid == 222);
         assert_eq!(orphans, vec!["darkmux-gate-1-0".to_string()]);
     }
 

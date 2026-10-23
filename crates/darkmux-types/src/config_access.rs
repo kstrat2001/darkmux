@@ -1595,6 +1595,24 @@ pub fn turn_delay_ms_with_source() -> (u64, Source) {
     (v.unwrap(), s)
 }
 
+/// (#906) Whether a lab run's verify command and grader suites run on the
+/// host instead of in a container. An **opt-in**: `env(DARKMUX_TESTS_ON_HOST)`
+/// truthy > `config.runtime.tests_on_host` > `false`; an unrecognized token
+/// reads as `false`, so a typo keeps model-written tests in the container.
+pub fn tests_on_host() -> bool {
+    tests_on_host_with_source().0
+}
+/// `tests_on_host` plus WHICH tier resolved it.
+pub fn tests_on_host_with_source() -> (bool, Source) {
+    if let Some(s) = env_str("DARKMUX_TESTS_ON_HOST") {
+        return (parse_bool_token(&s).unwrap_or(false), Source::Env);
+    }
+    match config().runtime.as_ref().and_then(|r| r.tests_on_host) {
+        Some(v) => (v, Source::Config),
+        None => (false, Source::BuiltIn),
+    }
+}
+
 /// (#3275) The operator's override for which user the dispatch container
 /// runs as, unparsed: `env(DARKMUX_CONTAINER_USER) > config.runtime.
 /// container_user > none`. There is no built-in default here: with no
@@ -4884,6 +4902,7 @@ mod tests {
             "DARKMUX_CMD_ENABLED",
             "DARKMUX_HOOKS_ENABLED",
             "DARKMUX_STRICT_SELECTION",
+            "DARKMUX_TESTS_ON_HOST",
         ];
         let prev: Vec<_> = names.iter().map(|n| (*n, std::env::var(n).ok())).collect();
 
@@ -4901,6 +4920,7 @@ mod tests {
             assert!(!cmd_enabled(), "cmd_enabled({token})");
             assert!(!hooks_enabled(), "hooks_enabled({token})");
             assert!(!strict_selection(), "strict_selection({token})");
+            assert!(!tests_on_host(), "tests_on_host({token})");
         }
         // Every TRUTHY spelling enables every knob in both families.
         for token in ["1", "true", "TRUE", "yes", "Yes", "on", "ON", " on "] {
@@ -4913,6 +4933,7 @@ mod tests {
             assert!(thermal_enabled(), "thermal_enabled({token})");
             assert!(cmd_enabled(), "cmd_enabled({token})");
             assert!(strict_selection(), "strict_selection({token})");
+            assert!(tests_on_host(), "tests_on_host({token})");
         }
         // An UNRECOGNIZED token is where the two families legitimately
         // differ, and the difference is the POINT: an opt-out must not be
@@ -4927,6 +4948,7 @@ mod tests {
         assert!(!cmd_enabled(), "an opt-IN stays off for an unrecognized token");
         assert!(!hooks_enabled(), "…same");
         assert!(!strict_selection(), "…same");
+        assert!(!tests_on_host(), "…same: a typo keeps model-written tests in the container");
 
         unsafe {
             for (n, v) in prev {

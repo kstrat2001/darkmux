@@ -191,6 +191,7 @@ pub fn run() -> DoctorReport {
         check_quarantined_mirrors(),
         checks_power::check_power_posture(),
         checks_container::check_container_user(),
+        checks_container::check_lab_tests_placement(),
         check_unmanaged_endpoint_credentials(),
         check_endpoints(),
         check_default_engine(),
@@ -12215,8 +12216,11 @@ mod tests {
         // power-posture row.
         //
         // (#2664) 69: `check_relative_home` joined beside the project-local row.
+        //
+        // (#906) 70: `checks_container::check_lab_tests_placement` joined
+        // beside the container-user row.
         let expected =
-            69 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            70 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
