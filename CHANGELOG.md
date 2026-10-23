@@ -14,6 +14,16 @@ darkmux release.
 
 ## [Unreleased]
 
+## [5.4.0] - 2026-10-23
+
+`darkmux lab submit` shares lab runs on darkmux evals: one bundle of runs from one fixture
+checkout, uploaded with a token from the site, with a dry run that sends nothing. A run now
+records which darkmux ran it, and `--version` says `(release <sha>)` only for a build at its
+release tag. A submitted bundle names the Mac's CPU clusters, GPU core count and model id, so
+the site can compare like machines, and never anything that identifies the Mac or its user.
+Omarchy gains power and board-sensor telemetry. Run manifest data 1.1 and flow schemas 2.4.0
+and 2.5.0 are additive. The rest is a sweep of dispatch, runtime and viewer fixes.
+
 ### Added
 
 - **`darkmux lab submit` shares lab runs on darkmux evals (evals.darkmux.com).** It builds one
@@ -29,6 +39,8 @@ darkmux release.
   physical cores per CPU cluster by the OS's own name (an M5 Max reads Super 6, Performance 12),
   the GPU core count and the model identifier (`Mac17,7`). On Omarchy only the CPU clusters are
   read yet; the rest is "not reported" (#3343).
+  It never shares what identifies the Mac or its user (serial, hardware id, host or login names);
+  free text naming one is left out, and anything else naming one refuses the bundle.
 - **A run records the darkmux that ran it.** The run manifest (data version 1.1, additive) gains
   `darkmux: {version, commit, build}`. `--version` now says `(release <sha>)` for a clean
   checkout at its release tag, so a build from `main` never reads as the release it follows.
@@ -59,6 +71,32 @@ darkmux release.
   New `host_unmeasured` (each host figure that is `null` although telemetry landed, with why),
   `board_temp_c_max_busy` and `fan_rpm_max_busy`. Migration: `cpu_speed_limit_min` is now `null`,
   not `100`, when no sample read a CPU speed limit.
+
+### Fixed
+
+- The docker CLI child is reaped on every dispatch exit path (#2640), and the daemon reaps
+  dispatch containers whose darkmux host died unhandled (#3200).
+- A salvaged turn gets its `dispatch.turn` record (#2967). An inactivity budget too large to
+  represent reads as unbounded instead of panicking (#2639).
+- A direct-path stream that goes silent ends at the inactivity cutoff (#3296). A mid-stream
+  error with a string code is classified as its HTTP twin (#3271). An engine error sent
+  mid-stream fails with the engine's own message (#3299). An unstreamed mlx reply's
+  `message.reasoning` reads as its reasoning (#3295).
+- Dispatch says "may replace the model it holds" only when the engine could hold another
+  model (#3283).
+- A relative `DARKMUX_HOME` is refused (#2664). `darkmux init` refuses a bad input before its
+  first write (#3143). On Linux, doctor's RAM headroom reads reclaimable memory from the
+  platform (#3281).
+- The fleet listener closes without a reset, so a refusal sent before the body is read reaches
+  the sender.
+- Viewer: a replayed record reads its age at the playhead (#2880); the mission header shows the
+  runs board's status (#2868); a dispatch or mission page claims nothing until its subject
+  resolves (#2284); the static demo's Machine info trigger renders (#2648); the mission graph
+  no longer retries a mission that does not exist.
+- `/runs` parses only the flow bytes appended since its last read (#2891).
+- Review: the scope line and the crawl summary use one word per step ending (#2594).
+- A test build never writes the audit chain outside its temp dir (#2730).
+- Runtime: rustls-webpki 0.103.16 and webpki-roots 1.0.10 (RUSTSEC-2026-0382, -0381).
 
 ## [5.3.0] - 2026-10-18
 
@@ -3757,6 +3795,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   does. `FLOW_SCHEMA_VERSION` unchanged at 1.52.0; `RULES_SCHEMA_VERSION`
   unchanged at 3.0.0.
 
+[5.4.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.4.0
 [5.3.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.3.0
 [5.2.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.2.0
 [5.1.1]: https://github.com/kstrat2001/darkmux/releases/tag/v5.1.1
