@@ -27,9 +27,19 @@ pub struct Stream {
     /// Answer chars this stream produced (`model.partial` restarts its
     /// cumulative count with every stream).
     pub content_chars: u64,
+    /// The clock of the stream's first output: the first `model.partial`
+    /// carrying anything (answer, reasoning or a tool call). The stream opens
+    /// before the request is sent, so the gap is prefill plus transport.
+    pub first_output_ms: Option<u64>,
 }
 
 impl Stream {
+    /// Time to first token: from the stream's start to its first output;
+    /// `None` when it produced none.
+    pub fn first_output_after_ms(&self) -> Option<u64> {
+        self.first_output_ms.map(|t| t.saturating_sub(self.start_ms))
+    }
+
     /// Generation time of a closed stream; 0 while open.
     pub fn ms(&self) -> u64 {
         match self.end_ms {
@@ -141,6 +151,9 @@ pub struct TrajectoryFold {
     pub estimated_completion_tokens: u64,
     pub turn_detail: BTreeMap<u64, TurnDetail>,
     pub streams: Vec<Stream>,
+    /// The largest `prompt_tokens` any one call reported: the context the
+    /// run used at its fullest. `None` when no call reported one.
+    pub prompt_tokens_peak: Option<u64>,
     compaction_events: u32,
     pub rests: Vec<RestTaken>,
     pub tools: Vec<ToolTaken>,
@@ -207,6 +220,7 @@ impl TrajectoryFold {
                 start_ms: s.ts,
                 end_ms: None,
                 content_chars: 0,
+                first_output_ms: None,
             }),
             E::StreamingEnd(s) => {
                 // The most recent OPEN stream on this seq: an aborted turn is
@@ -218,7 +232,17 @@ impl TrajectoryFold {
                     open.end_ms = Some(s.ts);
                 }
             }
-            E::Partial(p) => self.partial(p.seq, p.cumulative_chars),
+            E::Partial(p) => {
+                self.partial(p.seq, p.cumulative_chars);
+                // An older runtime sends no `generated_chars`; its answer
+                // chars are then the only output it can show.
+                let produced = p.generated_chars.unwrap_or(p.cumulative_chars) > 0 || p.delta_chars > 0 || p.tool_calls_present;
+                if produced {
+                    if let Some(s) = self.streams.iter_mut().rev().find(|s| s.seq == p.seq) {
+                        s.first_output_ms.get_or_insert(p.ts);
+                    }
+                }
+            }
             E::Reasoning(r) => {
                 let t = self.turn_detail.entry(r.seq).or_default();
                 t.reasoning_chars = t.reasoning_chars.saturating_add(r.reasoning_chars);
@@ -302,6 +326,9 @@ impl TrajectoryFold {
         self.turn_seqs.insert(seq);
         self.model_calls = self.model_calls.saturating_add(1);
         self.tokens.add(&counts);
+        if let Some(p) = counts.prompt {
+            self.prompt_tokens_peak = Some(self.prompt_tokens_peak.map_or(p, |m| m.max(p)));
+        }
         if !counts.reported() {
             self.unreported_calls = self.unreported_calls.saturating_add(1);
         }

@@ -513,3 +513,47 @@ fn every_event_type_reports_its_turn_and_clock() {
     }
     assert_eq!((TrajectoryEvent::Unknown.seq(), TrajectoryEvent::Unknown.ts()), (None, None));
 }
+
+/// (Kain, 2026-10-23) Time to first token: the stream opens before the
+/// request is sent, so the gap to its first output is the prompt's
+/// processing (prefill) plus transport. A chunk that carries nothing (a
+/// role-only first delta) is not output; reasoning and a tool call being
+/// written are.
+#[test]
+fn a_stream_marks_its_first_output_not_its_first_chunk() {
+    let f = fold(&[
+        r#"{"type":"model.streaming.start","seq":1,"ts":1000}"#,
+        r#"{"type":"model.partial","seq":1,"ts":1200,"cumulative_chars":0,"delta_chars":0,"generated_chars":0}"#,
+        r#"{"type":"model.partial","seq":1,"ts":9000,"cumulative_chars":0,"delta_chars":0,"generated_chars":3}"#,
+        r#"{"type":"model.partial","seq":1,"ts":9500,"cumulative_chars":40,"delta_chars":40,"generated_chars":60}"#,
+        r#"{"type":"model.streaming.end","seq":1,"ts":12000}"#,
+        r#"{"type":"model.streaming.start","seq":2,"ts":20000}"#,
+        r#"{"type":"model.partial","seq":2,"ts":20400,"cumulative_chars":0,"tool_calls_present":true}"#,
+        r#"{"type":"model.streaming.end","seq":2,"ts":21000}"#,
+        r#"{"type":"model.streaming.start","seq":3,"ts":30000}"#,
+        r#"{"type":"model.partial","seq":3,"ts":30300,"cumulative_chars":5}"#,
+        r#"{"type":"model.streaming.end","seq":3,"ts":31000}"#,
+        r#"{"type":"model.streaming.start","seq":4,"ts":40000}"#,
+        r#"{"type":"model.streaming.end","seq":4,"ts":41000}"#,
+    ]);
+    let first: Vec<Option<u64>> = f.streams.iter().map(Stream::first_output_after_ms).collect();
+    assert_eq!(
+        first,
+        vec![Some(8000), Some(400), Some(300), None],
+        "reasoning counts; a tool call counts; an old runtime's answer chars count; no output is unknown"
+    );
+}
+
+/// The largest prompt any one call sent: how much of the window the run
+/// used at its fullest. A call that reported no prompt count adds nothing.
+#[test]
+fn the_context_peak_is_the_largest_prompt_of_any_call() {
+    let f = fold(&[
+        r#"{"type":"model.completed","seq":1,"usage":{"prompt_tokens":6362,"completion_tokens":10}}"#,
+        r#"{"type":"model.completed","seq":2,"usage":{"prompt_tokens":48211,"completion_tokens":10}}"#,
+        r#"{"type":"model.completed","seq":3,"usage":{"prompt_tokens":9000,"completion_tokens":10}}"#,
+        r#"{"type":"model.completed","seq":4}"#,
+    ]);
+    assert_eq!(f.prompt_tokens_peak, Some(48211), "after a compaction the prompt shrinks; the peak stays");
+    assert_eq!(fold(&[r#"{"type":"model.completed","seq":1}"#]).prompt_tokens_peak, None);
+}

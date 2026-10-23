@@ -62,7 +62,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// Data-shape semver for [`RunStats`], per the repo's additive-minor rule.
-pub const RUN_STATS_SCHEMA_VERSION: &str = "2.2.0";
+pub const RUN_STATS_SCHEMA_VERSION: &str = "2.3.0";
 
 use darkmux_trajectory::DEGENERATE_TAIL_RATIO;
 
@@ -293,6 +293,24 @@ pub struct RunStats {
     /// execution and rest, and dividing by it understates the engine by
     /// however tool-heavy the task happened to be.
     pub tok_per_s: Option<f64>,
+    /// (2.3.0) Billed tokens over billed generation seconds AFTER each
+    /// stream's first output: `tok_per_s` with the prompt's processing
+    /// (prefill) left out, so a long prompt does not read as slow
+    /// generation. `None` when any billed, finished stream has no
+    /// first-output mark, since its split is then unknown.
+    pub decode_tok_per_s: Option<f64>,
+    /// (2.3.0) The billed streams' summed wait for their first output, the
+    /// time `decode_tok_per_s` leaves out; `None` on the same terms.
+    pub prefill_ms_billed: Option<u64>,
+    /// (2.3.0) Time to first token, median and max over the billed streams
+    /// that produced output: the prompt's processing plus transport, since
+    /// a stream opens before its request is sent.
+    pub first_token_ms_median: Option<u64>,
+    pub first_token_ms_max: Option<u64>,
+    /// (2.3.0) The largest prompt any one call sent, in tokens: the context
+    /// the run used at its fullest. Compaction shrinks the prompt; this is
+    /// the high-water mark.
+    pub context_peak_tokens: Option<u64>,
     /// The THINKING channel's rate, over every stream. Immune to the billing
     /// gap, and not a measure of answer output.
     pub reasoning_chars_per_s: Option<f64>,
@@ -921,6 +939,11 @@ pub(crate) fn derive_stats(
         billed_gen_fraction: (billing.gen_ms_all > 0)
             .then(|| round(billing.gen_ms_billed as f64 / billing.gen_ms_all as f64, 2)),
         tok_per_s: rate(completion_tokens, billing.gen_ms_billed),
+        decode_tok_per_s: billing.prefill_ms_billed.and_then(|p| rate(completion_tokens, billing.gen_ms_billed.saturating_sub(p))),
+        prefill_ms_billed: billing.prefill_ms_billed,
+        first_token_ms_median: median_ms(&billing.first_token_ms),
+        first_token_ms_max: billing.first_token_ms.iter().copied().max(),
+        context_peak_tokens: fold.prompt_tokens_peak,
         reasoning_chars_per_s: rate(reasoning_chars, billing.gen_ms_all),
         gates: Gates {
             stream: StreamGate {
@@ -970,6 +993,18 @@ pub(crate) fn derive_stats(
     }
 }
 
+/// The median of `ms`, rounded down to a whole ms; `None` when empty.
+fn median_ms(ms: &[u64]) -> Option<u64> {
+    let mut v = ms.to_vec();
+    v.sort_unstable();
+    let mid = v.len() / 2;
+    match v.len() {
+        0 => None,
+        n if n % 2 == 1 => Some(v[mid]),
+        _ => Some((v[mid - 1] + v[mid]) / 2),
+    }
+}
+
 /// `n` per second over `ms`, to one decimal; `None` when either is zero.
 fn rate(n: u64, ms: u64) -> Option<f64> {
     (ms > 0 && n > 0).then(|| round(n as f64 / (ms as f64 / 1000.0), 1))
@@ -989,6 +1024,10 @@ struct StreamBilling {
     gen_ms_all: u64,
     gen_ms_billed: u64,
     unterminated: usize,
+    /// Each billed stream's wait for its first output, where it has one.
+    first_token_ms: Vec<u64>,
+    /// Their sum, when every billed, finished stream has one.
+    prefill_ms_billed: Option<u64>,
 }
 
 impl StreamBilling {
@@ -1020,7 +1059,14 @@ impl StreamBilling {
         let gen_ms_all = streams.iter().map(|s| s.ms()).sum();
         let gen_ms_billed = streams.iter().enumerate().filter(|(i, _)| !unbilled.contains(i)).map(|(_, s)| s.ms()).sum();
         let unterminated = streams.iter().filter(|s| s.end_ms.is_none()).count();
-        Self { unbilled, frames_match, gen_ms_all, gen_ms_billed, unterminated }
+        let billed_closed: Vec<_> =
+            streams.iter().enumerate().filter(|(i, s)| !unbilled.contains(i) && s.end_ms.is_some()).map(|(_, s)| s).collect();
+        // A first output after the stream's end is clock skew, not a wait.
+        let wait = |s: &darkmux_trajectory::Stream| s.first_output_after_ms().map(|w| w.min(s.ms()));
+        let first_token_ms: Vec<u64> = billed_closed.iter().filter_map(|s| wait(s)).collect();
+        let prefill_ms_billed =
+            (!billed_closed.is_empty() && first_token_ms.len() == billed_closed.len()).then(|| first_token_ms.iter().sum());
+        Self { unbilled, frames_match, gen_ms_all, gen_ms_billed, unterminated, first_token_ms, prefill_ms_billed }
     }
 }
 

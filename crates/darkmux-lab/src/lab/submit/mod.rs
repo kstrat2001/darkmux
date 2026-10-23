@@ -396,6 +396,16 @@ pub fn detail_from(manifest: &Value, stats: &Value, names: &[String]) -> Value {
         "thermalStates": host(thermal.filter(|t| !t.is_empty()).map_or(Value::Null, Value::Object)),
         "cpuSpeedLimitMinPct": host(count(s("cpu_speed_limit_min"))),
         "throttledSamples": host(count(s("throttled_samples"))),
+        // (5.5.0) The model's side of the run, beside the machine's: how often
+        // the context was compacted, how full it got, how long each call
+        // waited for its first token (prefill), and generation speed with
+        // that wait left out. New keys in detail need no site deploy first
+        // (darklyenergized#316): the site keeps a number it does not know yet.
+        "compactions": count(s("compactions")),
+        "contextPeakTokens": count(s("context_peak_tokens")),
+        "firstTokenMsMedian": count(s("first_token_ms_median")),
+        "firstTokenMsMax": count(s("first_token_ms_max")),
+        "decodeTokensPerSecond": measure(s("decode_tok_per_s"), 100_000.0),
         "verify": verify_detail_from(manifest, names),
     })
 }
