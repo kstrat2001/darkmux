@@ -9,15 +9,24 @@
 //! darkmux never decides that two spellings are the same.
 //!
 //! An expected value is one of:
-//! - a string, number, boolean or null: equal to the reply's value;
+//! - a string, boolean or null: equal to the reply's value;
+//! - a number: the same number (`1` and `1.0` are one value);
 //! - `{"anyOf": [v, ...]}`: any one of the listed values;
 //! - `{"includes": [v, ...]}`: a list holding each listed item, extras allowed;
+//! - `{"items": [v, ...], "optional": [v, ...]}`: a list holding each of
+//!   `items`, and otherwise only entries of `optional` (each at most once):
+//!   answers that are true but were not asked for, such as a free offer
+//!   listed among prices;
 //! - a plain list: a list holding exactly these items, in any order;
 //! - any other object: an object whose listed keys each match (keys the
 //!   expected object does not list are not checked).
 //!
-//! A one-key object named `anyOf` or `includes` is always read as the
-//! keyword, so a field of that name cannot be expected inside a value.
+//! In `includes` and `items`/`optional`, each entry takes its own reply item,
+//! so one reply item never satisfies two entries.
+//!
+//! A one-key object named `anyOf` or `includes`, and a two-key object of
+//! `items` and `optional`, are always read as the keyword, so fields of those
+//! names cannot be expected inside a value.
 //!
 //! The verdict is all or nothing (every top-level field matches); the count
 //! of fields right out of fields expected is recorded beside it, the same
@@ -104,16 +113,8 @@ fn first_object(reply: &str) -> Result<Map<String, Value>, String> {
 }
 
 fn matches(want: &Value, got: Option<&Value>) -> bool {
-    if let Some(alts) = keyword_list(want, "anyOf") {
-        return alts.iter().any(|alt| matches(alt, got));
-    }
-    if let Some(items) = keyword_list(want, "includes") {
-        let Some(Value::Array(have)) = got else {
-            return false;
-        };
-        return items
-            .iter()
-            .all(|item| have.iter().any(|h| matches(item, Some(h))));
+    if let Some(verdict) = keyword_match(want, got) {
+        return verdict;
     }
     let Some(got) = got else { return false };
     match (want, got) {
@@ -122,9 +123,27 @@ fn matches(want: &Value, got: Option<&Value>) -> bool {
             w.len() == g.len() && pair_off(w, g, &mut vec![false; g.len()])
         }
         (Value::Object(w), Value::Object(g)) => w.iter().all(|(k, v)| matches(v, g.get(k))),
-        (Value::Array(_) | Value::Object(_) | Value::String(_), _) => false,
+        (Value::Number(w), Value::Number(g)) => w.as_f64() == g.as_f64(),
+        (Value::Array(_) | Value::Object(_) | Value::String(_) | Value::Number(_), _) => false,
         (w, g) => w == g,
     }
+}
+
+/// The verdict of an expected value written as a keyword (`anyOf`,
+/// `includes`, `items`/`optional`); `None` for any other value.
+fn keyword_match(want: &Value, got: Option<&Value>) -> Option<bool> {
+    if let Some(alts) = keyword_list(want, "anyOf") {
+        return Some(alts.iter().any(|alt| matches(alt, got)));
+    }
+    let have = match got {
+        Some(Value::Array(have)) => Some(have),
+        _ => None,
+    };
+    if let Some(items) = keyword_list(want, "includes") {
+        return Some(have.is_some_and(|have| pair_off(items, have, &mut vec![false; have.len()])));
+    }
+    let (items, optional) = items_and_optional(want)?;
+    Some(have.is_some_and(|have| pair_with_optional(items, optional, have, &mut vec![false; have.len()])))
 }
 
 /// `{"<keyword>": [...]}` and nothing else.
@@ -133,6 +152,52 @@ fn keyword_list<'a>(want: &'a Value, keyword: &str) -> Option<&'a Vec<Value>> {
         Value::Object(o) if o.len() == 1 => o.get(keyword)?.as_array(),
         _ => None,
     }
+}
+
+/// `{"items": [...], "optional": [...]}` and nothing else.
+fn items_and_optional(want: &Value) -> Option<(&Vec<Value>, &Vec<Value>)> {
+    match want {
+        Value::Object(o) if o.len() == 2 => Some((o.get("items")?.as_array()?, o.get("optional")?.as_array()?)),
+        _ => None,
+    }
+}
+
+/// Each required item matched to its own reply item, then every reply item
+/// left over matched to its own optional entry. Backtracks over the required
+/// pairing too: a reply item a required `anyOf` took may be the only one an
+/// optional entry could cover.
+fn pair_with_optional(items: &[Value], optional: &[Value], got: &[Value], used: &mut Vec<bool>) -> bool {
+    let Some((first, rest)) = items.split_first() else {
+        let left: Vec<&Value> = got.iter().zip(used.iter()).filter(|(_, u)| !**u).map(|(g, _)| g).collect();
+        return cover(&left, optional, &mut vec![false; optional.len()]);
+    };
+    for i in 0..got.len() {
+        if !used[i] && matches(first, Some(&got[i])) {
+            used[i] = true;
+            if pair_with_optional(rest, optional, got, used) {
+                return true;
+            }
+            used[i] = false;
+        }
+    }
+    false
+}
+
+/// Whether each reply item can be matched to its own optional entry.
+fn cover(left: &[&Value], optional: &[Value], taken: &mut Vec<bool>) -> bool {
+    let Some((first, rest)) = left.split_first() else {
+        return true;
+    };
+    for j in 0..optional.len() {
+        if !taken[j] && matches(&optional[j], Some(first)) {
+            taken[j] = true;
+            if cover(rest, optional, taken) {
+                return true;
+            }
+            taken[j] = false;
+        }
+    }
+    false
 }
 
 /// Whether each expected item can be matched to its own reply item. Small
@@ -226,6 +291,48 @@ mod tests {
     }
 
     #[test]
+    fn includes_needs_its_own_reply_item_for_each_listed_item() {
+        let e = expect(json!({"services": {"includes": ["Tune-ups", {"anyOf": ["Basic tune-up", "Tune-ups"]}]}}));
+        assert!(!grade(&e, r#"{"services": ["Tune-ups"]}"#).passed());
+        assert!(grade(&e, r#"{"services": ["Tune-ups", "Basic tune-up", "Bike fit"]}"#).passed());
+        let twice = expect(json!({"x": {"includes": ["a", "a"]}}));
+        assert!(!grade(&twice, r#"{"x": ["a"]}"#).passed());
+        assert!(grade(&twice, r#"{"x": ["a", "b", "a"]}"#).passed());
+    }
+
+    #[test]
+    fn optional_items_may_appear_and_nothing_else_may() {
+        let e = expect(json!({"prices": {
+            "items": [{"price": "$79"}, {"price": "$15"}],
+            "optional": [{"price": "Free"}, {"price": {"anyOf": ["Call for a quote", "Varies"]}}]
+        }}));
+        // The required items alone, in any order.
+        assert!(grade(&e, r#"{"prices": [{"price": "$15"}, {"price": "$79"}]}"#).passed());
+        // Plus any of the optional ones.
+        assert!(grade(&e, r#"{"prices": [{"price": "$79"}, {"price": "Free"}, {"price": "$15"}, {"price": "Varies"}]}"#).passed());
+        // An item that is neither fails the field.
+        assert!(!grade(&e, r#"{"prices": [{"price": "$79"}, {"price": "$15"}, {"price": "$5"}]}"#).passed());
+        // A missing required item fails it, however many optional ones are there.
+        assert!(!grade(&e, r#"{"prices": [{"price": "$79"}, {"price": "Free"}]}"#).passed());
+        // Each optional entry is used once: a repeat is an item it does not cover.
+        assert!(!grade(&e, r#"{"prices": [{"price": "$79"}, {"price": "$15"}, {"price": "Free"}, {"price": "Free"}]}"#).passed());
+        assert!(!grade(&e, r#"{"prices": "Free"}"#).passed());
+    }
+
+    #[test]
+    fn optional_pairing_backtracks_over_the_required_items_too() {
+        // "a" must go to the optional entry, "b" to the required anyOf.
+        let e = expect(json!({"x": {"items": [{"anyOf": ["a", "b"]}], "optional": ["a"]}}));
+        assert!(grade(&e, r#"{"x": ["a", "b"]}"#).passed());
+        // A reply item a failed try took is free again, so it still counts.
+        let none = expect(json!({"x": {"items": [{"anyOf": ["a", "b"]}], "optional": []}}));
+        assert!(!grade(&none, r#"{"x": ["a", "b"]}"#).passed());
+        // Leftover items backtrack over the optional entries as well.
+        let opt = expect(json!({"x": {"items": [], "optional": [{"anyOf": ["a", "b"]}, "a"]}}));
+        assert!(grade(&opt, r#"{"x": ["a", "b"]}"#).passed());
+    }
+
+    #[test]
     fn list_items_can_list_their_own_accepted_spellings() {
         // Case is the fixture's call, made in its data: here either casing counts.
         let e = expect(json!({"services": [{"anyOf": ["Tune-up", "tune-up"]}, "Flat repair"]}));
@@ -269,6 +376,11 @@ mod tests {
             grade(&expect(json!({"none": null})), "{}").missed,
             vec!["none"]
         );
+        // A number is its value, however the JSON spells it.
+        let one = expect(json!({"n": 1}));
+        assert!(grade(&one, r#"{"n": 1.0}"#).passed());
+        assert!(!grade(&one, r#"{"n": 1.5}"#).passed());
+        assert!(grade(&expect(json!({"n": 0.5})), r#"{"n": 5e-1}"#).passed());
     }
 
     #[test]

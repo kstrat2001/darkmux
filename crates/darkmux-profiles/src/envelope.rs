@@ -52,7 +52,7 @@ mod tests {
     use super::*;
 
     fn pm(id: &str, ident: Option<&str>) -> ProfileModel {
-        ProfileModel {
+        ProfileModel { max_output_tokens: None,
             endpoint: None,
             extras: Default::default(),
             id: id.to_string(),

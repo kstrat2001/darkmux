@@ -77,10 +77,15 @@ impl WorkloadProvider for PromptProvider {
             None => None,
         };
         opts.max_completion_tokens = reply_room;
+        let system_chars = darkmux_crew::dispatch::one_call_context(&opts).ok().flatten().map_or(0, |c| c.system_prompt_chars);
         let (dispatched, out_dir) = dispatch_via_internal(opts)?;
         preserve_trajectory(out_dir.as_deref(), run_dir);
-        // The container path mounts a bookkeeping dir; the one-call path has none.
+        // The container path mounts a bookkeeping dir; the one-call path has
+        // none, and its trajectory is the one call's own counts.
         let one_call = out_dir.is_none();
+        if one_call {
+            write_one_call_trajectory(&dispatched.stdout, system_chars, prompt.chars().count(), run_dir, now_ms());
+        }
         finish_run(
             &FinishInputs {
                 loaded,
@@ -290,7 +295,15 @@ fn reply_room_for(ctx: Option<darkmux_crew::dispatch::OneCallContext>, prompt: &
             ctx.model
         )
     })?;
-    Ok(Some(reply_room_from(n_ctx, ctx.system_prompt_bytes + prompt.len(), workload_id)?))
+    let room = reply_room_from(n_ctx, ctx.system_prompt_bytes + prompt.len(), workload_id)?;
+    match ctx.max_output_tokens {
+        Some(max) if max < REPLY_ROOM_MIN_TOKENS => Err(anyhow!(
+            "workload \"{workload_id}\": model `{}` declares max_output_tokens {max}, below the {REPLY_ROOM_MIN_TOKENS} a reply needs",
+            ctx.model
+        )),
+        Some(max) => Ok(Some(room.min(max))),
+        None => Ok(Some(room)),
+    }
 }
 
 /// The host has no tokenizer, so the prompt is over-counted at one token per
@@ -328,6 +341,40 @@ fn preserve_trajectory(out_dir: Option<&Path>, run_dir: &Path) {
     if let Some(out) = out_dir {
         crate::providers::coding_task::preserve_runtime_artifacts(out, run_dir, &["trajectory.jsonl"]);
     }
+}
+
+/// The trajectory of a one-call run, which has no runtime to write one: a
+/// header, the call's start, its one `model.completed` with the usage the
+/// endpoint reported, and its completion, all from the envelope the call
+/// returned (`DirectDispatchEnvelope`). The finish reason is not in that
+/// envelope, so it is left empty rather than guessed. A reply that is not
+/// that envelope writes nothing.
+fn write_one_call_trajectory(stdout: &str, system_chars: usize, prompt_chars: usize, run_dir: &Path, end_ms: u64) {
+    use darkmux_trajectory::event::{DispatchComplete, DispatchStart, Header, ModelCompleted, TrajectoryEvent};
+    let Ok(envelope) = serde_json::from_str::<serde_json::Value>(stdout) else { return };
+    let Some(metrics) = envelope.get("metrics") else { return };
+    let (Some(model), Some(wall_ms)) = (metrics.get("model").and_then(|v| v.as_str()), metrics.get("wall_ms").and_then(|v| v.as_u64())) else {
+        return;
+    };
+    let usage: darkmux_trajectory::usage::Usage = serde_json::from_value(metrics.clone()).unwrap_or_default();
+    let events = [
+        TrajectoryEvent::Header(Header { schema_version: darkmux_trajectory::TRAJECTORY_SCHEMA_VERSION.to_string() }),
+        TrajectoryEvent::DispatchStart(DispatchStart {
+            ts: end_ms.saturating_sub(wall_ms),
+            model: model.to_string(),
+            system_chars: system_chars as u64,
+            prompt_chars: prompt_chars as u64,
+            tools: Vec::new(),
+        }),
+        TrajectoryEvent::ModelCompleted(ModelCompleted { seq: 1, ts: end_ms, usage: Some(usage), ..Default::default() }),
+        TrajectoryEvent::DispatchComplete(DispatchComplete { ts: end_ms, result: "stop".to_string(), wall_ms, turn_delay_effective_ms: None }),
+    ];
+    let lines: Vec<String> = events.iter().filter_map(|e| serde_json::to_string(e).ok()).collect();
+    let _ = fs::write(run_dir.join(darkmux_trajectory::TRAJECTORY_FILE), lines.join("\n") + "\n");
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
 /// The lab's dispatch options for one prompt run.
@@ -758,11 +805,52 @@ mod tests {
     fn reply_room_follows_the_dispatchs_own_route() {
         use darkmux_crew::dispatch::OneCallContext;
         assert_eq!(reply_room_for(None, "x", "w").unwrap(), None, "the container path sends no cap");
-        let ctx = |n_ctx| Some(OneCallContext { model: "m".into(), n_ctx, system_prompt_bytes: 5_700 });
+        let ctx = |n_ctx| Some(OneCallContext { model: "m".into(), n_ctx, max_output_tokens: None, system_prompt_bytes: 5_700, system_prompt_chars: 5_700 });
         let err = reply_room_for(ctx(None), "x", "w").unwrap_err().to_string();
         assert!(err.contains("`m` declares no n_ctx"), "{err}");
         // "日本" is six bytes: two CJK characters are counted as two tokens.
         assert_eq!(reply_room_for(ctx(Some(16_384)), "日本", "w").unwrap(), Some(16_384 - 1_902 - REPLY_ROOM_OVERHEAD_TOKENS));
+    }
+
+    /// A model whose output limit is below what its window leaves gets its
+    /// output limit (a hosted Opus: 200K window, 128K output); one whose
+    /// limit is above it gets the window's remainder.
+    #[test]
+    fn reply_room_stops_at_the_models_output_limit() {
+        use darkmux_crew::dispatch::OneCallContext;
+        let ctx = |max| Some(OneCallContext { model: "m".into(), n_ctx: Some(200_000), max_output_tokens: max, system_prompt_bytes: 5_700, system_prompt_chars: 5_700 });
+        assert_eq!(reply_room_for(ctx(Some(128_000)), "x", "w").unwrap(), Some(128_000));
+        let room = 200_000 - 1_901 - REPLY_ROOM_OVERHEAD_TOKENS;
+        assert_eq!(reply_room_for(ctx(Some(250_000)), "x", "w").unwrap(), Some(room));
+        assert_eq!(reply_room_for(ctx(None), "x", "w").unwrap(), Some(room));
+        let err = reply_room_for(ctx(Some(0)), "x", "w").unwrap_err().to_string();
+        assert!(err.contains("declares max_output_tokens 0"), "{err}");
+    }
+
+    /// A one-call run writes the trajectory of its one call, from the counts
+    /// the call itself reported, so `run stats` and `lab submit` can read it.
+    #[test]
+    fn a_one_call_run_writes_the_trajectory_of_its_one_call() {
+        let tmp = TempDir::new().unwrap();
+        let stdout = serde_json::json!({"result": "stop", "final_assistant": "{}", "metrics": {
+            "model": "m", "endpoint": "e", "wall_ms": 13_100, "turns": 1,
+            "prompt_tokens": 6_000, "completion_tokens": 900, "total_tokens": 6_900}})
+        .to_string();
+        write_one_call_trajectory(&stdout, 5_700, 21_000, tmp.path(), 1_000_000);
+        let fold = crate::lab::inspect::checked_run_trajectory(tmp.path()).unwrap();
+        assert_eq!(fold.events, 3, "the header is a marker, not an event");
+        assert_eq!(fold.schema_version.as_deref(), Some(darkmux_trajectory::TRAJECTORY_SCHEMA_VERSION));
+        assert_eq!(fold.model_calls, 1);
+        assert_eq!(fold.frames, vec![Some(900)]);
+        let start = fold.start.as_ref().unwrap();
+        assert_eq!((start.model.as_str(), start.system_chars, start.prompt_chars, start.ts), ("m", 5_700, 21_000, 1_000_000 - 13_100));
+        let complete = fold.complete.as_ref().unwrap();
+        assert_eq!((complete.result.as_str(), complete.wall_ms), ("stop", 13_100));
+        crate::lab::stats::compute_from_dir(tmp.path(), &tmp.path().join("flows")).expect("the run's numbers can be read");
+        // A reply that is not the one-call envelope leaves no file to misread.
+        let other = TempDir::new().unwrap();
+        write_one_call_trajectory("plain text", 1, 1, other.path(), 1_000_000);
+        assert!(!other.path().join("trajectory.jsonl").exists());
     }
 
     /// The runtime's trajectory lands in the run dir, where `run stats` and

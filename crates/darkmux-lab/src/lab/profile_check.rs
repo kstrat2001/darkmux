@@ -106,7 +106,7 @@ mod tests {
     use darkmux_types::ProfileModel;
 
     fn pm(id: &str, n_ctx: u32) -> ProfileModel {
-        ProfileModel {
+        ProfileModel { max_output_tokens: None,
             endpoint: None,
             extras: Default::default(),
             id: id.to_string(),

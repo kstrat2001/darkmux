@@ -3243,7 +3243,9 @@ pub fn one_call_context(opts: &DispatchOpts) -> Result<Option<crate::dispatch::O
             Some(crate::dispatch::OneCallContext {
                 model: target.model.id.clone(),
                 n_ctx: target.model.n_ctx,
+                max_output_tokens: target.model.max_output_tokens,
                 system_prompt_bytes: system_prompt.len(),
+                system_prompt_chars: system_prompt.chars().count(),
             })
         }
         _ => None,

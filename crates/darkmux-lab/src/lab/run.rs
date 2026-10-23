@@ -188,23 +188,40 @@ fn apply_inject_context(
 
 /// The workload checks and edits that run before any run directory exists:
 /// refuse keys this provider would ignore, then splice an A/B context arm
-/// in front of the prompt, read from the bound fixture's checkout when the
-/// workload binds one.
-fn prepare_workload(
-    loaded: &mut crate::workloads::types::LoadedWorkload,
-    ctx: Option<&str>,
-    paths: &paths::DarkmuxPaths,
-) -> Result<()> {
+/// in front of the prompt, read from beside the workload document. A prompt
+/// workload that binds a fixture reads its `promptFile` from the run's copy
+/// of that fixture, which does not exist yet, so its splice waits for
+/// [`workload_for_run`].
+fn prepare_workload(loaded: &mut crate::workloads::types::LoadedWorkload, ctx: Option<&str>) -> Result<()> {
     refuse_keys_another_provider_ignores(loaded)?;
-    if !ctx.is_some_and(|c| !c.trim().is_empty()) {
-        return Ok(());
+    if !context_reads_the_run_copy(loaded) {
+        let base_dir = loaded.base_dir.clone();
+        apply_inject_context(loaded, ctx, &base_dir);
     }
-    let prompt_dir = match loaded.manifest.workload.requires_fixture {
-        Some(_) => resolve_source_sandbox(loaded, paths)?,
-        None => loaded.base_dir.clone(),
-    };
-    apply_inject_context(loaded, ctx, &prompt_dir);
     Ok(())
+}
+
+/// Whether a workload's prompt comes from its run's copy of a fixture.
+fn context_reads_the_run_copy(loaded: &crate::workloads::types::LoadedWorkload) -> bool {
+    let w = &loaded.manifest.workload;
+    w.provider == "prompt" && w.requires_fixture.is_some()
+}
+
+/// The workload one run dispatches: for a prompt workload bound to a
+/// fixture, with the A/B context spliced in front of the prompt file in that
+/// run's own sandbox (the copy whose hash the manifest records); otherwise
+/// the workload as prepared.
+fn workload_for_run<'a>(
+    loaded: &'a crate::workloads::types::LoadedWorkload,
+    ctx: Option<&str>,
+    sandbox: &Path,
+) -> std::borrow::Cow<'a, crate::workloads::types::LoadedWorkload> {
+    if !context_reads_the_run_copy(loaded) || !ctx.is_some_and(|c| !c.trim().is_empty()) {
+        return std::borrow::Cow::Borrowed(loaded);
+    }
+    let mut owned = loaded.clone();
+    apply_inject_context(&mut owned, ctx, sandbox);
+    std::borrow::Cow::Owned(owned)
 }
 
 pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
@@ -226,7 +243,7 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
     let mut loaded_workload = loaded?;
     let paths = paths::resolve(ResolveScope::ForceUser);
     paths::ensure(&paths)?;
-    prepare_workload(&mut loaded_workload, opts.inject_context.as_deref(), &paths)?;
+    prepare_workload(&mut loaded_workload, opts.inject_context.as_deref())?;
 
     let registry_loaded = load_registry(opts.config_path.as_deref())?;
     // (#2902) With no `--profile`, the run is on the profile bound to the
@@ -376,10 +393,11 @@ impl OneRun<'_> {
         sandbox: &Path,
         mut lifecycle: lifecycle::RunLifecycle,
     ) -> Result<ProviderRun> {
+        let workload = workload_for_run(self.workload, self.opts.inject_context.as_deref(), sandbox);
         let result = with_provider(&self.workload.manifest.workload.provider, |p| {
-            p.setup(self.workload, run_dir, sandbox)?;
+            p.setup(&workload, run_dir, sandbox)?;
             p.run(
-                self.workload,
+                &workload,
                 run_dir,
                 sandbox,
                 self.profile,
@@ -2265,6 +2283,36 @@ mod tests {
         };
         apply_inject_context(&mut w, Some("CTX"), &fixture);
         assert_eq!(w.manifest.workload.prompt.as_deref(), Some("CTX\n\nfrom the fixture"));
+    }
+
+    /// A prompt workload bound to a fixture splices the A/B context into the
+    /// run's own copy of the prompt file; any other workload splices it, as
+    /// before, from beside the workload document.
+    #[test]
+    fn the_context_arm_reads_the_run_copy_only_for_a_fixture_bound_prompt_workload() {
+        let tmp = TempDir::new().unwrap();
+        let (doc, sandbox) = (tmp.path().join("doc"), tmp.path().join("run/sandbox"));
+        std::fs::create_dir_all(&doc).unwrap();
+        std::fs::create_dir_all(&sandbox).unwrap();
+        std::fs::write(doc.join("in.txt"), "beside the document").unwrap();
+        std::fs::write(sandbox.join("in.txt"), "the run's copy").unwrap();
+        let load = |provider: &str| crate::workloads::types::LoadedWorkload {
+            manifest: serde_json::from_value(serde_json::json!({"workload": {"id": "w", "provider": provider,
+                "promptFile": "in.txt", "requires_fixture": "f@1.0"}}))
+            .unwrap(),
+            base_dir: doc.clone(),
+            source: crate::workloads::types::WorkloadSource::OnDisk,
+        };
+        let mut coding = load("coding-task");
+        prepare_workload(&mut coding, Some("CTX")).unwrap();
+        assert_eq!(coding.manifest.workload.prompt.as_deref(), Some("CTX\n\nbeside the document"));
+
+        let mut prompt = load("prompt");
+        prepare_workload(&mut prompt, Some("CTX")).unwrap();
+        assert_eq!(prompt.manifest.workload.prompt, None, "nothing to read until the run's copy exists");
+        let run = workload_for_run(&prompt, Some("CTX"), &sandbox);
+        assert_eq!(run.manifest.workload.prompt.as_deref(), Some("CTX\n\nthe run's copy"));
+        assert!(matches!(workload_for_run(&prompt, None, &sandbox), std::borrow::Cow::Borrowed(_)));
     }
 }
 

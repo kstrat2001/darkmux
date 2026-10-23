@@ -8210,7 +8210,7 @@
             extras: Default::default(),
             description: None,
             default_model: None,
-            models: vec![ProfileModel {
+            models: vec![ProfileModel { max_output_tokens: None,
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary".into(),
@@ -8252,7 +8252,7 @@
             extras: Default::default(),
             description: None,
             default_model: None,
-            models: vec![ProfileModel {
+            models: vec![ProfileModel { max_output_tokens: None,
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
@@ -8292,7 +8292,7 @@
             extras: Default::default(),
             description: None,
             default_model: None,
-            models: vec![ProfileModel {
+            models: vec![ProfileModel { max_output_tokens: None,
                 endpoint: Some(ModelEndpoint {
                     url: Some("https://example.azure.com/openai".into()),
                     ..Default::default()
@@ -8381,7 +8381,7 @@
             extras: Default::default(),
             description: None,
             default_model: None,
-            models: vec![ProfileModel {
+            models: vec![ProfileModel { max_output_tokens: None,
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
@@ -8417,7 +8417,7 @@
             extras: Default::default(),
             description: None,
             default_model: None,
-            models: vec![ProfileModel {
+            models: vec![ProfileModel { max_output_tokens: None,
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
@@ -8467,7 +8467,7 @@
             extras: Default::default(),
             description: None,
             default_model: None,
-            models: vec![ProfileModel {
+            models: vec![ProfileModel { max_output_tokens: None,
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
@@ -8521,7 +8521,7 @@
             extras: Default::default(),
             description: None,
             default_model: None,
-            models: vec![ProfileModel {
+            models: vec![ProfileModel { max_output_tokens: None,
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
@@ -8563,7 +8563,7 @@
             extras: Default::default(),
             description: None,
             default_model: None,
-            models: vec![ProfileModel {
+            models: vec![ProfileModel { max_output_tokens: None,
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
@@ -8619,7 +8619,7 @@
             extras: Default::default(),
             description: None,
             default_model: None,
-            models: vec![ProfileModel {
+            models: vec![ProfileModel { max_output_tokens: None,
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
@@ -8656,7 +8656,7 @@
             extras: Default::default(),
             description: None,
             default_model: None,
-            models: vec![ProfileModel {
+            models: vec![ProfileModel { max_output_tokens: None,
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
@@ -15240,7 +15240,7 @@
             extras: Default::default(),
             description: None,
             default_model: None,
-            models: vec![ProfileModel {
+            models: vec![ProfileModel { max_output_tokens: None,
                 endpoint: None,
                 extras: Default::default(),
                 id: bare_key.into(),
@@ -15635,7 +15635,7 @@ fn dispatch_wire_model_id_namespaces_a_plain_profile_model() {
         extras: Default::default(),
         description: None,
         default_model: None,
-        models: vec![ProfileModel {
+        models: vec![ProfileModel { max_output_tokens: None,
             endpoint: None,
             extras: Default::default(),
             id: "qwen3-4b-instruct-2507".into(),
@@ -15663,7 +15663,7 @@ fn dispatch_wire_model_id_passes_through_an_explicit_identifier() {
         extras: Default::default(),
         description: None,
         default_model: None,
-        models: vec![ProfileModel {
+        models: vec![ProfileModel { max_output_tokens: None,
             endpoint: None,
             extras: Default::default(),
             id: "qwen3-4b-instruct-2507".into(),

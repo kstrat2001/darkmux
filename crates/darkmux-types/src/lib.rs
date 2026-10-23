@@ -219,6 +219,13 @@ pub struct ProfileModel {
     /// contract, #1269).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub n_ctx: Option<u32>,
+    /// The most output tokens the model may return in one reply, when the
+    /// provider sets a limit below the window (a hosted Opus: 128K output on a
+    /// 200K window). Declared, like an endpoint model's `n_ctx`: darkmux never
+    /// guesses it. A prompt workload's `replyRoom: "context"` asks for no more
+    /// than this, since a provider refuses a request above it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identifier: Option<String>,
     /// Capability vector — what kinds of work this model is good at, and
@@ -1250,7 +1257,7 @@ mod tests {
 
     #[test]
     fn profile_model_round_trips() {
-        let m = ProfileModel {
+        let m = ProfileModel { max_output_tokens: None,
             endpoint: None,
             id: "x".to_string(),
             n_ctx: Some(32_000),
@@ -1267,7 +1274,7 @@ mod tests {
 
     #[test]
     fn profile_model_omits_none_identifier() {
-        let m = ProfileModel {
+        let m = ProfileModel { max_output_tokens: None,
             endpoint: None,
             id: "x".to_string(),
             n_ctx: Some(1024),

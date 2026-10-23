@@ -801,8 +801,13 @@ pub struct OneCallContext {
     pub model: String,
     /// The window the profile declares for that model, when it declares one.
     pub n_ctx: Option<u32>,
+    /// The most output tokens the profile says that model may return in one
+    /// reply, when it says.
+    pub max_output_tokens: Option<u32>,
     /// The system prompt the call would send, in UTF-8 bytes.
     pub system_prompt_bytes: usize,
+    /// The same system prompt, in characters.
+    pub system_prompt_chars: usize,
 }
 
 /// (#1698 Packet B2 gate) True when a dispatch with this (role, profile)
