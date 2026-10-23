@@ -124,9 +124,15 @@ pub(crate) fn cow_clone_dir_excluding(
     cow_clone_dir(src, dst)?; // existing clonefile/reflink copy (verbatim, fast)
     for name in exclude_dir_names {
         let p = dst.join(name);
-        if p.exists() {
-            std::fs::remove_dir_all(&p)
-                .with_context(|| format!("pruning artifact dir from clone: {}", p.display()))?;
+        // An artifact name can be a file too (`.coverage`); a link is removed
+        // as a link.
+        if let Ok(meta) = std::fs::symlink_metadata(&p) {
+            if meta.is_dir() {
+                std::fs::remove_dir_all(&p)
+            } else {
+                std::fs::remove_file(&p)
+            }
+            .with_context(|| format!("pruning artifact dir from clone: {}", p.display()))?;
         }
     }
     Ok(())

@@ -55,7 +55,7 @@ const DEFAULT_SUITE_TIMEOUT_SECONDS: u64 = 120;
 /// Everything one grading reads. Nothing here is written to.
 pub(crate) struct GradeInput<'a> {
     pub spec: &'a GradeSpec,
-    /// The workload's prompt, as the model was given it (placeholders unexpanded).
+    /// The prompt as the model was given it (placeholders expanded).
     pub prompt: &'a str,
     /// The pristine fixture the run started from.
     pub fixture: &'a Path,
@@ -64,6 +64,8 @@ pub(crate) struct GradeInput<'a> {
     pub dispatch: &'a DispatchEnd,
     /// The model's final reply, when there was one.
     pub reply: Option<&'a str>,
+    /// How the runtime says the dispatch ended (its envelope's `result`).
+    pub result_kind: Option<&'a str>,
     /// The fixture's `baseline.test_count`, when it declares one.
     pub baseline_test_count: Option<u64>,
     /// An empty scratch directory the grader may fill.
@@ -106,7 +108,7 @@ pub(crate) fn grade(input: &GradeInput) -> Result<GradeRecord> {
     check_asks(input.spec, input.prompt)?;
     let changes = files::compare(input.fixture, input.result)?;
     let copies = Copies::new(input.work);
-    let mut checks = vec![run_finished(input.dispatch)];
+    let mut checks = vec![run_finished(input.dispatch, input.result_kind)];
     checks.extend(scope_row(input, &changes));
     let suite = match &input.spec.suite {
         Some(spec) => Some(suite_row(input, spec, &copies)?),
@@ -127,7 +129,7 @@ pub(crate) fn grade(input: &GradeInput) -> Result<GradeRecord> {
         passed: checks.iter().all(|c| c.passed),
         checks,
         tests_passed: run.and_then(|(_, run)| run.counts.as_ref().map(|c| c.passed())),
-        ungraded_passed: None,
+        ..Default::default()
     })
 }
 
@@ -149,6 +151,9 @@ fn suite_row<'s>(
     copies: &Copies,
 ) -> Result<(GradeCheck, SuiteRun, &'s SuiteGrade)> {
     let before = run_suite(spec, input.fixture, &copies.fresh()?)?;
+    if before.counts.is_none() {
+        bail!("the fixture's own suite run left no readable report: cannot tell which tests must still pass");
+    }
     let run = run_suite(spec, input.result, &copies.fresh()?)?;
     let check = suite_check(spec, &run, &before, input.baseline_test_count)?;
     Ok((check, run, spec))
@@ -190,7 +195,7 @@ fn style_row(input: &GradeInput, changes: &files::Changes) -> Result<Option<Grad
     Ok(Some(row(
         "style",
         &style.asks,
-        files::style_violations(changes, input.result, style)?,
+        files::style_violations(changes, style)?,
         "every new file matches",
     )))
 }
@@ -253,8 +258,11 @@ fn check_asks(spec: &GradeSpec, prompt: &str) -> Result<()> {
         }
     }
     for (check, asks) in declared {
-        if asks.iter().all(|a| a.trim().is_empty()) {
+        if asks.is_empty() {
             bail!("verify.grade.{check} quotes no prompt sentence: every graded check names what the prompt asks");
+        }
+        if asks.iter().any(|a| a.trim().is_empty()) {
+            bail!("verify.grade.{check} quotes an empty sentence: every quote is a sentence the prompt holds");
         }
         if let Some(missing) = asks.iter().find(|a| !prompt.contains(a.as_str())) {
             bail!("verify.grade.{check} quotes \"{missing}\", which is not in the prompt word for word");
@@ -263,17 +271,31 @@ fn check_asks(spec: &GradeSpec, prompt: &str) -> Result<()> {
     Ok(())
 }
 
-fn run_finished(dispatch: &DispatchEnd) -> GradeCheck {
-    let problems = match dispatch {
-        DispatchEnd::Completed => vec![],
-        DispatchEnd::Escalated { reason } => vec![format!(
+/// Finished means the model stopped on its own: the dispatch completed AND
+/// the runtime's envelope says `stop`. A turn limit or a missing envelope is
+/// not a finish, though the dispatch may exit cleanly on either.
+fn run_finished(dispatch: &DispatchEnd, result_kind: Option<&str>) -> GradeCheck {
+    let problems = match (dispatch, result_kind) {
+        (DispatchEnd::Escalated { reason }, _) => vec![format!(
             "the dispatch escalated ({reason}) before finishing"
         )],
-        DispatchEnd::Failed => vec![
+        (DispatchEnd::Failed, _) => vec![
             "the dispatch did not complete (an error, a crash or a limit cut it off)".to_string(),
         ],
+        (DispatchEnd::Completed, Some("stop")) => vec![],
+        (DispatchEnd::Completed, Some(other)) => vec![format!(
+            "the dispatch ended with `{other}`, not a stop of the model's own"
+        )],
+        (DispatchEnd::Completed, None) => {
+            vec!["no runtime envelope says how the dispatch ended".to_string()]
+        }
     };
-    row("run_finished", &[], problems, "the dispatch completed")
+    row(
+        "run_finished",
+        &[],
+        problems,
+        "the model stopped on its own",
+    )
 }
 
 /// One check row: passed when there are no problems.
@@ -287,6 +309,7 @@ fn row(id: &str, asks: &[String], problems: Vec<String>, ok: &str) -> GradeCheck
             problems.join("; ")
         },
         asks: asks.to_vec(),
+        ..Default::default()
     }
 }
 
@@ -348,6 +371,7 @@ fn copy_into(source: &Path, at: &Path) -> Result<PathBuf> {
         &dir,
         crate::lab::artifact_dirs::RUN_ARTIFACT_DIRS,
     )?;
+    files::prune_artifacts(&dir, "")?;
     Ok(dir)
 }
 
@@ -365,7 +389,7 @@ fn run_suite_in(spec: &SuiteGrade, dir: &Path, report: &Path) -> Result<SuiteRun
     let outcome = match run_bounded(cmd, Duration::from_secs(seconds)) {
         Bounded::Finished { code, .. } => SuiteOutcome::Exited { code },
         Bounded::TimedOut { seconds } => SuiteOutcome::TimedOut { seconds },
-        Bounded::Interrupted => bail!("interrupted while running the suite"),
+        Bounded::Interrupted => return Err(Interrupted.into()),
         Bounded::SpawnFailed(e) => bail!("could not start the suite command `{command}`: {e}"),
     };
     let counts = match spec.report {
@@ -470,7 +494,7 @@ fn missed_behaviors(
         .as_ref()
         .ok_or_else(|| anyhow!("verify.grade.behaviors needs a suite"))?;
     let originals = planted_files(input.fixture, spec)?;
-    if let Some(problem) = control_problem(input, suite, copies, &originals)? {
+    if let Some(problem) = control_problem(input, spec, suite, copies, &originals)? {
         return Ok(vec![problem]);
     }
     let mut survived: Vec<(String, Vec<usize>)> = Vec::new();
@@ -502,6 +526,7 @@ fn missed_behaviors(
 /// behavior. A suite that fails on it tests the source text.
 fn control_problem(
     input: &GradeInput,
+    spec: &crate::workloads::grade_spec::BehaviorsGrade,
     suite: &SuiteGrade,
     copies: &Copies,
     originals: &std::collections::BTreeMap<String, String>,
@@ -516,7 +541,35 @@ fn control_problem(
             )));
         }
     }
+    for (i, mutant) in spec.mutants.iter().enumerate() {
+        let Some(respaced) = respace(&mutant.find) else {
+            continue;
+        };
+        let edited = originals[&mutant.file].replacen(&mutant.find, &respaced, 1);
+        let run = run_planted(input, suite, copies, &mutant.file, &edited)?;
+        if !run.green() {
+            return Ok(Some(format!(
+                "the tests fail when bug {}'s code in {} gains a space, which changes no behavior: \
+                 they check the source text, not its behavior ({})",
+                i + 1,
+                mutant.file,
+                run.describe()
+            )));
+        }
+    }
     Ok(None)
+}
+
+/// The span a planted bug replaces, with one space doubled: the first space
+/// after a non-space character, so leading indentation is never touched. A
+/// test that asserts the span's text goes red on it; code does not.
+fn respace(find: &str) -> Option<String> {
+    let at = find
+        .char_indices()
+        .zip(find.chars().skip(1))
+        .find(|((_, c), next)| !c.is_whitespace() && *next == ' ')
+        .map(|((i, c), _)| i + c.len_utf8())?;
+    Some(format!("{} {}", &find[..at], &find[at..]))
 }
 
 /// The fixture's text of every file a bug is planted in, each bug's text
@@ -560,9 +613,17 @@ fn run_planted(
     let target = dir.join(file);
     let mut walked = dir.clone();
     for part in Path::new(file).components() {
-        walked.push(part);
+        let std::path::Component::Normal(name) = part else {
+            bail!("planted bug file {file} is not a plain relative path");
+        };
+        walked.push(name);
         if fs::symlink_metadata(&walked).is_ok_and(|m| m.file_type().is_symlink()) {
-            bail!("the result reaches {file} through a symlink ({}); the grader writes no planted bug through a link", walked.display());
+            let rel = walked
+                .strip_prefix(&dir)
+                .unwrap_or(&walked)
+                .display()
+                .to_string();
+            bail!("the result reaches {file} through a symlink ({rel}); the grader writes no planted bug through a link");
         }
     }
     if let Some(parent) = target.parent() {
@@ -576,13 +637,25 @@ fn run_planted(
 
 /// The model's final reply, from the runtime envelope the run kept.
 pub(crate) fn final_reply(run_dir: &Path) -> Option<String> {
-    let stdout = fs::read_to_string(run_dir.join("qa-reply.json")).ok()?;
-    let envelope: serde_json::Value =
-        serde_json::from_str(crate::lab::scores::envelope_candidate(&stdout)).ok()?;
-    envelope
+    // The runtime writes `<empty>` when the model gave no final answer.
+    envelope(run_dir)?
         .get("final_assistant")?
         .as_str()
+        .filter(|r| *r != "<empty>")
         .map(str::to_string)
+}
+
+/// How the runtime says the dispatch ended: its envelope's `result`.
+pub(crate) fn result_kind(run_dir: &Path) -> Option<String> {
+    envelope(run_dir)?
+        .get("result")?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn envelope(run_dir: &Path) -> Option<serde_json::Value> {
+    let stdout = fs::read_to_string(run_dir.join("qa-reply.json")).ok()?;
+    serde_json::from_str(crate::lab::scores::envelope_candidate(&stdout)).ok()
 }
 
 fn baseline_test_count(fixture: &Path) -> Option<u64> {
@@ -590,19 +663,33 @@ fn baseline_test_count(fixture: &Path) -> Option<u64> {
     manifest.baseline.get("test_count")?.as_u64()
 }
 
-/// Grade a result into a record, with a grader that cannot grade recorded as
-/// a failed `grader` row rather than an error: the run fails closed and says why.
-pub(crate) fn grade_run(
+/// A signal stopped the grader. Never recorded as the run's verdict: the run
+/// was not graded, it was stopped.
+#[derive(Debug)]
+pub(crate) struct Interrupted;
+
+impl std::fmt::Display for Interrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("interrupted while running the suite")
+    }
+}
+
+impl std::error::Error for Interrupted {}
+
+/// Grade a result into a record, in a scratch dir under the run that is
+/// removed afterwards. `Err` when the grader could not grade at all.
+pub(crate) fn try_grade_run(
     run_dir: &Path,
     spec: &GradeSpec,
     prompt: &str,
     fixture: &Path,
     result: &Path,
     dispatch: &DispatchEnd,
-) -> GradeRecord {
+) -> Result<GradeRecord> {
     let work = run_dir.join(WORK_DIR);
     let _ = fs::remove_dir_all(&work);
     let reply = final_reply(run_dir);
+    let result_kind = result_kind(run_dir);
     let graded = fs::create_dir_all(&work)
         .map_err(anyhow::Error::from)
         .and_then(|()| {
@@ -613,12 +700,30 @@ pub(crate) fn grade_run(
                 result,
                 dispatch,
                 reply: reply.as_deref(),
+                result_kind: result_kind.as_deref(),
                 baseline_test_count: baseline_test_count(fixture),
                 work: &work,
             })
         });
     let _ = fs::remove_dir_all(&work);
-    graded.unwrap_or_else(|e| cannot_grade(&e))
+    graded
+}
+
+/// The lab run's grading: a grader that cannot grade is recorded as a failed
+/// `grader` row rather than an error, so the run fails closed and says why.
+/// A signal is the one error passed on: a stopped run is not a failed one.
+pub(crate) fn grade_run(
+    run_dir: &Path,
+    spec: &GradeSpec,
+    prompt: &str,
+    fixture: &Path,
+    result: &Path,
+    dispatch: &DispatchEnd,
+) -> Result<GradeRecord> {
+    match try_grade_run(run_dir, spec, prompt, fixture, result, dispatch) {
+        Err(e) if e.downcast_ref::<Interrupted>().is_some() => Err(e),
+        graded => Ok(graded.unwrap_or_else(|e| cannot_grade(&e))),
+    }
 }
 
 /// A record for a run the grader could not grade: one failed `grader` row.
@@ -629,10 +734,9 @@ fn cannot_grade(e: &anyhow::Error) -> GradeRecord {
             id: "grader".to_string(),
             passed: false,
             evidence: format!("could not grade: {e:#}"),
-            asks: vec![],
+            ..Default::default()
         }],
-        tests_passed: None,
-        ungraded_passed: None,
+        ..Default::default()
     }
 }
 
@@ -654,7 +758,7 @@ pub(crate) fn summary(record: &GradeRecord) -> String {
 /// Taken before the grader runs any of the result's code, so nothing that
 /// code writes to disk can change it.
 #[derive(Debug, Clone)]
-pub(crate) struct Ungraded {
+pub struct Ungraded {
     pub passed: bool,
     pub details: String,
 }
@@ -664,12 +768,16 @@ impl Ungraded {
     /// first grading recorded, else the report as the run left it.
     fn from_manifest(manifest: &RunManifest) -> Self {
         match manifest.verify_report() {
-            Some(report) => match report.grade.as_ref().and_then(|g| g.ungraded_passed) {
-                Some(passed) => Self {
-                    passed,
-                    details: "ungraded check failed".to_string(),
+            Some(report) => match report.grade.as_ref() {
+                Some(GradeRecord {
+                    ungraded_passed: Some(passed),
+                    ungraded_details,
+                    ..
+                }) => Self {
+                    passed: *passed,
+                    details: ungraded_details.clone().unwrap_or_default(),
                 },
-                None => Self {
+                _ => Self {
                     passed: report.passed,
                     details: report.details.clone(),
                 },
@@ -710,6 +818,7 @@ pub(crate) fn record(
         }
     };
     record.ungraded_passed = Some(ungraded.passed);
+    record.ungraded_details = (!ungraded.passed).then(|| ungraded.details.clone());
     report.passed = ungraded.passed && record.passed;
     report.details = if ungraded.passed {
         summary(&record)
@@ -749,39 +858,21 @@ pub(crate) fn apply(
     else {
         return gate;
     };
-    let (ungraded, tests_added) = match gate {
-        Ok(Some(g)) => (
-            Ungraded {
-                passed: g.passed,
-                details: g.details,
-            },
-            g.tests_added,
-        ),
-        Ok(None) => (
-            raw.map_or(
-                Ungraded {
-                    passed: true,
-                    details: String::new(),
-                },
-                |v| Ungraded {
-                    passed: v.passed,
-                    details: v.details.clone(),
-                },
-            ),
-            None,
-        ),
-        Err(e) => (
-            Ungraded {
-                passed: false,
-                details: format!("verify gate could not be applied: {e:#}"),
-            },
-            None,
-        ),
-    };
-    let graded = match crate::providers::coding_task::resolve_prompt(loaded) {
-        Ok(prompt) => grade_run(run_dir, spec, &prompt, fixture, result, dispatch),
+    let coverage = loaded
+        .manifest
+        .workload
+        .verify
+        .as_ref()
+        .and_then(|v| v.coverage_min_pct);
+    let (ungraded, tests_added) = ungraded_verdict(spec, coverage, raw, gate);
+    let graded = match crate::providers::coding_task::dispatched_prompt(loaded) {
+        Ok(prompt) => grade_run(run_dir, spec, &prompt, fixture, result, dispatch)?,
         Err(e) => cannot_grade(&anyhow!("resolving the prompt: {e:#}")),
     };
+    let tests_added = tests_added.or_else(|| {
+        let baseline = baseline_test_count(fixture)?;
+        Some(graded.tests_passed? as i64 - baseline as i64)
+    });
     let record = record(run_dir, graded, &ungraded)?;
     let passed = ungraded.passed && record.passed;
     let details = RunManifest::read(run_dir)
@@ -795,10 +886,61 @@ pub(crate) fn apply(
     }))
 }
 
+/// The verdict before grading, and the tests the gate counted as added.
+///
+/// A grader `suite` reads its runner's report, so it supersedes the work
+/// gate, whose test count reads `node --test` output only: the ungraded
+/// verdict is then the verify command's own (every other gate rule has a
+/// grader check: run_finished, scope, suite). The gate still runs and
+/// records its evidence. A declared `coverage_min_pct` has no grader check,
+/// so with one the gate's verdict stands.
+fn ungraded_verdict(
+    spec: &GradeSpec,
+    coverage_min_pct: Option<f32>,
+    raw: Option<&crate::workloads::types::VerifyOutcome>,
+    gate: Result<Option<WorkGateResult>>,
+) -> (Ungraded, Option<i64>) {
+    let from_raw = || {
+        raw.map_or(
+            Ungraded {
+                passed: true,
+                details: String::new(),
+            },
+            |v| Ungraded {
+                passed: v.passed,
+                details: v.details.clone(),
+            },
+        )
+    };
+    if spec.suite.is_some() && coverage_min_pct.is_none() {
+        let added = gate.ok().flatten().and_then(|g| g.tests_added);
+        return (from_raw(), added);
+    }
+    match gate {
+        Ok(Some(g)) => (
+            Ungraded {
+                passed: g.passed,
+                details: g.details,
+            },
+            g.tests_added,
+        ),
+        Ok(None) => (from_raw(), None),
+        Err(e) => (
+            Ungraded {
+                passed: false,
+                details: format!("verify gate could not be applied: {e:#}"),
+            },
+            None,
+        ),
+    }
+}
+
 /// `darkmux lab grade <run>`: grade a kept run again, without re-running it.
 pub struct Regrade {
     pub run_dir: PathBuf,
     pub record: GradeRecord,
+    /// The verdict before grading, which the run's verdict ANDs with.
+    pub ungraded: Ungraded,
     /// Whether the record was written into the run's manifest.
     pub recorded: bool,
 }
@@ -825,11 +967,13 @@ pub fn regrade(run: &str, fixture: Option<&Path>, write: bool) -> Result<Regrade
             )
         })?;
     let fixture_dir = run_fixture(&run_dir, &manifest, fixture)?;
-    let result = kept_result(&run_dir, &manifest);
+    let result = kept_result(&run_dir, &manifest)?;
     let dispatch = kept_dispatch(&manifest);
     let ungraded = Ungraded::from_manifest(&manifest);
-    let prompt = crate::providers::coding_task::resolve_prompt(&loaded)?;
-    let graded = grade_run(&run_dir, spec, &prompt, &fixture_dir, &result, &dispatch);
+    let prompt = crate::providers::coding_task::dispatched_prompt(&loaded)?;
+    // Any error, a signal included, ends here: a kept run's manifest is
+    // written only with a verdict the grader reached.
+    let graded = try_grade_run(&run_dir, spec, &prompt, &fixture_dir, &result, &dispatch)?;
     let record = if write {
         self::record(&run_dir, graded, &ungraded)?
     } else {
@@ -838,6 +982,7 @@ pub fn regrade(run: &str, fixture: Option<&Path>, write: bool) -> Result<Regrade
     Ok(Regrade {
         run_dir,
         record,
+        ungraded,
         recorded: write,
     })
 }
@@ -845,12 +990,28 @@ pub fn regrade(run: &str, fixture: Option<&Path>, write: bool) -> Result<Regrade
 /// The run's own sandbox, where the lab keeps it; the manifest's path only
 /// for a run kept elsewhere (a run folder copied between machines still
 /// carries the first machine's path).
-fn kept_result(run_dir: &Path, manifest: &RunManifest) -> PathBuf {
+/// It must still hash to the run's recorded `final_hash`, when there is one:
+/// a sandbox changed after the run is not what the run produced.
+fn kept_result(run_dir: &Path, manifest: &RunManifest) -> Result<PathBuf> {
     let kept = run_dir.join("sandbox");
-    if kept.is_dir() {
-        return kept;
+    let result = if kept.is_dir() {
+        kept
+    } else {
+        manifest.sandbox.clone().map(PathBuf::from).unwrap_or(kept)
+    };
+    if !result.is_dir() {
+        bail!("the run's sandbox is gone ({})", result.display());
     }
-    manifest.sandbox.clone().map(PathBuf::from).unwrap_or(kept)
+    if let Some(recorded) = manifest.final_hash_value() {
+        let now = crate::lab::sandbox_hash::hash_sandbox_dir(&result)?;
+        if now != recorded {
+            bail!(
+                "{} changed after the run (hash {now}, the run recorded {recorded}): it is not what the run produced",
+                result.display()
+            );
+        }
+    }
+    Ok(result)
 }
 
 /// How a kept run's dispatch ended, from its manifest.
@@ -925,6 +1086,13 @@ fn run_fixture(run_dir: &Path, manifest: &RunManifest, fixture: Option<&Path>) -
 }
 
 /// The text `lab grade` prints for one run.
+impl Regrade {
+    /// The run's verdict: the ungraded one AND the grader's.
+    pub fn passed(&self) -> bool {
+        self.ungraded.passed && self.record.passed
+    }
+}
+
 pub fn render(regrade: &Regrade) -> String {
     let mut out = String::new();
     p!(out, "{}", regrade.run_dir.display());
@@ -937,14 +1105,17 @@ pub fn render(regrade: &Regrade) -> String {
             c.evidence
         );
     }
+    if !regrade.ungraded.passed {
+        let why = match regrade.ungraded.details.as_str() {
+            "" => "the verify command or work gate failed",
+            d => d,
+        };
+        p!(out, "  FAIL  {:<15} {why}", "ungraded");
+    }
     p!(
         out,
         "  verdict: {}{}",
-        if regrade.record.passed {
-            "pass"
-        } else {
-            "fail"
-        },
+        if regrade.passed() { "pass" } else { "fail" },
         if regrade.recorded {
             " (recorded in the run's manifest)"
         } else {

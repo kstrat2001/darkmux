@@ -23,7 +23,7 @@ impl Counts {
 /// Count the report's testcases. `None` when the text holds no
 /// `<testsuites>`/`<testsuite>` element, so it is not a JUnit report.
 pub(crate) fn parse(xml: &str) -> Option<Counts> {
-    let xml = strip(strip(xml, "<!--", "-->").as_str(), "<![CDATA[", "]]>");
+    let xml = strip_unparsed(xml);
     if !(has_tag(&xml, "testsuites") || has_tag(&xml, "testsuite")) {
         return None;
     }
@@ -82,19 +82,28 @@ fn attribute(tag: &str, name: &str) -> Option<String> {
     None
 }
 
-/// Remove every `open … close` span.
-fn strip(text: &str, open: &str, close: &str) -> String {
+/// Remove every comment and CDATA section in one left-to-right pass, so a
+/// `<!--` inside CDATA (or `]]>` inside a comment) is just text. An unclosed
+/// one runs to the end.
+fn strip_unparsed(text: &str) -> String {
+    const SPANS: [(&str, &str); 2] = [("<!--", "-->"), ("<![CDATA[", "]]>")];
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(i) = rest.find(open) {
+    loop {
+        let next = SPANS
+            .iter()
+            .filter_map(|(open, close)| rest.find(open).map(|i| (i, *open, *close)))
+            .min_by_key(|(i, _, _)| *i);
+        let Some((i, open, close)) = next else {
+            out.push_str(rest);
+            return out;
+        };
         out.push_str(&rest[..i]);
-        match rest[i..].find(close) {
-            Some(j) => rest = &rest[i + j + close.len()..],
+        match rest[i + open.len()..].find(close) {
+            Some(j) => rest = &rest[i + open.len() + j + close.len()..],
             None => return out,
         }
     }
-    out.push_str(rest);
-    out
 }
 
 /// The byte offset of the next `<name` opening tag (followed by whitespace,

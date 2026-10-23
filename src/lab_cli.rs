@@ -87,7 +87,7 @@ fn cmd_lab_grade(runs: &[String], fixture: Option<&str>, record: bool) -> Result
         match lab::grade::regrade(run, fixture.map(std::path::Path::new), record) {
             Ok(graded) => {
                 print!("{}", lab::grade::render(&graded));
-                if !graded.record.passed {
+                if !graded.passed() {
                     code = 1;
                 }
             }

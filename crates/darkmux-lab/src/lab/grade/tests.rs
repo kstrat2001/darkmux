@@ -106,9 +106,19 @@ fn run(
         result,
         dispatch: &dispatch,
         reply,
+        result_kind: Some(kind_of(&dispatch)),
         baseline_test_count: Some(1),
         work: &work,
     })
+}
+
+/// The envelope `result` the runtime writes for each way a dispatch ends.
+fn kind_of(dispatch: &DispatchEnd) -> &'static str {
+    match dispatch {
+        DispatchEnd::Completed => "stop",
+        DispatchEnd::Escalated { .. } => "escalated",
+        DispatchEnd::Failed => "error",
+    }
 }
 
 fn failed(record: &GradeRecord) -> Vec<&str> {
@@ -500,10 +510,9 @@ fn recording_a_grade_ands_the_ungraded_verdict() {
             id: "suite".into(),
             passed,
             evidence: "e".into(),
-            asks: vec![],
+            ..Default::default()
         }],
-        tests_passed: None,
-        ungraded_passed: None,
+        ..Default::default()
     };
     let ok = Ungraded::from_manifest(&RunManifest::read(dir).unwrap());
     assert!(ok.passed);
@@ -780,8 +789,9 @@ fn the_lab_run_step_grades_records_and_returns_the_verdict() {
     );
 }
 
-/// A gate that could not be applied, or a raw verify that failed, still
-/// leaves a recorded, graded run that fails and says why.
+/// A gate that could not be applied (here one that stands, beside a coverage
+/// threshold), or a raw verify that failed, still leaves a recorded, graded
+/// run that fails and says why.
 #[test]
 fn the_lab_run_step_records_a_fail_when_the_gate_errs() {
     let tmp = TempDir::new().unwrap();
@@ -805,7 +815,7 @@ fn the_lab_run_step_records_a_fail_when_the_gate_errs() {
     let loaded = crate::workloads::types::LoadedWorkload {
         manifest: serde_json::from_value(
             serde_json::json!({"workload": {"id": "w", "provider": "coding-task",
-            "prompt": PROMPT, "verify": {"command": "true", "grade": s}}}),
+            "prompt": PROMPT, "verify": {"command": "true", "coverage_min_pct": 50.0, "grade": s}}}),
         )
         .unwrap(),
         base_dir: tmp.path().to_path_buf(),
@@ -862,4 +872,240 @@ fn the_lab_run_step_records_a_fail_when_the_gate_errs() {
         "{}",
         got.details
     );
+}
+
+/// A dispatch that exits cleanly at its turn limit, or leaves no envelope,
+/// did not finish: only the runtime's `stop` is the model stopping itself.
+#[test]
+fn a_turn_limit_or_a_missing_envelope_is_not_a_finish() {
+    let tmp = TempDir::new().unwrap();
+    let f = fixture(tmp.path());
+    let r = result_from(tmp.path(), &f);
+    write(&r, "test/b.t", "value=1");
+    let work = tmp.path().join("work");
+    for (kind, says) in [
+        (Some("max_turns"), "`max_turns`"),
+        (None, "no runtime envelope"),
+    ] {
+        let _ = fs::remove_dir_all(&work);
+        fs::create_dir_all(&work).unwrap();
+        let record = grade(&GradeInput {
+            spec: &spec(),
+            prompt: PROMPT,
+            fixture: &f,
+            result: &r,
+            dispatch: &DispatchEnd::Completed,
+            reply: Some("done"),
+            result_kind: kind,
+            baseline_test_count: Some(1),
+            work: &work,
+        })
+        .unwrap();
+        assert_eq!(failed(&record), ["run_finished"], "{record:?}");
+        assert!(
+            record.checks[0].evidence.contains(says),
+            "{}",
+            record.checks[0].evidence
+        );
+    }
+}
+
+/// The runtime writes `<empty>` as the final answer when there was none.
+#[test]
+fn the_runtimes_empty_sentinel_is_no_reply() {
+    let tmp = TempDir::new().unwrap();
+    fs::write(
+        tmp.path().join("qa-reply.json"),
+        r#"{"result":"stop","final_assistant":"<empty>"}"#,
+    )
+    .unwrap();
+    assert_eq!(final_reply(tmp.path()), None);
+    assert_eq!(result_kind(tmp.path()).as_deref(), Some("stop"));
+}
+
+/// A test that asserts a planted bug's own text, rather than what the code
+/// does, survives a trailing blank line; the respaced span shows it up.
+#[test]
+fn tests_that_assert_the_planted_span_do_not_count() {
+    let tmp = TempDir::new().unwrap();
+    let f = fixture(tmp.path());
+    // The bug's span gains a space; `grep -qx` of the exact line then fails.
+    write(&f, "src/a.txt", "value = 1\nother=2\n");
+    write(&f, "test/a.t", "other=2");
+    let r = result_from(tmp.path(), &f);
+    write(&r, "test/b.t", "value = 1");
+    let mut s = spec();
+    s.behaviors.as_mut().unwrap().mutants[0].find = "value = 1".into();
+    s.behaviors.as_mut().unwrap().mutants[0].replace = "value = 9".into();
+    let record = run(&s, &f, &r, DispatchEnd::Completed, Some("done"), tmp.path()).unwrap();
+    assert_eq!(failed(&record), ["behaviors"], "{record:?}");
+    let ev = &record
+        .checks
+        .iter()
+        .find(|c| c.id == "behaviors")
+        .unwrap()
+        .evidence;
+    assert!(ev.contains("gains a space"), "{ev}");
+    assert_eq!(respace("  if (a && b)").as_deref(), Some("  if  (a && b)"));
+    assert_eq!(respace("nospace"), None);
+}
+
+/// Scope sees what the suite runs: a dependency tree is diffed, and a build
+/// dropping at any depth is ignored by scope and removed from the suite's copy.
+#[test]
+fn scope_diffs_dependencies_and_ignores_droppings_at_any_depth() {
+    let tmp = TempDir::new().unwrap();
+    let f = fixture(tmp.path());
+    let r = result_from(tmp.path(), &f);
+    write(&r, "test/b.t", "value=1");
+    write(&r, "src/__pycache__/a.pyc", "x");
+    write(&r, ".coverage", "x");
+    let record = run(
+        &spec(),
+        &f,
+        &r,
+        DispatchEnd::Completed,
+        Some("done"),
+        tmp.path(),
+    )
+    .unwrap();
+    assert!(record.passed, "{record:?}");
+    write(&r, "node_modules/helper/index.js", "x");
+    let record = run(
+        &spec(),
+        &f,
+        &r,
+        DispatchEnd::Completed,
+        Some("done"),
+        tmp.path(),
+    )
+    .unwrap();
+    assert_eq!(failed(&record), ["scope"], "{record:?}");
+
+    let copy = tmp.path().join("copy");
+    write(&copy, "src/__pycache__/a.pyc", "x");
+    write(&copy, "src/a.txt", "x");
+    write(&copy, "node_modules/p/coverage/c.js", "x");
+    super::files::prune_artifacts(&copy, "").unwrap();
+    assert!(!copy.join("src/__pycache__").exists());
+    assert!(copy.join("src/a.txt").exists());
+    assert!(
+        copy.join("node_modules/p/coverage/c.js").exists(),
+        "a package's own files stay"
+    );
+}
+
+/// A planted bug's file is a plain relative path: one that climbs out of the
+/// copy or is absolute is refused before anything is written.
+#[test]
+fn a_planted_bug_path_never_leaves_the_copy() {
+    let tmp = TempDir::new().unwrap();
+    let f = fixture(tmp.path());
+    let r = result_from(tmp.path(), &f);
+    write(&r, "test/b.t", "value=1");
+    write(&f, "../escape.txt", "value=1\n");
+    let mut s = spec();
+    s.behaviors.as_mut().unwrap().mutants[0].file = "../escape.txt".into();
+    let err = run(&s, &f, &r, DispatchEnd::Completed, Some("done"), tmp.path()).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("not a plain relative path"),
+        "{err:#}"
+    );
+}
+
+/// The fixture's own run must leave a readable report, or the grader cannot
+/// tell which tests must still pass.
+#[test]
+fn an_unreadable_fixture_report_refuses_to_grade() {
+    let tmp = TempDir::new().unwrap();
+    let f = fixture(tmp.path());
+    let r = result_from(tmp.path(), &f);
+    write(&r, "test/b.t", "value=1");
+    // Only the result writes a report.
+    write(&r, "run.sh", SUITE_SH);
+    write(&f, "run.sh", "exit 0\n");
+    let err = run(
+        &spec(),
+        &f,
+        &r,
+        DispatchEnd::Completed,
+        Some("done"),
+        tmp.path(),
+    )
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("no readable report"), "{err:#}");
+}
+
+#[test]
+fn an_empty_quote_beside_a_real_one_is_refused() {
+    let mut s = spec();
+    s.scope.as_mut().unwrap().asks.push("  ".into());
+    let err = check_asks(&s, PROMPT).unwrap_err();
+    assert!(err.to_string().contains("empty sentence"), "{err}");
+}
+
+/// Invalid UTF-8 in an append-only file cannot be compared line by line, so
+/// any change to it fails.
+#[test]
+fn a_non_utf8_append_only_change_fails() {
+    let changes = Changes {
+        modified: vec![(
+            "t.bin".into(),
+            Some(b"a\xff\n".to_vec()),
+            Some(b"a\xfe\n".to_vec()),
+        )],
+        ..Default::default()
+    };
+    let spec = ScopeGrade {
+        asks: vec![],
+        may_add: vec![],
+        append_only: vec!["t.bin".into()],
+        comment_prefixes: vec![],
+    };
+    assert_eq!(scope_violations(&changes, &spec).len(), 1);
+}
+
+/// A comment opener inside CDATA is text, not a comment that eats the
+/// testcases after it.
+#[test]
+fn junit_cdata_holding_a_comment_opener_hides_nothing() {
+    let xml = r#"<testsuites><testsuite>
+        <testcase name="a"><system-out><![CDATA[log <!-- unclosed]]></system-out></testcase>
+        <testcase name="b"><failure message="x"/></testcase>
+        <!-- <testcase name="fake"/> -->
+    </testsuite></testsuites>"#;
+    let c = junit::parse(xml).unwrap();
+    assert_eq!(
+        (c.tests, c.failed, c.passing.clone()),
+        (2, 1, vec!["a".to_string()])
+    );
+}
+
+/// With a grader suite and no coverage threshold, the work gate's node-only
+/// count does not decide the run: the verify command's own verdict does.
+#[test]
+fn a_grader_suite_supersedes_the_node_only_work_gate() {
+    let raw = crate::workloads::types::VerifyOutcome {
+        passed: true,
+        details: "ok".into(),
+    };
+    let unreadable = WorkGateResult {
+        passed: false,
+        details: "verify output's passing-test count is unreadable".into(),
+        tests_added: None,
+    };
+    let (u, _) = ungraded_verdict(&spec(), None, Some(&raw), Ok(Some(unreadable.clone())));
+    assert!(u.passed);
+    // A coverage threshold has no grader check, so the gate stands.
+    let (u, _) = ungraded_verdict(
+        &spec(),
+        Some(90.0),
+        Some(&raw),
+        Ok(Some(unreadable.clone())),
+    );
+    assert!(!u.passed);
+    let mut no_suite = spec();
+    no_suite.suite = None;
+    let (u, _) = ungraded_verdict(&no_suite, None, Some(&raw), Ok(Some(unreadable)));
+    assert!(!u.passed);
 }

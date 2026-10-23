@@ -4,7 +4,7 @@
 //! the run-artifact and dependency directories (`crate::lab::artifact_dirs`)
 //! are skipped at the top level, where the suite's copy skips them.
 
-use crate::lab::artifact_dirs::{HASH_ONLY_EXCLUDES, RUN_ARTIFACT_DIRS};
+use crate::lab::artifact_dirs::RUN_ARTIFACT_DIRS;
 use crate::workloads::grade_spec::{ScopeGrade, StyleGrade};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
@@ -26,6 +26,9 @@ pub(crate) type Modified = (String, Option<Vec<u8>>, Option<Vec<u8>>);
 #[derive(Debug, Default)]
 pub(crate) struct Changes {
     pub added: Vec<String>,
+    /// The added regular files' bytes, as the walk read them (a symlink is
+    /// not followed, so it has none).
+    pub added_files: BTreeMap<String, Vec<u8>>,
     pub deleted: Vec<String>,
     /// Modified files, with both sides' bytes (`None` for a symlink side).
     pub modified: Vec<Modified>,
@@ -42,7 +45,12 @@ pub(crate) fn compare(fixture: &Path, result: &Path) -> Result<Changes> {
             Some(new) => changes.modified.push((path, bytes(old), bytes(new))),
         }
     }
-    changes.added = after.into_keys().collect();
+    for (path, entry) in after {
+        if let Entry::File(bytes) = entry {
+            changes.added_files.insert(path.clone(), bytes);
+        }
+        changes.added.push(path);
+    }
     Ok(changes)
 }
 
@@ -63,12 +71,13 @@ fn walk_into(dir: &Path, prefix: &str, out: &mut BTreeMap<String, Entry>) -> Res
     for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
+        if is_artifact(prefix, &name) {
+            continue;
+        }
         let rel = join_rel(prefix, &name);
         let kind = entry.file_type()?;
         if kind.is_dir() {
-            if !skipped_dir(prefix, &name) {
-                walk_into(&entry.path(), &rel, out)?;
-            }
+            walk_into(&entry.path(), &rel, out)?;
         } else if let Some(e) = read_entry(&entry.path(), kind)? {
             out.insert(rel, e);
         }
@@ -84,11 +93,38 @@ fn join_rel(prefix: &str, name: &str) -> String {
     }
 }
 
-/// Run-artifact and dependency dirs are skipped at the top only, as the
-/// suite's copy skips them: a nested one is in what the suite runs, so scope
-/// sees it.
-fn skipped_dir(prefix: &str, name: &str) -> bool {
-    prefix.is_empty() && (RUN_ARTIFACT_DIRS.contains(&name) || HASH_ONLY_EXCLUDES.contains(&name))
+/// A run or build dropping (`__pycache__`, `.coverage`, `target`, ...), file
+/// or directory, at any depth outside a dependency tree. Scope ignores them,
+/// and every copy the suite runs in has them removed, so what scope does not
+/// see the suite does not run.
+pub(crate) fn is_artifact(prefix: &str, name: &str) -> bool {
+    RUN_ARTIFACT_DIRS.contains(&name) && !prefix.split('/').any(|p| p == "node_modules")
+}
+
+/// Remove every run or build dropping under `dir` (see [`is_artifact`]).
+/// Symlinks are removed as links, never followed.
+pub(crate) fn prune_artifacts(dir: &Path, prefix: &str) -> Result<()> {
+    for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let kind = entry.file_type()?;
+        if is_artifact(prefix, &name) {
+            remove(&entry.path(), kind)?;
+        } else if kind.is_dir() {
+            prune_artifacts(&entry.path(), &join_rel(prefix, &name))?;
+        }
+    }
+    Ok(())
+}
+
+/// Remove a directory tree, or a file or link.
+fn remove(path: &Path, kind: fs::FileType) -> Result<()> {
+    if kind.is_dir() {
+        fs::remove_dir_all(path)?;
+    } else {
+        fs::remove_file(path)?;
+    }
+    Ok(())
 }
 
 /// A file's bytes or a symlink's target; `None` for anything else.
@@ -126,12 +162,12 @@ pub(crate) fn scope_violations(changes: &Changes, spec: &ScopeGrade) -> Vec<Stri
             problems.push(format!("changed {path}"));
             continue;
         }
+        // Not UTF-8 on either side: no line comparison holds, so it fails.
         let kept = match (old, new) {
-            (Some(old), Some(new)) => lines_kept(
-                &String::from_utf8_lossy(old),
-                &String::from_utf8_lossy(new),
-                &spec.comment_prefixes,
-            ),
+            (Some(old), Some(new)) => match (std::str::from_utf8(old), std::str::from_utf8(new)) {
+                (Ok(old), Ok(new)) => lines_kept(old, new, &spec.comment_prefixes),
+                _ => false,
+            },
             _ => false,
         };
         if !kept {
@@ -159,14 +195,14 @@ pub(crate) fn lines_kept(old: &str, new: &str, comment_prefixes: &[String]) -> b
 }
 
 /// `style`'s problems: a new file matching `files` that lacks a required string.
-pub(crate) fn style_violations(
-    changes: &Changes,
-    result: &Path,
-    spec: &StyleGrade,
-) -> Result<Vec<String>> {
+pub(crate) fn style_violations(changes: &Changes, spec: &StyleGrade) -> Result<Vec<String>> {
     let mut problems = vec![];
     for path in changes.added.iter().filter(|p| glob_match(&spec.files, p)) {
-        let text = fs::read_to_string(result.join(path)).unwrap_or_default();
+        let text = changes
+            .added_files
+            .get(path)
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_default();
         let missing: Vec<&str> = spec
             .must_contain
             .iter()

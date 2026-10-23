@@ -134,7 +134,7 @@ pub struct ManifestVerifyReport {
 
 /// What the grader (`crate::lab::grade`) recorded: the verdict, and each check
 /// with the prompt sentences it grades and the evidence it saw.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct GradeRecord {
     pub passed: bool,
     pub checks: Vec<GradeCheck>,
@@ -145,16 +145,25 @@ pub struct GradeRecord {
     /// kept so grading the same run again ANDs with it, not with itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ungraded_passed: Option<bool>,
+    /// Why the ungraded verdict failed, when it did, kept for the same reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ungraded_details: Option<String>,
+    /// A key this type does not name (a newer darkmux's field), kept.
+    #[serde(flatten)]
+    pub extras: Map<String, Value>,
 }
 
 /// One grader check.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct GradeCheck {
     pub id: String,
     pub passed: bool,
     pub evidence: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub asks: Vec<String>,
+    /// A key this type does not name (a newer darkmux's field), kept.
+    #[serde(flatten)]
+    pub extras: Map<String, Value>,
 }
 
 /// What the write-the-tests work gate recorded.

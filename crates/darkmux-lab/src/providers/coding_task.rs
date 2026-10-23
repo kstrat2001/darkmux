@@ -233,8 +233,7 @@ impl WorkloadProvider for CodingTaskProvider {
 
         // The internal runtime mounts sandbox_dir at /workspace in the
         // container, so the prompt substitutes the container-side path.
-        let raw_prompt = resolve_prompt(loaded)?;
-        let prompt = expand_placeholders_with(&raw_prompt, "/workspace");
+        let prompt = dispatched_prompt(loaded)?;
         let role = pick_role(loaded);
         let session_id = SessionId::adhoc(run.clone(), &role, &loaded.manifest.workload.id);
         // (#2511) Report the id back to the lab harness BEFORE dispatching —
@@ -635,6 +634,12 @@ fn reject_escaping_relpath(raw: &str, label: &str) -> Result<()> {
         bail!("{label} `{raw}` names no file under the sandbox (resolves to the sandbox dir itself)");
     }
     Ok(())
+}
+
+/// The prompt as the dispatch gives it to the model: the sandbox
+/// placeholders expanded to the container's `/workspace`.
+pub(crate) fn dispatched_prompt(loaded: &LoadedWorkload) -> Result<String> {
+    Ok(expand_placeholders_with(&resolve_prompt(loaded)?, "/workspace"))
 }
 
 pub(crate) fn resolve_prompt(loaded: &LoadedWorkload) -> Result<String> {
