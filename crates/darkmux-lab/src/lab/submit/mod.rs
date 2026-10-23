@@ -316,6 +316,7 @@ pub fn verify_detail_from(manifest: &Value, names: &[String]) -> Value {
     let empty = Value::Object(Map::new());
     let g = v.get("work_gate").filter(|g| g.is_object()).unwrap_or(&empty);
     let added = g.get("tests_added").and_then(Value::as_f64).filter(|n| n.fract() == 0.0 && n.abs() <= MAX_COUNT);
+    let (fields_correct, fields_expected, fields_missed) = fields_count(v);
     json!({
         "summary": shareable(v.get("details"), 500, names),
         "forcedFailureReason": shareable(g.get("forced_failure_reason"), 500, names),
@@ -330,17 +331,32 @@ pub fn verify_detail_from(manifest: &Value, names: &[String]) -> Value {
         "commandPassed": flag(g.get("command_passed")),
         // A structured-output workload's count (`verify.expect`), the same
         // names for every one; null for any other workload.
-        "fieldsCorrect": count(v.get("fields_correct")),
-        "fieldsExpected": count(v.get("fields_expected")),
-        "fieldsMissed": field_names(v.get("fields_missed"), names),
+        "fieldsCorrect": fields_correct,
+        "fieldsExpected": fields_expected,
+        "fieldsMissed": fields_missed,
     })
 }
 
-/// The fields a structured-output run missed, as the site takes them: at
-/// most 100 names, each shareable text, or null when the run has no count.
-fn field_names(v: Option<&Value>, names: &[String]) -> Value {
-    let Some(list) = v.and_then(Value::as_array) else { return Value::Null };
-    json!(list.iter().take(100).map(|n| shareable(Some(n), 100, names)).filter(|n| !n.is_null()).collect::<Vec<_>>())
+/// A structured-output run's count as the site takes it: all three, or all
+/// three null when they do not add up (`correct` over `expected`, no field
+/// expected, a missed list that is not `expected - correct` distinct names,
+/// or a name outside `[A-Za-z0-9_.-]{1,60}`, which also keeps any path or
+/// personal text out).
+fn fields_count(v: &Value) -> (Value, Value, Value) {
+    static NAME: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let name = NAME.get_or_init(|| regex::Regex::new(r"^[A-Za-z0-9_.-]{1,60}$").expect("valid pattern"));
+    let none = (Value::Null, Value::Null, Value::Null);
+    let (Some(correct), Some(expected)) = (count(v.get("fields_correct")).as_u64(), count(v.get("fields_expected")).as_u64())
+    else {
+        return none;
+    };
+    let Some(missed) = v.get("fields_missed").and_then(Value::as_array) else { return none };
+    let names: Vec<&str> = missed.iter().filter_map(Value::as_str).filter(|n| name.is_match(n)).collect();
+    let distinct = names.iter().collect::<BTreeSet<_>>().len();
+    if expected < 1 || correct > expected || names.len() != missed.len() || distinct != names.len() || names.len() as u64 != expected - correct {
+        return none;
+    }
+    (json!(correct), json!(expected), json!(names))
 }
 
 /// The detail beyond the basics. Host figures need busy samples: with none

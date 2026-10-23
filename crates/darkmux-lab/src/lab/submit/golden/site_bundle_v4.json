@@ -1,0 +1,97 @@
+{
+  "bundle": {
+    "format": "darkmux-evals-bundle",
+    "formatVersion": 4,
+    "fixture": {
+      "repo": "kstrat2001/biz-scrape-fixture",
+      "commitSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "name": "biz-scrape-fixture",
+      "version": "1.0",
+      "manifest": {
+        "name": "biz-scrape-fixture",
+        "version": "1.0",
+        "satisfies": "biz-scrape-easy@1.0"
+      }
+    },
+    "runs": [
+      {
+        "key": "f3d792c66eb2487b8489118b65f5226ff7451b8debce3b37e692046e011409b9",
+        "darkmuxVersion": "5.4.0",
+        "darkmuxCommit": "abc1234",
+        "darkmuxBuild": "release",
+        "passed": false,
+        "activeSeconds": 123.5,
+        "tokensPerSecond": 41.27,
+        "peakMemoryGb": null,
+        "startedAt": "2025-10-22T08:00:00.123Z",
+        "stack": {
+          "chip": "Apple M5 Max",
+          "ramGb": 128,
+          "accelerator": "Metal",
+          "os": "macOS 26.1",
+          "engine": "LM Studio",
+          "engineBackend": "MLX",
+          "engineVersion": "mlx-llm 1.13.1",
+          "model": "qwen3-coder-30b",
+          "weightsHash": null,
+          "quant": "4bit",
+          "contextLength": 65536,
+          "kvCacheDtype": null,
+          "cpuCores": [
+            {
+              "cluster": "Super",
+              "cores": 6
+            },
+            {
+              "cluster": "Performance",
+              "cores": 12
+            }
+          ],
+          "gpuCores": 40,
+          "modelId": "Mac17,7",
+          "maxCompletionTokens": 2048
+        },
+        "detail": {
+          "wallSeconds": 150,
+          "restSeconds": 26.6,
+          "turns": 12,
+          "toolCalls": 30,
+          "toolCallsFailed": 2,
+          "completionTokens": 9000,
+          "reasoningTokens": 3000,
+          "packageWatts": 31.3,
+          "cpuWatts": 5,
+          "gpuWatts": 25,
+          "gpuBusyPct": 87.5,
+          "joulesPer1kTokens": 410.3,
+          "memoryPressureMaxPct": 62,
+          "thermalStates": {
+            "nominal": 38,
+            "fair": 2
+          },
+          "cpuSpeedLimitMinPct": 100,
+          "throttledSamples": 0,
+          "verify": {
+            "summary": null,
+            "forcedFailureReason": null,
+            "baselineTests": null,
+            "testsTotal": null,
+            "testsPassed": null,
+            "testsAdded": null,
+            "testsFailed": null,
+            "sandboxChanged": null,
+            "coveragePct": null,
+            "coverageMinPct": null,
+            "commandPassed": null,
+            "fieldsCorrect": 7,
+            "fieldsExpected": 8,
+            "fieldsMissed": [
+              "hours"
+            ]
+          }
+        }
+      }
+    ]
+  },
+  "ok": true
+}
