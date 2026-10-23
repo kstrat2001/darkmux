@@ -1021,6 +1021,11 @@ RunStats
   unbilled_gen_ms: uint64
   billed_gen_fraction: double | null
   tok_per_s: double | null
+  decode_tok_per_s: double | null
+  prefill_ms_billed: uint64 | null
+  first_token_ms_median: uint64 | null
+  first_token_ms_max: uint64 | null
+  context_peak_tokens: uint64 | null
   reasoning_chars_per_s: double | null
   gates: Gates
   bounds: { [key: string]: Knob }

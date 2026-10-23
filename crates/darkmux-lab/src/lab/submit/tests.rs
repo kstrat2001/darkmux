@@ -32,6 +32,8 @@ fn stats() -> Value {
         "cpu_w_busy": 5.04, "gpu_w_busy": 24.95, "gpu_duty_pct": 87.5, "pkg_j_per_1k_tokens": 410.33,
         "mem_pct_busy_max": 62, "thermal_states_busy": { "nominal": 38, "fair": 2, "Bad": 1 },
         "cpu_speed_limit_min": 100, "throttled_samples": 0,
+        "compactions": 2, "context_peak_tokens": 48_211, "first_token_ms_median": 1_840,
+        "first_token_ms_max": 9_120, "decode_tok_per_s": 58.44,
         "checks": { "all_streams_billed": true },
     })
 }
@@ -181,6 +183,11 @@ fn a_rate_over_part_of_the_generation_is_not_quoted() {
     let run = bundle_run("r", &manifest(), &s, &RanBy::default(), &stack(), &[]);
     assert_eq!(run["tokensPerSecond"], Value::Null);
     assert_eq!(run["darkmuxVersion"], Value::Null);
+    // (Argon review) Decode speed is a rate over the generation too.
+    s["decode_tok_per_s"] = json!(80.0);
+    assert_eq!(detail_from(&manifest(), &s, &[])["decodeTokensPerSecond"], Value::Null);
+    s["checks"]["all_streams_billed"] = json!(true);
+    assert_eq!(detail_from(&manifest(), &s, &[])["decodeTokensPerSecond"], json!(80.0));
 }
 
 #[test]

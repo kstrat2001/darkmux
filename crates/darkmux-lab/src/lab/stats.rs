@@ -62,7 +62,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// Data-shape semver for [`RunStats`], per the repo's additive-minor rule.
-pub const RUN_STATS_SCHEMA_VERSION: &str = "2.2.0";
+pub const RUN_STATS_SCHEMA_VERSION: &str = "2.3.0";
 
 use darkmux_trajectory::DEGENERATE_TAIL_RATIO;
 
@@ -293,6 +293,27 @@ pub struct RunStats {
     /// execution and rest, and dividing by it understates the engine by
     /// however tool-heavy the task happened to be.
     pub tok_per_s: Option<f64>,
+    /// (2.3.0) Tokens over generation seconds AFTER each stream's first
+    /// output: `tok_per_s` with the prompt's processing (prefill) left out,
+    /// so a long prompt does not read as slow generation. Over the billed,
+    /// finished streams whose output came in more than one chunk (a reply
+    /// that arrived at once has no decode time to divide by). `None` when
+    /// frames and streams do not pair, when a billed stream with tokens has
+    /// no first-output mark (a runtime from before #2877), or when no stream
+    /// qualifies.
+    pub decode_tok_per_s: Option<f64>,
+    /// (2.3.0) Those same streams' summed wait for their first output: the
+    /// time `decode_tok_per_s` leaves out. `None` exactly when it is.
+    pub prefill_ms_billed: Option<u64>,
+    /// (2.3.0) Time to first token, median and max over the billed streams
+    /// that produced output: the prompt's processing plus transport, since
+    /// a stream opens before its request is sent.
+    pub first_token_ms_median: Option<u64>,
+    pub first_token_ms_max: Option<u64>,
+    /// (2.3.0) The largest prompt any one call sent, in tokens: the context
+    /// the run used at its fullest. Compaction shrinks the prompt; this is
+    /// the high-water mark.
+    pub context_peak_tokens: Option<u64>,
     /// The THINKING channel's rate, over every stream. Immune to the billing
     /// gap, and not a measure of answer output.
     pub reasoning_chars_per_s: Option<f64>,
@@ -855,6 +876,7 @@ pub(crate) fn derive_stats(
     let turns = u64::from(fold.turns());
     let rest_ms = fold.rest_ms();
     let billing = StreamBilling::of(fold);
+    let decode = Decode::of(fold, &billing);
     let completion_tokens = fold.tokens.completion;
     let reasoning_chars: u64 = fold.turn_detail.values().map(|e| e.reasoning_chars).sum();
     let content_chars: u64 = fold.streams.iter().map(|s| s.content_chars).sum::<u64>()
@@ -921,6 +943,11 @@ pub(crate) fn derive_stats(
         billed_gen_fraction: (billing.gen_ms_all > 0)
             .then(|| round(billing.gen_ms_billed as f64 / billing.gen_ms_all as f64, 2)),
         tok_per_s: rate(completion_tokens, billing.gen_ms_billed),
+        decode_tok_per_s: decode.tok_per_s,
+        prefill_ms_billed: decode.prefill_ms,
+        first_token_ms_median: median_ms(&billing.first_token_ms),
+        first_token_ms_max: billing.first_token_ms.iter().copied().max(),
+        context_peak_tokens: fold.prompt_tokens_peak,
         reasoning_chars_per_s: rate(reasoning_chars, billing.gen_ms_all),
         gates: Gates {
             stream: StreamGate {
@@ -970,6 +997,68 @@ pub(crate) fn derive_stats(
     }
 }
 
+/// A stream's wait for its first output. A first output after the stream's
+/// end is clock skew, not a wait.
+fn wait(s: &darkmux_trajectory::Stream) -> Option<u64> {
+    s.first_output_after_ms().map(|w| w.min(s.ms()))
+}
+
+/// (2.3.0) Decode speed over the billed, finished streams whose split
+/// between waiting and generating was measured, each stream's own tokens
+/// over its own time after its first output.
+struct Decode {
+    tok_per_s: Option<f64>,
+    prefill_ms: Option<u64>,
+}
+
+impl Decode {
+    fn of(fold: &darkmux_trajectory::TrajectoryFold, billing: &StreamBilling) -> Self {
+        let unknown = Self { tok_per_s: None, prefill_ms: None };
+        // Per-stream tokens need frames paired with streams.
+        if !billing.frames_match {
+            return unknown;
+        }
+        let (mut tokens, mut decode_ms, mut wait_ms) = (0u64, 0u64, 0u64);
+        for (i, s) in fold.streams.iter().enumerate() {
+            let frame = fold.frames[i].unwrap_or(0);
+            if billing.unbilled.contains(&i) || s.end_ms.is_none() {
+                continue;
+            }
+            let Some(w) = wait(s) else {
+                // Tokens with no mark: a runtime that could not show when
+                // output began, so the run's split is unknown.
+                if frame > 0 {
+                    return unknown;
+                }
+                continue;
+            };
+            // Output that arrived in one chunk has no decode time of its own.
+            if s.output_chunks < 2 || s.ms() == w {
+                continue;
+            }
+            tokens += frame;
+            decode_ms += s.ms() - w;
+            wait_ms += w;
+        }
+        match rate(tokens, decode_ms) {
+            Some(r) => Self { tok_per_s: Some(r), prefill_ms: Some(wait_ms) },
+            None => unknown,
+        }
+    }
+}
+
+/// The median of `ms`, rounded down to a whole ms; `None` when empty.
+fn median_ms(ms: &[u64]) -> Option<u64> {
+    let mut v = ms.to_vec();
+    v.sort_unstable();
+    let mid = v.len() / 2;
+    match v.len() {
+        0 => None,
+        n if n % 2 == 1 => Some(v[mid]),
+        _ => Some((v[mid - 1] + v[mid]) / 2),
+    }
+}
+
 /// `n` per second over `ms`, to one decimal; `None` when either is zero.
 fn rate(n: u64, ms: u64) -> Option<f64> {
     (ms > 0 && n > 0).then(|| round(n as f64 / (ms as f64 / 1000.0), 1))
@@ -989,6 +1078,9 @@ struct StreamBilling {
     gen_ms_all: u64,
     gen_ms_billed: u64,
     unterminated: usize,
+    /// Each billed, finished stream's wait for its first output, where it
+    /// has one.
+    first_token_ms: Vec<u64>,
 }
 
 impl StreamBilling {
@@ -1020,7 +1112,13 @@ impl StreamBilling {
         let gen_ms_all = streams.iter().map(|s| s.ms()).sum();
         let gen_ms_billed = streams.iter().enumerate().filter(|(i, _)| !unbilled.contains(i)).map(|(_, s)| s.ms()).sum();
         let unterminated = streams.iter().filter(|s| s.end_ms.is_none()).count();
-        Self { unbilled, frames_match, gen_ms_all, gen_ms_billed, unterminated }
+        let first_token_ms = streams
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| !unbilled.contains(i) && s.end_ms.is_some())
+            .filter_map(|(_, s)| wait(s))
+            .collect();
+        Self { unbilled, frames_match, gen_ms_all, gen_ms_billed, unterminated, first_token_ms }
     }
 }
 

@@ -27,9 +27,27 @@ pub struct Stream {
     /// Answer chars this stream produced (`model.partial` restarts its
     /// cumulative count with every stream).
     pub content_chars: u64,
+    /// The clock of the stream's first output: the first `model.partial`
+    /// whose `generated_chars` (answer, reasoning and tool-call arguments,
+    /// #2877) grew. The stream opens before the request is sent, so the gap
+    /// is prefill plus transport. `None` on a runtime from before #2877,
+    /// whose partials cannot show reasoning output: its first answer chunk
+    /// would read the whole think as prefill.
+    pub first_output_ms: Option<u64>,
+    /// `model.partial` chunks that grew `generated_chars`. One chunk means
+    /// the output arrived at once, so the time after it is not decode time.
+    pub output_chunks: u32,
+    /// The latest `generated_chars` this stream reported.
+    generated_chars: u64,
 }
 
 impl Stream {
+    /// Time to first token: from the stream's start to its first output;
+    /// `None` when it produced none.
+    pub fn first_output_after_ms(&self) -> Option<u64> {
+        self.first_output_ms.filter(|t| *t >= self.start_ms).map(|t| t - self.start_ms)
+    }
+
     /// Generation time of a closed stream; 0 while open.
     pub fn ms(&self) -> u64 {
         match self.end_ms {
@@ -141,6 +159,9 @@ pub struct TrajectoryFold {
     pub estimated_completion_tokens: u64,
     pub turn_detail: BTreeMap<u64, TurnDetail>,
     pub streams: Vec<Stream>,
+    /// The largest `prompt_tokens` any one call reported: the context the
+    /// run used at its fullest. `None` when no call reported one.
+    pub prompt_tokens_peak: Option<u64>,
     compaction_events: u32,
     pub rests: Vec<RestTaken>,
     pub tools: Vec<ToolTaken>,
@@ -207,6 +228,9 @@ impl TrajectoryFold {
                 start_ms: s.ts,
                 end_ms: None,
                 content_chars: 0,
+                first_output_ms: None,
+                output_chunks: 0,
+                generated_chars: 0,
             }),
             E::StreamingEnd(s) => {
                 // The most recent OPEN stream on this seq: an aborted turn is
@@ -218,7 +242,7 @@ impl TrajectoryFold {
                     open.end_ms = Some(s.ts);
                 }
             }
-            E::Partial(p) => self.partial(p.seq, p.cumulative_chars),
+            E::Partial(p) => self.partial(p),
             E::Reasoning(r) => {
                 let t = self.turn_detail.entry(r.seq).or_default();
                 t.reasoning_chars = t.reasoning_chars.saturating_add(r.reasoning_chars);
@@ -302,6 +326,9 @@ impl TrajectoryFold {
         self.turn_seqs.insert(seq);
         self.model_calls = self.model_calls.saturating_add(1);
         self.tokens.add(&counts);
+        if let Some(p) = counts.prompt {
+            self.prompt_tokens_peak = Some(self.prompt_tokens_peak.map_or(p, |m| m.max(p)));
+        }
         if !counts.reported() {
             self.unreported_calls = self.unreported_calls.saturating_add(1);
         }
@@ -311,11 +338,22 @@ impl TrajectoryFold {
         t.reasoning_tokens = t.reasoning_tokens.saturating_add(counts.reasoning.unwrap_or(0));
     }
 
-    fn partial(&mut self, seq: u64, cumulative_chars: u64) {
+    fn partial(&mut self, p: &crate::event::Partial) {
+        let (seq, cumulative_chars) = (p.seq, p.cumulative_chars);
         // Cumulative within ONE stream, so it belongs to the latest stream
         // on this seq and is summed across streams.
         if let Some(s) = self.streams.iter_mut().rev().find(|s| s.seq == seq) {
             s.content_chars = s.content_chars.max(cumulative_chars);
+            // Output timing only from a partial on the OPEN stream, with a
+            // clock, carrying `generated_chars`.
+            match p.generated_chars {
+                Some(g) if s.end_ms.is_none() && p.ts >= s.start_ms && p.ts > 0 && g > s.generated_chars => {
+                    s.generated_chars = g;
+                    s.output_chunks = s.output_chunks.saturating_add(1);
+                    s.first_output_ms.get_or_insert(p.ts);
+                }
+                _ => {}
+            }
         } else {
             let t = self.turn_detail.entry(seq).or_default();
             t.content_chars = t.content_chars.max(cumulative_chars);
