@@ -14,6 +14,18 @@ darkmux release.
 
 ## [Unreleased]
 
+## [5.5.0] - 2026-10-23
+
+Lab runs are graded on what the prompt asked for. A coding workload can declare a grader
+(`verify.grade`) whose checks each quote the prompt sentence they grade, and `darkmux lab
+grade` grades kept runs again without re-running them; pepper-grinder ships with one. A
+prompt workload can grade a structured answer field by field (`verify.expect`) and give the
+model the window's room to reply. A lab run's verify command and the grader's suites now run
+in a locked-down container instead of on your machine. Run stats gain time to first token,
+decode speed and context peak, and `lab submit` carries them, with the fields count, to
+darkmux evals (bundle format 4). Workload schema 1.2, config schema 2.6 and run stats 2.3.0
+are additive; run manifest v9 adds `verify.grade`.
+
 ### Added
 
 - **A grader for coding runs: `verify.grade` (#3353).** A workload names checks on the run's
@@ -50,8 +62,7 @@ darkmux release.
   did not record what it needs, never guessed. `lab submit` adds `compactions`,
   `contextPeakTokens`, `firstTokenMsMedian`, `firstTokenMsMax` and `decodeTokensPerSecond` to
   each run's `detail` (not `prefill_ms_billed`; decode speed is null there unless every
-  stream was billed, like `tokensPerSecond`). evals.darkmux.com takes these keys only once
-  darklyenergized#316 is deployed; until then it refuses the bundle.
+  stream was billed, like `tokensPerSecond`). evals.darkmux.com takes these keys.
 - **Prompt workloads can grade a structured answer: `verify.expect`.** The workload names the
   answer the reply's first JSON object that parses must give, field by field. Strings compare
   exactly (only the ends are trimmed); numbers compare as the same value (`1` and `1.0` match;
@@ -97,6 +108,17 @@ darkmux release.
 
 ### Fixed
 
+- A one-call prompt run (a `url` endpoint with a tool-less role) records its call as one
+  stream, so it has a generation rate: `tok_per_s` and J/1k tokens are no longer null, and
+  `lab submit` no longer sends `tokensPerSecond: null` for it.
+- `lab submit` hands curl the upload token on stdin, so a submit killed mid-upload leaves no
+  token on disk.
+- `lab submit` refuses `--quant`, `--engine-version` and `--engine-backend` without
+  `--engine`, instead of silently dropping them.
+- `lab submit`'s fixture commit must hold through every run in the bundle: a checkout away
+  and back between the first and last run no longer stamps a middle run with the wrong
+  commit. A run with no start time is refused unless `--commit` is given.
+- A prompt run's refusal manifest names its workload, so `lab inspect` can read it.
 - The write-the-tests work gate leaves a prompt run's verify alone. A prompt run writes no test
   output, so a fixture that declares `baseline.test_count` used to replace the verdict with
   "passing-test count is unreadable".
@@ -3882,6 +3904,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   does. `FLOW_SCHEMA_VERSION` unchanged at 1.52.0; `RULES_SCHEMA_VERSION`
   unchanged at 3.0.0.
 
+[5.5.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.5.0
 [5.4.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.4.0
 [5.3.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.3.0
 [5.2.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.2.0
