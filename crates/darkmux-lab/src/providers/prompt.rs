@@ -436,22 +436,34 @@ fn write_refusal_manifest(run_dir: &Path, refused: &[crate::providers::coding_ta
 /// and empty when it names none, never guessed. A reply that is not that
 /// envelope writes nothing.
 fn write_one_call_trajectory(stdout: &str, system_chars: usize, prompt_chars: usize, run_dir: &Path, end_ms: u64) {
-    use darkmux_trajectory::event::{DispatchComplete, DispatchStart, Header, ModelCompleted, TrajectoryEvent};
+    use darkmux_trajectory::event::{DispatchComplete, DispatchStart, Header, ModelCompleted, StreamingEnd, StreamingStart, TrajectoryEvent};
     let Ok(envelope) = serde_json::from_str::<serde_json::Value>(stdout) else { return };
     let Some(metrics) = envelope.get("metrics") else { return };
     let (Some(model), Some(wall_ms)) = (metrics.get("model").and_then(|v| v.as_str()), metrics.get("wall_ms").and_then(|v| v.as_u64())) else {
         return;
     };
     let usage: darkmux_trajectory::usage::Usage = serde_json::from_value(metrics.clone()).unwrap_or_default();
+    let start_ms = end_ms.saturating_sub(wall_ms);
+    let reply_chars = envelope.get("final_assistant").and_then(|v| v.as_str()).map_or(0, |s| s.chars().count() as u64);
     let events = [
         TrajectoryEvent::Header(Header { schema_version: darkmux_trajectory::TRAJECTORY_SCHEMA_VERSION.to_string() }),
         TrajectoryEvent::DispatchStart(DispatchStart {
-            ts: end_ms.saturating_sub(wall_ms),
+            ts: start_ms,
             model: model.to_string(),
             system_chars: system_chars as u64,
             prompt_chars: prompt_chars as u64,
             tools: Vec::new(),
         }),
+        // The call is one stream, request to reply, as a runtime stream is
+        // timed: without it the run has no generation time, so no rate, and
+        // its one usage frame pairs with nothing.
+        TrajectoryEvent::StreamingStart(StreamingStart {
+            seq: 1,
+            ts: start_ms,
+            system_chars: system_chars as u64,
+            prompt_chars: prompt_chars as u64,
+        }),
+        TrajectoryEvent::StreamingEnd(StreamingEnd { seq: 1, ts: end_ms, total_content_chars: reply_chars, ..Default::default() }),
         TrajectoryEvent::ModelCompleted(ModelCompleted {
             seq: 1,
             ts: end_ms,
@@ -994,7 +1006,7 @@ mod tests {
         .to_string();
         write_one_call_trajectory(&stdout, 5_700, 21_000, tmp.path(), 1_000_000);
         let fold = crate::lab::inspect::checked_run_trajectory(tmp.path()).unwrap();
-        assert_eq!(fold.events, 3, "the header is a marker, not an event");
+        assert_eq!(fold.events, 5, "the header is a marker, not an event");
         assert_eq!(fold.schema_version.as_deref(), Some(darkmux_trajectory::TRAJECTORY_SCHEMA_VERSION));
         assert_eq!(fold.model_calls, 1);
         assert_eq!(fold.frames, vec![Some(900)]);
@@ -1002,7 +1014,14 @@ mod tests {
         assert_eq!((start.model.as_str(), start.system_chars, start.prompt_chars, start.ts), ("m", 5_700, 21_000, 1_000_000 - 13_100));
         let complete = fold.complete.as_ref().unwrap();
         assert_eq!((complete.result.as_str(), complete.wall_ms), ("stop", 13_100));
-        crate::lab::stats::compute_from_dir(tmp.path(), &tmp.path().join("flows")).expect("the run's numbers can be read");
+        let stats = crate::lab::stats::compute_from_dir(tmp.path(), &tmp.path().join("flows")).expect("the run's numbers can be read");
+        // The call is one stream, start to end, so the run has a rate and
+        // reconciles: no rate means `lab submit` uploads tokensPerSecond null.
+        assert_eq!(fold.streams.len(), 1);
+        assert_eq!(fold.streams[0].ms(), 13_100);
+        assert_eq!(stats.tok_per_s, Some(68.7));
+        assert!(stats.checks.frames_match_streams && stats.checks.all_streams_billed);
+        assert!(!stats.unreconciled().iter().any(|w| w.contains("streams")), "{:?}", stats.unreconciled());
         // The call's finish reason, when the envelope carries it, is the
         // trajectory's: the grade reads it to tell a cut-off reply from one
         // that stopped on its own.
