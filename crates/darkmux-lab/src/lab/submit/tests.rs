@@ -183,6 +183,11 @@ fn a_rate_over_part_of_the_generation_is_not_quoted() {
     let run = bundle_run("r", &manifest(), &s, &RanBy::default(), &stack(), &[]);
     assert_eq!(run["tokensPerSecond"], Value::Null);
     assert_eq!(run["darkmuxVersion"], Value::Null);
+    // (Argon review) Decode speed is a rate over the generation too.
+    s["decode_tok_per_s"] = json!(80.0);
+    assert_eq!(detail_from(&manifest(), &s, &[])["decodeTokensPerSecond"], Value::Null);
+    s["checks"]["all_streams_billed"] = json!(true);
+    assert_eq!(detail_from(&manifest(), &s, &[])["decodeTokensPerSecond"], json!(80.0));
 }
 
 #[test]

@@ -361,6 +361,12 @@ fn fields_count(v: &Value) -> (Value, Value, Value) {
 
 /// The detail beyond the basics. Host figures need busy samples: with none
 /// they are null, never zero.
+/// Whether every stream's tokens were billed: a rate over only some of the
+/// generation is not quoted.
+fn all_streams_billed(stats: &Value) -> bool {
+    stats.get("checks").and_then(|c| c.get("all_streams_billed")) != Some(&Value::Bool(false))
+}
+
 pub fn detail_from(manifest: &Value, stats: &Value, names: &[String]) -> Value {
     let sampled = stats.get("samples_busy").and_then(Value::as_u64).is_some_and(|n| n > 0);
     let host = |v: Value| if sampled { v } else { Value::Null };
@@ -406,7 +412,7 @@ pub fn detail_from(manifest: &Value, stats: &Value, names: &[String]) -> Value {
         "contextPeakTokens": count(s("context_peak_tokens")),
         "firstTokenMsMedian": count(s("first_token_ms_median")),
         "firstTokenMsMax": count(s("first_token_ms_max")),
-        "decodeTokensPerSecond": measure(s("decode_tok_per_s"), 100_000.0),
+        "decodeTokensPerSecond": if all_streams_billed(stats) { measure(s("decode_tok_per_s"), 100_000.0) } else { Value::Null },
         "verify": verify_detail_from(manifest, names),
     })
 }
@@ -493,7 +499,7 @@ impl Stack {
 /// One run as the site takes it.
 pub fn bundle_run(run_id: &str, manifest: &Value, stats: &Value, ran_by: &RanBy, stack: &Stack, names: &[String]) -> Value {
     let active = stats.get("active_ms").and_then(Value::as_f64).filter(|n| *n > 0.0);
-    let all_billed = stats.get("checks").and_then(|c| c.get("all_streams_billed")) != Some(&Value::Bool(false));
+    let all_billed = all_streams_billed(stats);
     let started = stats.get("started_at_unix_ms").and_then(Value::as_u64);
     json!({
         "key": sha256::hex(run_id.as_bytes()),

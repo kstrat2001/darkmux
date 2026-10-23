@@ -19,12 +19,14 @@ darkmux release.
 - **Run stats 2.3.0: time to first token, generation speed without prefill, and context peak.**
   `run stats` now reports `first_token_ms_median` and `first_token_ms_max` (the wait from a
   stream's start to its first output, which is the prompt's processing plus transport),
-  `decode_tok_per_s` (billed tokens over the billed seconds after each stream's first output,
-  so a long prompt no longer reads as slow generation), `prefill_ms_billed`, and
+  `decode_tok_per_s` (tokens over the seconds after each stream's first output, so a long
+  prompt no longer reads as slow generation; over billed, finished streams whose output came
+  in more than one chunk), `prefill_ms_billed` (those streams' waits), and
   `context_peak_tokens` (the largest prompt any one call sent). Each is null when the run
   did not record what it needs, never guessed. `lab submit` adds `compactions`,
   `contextPeakTokens`, `firstTokenMsMedian`, `firstTokenMsMax` and `decodeTokensPerSecond` to
-  each run's `detail` (not `prefill_ms_billed`). evals.darkmux.com takes these keys only once
+  each run's `detail` (not `prefill_ms_billed`; decode speed is null there unless every
+  stream was billed, like `tokensPerSecond`). evals.darkmux.com takes these keys only once
   darklyenergized#316 is deployed; until then it refuses the bundle.
 - **Prompt workloads can grade a structured answer: `verify.expect`.** The workload names the
   answer the reply's first JSON object that parses must give, field by field. Strings compare

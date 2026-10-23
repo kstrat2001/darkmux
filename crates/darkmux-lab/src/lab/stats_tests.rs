@@ -1425,12 +1425,21 @@ fn a_run_that_ended_on_its_own_is_not_flagged_interrupted() {
 // Prefill, decode and context (Kain, 2026-10-23)
 // ---------------------------------------------------------------------------
 
-/// The first output of the open stream on `seq`, at `ts`.
-fn first_output(seq: u64, ts: u64) -> String {
+/// Output on the open stream on `seq` at `ts`, `generated_chars` so far `g`.
+fn output(seq: u64, ts: u64, g: u64) -> String {
     line(serde_json::json!({
         "type": "model.partial", "seq": seq, "ts": ts,
-        "cumulative_chars": 0, "delta_chars": 0, "generated_chars": 4
+        "cumulative_chars": 0, "delta_chars": 0, "generated_chars": g
     }))
+}
+
+/// A stream from `t0` to `t1` whose output starts at `first` and goes on.
+fn streamed(seq: u64, t0: u64, first: u64, t1: u64) -> String {
+    format!("{}{}{}{}", stream(seq, t0, None), output(seq, first, 4), output(seq, first + 1, 40), stream_end(seq, t1))
+}
+
+fn stream_end(seq: u64, t1: u64) -> String {
+    line(serde_json::json!({"type": "model.streaming.end", "seq": seq, "ts": t1}))
 }
 
 fn prompt(seq: u64, prompt_tokens: u64, ct: u64) -> String {
@@ -1448,12 +1457,10 @@ fn decode_speed_leaves_out_the_wait_for_the_first_token() {
     // Two billed streams: 8s then 2s before the first token, 10s and 8s long,
     // 1,000 tokens each. Decode runs over (10-8) + (8-2) = 8s.
     let traj = format!(
-        "{}{}{}{}{}{}",
-        stream(1, 0, Some(10_000)),
-        first_output(1, 8_000),
+        "{}{}{}{}",
+        streamed(1, 0, 8_000, 10_000),
         prompt(1, 6_000, 1_000),
-        stream(2, 20_000, Some(28_000)),
-        first_output(2, 22_000),
+        streamed(2, 20_000, 22_000, 28_000),
         prompt(2, 48_000, 1_000),
     );
     let s = stats(&traj, 60_000);
@@ -1470,12 +1477,10 @@ fn decode_speed_leaves_out_the_wait_for_the_first_token() {
 #[test]
 fn decode_speed_uses_the_billed_streams_only() {
     let traj = format!(
-        "{}{}{}{}{}{}",
-        stream(1, 0, Some(80_000)),
-        first_output(1, 70_000),
+        "{}{}{}{}",
+        streamed(1, 0, 70_000, 80_000),
         completed(1, None, 0),
-        stream(2, 80_000, Some(100_000)),
-        first_output(2, 90_000),
+        streamed(2, 80_000, 90_000, 100_000),
         completed(2, Some(2_000), 0),
     );
     let s = stats(&traj, 120_000);
@@ -1484,8 +1489,34 @@ fn decode_speed_uses_the_billed_streams_only() {
     assert_eq!(s.first_token_ms_median, Some(10_000), "the unbilled stream's wait is not a measured one");
 }
 
-/// A billed stream with no first-output mark (a runtime that sent no
-/// partials) leaves the split unknown: null, never the whole stream.
+/// (Argon review) A reply that arrived in one chunk was done at its first
+/// token: the milliseconds to the stream's end are teardown, and dividing by
+/// them read 200,000 tok/s. It keeps its time to first token and is left out
+/// of decode, tokens and time both.
+#[test]
+fn a_reply_in_one_chunk_is_left_out_of_decode_speed() {
+    let traj = format!(
+        "{}{}{}{}{}{}",
+        stream(1, 0, None),
+        output(1, 1_000, 900),
+        stream_end(1, 1_001),
+        prompt(1, 6_000, 200),
+        streamed(2, 10_000, 12_000, 20_000),
+        prompt(2, 7_000, 800),
+    );
+    let s = stats(&traj, 30_000);
+    assert_eq!(s.decode_tok_per_s, Some(100.0), "800 tokens over stream 2's 8s, not 1,000 over 8.001s");
+    assert_eq!(s.prefill_ms_billed, Some(2_000), "the same streams decode uses");
+    assert_eq!(s.first_token_ms_median, Some(1_500), "both waits are measurements");
+    let alone = stats(&format!("{}{}{}{}", stream(1, 0, None), output(1, 1_000, 900), stream_end(1, 1_001), prompt(1, 6_000, 200)), 5_000);
+    assert_eq!(alone.decode_tok_per_s, None, "no stream to measure decode on");
+    assert_eq!(alone.prefill_ms_billed, None, "null exactly when decode is");
+    assert_eq!(alone.first_token_ms_max, Some(1_000));
+}
+
+/// A billed stream with tokens but no first-output mark (a runtime from
+/// before #2877, or one that sent no partials) leaves the split unknown:
+/// null, never the whole stream.
 #[test]
 fn with_no_first_output_mark_decode_and_first_token_are_null_not_guessed() {
     let traj = format!("{}{}", stream(1, 0, Some(10_000)), prompt(1, 6_000, 1_000));
@@ -1497,9 +1528,8 @@ fn with_no_first_output_mark_decode_and_first_token_are_null_not_guessed() {
     assert_eq!(s.first_token_ms_max, None);
     assert_eq!(s.context_peak_tokens, Some(6_000));
     let mixed = format!(
-        "{}{}{}{}{}",
-        stream(1, 0, Some(10_000)),
-        first_output(1, 2_000),
+        "{}{}{}{}",
+        streamed(1, 0, 2_000, 10_000),
         prompt(1, 6_000, 1_000),
         stream(2, 20_000, Some(30_000)),
         prompt(2, 7_000, 1_000),

@@ -516,9 +516,9 @@ fn every_event_type_reports_its_turn_and_clock() {
 
 /// (Kain, 2026-10-23) Time to first token: the stream opens before the
 /// request is sent, so the gap to its first output is the prompt's
-/// processing (prefill) plus transport. A chunk that carries nothing (a
-/// role-only first delta) is not output; reasoning and a tool call being
-/// written are.
+/// processing (prefill) plus transport. Output is `generated_chars` growing
+/// (#2877: answer, reasoning and tool-call arguments), so a role-only empty
+/// first chunk is not output and reasoning is.
 #[test]
 fn a_stream_marks_its_first_output_not_its_first_chunk() {
     let f = fold(&[
@@ -526,22 +526,38 @@ fn a_stream_marks_its_first_output_not_its_first_chunk() {
         r#"{"type":"model.partial","seq":1,"ts":1200,"cumulative_chars":0,"delta_chars":0,"generated_chars":0}"#,
         r#"{"type":"model.partial","seq":1,"ts":9000,"cumulative_chars":0,"delta_chars":0,"generated_chars":3}"#,
         r#"{"type":"model.partial","seq":1,"ts":9500,"cumulative_chars":40,"delta_chars":40,"generated_chars":60}"#,
+        r#"{"type":"model.partial","seq":1,"ts":9600,"cumulative_chars":40,"delta_chars":0,"generated_chars":60}"#,
         r#"{"type":"model.streaming.end","seq":1,"ts":12000}"#,
         r#"{"type":"model.streaming.start","seq":2,"ts":20000}"#,
-        r#"{"type":"model.partial","seq":2,"ts":20400,"cumulative_chars":0,"tool_calls_present":true}"#,
+        r#"{"type":"model.partial","seq":2,"ts":20400,"cumulative_chars":0,"tool_calls_present":true,"generated_chars":12}"#,
         r#"{"type":"model.streaming.end","seq":2,"ts":21000}"#,
         r#"{"type":"model.streaming.start","seq":3,"ts":30000}"#,
-        r#"{"type":"model.partial","seq":3,"ts":30300,"cumulative_chars":5}"#,
         r#"{"type":"model.streaming.end","seq":3,"ts":31000}"#,
-        r#"{"type":"model.streaming.start","seq":4,"ts":40000}"#,
-        r#"{"type":"model.streaming.end","seq":4,"ts":41000}"#,
     ]);
     let first: Vec<Option<u64>> = f.streams.iter().map(Stream::first_output_after_ms).collect();
-    assert_eq!(
-        first,
-        vec![Some(8000), Some(400), Some(300), None],
-        "reasoning counts; a tool call counts; an old runtime's answer chars count; no output is unknown"
-    );
+    assert_eq!(first, vec![Some(8000), Some(400), None], "reasoning counts; a tool call counts; no output is unknown");
+    let chunks: Vec<u32> = f.streams.iter().map(|s| s.output_chunks).collect();
+    assert_eq!(chunks, vec![2, 1, 0], "a chunk that grew nothing is not output");
+}
+
+/// (Argon review) A runtime from before #2877 sends no `generated_chars`, so
+/// a thinking model's reasoning chunks look empty and its first answer chunk
+/// would read the whole think as prefill. No mark, rather than a wrong one;
+/// likewise a partial with no clock, one before its stream's start, and one
+/// after the stream closed.
+#[test]
+fn first_output_is_unknown_rather_than_guessed() {
+    let f = fold(&[
+        r#"{"type":"model.streaming.start","seq":1,"ts":1000}"#,
+        r#"{"type":"model.partial","seq":1,"ts":9000,"cumulative_chars":40,"delta_chars":40,"tool_calls_present":true}"#,
+        r#"{"type":"model.streaming.end","seq":1,"ts":12000}"#,
+        r#"{"type":"model.streaming.start","seq":2,"ts":20000}"#,
+        r#"{"type":"model.partial","seq":2,"cumulative_chars":5,"generated_chars":5}"#,
+        r#"{"type":"model.partial","seq":2,"ts":19000,"cumulative_chars":6,"generated_chars":6}"#,
+        r#"{"type":"model.streaming.end","seq":2,"ts":21000}"#,
+        r#"{"type":"model.partial","seq":2,"ts":21500,"cumulative_chars":9,"generated_chars":9}"#,
+    ]);
+    assert!(f.streams.iter().all(|s| s.first_output_ms.is_none() && s.output_chunks == 0), "{:?}", f.streams);
 }
 
 /// The largest prompt any one call sent: how much of the window the run

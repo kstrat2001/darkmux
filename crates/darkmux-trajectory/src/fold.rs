@@ -28,16 +28,24 @@ pub struct Stream {
     /// cumulative count with every stream).
     pub content_chars: u64,
     /// The clock of the stream's first output: the first `model.partial`
-    /// carrying anything (answer, reasoning or a tool call). The stream opens
-    /// before the request is sent, so the gap is prefill plus transport.
+    /// whose `generated_chars` (answer, reasoning and tool-call arguments,
+    /// #2877) grew. The stream opens before the request is sent, so the gap
+    /// is prefill plus transport. `None` on a runtime from before #2877,
+    /// whose partials cannot show reasoning output: its first answer chunk
+    /// would read the whole think as prefill.
     pub first_output_ms: Option<u64>,
+    /// `model.partial` chunks that grew `generated_chars`. One chunk means
+    /// the output arrived at once, so the time after it is not decode time.
+    pub output_chunks: u32,
+    /// The latest `generated_chars` this stream reported.
+    generated_chars: u64,
 }
 
 impl Stream {
     /// Time to first token: from the stream's start to its first output;
     /// `None` when it produced none.
     pub fn first_output_after_ms(&self) -> Option<u64> {
-        self.first_output_ms.map(|t| t.saturating_sub(self.start_ms))
+        self.first_output_ms.filter(|t| *t >= self.start_ms).map(|t| t - self.start_ms)
     }
 
     /// Generation time of a closed stream; 0 while open.
@@ -221,6 +229,8 @@ impl TrajectoryFold {
                 end_ms: None,
                 content_chars: 0,
                 first_output_ms: None,
+                output_chunks: 0,
+                generated_chars: 0,
             }),
             E::StreamingEnd(s) => {
                 // The most recent OPEN stream on this seq: an aborted turn is
@@ -330,15 +340,19 @@ impl TrajectoryFold {
 
     fn partial(&mut self, p: &crate::event::Partial) {
         let (seq, cumulative_chars) = (p.seq, p.cumulative_chars);
-        // An older runtime sends no `generated_chars`; its answer chars are
-        // then the only output it can show.
-        let produced = p.generated_chars.unwrap_or(cumulative_chars) > 0 || p.delta_chars > 0 || p.tool_calls_present;
         // Cumulative within ONE stream, so it belongs to the latest stream
         // on this seq and is summed across streams.
         if let Some(s) = self.streams.iter_mut().rev().find(|s| s.seq == seq) {
             s.content_chars = s.content_chars.max(cumulative_chars);
-            if produced {
-                s.first_output_ms.get_or_insert(p.ts);
+            // Output timing only from a partial on the OPEN stream, with a
+            // clock, carrying `generated_chars`.
+            match p.generated_chars {
+                Some(g) if s.end_ms.is_none() && p.ts >= s.start_ms && p.ts > 0 && g > s.generated_chars => {
+                    s.generated_chars = g;
+                    s.output_chunks = s.output_chunks.saturating_add(1);
+                    s.first_output_ms.get_or_insert(p.ts);
+                }
+                _ => {}
             }
         } else {
             let t = self.turn_detail.entry(seq).or_default();
