@@ -173,6 +173,23 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The engine's details describe the engine named with --engine; alone
+    /// they are refused, never accepted and dropped.
+    #[test]
+    fn engine_details_need_the_engine() {
+        use clap::Parser;
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["darkmux", "lab", "submit", "r", "--dry-run"];
+            argv.extend_from_slice(extra);
+            crate::cli::Cli::try_parse_from(argv)
+        };
+        for flag in [["--quant", "Q4_K_M"], ["--engine-version", "0.4.1"], ["--engine-backend", "metal"]] {
+            let err = parse(&flag).err().unwrap_or_else(|| panic!("{} alone must be refused", flag[0])).to_string();
+            assert!(err.contains("--engine"), "{err}");
+            assert!(parse(&[flag[0], flag[1], "--engine", "rec"]).is_ok(), "{} with --engine", flag[0]);
+        }
+    }
+
     fn token() -> String {
         format!("{}{}", upload::TOKEN_PREFIX, "ab12".repeat(8))
     }

@@ -1614,13 +1614,13 @@ pub(crate) enum LabCmd {
         #[arg(long)]
         engine: Option<String>,
         /// The engine's backend, with --engine.
-        #[arg(long = "engine-backend")]
+        #[arg(long = "engine-backend", requires = "engine")]
         engine_backend: Option<String>,
         /// The engine's version, with --engine.
-        #[arg(long = "engine-version")]
+        #[arg(long = "engine-version", requires = "engine")]
         engine_version: Option<String>,
         /// The quantization, with --engine.
-        #[arg(long)]
+        #[arg(long, requires = "engine")]
         quant: Option<String>,
         /// The model's weights (a folder or a file), with --engine or when
         /// LM Studio's are not found.

@@ -146,17 +146,14 @@ impl Answer {
     }
 }
 
-static CFG_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// One call to the site through `curl`. The token and URL ride in a 0600
-/// config file; a body is read from `body_file`.
+/// One call to the site through `curl`. The token and URL ride in a config
+/// curl reads on stdin, never in a file or the process list; a body is read
+/// from `body_file`.
 pub fn call(site: &str, method: &str, path: &str, token: &str, body_file: Option<&Path>) -> Result<Answer> {
     let url = format!("{}{path}", site.trim_end_matches('/'));
     if !site_is_safe(site) {
         bail!("the site must be https (or a preview on this machine): {site}");
     }
-    let n = CFG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let cfg = std::env::temp_dir().join(format!("darkmux-evals-{}-{n}.curl", std::process::id()));
     let quote = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
     let mut config = format!(
         "url = \"{}\"\nrequest = \"{method}\"\nheader = \"Authorization: Bearer {}\"\nheader = \"Accept: application/json\"\n",
@@ -167,14 +164,17 @@ pub fn call(site: &str, method: &str, path: &str, token: &str, body_file: Option
         config.push_str("header = \"Content-Type: application/json\"\n");
         config.push_str(&format!("data-binary = \"@{}\"\n", quote(&file.display().to_string())));
     }
-    write_private(&cfg, config.as_bytes())?;
-    let out = Command::new("curl")
+    let mut child = Command::new("curl")
         // `-q` first: no `~/.curlrc`, whose `verbose` would print the token.
-        .args(["-q", "-sS", "--max-time", "120", "-w", "\n%{http_code}", "-K"])
-        .arg(&cfg)
-        .output();
-    let _ = std::fs::remove_file(&cfg);
-    let out = out.context("running curl (darkmux uses it for HTTPS)")?;
+        .args(["-q", "-sS", "--max-time", "120", "-w", "\n%{http_code}", "-K", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("running curl (darkmux uses it for HTTPS)")?;
+    // Dropping stdin after the write closes it, so curl reads the whole config.
+    child.stdin.take().expect("piped").write_all(config.as_bytes()).context("handing curl its config")?;
+    let out = child.wait_with_output().context("running curl (darkmux uses it for HTTPS)")?;
     if !out.status.success() {
         bail!("could not reach {site}: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
@@ -350,6 +350,37 @@ mod tests {
         assert!(request.starts_with("POST /api/v1/uploads "), "{request}");
         assert!(request.contains("Content-Type: application/json"), "{request}");
         assert!(request.ends_with("{\"runs\":[]}"), "{request}");
+    }
+
+    /// The token reaches curl on stdin: no file holds it while the call is in
+    /// flight, so one killed mid-upload leaves nothing behind.
+    #[test]
+    fn the_token_is_never_written_to_disk() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let site = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let secret = token();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = conn.read(&mut buf);
+            // Mid-call: look for any small temp file that holds the token.
+            // Regular files only: opening a FIFO a shared temp dir holds
+            // (macOS's does) would block this thread, and the call with it.
+            let holders: Vec<String> = std::fs::read_dir(std::env::temp_dir())
+                .unwrap()
+                .flatten()
+                .filter(|e| e.metadata().is_ok_and(|m| m.is_file() && m.len() < 64 * 1024))
+                .filter(|e| std::fs::read_to_string(e.path()).is_ok_and(|t| t.contains(&secret)))
+                .map(|e| e.path().display().to_string())
+                .collect();
+            let reply = "HTTP/1.1 200 X\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+            conn.write_all(reply.as_bytes()).unwrap();
+            holders
+        });
+        call(&site, "GET", "/api/v1/account", &token(), None).unwrap();
+        let holders = server.join().unwrap();
+        assert!(holders.is_empty(), "the token was on disk mid-call: {holders:?}");
     }
 
     #[test]
