@@ -13245,12 +13245,6 @@ fn status_for_plan(plan: Result<crate::runtime_image::DefaultImagePlan>) -> Dock
 /// role-load / model-probe / workspace setup so a new user without Docker gets
 /// a clean, operator-actionable bail, and a `brew install` user without a
 /// local image gets a one-time pull instead of a "build from source" dead-end.
-/// (#906) The darkmux runtime image, resolved for running a lab run's tests
-/// in it: the same preflight and version check a dispatch gets.
-pub(crate) fn test_runtime_image() -> Result<String> {
-    check_docker_preflight(None).map(|image| image.reference)
-}
-
 fn check_docker_preflight(explicit: Option<&str>) -> Result<crate::runtime_image::ResolvedImage> {
     match docker_runtime_status() {
         // Daemon up (image present OR absent) — resolve the darkmux image,
@@ -13267,6 +13261,14 @@ fn check_docker_preflight(explicit: Option<&str>) -> Result<crate::runtime_image
         other => preflight_result_for(other)
             .and_then(|()| Err(anyhow!("docker preflight produced no runtime image"))),
     }
+}
+
+/// (#906) The darkmux runtime image, resolved for running a lab run's tests
+/// in it: the same preflight and version check a dispatch gets. (#3355
+/// review) By the content id that was checked, like the dispatch (#2923
+/// review C6), so a tag re-pointed after the check cannot swap the image.
+pub(crate) fn test_runtime_image() -> Result<String> {
+    check_docker_preflight(None).map(|image| image.id)
 }
 
 /// Map a probe result to the dispatch-time bail (pure — unit-testable

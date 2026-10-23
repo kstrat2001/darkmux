@@ -5,6 +5,7 @@
 
 use super::files::{glob_match, lines_kept, scope_violations, Changes};
 use super::*;
+use darkmux_crew::contained_command::Placement;
 use crate::lab::manifest::{GradeRecord, RunManifest};
 use crate::workloads::grade_spec::*;
 use std::fs;

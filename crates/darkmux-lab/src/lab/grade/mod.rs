@@ -41,7 +41,7 @@ mod tests;
 
 use crate::lab::dispatch_end::DispatchEnd;
 use darkmux_crew::bounded_command::Bounded;
-use darkmux_crew::contained_command::{self, Placement};
+use darkmux_crew::contained_command;
 use crate::lab::manifest::{
     GradeCheck, GradeRecord, ManifestVerify, ManifestVerifyReport, RunManifest,
 };
@@ -57,35 +57,8 @@ const WORK_DIR: &str = "grade-work";
 /// The default bound on one run of the suite command.
 const DEFAULT_SUITE_TIMEOUT_SECONDS: u64 = 120;
 
-/// Where the grader runs the suite, and as whom in a container.
-#[derive(Debug, Clone)]
-pub(crate) struct Runner {
-    pub placement: Placement,
-    pub user: Option<String>,
-}
-
-impl Runner {
-    /// The suite runs where the run's verify command runs: the workload's
-    /// image (else the runtime image), or the host with `runtime.tests_on_host`.
-    pub(crate) fn for_workload(loaded: &crate::workloads::types::LoadedWorkload) -> Result<Self> {
-        let placement = crate::providers::coding_task::test_placement(loaded)?;
-        let user = crate::providers::coding_task::test_user(&placement)?;
-        Ok(Self { placement, user })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn host() -> Self {
-        Self { placement: Placement::Host, user: None }
-    }
-
-    /// The path the suite sees for `root`, the directory mounted for it.
-    fn view(&self, root: &Path) -> String {
-        match self.placement {
-            Placement::Host => root.display().to_string(),
-            Placement::Container(_) => "/workspace".to_string(),
-        }
-    }
-}
+/// Where the grader runs the suite: where the run's verify command runs.
+pub(crate) use crate::providers::coding_task::TestRunner as Runner;
 
 /// Everything one grading reads. Nothing here is written to.
 pub(crate) struct GradeInput<'a> {
@@ -430,11 +403,8 @@ fn run_suite_in(runner: &Runner, spec: &SuiteGrade, root: &Path, dir: &Path) -> 
         user: runner.user.clone(),
         name_prefix: "darkmux-grade",
     };
-    let ran = contained_command::run(&runner.placement, &run, Duration::from_secs(seconds));
-    if contained_command::docker_failed(&runner.placement, &ran) {
-        let Bounded::Finished { stderr, .. } = &ran else { unreachable!() };
-        bail!("the suite could not run in its container: {}", String::from_utf8_lossy(stderr).trim());
-    }
+    let ran = contained_command::run(&runner.placement, &run, Duration::from_secs(seconds))
+        .map_err(|why| anyhow!("the suite did not run in its container: {why}"))?;
     let outcome = match ran {
         Bounded::Finished { code, .. } => SuiteOutcome::Exited { code },
         Bounded::TimedOut { seconds } => SuiteOutcome::TimedOut { seconds },

@@ -27,11 +27,33 @@ pub enum Placement {
 /// `docker run`'s exit code for "the container could not be run".
 pub const DOCKER_RUN_FAILED: i32 = 125;
 
-/// (#2973 review) A file written into the mounted tree that the container
-/// checks for before running anything: a Docker daemon that cannot see the
-/// tree (remote, or a VM without that share) mounts an empty directory,
-/// where a permissive command would pass.
+/// (#2973 review) A file the container checks for before running anything:
+/// a Docker daemon that cannot see the host's paths (remote, or a VM
+/// without that share) mounts empty directories, where a permissive command
+/// would pass. (#3355 review) It lives in a directory of its own beside the
+/// tree, never in it: the tree is the model's, so a file written there
+/// could follow a link the model planted, and the command would see it.
 pub const SENTINEL: &str = ".darkmux-gate";
+
+/// Where the sentinel's directory is mounted, read-only.
+const SENTINEL_AT: &str = "/darkmux-gate";
+
+/// (#3355 review) The line the container prints before the command runs.
+/// Its presence is what says the command ran: without it, any exit is
+/// Docker's or the mount check's, and with it, any exit (125 included) is
+/// the command's own. Removed from the output the caller sees.
+const STARTED_LINE: &str = "darkmux-contained: started";
+
+/// A run the container never started: Docker could not run it, or the tree
+/// was not mounted. Never the command's own result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotRun(pub String);
+
+impl std::fmt::Display for NotRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 /// The label a container carries: the darkmux process that started it.
 pub const PID_LABEL: &str = "darkmux.gate.pid";
@@ -74,6 +96,9 @@ pub fn container_args(image: &str, name: &str, run: &Run) -> Vec<String> {
         "-v".to_string(),
         format!("{}:/workspace", run.tree.display()),
     ]);
+    if let Some(sentinel_dir) = sentinel_dir_for(name, run.tree) {
+        args.extend(["-v".to_string(), format!("{}:{SENTINEL_AT}:ro", sentinel_dir.display())]);
+    }
     for (host, at) in run.mounts {
         args.extend(["-v".to_string(), format!("{}:{at}", host.display())]);
     }
@@ -94,7 +119,11 @@ pub fn container_args(image: &str, name: &str, run: &Run) -> Vec<String> {
         "sh".to_string(),
         image.to_string(),
         "-c".to_string(),
-        format!("test -f /workspace/{SENTINEL} || exit {DOCKER_RUN_FAILED}\n{}", run.command),
+        format!(
+            "test -f {SENTINEL_AT}/{SENTINEL} || {{ echo 'the tree was not mounted: the Docker daemon cannot see the host path' >&2; exit {DOCKER_RUN_FAILED}; }}\n\
+             echo '{STARTED_LINE}'\n{}",
+            run.command
+        ),
     ]);
     args
 }
@@ -118,39 +147,58 @@ pub fn command(placement: &Placement, run: &Run) -> (Command, Option<String>) {
     }
 }
 
-/// Run `run` where `placement` says, bounded by `timeout`. In a container,
-/// the sentinel is written into the tree for the run and removed after it,
-/// orphaned containers are reaped first, and a container whose client was
-/// killed (deadline or signal) is removed by name. `Finished` with
-/// [`DOCKER_RUN_FAILED`] in a container is Docker failing to run it, never
-/// the command's own exit: see [`docker_failed`].
-pub fn run(placement: &Placement, run: &Run, timeout: Duration) -> Bounded {
-    let in_container = matches!(placement, Placement::Container(_));
-    let sentinel = run.tree.join(SENTINEL);
-    if in_container {
-        reap_orphaned_containers();
-        if let Err(e) = std::fs::write(&sentinel, b"") {
-            return Bounded::SpawnFailed(e);
-        }
-    }
-    let (cmd, container) = command(placement, run);
-    let ran = run_bounded(cmd, timeout);
-    if let (Some(name), Bounded::TimedOut { .. } | Bounded::Interrupted) = (&container, &ran) {
-        // Killing the `docker run` client does not stop its container.
-        remove_container(name);
-    }
-    if in_container {
-        let _ = std::fs::remove_file(&sentinel);
-    }
-    ran
+/// The sentinel's directory for the container `name`: beside the tree, in
+/// its parent, which darkmux made (the run directory, a scratch dir), never
+/// inside the tree. `None` for a tree with no parent.
+fn sentinel_dir_for(name: &str, tree: &Path) -> Option<PathBuf> {
+    Some(tree.parent()?.join(format!("{SENTINEL}-{name}")))
 }
 
-/// Whether a finished run is Docker failing to run the container (a missing
-/// image, a stopped daemon, the tree not mounted) rather than the command's
-/// own exit.
-pub fn docker_failed(placement: &Placement, ran: &Bounded) -> bool {
-    matches!(placement, Placement::Container(_))
-        && matches!(ran, Bounded::Finished { code: Some(DOCKER_RUN_FAILED), .. })
+/// Run `run` where `placement` says, bounded by `timeout`. In a container,
+/// orphaned containers are reaped first, the sentinel is written beside the
+/// tree for the run and removed after it, and a container whose client was
+/// killed (deadline or signal) is removed by name. `Err` is a container that
+/// never ran the command; `Finished` is always the command's own exit.
+pub fn run(placement: &Placement, run: &Run, timeout: Duration) -> Result<Bounded, NotRun> {
+    let (cmd, container) = command(placement, run);
+    let Some(name) = container else {
+        return Ok(run_bounded(cmd, timeout));
+    };
+    reap_orphaned_containers();
+    let sentinel_dir = sentinel_dir_for(&name, run.tree)
+        .ok_or_else(|| NotRun(format!("{} has no parent directory to hold the mount check", run.tree.display())))?;
+    if let Err(e) = write_sentinel(&sentinel_dir) {
+        return Err(NotRun(format!("could not write the mount check in {}: {e}", sentinel_dir.display())));
+    }
+    let ran = run_bounded(cmd, timeout);
+    if matches!(ran, Bounded::TimedOut { .. } | Bounded::Interrupted) {
+        // Killing the `docker run` client does not stop its container.
+        remove_container(&name);
+    }
+    let _ = std::fs::remove_dir_all(&sentinel_dir);
+    started(ran)
+}
+
+/// A fresh directory holding the sentinel. `create_dir` and `create_new`
+/// refuse anything already there, a link included, so nothing is followed.
+fn write_sentinel(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir(dir)?;
+    std::fs::OpenOptions::new().write(true).create_new(true).open(dir.join(SENTINEL)).map(drop)
+}
+
+/// A container's result, read by whether it printed [`STARTED_LINE`].
+fn started(ran: Bounded) -> Result<Bounded, NotRun> {
+    match ran {
+        Bounded::Finished { success, code, stdout, stderr } => match stdout.strip_prefix(format!("{STARTED_LINE}\n").as_bytes()) {
+            Some(rest) => Ok(Bounded::Finished { success, code, stdout: rest.to_vec(), stderr }),
+            None => {
+                let said = String::from_utf8_lossy(&stderr).trim().to_string();
+                let code = code.map_or("a signal".to_string(), |c| format!("exit {c}"));
+                Err(NotRun(if said.is_empty() { format!("docker run ended ({code}) before the command started") } else { said }))
+            }
+        },
+        other => Ok(other),
+    }
 }
 
 /// (#2973 review) The containers to remove: those whose owning darkmux
@@ -233,10 +281,12 @@ mod tests {
             "-v /tmp/s/report:/report", "-w /workspace/pkg", "--user=501:20 -e HOME=/tmp", "--entrypoint sh node:22 -c"] {
             assert!(joined.contains(want), "missing `{want}` in: {joined}");
         }
-        assert_eq!(args.iter().filter(|a| *a == "-v").count(), 2, "{joined}");
+        // The tree, the named mount, and the mount check beside the tree, read-only.
+        assert!(joined.contains(&format!("-v /tmp/s/{SENTINEL}-darkmux-test-1:{SENTINEL_AT}:ro")), "{joined}");
+        assert_eq!(args.iter().filter(|a| *a == "-v").count(), 3, "{joined}");
         let script = args.last().unwrap();
-        assert!(script.starts_with(&format!("test -f /workspace/{SENTINEL} || exit 125\n")), "{script}");
-        assert!(script.ends_with("\nnpm test"), "{script}");
+        assert!(script.starts_with(&format!("test -f {SENTINEL_AT}/{SENTINEL} || {{")), "{script}");
+        assert!(script.ends_with(&format!("\necho '{STARTED_LINE}'\nnpm test")), "{script}");
         assert!(!container_args("node:22", "n", &a_run(&[], None)).join(" ").contains("--user"));
     }
 
@@ -248,12 +298,44 @@ mod tests {
         assert_eq!(cmd.get_current_dir(), Some(Path::new("/tmp/s/tree/pkg")));
     }
 
-    /// Exit 125 is Docker's in a container and the command's own on the host.
+    /// (#3355 review) A container that printed the start line ran the
+    /// command, so its exit is the command's own, 125 included; one that did
+    /// not never ran it, whatever its exit, and says why.
     #[test]
-    fn exit_125_is_docker_failing_only_in_a_container() {
-        let ran = Bounded::Finished { success: false, code: Some(125), stdout: vec![], stderr: vec![] };
-        assert!(docker_failed(&Placement::Container("x".into()), &ran));
-        assert!(!docker_failed(&Placement::Host, &ran));
+    fn only_a_started_container_reports_the_commands_exit() {
+        let finished = |stdout: &str, stderr: &str| Bounded::Finished {
+            success: false,
+            code: Some(125),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+        let Ok(Bounded::Finished { code, stdout, .. }) = started(finished(&format!("{STARTED_LINE}\nout"), "")) else {
+            panic!("a started run is the command's")
+        };
+        assert_eq!((code, stdout), (Some(125), b"out".to_vec()), "the start line is not the command's output");
+        assert_eq!(started(finished("", "Unable to find image")).unwrap_err(), NotRun("Unable to find image".into()));
+        let silent = started(finished("", "")).unwrap_err().0;
+        assert!(silent.contains("exit 125") && silent.contains("before the command started"), "{silent}");
+        assert!(started(Bounded::TimedOut { seconds: 3 }).is_ok());
+    }
+
+    /// (#3355 review) The mount check is written beside the tree, never in it,
+    /// and refuses anything already at its path: a link there is not followed.
+    #[test]
+    fn the_mount_check_never_follows_a_link() {
+        let root = tempfile::TempDir::new().unwrap();
+        let tree = root.path().join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        let dir = sentinel_dir_for("c-1", &tree).unwrap();
+        assert_eq!(dir.parent(), Some(root.path()), "beside the tree, not in it");
+        let target = root.path().join("precious");
+        std::fs::write(&target, "keep").unwrap();
+        std::os::unix::fs::symlink(&target, &dir).unwrap();
+        assert!(write_sentinel(&dir).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
+        std::fs::remove_file(&dir).unwrap();
+        write_sentinel(&dir).unwrap();
+        assert!(dir.join(SENTINEL).is_file());
     }
 
     /// (#906) A run in a real container sees its tree and no network, and the
@@ -271,10 +353,22 @@ mod tests {
             user: None,
             name_prefix: "darkmux-test",
         };
-        let ran = run(&Placement::Container("node:22-bookworm-slim".into()), &run_, Duration::from_secs(60));
-        let Bounded::Finished { success, stdout, stderr, .. } = ran else { panic!("{ran:?}") };
+        let contained = Placement::Container("node:22-bookworm-slim".into());
+        let ran = run(&contained, &run_, Duration::from_secs(60));
+        let Ok(Bounded::Finished { success, stdout, stderr, .. }) = ran else { panic!("{ran:?}") };
         assert!(success, "{} {}", String::from_utf8_lossy(&stdout), String::from_utf8_lossy(&stderr));
         assert_eq!(String::from_utf8_lossy(&stdout), "hello");
-        assert!(!tree.path().join(SENTINEL).exists());
+        let left: Vec<_> = std::fs::read_dir(tree.path().parent().unwrap()).unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| n.starts_with(SENTINEL))
+            .collect();
+        assert!(left.is_empty(), "the mount check is removed: {left:?}");
+        // The command sees only the model's files, and its own exit 125 is its own.
+        let own = Run { command: "ls -A; exit 125", ..run_.clone() };
+        let Ok(Bounded::Finished { code, stdout, .. }) = run(&contained, &own, Duration::from_secs(60)) else { panic!() };
+        assert_eq!((code, String::from_utf8_lossy(&stdout).trim().to_string()), (Some(125), "a.txt".to_string()));
+        // A missing image never ran the command.
+        let missing = run(&Placement::Container("darkmux-no-such-image:0".into()), &run_, Duration::from_secs(60));
+        assert!(missing.is_err(), "{missing:?}");
     }
 }

@@ -454,28 +454,33 @@ fn run_gate_command(placement: &GatePlacement, command: &str, scratch_checkout: 
         &gate_run(command, scratch_checkout),
         crate::bounded_command::configured_timeout(),
     );
-    gate_result(placement, command, scratch_checkout, ran)
+    gate_result(command, scratch_checkout, ran)
 }
 
-/// What one gate run means. (#2973 review) In a container, `docker run`'s
-/// own exit 125 is Docker failing to run it (a missing image, a stopped
-/// daemon, or the sentinel check finding the scratch copy unmounted): a
-/// named skip, never a kit that "applied and failed its tests".
+/// What one gate run means. (#2973 review) A container that never ran the
+/// command (a missing image, a stopped daemon, or the mount check finding
+/// the scratch copy unmounted) is a named skip, never a kit that "applied
+/// and failed its tests". (#3355 review) Once it started, every exit is
+/// the command's own, 125 included.
 fn gate_result(
-    placement: &GatePlacement,
     command: &str,
     scratch_checkout: &Path,
-    ran: crate::bounded_command::Bounded,
+    ran: Result<crate::bounded_command::Bounded, crate::contained_command::NotRun>,
 ) -> (Option<GateOutcome>, Option<String>) {
     use crate::bounded_command::Bounded;
+    let ran = match ran {
+        Ok(ran) => ran,
+        Err(why) => {
+            return (
+                None,
+                Some(format!(
+                    "the gate container did not run test_command ({why}): the `gate_image` may be missing, \
+                     Docker may be down, or the scratch copy was not mounted (a remote Docker daemon)"
+                )),
+            )
+        }
+    };
     match ran {
-        Bounded::Finished { code: Some(DOCKER_RUN_FAILED), .. } if matches!(placement, GatePlacement::Container(_)) => (
-            None,
-            Some(format!(
-                "the gate container did not run test_command (docker exit {DOCKER_RUN_FAILED}): the `gate_image` may be \
-                 missing, Docker may be down, or the scratch copy was not mounted (a remote Docker daemon)"
-            )),
-        ),
         Bounded::Finished { success, code, .. } => (
             Some(GateOutcome { passed: success, command: command.to_string(), exit_code: code, applied: Some(true), reason: None }),
             None,
@@ -486,8 +491,6 @@ fn gate_result(
     }
 }
 
-/// `docker run`'s exit code for "the container could not be run".
-const DOCKER_RUN_FAILED: i32 = crate::contained_command::DOCKER_RUN_FAILED;
 
 /// See [`crate::contained_command::SENTINEL`].
 #[cfg(test)]
@@ -761,7 +764,9 @@ mod tests {
             "-v /tmp/s/checkout:/workspace", "-w /workspace"] {
             assert!(joined.contains(want), "missing `{want}` in: {joined}");
         }
-        assert_eq!(args.iter().filter(|a| *a == "-v").count(), 1, "exactly one mount: {joined}");
+        // The scratch copy, and the mount check beside it, read-only.
+        assert_eq!(args.iter().filter(|a| *a == "-v").count(), 2, "the copy and the mount check only: {joined}");
+        assert!(joined.contains(&format!("-v /tmp/s/{GATE_SENTINEL}-darkmux-gate-1:/darkmux-gate:ro")), "{joined}");
         assert!(joined.contains("--entrypoint sh rust:1-slim -c"), "{joined}");
         // (#2973 review) The coder container's own limits, tini as PID 1, and
         // the owner pid as a label so an orphan can be reaped.
@@ -771,7 +776,7 @@ mod tests {
         // The script refuses to run the command unless the patched copy is
         // actually mounted (a remote daemon mounts an empty directory).
         let script = args.last().unwrap();
-        assert!(script.starts_with(&format!("test -f /workspace/{GATE_SENTINEL} || exit 125")), "{script}");
+        assert!(script.starts_with(&format!("test -f /darkmux-gate/{GATE_SENTINEL} || {{")), "{script}");
         assert!(script.ends_with("\ncargo test"), "{script}");
     }
 
@@ -828,18 +833,19 @@ mod tests {
         assert!(String::from_utf8_lossy(&ps.stdout).trim().is_empty(), "a gate container outlived its deadline");
     }
 
-    /// (#2973 review, PROVEN) `docker run` exiting 125 is Docker failing to
-    /// run the container (a missing image, a stopped daemon, the copy not
-    /// mounted): a named skip, never "applied, tests failed".
+    /// (#2973 review, PROVEN) A container that never ran the command (a
+    /// missing image, a stopped daemon, the copy not mounted) is a named
+    /// skip, never "applied, tests failed". (#3355 review) Once the command
+    /// ran, its exit 125 is its own: a failed kit.
     #[test]
     fn a_container_that_never_ran_the_command_is_a_skip_not_a_failed_kit() {
-        let (outcome, reason) = gate_result(&GatePlacement::Container("x".into()), "true", Path::new("/w"),
-            crate::bounded_command::Bounded::Finished { success: false, code: Some(125), stdout: Vec::new(), stderr: Vec::new() });
+        let never = crate::contained_command::NotRun("Unable to find image".into());
+        let (outcome, reason) = gate_result("true", Path::new("/w"), Err(never));
         assert!(outcome.is_none(), "{outcome:?}");
-        assert!(reason.unwrap().contains("exit 125"));
-        let (on_host, _) = gate_result(&GatePlacement::Host, "true", Path::new("/w"),
-            crate::bounded_command::Bounded::Finished { success: false, code: Some(125), stdout: Vec::new(), stderr: Vec::new() });
-        assert!(on_host.is_some_and(|o| !o.passed), "on the host, 125 is the command's own exit");
+        assert!(reason.unwrap().contains("Unable to find image"));
+        let (own, _) = gate_result("true", Path::new("/w"),
+            Ok(crate::bounded_command::Bounded::Finished { success: false, code: Some(125), stdout: Vec::new(), stderr: Vec::new() }));
+        assert!(own.is_some_and(|o| !o.passed && o.exit_code == Some(125)), "the command's own exit 125 fails the kit");
     }
 
     /// (#2973 review) An orphan is a gate container whose owner process is
