@@ -166,6 +166,7 @@ const KEYS: &[(&str, Ty)] = &[
     ("runtime.verbose", Ty::Bool),
     // (#3275) A string: a bare uid stays `"1000"`, the field is a string.
     ("runtime.container_user", Ty::Str),
+    ("runtime.tests_on_host", Ty::Bool),
     // (#2110/#2109) The thermal governor + breaker's tuning block —
     // see `ThermalConfig`'s own doc. (#2947) The enum-valued keys
     // (`runtime.detection.degeneracy.policy`, `runtime.thermal.pause_at` /

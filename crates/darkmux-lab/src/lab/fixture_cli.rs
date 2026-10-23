@@ -81,11 +81,12 @@ pub fn cmd_register(
             .unwrap_or_default(),
     );
 
-    // (#906, P6 defense-in-depth) `verify_command` runs on the HOST shell
-    // (`/bin/sh -c`) with the operator's privileges, NOT inside the
-    // dispatch container. Surface this at register time so an operator
-    // adding a shared / third-party fixture knows its verify command will
-    // execute as them (a planted `rm -rf ~` would run unsandboxed).
+    // (#906, P6 defense-in-depth) A fixture's verify command runs the code
+    // a model wrote, and the command itself is the fixture's. It runs in a
+    // container (no network, only the sandbox mounted) unless the operator
+    // opted in to the host with `runtime.tests_on_host`; say which at
+    // register time, so an operator adding a shared or third-party fixture
+    // knows where its command will execute.
     if let Ok(manifest) = FixtureManifest::load_from_dir(path) {
         if manifest
             .verify_command
@@ -93,15 +94,23 @@ pub fn cmd_register(
             .map(|c| !c.trim().is_empty())
             .unwrap_or(false)
         {
-            msg.push_str(
-                "\n\n  ⚠ This fixture declares a verify_command. It runs on the HOST shell\n    \
-                 with your privileges (not inside the dispatch container). Only register\n    \
-                 fixtures whose verify_command you trust.",
-            );
+            msg.push_str(verify_command_note(darkmux_types::config_access::tests_on_host()));
         }
     }
 
     Ok(msg)
+}
+
+/// (#906) What register says about a fixture's verify command, by where it
+/// will run.
+fn verify_command_note(on_host: bool) -> &'static str {
+    if on_host {
+        "\n\n  ⚠ This fixture declares a verify_command. `runtime.tests_on_host` is on, so it runs\n    \
+         on this machine with your privileges. Only register fixtures whose verify_command you trust."
+    } else {
+        "\n\n  This fixture declares a verify_command. It runs in a container with no network\n    \
+         and only the run's sandbox mounted (`runtime.tests_on_host` would put it on this machine)."
+    }
 }
 
 /// `dm lab fixture unregister <name>` — remove pointer from registry.
@@ -190,6 +199,15 @@ mod tests {
     // the binary). Unit-test coverage for the underlying LabRegistry
     // operations lives in src/lab/registry.rs. This module is thin
     // wiring; the wiring is exercised via the CLI tests.
+
+    /// (#906) Register says where a fixture's verify command will run: the
+    /// warning about your privileges only when it really runs on the host.
+    #[test]
+    fn the_verify_command_note_names_where_it_runs() {
+        assert!(super::verify_command_note(true).contains("with your privileges"));
+        let contained = super::verify_command_note(false);
+        assert!(contained.contains("container") && !contained.contains("your privileges"), "{contained}");
+    }
 
     /// (5.0) The console's lab-fixture-list panel, for a viewer that is not
     /// this machine: every fixture's absolute path is withheld; its name and

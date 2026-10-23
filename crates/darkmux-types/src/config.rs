@@ -420,7 +420,12 @@ use std::path::Path;
 //           `<uid>:<gid>`; `DARKMUX_CONTAINER_USER`), overriding the
 //           platform's answer for which user the dispatch container runs
 //           as. An older binary refuses a config carrying it.
-pub const CONFIG_SCHEMA_VERSION: &str = "2.5";
+//   2.6 (#906): additive `runtime.tests_on_host` (bool, default false;
+//           `DARKMUX_TESTS_ON_HOST`): a lab run's verify command and grader
+//           suites, which run model-written tests, run on the host as the
+//           user instead of in a locked-down container. An older binary
+//           refuses a config carrying it.
+pub const CONFIG_SCHEMA_VERSION: &str = "2.6";
 
 /// A `config.json` key an older darkmux read (and `init` may have written)
 /// that this one does not. The unknown-key gate (`user_files`) names it with
@@ -1121,6 +1126,13 @@ pub struct RuntimeBehaviorConfig {
     /// parse refuses the dispatch. Not written by `init`: the right value
     /// depends on the platform, so a literal would be wrong somewhere.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub container_user: Option<String>,
+    /// (#906, 2.6) Run a lab run's verify command and grader suites, which
+    /// execute model-written tests, on this machine as the darkmux user
+    /// instead of in a container with no network and only the tree mounted.
+    /// An opt-in (default `false`): only the operator decides that code a
+    /// model wrote may run with their privileges. Resolved through
+    /// `config_access::tests_on_host()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub tests_on_host: Option<bool>,
     /// (#2107, #1833, #2108) Cadence, in milliseconds, of `darkmux serve`'s
     /// daemon-side continuous host sampler — the background thread that
     /// reads cpu/mem/gpu/power/thermal (via its OWN privately-owned
@@ -2240,6 +2252,9 @@ impl DarkmuxConfig {
                 generation_checkpoint_interval_tokens: None,
                 max_stall_recoveries: None,
                 strict_selection: Some(false),
+                // (#906) A visible `false`: model-written tests run in a
+                // container unless the operator opts in.
+                tests_on_host: Some(false),
                 // (#1548) Now wired end-to-end (config_access accessor +
                 // docker-spawn forwarding) — a visible `true` default, same
                 // treatment as strict_selection/check_updates above.

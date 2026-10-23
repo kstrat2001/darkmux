@@ -13263,6 +13263,14 @@ fn check_docker_preflight(explicit: Option<&str>) -> Result<crate::runtime_image
     }
 }
 
+/// (#906) The darkmux runtime image, resolved for running a lab run's tests
+/// in it: the same preflight and version check a dispatch gets. (#3355
+/// review) By the content id that was checked, like the dispatch (#2923
+/// review C6), so a tag re-pointed after the check cannot swap the image.
+pub(crate) fn test_runtime_image() -> Result<String> {
+    check_docker_preflight(None).map(|image| image.id)
+}
+
 /// Map a probe result to the dispatch-time bail (pure — unit-testable
 /// without Docker on the host).
 fn preflight_result_for(status: DockerRuntimeStatus) -> Result<()> {
