@@ -369,6 +369,7 @@ impl Bench {
             installed: darkmux_types::BuildInfo { version: "5.4.0".into(), commit: Some("c".repeat(40)), build: Some(darkmux_types::BuildKind::Dev) },
             installed_at: Some(0),
             provenance: Box::new(move |m| (m == "m1").then(|| provenance.clone()).flatten()),
+            identifying: Vec::new(),
         }
     }
 
@@ -588,4 +589,73 @@ fn gather_here_refuses_before_it_reads_anything() {
     let err = gather(&[], &Stated::default(), &mut |_| {}).unwrap_err().to_string();
     // Off Apple Silicon the machine is refused first; on it, the empty list.
     assert!(err.contains("name at least one lab run") || err.contains("Apple Silicon results only"), "{err}");
+}
+
+/// What identifies the machine and its user never leaves it (Kain, 2026-10-23):
+/// free text that names them is left out, and anything else that does refuses
+/// the bundle, saying where but never what. The fixture is a public repo's.
+#[test]
+fn nothing_that_identifies_the_machine_or_its_user_is_shared() {
+    let b = bench();
+    let serial = "C02XYZ123AB";
+    let uuid = "00000000-0000-4000-8000-ABCDEF000009";
+    let mut machine = b.machine(Some(b.provenance()));
+    machine.identifying = vec![serial.into(), uuid.into(), "Kains-MacBook-Pro".into(), "kstrat2001".into(), "ab".into()];
+    let runs = vec![
+        b.run("r1", "darkmux:m1", json!({"verify": {"passed": true, "details": "ran on Kains-MacBook-Pro.local"}})),
+        b.run("r2", "darkmux:m1", json!({"verify": {"passed": false, "details": "mail kain@example.com for the logs",
+            "work_gate": {"forced_failure_reason": format!("board {serial} timed out")}}})),
+        b.run("r3", "darkmux:m1", json!({"verify": {"passed": true, "details": "lab ab 3 of 5"}})),
+    ];
+    let (built, _) = b.gather(&machine, &runs, &Stated::default()).unwrap();
+    let text = serde_json::to_string(&built.bundle["runs"]).unwrap();
+    for gone in [serial, uuid, "Kains-MacBook-Pro", "kain@example.com"] {
+        assert!(!text.contains(gone), "{gone} reached the bundle: {text}");
+    }
+    let verify = |i: usize| built.bundle["runs"][i]["detail"]["verify"].clone();
+    assert_eq!((verify(0)["summary"].clone(), verify(1)["summary"].clone()), (Value::Null, Value::Null));
+    assert_eq!(verify(1)["forcedFailureReason"], Value::Null);
+    assert_eq!(verify(2)["summary"], "lab ab 3 of 5", "a two-letter name is too common to judge by");
+    assert_eq!(built.bundle["fixture"]["repo"], "kstrat2001/pepper-grinder", "the fixture's public repo is shared as it is");
+
+    // A name anywhere else is not edited out: the bundle is refused, naming where.
+    let named = vec![b.run("r4", "darkmux:Kains-MacBook-Pro-model", json!({}))];
+    let err = b.gather(&machine, &named, &Stated { engine: Some("LM Studio".into()), ..Default::default() }).unwrap_err().to_string();
+    assert!(err.contains("identifies this machine or you") && err.contains("bundle.runs[0].stack.model"), "{err}");
+    assert!(!err.contains("Kains-MacBook-Pro"), "the refusal never repeats the name: {err}");
+}
+
+#[test]
+fn personal_text_is_an_email_an_address_or_a_uuid() {
+    for yes in ["kain@example.com", "from 192.168.1.20", "a4:83:e7:0b:12:9f", "id 00000000-0000-4000-8000-ABCDEF000009"] {
+        assert!(looks_personal(yes), "{yes}");
+    }
+    for no in ["mlx-llm 1.13.1", "14 of 14 passed", "qwen/qwen3.8-27b", "@decorator", "v5.4.0"] {
+        assert!(!looks_personal(no), "{no}");
+    }
+}
+
+#[test]
+fn a_name_counts_as_a_whole_word_in_any_case() {
+    let names = vec!["kain".to_string(), "macbook-dm-5".to_string(), "ab".to_string()];
+    assert!(names_any("built by Kain today", &names));
+    assert!(names_any("host MACBOOK-DM-5.local", &names));
+    assert!(!names_any("the kainite crystal", &names), "inside a longer word");
+    assert!(!names_any("ab ab ab", &names), "too short to judge by");
+    assert!(!names_any("macbook-dm-50", &names));
+    let mut found = Vec::new();
+    names_in(&json!({"a": ["x", "kain"], "kain": 1}), "v", &names, &mut found);
+    assert_eq!(found, vec!["v.a[1]".to_string(), "v.kain".to_string()]);
+}
+
+#[test]
+fn the_user_is_named_by_login_and_home_folder_once_each() {
+    let got = identifying_here(
+        vec!["C02XYZ".into()],
+        Some("kain".into()),
+        Some("kain".into()),
+        Some(PathBuf::from("/Users/kosterholt")),
+    );
+    assert_eq!(got, vec!["C02XYZ".to_string(), "kain".to_string(), "kosterholt".to_string()]);
+    assert_eq!(identifying_here(Vec::new(), Some(" ".into()), None, None), Vec::<String>::new());
 }

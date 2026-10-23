@@ -53,6 +53,55 @@ pub fn looks_like_path(value: &str) -> bool {
     patterns.iter().any(|re| re.is_match(value) || decoded.as_deref().is_some_and(|d| re.is_match(d)))
 }
 
+/// An email, an IP or MAC address, or a UUID: what free text may carry that
+/// names a person or a machine. Free text with one is not shared.
+pub fn looks_personal(value: &str) -> bool {
+    static PATTERNS: std::sync::OnceLock<Vec<regex::Regex>> = std::sync::OnceLock::new();
+    let patterns = PATTERNS.get_or_init(|| {
+        [
+            r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}",
+            r"(?-u:\b)(?:\d{1,3}\.){3}\d{1,3}(?-u:\b)",
+            r"(?i)(?-u:\b)[0-9a-f]{2}(?::[0-9a-f]{2}){5}(?-u:\b)",
+            r"(?i)(?-u:\b)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?-u:\b)",
+        ]
+        .iter()
+        .map(|p| regex::Regex::new(p).expect("valid pattern"))
+        .collect()
+    });
+    patterns.iter().any(|re| re.is_match(value))
+}
+
+/// Whether `value` holds one of `names` as a whole word, in any case. A
+/// name under three characters is too common to judge by.
+pub fn names_any(value: &str, names: &[String]) -> bool {
+    let hay = value.to_lowercase();
+    names.iter().filter(|n| n.chars().count() >= 3).any(|n| {
+        let needle = n.to_lowercase();
+        hay.match_indices(&needle).any(|(at, m)| {
+            let before = hay[..at].chars().next_back();
+            let after = hay[at + m.len()..].chars().next();
+            !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+        })
+    })
+}
+
+/// Every string in a value, or key, that holds one of `names`, by where it is.
+pub fn names_in(v: &Value, at: &str, names: &[String], found: &mut Vec<String>) {
+    match v {
+        Value::String(s) if names_any(s, names) => found.push(at.to_string()),
+        Value::Array(items) => items.iter().enumerate().for_each(|(i, x)| names_in(x, &format!("{at}[{i}]"), names, found)),
+        Value::Object(map) => {
+            for (k, x) in map {
+                if names_any(k, names) {
+                    found.push(format!("{at}.{k}"));
+                }
+                names_in(x, &format!("{at}.{k}"), names, found);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// `decodeURIComponent`, or `None` where it would throw.
 fn percent_decode(value: &str) -> Option<String> {
     let b = value.as_bytes();
@@ -231,7 +280,7 @@ fn shareable(v: Option<&Value>, max: usize) -> Value {
     let Some(t) = v.and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty()) else {
         return Value::Null;
     };
-    if looks_like_path(t) {
+    if looks_like_path(t) || looks_personal(t) {
         return Value::Null;
     }
     // The site counts UTF-16 units; a char never takes fewer, so this never runs over.
@@ -625,7 +674,9 @@ pub fn gather_on(machine: &Machine, runs: &[String], stated: &Stated, flows_dir:
         notes.push(note);
     }
     let (repo, commit_sha, fixture_manifest) = fixture_at(&source, &starts, stated.commit.as_deref())?;
-    let bundle = assemble(&repo, &commit_sha, &fixture_manifest, bundled)?;
+    let mut bundle = assemble(&repo, &commit_sha, &fixture_manifest, bundled)?;
+    withhold_naming_text(&mut bundle, &machine.identifying);
+    refuse_identifying(&bundle, &machine.identifying)?;
     refuse_unshareable(&bundle)?;
     let f = &bundle["fixture"];
     Ok(Built {
@@ -646,6 +697,35 @@ fn refuse_repeats(runs: &[String]) -> Result<()> {
     }
     if let Some(twice) = runs.iter().enumerate().find_map(|(i, r)| runs[..i].contains(r).then_some(r)) {
         bail!("{twice} is named twice");
+    }
+    Ok(())
+}
+
+/// A verify summary or failure reason that names this machine or its user is
+/// left out, as one with a path is: free text is shared only when it names no one.
+fn withhold_naming_text(bundle: &mut Value, names: &[String]) {
+    let Some(runs) = bundle["runs"].as_array_mut() else { return };
+    for run in runs {
+        let Some(verify) = run["detail"]["verify"].as_object_mut() else { continue };
+        for k in ["summary", "forcedFailureReason"] {
+            if verify.get(k).and_then(Value::as_str).is_some_and(|t| names_any(t, names)) {
+                verify.insert(k.to_string(), Value::Null);
+            }
+        }
+    }
+}
+
+/// The machine's serial, hardware id or names, or its user's, anywhere in a
+/// run. The fixture is left out: it is a public repo's, approved as it is.
+/// The refusal says where, never what.
+fn refuse_identifying(bundle: &Value, names: &[String]) -> Result<()> {
+    let mut found = Vec::new();
+    names_in(&bundle["runs"], "bundle.runs", names, &mut found);
+    if !found.is_empty() {
+        bail!(
+            "the bundle would carry something that identifies this machine or you (its serial, hardware id, host or user name), which is never shared; found at {}",
+            found.join(", ")
+        );
     }
     Ok(())
 }
@@ -759,6 +839,22 @@ pub struct Machine {
     pub installed: darkmux_types::BuildInfo,
     pub installed_at: Option<u64>,
     pub provenance: ProvenanceOf,
+    /// What identifies this machine and its user (serial, hardware id, host
+    /// and login names): read to check the bundle against, never sent.
+    pub identifying: Vec<String>,
+}
+
+/// The platform's identifying strings, and the user's login names: `$USER`,
+/// `$LOGNAME` and the home folder's name.
+pub fn identifying_here(platform: Vec<String>, user: Option<String>, logname: Option<String>, home: Option<PathBuf>) -> Vec<String> {
+    let home = home.and_then(|h| h.file_name().map(|n| n.to_string_lossy().into_owned()));
+    let mut out = platform;
+    for name in [user, logname, home].into_iter().flatten() {
+        if !name.trim().is_empty() && !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
 }
 
 /// The chip, when it is Apple Silicon: the only results the site takes.
@@ -786,6 +882,12 @@ impl Machine {
             installed: darkmux_types::build_info(),
             installed_at: std::env::current_exe().ok().and_then(|p| std::fs::canonicalize(p).ok()).and_then(|p| mtime_ms(&p)),
             provenance: Box::new(move |model| lmstudio.provenance(model).ok().flatten()),
+            identifying: identifying_here(
+                platform.identifying_strings(),
+                std::env::var("USER").ok(),
+                std::env::var("LOGNAME").ok(),
+                dirs::home_dir(),
+            ),
         })
     }
 

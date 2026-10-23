@@ -27,6 +27,18 @@ impl Platform for MacPlatform {
         parse_io_platform_uuid(&ioreg_platform_expert()?)
     }
 
+    /// The `IOPlatformUUID` and `IOPlatformSerialNumber`, and the names
+    /// `scutil` knows the Mac by (`ComputerName`, `LocalHostName`, `HostName`).
+    fn identifying_strings(&self) -> Vec<String> {
+        let expert = ioreg_platform_expert().unwrap_or_default();
+        let mut out: Vec<String> = ["IOPlatformUUID", "IOPlatformSerialNumber"]
+            .iter()
+            .filter_map(|k| parse_io_platform_value(&expert, k))
+            .collect();
+        out.extend(["ComputerName", "LocalHostName", "HostName"].iter().filter_map(|k| scutil_get(k)));
+        out
+    }
+
     /// `sysctl machdep.cpu.brand_string`.
     fn cpu_brand(&self) -> Option<String> {
         parse_brand_string(&sysctl_brand_string()?)
@@ -347,18 +359,29 @@ fn ioreg_platform_expert() -> Option<String> {
 /// `    "IOPlatformUUID" = "XXXXXXXX-...."`). Pure — testable without
 /// shelling out.
 pub(crate) fn parse_io_platform_uuid(ioreg_output: &str) -> Option<String> {
-    for line in ioreg_output.lines() {
-        // Match the quoted key so a hypothetical sibling like
-        // `"IOPlatformUUIDExtra"` can't grab the value.
-        if line.contains("\"IOPlatformUUID\"") {
-            if let Some(eq) = line.find('=') {
-                let uuid = line[eq + 1..].trim().trim_matches('"').trim();
-                if !uuid.is_empty() {
-                    return Some(uuid.to_string());
-                }
-            }
-        }
+    parse_io_platform_value(ioreg_output, "IOPlatformUUID")
+}
+
+/// A string property of that output by its key. The quoted key is matched,
+/// so a sibling like `"IOPlatformUUIDExtra"` can't grab the value.
+pub(crate) fn parse_io_platform_value(ioreg_output: &str, key: &str) -> Option<String> {
+    let quoted = format!("\"{key}\"");
+    let line = ioreg_output.lines().find(|l| l.contains(&quoted))?;
+    let eq = line.find('=')?;
+    crate::trimmed(line[eq + 1..].trim().trim_matches('"'))
+}
+
+#[cfg(target_os = "macos")]
+fn scutil_get(key: &str) -> Option<String> {
+    let out = std::process::Command::new("scutil").args(["--get", key]).output().ok()?;
+    if !out.status.success() {
+        return None;
     }
+    crate::trimmed(&String::from_utf8_lossy(&out.stdout))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn scutil_get(_key: &str) -> Option<String> {
     None
 }
 

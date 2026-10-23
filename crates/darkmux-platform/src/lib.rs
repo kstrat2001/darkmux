@@ -118,6 +118,13 @@ pub trait Platform: Send + Sync {
     /// Where darkmux keeps a secret it is handed (an upload token).
     fn secret_store(&self) -> SecretStore;
 
+    /// What would identify this machine if it were shared: its hardware id,
+    /// its serial number and its names on the network. darkmux never sends
+    /// these; what it shares is checked against them. Empty where none is read.
+    fn identifying_strings(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Stores `secret` as the login keychain's generic password `item` for
     /// `account`, replacing one there. An error says why it was not stored;
     /// a platform with no keychain (its [`Platform::secret_store`] is a file)
@@ -317,3 +324,10 @@ mod tests;
 
 #[cfg(test)]
 mod os_gates;
+
+/// A value as a file or a command gives it: trimmed of whitespace and the
+/// device tree's trailing NUL. Empty is `None`.
+pub(crate) fn trimmed(value: &str) -> Option<String> {
+    let s = value.trim_matches(|c: char| c.is_whitespace() || c == '\0');
+    (!s.is_empty()).then(|| s.to_string())
+}

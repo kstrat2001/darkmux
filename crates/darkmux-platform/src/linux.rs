@@ -40,6 +40,13 @@ impl Platform for LinuxPlatform {
         machine_uid_from_disk()
     }
 
+    /// The machine-id, the kernel's host name and, on Apple Silicon, the
+    /// serial number the device tree carries.
+    fn identifying_strings(&self) -> Vec<String> {
+        let read = ["/proc/sys/kernel/hostname", "/proc/device-tree/serial-number"].map(read_to_string);
+        machine_uid_from_disk().into_iter().chain(read.into_iter().flatten().filter_map(|s| crate::trimmed(&s))).collect()
+    }
+
     /// On Apple Silicon (Asahi), the chip named from the device tree the way
     /// macOS names it; otherwise `/proc/cpuinfo`'s `model name` (x86 has
     /// one; most ARM boards don't, and get `None`).
