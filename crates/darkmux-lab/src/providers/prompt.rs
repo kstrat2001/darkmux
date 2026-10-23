@@ -605,11 +605,12 @@ pub(crate) fn run_verify_with(loaded: &LoadedWorkload, text: &str, hit_length: b
 }
 
 /// The workload's `verify.expect` check of `text`, `None` when it has none.
+#[cfg(test)]
 pub(crate) fn expect_report(loaded: &LoadedWorkload, text: &str) -> Option<expect::FieldsReport> {
     expect_report_with(loaded, text, false)
 }
 
-/// [`expect_report`], told whether the reply hit its length limit.
+/// The workload's `verify.expect` check, told whether the reply hit its length limit.
 pub(crate) fn expect_report_with(loaded: &LoadedWorkload, text: &str, hit_length: bool) -> Option<expect::FieldsReport> {
     // Only a prompt run applies it (`lab run` refuses it on any other
     // provider), so another provider's inspect never shows its verdict.
@@ -629,8 +630,7 @@ fn hit_length_limit(run_dir: &Path) -> bool {
     let Ok(raw) = fs::read_to_string(run_dir.join(darkmux_trajectory::TRAJECTORY_FILE)) else { return false };
     raw.lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some("model.completed"))
-        .last()
+        .rfind(|e| e.get("type").and_then(|t| t.as_str()) == Some("model.completed"))
         .and_then(|e| e.get("finish_reason").and_then(|f| f.as_str()).map(|f| f == "length" || f == "max_tokens"))
         .unwrap_or(false)
 }

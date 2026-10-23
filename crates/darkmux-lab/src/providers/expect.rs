@@ -73,13 +73,14 @@ impl FieldsReport {
 
 /// Compare the reply's first JSON object against `expect`, for a reply not
 /// known to have hit its length limit.
+#[cfg(test)]
 pub(crate) fn grade(expect: &Map<String, Value>, reply: &str) -> FieldsReport {
     grade_with(expect, reply, false)
 }
 
-/// [`grade`], told whether the reply hit its length limit (its last model
-/// call finished on `length`). Only then is an object that ends before it
-/// closes called cut off.
+/// Compare the reply's first JSON object against `expect`, told whether the
+/// reply hit its length limit (its last model call finished on `length`).
+/// Only then is an object that ends before it closes called cut off.
 pub(crate) fn grade_with(expect: &Map<String, Value>, reply: &str, hit_length: bool) -> FieldsReport {
     let expected = expect.len();
     let answer = match first_object(reply) {
