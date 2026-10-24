@@ -265,6 +265,17 @@ pub struct DirectMetrics {
     /// Messages `max_tokens`). Absent when the reply named none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
+    /// (#3367) When the streamed reply's first generated text arrived, in ms
+    /// after the call began. Absent when the call did not stream or wrote
+    /// nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_output_ms: Option<u64>,
+    /// (#3367) In how many reads the streamed reply grew, with that first output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_chunks: Option<u64>,
+    /// (#3367) The chars it generated, answer and reasoning, with that first output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_chars: Option<u64>,
     #[serde(flatten)]
     pub tokens: DirectTokens,
 }

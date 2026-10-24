@@ -392,6 +392,33 @@ pub(crate) struct TurnEvidence<F: Fn(darkmux_flow::Payload)> {
     pub streams: bool,
     /// When the attempt that streamed was sent (its model time's start).
     started: Option<std::time::Instant>,
+    /// (#3367) That attempt's output so far: when it began, in how many
+    /// reads it grew, and how much was generated.
+    output: Option<StreamOutput>,
+}
+
+/// (#3367) A streamed reply's output: when its first generated text arrived,
+/// in how many reads it grew, and how many chars were generated in all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StreamOutput {
+    pub first: std::time::Instant,
+    pub chunks: u64,
+    pub generated_chars: u64,
+}
+
+impl StreamOutput {
+    /// `output` after one more progress report: a report from a new attempt
+    /// starts it over, one with more generated text grows it.
+    fn after(output: Option<Self>, p: &SseProgress, attempt_changed: bool, now: std::time::Instant) -> Option<Self> {
+        let output = output.filter(|_| !attempt_changed);
+        match output {
+            Some(o) if p.generated_chars > o.generated_chars => {
+                Some(StreamOutput { chunks: o.chunks + 1, generated_chars: p.generated_chars, ..o })
+            }
+            None if p.generated_chars > 0 => Some(StreamOutput { first: now, chunks: 1, generated_chars: p.generated_chars }),
+            o => o,
+        }
+    }
 }
 
 impl<F: Fn(darkmux_flow::Payload)> TurnEvidence<F> {
@@ -404,6 +431,7 @@ impl<F: Fn(darkmux_flow::Payload)> TurnEvidence<F> {
             shape: Shape::of(dialect),
             streams: true,
             started: None,
+            output: None,
         }
     }
 
@@ -436,8 +464,10 @@ impl<F: Fn(darkmux_flow::Payload)> TurnEvidence<F> {
     /// Run `call` with the progress callback: heartbeats through the gate,
     /// and the streaming attempt's start noted for the model time.
     fn with_progress<R>(&mut self, call: impl FnOnce(&mut dyn FnMut(&SseProgress)) -> R) -> R {
-        let (gate, relay, emit, started) = (&mut self.gate, &mut self.relay, &self.emit, &mut self.started);
+        let (gate, relay, emit, started, output) = (&mut self.gate, &mut self.relay, &self.emit, &mut self.started, &mut self.output);
         let mut on = |p: &SseProgress| {
+            let attempt_changed = p.started.is_some() && p.started != *started;
+            *output = StreamOutput::after(*output, p, attempt_changed, std::time::Instant::now());
             *started = p.started.or(*started);
             if gate.due(std::time::Instant::now()) {
                 // (#3210) One generation beat per 20 s also rides the hub.
@@ -447,6 +477,11 @@ impl<F: Fn(darkmux_flow::Payload)> TurnEvidence<F> {
             }
         };
         call(&mut on)
+    }
+
+    /// (#3367) The streamed reply's output, when the call streamed any.
+    pub(crate) fn output(&self) -> Option<StreamOutput> {
+        self.output.filter(|_| self.streams)
     }
 
     /// The reply is in: the turn's record. Its model time runs from the

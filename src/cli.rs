@@ -1645,6 +1645,10 @@ pub(crate) enum LabCmd {
         /// made by a darkmux since replaced.
         #[arg(long = "darkmux-version")]
         darkmux_version: Option<String>,
+        /// The profiles registry the runs were made with (`lab run
+        /// --profiles-file`), for the context length their profile declares.
+        #[command(flatten)]
+        profiles: ProfilesFileArg,
     },
 }
 

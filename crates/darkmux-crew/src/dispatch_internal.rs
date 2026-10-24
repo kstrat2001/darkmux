@@ -4561,6 +4561,8 @@ fn dispatch_unmanaged(
         refused_stream_request,
     );
     let wall_ms = t0.elapsed().map(|d| d.as_millis() as u64).unwrap_or(0);
+    // (#3367) Read at the same moment as `wall_ms`, so the two share a clock.
+    let output = evidence.output().map(|o| (wall_ms.saturating_sub(o.first.elapsed().as_millis() as u64), o));
 
     let resp = match resp {
         Ok(r) => r,
@@ -4666,6 +4668,9 @@ fn dispatch_unmanaged(
                     .or_else(|| resp.get("stop_reason"))
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string),
+                first_output_ms: output.map(|(ms, _)| ms),
+                output_chunks: output.map(|(_, o)| o.chunks),
+                generated_chars: output.map(|(_, o)| o.generated_chars),
                 tokens: crate::dispatch_envelope::DirectTokens::of(&counts),
             },
         })

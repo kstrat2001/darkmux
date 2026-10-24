@@ -20,14 +20,14 @@ pub(crate) struct SubmitArgs {
 
 /// `lab submit`, from its parsed command line: `login` / `logout`, or a submit.
 pub(crate) fn cmd_lab_submit(cmd: LabCmd) -> Result<i32> {
-    let LabCmd::Submit { sub, runs, dry_run, out, site, replace, commit, engine, engine_backend, engine_version, quant, weights_dir, darkmux_version } = cmd
+    let LabCmd::Submit { sub, runs, dry_run, out, site, replace, commit, engine, engine_backend, engine_version, quant, weights_dir, darkmux_version, profiles } = cmd
     else {
         unreachable!("cmd_lab_submit takes `lab submit` only")
     };
     if let Some(sub) = sub {
         return cmd_submit_token(sub);
     }
-    let stated = submit::Stated { engine, engine_backend, engine_version, quant, weights_dir: weights_dir.map(Into::into), darkmux_version, commit };
+    let stated = submit::Stated { engine, engine_backend, engine_version, quant, weights_dir: weights_dir.map(Into::into), darkmux_version, commit, profiles_file: profiles.profiles };
     cmd_submit(SubmitArgs { runs, dry_run, out, site, replace, stated })
 }
 

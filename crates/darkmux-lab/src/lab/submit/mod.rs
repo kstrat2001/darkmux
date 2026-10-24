@@ -738,6 +738,8 @@ pub struct Stated {
     pub weights_dir: Option<PathBuf>,
     pub darkmux_version: Option<String>,
     pub commit: Option<String>,
+    /// (#3367) The registry the runs were made with; the default one when absent.
+    pub profiles_file: Option<String>,
 }
 
 /// A bundle, and what it leaves out and why.
@@ -752,7 +754,7 @@ pub struct Built {
 
 /// Reads the runs and the machine and builds one bundle. Reads only.
 pub fn gather(runs: &[String], stated: &Stated, progress: &mut dyn FnMut(&str)) -> Result<Built> {
-    gather_on(&Machine::here()?, runs, stated, &darkmux_types::config_access::flows_dir(), progress)
+    gather_on(&Machine::here(stated.profiles_file.as_deref())?, runs, stated, &darkmux_types::config_access::flows_dir(), progress)
 }
 
 /// [`gather`] on a given machine, reading run stats against `flows_dir`.
@@ -1019,7 +1021,7 @@ pub fn apple_chip(brand: Option<String>) -> Result<String> {
 }
 
 impl Machine {
-    fn here() -> Result<Self> {
+    fn here(profiles_file: Option<&str>) -> Result<Self> {
         let platform = darkmux_platform::current();
         let lmstudio = darkmux_profiles::engine::lmstudio();
         Ok(Machine {
@@ -1028,7 +1030,11 @@ impl Machine {
             accelerator: platform.gpu_api().map(str::to_string),
             config: platform.machine_config(),
             os_release: platform.os_release(),
-            registry: darkmux_profiles::profiles::load_registry_quiet(None).ok().map(|l| l.registry),
+            // A named registry that does not load is an error; the default one may be absent.
+            registry: match profiles_file {
+                Some(path) => Some(darkmux_profiles::profiles::load_registry_quiet(Some(path))?.registry),
+                None => darkmux_profiles::profiles::load_registry_quiet(None).ok().map(|l| l.registry),
+            },
             installed: darkmux_types::build_info(),
             installed_at: std::env::current_exe().ok().and_then(|p| std::fs::canonicalize(p).ok()).and_then(|p| mtime_ms(&p)),
             provenance: Box::new(move |model| lmstudio.provenance(model).ok().flatten()),

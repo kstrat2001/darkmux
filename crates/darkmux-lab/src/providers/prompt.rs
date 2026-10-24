@@ -446,8 +446,15 @@ fn fill_refusal_defaults(manifest: &mut RunManifest, run_dir: &Path, workload_id
 /// returned (`DirectDispatchEnvelope`). The finish reason is the envelope's,
 /// and empty when it names none, never guessed. A reply that is not that
 /// envelope writes nothing.
+///
+/// (#3367) A call that streamed also says when its first output arrived and
+/// in how many reads it grew: that is one partial at the first output, so
+/// the run has a time to first token, and, when it grew more than once, one
+/// more at the end with everything generated, so the run has a decode time.
+/// The first partial counts one generated char: the call reports no count
+/// for its first read, and the stream's rate is read from tokens, not chars.
 fn write_one_call_trajectory(stdout: &str, system_chars: usize, prompt_chars: usize, run_dir: &Path, end_ms: u64) {
-    use darkmux_trajectory::event::{DispatchComplete, DispatchStart, Header, ModelCompleted, StreamingEnd, StreamingStart, TrajectoryEvent};
+    use darkmux_trajectory::event::{DispatchComplete, DispatchStart, Header, ModelCompleted, Partial, StreamingEnd, StreamingStart, TrajectoryEvent};
     let Ok(envelope) = serde_json::from_str::<serde_json::Value>(stdout) else { return };
     let Some(metrics) = envelope.get("metrics") else { return };
     let (Some(model), Some(wall_ms)) = (metrics.get("model").and_then(|v| v.as_str()), metrics.get("wall_ms").and_then(|v| v.as_u64())) else {
@@ -456,7 +463,29 @@ fn write_one_call_trajectory(stdout: &str, system_chars: usize, prompt_chars: us
     let usage: darkmux_trajectory::usage::Usage = serde_json::from_value(metrics.clone()).unwrap_or_default();
     let start_ms = end_ms.saturating_sub(wall_ms);
     let reply_chars = envelope.get("final_assistant").and_then(|v| v.as_str()).map_or(0, |s| s.chars().count() as u64);
-    let events = [
+    let count = |k: &str| metrics.get(k).and_then(|v| v.as_u64());
+    let partial = |index: u64, ts: u64, cumulative_chars: u64, generated_chars: u64| {
+        TrajectoryEvent::Partial(Partial {
+            seq: 1,
+            ts,
+            partial_index: index,
+            delta_chars: 0,
+            cumulative_chars,
+            tool_calls_present: false,
+            generated_chars: Some(generated_chars),
+            phase: None,
+            tool_name: None,
+        })
+    };
+    let mut output = Vec::new();
+    if let Some(first_ms) = count("first_output_ms").filter(|ms| *ms <= wall_ms) {
+        output.push(partial(0, start_ms + first_ms, 0, 1));
+        let generated = count("generated_chars").unwrap_or(0);
+        if count("output_chunks").unwrap_or(0) >= 2 && generated > 1 && first_ms < wall_ms {
+            output.push(partial(1, end_ms, reply_chars, generated));
+        }
+    }
+    let opening = [
         TrajectoryEvent::Header(Header { schema_version: darkmux_trajectory::TRAJECTORY_SCHEMA_VERSION.to_string() }),
         TrajectoryEvent::DispatchStart(DispatchStart {
             ts: start_ms,
@@ -474,7 +503,15 @@ fn write_one_call_trajectory(stdout: &str, system_chars: usize, prompt_chars: us
             system_chars: system_chars as u64,
             prompt_chars: prompt_chars as u64,
         }),
-        TrajectoryEvent::StreamingEnd(StreamingEnd { seq: 1, ts: end_ms, total_content_chars: reply_chars, ..Default::default() }),
+    ];
+    let closing = [
+        TrajectoryEvent::StreamingEnd(StreamingEnd {
+            seq: 1,
+            ts: end_ms,
+            partial_count: output.len() as u64,
+            total_content_chars: reply_chars,
+            ..Default::default()
+        }),
         TrajectoryEvent::ModelCompleted(ModelCompleted {
             seq: 1,
             ts: end_ms,
@@ -484,7 +521,8 @@ fn write_one_call_trajectory(stdout: &str, system_chars: usize, prompt_chars: us
         }),
         TrajectoryEvent::DispatchComplete(DispatchComplete { ts: end_ms, result: "stop".to_string(), wall_ms, turn_delay_effective_ms: None }),
     ];
-    let lines: Vec<String> = events.iter().filter_map(|e| serde_json::to_string(e).ok()).collect();
+    let events = opening.iter().chain(&output).chain(&closing);
+    let lines: Vec<String> = events.filter_map(|e| serde_json::to_string(e).ok()).collect();
     let _ = fs::write(run_dir.join(darkmux_trajectory::TRAJECTORY_FILE), lines.join("\n") + "\n");
 }
 
@@ -1051,6 +1089,31 @@ mod tests {
         let other = TempDir::new().unwrap();
         write_one_call_trajectory("plain text", 1, 1, other.path(), 1_000_000);
         assert!(!other.path().join("trajectory.jsonl").exists());
+    }
+
+    /// (#3367) A call that streamed has a time to first token and, when its
+    /// reply grew more than once, a decode rate: its tokens over the time
+    /// after its first output. One that did not stream has neither.
+    #[test]
+    fn a_streamed_one_call_run_has_a_first_token_and_a_decode_rate() {
+        let run = |extra: serde_json::Value| {
+            let tmp = TempDir::new().unwrap();
+            let mut metrics = serde_json::json!({"model": "m", "endpoint": "e", "wall_ms": 13_100, "turns": 1,
+                "prompt_tokens": 6_000, "completion_tokens": 900, "total_tokens": 6_900});
+            metrics.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            let stdout = serde_json::json!({"result": "stop", "final_assistant": "{}", "metrics": metrics}).to_string();
+            write_one_call_trajectory(&stdout, 1, 1, tmp.path(), 1_000_000);
+            let stats = crate::lab::stats::compute_from_dir(tmp.path(), &tmp.path().join("flows")).unwrap();
+            (stats.first_token_ms_median, stats.decode_tok_per_s, stats.tok_per_s)
+        };
+        let streamed = serde_json::json!({"first_output_ms": 4_100, "output_chunks": 300, "generated_chars": 2_666});
+        assert_eq!(run(streamed), (Some(4_100), Some(100.0), Some(68.7)));
+        // Output in one read has a first token but no decode time of its own.
+        let one_read = serde_json::json!({"first_output_ms": 4_100, "output_chunks": 1, "generated_chars": 2_666});
+        assert_eq!(run(one_read), (Some(4_100), None, Some(68.7)));
+        assert_eq!(run(serde_json::json!({})), (None, None, Some(68.7)));
+        // A first output past the call's end is not believed.
+        assert_eq!(run(serde_json::json!({"first_output_ms": 20_000, "output_chunks": 3, "generated_chars": 9})), (None, None, Some(68.7)));
     }
 
     /// The runtime's trajectory lands in the run dir, where `run stats` and

@@ -569,6 +569,7 @@ fn what_the_operator_states_stands_in_for_what_the_machine_cannot_say() {
         weights_dir: Some(b.weights.clone()),
         darkmux_version: Some("5.3.0".into()),
         commit: Some(git(&b.fixture, &["rev-parse", "--short", "HEAD"])),
+        profiles_file: None,
     };
     let (built, _) = b.gather(&b.machine(Some(b.provenance())), &runs, &stated).unwrap();
     let r1 = &built.bundle["runs"][0];

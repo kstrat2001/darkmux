@@ -123,13 +123,15 @@ impl Platform for LinuxPlatform {
     }
 
     /// `/etc/os-release`'s `PRETTY_NAME`, named Omarchy where Omarchy is
-    /// installed (`~/.local/share/omarchy`). A rolling release says no
-    /// install time, so none is claimed.
+    /// installed (`~/.local/share/omarchy`). A rolling release names no
+    /// version, so the name held since the file was last written: its change
+    /// time (#3367), which an update that replaces it moves and nothing
+    /// short of that can set back.
     fn os_release(&self) -> Option<crate::OsRelease> {
         let omarchy = std::env::var_os("HOME")
             .is_some_and(|h| std::path::Path::new(&h).join(".local/share/omarchy").is_dir());
         let name = os_name_from_release(&read_to_string("/etc/os-release")?, omarchy)?;
-        Some(crate::OsRelease { name, installed_at_unix_ms: None })
+        Some(crate::OsRelease { name, installed_at_unix_ms: changed_at_ms("/etc/os-release") })
     }
 
     /// Asahi's Apple GPU driver serves Vulkan.
@@ -223,6 +225,20 @@ fn read_to_string(path: &str) -> Option<String> {
 
 #[cfg(not(target_os = "linux"))]
 fn read_to_string(_path: &str) -> Option<String> {
+    None
+}
+
+/// When `path` (followed through links) last changed, in Unix ms: its ctime.
+#[cfg(target_os = "linux")]
+pub(crate) fn changed_at_ms(path: &str) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path).ok()?;
+    let ms = u64::try_from(m.ctime()).ok()?.checked_mul(1000)?;
+    Some(ms + u64::try_from(m.ctime_nsec()).ok()? / 1_000_000)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn changed_at_ms(_path: &str) -> Option<u64> {
     None
 }
 

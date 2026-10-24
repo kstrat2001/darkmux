@@ -421,3 +421,20 @@ fn the_direct_path_relays_the_first_output_past_the_stream_open_chunk() {
         .collect();
     assert_eq!(marked, [Some(1), Some(2)], "the 3-char chunk and the first beat past it, nothing more inside 20 s");
 }
+
+/// (#3367) The output is timed from the first read that generated text,
+/// grows with every read that adds some, and starts over on a new attempt.
+#[test]
+fn stream_output_starts_at_the_first_generated_text_and_restarts_per_attempt() {
+    let t0 = std::time::Instant::now();
+    let later = t0 + std::time::Duration::from_millis(500);
+    let at = |generated_chars| SseProgress { generated_chars, ..Default::default() };
+    assert_eq!(StreamOutput::after(None, &at(0), false, t0), None, "a prefill report is not output");
+    let first = StreamOutput::after(None, &at(12), false, t0).unwrap();
+    assert_eq!((first.first, first.chunks, first.generated_chars), (t0, 1, 12));
+    let grown = StreamOutput::after(Some(first), &at(40), false, later).unwrap();
+    assert_eq!((grown.first, grown.chunks, grown.generated_chars), (t0, 2, 40));
+    assert_eq!(StreamOutput::after(Some(grown), &at(40), false, later), Some(grown), "no new text, no new read");
+    let retried = StreamOutput::after(Some(grown), &at(5), true, later).unwrap();
+    assert_eq!((retried.first, retried.chunks, retried.generated_chars), (later, 1, 5));
+}

@@ -762,7 +762,7 @@ fn macos_install_time_is_the_newest_install_of_the_running_version() {
 fn linux_reads_its_release_and_ram_from_the_files_it_has() {
     let release = LinuxPlatform.os_release();
     if std::fs::read_to_string("/etc/os-release").is_ok_and(|r| r.contains("PRETTY_NAME=")) {
-        assert!(release.is_some_and(|r| !r.name.is_empty() && r.installed_at_unix_ms.is_none()));
+        assert!(release.is_some_and(|r| !r.name.is_empty() && r.installed_at_unix_ms.is_some()), "dated by the file's change time (#3367)");
     }
     if std::fs::metadata("/proc/meminfo").is_ok() {
         assert!(LinuxPlatform.ram_as_sold_gb().is_some_and(|gb| gb >= 1));
@@ -795,6 +795,19 @@ fn linux_os_name_is_omarchy_where_omarchy_is_installed() {
     assert_eq!(crate::linux::os_name_from_release(rel, true).as_deref(), Some("Omarchy (Arch Linux ARM)"));
     assert_eq!(crate::linux::os_name_from_release(rel, false).as_deref(), Some("Arch Linux ARM"));
     assert_eq!(crate::linux::os_name_from_release("", false), None);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_os_release_is_dated_by_its_change_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("os-release");
+    let before = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    std::fs::write(&file, "PRETTY_NAME=\"Arch Linux ARM\"\n").unwrap();
+    let changed = crate::linux::changed_at_ms(file.to_str().unwrap()).unwrap();
+    // ctime is kept at the filesystem's granularity, so allow one second.
+    assert!(changed + 1000 >= before, "{changed} vs {before}");
+    assert_eq!(crate::linux::changed_at_ms(dir.path().join("absent").to_str().unwrap()), None);
 }
 
 #[test]

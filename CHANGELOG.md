@@ -14,6 +14,18 @@ darkmux release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`lab submit` reports the OS of a Linux run (#3367).** Linux dates `/etc/os-release` by its
+  change time, so a run made after the OS's last update carries `os` instead of `null`.
+- **A hosted one-call run has a time to first token and a decode rate (#3367).** The direct
+  dispatch envelope's `metrics` gains `first_output_ms`, `output_chunks` and `generated_chars`
+  (additive, absent when the call did not stream), and the prompt provider's trajectory marks
+  the first output from them, so `run stats` and `lab submit` read `firstTokenMs*` and
+  `decodeTokensPerSecond` for `runtime=direct` runs (mlx_lm.server and other unmanaged endpoints).
+- **`lab submit --profiles-file` (#3367)** reads the registry the runs were made with (`lab run
+  --profiles-file`), so their profile's context length reaches `contextLength`.
+
 ## [5.6.0] - 2026-10-24
 
 An eval owns its workload and its grader. darkmux processes an eval (generic grading rules,
