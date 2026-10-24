@@ -5,7 +5,7 @@
 #
 # Operator-facing install path:
 #   brew tap kstrat2001/tap
-#   brew install darkmux                # stable release (v5.5.0)
+#   brew install darkmux                # stable release (v5.6.0)
 #   brew install --HEAD darkmux         # build from main instead
 #
 # For local development / smoke testing:
@@ -17,10 +17,10 @@
 class Darkmux < Formula
   desc "Mission orchestrator and lab for local AI, running your models or a cloud endpoint"
   homepage "https://darkmux.com"
-  # Stable release: v5.5.0, the coding grader and `lab grade`, verify in a locked-down container, launch metrics.
+  # Stable release: v5.6.0, an eval owns its workload and grader (eval_dir, bundle format 5).
   # See CHANGELOG.md.
-  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v5.5.0.tar.gz"
-  sha256 "522c43649b0897f9dc6e94d00af1b8713d13b392aea0badc205af77b87f75b7a"
+  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v5.6.0.tar.gz"
+  sha256 "291a88a8ef6aa247bbd4e138c305c11f95ea0c1f4037cb74461f500bd5763db0"
   license "MIT"
   head "https://github.com/kstrat2001/darkmux.git", branch: "main"
 
