@@ -760,7 +760,7 @@ pub fn gather_on(machine: &Machine, runs: &[String], stated: &Stated, flows_dir:
     refuse_repeats(runs)?;
     let inputs = read_runs(runs, flows_dir)?;
     let source = one_fixture(&inputs, stated)?;
-    let (mut bundled, notes, starts) = bundle_all(machine, &inputs, stated, progress)?;
+    let Bundled { runs: mut bundled, notes, starts } = bundle_all(machine, &inputs, stated, progress)?;
     let (repo, commit_sha, fixture_manifest) = fixture_at(&source, &starts, stated.commit.as_deref())?;
     name_eval_workloads(&mut bundled, eval_workloads(&source, &commit_sha, &fixture_manifest, &inputs)?);
     let bundle = assemble(&repo, &commit_sha, &fixture_manifest, bundled)?;
@@ -780,16 +780,22 @@ pub fn gather_on(machine: &Machine, runs: &[String], stated: &Stated, flows_dir:
 }
 
 /// Every input as a bundle run, with its note and start time.
-fn bundle_all(machine: &Machine, inputs: &[Input], stated: &Stated, progress: &mut dyn FnMut(&str)) -> Result<(Vec<Value>, Vec<String>, Vec<Option<u64>>)> {
+struct Bundled {
+    runs: Vec<Value>,
+    notes: Vec<String>,
+    starts: Vec<Option<u64>>,
+}
+
+fn bundle_all(machine: &Machine, inputs: &[Input], stated: &Stated, progress: &mut dyn FnMut(&str)) -> Result<Bundled> {
     let mut caches = Caches::default();
-    let (mut bundled, mut notes, mut starts) = (Vec::new(), Vec::new(), Vec::new());
+    let mut out = Bundled { runs: Vec::new(), notes: Vec::new(), starts: Vec::new() };
     for input in inputs {
         let (run, note) = machine.bundle_one(input, stated, &mut caches, progress)?;
-        starts.push(input.started());
-        bundled.push(run);
-        notes.push(note);
+        out.starts.push(input.started());
+        out.runs.push(run);
+        out.notes.push(note);
     }
-    Ok((bundled, notes, starts))
+    Ok(out)
 }
 
 /// (#3361) Each run states the eval workload it used, proven against the
