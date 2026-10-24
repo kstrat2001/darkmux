@@ -187,7 +187,7 @@ fn every_shipped_template_file_has_no_unknown_keys() {
     found.extend(check_dir::<MissionConfig>(UserFileKind::MissionConfig, &t.join("mission-configs"), &no_retired));
     found.extend(check_dir::<Rule>(UserFileKind::Rule, &t.join("rules"), &no_retired));
     let workloads = crate::workloads::load::documents_in(&t.join("workloads"));
-    assert!(workloads.len() >= 7, "{workloads:?}");
+    assert!(workloads.len() >= 6, "{workloads:?}");
     found.extend(workloads.iter().filter_map(|p| check_path::<WorkloadManifest>(UserFileKind::Workload, p, &no_retired)));
     for fixture in std::fs::read_dir(t.join("lab-fixtures")).unwrap().flatten() {
         found.extend(check_path::<FixtureManifest>(UserFileKind::LabFixture, &fixture.path().join(".fixture.json"), &no_retired));

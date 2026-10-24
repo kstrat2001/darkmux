@@ -675,31 +675,6 @@ fn an_existing_test_switched_off_fails_the_suite() {
     assert!(ev.contains("\"test/a.t\""), "{ev}");
 }
 
-/// The shipped pepper-grinder grader quotes its prompt word for word, so it
-/// grades (the fixture itself is not in this repo; its planted bugs are
-/// checked against it by `lab grade` and the lab run).
-#[test]
-fn the_pepper_grinder_grader_quotes_its_prompt() {
-    let (_, json) = crate::workloads::load::EMBEDDED_WORKLOADS
-        .iter()
-        .find(|(id, _)| *id == "pepper-grinder")
-        .unwrap();
-    let manifest: crate::workloads::types::WorkloadManifest = serde_json::from_str(json).unwrap();
-    let spec = manifest
-        .workload
-        .verify
-        .as_ref()
-        .unwrap()
-        .grade
-        .as_ref()
-        .unwrap();
-    check_asks(spec, manifest.workload.prompt.as_deref().unwrap()).unwrap();
-    assert_eq!(
-        behavior_names(spec.behaviors.as_ref().unwrap()),
-        ["pepper", "row lock", "boot guard", "expiry parsing"]
-    );
-}
-
 #[test]
 fn the_final_reply_is_read_from_the_runtime_envelope() {
     let tmp = TempDir::new().unwrap();

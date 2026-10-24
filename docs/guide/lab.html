@@ -90,6 +90,7 @@
     <pre><code>git clone https://github.com/kstrat2001/pepper-grinder
 darkmux lab fixture register ./pepper-grinder
 darkmux lab run pepper-grinder</code></pre>
+    <p>The workload and its grader are not part of darkmux: they ship in the fixture's own <code>eval/</code> folder, and darkmux loads them from the registered fixture. darkmux processes an eval; the eval's repo defines it. The model's sandbox never holds that folder.</p>
     <p>The untouched suite already passes (14 tests), so a green suite on its own is a weak bar. The workload declares a grader (<code>verify.grade</code>), and a run passes only when every check does. Each check quotes the prompt sentence it grades, and the grader refuses to run one the prompt does not say word for word:</p>
     <ul>
       <li><code>run_finished</code>: the model stopped on its own (the runtime says <code>stop</code>; an error, an escalation or a turn limit is not a finish).</li>
