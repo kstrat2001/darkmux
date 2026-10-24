@@ -1,5 +1,13 @@
 //! Load workload manifests by id from any of several known locations.
-//! Search order: user dir → on-disk built-in template dirs → binary-embedded built-ins.
+//! Search order: registered evals → user dir → on-disk built-in template dirs →
+//! binary-embedded built-ins.
+//!
+//! **(#3361) An eval owns its workload.** A registered fixture whose
+//! `.fixture.json` names an `eval_dir` defines the workloads in
+//! `<eval_dir>/workloads/`, and they win over every other tier: darkmux is
+//! the processor of an eval, not its definer, so a copy elsewhere never
+//! stands in for the eval's own document. A workload the eval defines must
+//! bind that fixture (`requires_fixture` = its `satisfies`).
 //!
 //! **(#2553) The on-disk tier is NOT cwd-sensitive.** It used to
 //! unconditionally search `<shell's cwd>/templates/builtin/workloads/` ahead
@@ -133,7 +141,97 @@ fn builtin_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+/// (#3361) A registered fixture that defines workloads: the eval folder its
+/// `.fixture.json` names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EvalHome {
+    /// The fixture's registry name.
+    pub name: String,
+    /// The fixture checkout (the registry's canonical path).
+    pub fixture_dir: PathBuf,
+    /// `eval_dir`, relative to the fixture.
+    pub eval_dir: String,
+    /// What the fixture satisfies; its workloads must require exactly this.
+    pub satisfies: String,
+}
+
+impl EvalHome {
+    /// Where the eval's workload documents live.
+    pub(crate) fn workloads_dir(&self) -> PathBuf {
+        self.fixture_dir.join(&self.eval_dir).join("workloads")
+    }
+
+    /// The document defining workload `id`, when this eval defines it.
+    pub(crate) fn document(&self, id: &str) -> Option<PathBuf> {
+        find_in_dir(&self.workloads_dir(), id)
+    }
+}
+
+/// Every registered fixture that declares an `eval_dir`, in registry order.
+/// A registry or manifest that cannot be read defines nothing here; `darkmux
+/// lab doctor` reports it.
+pub(crate) fn eval_homes() -> Vec<EvalHome> {
+    let reg_path = crate::lab::registry::default_registry_path(&darkmux_types::paths::resolve(
+        darkmux_types::paths::ResolveScope::ForceUser,
+    ));
+    let Ok(registry) = crate::lab::registry::LabRegistry::load(&reg_path) else { return Vec::new() };
+    registry
+        .fixtures
+        .iter()
+        .filter_map(|(name, f)| {
+            let manifest = crate::lab::fixture::FixtureManifest::load_from_dir(&f.path).ok()?;
+            Some(EvalHome {
+                name: name.clone(),
+                fixture_dir: f.path.clone(),
+                eval_dir: manifest.eval_dir?,
+                satisfies: manifest.satisfies?,
+            })
+        })
+        .collect()
+}
+
+/// The eval a loaded workload came from: `None` unless it resolved from the
+/// eval tier.
+pub(crate) fn eval_home_of(loaded: &LoadedWorkload) -> Option<EvalHome> {
+    if loaded.source != WorkloadSource::Eval {
+        return None;
+    }
+    eval_homes().into_iter().find(|h| loaded.base_dir.starts_with(h.workloads_dir()))
+}
+
+/// The eval-tier resolution of `id` among `homes`: `None` when no eval
+/// defines it, an error when several do or when the document does not bind
+/// its own fixture.
+fn load_from_evals(id: &str, homes: &[EvalHome]) -> Result<Option<LoadedWorkload>> {
+    let defined: Vec<(&EvalHome, PathBuf)> = homes.iter().filter_map(|h| Some((h, h.document(id)?))).collect();
+    let (home, doc) = match defined.as_slice() {
+        [] => return Ok(None),
+        [one] => one,
+        several => bail!(
+            "workload \"{id}\" is defined by more than one registered fixture ({}); \
+             unregister all but one with `darkmux lab fixture unregister <name>`",
+            several.iter().map(|(h, _)| format!("`{}`", h.name)).collect::<Vec<_>>().join(", ")
+        ),
+    };
+    let loaded = parse(doc, WorkloadSource::Eval)?;
+    let requires = loaded.manifest.workload.requires_fixture.as_deref();
+    if requires != Some(home.satisfies.as_str()) {
+        bail!(
+            "workload \"{id}\" at {} is defined by fixture `{}` but requires_fixture is {}; \
+             a workload an eval defines must bind its own fixture: set it to \"{}\"",
+            doc.display(),
+            home.name,
+            requires.map_or_else(|| "missing".to_string(), |r| format!("\"{r}\"")),
+            home.satisfies
+        );
+    }
+    Ok(Some(loaded))
+}
+
 pub(crate) fn load(id: &str, user_dir: Option<&Path>) -> Result<LoadedWorkload> {
+    if let Some(loaded) = load_from_evals(id, &eval_homes())? {
+        return Ok(loaded);
+    }
     if let Some(udir) = user_dir {
         let user_workloads = udir.join("workloads");
         if let Some(p) = find_in_dir(&user_workloads, id) {
@@ -216,7 +314,7 @@ fn display_under_cwd(p: &Path) -> String {
 
 pub fn list_available(user_dir: Option<&Path>) -> Vec<String> {
     let mut set: BTreeSet<String> = BTreeSet::new();
-    let mut all_dirs: Vec<PathBuf> = Vec::new();
+    let mut all_dirs: Vec<PathBuf> = eval_homes().iter().map(EvalHome::workloads_dir).collect();
     if let Some(d) = user_dir {
         all_dirs.push(d.join("workloads"));
     }
@@ -242,11 +340,13 @@ pub fn list_available(user_dir: Option<&Path>) -> Vec<String> {
     set.into_iter().collect()
 }
 
-/// Every directory a workload document is read from on disk: the user tier
-/// (`<user root>/workloads`), then the on-disk built-in template dirs (the
-/// embedded tier is compiled in, not a file).
+/// Every directory a workload document is read from on disk: each
+/// registered eval's `workloads/`, the user tier (`<user root>/workloads`),
+/// then the on-disk built-in template dirs (the embedded tier is compiled in,
+/// not a file).
 pub(crate) fn on_disk_dirs(user_root: &Path) -> Vec<PathBuf> {
-    let mut dirs = vec![user_root.join("workloads")];
+    let mut dirs: Vec<PathBuf> = eval_homes().iter().map(EvalHome::workloads_dir).collect();
+    dirs.push(user_root.join("workloads"));
     dirs.extend(builtin_dirs());
     dirs
 }

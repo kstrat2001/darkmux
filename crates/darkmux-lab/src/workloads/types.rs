@@ -249,6 +249,9 @@ pub(crate) struct LoadedWorkload {
 /// no longer searching cwd at all (see that function's doc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorkloadSource {
+    /// (#3361) `<eval_dir>/workloads/<id>.json` of a registered fixture: the
+    /// eval's own document, which wins over every other tier.
+    Eval,
     /// `<user workloads dir>/<id>.json` (or nested `<id>/workload.json`) —
     /// operator override.
     User,
@@ -266,6 +269,7 @@ pub(crate) enum WorkloadSource {
 impl WorkloadSource {
     pub(crate) fn label(self) -> &'static str {
         match self {
+            WorkloadSource::Eval => "eval",
             WorkloadSource::User => "user",
             WorkloadSource::OnDisk => "on-disk",
             WorkloadSource::Embedded => "embedded",

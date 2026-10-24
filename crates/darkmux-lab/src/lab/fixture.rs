@@ -76,6 +76,14 @@ pub(crate) struct FixtureManifest {
     /// fails the fixture if any required_file is missing.
     #[serde(default)]
     pub required_files: Vec<String>,
+
+    /// (#3361) The eval's own folder, relative to the fixture root: the
+    /// workload documents this fixture defines and their grading data. The
+    /// eval owns its workload and grader; darkmux only processes them.
+    /// `lab run` loads a workload the fixture defines from here, and a run's
+    /// sandbox never holds this folder, so the model never sees the grader.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eval_dir: Option<String>,
 }
 
 fn default_version() -> String {
@@ -120,6 +128,19 @@ impl FixtureManifest {
                 ));
             }
         }
+        if let Some(dir) = &self.eval_dir {
+            if !is_plain_relative(dir) {
+                return Err(anyhow!(
+                    "eval_dir `{dir}` must be a folder inside the fixture, written relative to it \
+                     (e.g. `eval`), with no `..`, `.` or leading `/`"
+                ));
+            }
+            if self.satisfies.is_none() {
+                return Err(anyhow!(
+                    "eval_dir `{dir}` needs `satisfies`: a workload the eval defines binds its fixture by it"
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -132,6 +153,26 @@ impl FixtureManifest {
             .cloned()
             .collect()
     }
+}
+
+/// A path made only of plain names (`eval`, `grading/v1`): inside the
+/// directory it is joined to, whatever that directory is.
+fn is_plain_relative(dir: &str) -> bool {
+    let path = Path::new(dir);
+    !dir.trim().is_empty()
+        && !dir.contains('\\')
+        && path.components().all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
+/// (#3361) The eval folder a fixture checkout declares, as a `/`-separated
+/// path relative to it: `None` when it has no `.fixture.json`, the manifest
+/// cannot be read, or it declares none. The sandbox clone prunes it and the
+/// grader's scope check skips it.
+pub(crate) fn eval_dir_of(fixture_dir: &Path) -> Option<String> {
+    if !fixture_dir.join(".fixture.json").exists() {
+        return None;
+    }
+    FixtureManifest::load_from_dir(fixture_dir).ok()?.eval_dir
 }
 
 #[cfg(test)]
@@ -174,6 +215,35 @@ mod tests {
         assert_eq!(m.language.as_deref(), Some("nodejs"));
         assert_eq!(m.required_files.len(), 1);
         assert_eq!(m.baseline["test_count"], 14);
+    }
+
+    #[test]
+    fn eval_dir_is_read_and_named_by_eval_dir_of() {
+        let tmp = TempDir::new().unwrap();
+        write_manifest(tmp.path(), r#"{"name": "pg", "satisfies": "pg@2.1", "eval_dir": "eval"}"#);
+        assert_eq!(FixtureManifest::load_from_dir(tmp.path()).unwrap().eval_dir.as_deref(), Some("eval"));
+        assert_eq!(eval_dir_of(tmp.path()).as_deref(), Some("eval"));
+        let none = TempDir::new().unwrap();
+        assert_eq!(eval_dir_of(none.path()), None);
+    }
+
+    #[test]
+    fn eval_dir_must_stay_inside_the_fixture() {
+        for bad in ["", "..", "../grader", "/abs", "./eval", "eval/../..", "a\\b"] {
+            let m: FixtureManifest =
+                serde_json::from_value(serde_json::json!({"name": "pg", "satisfies": "pg@2.1", "eval_dir": bad})).unwrap();
+            let err = m.validate().unwrap_err().to_string();
+            assert!(err.contains("eval_dir"), "{bad}: {err}");
+        }
+        let nested: FixtureManifest =
+            serde_json::from_value(serde_json::json!({"name": "pg", "satisfies": "pg@2.1", "eval_dir": "grading/v1"})).unwrap();
+        nested.validate().unwrap();
+    }
+
+    #[test]
+    fn eval_dir_needs_satisfies() {
+        let m: FixtureManifest = serde_json::from_value(serde_json::json!({"name": "pg", "eval_dir": "eval"})).unwrap();
+        assert!(m.validate().unwrap_err().to_string().contains("needs `satisfies`"));
     }
 
     #[test]
