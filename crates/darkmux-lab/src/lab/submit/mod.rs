@@ -766,17 +766,18 @@ pub fn gather_on(machine: &Machine, runs: &[String], stated: &Stated, flows_dir:
     let bundle = assemble(&repo, &commit_sha, &fixture_manifest, bundled)?;
     refuse_identifying(&bundle, &machine.identifying)?;
     refuse_unshareable(&bundle)?;
+    Ok(Built { fixture: fixture_label(&repo, &commit_sha, &bundle), bundle, notes })
+}
+
+/// `repo@sha7 (name version)`: the line a submit shows for its fixture.
+fn fixture_label(repo: &str, commit_sha: &str, bundle: &Value) -> String {
     let f = &bundle["fixture"];
-    Ok(Built {
-        fixture: format!(
-            "{repo}@{} ({} {})",
-            &commit_sha[..7],
-            f["name"].as_str().unwrap_or_default(),
-            f["version"].as_str().unwrap_or_default()
-        ),
-        bundle,
-        notes,
-    })
+    format!(
+        "{repo}@{} ({} {})",
+        &commit_sha[..7],
+        f["name"].as_str().unwrap_or_default(),
+        f["version"].as_str().unwrap_or_default()
+    )
 }
 
 /// Every input as a bundle run, with its note and start time.
