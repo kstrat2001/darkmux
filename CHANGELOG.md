@@ -14,6 +14,27 @@ darkmux release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Linux lab runs keep the OS and the context window they ran with (#3367).**
+  The run manifest records the OS name. A rolling release has no install time,
+  so submit could not tell whether the name read now still held and left `os`
+  null. It also records the `n_ctx` of the model the dispatch loaded, including
+  one from `--profiles-file`, and `lab submit` reads that window instead of the
+  registry loaded at submit time. A hosted prompt run stamps when the first
+  generated text arrived on the direct stream and writes that onto the one-call
+  trajectory, so time to first token and decode speed are reported when the
+  stream had them. The one-call envelope gains optional `first_token_ms` and
+  `output_chunks` (`tests/cli-json.golden`). `gpuCores`, `modelId`,
+  `kvCacheDtype`, GPU utilization and thermal state stay unset: nothing read
+  here produces a value the site accepts.
+
+### Changed
+
+- **Run manifest schema 1.1 to 1.2** (additive): `os`, `n_ctx`, and
+  `prompt_tokens_counted` (the reply-room estimate, one token per two bytes
+  plus the chat-template overhead).
+
 ## [5.6.0] - 2026-10-24
 
 An eval owns its workload and its grader. darkmux processes an eval (generic grading rules,

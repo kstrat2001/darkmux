@@ -51,6 +51,11 @@ pub(crate) struct SseProgress {
     pub generated_chars: u64,
     /// `data:` events read, the end marker excluded.
     pub chunks: u64,
+    /// Events that carried generated text. A role-only chunk and a usage-only
+    /// event are not counted: they are not output.
+    pub output_events: u64,
+    /// When the first generated text (answer or reasoning) arrived.
+    pub first_output_at: Option<std::time::Instant>,
     /// (#3210) The latest prefill progress the engine reported, when it
     /// reports any (`darkmux_trajectory::PromptProgressSample`, the parser
     /// the runtime's reader shares).
@@ -166,6 +171,12 @@ impl SseTail {
         for data in data_lines(&text) {
             let Ok(event) = serde_json::from_str::<Value>(data) else { continue };
             let (content, generated) = delta_chars(&event, self.shape);
+            if generated > 0 {
+                if self.progress.first_output_at.is_none() {
+                    self.progress.first_output_at = Some(std::time::Instant::now());
+                }
+                self.progress.output_events += 1;
+            }
             self.progress.content_chars += content;
             self.progress.generated_chars += generated;
             self.progress.chunks += 1;
@@ -392,6 +403,10 @@ pub(crate) struct TurnEvidence<F: Fn(darkmux_flow::Payload)> {
     pub streams: bool,
     /// When the attempt that streamed was sent (its model time's start).
     started: Option<std::time::Instant>,
+    /// Ms from that send to the first generated text. Absent until some arrives.
+    first_token_ms: Option<u64>,
+    /// Events that carried generated text, across the attempt.
+    output_events: u64,
 }
 
 impl<F: Fn(darkmux_flow::Payload)> TurnEvidence<F> {
@@ -404,6 +419,8 @@ impl<F: Fn(darkmux_flow::Payload)> TurnEvidence<F> {
             shape: Shape::of(dialect),
             streams: true,
             started: None,
+            first_token_ms: None,
+            output_events: 0,
         }
     }
 
@@ -436,9 +453,18 @@ impl<F: Fn(darkmux_flow::Payload)> TurnEvidence<F> {
     /// Run `call` with the progress callback: heartbeats through the gate,
     /// and the streaming attempt's start noted for the model time.
     fn with_progress<R>(&mut self, call: impl FnOnce(&mut dyn FnMut(&SseProgress)) -> R) -> R {
-        let (gate, relay, emit, started) = (&mut self.gate, &mut self.relay, &self.emit, &mut self.started);
+        let (gate, relay, emit, started, first_token, output_events) =
+            (&mut self.gate, &mut self.relay, &self.emit, &mut self.started, &mut self.first_token_ms, &mut self.output_events);
         let mut on = |p: &SseProgress| {
             *started = p.started.or(*started);
+            // The heartbeat gate coalesces. The first-text instant does not:
+            // a beat every few seconds is not the time the first token arrived.
+            if first_token.is_none() {
+                if let (Some(t0), Some(at)) = (*started, p.first_output_at) {
+                    *first_token = Some(at.saturating_duration_since(t0).as_millis() as u64);
+                }
+            }
+            *output_events = (*output_events).max(p.output_events);
             if gate.due(std::time::Instant::now()) {
                 // (#3210) One generation beat per 20 s also rides the hub.
                 let mut beat = chunk_beat(p);
@@ -447,6 +473,18 @@ impl<F: Fn(darkmux_flow::Payload)> TurnEvidence<F> {
             }
         };
         call(&mut on)
+    }
+
+    /// Ms from the streaming attempt's send to its first generated text.
+    /// Absent when the call did not stream, or no text arrived.
+    pub(crate) fn first_token_ms(&self) -> Option<u64> {
+        self.streams.then_some(self.first_token_ms).flatten()
+    }
+
+    /// Events that carried generated text, when the call streamed and there
+    /// was at least one.
+    pub(crate) fn output_events(&self) -> Option<u64> {
+        self.streams.then_some(self.output_events).filter(|n| *n > 0)
     }
 
     /// The reply is in: the turn's record. Its model time runs from the

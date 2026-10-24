@@ -1066,7 +1066,7 @@ impl Machine {
             }
         };
         let ran_by = self.ran_by(&input.manifest, stated, started, &mut why);
-        let os = self.os_as_of(started, &mut why);
+        let os = self.os_as_of(&input.manifest, started, &mut why);
         let engine = engine_of(stated, provenance.as_ref(), weights_changed, started, &mut why);
         let stack = Stack {
             chip: self.chip.clone(),
@@ -1079,7 +1079,7 @@ impl Machine {
             model: (!model_id.is_empty()).then(|| model_id.clone()),
             weights_hash,
             quant: engine.quant,
-            context_length: profile_model.and_then(|m| m.n_ctx).map(u64::from),
+            context_length: recorded_n_ctx(&input.manifest).or_else(|| profile_model.and_then(|m| m.n_ctx).map(u64::from)),
             cpu_cores: self.config.cpu_clusters.clone(),
             gpu_cores: self.config.gpu_cores,
             model_id: self.config.model_id.clone(),
@@ -1109,13 +1109,36 @@ impl Machine {
         RanBy { version: Some(b.version), commit: b.commit, build: b.build.map(build_word) }
     }
 
-    fn os_as_of(&self, started: Option<u64>, why: &mut Vec<String>) -> Option<String> {
-        let release = self.os_release.as_ref()?;
-        let os = as_of_run(Some(release.name.clone()), release.installed_at_unix_ms, started);
-        if os.is_none() {
-            why.push("the OS may have been updated after the run".to_string());
+    /// The OS the run recorded, else the one installed before it began.
+    fn os_as_of(&self, manifest: &Value, started: Option<u64>, why: &mut Vec<String>) -> Option<String> {
+        if let Some(name) = manifest.get("os").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+            return os_the_site_takes(name, why);
         }
-        os
+        let release = self.os_release.as_ref()?;
+        match as_of_run(Some(release.name.clone()), release.installed_at_unix_ms, started) {
+            Some(name) => os_the_site_takes(&name, why),
+            None => {
+                why.push("the OS may have been updated after the run".to_string());
+                None
+            }
+        }
+    }
+}
+
+/// The window the run recorded (`n_ctx`), when it recorded one.
+fn recorded_n_ctx(manifest: &Value) -> Option<u64> {
+    manifest.get("n_ctx").and_then(Value::as_u64).filter(|n| *n > 0)
+}
+
+/// A name `parseBundle` accepts, or nothing: a string it refuses would fail
+/// the whole bundle, and null is a value it allows.
+fn os_the_site_takes(name: &str, why: &mut Vec<String>) -> Option<String> {
+    let name = name.trim();
+    if Forms::new().os.is_match(name) {
+        Some(name.to_string())
+    } else {
+        why.push(format!("os is not in the form the site takes ({name})"));
+        None
     }
 }
 

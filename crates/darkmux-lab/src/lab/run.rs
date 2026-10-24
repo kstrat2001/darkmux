@@ -705,6 +705,11 @@ fn enrich_manifest_with_fixture_info(
     manifest.raise_schema_version(4);
     // What built this darkmux, so a shared result names it (`lab submit`).
     manifest.darkmux = Some(darkmux_types::build_info());
+    // The OS name at the run. A rolling release has no install time, so a
+    // later submit cannot recover the name from the machine (#3367).
+    if manifest.os.is_none() {
+        manifest.os = darkmux_platform::current().os_release().map(|r| r.name).filter(|n| !n.is_empty());
+    }
     manifest.write(run_dir)?;
     Ok(())
 }
@@ -2063,6 +2068,8 @@ mod tests {
             serde_json::from_value::<darkmux_types::BuildInfo>(parsed["darkmux"].clone()).unwrap(),
             darkmux_types::build_info()
         );
+        let live = darkmux_platform::current().os_release().map(|r| r.name);
+        assert_eq!(parsed["os"].as_str().map(str::to_string), live, "the OS name is recorded with the run");
     }
 
     /// `baseline_hash: None` is recorded as JSON null (operator-visible

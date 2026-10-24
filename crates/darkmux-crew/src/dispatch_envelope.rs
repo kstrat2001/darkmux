@@ -265,6 +265,14 @@ pub struct DirectMetrics {
     /// Messages `max_tokens`). Absent when the reply named none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
+    /// Ms from the streaming attempt's send to its first generated text.
+    /// Absent when the call did not stream, or no text arrived (#3367).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_token_ms: Option<u64>,
+    /// SSE events that carried generated text. Absent when the call did not
+    /// stream. One event has a first-token time and no decode interval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_chunks: Option<u64>,
     #[serde(flatten)]
     pub tokens: DirectTokens,
 }
