@@ -510,6 +510,49 @@ fn gather_reads_the_runs_the_fixture_and_the_machine() {
     assert!(built.notes[1].starts_with("r2: failed, m1"), "{}", built.notes[1]);
 }
 
+/// (#3367) A rolling release records no install time, so the as-of check
+/// drops the OS on every Linux run. The name the run recorded holds anyway,
+/// and the window the run recorded beats the registry loaded at submit.
+#[test]
+fn a_run_that_recorded_its_os_and_window_keeps_them_when_the_machine_cannot_say() {
+    let b = bench();
+    let runs = vec![b.run("r1", "darkmux:m1", json!({"os": "Omarchy (Arch Linux ARM)", "n_ctx": 16_384}))];
+    let mut machine = b.machine(Some(b.provenance()));
+    machine.os_release = Some(darkmux_platform::OsRelease { name: "Omarchy (updated since)".into(), installed_at_unix_ms: None });
+    let (built, _) = b.gather(&machine, &runs, &Stated::default()).unwrap();
+    let stack = &built.bundle["runs"][0]["stack"];
+    assert_eq!(stack["os"], "Omarchy (Arch Linux ARM)", "the name recorded with the run");
+    assert_eq!(stack["contextLength"], 16_384, "the window the run loaded, not the registry's 65536");
+    assert!(!built.notes[0].contains("the OS may have been updated"), "{}", built.notes[0]);
+}
+
+/// A name the site's form refuses stays null. Putting it on the bundle would
+/// fail the upload, and null is a value the site allows.
+#[test]
+fn a_recorded_os_the_site_does_not_take_stays_null() {
+    let b = bench();
+    let runs = vec![b.run("r1", "darkmux:m1", json!({"os": "Arch Linux"}))];
+    let mut machine = b.machine(Some(b.provenance()));
+    machine.os_release = Some(darkmux_platform::OsRelease { name: "Arch Linux".into(), installed_at_unix_ms: None });
+    let (built, _) = b.gather(&machine, &runs, &Stated::default()).unwrap();
+    assert_eq!(built.bundle["runs"][0]["stack"]["os"], Value::Null);
+    assert!(built.notes[0].contains("os is not in the form the site takes (Arch Linux)"), "{}", built.notes[0]);
+    assert!(!built.notes[0].contains("the OS may have been updated"), "{}", built.notes[0]);
+}
+
+/// The same machine, with nothing recorded on the run, still reports no OS:
+/// an unknown install time is not a license to claim the name read now.
+#[test]
+fn an_unrecorded_os_with_no_install_time_stays_unreported() {
+    let b = bench();
+    let runs = vec![b.run("r1", "darkmux:m1", json!({}))];
+    let mut machine = b.machine(Some(b.provenance()));
+    machine.os_release = Some(darkmux_platform::OsRelease { name: "Omarchy (Arch Linux ARM)".into(), installed_at_unix_ms: None });
+    let (built, _) = b.gather(&machine, &runs, &Stated::default()).unwrap();
+    assert_eq!(built.bundle["runs"][0]["stack"]["os"], Value::Null);
+    assert!(built.notes[0].contains("the OS may have been updated"), "{}", built.notes[0]);
+}
+
 #[test]
 fn what_changed_after_the_run_is_left_out_and_said() {
     let b = bench();

@@ -73,14 +73,8 @@ impl WorkloadProvider for PromptProvider {
         let guard = PromptDispatchGuard::arm(&role, &loaded.manifest.workload.id, run_dir, &mut opts);
         // (`replyRoom`) Worked out from the route the dispatch itself will
         // take: its selected model's window and its own system prompt.
-        let reply_room = match loaded.manifest.workload.reply_room {
-            Some(ReplyRoom::Context) => {
-                reply_room_for(darkmux_crew::dispatch::one_call_context(&opts)?, &prompt, &loaded.manifest.workload.id)?
-            }
-            None => None,
-        };
-        opts.max_completion_tokens = reply_room;
-        let system_chars = darkmux_crew::dispatch::one_call_context(&opts).ok().flatten().map_or(0, |c| c.system_prompt_chars);
+        let route = one_call_route(&opts, &loaded.manifest.workload.id, loaded.manifest.workload.reply_room, &prompt)?;
+        opts.max_completion_tokens = route.reply_cap;
         let (dispatched, out_dir) = dispatch_via_internal(opts)?;
         // Disarm before the one-call trajectory is written, so the guard
         // does not then mark that finished trajectory interrupted.
@@ -89,7 +83,7 @@ impl WorkloadProvider for PromptProvider {
         // none, and its trajectory is the one call's own counts.
         let one_call = out_dir.is_none();
         if one_call {
-            write_one_call_trajectory(&dispatched.stdout, system_chars, prompt.chars().count(), run_dir, now_ms());
+            write_one_call_trajectory(&dispatched.stdout, route.system_chars, prompt.chars().count(), run_dir, now_ms());
         }
         finish_run(
             &FinishInputs {
@@ -101,7 +95,9 @@ impl WorkloadProvider for PromptProvider {
                 duration_ms: started.elapsed().as_millis(),
                 // Only the one-call path sends the cap; the container path's
                 // runtime continues a reply in chunks and caps nothing.
-                reply_cap: reply_room.filter(|_| one_call),
+                reply_cap: route.reply_cap.filter(|_| one_call),
+                n_ctx: route.n_ctx.filter(|_| one_call),
+                prompt_tokens_counted: route.prompt_tokens_counted.filter(|_| one_call),
                 refused: &refused,
             },
             &dispatched,
@@ -163,6 +159,10 @@ pub(crate) struct FinishInputs<'a> {
     /// The `max_completion_tokens` this run's dispatch actually sent, when
     /// the workload asked for `replyRoom` and the dispatch was one call.
     pub reply_cap: Option<u32>,
+    /// The window of the model the one-call dispatch selected.
+    pub n_ctx: Option<u32>,
+    /// Prompt tokens counted for that window (see [`counted_prompt_tokens`]).
+    pub prompt_tokens_counted: Option<u32>,
     /// Runtime files the run refused to copy. Empty leaves the manifest unchanged.
     pub refused: &'a [crate::providers::coding_task::RefusedArtifact],
 }
@@ -197,6 +197,7 @@ pub(crate) fn finish_run(f: &FinishInputs<'_>, d: &Dispatched) -> Result<RunResu
         },
     )?;
     record_structured_output(f.run_dir, fields.as_ref(), f.reply_cap)?;
+    record_window(f.run_dir, f.n_ctx, f.prompt_tokens_counted)?;
     Ok(RunResult {
         escalation: end.escalation().map(str::to_string),
         ok: end.ok(),
@@ -284,6 +285,52 @@ fn record_structured_output(run_dir: &Path, fields: Option<&expect::FieldsReport
     Ok(())
 }
 
+/// Stamp the window the one-call dispatch selected, and the prompt tokens
+/// counted against it, onto the manifest `write_manifest` just wrote. A run
+/// that is not one call leaves both absent.
+fn record_window(run_dir: &Path, n_ctx: Option<u32>, prompt_tokens_counted: Option<u32>) -> Result<()> {
+    if n_ctx.is_none() && prompt_tokens_counted.is_none() {
+        return Ok(());
+    }
+    let mut manifest = RunManifest::read(run_dir)?;
+    manifest.n_ctx = n_ctx.filter(|n| *n > 0);
+    manifest.prompt_tokens_counted = prompt_tokens_counted;
+    manifest.write(run_dir)
+}
+
+/// The window and the counted prompt of the route this dispatch will take.
+struct OneCallFacts {
+    reply_cap: Option<u32>,
+    system_chars: usize,
+    n_ctx: Option<u32>,
+    prompt_tokens_counted: Option<u32>,
+}
+
+/// Resolve the one-call route once. A workload that asks for `replyRoom`
+/// surfaces a resolution error; any other workload keeps going with no
+/// window when the route cannot be read, as the system-char count did.
+fn one_call_route(
+    opts: &darkmux_crew::dispatch::DispatchOpts,
+    workload_id: &str,
+    reply_room: Option<ReplyRoom>,
+    prompt: &str,
+) -> Result<OneCallFacts> {
+    let asked = reply_room == Some(ReplyRoom::Context);
+    let ctx = if asked {
+        darkmux_crew::dispatch::one_call_context(opts)?
+    } else {
+        darkmux_crew::dispatch::one_call_context(opts).ok().flatten()
+    };
+    let reply_cap = if asked { reply_room_for(ctx.clone(), prompt, workload_id)? } else { None };
+    let prompt_tokens_counted = ctx.as_ref().map(|c| counted_prompt_tokens(c.system_prompt_bytes + prompt.len()));
+    Ok(OneCallFacts {
+        reply_cap,
+        system_chars: ctx.as_ref().map_or(0, |c| c.system_prompt_chars),
+        n_ctx: ctx.and_then(|c| c.n_ctx),
+        prompt_tokens_counted,
+    })
+}
+
 /// Where a `promptFile` resolves: the run's own copy of the fixture when the
 /// workload binds one (so the input is the one the recorded fixture commit
 /// holds), else beside the workload document.
@@ -323,6 +370,11 @@ fn reply_room_for(ctx: Option<darkmux_crew::dispatch::OneCallContext>, prompt: &
     }
 }
 
+/// One token per two UTF-8 bytes, plus the chat-template overhead.
+fn counted_prompt_tokens(prompt_bytes: usize) -> u32 {
+    u32::try_from(prompt_bytes.div_ceil(2)).unwrap_or(u32::MAX).saturating_add(REPLY_ROOM_OVERHEAD_TOKENS)
+}
+
 /// The host has no tokenizer, so the prompt is counted at one token per two
 /// UTF-8 bytes, plus a fixed overhead for the chat template. English prose
 /// runs nearer four bytes a token and HTML, JSON or code nearer two or three,
@@ -334,7 +386,7 @@ fn reply_room_for(ctx: Option<darkmux_crew::dispatch::OneCallContext>, prompt: &
 /// extraction prompt on a 16K window that actually holds it with room to
 /// spare (6,144 tokens on a 1.7B model).
 fn reply_room_from(n_ctx: u32, prompt_bytes: usize, workload_id: &str) -> Result<u32> {
-    let prompt_tokens = u32::try_from(prompt_bytes.div_ceil(2)).unwrap_or(u32::MAX).saturating_add(REPLY_ROOM_OVERHEAD_TOKENS);
+    let prompt_tokens = counted_prompt_tokens(prompt_bytes);
     let room = n_ctx.saturating_sub(prompt_tokens);
     if room < REPLY_ROOM_MIN_TOKENS {
         return Err(anyhow!(
@@ -447,7 +499,9 @@ fn fill_refusal_defaults(manifest: &mut RunManifest, run_dir: &Path, workload_id
 /// and empty when it names none, never guessed. A reply that is not that
 /// envelope writes nothing.
 fn write_one_call_trajectory(stdout: &str, system_chars: usize, prompt_chars: usize, run_dir: &Path, end_ms: u64) {
-    use darkmux_trajectory::event::{DispatchComplete, DispatchStart, Header, ModelCompleted, StreamingEnd, StreamingStart, TrajectoryEvent};
+    use darkmux_trajectory::event::{
+        DispatchComplete, DispatchStart, Header, ModelCompleted, StreamingEnd, StreamingStart, TrajectoryEvent,
+    };
     let Ok(envelope) = serde_json::from_str::<serde_json::Value>(stdout) else { return };
     let Some(metrics) = envelope.get("metrics") else { return };
     let (Some(model), Some(wall_ms)) = (metrics.get("model").and_then(|v| v.as_str()), metrics.get("wall_ms").and_then(|v| v.as_u64())) else {
@@ -456,7 +510,9 @@ fn write_one_call_trajectory(stdout: &str, system_chars: usize, prompt_chars: us
     let usage: darkmux_trajectory::usage::Usage = serde_json::from_value(metrics.clone()).unwrap_or_default();
     let start_ms = end_ms.saturating_sub(wall_ms);
     let reply_chars = envelope.get("final_assistant").and_then(|v| v.as_str()).map_or(0, |s| s.chars().count() as u64);
-    let events = [
+    let marks = output_marks(metrics, start_ms, end_ms);
+    let partials = marks.len() as u64;
+    let mut events = vec![
         TrajectoryEvent::Header(Header { schema_version: darkmux_trajectory::TRAJECTORY_SCHEMA_VERSION.to_string() }),
         TrajectoryEvent::DispatchStart(DispatchStart {
             ts: start_ms,
@@ -474,18 +530,62 @@ fn write_one_call_trajectory(stdout: &str, system_chars: usize, prompt_chars: us
             system_chars: system_chars as u64,
             prompt_chars: prompt_chars as u64,
         }),
-        TrajectoryEvent::StreamingEnd(StreamingEnd { seq: 1, ts: end_ms, total_content_chars: reply_chars, ..Default::default() }),
-        TrajectoryEvent::ModelCompleted(ModelCompleted {
-            seq: 1,
-            ts: end_ms,
-            finish_reason: metrics.get("finish_reason").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-            usage: Some(usage),
-            ..Default::default()
-        }),
-        TrajectoryEvent::DispatchComplete(DispatchComplete { ts: end_ms, result: "stop".to_string(), wall_ms, turn_delay_effective_ms: None }),
     ];
+    events.extend(marks);
+    events.push(TrajectoryEvent::StreamingEnd(StreamingEnd {
+        seq: 1,
+        ts: end_ms,
+        total_content_chars: reply_chars,
+        partial_count: partials,
+        ..Default::default()
+    }));
+    events.push(TrajectoryEvent::ModelCompleted(ModelCompleted {
+        seq: 1,
+        ts: end_ms,
+        finish_reason: metrics.get("finish_reason").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+        usage: Some(usage),
+        ..Default::default()
+    }));
+    events.push(TrajectoryEvent::DispatchComplete(DispatchComplete {
+        ts: end_ms,
+        result: "stop".to_string(),
+        wall_ms,
+        turn_delay_effective_ms: None,
+    }));
     let lines: Vec<String> = events.iter().filter_map(|e| serde_json::to_string(e).ok()).collect();
     let _ = fs::write(run_dir.join(darkmux_trajectory::TRAJECTORY_FILE), lines.join("\n") + "\n");
+}
+
+/// The first-output marks a hosted stream can support. One mark when the
+/// envelope says when the first text arrived; a second, at the end, when
+/// more than one chunk carried text, so decode speed has an interval. No
+/// mark when the call did not say, or said the first text arrived as it ended.
+fn output_marks(metrics: &serde_json::Value, start_ms: u64, end_ms: u64) -> Vec<darkmux_trajectory::event::TrajectoryEvent> {
+    let Some(wait) = metrics.get("first_token_ms").and_then(|v| v.as_u64()) else {
+        return Vec::new();
+    };
+    let ts = start_ms.saturating_add(wait);
+    if ts == 0 || ts >= end_ms {
+        return Vec::new();
+    }
+    let mut marks = vec![output_mark(1, ts, 1)];
+    if metrics.get("output_chunks").and_then(|v| v.as_u64()).unwrap_or(0) >= 2 {
+        marks.push(output_mark(2, end_ms, 2));
+    }
+    marks
+}
+
+fn output_mark(index: u64, ts: u64, generated: u64) -> darkmux_trajectory::event::TrajectoryEvent {
+    use darkmux_trajectory::event::{Partial, TrajectoryEvent};
+    TrajectoryEvent::Partial(Partial {
+        seq: 1,
+        ts,
+        partial_index: index,
+        delta_chars: 1,
+        cumulative_chars: generated,
+        generated_chars: Some(generated),
+        ..Partial::default()
+    })
 }
 
 fn now_ms() -> u64 {
@@ -804,7 +904,7 @@ mod tests {
             let run_dir = tmp.path().join(format!("run{i}"));
             fs::create_dir_all(&run_dir).unwrap();
             let d = Dispatched { exit_code, stdout: stdout.into(), stderr: "boom".into() };
-            let r = finish_run(&FinishInputs { loaded: &loaded, run_dir: &run_dir, profile: &profile, profile_name: "p", session_id: &session, duration_ms: 1, reply_cap: None, refused: &[] }, &d).unwrap();
+            let r = finish_run(&FinishInputs { loaded: &loaded, run_dir: &run_dir, profile: &profile, profile_name: "p", session_id: &session, duration_ms: 1, reply_cap: None, n_ctx: None, prompt_tokens_counted: None, refused: &[] }, &d).unwrap();
             assert_eq!(r.ok, ok, "case {i}");
             assert_eq!(r.escalation.as_deref(), escalation, "case {i}");
             assert_eq!(r.error.is_some(), errored, "case {i}: an escalation is not an error");
@@ -909,7 +1009,18 @@ mod tests {
         let run_dir = tmp.path().join("structured");
         fs::create_dir_all(&run_dir).unwrap();
         let d = Dispatched { exit_code: 0, stdout: envelope(r#"{"a": "1", "b": "x", "c": "3"}"#), stderr: String::new() };
-        let inputs = FinishInputs { loaded: &loaded, run_dir: &run_dir, profile: &profile, profile_name: "p", session_id: &session, duration_ms: 1, reply_cap: Some(30_000), refused: &[] };
+        let inputs = FinishInputs {
+            loaded: &loaded,
+            run_dir: &run_dir,
+            profile: &profile,
+            profile_name: "p",
+            session_id: &session,
+            duration_ms: 1,
+            reply_cap: Some(30_000),
+            n_ctx: Some(16_384),
+            prompt_tokens_counted: Some(6_148),
+            refused: &[],
+        };
         let r = finish_run(&inputs, &d).unwrap();
         assert!(!r.verify.unwrap().passed);
         let m = manifest_of(&run_dir);
@@ -918,15 +1029,18 @@ mod tests {
         assert_eq!(m["verify"]["fields_expected"], 3);
         assert_eq!(m["verify"]["fields_missed"], serde_json::json!(["b"]));
         assert_eq!(m["max_completion_tokens"], 30_000);
+        assert_eq!(m["n_ctx"], 16_384, "the window the dispatch selected");
+        assert_eq!(m["prompt_tokens_counted"], 6_148, "the tokens counted against that window");
 
         let plain = make_loaded(spec_with_prompt("x"), tmp.path().to_path_buf());
         let run_dir = tmp.path().join("plain");
         fs::create_dir_all(&run_dir).unwrap();
         let d = Dispatched { exit_code: 0, stdout: envelope("hi"), stderr: String::new() };
-        let inputs = FinishInputs { loaded: &plain, run_dir: &run_dir, profile: &profile, profile_name: "p", session_id: &session, duration_ms: 1, reply_cap: None, refused: &[] };
+        let inputs = FinishInputs { loaded: &plain, run_dir: &run_dir, profile: &profile, profile_name: "p", session_id: &session, duration_ms: 1, reply_cap: None, n_ctx: None, prompt_tokens_counted: None, refused: &[] };
         finish_run(&inputs, &d).unwrap();
         let m = manifest_of(&run_dir);
         assert!(m.get("max_completion_tokens").is_none());
+        assert!(m.get("n_ctx").is_none() && m.get("prompt_tokens_counted").is_none());
         assert!(m["verify"].is_null(), "no verify spec: not checked, as before");
     }
 
@@ -953,7 +1067,7 @@ mod tests {
             )
             .unwrap();
             let d = Dispatched { exit_code: 0, stdout: stdout.clone(), stderr: String::new() };
-            let inputs = FinishInputs { loaded: &loaded, run_dir: &run_dir, profile: &profile, profile_name: "p", session_id: &session, duration_ms: 1, reply_cap: None, refused: &[] };
+            let inputs = FinishInputs { loaded: &loaded, run_dir: &run_dir, profile: &profile, profile_name: "p", session_id: &session, duration_ms: 1, reply_cap: None, n_ctx: None, prompt_tokens_counted: None, refused: &[] };
             let r = finish_run(&inputs, &d).unwrap();
             assert_eq!(r.verify.unwrap().details, want, "finish_reason {finish:?}");
             let inspected = PromptProvider.inspect(&loaded, &run_dir).unwrap();
@@ -1051,6 +1165,50 @@ mod tests {
         let other = TempDir::new().unwrap();
         write_one_call_trajectory("plain text", 1, 1, other.path(), 1_000_000);
         assert!(!other.path().join("trajectory.jsonl").exists());
+    }
+
+    /// (#3367) A hosted stream that reported when its first text arrived gets
+    /// a first-token mark, and a second output chunk so decode speed is the
+    /// tokens after that mark. A call that names neither stays unmarked.
+    #[test]
+    fn a_one_call_run_marks_time_to_first_token_when_the_stream_reported_it() {
+        let tmp = TempDir::new().unwrap();
+        let stdout = serde_json::json!({"result": "stop", "final_assistant": "hello", "metrics": {
+            "model": "m", "endpoint": "e", "wall_ms": 13_100, "turns": 1,
+            "prompt_tokens": 6_000, "completion_tokens": 900, "total_tokens": 6_900,
+            "first_token_ms": 2_000, "output_chunks": 4}})
+        .to_string();
+        write_one_call_trajectory(&stdout, 100, 100, tmp.path(), 1_000_000);
+        let fold = crate::lab::inspect::checked_run_trajectory(tmp.path()).unwrap();
+        assert_eq!(fold.streams[0].output_chunks, 2, "two observations: the first text, and the rest");
+        assert_eq!(fold.streams[0].first_output_after_ms(), Some(2_000));
+        let stats = crate::lab::stats::compute_from_dir(tmp.path(), &tmp.path().join("flows")).expect("numbers");
+        assert_eq!(stats.first_token_ms_median, Some(2_000));
+        assert_eq!(stats.first_token_ms_max, Some(2_000));
+        // 900 completion tokens over the 11.1 s after the first token.
+        assert_eq!(stats.decode_tok_per_s, Some(81.1));
+
+        let one = TempDir::new().unwrap();
+        let stdout = serde_json::json!({"result": "stop", "final_assistant": "hello", "metrics": {
+            "model": "m", "endpoint": "e", "wall_ms": 13_100, "turns": 1,
+            "prompt_tokens": 6_000, "completion_tokens": 900, "total_tokens": 6_900,
+            "first_token_ms": 2_000, "output_chunks": 1}})
+        .to_string();
+        write_one_call_trajectory(&stdout, 100, 100, one.path(), 1_000_000);
+        let stats = crate::lab::stats::compute_from_dir(one.path(), &one.path().join("flows")).expect("numbers");
+        assert_eq!(stats.first_token_ms_median, Some(2_000), "one chunk still has a wait");
+        assert_eq!(stats.decode_tok_per_s, None, "one chunk has no decode interval");
+
+        let late = TempDir::new().unwrap();
+        let stdout = serde_json::json!({"result": "stop", "final_assistant": "hello", "metrics": {
+            "model": "m", "endpoint": "e", "wall_ms": 13_100, "turns": 1,
+            "prompt_tokens": 6_000, "completion_tokens": 900, "total_tokens": 6_900,
+            "first_token_ms": 13_100, "output_chunks": 4}})
+        .to_string();
+        write_one_call_trajectory(&stdout, 100, 100, late.path(), 1_000_000);
+        let stats = crate::lab::stats::compute_from_dir(late.path(), &late.path().join("flows")).expect("numbers");
+        assert_eq!(stats.first_token_ms_median, None, "text that arrives as the call ends is not a measured wait");
+        assert_eq!(stats.decode_tok_per_s, None);
     }
 
     /// The runtime's trajectory lands in the run dir, where `run stats` and
@@ -1184,6 +1342,8 @@ mod tests {
                 session_id: &session,
                 duration_ms: 1,
                 reply_cap: None,
+                n_ctx: None,
+                prompt_tokens_counted: None,
                 refused: &refused,
             },
             &d,

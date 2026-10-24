@@ -95,6 +95,20 @@ pub struct RunManifest {
     /// build (run manifest 1.1). Absent on a run from before 5.4.
     #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     pub darkmux: Option<darkmux_types::BuildInfo>,
+    /// The OS name at the run (run manifest 1.2). A later submit reads this
+    /// instead of guessing from the machine's install time, which a rolling
+    /// release does not have. Absent on a run from before it was recorded.
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+    /// The context window of the model the run dispatched, from the profile
+    /// it loaded, including a `--profiles-file` (run manifest 1.2).
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    pub n_ctx: Option<u32>,
+    /// Prompt tokens counted for `replyRoom`: one per two UTF-8 bytes of the
+    /// system prompt and the message, plus the chat-template overhead (run
+    /// manifest 1.2). The endpoint's own count stays on the trajectory.
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_counted: Option<u32>,
     /// A key this type does not name (an older run's camelCase spelling, a newer
     /// darkmux's field), kept and re-serialized flat.
     #[serde(flatten)]

@@ -57,8 +57,10 @@ pub const RESUME_ORIGIN_SCHEMA_VERSION: &str = "1.0";
 /// A lab run's `manifest.json`, shared by every provider. It is a separate key
 /// ([`RUN_MANIFEST_KEY`]) beside each provider's own integer `schema_version`,
 /// which versions that provider's fields and which the enricher raises.
-/// 1.1 adds `darkmux`, the build that ran it.
-pub const RUN_MANIFEST_SCHEMA_VERSION: &str = "1.1";
+/// 1.1 adds `darkmux`, the build that ran it. 1.2 adds `os` (the OS name at
+/// the run), `n_ctx` (the window the run's profile declared for the model it
+/// dispatched) and `prompt_tokens_counted` (the reply-room estimate).
+pub const RUN_MANIFEST_SCHEMA_VERSION: &str = "1.2";
 /// The key the lab run manifest's shared marker lives under.
 pub const RUN_MANIFEST_KEY: &str = "manifest_schema_version";
 /// A mission's `graph-report.json`.

@@ -252,6 +252,8 @@ DirectMetrics
   wall_ms: uint64
   turns: uint32
   finish_reason?: string | null
+  first_token_ms?: uint64 | null
+  output_chunks?: uint64 | null
   prompt_tokens: uint64 | null
   completion_tokens: uint64 | null
   total_tokens: uint64 | null

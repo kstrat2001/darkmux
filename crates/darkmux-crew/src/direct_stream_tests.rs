@@ -240,6 +240,23 @@ data: {\"type\":\"message_stop\"}\n\n";
     assert_eq!(reply["content"][0]["text"], "Hi");
 }
 
+/// The first generated text is the time-to-first-token mark. A role chunk
+/// is not one, and neither is a usage-only event. Reasoning counts: the
+/// fold's first output is generated text, which includes it.
+#[test]
+fn the_tail_marks_the_first_generated_text_and_counts_those_chunks() {
+    let mut role = SseTail::default();
+    assert!(role.feed(b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n"));
+    assert!(role.progress.first_output_at.is_none(), "a role chunk is not output");
+    assert_eq!(role.progress.output_events, 0);
+
+    let mut tail = SseTail::sent_at(std::time::Instant::now(), Shape::Chat);
+    assert!(tail.feed(SSE.as_bytes()));
+    assert!(tail.progress.first_output_at.is_some());
+    // reasoning "think", then "Hel", then "lo". The role chunk and the usage event are not output.
+    assert_eq!(tail.progress.output_events, 3);
+}
+
 #[test]
 fn the_tail_counts_messages_text_and_thinking_deltas() {
     let mut tail = SseTail::new(Shape::Messages);
@@ -420,4 +437,58 @@ fn the_direct_path_relays_the_first_output_past_the_stream_open_chunk() {
         })
         .collect();
     assert_eq!(marked, [Some(1), Some(2)], "the 3-char chunk and the first beat past it, nothing more inside 20 s");
+}
+
+/// The wait for the first generated text is taken from the progress that
+/// carried it, not from the coalesced heartbeat. A later progress does not
+/// move it. A call that never streamed reports neither.
+#[test]
+fn the_turn_keeps_the_wait_for_the_first_generated_text() {
+    let mut ev = TurnEvidence::open(darkmux_types::Dialect::ChatCompletions, 10, std::time::Duration::from_secs(60), |_| {});
+    let sent = std::time::Instant::now() - std::time::Duration::from_millis(2_000);
+    let at = sent + std::time::Duration::from_millis(400);
+    let _ = ev.send(
+        serde_json::json!({ "model": "m" }),
+        |_, progress| {
+            let on = progress.expect("a streamed call");
+            on(&SseProgress { started: Some(sent), chunks: 1, ..SseProgress::default() });
+            on(&SseProgress {
+                started: Some(sent),
+                first_output_at: Some(at),
+                output_events: 1,
+                generated_chars: 3,
+                chunks: 2,
+                ..SseProgress::default()
+            });
+            on(&SseProgress {
+                started: Some(sent),
+                first_output_at: Some(at + std::time::Duration::from_secs(5)),
+                output_events: 4,
+                generated_chars: 80,
+                chunks: 5,
+                ..SseProgress::default()
+            });
+            Ok(serde_json::json!({ "choices": [{ "finish_reason": "stop" }] }))
+        },
+        |_| false,
+    );
+    assert_eq!(ev.first_token_ms(), Some(400), "the first text, not a later one and not the heartbeat");
+    assert_eq!(ev.output_events(), Some(4));
+
+    let mut refused = TurnEvidence::open(darkmux_types::Dialect::ChatCompletions, 10, std::time::Duration::from_secs(60), |_| {});
+    let _ = refused.send(
+        serde_json::json!({ "model": "m" }),
+        |body, progress| {
+            if body.get("stream").is_some() {
+                let on = progress.expect("the streamed attempt");
+                on(&SseProgress { started: Some(sent), first_output_at: Some(at), output_events: 2, ..SseProgress::default() });
+                Err(anyhow::anyhow!("refused"))
+            } else {
+                Ok(serde_json::json!({}))
+            }
+        },
+        |_| true,
+    );
+    assert_eq!(refused.first_token_ms(), None, "an unstreamed retry has no first token");
+    assert_eq!(refused.output_events(), None);
 }

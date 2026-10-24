@@ -4666,6 +4666,8 @@ fn dispatch_unmanaged(
                     .or_else(|| resp.get("stop_reason"))
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string),
+                first_token_ms: evidence.first_token_ms(),
+                output_chunks: evidence.output_events(),
                 tokens: crate::dispatch_envelope::DirectTokens::of(&counts),
             },
         })
