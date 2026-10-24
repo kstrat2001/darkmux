@@ -244,11 +244,10 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
     // not load still gets the preflight's precise refusal first.
     let user_workloads_root = paths::resolve(ResolveScope::ForceUser).root;
     let loaded = load(&opts.workload_id, Some(user_workloads_root.as_path()));
-    let binds = loaded.as_ref().ok().and_then(|w| w.manifest.workload.requires_fixture.clone());
-    crate::user_files::preflight_with(
+    crate::user_files::preflight_workload(
         darkmux_types::config_enum::Scope::LabRun,
         opts.config_path.as_deref(),
-        binds.as_deref(),
+        loaded.as_ref().ok(),
     )?;
     let mut loaded_workload = loaded?;
     let paths = paths::resolve(ResolveScope::ForceUser);
@@ -362,6 +361,11 @@ impl OneRun<'_> {
         if let Err(e) = enrich_manifest_with_fixture_info(run_dir, baseline_hash, source) {
             warn(self.opts.quiet, &format!("enriching manifest with fixture info skipped: {e}"));
         }
+        if let Some(home) = crate::workloads::load::eval_home_of(self.workload) {
+            if let Err(e) = record_eval_workload(run_dir, &home, &self.workload.manifest.workload.id) {
+                warn(self.opts.quiet, &format!("recording the eval's workload skipped: {e}"));
+            }
+        }
         // (#2833) The write-the-tests work gate runs after the enrichment,
         // so both hashes it compares are on disk.
         let coverage_min_pct = self.workload.manifest.workload.verify.as_ref().and_then(|v| v.coverage_min_pct);
@@ -400,6 +404,9 @@ impl OneRun<'_> {
             "[lab] run {i}/{runs}: workload={} ({} tier) profile={} → {run_id}",
             self.opts.workload_id, self.workload.source, self.profile_name
         );
+        if let Some(note) = shadowed_note(self.workload, &paths::resolve(ResolveScope::ForceUser).root) {
+            eprintln!("[lab] note: {note}");
+        }
         for w in envelope.fresh(envelope_check(self.profile, self.profile_name)) {
             eprintln!("[lab] warn: {w}");
         }
@@ -536,7 +543,19 @@ fn materialize_sandbox(source: &Path, per_run: &Path, quiet: bool) -> Result<Opt
             .with_context(|| format!("creating empty per-run sandbox {}", per_run.display()))?;
         return Ok(None);
     }
-    cow_clone_dir_excluding(source, per_run, artifact_dirs::RUN_ARTIFACT_DIRS).with_context(|| {
+    // (#3361) The eval's own folder (its workloads and grading data) never
+    // reaches the sandbox: the model must not see the grader.
+    let eval_dir = crate::lab::fixture::eval_dir_of(source);
+    if let Some(dir) = &eval_dir {
+        if fs::symlink_metadata(source.join(dir)).is_ok_and(|m| m.file_type().is_symlink()) {
+            anyhow::bail!(
+                "the fixture's eval_dir `{dir}` is a symlink; the clone cannot keep the grader out of the sandbox through a link. Make it a real folder"
+            );
+        }
+    }
+    let mut excluded: Vec<&str> = artifact_dirs::RUN_ARTIFACT_DIRS.to_vec();
+    excluded.extend(eval_dir.as_deref());
+    cow_clone_dir_excluding(source, per_run, &excluded).with_context(|| {
         format!("cow-cloning source sandbox {} → {}", source.display(), per_run.display())
     })?;
     match hash_sandbox_dir(per_run) {
@@ -690,6 +709,28 @@ fn enrich_manifest_with_fixture_info(
     Ok(())
 }
 
+/// (#3361) Name the eval's own workload document in the run's `fixture`
+/// block: `eval_dir`, the document's path relative to the fixture, and its
+/// sha256, so `lab submit` can prove the run used the document at the
+/// fixture commit it names.
+fn record_eval_workload(run_dir: &Path, home: &crate::workloads::load::EvalHome, id: &str) -> Result<()> {
+    let doc = home.document(id).ok_or_else(|| anyhow!("the eval no longer defines workload `{id}`"))?;
+    let rel = doc
+        .strip_prefix(&home.fixture_dir)
+        .map_err(|_| anyhow!("{} is not inside the fixture {}", doc.display(), home.fixture_dir.display()))?
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
+    let sha = crate::lab::submit::sha256::file_hex(&doc).with_context(|| format!("hashing {}", doc.display()))?;
+    let mut manifest = RunManifest::read(run_dir)?;
+    let fixture = manifest.fixture.get_or_insert_with(Default::default);
+    fixture.extras.insert("eval_dir".into(), serde_json::json!(home.eval_dir));
+    fixture.extras.insert("workload_path".into(), serde_json::json!(rel));
+    fixture.extras.insert("workload_sha256".into(), serde_json::json!(sha));
+    manifest.write(run_dir)
+}
+
 /// (#490, #2613) Phase 3 — resolve the source sandbox for a workload.
 ///
 /// Resolution order:
@@ -719,6 +760,12 @@ pub(crate) fn resolve_source_sandbox(
     loaded: &crate::workloads::types::LoadedWorkload,
     paths: &paths::DarkmuxPaths,
 ) -> Result<std::path::PathBuf> {
+    // (#3361) A workload its eval defines runs on that eval's fixture (the
+    // load already checked it binds it), never on another that satisfies
+    // the same requirement.
+    if let Some(home) = crate::workloads::load::eval_home_of(loaded) {
+        return Ok(home.fixture_dir);
+    }
     if let Some(requires) = &loaded.manifest.workload.requires_fixture {
         // (#871) Fixture matching is LITERAL today — `find_satisfying` compares
         // the `satisfies` string for exact equality. A semver range operator in
@@ -764,6 +811,23 @@ pub(crate) fn resolve_source_sandbox(
     } else {
         Ok(paths.sandboxes.join(&loaded.manifest.workload.id))
     }
+}
+
+/// (#3361) When the eval's own document won over a copy in the user tier,
+/// say so: the copy is not what ran.
+fn shadowed_note(loaded: &crate::workloads::types::LoadedWorkload, user_root: &Path) -> Option<String> {
+    if loaded.source != crate::workloads::types::WorkloadSource::Eval {
+        return None;
+    }
+    let id = &loaded.manifest.workload.id;
+    let copy = [user_root.join("workloads").join(format!("{id}.json")), user_root.join("workloads").join(id).join("workload.json")]
+        .into_iter()
+        .find(|p| p.is_file())?;
+    Some(format!(
+        "{} is ignored: the eval defines workload `{id}` itself (loaded from {}). Delete the copy, or give it another id to experiment with it",
+        copy.display(),
+        loaded.base_dir.display()
+    ))
 }
 
 /// (#2902 re-review C3) The role `loaded`'s provider dispatches as; `None`
@@ -1304,6 +1368,200 @@ mod tests {
     /// (#490) Phase 3 — happy path: register a fixture whose
     /// `.fixture.json::satisfies` matches a workload's
     /// `requires_fixture`, resolve → returns the fixture's path.
+    /// (#3361) A registered fixture with an `eval_dir` at `dir`, defining
+    /// workload `id` (bound to `satisfies` unless `requires` says otherwise).
+    fn eval_fixture(dir: &Path, satisfies: &str, id: &str, requires: Option<&str>) {
+        std::fs::create_dir_all(dir.join("eval/workloads")).unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join(".fixture.json"),
+            format!(r#"{{"name": "x", "satisfies": "{satisfies}", "eval_dir": "eval"}}"#),
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/a.js"), "a").unwrap();
+        std::fs::write(dir.join("eval/mutants.txt"), "secret").unwrap();
+        std::fs::write(
+            dir.join(format!("eval/workloads/{id}.json")),
+            format!(
+                r#"{{"workload":{{"id":"{id}","provider":"prompt","prompt":"from the eval","requires_fixture":"{}"}}}}"#,
+                requires.unwrap_or(satisfies)
+            ),
+        )
+        .unwrap();
+    }
+
+    fn register_all(root: &Path, dirs: &[(&str, &Path)]) {
+        use crate::lab::registry::{default_registry_path, LabRegistry};
+        let mut registry = LabRegistry::default();
+        for (name, d) in dirs {
+            registry.register(d, Some((*name).to_string()), false).unwrap();
+        }
+        registry.save(&default_registry_path(&paths::DarkmuxPaths::under_root(root.to_path_buf()))).unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn an_eval_defined_workload_wins_over_a_user_copy_and_runs_on_its_own_fixture() {
+        let tmp = TempDir::new().unwrap();
+        let _home_guard = HomeGuard::set(tmp.path());
+        // Another checkout satisfying the same requirement, registered first by name.
+        let other = tmp.path().join("a-other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join(".fixture.json"), r#"{"name": "a", "satisfies": "pg@2.1"}"#).unwrap();
+        let eval = tmp.path().join("b-eval");
+        eval_fixture(&eval, "pg@2.1", "pg", None);
+        register_all(tmp.path(), &[("a-other", &other), ("b-eval", &eval)]);
+        std::fs::create_dir_all(tmp.path().join("workloads")).unwrap();
+        std::fs::write(
+            tmp.path().join("workloads/pg.json"),
+            r#"{"workload":{"id":"pg","provider":"prompt","prompt":"stale copy"}}"#,
+        )
+        .unwrap();
+
+        let loaded = load("pg", Some(tmp.path())).unwrap();
+        assert_eq!(loaded.source, crate::workloads::types::WorkloadSource::Eval);
+        assert_eq!(loaded.manifest.workload.prompt.as_deref(), Some("from the eval"));
+        let note = shadowed_note(&loaded, tmp.path()).expect("the user copy is named");
+        assert!(note.contains("workloads/pg.json is ignored"), "{note}");
+        let paths = paths::DarkmuxPaths::under_root(tmp.path().to_path_buf());
+        assert_eq!(resolve_source_sandbox(&loaded, &paths).unwrap(), eval.canonicalize().unwrap());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn an_eval_workload_must_bind_its_own_fixture() {
+        let tmp = TempDir::new().unwrap();
+        let _home_guard = HomeGuard::set(tmp.path());
+        let eval = tmp.path().join("eval-fx");
+        eval_fixture(&eval, "pg@2.1", "pg", Some("pg@2.0"));
+        register_all(tmp.path(), &[("eval-fx", &eval)]);
+        let err = load("pg", Some(tmp.path())).unwrap_err().to_string();
+        assert!(err.contains("must bind its own fixture") && err.contains("\"pg@2.1\""), "{err}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn two_evals_defining_one_workload_are_refused() {
+        let tmp = TempDir::new().unwrap();
+        let _home_guard = HomeGuard::set(tmp.path());
+        let (one, two) = (tmp.path().join("one"), tmp.path().join("two"));
+        eval_fixture(&one, "pg@2.1", "pg", None);
+        eval_fixture(&two, "pg@2.2", "pg", None);
+        register_all(tmp.path(), &[("one", &one), ("two", &two)]);
+        let err = load("pg", Some(tmp.path())).unwrap_err().to_string();
+        assert!(err.contains("more than one registered fixture") && err.contains("`one`, `two`"), "{err}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn the_sandbox_never_holds_the_eval_folder_and_the_run_names_the_workload_it_used() {
+        let tmp = TempDir::new().unwrap();
+        let _home_guard = HomeGuard::set(tmp.path());
+        let eval = tmp.path().join("eval-fx");
+        eval_fixture(&eval, "pg@2.1", "pg", None);
+        register_all(tmp.path(), &[("eval-fx", &eval)]);
+        let per_run = tmp.path().join("run/sandbox");
+        std::fs::create_dir_all(tmp.path().join("run")).unwrap();
+        materialize_sandbox(&eval, &per_run, true).unwrap();
+        assert!(per_run.join("src/a.js").is_file());
+        assert!(!per_run.join("eval").exists(), "the grader's folder reached the model's sandbox");
+
+        let run_dir = tmp.path().join("run");
+        std::fs::write(run_dir.join(MANIFEST_FILE), r#"{"run_id": "r", "fixture": {"baseline_hash": "h"}}"#).unwrap();
+        let home = crate::workloads::load::eval_homes().pop().unwrap();
+        record_eval_workload(&run_dir, &home, "pg").unwrap();
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(run_dir.join(MANIFEST_FILE)).unwrap()).unwrap();
+        let doc = std::fs::read(eval.join("eval/workloads/pg.json")).unwrap();
+        assert_eq!(written["fixture"]["eval_dir"], "eval");
+        assert_eq!(written["fixture"]["workload_path"], "eval/workloads/pg.json");
+        assert_eq!(written["fixture"]["workload_sha256"], crate::lab::submit::sha256::hex(&doc));
+        assert_eq!(written["fixture"]["baseline_hash"], "h");
+    }
+
+    /// (#3361 review) A checkout cannot point the eval's workload at a file
+    /// outside it, or its eval folder at a folder the sandbox would keep.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn an_eval_cannot_reach_through_a_symlink() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let _home_guard = HomeGuard::set(tmp.path());
+        let outside = tmp.path().join("outside.json");
+        std::fs::write(&outside, r#"{"workload":{"id":"pg","provider":"prompt","prompt":"outside","requires_fixture":"pg@2.1"}}"#).unwrap();
+
+        // The document itself is a link out of the checkout.
+        let linked_doc = tmp.path().join("linked-doc");
+        eval_fixture(&linked_doc, "pg@2.1", "pg", None);
+        std::fs::remove_file(linked_doc.join("eval/workloads/pg.json")).unwrap();
+        symlink(&outside, linked_doc.join("eval/workloads/pg.json")).unwrap();
+        register_all(tmp.path(), &[("linked-doc", &linked_doc)]);
+        let loaded = load("pg", Some(tmp.path()));
+        assert!(
+            loaded.as_ref().map_or(true, |l| l.source != crate::workloads::types::WorkloadSource::Eval),
+            "a symlinked document must not load as the eval's"
+        );
+        let home = crate::workloads::load::eval_homes().pop().unwrap();
+        assert!(home.document("pg").is_none());
+        for id in ["../outside", "/etc/passwd", "a/b", ""] {
+            assert!(home.document(id).is_none(), "{id}");
+        }
+
+        // The eval folder itself is a link: the clone refuses it.
+        let linked_dir = tmp.path().join("linked-dir");
+        std::fs::create_dir_all(linked_dir.join("secret")).unwrap();
+        std::fs::write(linked_dir.join("secret/mutant.txt"), "secret").unwrap();
+        std::fs::write(linked_dir.join(".fixture.json"), r#"{"name": "x", "satisfies": "pg@2.1", "eval_dir": "eval"}"#).unwrap();
+        symlink("secret", linked_dir.join("eval")).unwrap();
+        let per_run = tmp.path().join("run2/sandbox");
+        std::fs::create_dir_all(tmp.path().join("run2")).unwrap();
+        let err = materialize_sandbox(&linked_dir, &per_run, true).unwrap_err().to_string();
+        assert!(err.contains("eval_dir") && err.contains("symlink"), "{err}");
+        assert!(!per_run.join("secret").exists());
+    }
+
+    /// (#3361 review) The document that runs is the one that is recorded: a
+    /// file must be named for the id it declares.
+    #[test]
+    #[serial_test::serial]
+    fn an_eval_document_must_be_named_for_its_id() {
+        let tmp = TempDir::new().unwrap();
+        let _home_guard = HomeGuard::set(tmp.path());
+        let eval = tmp.path().join("eval-fx");
+        eval_fixture(&eval, "pg@2.1", "pg", None);
+        std::fs::write(
+            eval.join("eval/workloads/pg.json"),
+            r#"{"workload":{"id":"other","provider":"prompt","prompt":"x","requires_fixture":"pg@2.1"}}"#,
+        )
+        .unwrap();
+        register_all(tmp.path(), &[("eval-fx", &eval)]);
+        let err = load("pg", Some(tmp.path())).unwrap_err().to_string();
+        assert!(err.contains("declares id \"other\"") && err.contains("named for \"pg\""), "{err}");
+    }
+
+    /// (#3361 review) The preflight checks the fixture the eval workload runs
+    /// on, not the first registered one satisfying the same requirement.
+    #[test]
+    #[serial_test::serial]
+    fn the_preflight_checks_the_evals_own_fixture() {
+        let tmp = TempDir::new().unwrap();
+        let _home_guard = HomeGuard::set(tmp.path());
+        let other = tmp.path().join("a-other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join(".fixture.json"), r#"{"name": "a", "satisfies": "pg@2.1", "bogus_key": 1}"#).unwrap();
+        let eval = tmp.path().join("b-eval");
+        eval_fixture(&eval, "pg@2.1", "pg", None);
+        register_all(tmp.path(), &[("a-other", &other), ("b-eval", &eval)]);
+        let scope = darkmux_types::config_enum::Scope::LabRun;
+        let loaded = load("pg", Some(tmp.path())).unwrap();
+        assert_eq!(crate::user_files::preflight_workload(scope, None, Some(&loaded)), Ok(()), "a bad manifest on a fixture the run does not use refused it");
+
+        std::fs::write(eval.join(".fixture.json"), r#"{"name": "x", "satisfies": "pg@2.1", "eval_dir": "eval", "bogus_key": 1}"#).unwrap();
+        let refusal = crate::user_files::preflight_workload(scope, None, Some(&loaded)).unwrap_err().to_string();
+        assert!(refusal.contains("bogus_key"), "the eval's own bad manifest went unchecked: {refusal}");
+    }
+
     /// Pins the load-bearing end-to-end resolution.
     #[test]
     #[serial_test::serial]

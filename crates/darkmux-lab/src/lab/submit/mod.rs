@@ -27,8 +27,12 @@ pub const BUNDLE_FORMAT: &str = "darkmux-evals-bundle";
 /// `fieldsMissed`) and the reply cap the dispatch sent
 /// (`stack.maxCompletionTokens`). A bundle none of whose runs carries either
 /// is still written as 3, without those keys, so a site that reads only 3
-/// keeps taking every other result.
-pub const BUNDLE_FORMAT_VERSION: u64 = 4;
+/// keeps taking every other result. 5 adds the eval's own workload document
+/// each run used (`workloadPath`, `workloadSha256`, #3361), which every
+/// bundle `lab submit` writes carries.
+pub const BUNDLE_FORMAT_VERSION: u64 = 5;
+/// The version a bundle with format 4's fields and no workload is written as.
+const BUNDLE_FORMAT_VERSION_FIELDS: u64 = 4;
 /// The version a bundle with nothing format 4 added is written as.
 const BUNDLE_FORMAT_VERSION_BEFORE_FIELDS: u64 = 3;
 /// Where results are shared unless `--site` says otherwise.
@@ -579,12 +583,15 @@ pub fn assemble(repo: &str, commit_sha: &str, fixture_manifest: &Value, runs: Ve
 /// Format 4 when any run carries what 4 added; otherwise 3, with those keys
 /// (null in every run) left out.
 fn format_for(mut runs: Vec<Value>) -> (u64, Vec<Value>) {
+    if runs.iter().any(|r| r.get("workloadSha256").is_some_and(|v| !v.is_null())) {
+        return (BUNDLE_FORMAT_VERSION, runs);
+    }
     let carries = |r: &Value| {
         !r["stack"]["maxCompletionTokens"].is_null()
             || ["fieldsCorrect", "fieldsExpected", "fieldsMissed"].iter().any(|k| !r["detail"]["verify"][*k].is_null())
     };
     if runs.iter().any(carries) {
-        return (BUNDLE_FORMAT_VERSION, runs);
+        return (BUNDLE_FORMAT_VERSION_FIELDS, runs);
     }
     for r in &mut runs {
         if let Some(stack) = r.get_mut("stack").and_then(Value::as_object_mut) {
@@ -753,17 +760,9 @@ pub fn gather_on(machine: &Machine, runs: &[String], stated: &Stated, flows_dir:
     refuse_repeats(runs)?;
     let inputs = read_runs(runs, flows_dir)?;
     let source = one_fixture(&inputs, stated)?;
-    let mut caches = Caches::default();
-    let mut bundled = Vec::new();
-    let mut notes = Vec::new();
-    let mut starts = Vec::new();
-    for input in &inputs {
-        let (run, note) = machine.bundle_one(input, stated, &mut caches, progress)?;
-        starts.push(input.started());
-        bundled.push(run);
-        notes.push(note);
-    }
+    let Bundled { runs: mut bundled, notes, starts } = bundle_all(machine, &inputs, stated, progress)?;
     let (repo, commit_sha, fixture_manifest) = fixture_at(&source, &starts, stated.commit.as_deref())?;
+    name_eval_workloads(&mut bundled, eval_workloads(&source, &commit_sha, &fixture_manifest, &inputs)?);
     let bundle = assemble(&repo, &commit_sha, &fixture_manifest, bundled)?;
     refuse_identifying(&bundle, &machine.identifying)?;
     refuse_unshareable(&bundle)?;
@@ -778,6 +777,34 @@ pub fn gather_on(machine: &Machine, runs: &[String], stated: &Stated, flows_dir:
         bundle,
         notes,
     })
+}
+
+/// Every input as a bundle run, with its note and start time.
+struct Bundled {
+    runs: Vec<Value>,
+    notes: Vec<String>,
+    starts: Vec<Option<u64>>,
+}
+
+fn bundle_all(machine: &Machine, inputs: &[Input], stated: &Stated, progress: &mut dyn FnMut(&str)) -> Result<Bundled> {
+    let mut caches = Caches::default();
+    let mut out = Bundled { runs: Vec::new(), notes: Vec::new(), starts: Vec::new() };
+    for input in inputs {
+        let (run, note) = machine.bundle_one(input, stated, &mut caches, progress)?;
+        out.starts.push(input.started());
+        out.runs.push(run);
+        out.notes.push(note);
+    }
+    Ok(out)
+}
+
+/// (#3361) Each run states the eval workload it used, proven against the
+/// fixture commit.
+fn name_eval_workloads(bundled: &mut [Value], workloads: Vec<(String, String)>) {
+    for (run, (path, sha)) in bundled.iter_mut().zip(workloads) {
+        run["workloadPath"] = json!(path);
+        run["workloadSha256"] = json!(sha);
+    }
 }
 
 fn refuse_repeats(runs: &[String]) -> Result<()> {
@@ -1213,6 +1240,63 @@ pub fn fixture_at(source: &Path, starts: &[Option<u64>], stated_commit: Option<&
         .ok_or_else(|| anyhow!("the fixture has no .fixture.json at {}", &commit_sha[..7]))?;
     let manifest: Value = serde_json::from_str(&text).context("reading the fixture's .fixture.json")?;
     Ok((repo, commit_sha, manifest))
+}
+
+/// (#3361) Each run's workload document, proved to be the eval's own at the
+/// fixture commit: `(path, sha256)` per run, in order. The eval owns its
+/// workload and grader, so a fixture with no `eval_dir` at that commit, a run
+/// whose workload came from anywhere else, or a document that differs from
+/// the commit's is refused, every run named.
+fn eval_workloads(source: &Path, commit_sha: &str, fixture_manifest: &Value, inputs: &[Input]) -> Result<Vec<(String, String)>> {
+    let short = &commit_sha[..7.min(commit_sha.len())];
+    let Some(eval_dir) = fixture_manifest.get("eval_dir").and_then(Value::as_str) else {
+        bail!(
+            "the fixture at {short} defines no eval_dir, so it does not own its workload and grader; \
+             only an eval that does can be shared (#3361)"
+        );
+    };
+    let mut proved = Vec::new();
+    let mut refused = Vec::new();
+    for input in inputs {
+        let (path, sha) = (fixture_field(&input.manifest, "workload_path"), fixture_field(&input.manifest, "workload_sha256"));
+        let (Some(path), Some(sha)) = (path, sha) else {
+            refused.push(format!("{}: its workload did not come from the eval's {eval_dir}/ (another copy, or a darkmux before 5.6)", input.run_id));
+            continue;
+        };
+        if !is_eval_document(&path, eval_dir) {
+            refused.push(format!("{}: its workload {path} is not in the eval's {eval_dir}/", input.run_id));
+            continue;
+        }
+        let at_commit = Command::new("git")
+            .arg("-C")
+            .arg(source)
+            .args(["show", &format!("{commit_sha}:{path}")])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| sha256::hex(&o.stdout));
+        match at_commit {
+            None => refused.push(format!("{}: the fixture has no {path} at {short}", input.run_id)),
+            Some(at) if at != sha => {
+                refused.push(format!("{}: its workload {path} is not the one at {short} (it was changed)", input.run_id))
+            }
+            Some(_) => proved.push((path, sha)),
+        }
+    }
+    if !refused.is_empty() {
+        bail!("not submitted:\n  {}", refused.join("\n  "));
+    }
+    Ok(proved)
+}
+
+/// A `.json` document inside `eval_dir`, every part of its path a plain name:
+/// what the site reads, and never a path that climbs out of the fixture.
+fn is_eval_document(path: &str, eval_dir: &str) -> bool {
+    let parts: Vec<&str> = path.split('/').collect();
+    parts.len() > 1
+        && parts[0] == eval_dir
+        && path.ends_with(".json")
+        && parts.iter().all(|part| crate::lab::fixture::is_plain_name(part))
 }
 
 /// The commit HEAD was on from the first run's start to the last's, by the

@@ -675,31 +675,6 @@ fn an_existing_test_switched_off_fails_the_suite() {
     assert!(ev.contains("\"test/a.t\""), "{ev}");
 }
 
-/// The shipped pepper-grinder grader quotes its prompt word for word, so it
-/// grades (the fixture itself is not in this repo; its planted bugs are
-/// checked against it by `lab grade` and the lab run).
-#[test]
-fn the_pepper_grinder_grader_quotes_its_prompt() {
-    let (_, json) = crate::workloads::load::EMBEDDED_WORKLOADS
-        .iter()
-        .find(|(id, _)| *id == "pepper-grinder")
-        .unwrap();
-    let manifest: crate::workloads::types::WorkloadManifest = serde_json::from_str(json).unwrap();
-    let spec = manifest
-        .workload
-        .verify
-        .as_ref()
-        .unwrap()
-        .grade
-        .as_ref()
-        .unwrap();
-    check_asks(spec, manifest.workload.prompt.as_deref().unwrap()).unwrap();
-    assert_eq!(
-        behavior_names(spec.behaviors.as_ref().unwrap()),
-        ["pepper", "row lock", "boot guard", "expiry parsing"]
-    );
-}
-
 #[test]
 fn the_final_reply_is_read_from_the_runtime_envelope() {
     let tmp = TempDir::new().unwrap();
@@ -1456,4 +1431,28 @@ fn an_unreadable_tree_is_an_error_not_an_empty_diff() {
         assert!(format!("{err:#}").contains("reading"), "{err:#}");
     }
     assert!(super::files::prune_artifacts(&missing, "").is_err());
+}
+
+/// (#3361) The eval's own folder never reaches the sandbox, so the scope
+/// check does not read its absence as a deletion; a file the model adds
+/// under that name is still a change.
+#[test]
+fn the_eval_folder_is_not_a_deletion() {
+    let tmp = TempDir::new().unwrap();
+    let fixture = tmp.path().join("fixture");
+    let result = tmp.path().join("result");
+    for d in [&fixture, &result] {
+        fs::create_dir_all(d.join("src")).unwrap();
+        fs::write(d.join("src/a.js"), "a").unwrap();
+        fs::write(d.join(".fixture.json"), r#"{"name": "x", "satisfies": "x@1", "eval_dir": "eval"}"#).unwrap();
+    }
+    fs::create_dir_all(fixture.join("eval/workloads")).unwrap();
+    fs::write(fixture.join("eval/workloads/x.json"), "{}").unwrap();
+    let changes = super::files::compare(&fixture, &result).unwrap();
+    assert!(changes.deleted.is_empty(), "{:?}", changes.deleted);
+
+    fs::create_dir_all(result.join("eval")).unwrap();
+    fs::write(result.join("eval/planted.txt"), "x").unwrap();
+    let changes = super::files::compare(&fixture, &result).unwrap();
+    assert_eq!(changes.added, vec!["eval/planted.txt".to_string()]);
 }

@@ -41,8 +41,9 @@ pub const RULE_SCHEMA_VERSION: &str = "1.0";
 /// `verify.expect` (the `prompt` provider's structured-output check); 1.2
 /// adds `verify.grade` (the grader, #3353).
 pub const WORKLOAD_SCHEMA_VERSION: &str = "1.2";
-/// Lab fixture manifest (`.fixture.json`).
-pub const LAB_FIXTURE_SCHEMA_VERSION: &str = "1.0";
+/// Lab fixture manifest (`.fixture.json`). 1.1 adds `eval_dir`, the folder
+/// holding the eval's own workloads and grading data (#3361).
+pub const LAB_FIXTURE_SCHEMA_VERSION: &str = "1.1";
 /// `mission.json`.
 pub const MISSION_SCHEMA_VERSION: &str = "1.0";
 /// A phase JSON.

@@ -35,7 +35,8 @@ pub(crate) struct Changes {
 }
 
 pub(crate) fn compare(fixture: &Path, result: &Path) -> Result<Changes> {
-    let before = walk(fixture)?;
+    let mut before = walk(fixture)?;
+    drop_eval_dir(fixture, &mut before);
     let mut after = walk(result)?;
     let mut changes = Changes::default();
     for (path, old) in before {
@@ -52,6 +53,15 @@ pub(crate) fn compare(fixture: &Path, result: &Path) -> Result<Changes> {
         changes.added.push(path);
     }
     Ok(changes)
+}
+
+/// (#3361) The eval's own folder never reaches the sandbox, so its absence
+/// from the result is not a deletion.
+fn drop_eval_dir(fixture: &Path, before: &mut BTreeMap<String, Entry>) {
+    if let Some(dir) = crate::lab::fixture::eval_dir_of(fixture) {
+        let inside = format!("{dir}/");
+        before.retain(|path, _| !path.starts_with(&inside));
+    }
 }
 
 fn bytes(e: Entry) -> Option<Vec<u8>> {

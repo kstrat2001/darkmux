@@ -58,6 +58,20 @@ pub(crate) fn hash_sandbox_dir(sandbox_dir: &Path) -> Result<String> {
 /// Same as `hash_sandbox_dir` but with a caller-supplied exclusion
 /// set. Used by Phase 2 (fixture manifest) and tests.
 pub(crate) fn hash_sandbox_dir_with_excludes(sandbox_dir: &Path, excludes: &[&str]) -> Result<String> {
+    hash_dir_skipping(sandbox_dir, excludes, None)
+}
+
+/// A fixture checkout hashed as its sandbox is: without the eval's own
+/// folder, which never reaches a sandbox (#3361), so a run's recorded
+/// `baseline_hash` matches the checkout it came from.
+pub(crate) fn hash_fixture_dir(fixture_dir: &Path) -> Result<String> {
+    let eval_dir = crate::lab::fixture::eval_dir_of(fixture_dir);
+    hash_dir_skipping(fixture_dir, &default_excludes(), eval_dir.as_deref())
+}
+
+/// The hash walk, with the folder `skip` (a path relative to the root)
+/// left out when given.
+fn hash_dir_skipping(sandbox_dir: &Path, excludes: &[&str], skip: Option<&str>) -> Result<String> {
     if !sandbox_dir.exists() {
         return Err(anyhow::anyhow!(
             "sandbox dir does not exist: {}",
@@ -73,6 +87,9 @@ pub(crate) fn hash_sandbox_dir_with_excludes(sandbox_dir: &Path, excludes: &[&st
 
     let mut files = Vec::new();
     collect_files(sandbox_dir, sandbox_dir, excludes, &mut files)?;
+    if let Some(skip) = skip {
+        files.retain(|(rel, _)| !rel.starts_with(skip));
+    }
     files.sort();
 
     let mut hasher = blake3::Hasher::new();
@@ -184,6 +201,36 @@ fn collect_files(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// (#3361) A fixture with an eval folder hashes as its sandbox does, so a
+    /// kept run still regrades against the unchanged checkout; only that
+    /// folder is left out, never a same-named directory elsewhere.
+    #[test]
+    fn a_fixture_hashes_without_its_eval_folder() {
+        let tmp = TempDir::new().unwrap();
+        let fixture = tmp.path().join("fixture");
+        let sandbox = tmp.path().join("sandbox");
+        for d in [&fixture, &sandbox] {
+            std::fs::create_dir_all(d.join("src/eval")).unwrap();
+            std::fs::write(d.join("src/eval/keep.js"), "k").unwrap();
+            std::fs::write(
+                d.join(".fixture.json"),
+                r#"{"name": "x", "satisfies": "x@1", "eval_dir": "eval"}"#,
+            )
+            .unwrap();
+        }
+        std::fs::create_dir_all(fixture.join("eval/workloads")).unwrap();
+        std::fs::write(fixture.join("eval/workloads/x.json"), "{}").unwrap();
+        assert_eq!(
+            hash_fixture_dir(&fixture).unwrap(),
+            hash_sandbox_dir(&sandbox).unwrap()
+        );
+        std::fs::write(fixture.join("src/eval/keep.js"), "changed").unwrap();
+        assert_ne!(
+            hash_fixture_dir(&fixture).unwrap(),
+            hash_sandbox_dir(&sandbox).unwrap()
+        );
+    }
 
     #[test]
     fn same_content_same_hash() {

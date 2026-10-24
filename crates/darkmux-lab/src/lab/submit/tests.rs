@@ -382,12 +382,21 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+/// The eval's own workload document in the bench fixture.
+const WORKLOAD_DOC: &[u8] = br#"{"workload":{"id":"pg"}}"#;
+
 fn bench() -> Bench {
     let root = tempfile::tempdir().unwrap();
     let fixture = root.path().join("fixture");
     std::fs::create_dir(&fixture).unwrap();
     git(&fixture, &["init", "-q"]);
-    std::fs::write(fixture.join(".fixture.json"), r#"{"name":"pepper-grinder","version":2.0}"#).unwrap();
+    std::fs::write(
+        fixture.join(".fixture.json"),
+        r#"{"name":"pepper-grinder","version":2.0,"satisfies":"pg@2.0","eval_dir":"eval"}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(fixture.join("eval/workloads")).unwrap();
+    std::fs::write(fixture.join("eval/workloads/pg.json"), WORKLOAD_DOC).unwrap();
     git(&fixture, &["add", "."]);
     git(&fixture, &["commit", "-qm", "fixture"]);
     git(&fixture, &["remote", "add", "origin", "https://github.com/kstrat2001/pepper-grinder.git"]);
@@ -417,7 +426,8 @@ impl Bench {
         let mut manifest = json!({
             "ok": true, "session_id": name, "profile": "p",
             "verify": {"passed": true, "details": "ok"},
-            "fixture": {"source_path": self.fixture.display().to_string(), "baseline_hash": "b"},
+            "fixture": {"source_path": self.fixture.display().to_string(), "baseline_hash": "b",
+                "eval_dir": "eval", "workload_path": "eval/workloads/pg.json", "workload_sha256": sha256::hex(WORKLOAD_DOC)},
         });
         for (k, v) in extra.as_object().unwrap() {
             manifest[k] = v.clone();
@@ -765,4 +775,52 @@ fn the_git_user_name_is_what_git_printed_trimmed_or_nothing() {
     assert_eq!(user_name_from(true, b"  \n"), None, "only space");
     assert_eq!(user_name_from(true, b""), None, "no user.name set");
     assert_eq!(user_name_from(false, b"Kain\n"), None, "git failed");
+}
+
+/// (#3361) A bundle names the eval's own workload document each run used,
+/// as format 5.
+#[test]
+fn a_bundle_names_the_eval_workload_each_run_used() {
+    let b = bench();
+    let runs = vec![b.run("r1", "darkmux:m1", json!({}))];
+    let (built, _) = b.gather(&b.machine(Some(b.provenance())), &runs, &Stated::default()).unwrap();
+    assert_eq!(built.bundle["formatVersion"], 5);
+    let r1 = &built.bundle["runs"][0];
+    assert_eq!(r1["workloadPath"], "eval/workloads/pg.json");
+    assert_eq!(r1["workloadSha256"], sha256::hex(WORKLOAD_DOC));
+}
+
+/// (#3361) Only an eval that owns its workload is shared, and only runs of
+/// the workload document at the fixture commit.
+#[test]
+fn a_run_not_of_the_eval_own_workload_is_refused() {
+    let b = bench();
+    let mut wrong = b.run("changed", "darkmux:m1", json!({}));
+    let manifest_path = std::path::Path::new(&wrong).join("manifest.json");
+    let mut m: Value = serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    m["fixture"]["workload_sha256"] = json!(sha256::hex(b"edited after the commit"));
+    std::fs::write(&manifest_path, m.to_string()).unwrap();
+    let elsewhere = b.run("elsewhere", "darkmux:m1", json!({}));
+    let manifest_path = std::path::Path::new(&elsewhere).join("manifest.json");
+    let mut m: Value = serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    m["fixture"].as_object_mut().unwrap().retain(|k, _| k == "source_path" || k == "baseline_hash");
+    std::fs::write(&manifest_path, m.to_string()).unwrap();
+    let err = b.gather(&b.machine(Some(b.provenance())), &[wrong.clone(), elsewhere], &Stated::default()).unwrap_err().to_string();
+    assert!(err.contains("changed: its workload eval/workloads/pg.json is not the one at"), "{err}");
+    assert!(err.contains("elsewhere: its workload did not come from the eval's eval/"), "{err}");
+
+    // A fixture that defines no eval_dir does not own its workload.
+    std::fs::write(b.fixture.join(".fixture.json"), r#"{"name":"pepper-grinder","version":2.0}"#).unwrap();
+    git(&b.fixture, &["commit", "-qam", "no eval"]);
+    wrong = b.run("old-fixture", "darkmux:m1", json!({}));
+    let err = b.gather(&b.machine(Some(b.provenance())), &[wrong], &Stated::default()).unwrap_err().to_string();
+    assert!(err.contains("defines no eval_dir"), "{err}");
+}
+
+#[test]
+fn an_eval_document_path_is_plain_names_inside_the_eval_dir() {
+    assert!(super::is_eval_document("eval/workloads/pg.json", "eval"));
+    for bad in ["eval/../secret.json", "eval/workloads/pg.txt", "other/pg.json", "eval/my doc.json", "/eval/pg.json", "eval/./pg.json", "pg.json"] {
+        assert!(!super::is_eval_document(bad, "eval"), "{bad}");
+    }
 }

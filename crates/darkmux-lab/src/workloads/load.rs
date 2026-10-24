@@ -1,5 +1,13 @@
 //! Load workload manifests by id from any of several known locations.
-//! Search order: user dir → on-disk built-in template dirs → binary-embedded built-ins.
+//! Search order: registered evals → user dir → on-disk built-in template dirs →
+//! binary-embedded built-ins.
+//!
+//! **(#3361) An eval owns its workload.** A registered fixture whose
+//! `.fixture.json` names an `eval_dir` defines the workloads in
+//! `<eval_dir>/workloads/`, and they win over every other tier: darkmux is
+//! the processor of an eval, not its definer, so a copy elsewhere never
+//! stands in for the eval's own document. A workload the eval defines must
+//! bind that fixture (`requires_fixture` = its `satisfies`).
 //!
 //! **(#2553) The on-disk tier is NOT cwd-sensitive.** It used to
 //! unconditionally search `<shell's cwd>/templates/builtin/workloads/` ahead
@@ -48,14 +56,9 @@ pub(crate) const EMBEDDED_WORKLOADS: &[(&str, &str)] = &[
         "crawl-error-discard",
         include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/workloads/crawl-error-discard.json")),
     ),
-    // The public long-agentic workload: binds the published pepper-grinder
-    // fixture (`node-pepper-grinder-js@2.0`) by contract, no seed dir. It
-    // replaced `long-agentic`, whose fixture contract only a private codebase
-    // ever satisfied, so no reader could run it.
-    (
-        "pepper-grinder",
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/workloads/pepper-grinder.json")),
-    ),
+    // (#3361) No eval workload is built in: `pepper-grinder` ships in its
+    // fixture's own `eval/` folder, with its grader, and loads from the
+    // registered fixture (the eval tier).
     (
         "quick-coding",
         include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/workloads/quick-coding.json")),
@@ -80,7 +83,7 @@ pub(crate) const EMBEDDED_WORKLOADS: &[(&str, &str)] = &[
     // It embeds cleanly under `parse_str`'s rules: no `promptFile`, and
     // although it is `provider: coding-task` it declares NO `sandboxSeed`
     // (it binds a registered fixture + external sandbox instead), exactly
-    // like the embedded `pepper-grinder`.
+    // like a workload an eval defines.
     (
         "demo-quickstart",
         include_str!(concat!(
@@ -133,7 +136,124 @@ fn builtin_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+/// (#3361) A registered fixture that defines workloads: the eval folder its
+/// `.fixture.json` names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EvalHome {
+    /// The fixture's registry name.
+    pub name: String,
+    /// The fixture checkout (the registry's canonical path).
+    pub fixture_dir: PathBuf,
+    /// `eval_dir`, relative to the fixture.
+    pub eval_dir: String,
+    /// What the fixture satisfies; its workloads must require exactly this.
+    pub satisfies: String,
+}
+
+impl EvalHome {
+    /// Where the eval's workload documents live.
+    pub(crate) fn workloads_dir(&self) -> PathBuf {
+        self.fixture_dir.join(&self.eval_dir).join("workloads")
+    }
+
+    /// The document defining workload `id`, when this eval defines it.
+    ///
+    /// `id` is one plain name, and nothing from the fixture down to the
+    /// document is a symlink: a checkout cannot point a workload at a file
+    /// outside itself, or at the folder the sandbox keeps the model out of.
+    pub(crate) fn document(&self, id: &str) -> Option<PathBuf> {
+        if !crate::lab::fixture::is_plain_name(id) {
+            return None;
+        }
+        let doc = find_in_dir(&self.workloads_dir(), id)?;
+        no_symlink_between(&self.fixture_dir, &doc).then_some(doc)
+    }
+}
+
+/// Whether every component of `path` below `base` is a real file or folder,
+/// never a symlink.
+fn no_symlink_between(base: &Path, path: &Path) -> bool {
+    let Ok(below) = path.strip_prefix(base) else { return false };
+    let mut here = base.to_path_buf();
+    below.components().all(|c| {
+        here.push(c);
+        fs::symlink_metadata(&here).is_ok_and(|m| !m.file_type().is_symlink())
+    })
+}
+
+/// Every registered fixture that declares an `eval_dir`, in registry order.
+/// A registry or manifest that cannot be read defines nothing here; `darkmux
+/// lab doctor` reports it.
+pub(crate) fn eval_homes() -> Vec<EvalHome> {
+    let reg_path = crate::lab::registry::default_registry_path(&darkmux_types::paths::resolve(
+        darkmux_types::paths::ResolveScope::ForceUser,
+    ));
+    let Ok(registry) = crate::lab::registry::LabRegistry::load(&reg_path) else { return Vec::new() };
+    registry
+        .fixtures
+        .iter()
+        .filter_map(|(name, f)| {
+            let manifest = crate::lab::fixture::FixtureManifest::load_from_dir(&f.path).ok()?;
+            Some(EvalHome {
+                name: name.clone(),
+                fixture_dir: f.path.clone(),
+                eval_dir: manifest.eval_dir?,
+                satisfies: manifest.satisfies?,
+            })
+        })
+        .collect()
+}
+
+/// The eval a loaded workload came from: `None` unless it resolved from the
+/// eval tier.
+pub(crate) fn eval_home_of(loaded: &LoadedWorkload) -> Option<EvalHome> {
+    if loaded.source != WorkloadSource::Eval {
+        return None;
+    }
+    eval_homes().into_iter().find(|h| loaded.base_dir.starts_with(h.workloads_dir()))
+}
+
+/// The eval-tier resolution of `id` among `homes`: `None` when no eval
+/// defines it, an error when several do or when the document does not bind
+/// its own fixture.
+fn load_from_evals(id: &str, homes: &[EvalHome]) -> Result<Option<LoadedWorkload>> {
+    let defined: Vec<(&EvalHome, PathBuf)> = homes.iter().filter_map(|h| Some((h, h.document(id)?))).collect();
+    let (home, doc) = match defined.as_slice() {
+        [] => return Ok(None),
+        [one] => one,
+        several => bail!(
+            "workload \"{id}\" is defined by more than one registered fixture ({}); \
+             unregister all but one with `darkmux lab fixture unregister <name>`",
+            several.iter().map(|(h, _)| format!("`{}`", h.name)).collect::<Vec<_>>().join(", ")
+        ),
+    };
+    let loaded = parse(doc, WorkloadSource::Eval)?;
+    if loaded.manifest.workload.id != id {
+        bail!(
+            "workload document {} declares id \"{}\" but is named for \"{id}\"; \
+             name the file after its id, so the one that runs is the one recorded",
+            doc.display(),
+            loaded.manifest.workload.id
+        );
+    }
+    let requires = loaded.manifest.workload.requires_fixture.as_deref();
+    if requires != Some(home.satisfies.as_str()) {
+        bail!(
+            "workload \"{id}\" at {} is defined by fixture `{}` but requires_fixture is {}; \
+             a workload an eval defines must bind its own fixture: set it to \"{}\"",
+            doc.display(),
+            home.name,
+            requires.map_or_else(|| "missing".to_string(), |r| format!("\"{r}\"")),
+            home.satisfies
+        );
+    }
+    Ok(Some(loaded))
+}
+
 pub(crate) fn load(id: &str, user_dir: Option<&Path>) -> Result<LoadedWorkload> {
+    if let Some(loaded) = load_from_evals(id, &eval_homes())? {
+        return Ok(loaded);
+    }
     if let Some(udir) = user_dir {
         let user_workloads = udir.join("workloads");
         if let Some(p) = find_in_dir(&user_workloads, id) {
@@ -216,7 +336,7 @@ fn display_under_cwd(p: &Path) -> String {
 
 pub fn list_available(user_dir: Option<&Path>) -> Vec<String> {
     let mut set: BTreeSet<String> = BTreeSet::new();
-    let mut all_dirs: Vec<PathBuf> = Vec::new();
+    let mut all_dirs: Vec<PathBuf> = eval_homes().iter().map(EvalHome::workloads_dir).collect();
     if let Some(d) = user_dir {
         all_dirs.push(d.join("workloads"));
     }
@@ -242,11 +362,13 @@ pub fn list_available(user_dir: Option<&Path>) -> Vec<String> {
     set.into_iter().collect()
 }
 
-/// Every directory a workload document is read from on disk: the user tier
-/// (`<user root>/workloads`), then the on-disk built-in template dirs (the
-/// embedded tier is compiled in, not a file).
+/// Every directory a workload document is read from on disk: each
+/// registered eval's `workloads/`, the user tier (`<user root>/workloads`),
+/// then the on-disk built-in template dirs (the embedded tier is compiled in,
+/// not a file).
 pub(crate) fn on_disk_dirs(user_root: &Path) -> Vec<PathBuf> {
-    let mut dirs = vec![user_root.join("workloads")];
+    let mut dirs: Vec<PathBuf> = eval_homes().iter().map(EvalHome::workloads_dir).collect();
+    dirs.push(user_root.join("workloads"));
     dirs.extend(builtin_dirs());
     dirs
 }
@@ -747,57 +869,10 @@ mod tests {
         );
     }
 
-    /// The files the PUBLISHED pepper-grinder fixture declares
-    /// (`required_files` in github.com/kstrat2001/pepper-grinder's
-    /// `.fixture.json`, contract `node-pepper-grinder-js@2.0`). Copied here
-    /// on purpose: a workload whose prompt names files its fixture does not
-    /// have is exactly how `long-agentic` came to ship pointing at a fixture
-    /// no reader could obtain.
-    const PUBLISHED_PEPPER_GRINDER_FILES: &[&str] = &[
-        "src/config.js",
-        "src/store.js",
-        "src/tokenRotation.js",
-        "test/tokenRotation.test.js",
-        "test/portability.test.js",
-        "package.json",
-    ];
-
-    /// The built-in pepper-grinder workload runs on a fixture anyone can
-    /// clone: it resolves from the binary alone, binds the published
-    /// fixture's contract, and its prompt names only files that fixture has.
-    #[serial_test::serial]
+    /// (#3361) No eval workload is built in: the eval owns it.
     #[test]
-    fn pepper_grinder_resolves_from_the_binary_and_names_only_published_files() {
-        let tmp = TempDir::new().unwrap();
-        let prev = env::current_dir().unwrap();
-        env::set_current_dir(tmp.path()).unwrap();
-        unsafe { env::set_var("DARKMUX_TEMPLATES_DIR", tmp.path().join("nope")) };
-        let result = load("pepper-grinder", None);
-        unsafe { env::remove_var("DARKMUX_TEMPLATES_DIR") };
-        env::set_current_dir(prev).unwrap();
-        let loaded = result.expect("pepper-grinder must resolve from the binary with no checkout");
-        let w = &loaded.manifest.workload;
-        assert_eq!(loaded.source, WorkloadSource::Embedded);
-        assert_eq!(w.id, "pepper-grinder");
-        assert_eq!(w.requires_fixture.as_deref(), Some("node-pepper-grinder-js@2.0"));
-        assert!(w.sandbox_seed.is_none(), "it binds the registered fixture, not a seed dir");
-        let verify = w.verify.as_ref().expect("pepper-grinder ships a verify spec");
-        assert_eq!(verify.command.as_deref(), Some("npm test"));
-
-        let prompt = w.prompt.as_deref().expect("pepper-grinder ships its prompt inline");
-        let named: Vec<&str> = prompt
-            .split("${SANDBOX_DIR}/")
-            .skip(1)
-            .map(|rest| rest.split(|c: char| c.is_whitespace() || c == ')' || c == '`').next().unwrap_or(""))
-            .filter(|p| p.contains('.'))
-            .collect();
-        assert!(!named.is_empty(), "the prompt should point the model at the fixture's files");
-        for path in named {
-            assert!(
-                PUBLISHED_PEPPER_GRINDER_FILES.contains(&path),
-                "prompt names `{path}`, which the published fixture does not have"
-            );
-        }
+    fn no_eval_workload_is_built_in() {
+        assert!(EMBEDDED_WORKLOADS.iter().all(|(id, _)| *id != "pepper-grinder"));
     }
 
     // ─── #2553 — the on-disk tier must NOT be cwd-sensitive ──────────────

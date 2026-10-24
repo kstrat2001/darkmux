@@ -111,12 +111,42 @@ fn registered_fixtures() -> Vec<(Option<String>, std::path::PathBuf)> {
 /// this run binds (`fixture`: the workload's `requires_fixture`), never a
 /// fixture this run does not read.
 pub fn preflight_with(scope: Scope, profiles_file: Option<&str>, fixture: Option<&str>) -> Result<(), PreflightRefusal> {
+    preflight_bound(scope, profiles_file, fixture, None)
+}
+
+/// [`preflight_with`] for a loaded workload: the fixture it binds is the one
+/// a run of it reads. A workload its eval defines runs on that eval's
+/// fixture (#3361), so that fixture's manifest is the one checked, not the
+/// first registered one satisfying the same requirement.
+pub(crate) fn preflight_workload(
+    scope: Scope,
+    profiles_file: Option<&str>,
+    loaded: Option<&crate::workloads::types::LoadedWorkload>,
+) -> Result<(), PreflightRefusal> {
+    let binds = loaded.and_then(|w| w.manifest.workload.requires_fixture.clone());
+    let eval_manifest = loaded
+        .and_then(crate::workloads::load::eval_home_of)
+        .map(|home| home.fixture_dir.join(".fixture.json"));
+    preflight_bound(scope, profiles_file, binds.as_deref(), eval_manifest)
+}
+
+fn preflight_bound(
+    scope: Scope,
+    profiles_file: Option<&str>,
+    fixture: Option<&str>,
+    bound_manifest: Option<std::path::PathBuf>,
+) -> Result<(), PreflightRefusal> {
     let mut refusal = darkmux_crew::user_files::preflight_with(scope, profiles_file)
         .err()
         .unwrap_or_else(|| PreflightRefusal::none(scope));
     refusal.files.extend(UserFileKind::consumed_by(scope).flat_map(|k| problems(k, Reach::Effective)));
-    let bound = registered_fixtures().into_iter().find(|(s, _)| s.as_deref().is_some_and(|s| Some(s) == fixture));
-    if let Some((_, manifest)) = bound {
+    let bound = bound_manifest.or_else(|| {
+        registered_fixtures()
+            .into_iter()
+            .find(|(s, _)| s.as_deref().is_some_and(|s| Some(s) == fixture))
+            .map(|(_, manifest)| manifest)
+    });
+    if let Some(manifest) = bound {
         refusal.files.extend(check_path::<FixtureManifest>(UserFileKind::LabFixture, &manifest, &fixture_retired));
     }
     refusal.into_result()

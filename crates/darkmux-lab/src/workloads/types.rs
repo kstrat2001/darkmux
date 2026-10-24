@@ -25,7 +25,7 @@ pub(crate) struct VerifySpec {
     /// (#2833) Minimum LINE coverage percentage the run's verify command
     /// must report, evaluated only for fixtures that also declare
     /// `baseline.test_count` (see `crate::lab::verify_gate`). `None` (the
-    /// default — the built-in `pepper-grinder` workload does NOT set
+    /// default — the `pepper-grinder` eval's workload does NOT set
     /// this) means no coverage rule is applied at all, matching today's
     /// behavior exactly.
     ///
@@ -249,6 +249,9 @@ pub(crate) struct LoadedWorkload {
 /// no longer searching cwd at all (see that function's doc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorkloadSource {
+    /// (#3361) `<eval_dir>/workloads/<id>.json` of a registered fixture: the
+    /// eval's own document, which wins over every other tier.
+    Eval,
     /// `<user workloads dir>/<id>.json` (or nested `<id>/workload.json`) —
     /// operator override.
     User,
@@ -266,6 +269,7 @@ pub(crate) enum WorkloadSource {
 impl WorkloadSource {
     pub(crate) fn label(self) -> &'static str {
         match self {
+            WorkloadSource::Eval => "eval",
             WorkloadSource::User => "user",
             WorkloadSource::OnDisk => "on-disk",
             WorkloadSource::Embedded => "embedded",
