@@ -610,7 +610,8 @@ fn suite_copies_have_opaque_names() {
     // fixture, result, elsewhere, control, one planted bug
     assert_eq!(dirs.len(), 5, "{dirs:?}");
     for d in &dirs {
-        let rel = d.split("/work/").nth(1).unwrap_or_else(|| panic!("{d}"));
+        // The last `/work/`: the scratch root itself may sit under one (CI runners do).
+        let rel = d.rsplit("/work/").next().unwrap_or_else(|| panic!("{d}"));
         let opaque = rel.split('/').next().unwrap();
         assert!(
             opaque.len() == 16 && opaque.bytes().all(|b| b.is_ascii_hexdigit()),

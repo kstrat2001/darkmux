@@ -764,9 +764,14 @@ pub fn gather_on(machine: &Machine, runs: &[String], stated: &Stated, flows_dir:
     let (repo, commit_sha, fixture_manifest) = fixture_at(&source, &starts, stated.commit.as_deref())?;
     name_eval_workloads(&mut bundled, eval_workloads(&source, &commit_sha, &fixture_manifest, &inputs)?);
     let bundle = assemble(&repo, &commit_sha, &fixture_manifest, bundled)?;
-    refuse_identifying(&bundle, &machine.identifying)?;
-    refuse_unshareable(&bundle)?;
+    refuse_unshareable_bundle(&bundle, &machine.identifying)?;
     Ok(Built { fixture: fixture_label(&repo, &commit_sha, &bundle), bundle, notes })
+}
+
+/// Both refusals a finished bundle must clear before it can leave this machine.
+fn refuse_unshareable_bundle(bundle: &Value, identifying: &[String]) -> Result<()> {
+    refuse_identifying(bundle, identifying)?;
+    refuse_unshareable(bundle)
 }
 
 /// `repo@sha7 (name version)`: the line a submit shows for its fixture.
