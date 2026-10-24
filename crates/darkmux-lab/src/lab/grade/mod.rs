@@ -1142,7 +1142,7 @@ fn run_fixture(run_dir: &Path, manifest: &RunManifest, fixture: Option<&Path>) -
             run_dir.display()
         )
     })?;
-    let now = crate::lab::sandbox_hash::hash_sandbox_dir(&fixture_dir)?;
+    let now = crate::lab::sandbox_hash::hash_fixture_dir(&fixture_dir)?;
     if now != baseline {
         bail!(
             "{} no longer matches what this run started from (hash {now}, the run recorded {baseline}): \
