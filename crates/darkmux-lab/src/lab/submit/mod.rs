@@ -771,10 +771,7 @@ pub fn gather_on(machine: &Machine, runs: &[String], stated: &Stated, flows_dir:
         notes.push(note);
     }
     let (repo, commit_sha, fixture_manifest) = fixture_at(&source, &starts, stated.commit.as_deref())?;
-    for (run, (path, sha)) in bundled.iter_mut().zip(eval_workloads(&source, &commit_sha, &fixture_manifest, &inputs)?) {
-        run["workloadPath"] = json!(path);
-        run["workloadSha256"] = json!(sha);
-    }
+    name_eval_workloads(&mut bundled, eval_workloads(&source, &commit_sha, &fixture_manifest, &inputs)?);
     let bundle = assemble(&repo, &commit_sha, &fixture_manifest, bundled)?;
     refuse_identifying(&bundle, &machine.identifying)?;
     refuse_unshareable(&bundle)?;
@@ -789,6 +786,15 @@ pub fn gather_on(machine: &Machine, runs: &[String], stated: &Stated, flows_dir:
         bundle,
         notes,
     })
+}
+
+/// (#3361) Each run states the eval workload it used, proven against the
+/// fixture commit.
+fn name_eval_workloads(bundled: &mut [Value], workloads: Vec<(String, String)>) {
+    for (run, (path, sha)) in bundled.iter_mut().zip(workloads) {
+        run["workloadPath"] = json!(path);
+        run["workloadSha256"] = json!(sha);
+    }
 }
 
 fn refuse_repeats(runs: &[String]) -> Result<()> {
