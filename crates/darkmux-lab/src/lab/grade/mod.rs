@@ -1106,14 +1106,10 @@ fn graded_workload(
         .ok_or_else(|| anyhow!("{}: the manifest names no workload", run_dir.display()))?;
     let user_root = crate::lab::paths::resolve(crate::lab::paths::ResolveScope::ForceUser).root;
     let loaded = crate::workloads::load::load(&workload_id, Some(&user_root));
-    let binds = loaded
-        .as_ref()
-        .ok()
-        .and_then(|w| w.manifest.workload.requires_fixture.clone());
-    crate::user_files::preflight_with(
+    crate::user_files::preflight_workload(
         darkmux_types::config_enum::Scope::LabRun,
         None,
-        binds.as_deref(),
+        loaded.as_ref().ok(),
     )?;
     loaded
 }

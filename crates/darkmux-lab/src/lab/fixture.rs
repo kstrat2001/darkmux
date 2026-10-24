@@ -129,10 +129,10 @@ impl FixtureManifest {
             }
         }
         if let Some(dir) = &self.eval_dir {
-            if !is_plain_relative(dir) {
+            if !is_plain_name(dir) {
                 return Err(anyhow!(
-                    "eval_dir `{dir}` must be a folder inside the fixture, written relative to it \
-                     (e.g. `eval`), with no `..`, `.` or leading `/`"
+                    "eval_dir `{dir}` must be one folder name at the top of the fixture (e.g. `eval`): \
+                     letters, digits, `.`, `_` and `-`, never `.` or `..`"
                 ));
             }
             if self.satisfies.is_none() {
@@ -155,17 +155,15 @@ impl FixtureManifest {
     }
 }
 
-/// A path made only of plain names (`eval`, `grading/v1`): inside the
-/// directory it is joined to, whatever that directory is.
-fn is_plain_relative(dir: &str) -> bool {
-    let path = Path::new(dir);
-    !dir.trim().is_empty()
-        && !dir.contains('\\')
-        && path.components().all(|c| matches!(c, std::path::Component::Normal(_)))
+/// One plain name: letters, digits, `.`, `_` and `-`, and not `.` or `..`.
+/// The grammar the site reads a workload path in, so a path built of these
+/// names is one it accepts; a name is also never a path that could leave the
+/// directory it is joined to.
+pub(crate) fn is_plain_name(name: &str) -> bool {
+    !matches!(name, "" | "." | "..") && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-/// (#3361) The eval folder a fixture checkout declares, as a `/`-separated
-/// path relative to it: `None` when it has no `.fixture.json`, the manifest
+/// (#3361) The eval folder a fixture checkout declares, a name at its top: `None` when it has no `.fixture.json`, the manifest
 /// cannot be read, or it declares none. The sandbox clone prunes it and the
 /// grader's scope check skips it.
 pub(crate) fn eval_dir_of(fixture_dir: &Path) -> Option<String> {
@@ -229,15 +227,15 @@ mod tests {
 
     #[test]
     fn eval_dir_must_stay_inside_the_fixture() {
-        for bad in ["", "..", "../grader", "/abs", "./eval", "eval/../..", "a\\b"] {
+        for bad in ["", ".", "..", "../grader", "/abs", "./eval", "eval/../..", "a\\b", "grading/v1", "my eval"] {
             let m: FixtureManifest =
                 serde_json::from_value(serde_json::json!({"name": "pg", "satisfies": "pg@2.1", "eval_dir": bad})).unwrap();
             let err = m.validate().unwrap_err().to_string();
             assert!(err.contains("eval_dir"), "{bad}: {err}");
         }
-        let nested: FixtureManifest =
-            serde_json::from_value(serde_json::json!({"name": "pg", "satisfies": "pg@2.1", "eval_dir": "grading/v1"})).unwrap();
-        nested.validate().unwrap();
+        let plain: FixtureManifest =
+            serde_json::from_value(serde_json::json!({"name": "pg", "satisfies": "pg@2.1", "eval_dir": "eval-v1.2"})).unwrap();
+        plain.validate().unwrap();
     }
 
     #[test]

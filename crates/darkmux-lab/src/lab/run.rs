@@ -244,11 +244,10 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
     // not load still gets the preflight's precise refusal first.
     let user_workloads_root = paths::resolve(ResolveScope::ForceUser).root;
     let loaded = load(&opts.workload_id, Some(user_workloads_root.as_path()));
-    let binds = loaded.as_ref().ok().and_then(|w| w.manifest.workload.requires_fixture.clone());
-    crate::user_files::preflight_with(
+    crate::user_files::preflight_workload(
         darkmux_types::config_enum::Scope::LabRun,
         opts.config_path.as_deref(),
-        binds.as_deref(),
+        loaded.as_ref().ok(),
     )?;
     let mut loaded_workload = loaded?;
     let paths = paths::resolve(ResolveScope::ForceUser);
@@ -547,6 +546,13 @@ fn materialize_sandbox(source: &Path, per_run: &Path, quiet: bool) -> Result<Opt
     // (#3361) The eval's own folder (its workloads and grading data) never
     // reaches the sandbox: the model must not see the grader.
     let eval_dir = crate::lab::fixture::eval_dir_of(source);
+    if let Some(dir) = &eval_dir {
+        if fs::symlink_metadata(source.join(dir)).is_ok_and(|m| m.file_type().is_symlink()) {
+            anyhow::bail!(
+                "the fixture's eval_dir `{dir}` is a symlink; the clone cannot keep the grader out of the sandbox through a link. Make it a real folder"
+            );
+        }
+    }
     let mut excluded: Vec<&str> = artifact_dirs::RUN_ARTIFACT_DIRS.to_vec();
     excluded.extend(eval_dir.as_deref());
     cow_clone_dir_excluding(source, per_run, &excluded).with_context(|| {
@@ -1471,6 +1477,89 @@ mod tests {
         assert_eq!(written["fixture"]["workload_path"], "eval/workloads/pg.json");
         assert_eq!(written["fixture"]["workload_sha256"], crate::lab::submit::sha256::hex(&doc));
         assert_eq!(written["fixture"]["baseline_hash"], "h");
+    }
+
+    /// (#3361 review) A checkout cannot point the eval's workload at a file
+    /// outside it, or its eval folder at a folder the sandbox would keep.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn an_eval_cannot_reach_through_a_symlink() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let _home_guard = HomeGuard::set(tmp.path());
+        let outside = tmp.path().join("outside.json");
+        std::fs::write(&outside, r#"{"workload":{"id":"pg","provider":"prompt","prompt":"outside","requires_fixture":"pg@2.1"}}"#).unwrap();
+
+        // The document itself is a link out of the checkout.
+        let linked_doc = tmp.path().join("linked-doc");
+        eval_fixture(&linked_doc, "pg@2.1", "pg", None);
+        std::fs::remove_file(linked_doc.join("eval/workloads/pg.json")).unwrap();
+        symlink(&outside, linked_doc.join("eval/workloads/pg.json")).unwrap();
+        register_all(tmp.path(), &[("linked-doc", &linked_doc)]);
+        let loaded = load("pg", Some(tmp.path()));
+        assert!(
+            loaded.as_ref().map_or(true, |l| l.source != crate::workloads::types::WorkloadSource::Eval),
+            "a symlinked document must not load as the eval's"
+        );
+        let home = crate::workloads::load::eval_homes().pop().unwrap();
+        assert!(home.document("pg").is_none());
+        for id in ["../outside", "/etc/passwd", "a/b", ""] {
+            assert!(home.document(id).is_none(), "{id}");
+        }
+
+        // The eval folder itself is a link: the clone refuses it.
+        let linked_dir = tmp.path().join("linked-dir");
+        std::fs::create_dir_all(linked_dir.join("secret")).unwrap();
+        std::fs::write(linked_dir.join("secret/mutant.txt"), "secret").unwrap();
+        std::fs::write(linked_dir.join(".fixture.json"), r#"{"name": "x", "satisfies": "pg@2.1", "eval_dir": "eval"}"#).unwrap();
+        symlink("secret", linked_dir.join("eval")).unwrap();
+        let per_run = tmp.path().join("run2/sandbox");
+        std::fs::create_dir_all(tmp.path().join("run2")).unwrap();
+        let err = materialize_sandbox(&linked_dir, &per_run, true).unwrap_err().to_string();
+        assert!(err.contains("eval_dir") && err.contains("symlink"), "{err}");
+        assert!(!per_run.join("secret").exists());
+    }
+
+    /// (#3361 review) The document that runs is the one that is recorded: a
+    /// file must be named for the id it declares.
+    #[test]
+    #[serial_test::serial]
+    fn an_eval_document_must_be_named_for_its_id() {
+        let tmp = TempDir::new().unwrap();
+        let _home_guard = HomeGuard::set(tmp.path());
+        let eval = tmp.path().join("eval-fx");
+        eval_fixture(&eval, "pg@2.1", "pg", None);
+        std::fs::write(
+            eval.join("eval/workloads/pg.json"),
+            r#"{"workload":{"id":"other","provider":"prompt","prompt":"x","requires_fixture":"pg@2.1"}}"#,
+        )
+        .unwrap();
+        register_all(tmp.path(), &[("eval-fx", &eval)]);
+        let err = load("pg", Some(tmp.path())).unwrap_err().to_string();
+        assert!(err.contains("declares id \"other\"") && err.contains("named for \"pg\""), "{err}");
+    }
+
+    /// (#3361 review) The preflight checks the fixture the eval workload runs
+    /// on, not the first registered one satisfying the same requirement.
+    #[test]
+    #[serial_test::serial]
+    fn the_preflight_checks_the_evals_own_fixture() {
+        let tmp = TempDir::new().unwrap();
+        let _home_guard = HomeGuard::set(tmp.path());
+        let other = tmp.path().join("a-other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join(".fixture.json"), r#"{"name": "a", "satisfies": "pg@2.1", "bogus_key": 1}"#).unwrap();
+        let eval = tmp.path().join("b-eval");
+        eval_fixture(&eval, "pg@2.1", "pg", None);
+        register_all(tmp.path(), &[("a-other", &other), ("b-eval", &eval)]);
+        let scope = darkmux_types::config_enum::Scope::LabRun;
+        let loaded = load("pg", Some(tmp.path())).unwrap();
+        assert_eq!(crate::user_files::preflight_workload(scope, None, Some(&loaded)), Ok(()), "a bad manifest on a fixture the run does not use refused it");
+
+        std::fs::write(eval.join(".fixture.json"), r#"{"name": "x", "satisfies": "pg@2.1", "eval_dir": "eval", "bogus_key": 1}"#).unwrap();
+        let refusal = crate::user_files::preflight_workload(scope, None, Some(&loaded)).unwrap_err().to_string();
+        assert!(refusal.contains("bogus_key"), "the eval's own bad manifest went unchecked: {refusal}");
     }
 
     /// Pins the load-bearing end-to-end resolution.

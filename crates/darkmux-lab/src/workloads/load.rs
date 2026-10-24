@@ -157,9 +157,28 @@ impl EvalHome {
     }
 
     /// The document defining workload `id`, when this eval defines it.
+    ///
+    /// `id` is one plain name, and nothing from the fixture down to the
+    /// document is a symlink: a checkout cannot point a workload at a file
+    /// outside itself, or at the folder the sandbox keeps the model out of.
     pub(crate) fn document(&self, id: &str) -> Option<PathBuf> {
-        find_in_dir(&self.workloads_dir(), id)
+        if !crate::lab::fixture::is_plain_name(id) {
+            return None;
+        }
+        let doc = find_in_dir(&self.workloads_dir(), id)?;
+        no_symlink_between(&self.fixture_dir, &doc).then_some(doc)
     }
+}
+
+/// Whether every component of `path` below `base` is a real file or folder,
+/// never a symlink.
+fn no_symlink_between(base: &Path, path: &Path) -> bool {
+    let Ok(below) = path.strip_prefix(base) else { return false };
+    let mut here = base.to_path_buf();
+    below.components().all(|c| {
+        here.push(c);
+        fs::symlink_metadata(&here).is_ok_and(|m| !m.file_type().is_symlink())
+    })
 }
 
 /// Every registered fixture that declares an `eval_dir`, in registry order.
@@ -209,6 +228,14 @@ fn load_from_evals(id: &str, homes: &[EvalHome]) -> Result<Option<LoadedWorkload
         ),
     };
     let loaded = parse(doc, WorkloadSource::Eval)?;
+    if loaded.manifest.workload.id != id {
+        bail!(
+            "workload document {} declares id \"{}\" but is named for \"{id}\"; \
+             name the file after its id, so the one that runs is the one recorded",
+            doc.display(),
+            loaded.manifest.workload.id
+        );
+    }
     let requires = loaded.manifest.workload.requires_fixture.as_deref();
     if requires != Some(home.satisfies.as_str()) {
         bail!(

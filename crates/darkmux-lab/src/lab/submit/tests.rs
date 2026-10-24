@@ -816,3 +816,11 @@ fn a_run_not_of_the_eval_own_workload_is_refused() {
     let err = b.gather(&b.machine(Some(b.provenance())), &[wrong], &Stated::default()).unwrap_err().to_string();
     assert!(err.contains("defines no eval_dir"), "{err}");
 }
+
+#[test]
+fn an_eval_document_path_is_plain_names_inside_the_eval_dir() {
+    assert!(super::is_eval_document("eval/workloads/pg.json", "eval"));
+    for bad in ["eval/../secret.json", "eval/workloads/pg.txt", "other/pg.json", "eval/my doc.json", "/eval/pg.json", "eval/./pg.json", "pg.json"] {
+        assert!(!super::is_eval_document(bad, "eval"), "{bad}");
+    }
+}

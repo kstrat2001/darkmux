@@ -1263,7 +1263,7 @@ fn eval_workloads(source: &Path, commit_sha: &str, fixture_manifest: &Value, inp
             refused.push(format!("{}: its workload did not come from the eval's {eval_dir}/ (another copy, or a darkmux before 5.6)", input.run_id));
             continue;
         };
-        if !path.starts_with(&format!("{eval_dir}/")) {
+        if !is_eval_document(&path, eval_dir) {
             refused.push(format!("{}: its workload {path} is not in the eval's {eval_dir}/", input.run_id));
             continue;
         }
@@ -1287,6 +1287,16 @@ fn eval_workloads(source: &Path, commit_sha: &str, fixture_manifest: &Value, inp
         bail!("not submitted:\n  {}", refused.join("\n  "));
     }
     Ok(proved)
+}
+
+/// A `.json` document inside `eval_dir`, every part of its path a plain name:
+/// what the site reads, and never a path that climbs out of the fixture.
+fn is_eval_document(path: &str, eval_dir: &str) -> bool {
+    let parts: Vec<&str> = path.split('/').collect();
+    parts.len() > 1
+        && parts[0] == eval_dir
+        && path.ends_with(".json")
+        && parts.iter().all(|part| crate::lab::fixture::is_plain_name(part))
 }
 
 /// The commit HEAD was on from the first run's start to the last's, by the
