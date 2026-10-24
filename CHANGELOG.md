@@ -14,6 +14,46 @@ darkmux release.
 
 ## [Unreleased]
 
+## [5.6.0] - 2026-10-24
+
+An eval owns its workload and its grader. darkmux processes an eval (generic grading rules,
+schema and runner); everything specific to one fixture lives in the fixture's own repo, hash-pinned
+with the fixture commit. Fixture manifest schema 1.1 adds `eval_dir`; `lab submit` writes
+bundle format 5. **5.5.0 refuses the new `eval_dir` key, so the pepper-grinder 2.1 and
+biz-scrape-fixture 1.1 fixtures need 5.6.0**, and evals.darkmux.com must accept format 5 first
+(it does as of 2026-10-24).
+
+### Added
+
+- **`eval_dir` in `.fixture.json` (#3361, #3362).** A fixture may name a folder inside itself
+  (needs `satisfies`; no `..` or absolute paths). `lab run` loads
+  `<eval_dir>/workloads/<id>.json` ahead of every other workload tier. That workload must bind
+  its own fixture (`requires_fixture` is the fixture's `satisfies`) and run on it; two fixtures
+  defining one id are refused, and a `~/.darkmux/workloads` copy it shadows is named in the run
+  banner.
+- **The run records which eval it used.** The run manifest's `fixture` block gains `eval_dir`,
+  `workload_path` and `workload_sha256`.
+- **`lab submit` bundle format 5** adds `workloadPath` and `workloadSha256` per run, and refuses
+  a fixture with no `eval_dir` at its commit, a run whose workload came from elsewhere, and a
+  workload that differs from the one at the fixture commit.
+
+### Changed
+
+- **The model never sees the grader.** The sandbox clone prunes `eval_dir`, so the grader, its
+  mutants and the answer key stay out of the model's reach; the scope check does not read their
+  absence as a deletion.
+- **Fixture manifest schema 1.0 to 1.1** (additive). The demo fixture's manifest is 1.1.
+
+### Removed
+
+- **The built-in `pepper-grinder` workload.** It moved to the pepper-grinder fixture's `eval/`
+  folder (fixture 2.1). Run it from a registered pepper-grinder 2.1 checkout.
+
+### Fixed
+
+- Review fixes to the eval-owned workload work landed with #3362 (load precedence, binding
+  refusals, the submit checks above), and main's CRAP ratchet is green again.
+
 ## [5.5.0] - 2026-10-23
 
 Lab runs are graded on what the prompt asked for. A coding workload can declare a grader
