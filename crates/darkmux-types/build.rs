@@ -6,6 +6,9 @@
 //!
 //! Precedence for the tag (`darkmux_types::build_version()` reads it). A git
 //! checkout with changes is never a release, flag or not: it shows as in 3.
+//! Cargo's own `.cargo-ok` marker in a `cargo install --git` checkout is not
+//! a change (#3380). That checkout carries no tags, so a tagged install is a
+//! release through `DARKMUX_RELEASE` (1), with git still naming the commit.
 //!   1. **release** — `DARKMUX_RELEASE` is set. The Homebrew stable formula
 //!      stamps this (it builds from a release tarball with no `.git`, so the
 //!      git fallback below would otherwise leave it indistinguishable from a
@@ -142,12 +145,22 @@ fn git_state() -> Option<GitState> {
     let dirty = Command::new("git")
         .args(["status", "--porcelain"])
         .output()
-        .map(|o| !o.stdout.is_empty())
+        .map(|o| porcelain_is_dirty(&String::from_utf8_lossy(&o.stdout)))
         .unwrap_or(false);
     let tags = git_stdout(&["tag", "--points-at", "HEAD"])
         .map(|t| t.lines().map(|l| l.trim().to_string()).collect())
         .unwrap_or_default();
     Some(GitState { commit, short, dirty, tags })
+}
+
+/// The marker cargo writes at the root of its own checkout for
+/// `cargo install --git` (#3380): untracked, and not a change to the source.
+const CARGO_CHECKOUT_MARKER: &str = "?? .cargo-ok";
+
+/// Whether `git status --porcelain` output reports a change. Cargo's
+/// checkout marker alone is not one; anything else, tracked or not, is.
+fn porcelain_is_dirty(porcelain: &str) -> bool {
+    porcelain.lines().any(|l| l != CARGO_CHECKOUT_MARKER)
 }
 
 /// The tag and the kind for a build: see the module doc for the precedence.
@@ -215,6 +228,30 @@ mod tests {
         assert_eq!((tag.as_str(), kind), ("", ""));
         let (tag, kind) = build_tag(false, None, "5.6.0", None);
         assert_eq!((tag.as_str(), kind), ("", ""));
+    }
+
+    /// (#3380) `cargo install --git` builds from cargo's own checkout, which
+    /// holds an untracked `.cargo-ok` marker cargo writes there. That marker is
+    /// not a change to darkmux's source, so it must not make the build `dev`.
+    #[test]
+    fn cargo_checkout_marker_is_not_a_change() {
+        assert!(!porcelain_is_dirty(""));
+        assert!(!porcelain_is_dirty("?? .cargo-ok\n"));
+        assert!(!porcelain_is_dirty("?? .cargo-ok"));
+        // Any real change still marks the build dirty, marker or not.
+        assert!(porcelain_is_dirty("?? .cargo-ok\n M src/lib.rs\n"));
+        assert!(porcelain_is_dirty(" M src/lib.rs\n?? .cargo-ok\n"));
+        assert!(porcelain_is_dirty("?? notes.txt\n"));
+        assert!(porcelain_is_dirty("?? crates/x/.cargo-ok\n"));
+    }
+
+    /// (#3380) A clean cargo checkout of a tag has no tags of its own, so the
+    /// release claim comes from `DARKMUX_RELEASE`; git still names the commit.
+    #[test]
+    fn flagged_clean_checkout_without_tags_is_release() {
+        let git = GitState { commit: SHA.to_string(), short: SHA[..7].to_string(), dirty: false, tags: Vec::new() };
+        assert_eq!(build_tag(true, Some(&git), "5.6.0", None), ("release 69b8fc5".to_string(), "release"));
+        assert_eq!(build_tag(false, Some(&git), "5.6.0", None), ("69b8fc5".to_string(), "dev"));
     }
 
     #[test]

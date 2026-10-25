@@ -14,6 +14,16 @@ darkmux release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A tagged `cargo install --git` build is a release, so its runs can be
+  submitted (#3380).** Cargo builds from its own checkout, which holds an
+  untracked `.cargo-ok` marker, so the build read the tree as modified and
+  recorded every run as a development build. evals.darkmux.com refused those
+  runs, even with `DARKMUX_RELEASE` set. The marker no longer counts as a
+  change. Cargo's checkout carries no tags, so the Omarchy guide's install line
+  now sets `DARKMUX_RELEASE=1`, and `--version` reads `(release <commit>)`.
+
 ## [5.7.0] - 2026-10-25
 
 Linux lab runs keep the OS and the context window they ran with, and a tarball
