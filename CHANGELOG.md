@@ -14,11 +14,12 @@ darkmux release.
 
 ## [Unreleased]
 
-## [5.6.1] - 2026-10-25
+## [5.7.0] - 2026-10-25
 
 Linux lab runs keep the OS and the context window they ran with, and a tarball
 build stamps the commit so evals.darkmux.com gets a non-empty `darkmuxCommit`.
-Run manifest schema 1.1 to 1.2 is additive. `FLOW_SCHEMA_VERSION` stays 2.5.0.
+Run manifest schema 1.1 to 1.2 is additive, which makes this a minor.
+`FLOW_SCHEMA_VERSION` stays 2.5.0.
 `RULES_SCHEMA_VERSION` stays 3.0.0.
 
 ### Fixed
@@ -3979,7 +3980,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   does. `FLOW_SCHEMA_VERSION` unchanged at 1.52.0; `RULES_SCHEMA_VERSION`
   unchanged at 3.0.0.
 
-[5.6.1]: https://github.com/kstrat2001/darkmux/releases/tag/v5.6.1
+[5.7.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.7.0
 [5.6.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.6.0
 [5.5.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.5.0
 [5.4.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.4.0
