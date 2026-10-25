@@ -1,6 +1,6 @@
 [package]
 name = "darkmux-trajectory"
-version = "5.6.0"
+version = "5.7.0"
 edition = "2021"
 description = "darkmux trajectory events: the one definition the runtime writes and the host reads, and the one fold over them"
 license = "MIT"

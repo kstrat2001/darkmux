@@ -14,9 +14,17 @@ darkmux release.
 
 ## [Unreleased]
 
+## [5.7.0] - 2026-10-25
+
+Linux lab runs keep the OS and the context window they ran with, and a tarball
+build stamps the commit so evals.darkmux.com gets a non-empty `darkmuxCommit`.
+Run manifest schema 1.1 to 1.2 is additive, which makes this a minor.
+`FLOW_SCHEMA_VERSION` stays 2.5.0.
+`RULES_SCHEMA_VERSION` stays 3.0.0.
+
 ### Fixed
 
-- **Linux lab runs keep the OS and the context window they ran with (#3367).**
+- **Linux lab runs keep the OS and the context window they ran with (#3367, #3372).**
   The run manifest records the OS name. A rolling release has no install time,
   so submit could not tell whether the name read now still held and left `os`
   null. It also records the `n_ctx` of the model the dispatch loaded, including
@@ -28,6 +36,13 @@ darkmux release.
   `output_chunks` (`tests/cli-json.golden`). `gpuCores`, `modelId`,
   `kvCacheDtype`, GPU utilization and thermal state stay unset: nothing read
   here produces a value the site accepts.
+- **Tarball builds stamp `darkmuxCommit` (#3373, #3376).** A release tarball
+  has no `.git`, so the build recorded an empty commit and evals.darkmux.com
+  showed a blank `darkmuxCommit`. When git is absent and `DARKMUX_RELEASE` is
+  set, the build takes a full 40-character SHA from `DARKMUX_COMMIT`. The
+  Homebrew formula sets that to the tagged commit
+  (`git rev-parse vX.Y.Z^{commit}`). A value that is not 40 hex characters is
+  ignored, the same as unset.
 
 ### Changed
 
@@ -3965,6 +3980,8 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   does. `FLOW_SCHEMA_VERSION` unchanged at 1.52.0; `RULES_SCHEMA_VERSION`
   unchanged at 3.0.0.
 
+[5.7.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.7.0
+[5.6.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.6.0
 [5.5.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.5.0
 [5.4.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.4.0
 [5.3.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.3.0
