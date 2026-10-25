@@ -9,8 +9,11 @@
 //!   1. **release** — `DARKMUX_RELEASE` is set. The Homebrew stable formula
 //!      stamps this (it builds from a release tarball with no `.git`, so the
 //!      git fallback below would otherwise leave it indistinguishable from a
-//!      bare source build). Shows `<version> (release)`, or
-//!      `<version> (release a1b2c3d)` when git can name the commit.
+//!      bare source build) and, alongside it, `DARKMUX_COMMIT` with the full
+//!      commit of the tag the formula's `url` points at — a tarball has no
+//!      `.git`, so without the env the commit would stay empty (#3373). Shows
+//!      `<version> (release)`, or `<version> (release a1b2c3d)` when the
+//!      commit is known.
 //!   2. **release, from git** — a clean checkout whose `HEAD` carries the tag
 //!      `v<version>`. Shows `<version> (release a1b2c3d)`.
 //!   3. **git SHA** — any other git checkout (dev build, or `brew install
@@ -22,7 +25,8 @@
 //! Beside the tag it bakes the full commit (`DARKMUX_BUILD_COMMIT`) and the
 //! kind (`DARKMUX_BUILD_KIND`: `release`, `dev`, or empty when neither is
 //! known), which `darkmux_types::build_info()` reads, so a run records what
-//! built the darkmux that ran it.
+//! built the darkmux that ran it. When git is unavailable (a release tarball)
+//! the full commit rides in the `DARKMUX_COMMIT` env var instead (#3373).
 //!
 //! Dep-free by design (CLAUDE.md: "don't add dependencies casually") — it
 //! shells to `git`. Lives in the foundation crate so serve + doctor + the
@@ -34,17 +38,21 @@ fn main() {
     let git = git_state();
     let flagged = std::env::var_os("DARKMUX_RELEASE").is_some();
     let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
-    let (tag, kind) = build_tag(flagged, git.as_ref(), &version);
+    // (#3373) A release tarball has no `.git`, so git can't name the commit;
+    // the formula stamps it here. Git still wins when it can speak.
+    let env_commit = std::env::var("DARKMUX_COMMIT")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let (tag, kind) = build_tag(flagged, git.as_ref(), &version, env_commit.as_deref());
     println!("cargo:rustc-env=DARKMUX_BUILD_TAG={tag}");
     println!("cargo:rustc-env=DARKMUX_BUILD_KIND={kind}");
-    println!(
-        "cargo:rustc-env=DARKMUX_BUILD_COMMIT={}",
-        git.as_ref().map(|g| g.commit.as_str()).unwrap_or_default()
-    );
+    println!("cargo:rustc-env=DARKMUX_BUILD_COMMIT={}", git.as_ref().map(|g| g.commit.as_str()).or(env_commit.as_deref()).unwrap_or(""));
 
-    // Re-run when the release flag flips or HEAD moves, so the baked tag can't
-    // go stale across rebuilds.
+    // Re-run when the release flag, the commit env, or HEAD moves, so the
+    // baked tag can't go stale across rebuilds.
     println!("cargo:rerun-if-env-changed=DARKMUX_RELEASE");
+    println!("cargo:rerun-if-env-changed=DARKMUX_COMMIT");
     for path in git_watch_paths() {
         println!("cargo:rerun-if-changed={}", path.display());
     }
@@ -140,9 +148,21 @@ fn git_state() -> Option<GitState> {
 }
 
 /// The tag and the kind for a build: see the module doc for the precedence.
-fn build_tag(flagged: bool, git: Option<&GitState>, version: &str) -> (String, &'static str) {
+fn build_tag(
+    flagged: bool,
+    git: Option<&GitState>,
+    version: &str,
+    env_commit: Option<&str>,
+) -> (String, &'static str) {
     match git {
-        None if flagged => ("release".to_string(), "release"),
+        // A release tarball has no `.git` at all, so the commit can only ride
+        // in the env the formula stamps (#3373). Keep the bare `(release)` tag
+        // when the env is unset — a tarball build without a stamped commit is
+        // still a release, just one the lab can't name.
+        None if flagged => match env_commit.filter(|c| !c.is_empty()) {
+            Some(c) => (format!("release {}", c.chars().take(7).collect::<String>()), "release"),
+            None => ("release".to_string(), "release"),
+        },
         None => (String::new(), ""),
         Some(g) if g.dirty => (format!("{}\u{2731}", g.short), "dev"),
         Some(g) if flagged || g.tags.iter().any(|t| *t == format!("v{version}")) => {

@@ -57,11 +57,13 @@ pub use endpoint::{
 ///
 ///   * `"<version> (release)"` — a packaged release (Homebrew stable stamps
 ///     `DARKMUX_RELEASE`).
-///   * `"<version> (release a1b2c3d)"` — a release that git can name: the
-///     flag with git, or a clean checkout at the tag `v<version>`.
+///   * `"<version> (release a1b2c3d)"` — a release that git can name (the
+///     flag with a clean checkout at the tag `v<version>`), or that the formula
+///     stamped via `DARKMUX_COMMIT` (the release tarball has no `.git`, #3373).
 ///   * `"<version> (a1b2c3d✱)"` — a git build (dev / `brew install --HEAD`);
 ///     short SHA, `✱` when the tree was dirty.
-///   * `"<version>"` — a source tarball build (no release flag, no git).
+///   * `"<version>"` — a source tarball build (no release flag, no git, no
+///     commit).
 pub fn build_version() -> String {
     let v = env!("CARGO_PKG_VERSION");
     match option_env!("DARKMUX_BUILD_TAG") {
@@ -75,9 +77,11 @@ pub fn build_version() -> String {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BuildInfo {
     pub version: String,
-    /// The full commit; `None` for a build without git (a release tarball).
+    /// The full commit; `None` for a build without git AND without a stamped
+    /// `DARKMUX_COMMIT` (a release tarball, #3373).
     pub commit: Option<String>,
-    /// `None` when the build says neither (a source tarball without the flag).
+    /// `None` when the build says neither (a source tarball without the flag
+    /// and without the commit env).
     pub build: Option<BuildKind>,
 }
 
@@ -121,6 +125,19 @@ mod build_info_tests {
         let tarball = build_info_from("5.4.0", "", "");
         assert_eq!((tarball.commit, tarball.build), (None, None));
         assert_eq!(build_info_from("5.4.0", "abc1234", "dev").build, Some(BuildKind::Dev));
+    }
+
+    #[test]
+    fn a_tarball_release_with_env_commit_bakes_full_commit_and_release_kind() {
+        // (#3373) A Homebrew release tarball has no `.git`, so the formula
+        // stamps the tag's full commit via DARKMUX_COMMIT; build.rs bakes it
+        // into DARKMUX_BUILD_COMMIT and reports release kind with the commit.
+        let b = build_info_from("5.6.0", "0123456789abcdef0123456789abcdef01234567", "release");
+        assert_eq!(b.build, Some(BuildKind::Release));
+        assert_eq!(b.commit.as_deref(), Some("0123456789abcdef0123456789abcdef01234567"));
+
+        let no_commit = build_info_from("5.6.0", "", "release");
+        assert_eq!((no_commit.commit, no_commit.build), (None, Some(BuildKind::Release)));
     }
 
     #[test]
