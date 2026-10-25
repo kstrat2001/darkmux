@@ -9,8 +9,12 @@
 //!   1. **release** — `DARKMUX_RELEASE` is set. The Homebrew stable formula
 //!      stamps this (it builds from a release tarball with no `.git`, so the
 //!      git fallback below would otherwise leave it indistinguishable from a
-//!      bare source build). Shows `<version> (release)`, or
-//!      `<version> (release a1b2c3d)` when git can name the commit.
+//!      bare source build) and, alongside it, `DARKMUX_COMMIT` with the full
+//!      commit of the tag the formula's `url` points at — a tarball has no
+//!      `.git`, so without the env the commit would stay empty (#3373). Shows
+//!      `<version> (release)`, or `<version> (release a1b2c3d)` when the
+//!      commit is known. A `DARKMUX_COMMIT` that is not 40 hex characters is
+//!      ignored, the same as unset.
 //!   2. **release, from git** — a clean checkout whose `HEAD` carries the tag
 //!      `v<version>`. Shows `<version> (release a1b2c3d)`.
 //!   3. **git SHA** — any other git checkout (dev build, or `brew install
@@ -22,7 +26,8 @@
 //! Beside the tag it bakes the full commit (`DARKMUX_BUILD_COMMIT`) and the
 //! kind (`DARKMUX_BUILD_KIND`: `release`, `dev`, or empty when neither is
 //! known), which `darkmux_types::build_info()` reads, so a run records what
-//! built the darkmux that ran it.
+//! built the darkmux that ran it. When git is unavailable (a release tarball)
+//! the full commit rides in the `DARKMUX_COMMIT` env var instead (#3373).
 //!
 //! Dep-free by design (CLAUDE.md: "don't add dependencies casually") — it
 //! shells to `git`. Lives in the foundation crate so serve + doctor + the
@@ -34,17 +39,23 @@ fn main() {
     let git = git_state();
     let flagged = std::env::var_os("DARKMUX_RELEASE").is_some();
     let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
-    let (tag, kind) = build_tag(flagged, git.as_ref(), &version);
+    // (#3373) A release tarball has no `.git`, so git can't name the commit;
+    // the formula stamps it here. Only a full 40-char hex SHA is accepted.
+    // Git still wins when it can speak.
+    let env_commit_raw = std::env::var("DARKMUX_COMMIT").ok();
+    let env_commit = env_commit_raw
+        .as_deref()
+        .and_then(accepted_commit)
+        .map(str::to_string);
+    let (tag, kind) = build_tag(flagged, git.as_ref(), &version, env_commit.as_deref());
     println!("cargo:rustc-env=DARKMUX_BUILD_TAG={tag}");
     println!("cargo:rustc-env=DARKMUX_BUILD_KIND={kind}");
-    println!(
-        "cargo:rustc-env=DARKMUX_BUILD_COMMIT={}",
-        git.as_ref().map(|g| g.commit.as_str()).unwrap_or_default()
-    );
+    println!("cargo:rustc-env=DARKMUX_BUILD_COMMIT={}", git.as_ref().map(|g| g.commit.as_str()).or(env_commit.as_deref()).unwrap_or(""));
 
-    // Re-run when the release flag flips or HEAD moves, so the baked tag can't
-    // go stale across rebuilds.
+    // Re-run when the release flag, the commit env, or HEAD moves, so the
+    // baked tag can't go stale across rebuilds.
     println!("cargo:rerun-if-env-changed=DARKMUX_RELEASE");
+    println!("cargo:rerun-if-env-changed=DARKMUX_COMMIT");
     for path in git_watch_paths() {
         println!("cargo:rerun-if-changed={}", path.display());
     }
@@ -140,14 +151,88 @@ fn git_state() -> Option<GitState> {
 }
 
 /// The tag and the kind for a build: see the module doc for the precedence.
-fn build_tag(flagged: bool, git: Option<&GitState>, version: &str) -> (String, &'static str) {
+fn build_tag(
+    flagged: bool,
+    git: Option<&GitState>,
+    version: &str,
+    env_commit: Option<&str>,
+) -> (String, &'static str) {
     match git {
-        None if flagged => ("release".to_string(), "release"),
+        // A release tarball has no `.git`, so the commit can only ride in the
+        // env the formula stamps (#3373). A missing or non-SHA value stays a
+        // bare `(release)` — still a release, just one the lab can't name.
+        None if flagged => tarball_release(env_commit),
         None => (String::new(), ""),
         Some(g) if g.dirty => (format!("{}\u{2731}", g.short), "dev"),
         Some(g) if flagged || g.tags.iter().any(|t| *t == format!("v{version}")) => {
             (format!("release {}", g.short), "release")
         }
         Some(g) => (g.short.clone(), "dev"),
+    }
+}
+
+/// No `.git`: `release <7>` from a full SHA, otherwise a bare `release`.
+fn tarball_release(env_commit: Option<&str>) -> (String, &'static str) {
+    match env_commit.and_then(accepted_commit) {
+        Some(c) => (format!("release {}", &c[..7]), "release"),
+        None => ("release".to_string(), "release"),
+    }
+}
+
+/// A full git SHA (40 hex characters). Surrounding whitespace is ignored.
+/// A short SHA, a tag name, or other text is refused so it is not baked.
+/// This does not distinguish a commit from an annotated-tag object id —
+/// both are 40 hex chars; the formula comment says to peel with `^{commit}`.
+fn accepted_commit(raw: &str) -> Option<&str> {
+    let c = raw.trim();
+    (c.len() == 40 && c.bytes().all(|b| b.is_ascii_hexdigit())).then_some(c)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// v5.6.0's commit (`git rev-parse v5.6.0^{commit}`), not the tag object.
+    const SHA: &str = "69b8fc5032ecd872885780be0bf5b4f7f24844a8";
+
+    #[test]
+    fn no_git_flagged_with_env_commit_is_release_short() {
+        let (tag, kind) = build_tag(true, None, "5.6.0", Some(SHA));
+        assert_eq!(tag, "release 69b8fc5");
+        assert_eq!(kind, "release");
+    }
+
+    #[test]
+    fn no_git_flagged_without_env_commit_is_bare_release() {
+        let (tag, kind) = build_tag(true, None, "5.6.0", None);
+        assert_eq!((tag.as_str(), kind), ("release", "release"));
+    }
+
+    #[test]
+    fn no_git_not_flagged_is_empty() {
+        // An env commit does not make a non-release tarball a release.
+        let (tag, kind) = build_tag(false, None, "5.6.0", Some(SHA));
+        assert_eq!((tag.as_str(), kind), ("", ""));
+        let (tag, kind) = build_tag(false, None, "5.6.0", None);
+        assert_eq!((tag.as_str(), kind), ("", ""));
+    }
+
+    #[test]
+    fn env_commit_must_be_40_hex_chars() {
+        for bad in [
+            "",
+            "   ",
+            "69b8fc5",
+            "not-a-commit",
+            "69b8fc5032ecd872885780be0bf5b4f7f24844a8extra",
+            "gggggggggggggggggggggggggggggggggggggggg",
+            "fabfdc84603ed07115b8f971345c3a2645733ad",
+        ] {
+            let (tag, kind) = build_tag(true, None, "5.6.0", Some(bad));
+            assert_eq!((tag.as_str(), kind), ("release", "release"), "{bad:?}");
+        }
+        let padded = "  69b8fc5032ecd872885780be0bf5b4f7f24844a8\n";
+        let (tag, kind) = build_tag(true, None, "5.6.0", Some(padded));
+        assert_eq!((tag.as_str(), kind), ("release 69b8fc5", "release"));
     }
 }

@@ -19,6 +19,17 @@ class Darkmux < Formula
   homepage "https://darkmux.com"
   # Stable release: v5.6.0, an eval owns its workload and grader (eval_dir, bundle format 5).
   # See CHANGELOG.md.
+  #
+  # The tarball has no `.git`, so the full commit the lab needs for
+  # `darkmuxCommit` (#3373) comes from the tag this formula's `url` points at.
+  #
+  # BUMP FOR EACH RELEASE: update BOTH the version here AND the commit below
+  # together. The commit is the full SHA of the tag being released. Annotated
+  # tags need the commit peel: `git rev-parse vX.Y.Z^{commit}`. Plain
+  # `git rev-parse vX.Y.Z` returns the tag object and would bake the wrong
+  # hash. A stale commit here means the lab submits an empty/mismatched
+  # `darkmuxCommit` for the release that actually shipped. After bumping,
+  # update the `sha256` on the url line too.
   url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v5.6.0.tar.gz"
   sha256 "291a88a8ef6aa247bbd4e138c305c11f95ea0c1f4037cb74461f500bd5763db0"
   license "MIT"
@@ -34,12 +45,15 @@ class Darkmux < Formula
   # don't run.
 
   def install
-    # (#1129) Stamp a stable (tarball) build as a release so `darkmux --version`,
+    # (#1129, #3373) Stamp a stable (tarball) build as a release so `darkmux --version`,
     # `darkmux doctor`, and the viewer header read `<version> (release)`. The
     # tarball has no `.git`, so without this stamp the build would be
-    # indistinguishable from a bare source build. A `--HEAD` build has a git
-    # checkout and bakes its short SHA instead, so leave it unstamped.
+    # indistinguishable from a bare source build. #3373: ALSO stamp the full
+    # commit of the release tag the tarball was cut from, via DARKMUX_COMMIT, so
+    # the run's `darkmuxCommit` carries the commit the lab actually ran against
+    # instead of being empty (the tarball has no `.git` for build.rs to read).
     ENV["DARKMUX_RELEASE"] = "1" unless build.head?
+    ENV["DARKMUX_COMMIT"] = "69b8fc5032ecd872885780be0bf5b4f7f24844a8" unless build.head?
 
     # Workspace-aware install. The root [[bin]] target in Cargo.toml is the
     # only thing that needs to land in bin/. The std_cargo_args helper sets
