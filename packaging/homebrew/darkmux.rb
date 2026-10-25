@@ -24,10 +24,12 @@ class Darkmux < Formula
   # `darkmuxCommit` (#3373) comes from the tag this formula's `url` points at.
   #
   # BUMP FOR EACH RELEASE: update BOTH the version here AND the commit below
-  # together. The commit is the full SHA of the tag being released — fetch it
-  # from the tag (`git rev-parse vX.Y.Z`) and paste it here. A stale commit here
-  # means the lab submits an empty/mismatched `darkmuxCommit` for the release
-  # that actually shipped. After bumping, update the `sha256` on the url line too.
+  # together. The commit is the full SHA of the tag being released. Annotated
+  # tags need the commit peel: `git rev-parse vX.Y.Z^{commit}`. Plain
+  # `git rev-parse vX.Y.Z` returns the tag object and would bake the wrong
+  # hash. A stale commit here means the lab submits an empty/mismatched
+  # `darkmuxCommit` for the release that actually shipped. After bumping,
+  # update the `sha256` on the url line too.
   url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v5.6.0.tar.gz"
   sha256 "291a88a8ef6aa247bbd4e138c305c11f95ea0c1f4037cb74461f500bd5763db0"
   license "MIT"

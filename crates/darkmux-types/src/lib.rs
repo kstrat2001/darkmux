@@ -152,6 +152,15 @@ mod build_info_tests {
     }
 }
 
+// (#3373) `cargo test` does not compile a `#[cfg(test)]` module inside a
+// build script, so the `build_tag` cases live in `build.rs` and this include
+// is what actually runs them. The build script's `main` and git helpers are
+// unused in this copy.
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../build.rs"]
+mod build_script;
+
 /// AI-industry-conventional model capabilities — orthogonal optimization
 /// dimensions that map to how Anthropic, OpenAI, HuggingFace, Google,
 /// Cohere, Mistral, and Meta describe their models. A *role* requests
