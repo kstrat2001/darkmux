@@ -1,6 +1,6 @@
 [package]
 name = "darkmux-eureka"
-version = "5.6.0"
+version = "5.6.1"
 edition = "2021"
 description = "darkmux eureka rules engine — config/resource anomaly rule defs + doctor-time evaluation"
 license = "MIT"
