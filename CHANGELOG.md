@@ -14,6 +14,12 @@ darkmux release.
 
 ## [Unreleased]
 
+## [5.7.1] - 2026-10-25
+
+A darkmux installed from a release tag with `cargo install --git` (the Linux
+install path) is a release build again, so its lab runs can be submitted to
+evals.darkmux.com. No schema moved.
+
 ### Fixed
 
 - **A tagged `cargo install --git` build is a release, so its runs can be
@@ -3990,6 +3996,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   does. `FLOW_SCHEMA_VERSION` unchanged at 1.52.0; `RULES_SCHEMA_VERSION`
   unchanged at 3.0.0.
 
+[5.7.1]: https://github.com/kstrat2001/darkmux/releases/tag/v5.7.1
 [5.7.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.7.0
 [5.6.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.6.0
 [5.5.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.5.0
