@@ -189,88 +189,121 @@ const MAX_ANCHOR: usize = 500;
 pub(crate) fn check_criteria(spec: &GradeSpec, root: Option<&Path>) -> Result<()> {
     let mutants = spec.behaviors.as_ref().map_or(&[][..], |b| &b.mutants[..]);
     let Some(criteria) = &spec.criteria else {
-        if let Some(m) = mutants.iter().find(|m| m.criterion.is_some()) {
-            bail!(
-                "verify.grade.behaviors: a planted bug names criterion \"{}\", but the workload declares no verify.grade.criteria",
-                m.criterion.as_deref().unwrap_or_default()
-            );
-        }
-        return Ok(());
+        return match mutants.iter().find_map(|m| m.criterion.as_deref()) {
+            Some(id) => bail!(
+                "verify.grade.behaviors: a planted bug names criterion \"{id}\", but the workload declares no verify.grade.criteria"
+            ),
+            None => Ok(()),
+        };
     };
     let mut problems = Vec::new();
     if criteria.is_empty() || criteria.len() > MAX_CRITERIA {
         problems.push(format!("declare 1 to {MAX_CRITERIA} criteria, not {}", criteria.len()));
     }
-    let is_slug = |id: &str| {
-        !id.is_empty()
-            && id.len() <= MAX_CRITERION_ID
-            && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-            && !id.starts_with('-')
-    };
     for (i, c) in criteria.iter().enumerate() {
         let at = format!("criteria[{i}] ({})", c.id);
-        if !is_slug(&c.id) {
-            problems.push(format!(
-                "{at}: an id is lowercase letters, digits and `-`, at most {MAX_CRITERION_ID} characters"
-            ));
-        }
-        if criteria[..i].iter().any(|o| o.id == c.id) {
-            problems.push(format!("{at}: declared twice"));
-        }
-        for (key, text, max) in [
-            ("name", &c.name, MAX_CRITERION_NAME),
-            ("description", &c.description, MAX_CRITERION_DESCRIPTION),
-            ("source.anchor", &c.source.anchor, MAX_ANCHOR),
-        ] {
-            if text.trim().is_empty() || text.chars().count() > max {
-                problems.push(format!("{at}: {key} is 1 to {max} characters"));
-            }
-        }
-        let graded = !c.tests.is_empty() || mutants.iter().any(|m| m.criterion.as_deref() == Some(c.id.as_str()));
-        if !graded {
-            problems.push(format!(
-                "{at}: graded by nothing (no planted bug names it and it names no tests)"
-            ));
-        }
-        if !c.tests.is_empty() && spec.suite.is_none() {
-            problems.push(format!("{at}: names tests, which need verify.grade.suite"));
-        }
-        let plain = !c.source.path.is_empty()
-            && c.source.path.split('/').all(crate::lab::fixture::is_plain_name);
-        if !plain {
-            problems.push(format!(
-                "{at}: source.path {} is not a plain path inside the repo",
-                c.source.path
-            ));
-        } else if let Some(root) = root {
-            let found = fs::read_to_string(root.join(&c.source.path))
-                .map(|text| text.matches(c.source.anchor.as_str()).count());
-            match found {
-                Ok(1) => {}
-                Ok(n) => problems.push(format!(
-                    "{at}: its anchor occurs {n} times in {}, not exactly once",
-                    c.source.path
-                )),
-                Err(_) => problems.push(format!(
-                    "{at}: {} is not a readable file in the fixture, so its anchor is not there exactly once",
-                    c.source.path
-                )),
-            }
-        }
+        problems.extend(criterion_shape_problems(&at, c, &criteria[..i]));
+        problems.extend(criterion_grading_problems(&at, c, mutants, spec.suite.is_some()));
+        problems.extend(criterion_source_problem(&at, c, root));
     }
-    for (i, m) in mutants.iter().enumerate() {
-        if let Some(id) = &m.criterion {
-            if !criteria.iter().any(|c| &c.id == id) {
-                problems.push(format!(
-                    "behaviors.mutants[{i}]: criterion \"{id}\" is not declared in verify.grade.criteria"
-                ));
-            }
-        }
-    }
+    problems.extend(undeclared_criteria(mutants, criteria));
     if problems.is_empty() {
         return Ok(());
     }
     bail!("verify.grade.criteria cannot be graded:\n  {}", problems.join("\n  "))
+}
+
+/// A criterion id: lowercase letters, digits and `-`, not starting with `-`.
+fn is_criterion_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_CRITERION_ID
+        && !id.starts_with('-')
+        && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Its id a slug not used by an earlier criterion, its texts within the site's bounds.
+fn criterion_shape_problems(
+    at: &str,
+    c: &crate::workloads::grade_spec::Criterion,
+    earlier: &[crate::workloads::grade_spec::Criterion],
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    if !is_criterion_id(&c.id) {
+        problems.push(format!(
+            "{at}: an id is lowercase letters, digits and `-`, at most {MAX_CRITERION_ID} characters"
+        ));
+    }
+    if earlier.iter().any(|o| o.id == c.id) {
+        problems.push(format!("{at}: declared twice"));
+    }
+    for (key, text, max) in [
+        ("name", &c.name, MAX_CRITERION_NAME),
+        ("description", &c.description, MAX_CRITERION_DESCRIPTION),
+        ("source.anchor", &c.source.anchor, MAX_ANCHOR),
+    ] {
+        if text.trim().is_empty() || text.chars().count() > max {
+            problems.push(format!("{at}: {key} is 1 to {max} characters"));
+        }
+    }
+    problems
+}
+
+/// Graded by a planted bug that names it or by the tests it names (which need a suite).
+fn criterion_grading_problems(
+    at: &str,
+    c: &crate::workloads::grade_spec::Criterion,
+    mutants: &[crate::workloads::grade_spec::Mutant],
+    has_suite: bool,
+) -> Vec<String> {
+    let named = mutants.iter().any(|m| m.criterion.as_deref() == Some(c.id.as_str()));
+    let mut problems = Vec::new();
+    if c.tests.is_empty() && !named {
+        problems.push(format!(
+            "{at}: graded by nothing (no planted bug names it and it names no tests)"
+        ));
+    }
+    if !c.tests.is_empty() && !has_suite {
+        problems.push(format!("{at}: names tests, which need verify.grade.suite"));
+    }
+    problems
+}
+
+/// Its source a plain path in the repo; given the checkout `root`, a file
+/// holding its anchor exactly once.
+fn criterion_source_problem(
+    at: &str,
+    c: &crate::workloads::grade_spec::Criterion,
+    root: Option<&Path>,
+) -> Option<String> {
+    let path = &c.source.path;
+    if path.is_empty() || !path.split('/').all(crate::lab::fixture::is_plain_name) {
+        return Some(format!("{at}: source.path {path} is not a plain path inside the repo"));
+    }
+    let text = fs::read_to_string(root?.join(path));
+    match text.map(|t| t.matches(c.source.anchor.as_str()).count()) {
+        Ok(1) => None,
+        Ok(n) => Some(format!("{at}: its anchor occurs {n} times in {path}, not exactly once")),
+        Err(_) => Some(format!(
+            "{at}: {path} is not a readable file in the fixture, so its anchor is not there exactly once"
+        )),
+    }
+}
+
+/// Each planted bug naming a criterion the registry does not declare.
+fn undeclared_criteria(
+    mutants: &[crate::workloads::grade_spec::Mutant],
+    criteria: &[crate::workloads::grade_spec::Criterion],
+) -> Vec<String> {
+    mutants
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| {
+            let id = m.criterion.as_deref()?;
+            (!criteria.iter().any(|c| c.id == id)).then(|| {
+                format!("behaviors.mutants[{i}]: criterion \"{id}\" is not declared in verify.grade.criteria")
+            })
+        })
+        .collect()
 }
 
 /// The suite's row and, when declared, the portable row, with the suite's

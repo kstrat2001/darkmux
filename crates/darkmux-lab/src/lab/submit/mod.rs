@@ -607,15 +607,15 @@ pub fn assemble(repo: &str, commit_sha: &str, fixture_manifest: &Value, runs: Ve
 /// Format 6 when any run carries criteria; otherwise without that key, 5
 /// when any names its workload, 4 when any carries what 4 added, else 3,
 /// with those keys (null in every run) left out.
-fn format_for(mut runs: Vec<Value>) -> (u64, Vec<Value>) {
-    if runs.iter().any(|r| r.get("criteria").is_some_and(|v| !v.is_null())) {
-        return (BUNDLE_FORMAT_VERSION, runs);
+fn format_for(runs: Vec<Value>) -> (u64, Vec<Value>) {
+    match without_criteria(runs) {
+        Ok(runs) => format_before_criteria(runs),
+        Err(runs) => (BUNDLE_FORMAT_VERSION, runs),
     }
-    for r in &mut runs {
-        if let Some(run) = r.as_object_mut() {
-            run.remove("criteria");
-        }
-    }
+}
+
+/// A bundle with no criteria: the version its other keys need.
+fn format_before_criteria(mut runs: Vec<Value>) -> (u64, Vec<Value>) {
     if runs.iter().any(|r| r.get("workloadSha256").is_some_and(|v| !v.is_null())) {
         return (BUNDLE_FORMAT_VERSION_WORKLOAD, runs);
     }
@@ -637,6 +637,18 @@ fn format_for(mut runs: Vec<Value>) -> (u64, Vec<Value>) {
         }
     }
     (BUNDLE_FORMAT_VERSION_BEFORE_FIELDS, runs)
+}
+
+/// (#3386) The runs without their `criteria` key when none carries any
+/// (`Ok`), or as they are when one does (`Err`: format 6).
+fn without_criteria(mut runs: Vec<Value>) -> std::result::Result<Vec<Value>, Vec<Value>> {
+    if runs.iter().any(|r| r.get("criteria").is_some_and(|v| !v.is_null())) {
+        return Err(runs);
+    }
+    for run in runs.iter_mut().filter_map(Value::as_object_mut) {
+        run.remove("criteria");
+    }
+    Ok(runs)
 }
 
 /// What the site's strict parser (`parseBundle`) would refuse in a bundle,
