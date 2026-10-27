@@ -14,6 +14,13 @@ darkmux release.
 
 ## [Unreleased]
 
+## [5.8.0] - 2026-10-27
+
+Evals can name what they grade. Each criterion an eval declares is recorded
+with a run as met or missed, and the evals site shows which ones a run missed.
+The run manifest moves to schema 10 and the submit bundle to format 6, both
+only for runs of a workload that declares criteria.
+
 ### Added
 
 - **Eval criteria (#3386).** A workload can name what it grades in
@@ -30,9 +37,8 @@ darkmux release.
   A bundle without criteria is still written as format 5.
   `lab run` refuses a registry it cannot grade, anchors included, before any
   model loads.
-- A criteria registry the grader cannot grade is refused before a run, naming
-  every problem: an undeclared or ungraded criterion, a repeated id, or an
-  anchor that is not in its file exactly once.
+  It names every problem: an undeclared or ungraded criterion, a repeated id,
+  or an anchor that is not in its file exactly once.
 - To add criteria to runs shared before their eval declared any, grade each kept
   run again with `darkmux lab grade <run> --record` and share it again.
 
@@ -4018,6 +4024,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   does. `FLOW_SCHEMA_VERSION` unchanged at 1.52.0; `RULES_SCHEMA_VERSION`
   unchanged at 3.0.0.
 
+[5.8.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.8.0
 [5.7.1]: https://github.com/kstrat2001/darkmux/releases/tag/v5.7.1
 [5.7.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.7.0
 [5.6.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.6.0
