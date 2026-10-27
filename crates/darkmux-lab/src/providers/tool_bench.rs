@@ -1147,6 +1147,7 @@ impl WorkloadProvider for ToolBenchProvider {
                     config_path,
                     timeout,
                     timeout_override_seconds,
+                    crate::providers::lab_inputs(loaded, sandbox_dir),
                     &self.dispatch,
                 )?;
 
@@ -1439,6 +1440,7 @@ fn dispatch_task(
     // `run()`'s own comment on `timeout_override_seconds` for why this is
     // separate from `timeout` above.
     timeout_override_seconds: Option<u32>,
+    lab_inputs: darkmux_crew::dispatch::LabInputs,
     dispatch_fn: &ToolBenchDispatchFn,
     // (#2685) Returns the raw exit CODE, not a collapsed `ok` bool: the
     // shared infra predicate needs "did this exit non-zero" alongside what
@@ -1479,6 +1481,8 @@ fn dispatch_task(
         model_base_url_override: None,
         step_id: None, // (#1483) set on the graph-step path only
         system_prompt_override: None,
+        // (#3363) The role from the eval, or darkmux's compiled-in one.
+        lab_inputs: Some(lab_inputs),
     };
     let result = (dispatch_fn)(opts).context("internal-runtime dispatch via tool-bench")?;
     Ok((result.stdout, result.stderr, result.exit_code, result.out_dir))

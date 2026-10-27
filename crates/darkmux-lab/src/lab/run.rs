@@ -232,6 +232,23 @@ fn check_criteria_anchors(loaded: &crate::workloads::types::LoadedWorkload, path
     crate::lab::grade::check_criteria(spec, Some(&fixture)).with_context(|| format!("workload \"{id}\""))
 }
 
+/// (#3363) An eval owns its roles: the role the workload dispatches as must
+/// load from the fixture checkout the run will copy (`roles/<id>.json` and
+/// `.md`), or, for a workload bound to no fixture, be one darkmux compiles
+/// in. Checked before any model runs, with the refusal the dispatch itself
+/// would give (it checks again, against the run's own copy).
+fn check_eval_role(loaded: &crate::workloads::types::LoadedWorkload, paths: &paths::DarkmuxPaths) -> Result<()> {
+    let Some(role) = workload_role(loaded) else {
+        return Ok(());
+    };
+    let inputs = match loaded.manifest.workload.requires_fixture {
+        Some(_) => darkmux_crew::dispatch::LabInputs::Eval { dir: resolve_source_sandbox(loaded, paths)? },
+        None => darkmux_crew::dispatch::LabInputs::Builtin,
+    };
+    darkmux_crew::dispatch::check_lab_role(&inputs, &role)
+        .with_context(|| format!("workload \"{}\"", loaded.manifest.workload.id))
+}
+
 /// Whether a workload's prompt comes from its run's copy of a fixture.
 fn context_reads_the_run_copy(loaded: &crate::workloads::types::LoadedWorkload) -> bool {
     let w = &loaded.manifest.workload;
@@ -275,6 +292,7 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
     paths::ensure(&paths)?;
     prepare_workload(&mut loaded_workload, opts.inject_context.as_deref())?;
     check_criteria_anchors(&loaded_workload, &paths)?;
+    check_eval_role(&loaded_workload, &paths)?;
 
     let registry_loaded = load_registry(opts.config_path.as_deref())?;
     // (#2902) With no `--profile`, the run is on the profile bound to the
@@ -1452,6 +1470,49 @@ mod tests {
         let err = check_criteria_anchors(&load("pg", Some(tmp.path())).unwrap(), &paths).unwrap_err();
         let err = format!("{err:#}");
         assert!(err.contains("workload \"pg\"") && err.contains("occurs 0 times in src/a.js"), "{err}");
+    }
+
+    /// (#3363) An eval owns its roles: a workload bound to a fixture whose
+    /// checkout lacks `roles/<id>.json` or `.md` is refused before any run
+    /// directory is claimed or any model chosen, naming the missing file.
+    /// Once the eval carries both, the check passes.
+    #[test]
+    #[serial_test::serial]
+    fn a_workload_whose_eval_lacks_its_role_is_refused_before_the_run() {
+        // The role is the provider's to name, as `main` registers them.
+        let _ = crate::providers::register_builtins();
+        let tmp = TempDir::new().unwrap();
+        let _home_guard = HomeGuard::set(tmp.path());
+        let eval = tmp.path().join("eval-fx");
+        eval_fixture(&eval, "pg@2.1", "pg", None);
+        register_all(tmp.path(), &[("eval-fx", &eval)]);
+        let run_opts = || RunOpts {
+            workload_id: "pg".into(),
+            profile_name: None,
+            runs: 1,
+            config_path: None,
+            quiet: true,
+            loop_override: None,
+            inject_context: None,
+        };
+
+        let err = format!("{:#}", lab_run(run_opts()).unwrap_err());
+        // The prompt provider's default role; the registry canonicalizes the checkout's path.
+        assert!(err.contains("eval-fx/roles/code-reviewer.json is missing"), "names the missing role file: {err}");
+        assert!(err.contains("the eval must carry its roles"), "{err}");
+        assert!(!tmp.path().join("runs").exists(), "refused before a run directory is claimed");
+
+        std::fs::create_dir_all(eval.join("roles")).unwrap();
+        let builtin = |file: &str| {
+            std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates/builtin/roles").join(file),
+            )
+            .unwrap()
+        };
+        std::fs::write(eval.join("roles/code-reviewer.json"), builtin("code-reviewer.json")).unwrap();
+        std::fs::write(eval.join("roles/code-reviewer.md"), builtin("code-reviewer.md")).unwrap();
+        let paths = paths::DarkmuxPaths::under_root(tmp.path().to_path_buf());
+        check_eval_role(&load("pg", Some(tmp.path())).unwrap(), &paths).expect("the eval carries its role");
     }
 
     #[test]

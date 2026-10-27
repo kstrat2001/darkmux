@@ -26,6 +26,11 @@ pub mod workloads;
 /// `src/lab/`, so a new provider that copies a work caller's
 /// `live_channel: true` fails here. (The crawl mission, `src/crawl/`, is
 /// operator-visible work and keeps the channel.)
+///
+/// (#3363) The same scan holds every lab dispatch to its pinned inputs: each
+/// `DispatchOpts` literal there sets `lab_inputs: Some(..)`, so its role
+/// comes from the eval (or darkmux's compiled-in role) and never from the
+/// home folder. The crawl mission sets `None`, as every work caller does.
 #[cfg(test)]
 mod live_channel_conformance {
     #[test]
@@ -55,6 +60,11 @@ mod live_channel_conformance {
                 builders += opts;
                 assert_eq!(text.matches("live_channel: false,").count(), opts, "{path:?}: every DispatchOpts must opt out");
                 assert!(!text.contains("live_channel: true"), "{path:?} opts in");
+                assert_eq!(
+                    text.matches("lab_inputs: Some(").count(),
+                    opts,
+                    "{path:?}: every lab DispatchOpts names its pinned inputs (lab_inputs: Some(..))"
+                );
             }
         }
         assert!(builders >= 3, "the scan sees the lab's dispatches ({builders})");

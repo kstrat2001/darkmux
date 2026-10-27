@@ -436,6 +436,7 @@ fn opts_with(profiles: &Path) -> DispatchOpts {
         model_base_url_override: None,
         step_id: None,
         system_prompt_override: None,
+        lab_inputs: None,
     }
 }
 

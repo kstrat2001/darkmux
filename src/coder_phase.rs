@@ -875,6 +875,7 @@ impl StepKind for MissionCoderStepKind {
             // unattributable and the seat never ticked.
             step_id: Some(step.id.clone()),
             system_prompt_override: None,
+            lab_inputs: None,
         };
         let result = crew::dispatch::dispatch(opts)?;
         if let Some(execution) = &result.execution {

@@ -445,6 +445,8 @@ fn step_config(opts: &DispatchOpts) -> serde_json::Value {
         model_base_url_override: _,
         step_id: _,
         system_prompt_override: _,
+        // (#3363) Only a lab run sets it; `darkmux dispatch` never does.
+        lab_inputs: _,
         host_out: _,
         max_turns_override: _,
     } = opts;
@@ -628,6 +630,7 @@ mod tests {
             model_base_url_override: None,
             step_id: None,
             system_prompt_override: None,
+            lab_inputs: None,
         }
     }
 

@@ -369,6 +369,48 @@ pub struct DispatchOpts {
     /// (every caller but the CLI's `dispatch` verb) preserves the existing
     /// `env > config > 600` resolution exactly.
     pub timeout_override_seconds: Option<u32>,
+    /// (#3363) Set by every lab dispatch, `None` on every other: where the
+    /// role comes from when a lab run is the caller. A lab run's system
+    /// prompt is built only from pinned inputs: the eval's own role files
+    /// (or darkmux's compiled-in role, for a workload bound to no fixture)
+    /// and darkmux's compiled-in preamble. It never reads the home folder's
+    /// `roles/`, its preamble override, `identity.md` or workspace notes.
+    /// See [`LabInputs`] and `role_inputs`.
+    pub lab_inputs: Option<LabInputs>,
+}
+
+/// (#3363) Where a lab dispatch takes its role from. An eval owns its roles:
+/// a workload bound to a fixture runs on the role files that fixture carries,
+/// and a workload bound to none runs on darkmux's compiled-in role.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LabInputs {
+    /// The workload binds a fixture: `<dir>/roles/<role-id>.json` and
+    /// `<dir>/roles/<role-id>.md`, where `dir` is the run's own copy of the
+    /// fixture (its sandbox). A missing file refuses the run.
+    Eval { dir: PathBuf },
+    /// The workload binds no fixture: darkmux's compiled-in role and prompt.
+    Builtin,
+}
+
+impl LabInputs {
+    /// The inputs of a workload that does (`binds_fixture`) or does not bind
+    /// a fixture, whose copy for this run is `sandbox_dir`.
+    pub fn for_workload(binds_fixture: bool, sandbox_dir: &std::path::Path) -> Self {
+        if binds_fixture {
+            LabInputs::Eval { dir: sandbox_dir.to_path_buf() }
+        } else {
+            LabInputs::Builtin
+        }
+    }
+}
+
+/// (#3363) Refuse a lab run whose role cannot be loaded from `inputs`: a
+/// fixture-bound workload whose eval lacks `roles/<id>.json` or `.md`, a
+/// role manifest the unknown-key gate refuses, or (bound to no fixture) a
+/// role darkmux does not compile in. The same refusal the dispatch would
+/// give, for the lab's preflight to give before any model loads.
+pub fn check_lab_role(inputs: &LabInputs, role_id: &str) -> Result<()> {
+    crate::role_inputs::check_lab_role(inputs, role_id)
 }
 
 /// Host-side compaction config passthrough to the internal runtime

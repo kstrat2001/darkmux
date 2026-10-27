@@ -191,6 +191,8 @@ fn every_shipped_template_file_has_no_unknown_keys() {
     found.extend(workloads.iter().filter_map(|p| check_path::<WorkloadManifest>(UserFileKind::Workload, p, &no_retired)));
     for fixture in std::fs::read_dir(t.join("lab-fixtures")).unwrap().flatten() {
         found.extend(check_path::<FixtureManifest>(UserFileKind::LabFixture, &fixture.path().join(".fixture.json"), &no_retired));
+        // (#3363) The roles an eval carries are role manifests too.
+        found.extend(check_dir::<Role>(UserFileKind::Role, &fixture.path().join("roles"), &no_retired));
     }
     found.extend(check_path::<darkmux_types::config::DarkmuxConfig>(
         UserFileKind::Config,
@@ -204,6 +206,32 @@ fn every_shipped_template_file_has_no_unknown_keys() {
     ));
     let lines: Vec<String> = found.iter().map(ToString::to_string).collect();
     assert!(lines.is_empty(), "{lines:#?}");
+}
+
+/// (#3363) An eval owns its roles, darkmux's own included: a built-in
+/// workload bound to a built-in fixture runs on the role that fixture
+/// carries, so every such pair must load (`lab run demo-quickstart` would
+/// otherwise be refused).
+#[test]
+fn every_builtin_workload_bound_to_a_builtin_fixture_finds_its_role_there() {
+    let t = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates/builtin");
+    let read = |p: &std::path::Path| -> serde_json::Value { serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap() };
+    let fixtures: Vec<(String, std::path::PathBuf)> = std::fs::read_dir(t.join("lab-fixtures"))
+        .unwrap()
+        .flatten()
+        .map(|e| (read(&e.path().join(".fixture.json"))["satisfies"].as_str().unwrap().to_string(), e.path()))
+        .collect();
+    let mut checked = 0;
+    for path in crate::workloads::load::documents_in(&t.join("workloads")) {
+        let doc = read(&path);
+        let Some(requires) = doc["workload"]["requires_fixture"].as_str() else { continue };
+        let Some((_, dir)) = fixtures.iter().find(|(satisfies, _)| satisfies == requires) else { continue };
+        let role = doc["workload"]["role"].as_str().unwrap_or_else(|| panic!("{path:?} names no role"));
+        darkmux_crew::dispatch::check_lab_role(&darkmux_crew::dispatch::LabInputs::Eval { dir: dir.clone() }, role)
+            .unwrap_or_else(|e| panic!("{path:?}: {e:#}"));
+        checked += 1;
+    }
+    assert!(checked >= 1, "demo-quickstart binds demo-tiny-py");
 }
 
 /// A mistyped value in a workload is refused by the lab preflight, naming

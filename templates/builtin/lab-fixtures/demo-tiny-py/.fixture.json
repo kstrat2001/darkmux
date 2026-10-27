@@ -8,6 +8,8 @@
   "baseline": { "test_count": 5 },
   "required_files": [
     "src/parser.py",
-    "tests/test_parser.py"
+    "tests/test_parser.py",
+    "roles/coder.json",
+    "roles/coder.md"
   ]
 }

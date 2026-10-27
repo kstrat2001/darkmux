@@ -67,6 +67,7 @@ impl WorkloadProvider for PromptProvider {
             loaded.manifest.workload.image.as_deref(),
             config_path,
             profile_name,
+            crate::providers::lab_inputs(loaded, sandbox_dir),
         );
         // Named and armed before the dispatch, so a dispatch that returns
         // `Err` still leaves its trajectory in the run dir (the guard's Drop).
@@ -600,6 +601,7 @@ fn dispatch_opts(
     image: Option<&str>,
     config_path: Option<&str>,
     profile_name: &str,
+    lab_inputs: darkmux_crew::dispatch::LabInputs,
 ) -> darkmux_crew::dispatch::DispatchOpts {
     darkmux_crew::dispatch::DispatchOpts {
         finding_sites: None,
@@ -650,6 +652,8 @@ fn dispatch_opts(
         model_base_url_override: None,
         step_id: None, // (#1483) set on the graph-step path only
         system_prompt_override: None,
+        // (#3363) The role from the eval, or darkmux's compiled-in one.
+        lab_inputs: Some(lab_inputs),
     }
 }
 
@@ -1246,7 +1250,7 @@ mod tests {
         let run = tmp.path().join("run");
         fs::create_dir_all(&run).unwrap();
         let session = SessionId::adhoc(RunId::lab("run1").unwrap(), "reviewer", "w");
-        let mut opts = dispatch_opts("reviewer", "hi", &session, None, None, "p");
+        let mut opts = dispatch_opts("reviewer", "hi", &session, None, None, "p", darkmux_crew::dispatch::LabInputs::Builtin);
         let guard = PromptDispatchGuard::arm("reviewer-a", "w", &run, &mut opts);
         let out = opts.host_out.clone().expect("the out dir is named before dispatch");
         let _remove_out = RemoveOut(out.clone());
@@ -1273,7 +1277,7 @@ mod tests {
         let run = tmp.path().join("run");
         fs::create_dir_all(&run).unwrap();
         let session = SessionId::adhoc(RunId::lab("run1").unwrap(), "reviewer", "w");
-        let mut opts = dispatch_opts("reviewer", "hi", &session, None, None, "p");
+        let mut opts = dispatch_opts("reviewer", "hi", &session, None, None, "p", darkmux_crew::dispatch::LabInputs::Builtin);
         let guard = PromptDispatchGuard::arm("reviewer-b", "w", &run, &mut opts);
         let out = opts.host_out.clone().unwrap();
         let _remove_out = RemoveOut(out.clone());
@@ -1308,7 +1312,7 @@ mod tests {
         let run = tmp.path().join("run");
         fs::create_dir_all(&run).unwrap();
         let session = SessionId::adhoc(RunId::lab("run1").unwrap(), "reviewer", "w");
-        let mut opts = dispatch_opts("reviewer", "hi", &session, None, None, "p");
+        let mut opts = dispatch_opts("reviewer", "hi", &session, None, None, "p", darkmux_crew::dispatch::LabInputs::Builtin);
         let guard = PromptDispatchGuard::arm("reviewer-c", "w", &run, &mut opts);
         let out = opts.host_out.clone().unwrap();
         let _remove_out = RemoveOut(out.clone());

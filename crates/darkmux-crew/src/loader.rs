@@ -102,7 +102,7 @@ pub(crate) const BUILTIN_ROLE_PROMPTS: &[(&str, &str)] = &[
 /// explicitly if blocked. Utility roles (bounded-I/O transformers
 /// like radio-router) skip the preamble since they don't run
 /// agent loops.
-const AUTONOMOUS_DISPATCH_PREAMBLE: &str =
+pub(crate) const AUTONOMOUS_DISPATCH_PREAMBLE: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/AUTONOMOUS_DISPATCH_PREAMBLE.md"));
 
 /// The operator's override of the autonomous-dispatch preamble, a file directly
@@ -118,13 +118,19 @@ pub const PREAMBLE_OVERRIDE_FILE: &str = "AUTONOMOUS_DISPATCH_PREAMBLE.md";
 /// than per-role so the preamble stays uniform across the
 /// specialist set.
 pub(crate) fn load_autonomous_dispatch_preamble() -> String {
+    resolve_autonomous_dispatch_preamble().0
+}
+
+/// (#3363) [`load_autonomous_dispatch_preamble`], and whether the operator's
+/// override supplied it, which a dispatch records.
+pub(crate) fn resolve_autonomous_dispatch_preamble() -> (String, bool) {
     let user_path = user_state_root().join(PREAMBLE_OVERRIDE_FILE);
     if user_path.is_file() {
         if let Ok(content) = fs::read_to_string(&user_path) {
-            return content;
+            return (content, true);
         }
     }
-    AUTONOMOUS_DISPATCH_PREAMBLE.to_string()
+    (AUTONOMOUS_DISPATCH_PREAMBLE.to_string(), false)
 }
 
 /// Expose the embedded role-id list for callers that need to verify
@@ -471,9 +477,11 @@ pub fn load_roles() -> Result<Vec<Role>> {
 /// file path; builtin manifests can't be operator-edited and get a
 /// "please file an issue" message instead.
 #[derive(Debug, Clone, Copy)]
-enum RoleSource {
+pub(crate) enum RoleSource {
     /// Operator-authored manifest under `roles_dir()`.
     User,
+    /// (#3363) An eval's `roles/<id>.json`, which the caller names.
+    Eval,
     /// Embedded manifest from `templates/builtin/roles/` — operator
     /// cannot edit it, so the actionable repair is "file an issue."
     Builtin,
@@ -489,7 +497,7 @@ enum RoleSource {
 ///
 /// Each error names the offending role, the value, and a repair path
 /// appropriate to where the manifest came from.
-fn validate_role_family(role: &Role, source: RoleSource) -> Result<()> {
+pub(crate) fn validate_role_family(role: &Role, source: RoleSource) -> Result<()> {
     match role.role_family.as_deref() {
         // The two recognized families, or absent (defaults to specialist).
         None | Some("specialist") | Some("utility") => Ok(()),
@@ -504,6 +512,13 @@ fn validate_role_family(role: &Role, source: RoleSource) -> Result<()> {
                 other,
                 roles_dir().display(),
                 role.id
+            ),
+            RoleSource::Eval => anyhow::anyhow!(
+                "role `{}` has `role_family: \"{}\"`, which is not a recognized family. \
+                 Valid values are \"specialist\" or \"utility\"; omit the field to default to \
+                 \"specialist\". Update the eval's role manifest.",
+                role.id,
+                other
             ),
             RoleSource::Builtin => anyhow::anyhow!(
                 "internal regression: builtin role `{}` declares an unrecognized \

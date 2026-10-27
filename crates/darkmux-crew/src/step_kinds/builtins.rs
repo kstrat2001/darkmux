@@ -622,6 +622,7 @@ pub(crate) fn dispatch_opts_for(
         // step's own (a producer named it).
         step_id: Some(step.id.clone()),
         system_prompt_override: None,
+        lab_inputs: None,
         resume_from,
         // (#2153) `dispatch.internal` steps get a fresh tempdir, same
         // as before — no crew-of-one graph step names an exact out

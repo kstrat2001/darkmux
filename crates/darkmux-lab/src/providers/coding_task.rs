@@ -294,6 +294,7 @@ impl WorkloadProvider for CodingTaskProvider {
             loaded.manifest.workload.image.as_deref(),
             config_path,
             out_dir,
+            crate::providers::lab_inputs(loaded, sandbox_dir),
         )?;
         let duration_ms = started.elapsed().as_millis();
         let (stdout, stderr) = (&dispatched.stdout, &dispatched.stderr);
@@ -681,6 +682,7 @@ fn dispatch_via_internal(
     image: Option<&str>,
     config_path: Option<&str>,
     host_out: PathBuf,
+    lab_inputs: darkmux_crew::dispatch::LabInputs,
 ) -> Result<(Dispatched, Option<PathBuf>)> {
     use darkmux_crew::dispatch::{dispatch, DispatchOpts};
     let opts = DispatchOpts {
@@ -725,6 +727,8 @@ fn dispatch_via_internal(
         model_base_url_override: None,
         step_id: None, // (#1483) set on the graph-step path only
         system_prompt_override: None,
+        // (#3363) The role from the eval, or darkmux's compiled-in one.
+        lab_inputs: Some(lab_inputs),
     };
     let result = dispatch(opts).context("internal-runtime dispatch via lab harness")?;
     // `out_dir` is the host path where the runtime wrote its

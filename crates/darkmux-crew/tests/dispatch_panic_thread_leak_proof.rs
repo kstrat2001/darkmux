@@ -281,6 +281,7 @@ fn dispatch_panic_mid_run_leaves_no_tailer_sampler_watchdog_thread() {
         model_base_url_override: Some("http://127.0.0.1:1/v1".to_string()),
         step_id: None,
         system_prompt_override: None,
+        lab_inputs: None,
     };
 
     // Silence the expected panic's default backtrace print so test output

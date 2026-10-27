@@ -1,5 +1,7 @@
-//! Hand-rolled SHA-256 + HMAC-SHA256 (RFC 2104), used ONLY to sign hook
-//! deliveries (`X-Darkmux-Signature`, #2135 option 2).
+//! Hand-rolled SHA-256 + HMAC-SHA256 (RFC 2104). The HMAC signs hook
+//! deliveries (`X-Darkmux-Signature`, #2135 option 2); [`sha256_hex`] hashes
+//! the system prompt and role files a dispatch used, for `dispatch.start`
+//! (#3363).
 //!
 //! darkmux's dependency set has neither `sha2`/`hmac` nor `ring` today
 //! (checked against `Cargo.lock` before writing this) — per the project's
@@ -7,7 +9,8 @@
 //! from-spec SHA-256 (FIPS 180-4) plus the ~15-line RFC 2104 HMAC
 //! construction around it, rather than pulling in a new crate for one
 //! header. Verified against the RFC 4231 SHA-256 test vectors below —
-//! this is NOT a general-purpose crypto module and has no other callers.
+//! this is NOT a general-purpose crypto module: it hashes small inputs in
+//! memory, and nothing outside those two jobs calls it.
 
 const K: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -109,6 +112,12 @@ pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     sha256(&outer)
 }
 
+/// (#3363) SHA-256 of `data`, hex-encoded lowercase: the form a
+/// `dispatch.start` record names the bytes a dispatch used in.
+pub fn sha256_hex(data: &[u8]) -> String {
+    sha256(data).iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// `hmac_sha256`, hex-encoded lowercase — the form `X-Darkmux-Signature`
 /// carries after its `sha256=` prefix.
 pub fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
@@ -118,6 +127,12 @@ pub fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (#3363) The hex form of the same FIPS vector.
+    #[test]
+    fn sha256_hex_matches_the_fips_vector() {
+        assert_eq!(sha256_hex(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    }
 
     /// FIPS 180-2 Appendix B.1 — SHA-256("abc").
     #[test]

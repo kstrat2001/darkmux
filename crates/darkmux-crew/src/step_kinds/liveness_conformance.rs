@@ -136,7 +136,7 @@ const ENTRY_POINTS: &[Site] = &[
     Site {
         file: "src/dispatch_internal.rs",
         func: "dispatch_local_single_shot",
-        anchor: "single-shot dispatch requires one",
+        anchor: "cannot serve a tool-bearing role",
     },
     // The hosted arm of every `darkmux dispatch` and fleet-queue job.
     Site {
@@ -346,7 +346,7 @@ fn the_extractor_discriminates_between_neighboring_functions() {
         "sanity: the extracted body is `dispatch_unmanaged`'s own"
     );
     assert!(
-        !remote.contains("single-shot dispatch requires one"),
+        !remote.contains("cannot serve a tool-bearing role"),
         "`dispatch_unmanaged`'s body ran on into its neighbor `dispatch_local_single_shot`: \
          the extractor is over-reaching, so every other assertion here is unearned"
     );

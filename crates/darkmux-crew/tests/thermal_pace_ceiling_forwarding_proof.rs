@@ -285,6 +285,7 @@ fn captured_docker_argv_with(
         model_base_url_override: base_url_override.map(str::to_string),
         step_id: None,
         system_prompt_override: None,
+        lab_inputs: None,
     };
 
     // The dispatch itself FAILS (the shim produces no result envelope) and

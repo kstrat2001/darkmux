@@ -58,7 +58,7 @@ fn json_docs_by_stem(dir: &std::path::Path) -> Vec<(String, std::path::PathBuf)>
 
 /// A role manifest's retired keys: every key a past `Role` had and this one
 /// does not, from `git log` (`every_historical_role_key_is_named_as_retired`).
-fn role_retired(path: &str) -> Option<String> {
+pub(crate) fn role_retired(path: &str) -> Option<String> {
     let line = match path {
         "capabilities" => "renamed to `skills` (#449): the skill ids this role draws on",
         "tier" => "removed in #605: nothing reads it (a model is chosen by capability, not tier). Delete it",
