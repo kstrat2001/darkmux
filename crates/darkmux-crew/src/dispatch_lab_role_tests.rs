@@ -442,3 +442,88 @@ fn the_hosted_start_record_carries_the_prompt_hash_and_the_role() {
     assert_eq!(p["prompt_additions"]["identity"], false, "{p}");
     assert_eq!(p["role"]["source"], "builtin", "{p}");
 }
+
+/// An eval role file that is a symlink is refused: the sandbox clone keeps
+/// links, so a link to the home folder's stale copy would otherwise deliver
+/// exactly the bytes this module keeps out.
+#[test]
+#[serial]
+fn a_symlinked_eval_role_file_is_refused_and_never_assembled() {
+    let home = home_with_overrides();
+    let eval = TempDir::new().unwrap();
+    let roles = eval.path().join("roles");
+    std::fs::create_dir_all(&roles).unwrap();
+    for ext in ["json", "md"] {
+        std::os::unix::fs::symlink(home.path().join(format!("roles/{ROLE}.{ext}")), roles.join(format!("{ROLE}.{ext}")))
+            .unwrap();
+    }
+    let _env = env_for(&home);
+    let lab = LabInputs::Eval { dir: eval.path().to_path_buf() };
+
+    let err = format!("{:#}", crate::dispatch::check_lab_role(&lab, ROLE).unwrap_err());
+    assert!(err.contains(&format!("roles/{ROLE}.json` is a symlink")), "{err}");
+    let (prompt, err) = dispatched_prompt(opts(&home, ROLE, Some(lab)));
+    assert!(err.contains("is a symlink"), "the dispatch refuses it too: {err}");
+    assert_eq!(prompt, None, "the stale text is never assembled");
+}
+
+/// A `roles/` folder that is itself a symlink is refused the same way.
+#[test]
+#[serial]
+fn a_symlinked_eval_roles_folder_is_refused() {
+    let home = home_with_overrides();
+    let eval = TempDir::new().unwrap();
+    std::os::unix::fs::symlink(home.path().join("roles"), eval.path().join("roles")).unwrap();
+    let _env = env_for(&home);
+    let err = crate::dispatch::check_lab_role(&LabInputs::Eval { dir: eval.path().to_path_buf() }, ROLE).unwrap_err();
+    let err = format!("{err:#}");
+    assert!(err.contains("roles` is a symlink") && err.contains("real folder"), "{err}");
+}
+
+/// A fixture-bound workload's lab inputs name its sandbox; an unbound one's
+/// name darkmux's compiled-in roles.
+#[test]
+fn a_fixture_bound_workload_takes_its_role_from_its_sandbox() {
+    let sandbox = std::path::Path::new("/runs/r1/sandbox");
+    assert_eq!(LabInputs::for_workload(true, sandbox), LabInputs::Eval { dir: sandbox.to_path_buf() });
+    assert_eq!(LabInputs::for_workload(false, sandbox), LabInputs::Builtin);
+}
+
+/// The window a lab run records is the one its dispatch's model selection
+/// makes from the eval's role: here the eval's `web-probe` asks for coding
+/// (the 128k model) while the home folder's asks for nothing (the default
+/// 32k model).
+#[test]
+#[serial]
+fn the_recorded_lab_window_follows_the_evals_role_not_the_home_folders() {
+    let home = home_with_overrides();
+    let eval = eval_with_role(PINNED_EVAL_MD);
+    let mut doc: serde_json::Value = serde_json::from_str(&role_json(ROLE)).unwrap();
+    doc["skills"] = serde_json::json!(["coding"]);
+    std::fs::write(eval.path().join("roles").join(format!("{ROLE}.json")), doc.to_string()).unwrap();
+    let pf = home.path().join("profiles-3363-window.json");
+    std::fs::write(
+        &pf,
+        r#"{"profiles":{"mixed":{"default_model":"generalist","models":[
+                {"id":"generalist","n_ctx":32000,"capabilities":{"reasoning":1.0}},
+                {"id":"codestar","n_ctx":128000,"capabilities":{"code":1.0}}
+            ]}},
+            "default_profile":"mixed"}"#,
+    )
+    .unwrap();
+    let _env = env_for(&home);
+    let lab = LabInputs::Eval { dir: eval.path().to_path_buf() };
+    assert_eq!(dispatch_window(ROLE, Some("mixed"), pf.to_str(), true).unwrap(), Some(32_000), "precondition: the home role");
+    assert_eq!(lab_dispatch_window(&lab, ROLE, Some("mixed"), pf.to_str()).unwrap(), Some(128_000));
+}
+
+/// An eval role file past the role-manifest size cap is refused, not read.
+#[test]
+#[serial]
+fn an_oversized_eval_role_file_is_refused() {
+    let home = home_with_overrides();
+    let eval = eval_with_role(&"x".repeat(darkmux_types::user_files::MAX_USER_FILE_BYTES as usize + 1));
+    let _env = env_for(&home);
+    let err = crate::dispatch::check_lab_role(&LabInputs::Eval { dir: eval.path().to_path_buf() }, ROLE).unwrap_err();
+    assert!(format!("{err:#}").contains("byte cap for a role file"), "{err:#}");
+}

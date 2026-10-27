@@ -1379,6 +1379,40 @@ mod tests {
         assert_eq!(resolve_prompt_from(&bound, prompt_base(&bound, &sandbox)).unwrap(), "from the fixture");
     }
 
+    /// (#3363) End to end through the provider: a fixture-bound workload's
+    /// dispatch takes its role from the run's sandbox, so a sandbox with no
+    /// `roles/` is refused naming the sandbox's file, never run on
+    /// darkmux's compiled-in role.
+    #[test]
+    #[serial_test::serial]
+    fn a_fixture_bound_prompt_run_takes_its_role_from_the_sandbox() {
+        let state = darkmux_types::test_isolation::IsolatedState::new();
+        let (doc_dir, sandbox, run_dir) = (state.join("doc"), state.join("sandbox"), state.join("run"));
+        for d in [&doc_dir, &sandbox, &run_dir] {
+            fs::create_dir_all(d).unwrap();
+        }
+        let mut spec = spec_with_prompt("hi");
+        spec.role = Some("reviewer".into());
+        spec.requires_fixture = Some("biz@1.0".into());
+        let loaded = make_loaded(spec, doc_dir);
+        let registry = state.join("no-such-profiles-3363.json");
+        let err = PromptProvider
+            .run(
+                &loaded,
+                &run_dir,
+                &sandbox,
+                &darkmux_types::Profile::default(),
+                "p",
+                registry.to_str(),
+                None,
+                &RunId::lab("r3363").unwrap(),
+                &mut |_: &SessionId| {},
+            )
+            .unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains(&format!("{}/roles/reviewer.json is missing", sandbox.display())), "{err}");
+    }
+
     #[test]
     fn provider_metadata() {
         let p = PromptProvider;

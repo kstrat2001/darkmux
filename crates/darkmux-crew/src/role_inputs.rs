@@ -69,7 +69,14 @@ pub(crate) fn resolve_role(opts: &DispatchOpts) -> Result<Option<ResolvedRole>> 
 /// Refuse a lab run whose role cannot be loaded from `inputs`, with the same
 /// message its dispatch would give. The lab calls it before any model loads.
 pub(crate) fn check_lab_role(inputs: &LabInputs, role_id: &str) -> Result<()> {
-    load_lab_role(inputs, role_id).map(|_| ())
+    lab_role(inputs, role_id).map(|_| ())
+}
+
+/// The role manifest a lab dispatch with `inputs` runs, loaded the way its
+/// dispatch loads it, for a lab check that reads the role before dispatching
+/// (the coding-task palette check, the bench's recorded window).
+pub(crate) fn lab_role(inputs: &LabInputs, role_id: &str) -> Result<Role> {
+    load_lab_role(inputs, role_id).map(|(role, _)| role)
 }
 
 fn load_lab_role(inputs: &LabInputs, role_id: &str) -> Result<(Role, LabRole)> {
@@ -82,8 +89,16 @@ fn load_lab_role(inputs: &LabInputs, role_id: &str) -> Result<(Role, LabRole)> {
 /// `<dir>/roles/<role_id>.json` and `.md`, through the same unknown-key gate
 /// and family check every role manifest gets.
 fn load_eval_role(dir: &Path, role_id: &str) -> Result<(Role, LabRole)> {
-    let json_path = dir.join("roles").join(format!("{role_id}.json"));
-    let md_path = dir.join("roles").join(format!("{role_id}.md"));
+    let roles_dir = dir.join("roles");
+    if is_symlink(&roles_dir) {
+        bail!(
+            "the eval's `{}` is a symlink; a lab run takes its role from the eval itself, and a link could \
+             deliver a role from anywhere. Make it a real folder",
+            roles_dir.display()
+        );
+    }
+    let json_path = roles_dir.join(format!("{role_id}.json"));
+    let md_path = roles_dir.join(format!("{role_id}.md"));
     let json = read_eval_role_file(&json_path, role_id)?;
     let md = read_eval_role_file(&md_path, role_id)?;
     use darkmux_types::user_files::{check_text, UserFileKind};
@@ -105,15 +120,27 @@ fn load_eval_role(dir: &Path, role_id: &str) -> Result<(Role, LabRole)> {
     Ok((role, LabRole { source: RoleInputSource::Eval, json, md }))
 }
 
+/// Whether `path` itself is a symbolic link (its target is not followed).
+fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+}
+
 /// One of an eval's role files, bounded like every role manifest. A missing
-/// file is the refusal this module exists for: there is no fallback.
+/// file is the refusal this module exists for: there is no fallback. A
+/// symlink is refused too: the sandbox clone keeps links, and one pointing at
+/// the home folder would deliver its bytes (the link itself is never followed).
 fn read_eval_role_file(path: &Path, role_id: &str) -> Result<String> {
     let cap = darkmux_types::user_files::MAX_USER_FILE_BYTES;
-    match std::fs::metadata(path) {
+    match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!(
             "{} is missing: a lab run of a workload bound to a fixture takes its role from the eval, so the \
              eval must carry its roles (roles/{role_id}.json and roles/{role_id}.md, listed in .fixture.json's \
              required_files). darkmux's built-in role and the home folder's roles/ are never used instead.",
+            path.display()
+        ),
+        Ok(meta) if meta.file_type().is_symlink() => bail!(
+            "the eval's `{}` is a symlink; a lab run takes its role from the eval itself, and a link could \
+             deliver a role from anywhere. Make it a real file",
             path.display()
         ),
         Ok(meta) if meta.len() > cap => {

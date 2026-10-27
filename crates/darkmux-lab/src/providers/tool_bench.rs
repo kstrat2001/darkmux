@@ -1220,11 +1220,17 @@ impl WorkloadProvider for ToolBenchProvider {
             backend: None,
             // (#2902 review M2) The window of the model the dispatches RAN on
             // (the one resolver's selection, with the lab's utility opt-in),
-            // not the profile's default model's.
-            n_ctx: darkmux_crew::dispatch_internal::dispatch_window(&role, Some(profile_name), config_path, true)
-                .ok()
-                .flatten()
-                .map(u64::from),
+            // not the profile's default model's. (#3363) Selected from the
+            // role the dispatches ran, the lab's pinned one.
+            n_ctx: darkmux_crew::dispatch_internal::lab_dispatch_window(
+                &crate::providers::lab_inputs(loaded, sandbox_dir),
+                &role,
+                Some(profile_name),
+                config_path,
+            )
+            .ok()
+            .flatten()
+            .map(u64::from),
         };
         let rows = build_rows(&trial_refs, trials_per_task, &artifact);
         let machine_id = darkmux_types::config_access::machine_id()
@@ -2435,6 +2441,42 @@ not json — tolerated
             .run(&loaded, run_dir.path(), sandbox_dir.path(), &profile, "mixed", pf.to_str(), None, &darkmux_types::session_id::RunId::lab("r").unwrap(), &mut |_sid: &SessionId| {})
             .expect("run completes");
         let doc = scores::read_scores(&run_dir.path().join("scores.json")).expect("the run wrote scores.json");
+        assert!(!doc.rows.is_empty());
+        assert!(doc.rows.iter().all(|r| r.artifact.n_ctx == Some(128_000)), "{:?}", doc.rows[0].artifact);
+    }
+
+    /// (#3363) For a fixture-bound bench the recorded window is selected
+    /// from the eval's role in the sandbox: its `web-probe` asks for coding
+    /// (the 128k model). No other tier defines `web-probe`, so a lookup
+    /// through the home folder falls back to the profile's default (32k).
+    #[test]
+    #[serial_test::serial]
+    fn a_fixture_bound_bench_records_the_window_of_the_evals_role() {
+        let state = darkmux_types::test_isolation::IsolatedState::new();
+        let pf = state.join("profiles.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{"mixed":{"default_model":"generalist","models":[
+                    {"id":"generalist","n_ctx":32000,"capabilities":{"reasoning":1.0}},
+                    {"id":"codestar","n_ctx":128000,"capabilities":{"code":1.0}}]}},
+                "default_profile":"mixed"}"#,
+        )
+        .unwrap();
+        let sandbox_dir = state.join("sandbox");
+        std::fs::create_dir_all(sandbox_dir.join("roles")).unwrap();
+        let role = serde_json::json!({"id": "web-probe", "description": "d", "skills": ["coding"],
+            "tool_palette": {"allow": ["read"], "deny": []}, "escalation_contract": "bail-with-explanation"});
+        std::fs::write(sandbox_dir.join("roles/web-probe.json"), role.to_string()).unwrap();
+        std::fs::write(sandbox_dir.join("roles/web-probe.md"), "# web-probe\n").unwrap();
+        let loaded = loaded_workload(serde_json::json!({ "chainDepths": [2], "role": "web-probe", "requires_fixture": "biz@1.0" }));
+        let run_dir = state.join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let provider = ToolBenchProvider::with_dispatch(Arc::new(|_opts: DispatchOpts| mock_ok_result()));
+        let profile = darkmux_profiles::profiles::load_registry(pf.to_str()).unwrap().registry.profiles["mixed"].clone();
+        provider
+            .run(&loaded, &run_dir, &sandbox_dir, &profile, "mixed", pf.to_str(), None, &darkmux_types::session_id::RunId::lab("r").unwrap(), &mut |_sid: &SessionId| {})
+            .expect("run completes");
+        let doc = scores::read_scores(&run_dir.join("scores.json")).expect("the run wrote scores.json");
         assert!(!doc.rows.is_empty());
         assert!(doc.rows.iter().all(|r| r.artifact.n_ctx == Some(128_000)), "{:?}", doc.rows[0].artifact);
     }

@@ -343,7 +343,11 @@ pub struct DispatchRoleInputs {
     /// The role's system prompt (`<id>.md`).
     pub md_sha256: String,
     /// darkmux's compiled-in preamble, `null` when the role is not a
-    /// specialist and so gets none.
+    /// specialist and so gets none. It hashes the preamble file exactly as
+    /// the release ships it (`templates/builtin/AUTONOMOUS_DISPATCH_PREAMBLE.md`
+    /// at the release's commit, trailing newline included), while the prompt
+    /// carries it with trailing whitespace trimmed: verify it against that
+    /// file, not against the prompt's text.
     pub preamble_sha256: Option<String>,
 }
 

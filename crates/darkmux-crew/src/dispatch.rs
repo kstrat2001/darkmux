@@ -413,6 +413,13 @@ pub fn check_lab_role(inputs: &LabInputs, role_id: &str) -> Result<()> {
     crate::role_inputs::check_lab_role(inputs, role_id)
 }
 
+/// (#3363) The role manifest a lab dispatch with `inputs` runs, loaded and
+/// refused exactly as its dispatch would: for a lab check that must judge the
+/// same role the dispatch uses rather than the home folder's.
+pub fn lab_role(inputs: &LabInputs, role_id: &str) -> Result<crate::types::Role> {
+    crate::role_inputs::lab_role(inputs, role_id)
+}
+
 /// Host-side compaction config passthrough to the internal runtime
 /// (#368). Each field maps 1:1 to a runtime CLI flag. The host
 /// constructs from a `Profile`; `crew::dispatch_internal::dispatch`

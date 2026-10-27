@@ -134,30 +134,31 @@ impl WorkloadProvider for CodingTaskProvider {
         //    forbids the only tools for execution.
         //
         //    The validator silently skips when the role can't be loaded
-        //    (unknown id) so the existing dispatch path produces its
-        //    own canonical "role not found" error without double-failing.
+        //    so the dispatch path produces its own canonical refusal
+        //    without double-failing. (#3363) The role is the one the
+        //    dispatch runs: the eval's own for a fixture-bound workload,
+        //    darkmux's compiled-in one otherwise, never the home folder's.
         let role_id = pick_role(loaded);
-        if let Ok(roles) = darkmux_crew::loader::load_roles() {
-            if let Some(role) = roles.iter().find(|r| r.id == role_id) {
-                if !role_can_modify_files(&role.tool_palette) {
-                    bail!(
-                        "coding-task workload `{}` is paired with role `{}` whose \
-                         tool_palette denies both `edit` and `write` — the agent has no \
-                         tools to apply a fix and the dispatch will inevitably waste \
-                         wall-clock on a 'describe-but-don't-execute' pattern.\n\
-                         \n\
-                         Fix one of:\n\
-                         \n\
-                           1. Set the workload's `role:` field to one that allows edit\n\
-                              (e.g. `\"role\": \"coder\"`).\n\
-                           2. Unset / override `DARKMUX_DEFAULT_ROLE` if it's pointing\n\
-                              at a review-shaped role.\n\
-                           3. Use a different workload that's review-shaped (where the\n\
-                              prompt asks the agent to FIND issues, not FIX them).",
-                        loaded.manifest.workload.id,
-                        role_id
-                    );
-                }
+        let lab_inputs = crate::providers::lab_inputs(loaded, sandbox_dir);
+        if let Ok(role) = darkmux_crew::dispatch::lab_role(&lab_inputs, &role_id) {
+            if !role_can_modify_files(&role.tool_palette) {
+                bail!(
+                    "coding-task workload `{}` is paired with role `{}` whose \
+                     tool_palette denies both `edit` and `write` — the agent has no \
+                     tools to apply a fix and the dispatch will inevitably waste \
+                     wall-clock on a 'describe-but-don't-execute' pattern.\n\
+                     \n\
+                     Fix one of:\n\
+                     \n\
+                       1. Set the workload's `role:` field to one that allows edit\n\
+                          (e.g. `\"role\": \"coder\"`).\n\
+                       2. Unset / override `DARKMUX_DEFAULT_ROLE` if it's pointing\n\
+                          at a review-shaped role.\n\
+                       3. Use a different workload that's review-shaped (where the\n\
+                          prompt asks the agent to FIND issues, not FIX them).",
+                    loaded.manifest.workload.id,
+                    role_id
+                );
             }
         }
 
@@ -516,7 +517,7 @@ fn expand_placeholders_with(input: &str, view_path: &str) -> String {
         .replace("${SANDBOX}", view_path)
 }
 
-fn manifest_seed_path(loaded: &LoadedWorkload) -> Option<String> {
+pub(crate) fn manifest_seed_path(loaded: &LoadedWorkload) -> Option<String> {
     if let Some(s) = loaded.manifest.workload.sandbox_seed.as_ref() {
         return Some(s.clone());
     }
@@ -1738,6 +1739,46 @@ mod tests {
         CodingTaskProvider
             .setup(&loaded, &run_dir, &sandbox_dir)
             .expect("default coder role must pass validation");
+    }
+
+    /// (#3363) The palette check reads the role the dispatch will run: for a
+    /// fixture-bound workload, the eval's own `roles/coder.json` in the
+    /// sandbox, never the home folder's. Both directions.
+    #[test]
+    #[serial_test::serial]
+    fn setup_checks_the_palette_of_the_evals_role_not_the_home_folders() {
+        let state = darkmux_types::test_isolation::IsolatedState::new();
+        let home = std::path::PathBuf::from(std::env::var("DARKMUX_HOME").expect("isolated home"));
+        let builtin = fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates/builtin/roles/coder.json"),
+        )
+        .unwrap();
+        let mut denying: serde_json::Value = serde_json::from_str(&builtin).unwrap();
+        denying["tool_palette"] = serde_json::json!({"allow": ["read"], "deny": ["edit", "write"]});
+        let denying = denying.to_string();
+        let write_role = |dir: &std::path::Path, json: &str| {
+            fs::create_dir_all(dir.join("roles")).unwrap();
+            fs::write(dir.join("roles/coder.json"), json).unwrap();
+            fs::write(dir.join("roles/coder.md"), "# coder\n").unwrap();
+        };
+        let mut spec = basic_spec();
+        spec.role = Some("coder".into());
+        spec.requires_fixture = Some("pg@2.1".into());
+        let loaded = make_loaded(spec, state.join("doc"));
+        let run = |sandbox: &std::path::Path| CodingTaskProvider.setup(&loaded, &state.join("run"), sandbox);
+
+        // The home folder's coder denies edit and write; the eval's allows them.
+        write_role(&home, &denying);
+        let allowing = state.join("sandbox-allowing");
+        write_role(&allowing, &builtin);
+        run(&allowing).expect("the eval's coder can edit, whatever the home folder says");
+
+        // The reverse: the home folder's coder allows, the eval's denies.
+        write_role(&home, &builtin);
+        let denied = state.join("sandbox-denying");
+        write_role(&denied, &denying);
+        let err = run(&denied).expect_err("the eval's coder cannot edit").to_string();
+        assert!(err.contains("denies both `edit` and `write`"), "{err}");
     }
 
     #[test]

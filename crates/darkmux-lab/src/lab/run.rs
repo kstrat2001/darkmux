@@ -161,6 +161,35 @@ fn refuse_keys_another_provider_ignores(loaded: &crate::workloads::types::Loaded
     ))
 }
 
+/// (#3363) A fixture-bound workload runs on the role files its eval carries
+/// (`roles/`), so the coding-task provider must not overwrite them after the
+/// preflight checked them: a `setupContent` entry under `roles/`, or a
+/// sandbox seed holding a `roles/` folder, is refused, naming it.
+fn refuse_writes_over_eval_roles(loaded: &crate::workloads::types::LoadedWorkload) -> Result<()> {
+    let w = &loaded.manifest.workload;
+    if w.requires_fixture.is_none() || w.provider != "coding-task" {
+        return Ok(());
+    }
+    let under_roles = |rel: &str| {
+        Path::new(rel).components().find(|c| matches!(c, std::path::Component::Normal(_)))
+            == Some(std::path::Component::Normal("roles".as_ref()))
+    };
+    if let Some(key) = w.setup_content.keys().find(|k| under_roles(k)) {
+        return Err(anyhow!(
+            "workload \"{}\": setupContent entry `{key}` writes under roles/, but the workload binds a fixture and runs on the role files its eval carries there. Remove the entry; change the role in the eval",
+            w.id
+        ));
+    }
+    let seed = crate::providers::coding_task::manifest_seed_path(loaded).unwrap_or_default();
+    if std::fs::symlink_metadata(loaded.base_dir.join(&seed).join("roles")).is_ok() {
+        return Err(anyhow!(
+            "workload \"{}\": sandboxSeed `{seed}` holds a roles/ folder, which would overwrite the role files the bound fixture's eval carries. Remove it from the seed; change the role in the eval",
+            w.id
+        ));
+    }
+    Ok(())
+}
+
 /// (#1004) Loop-lab A/B "with-context" arm: splice the caller-built
 /// engagement-context blocks in FRONT of the workload's own prompt, so the
 /// dispatch carries the same context a real coder brief would. Resolves the
@@ -204,6 +233,7 @@ fn apply_inject_context(
 /// [`workload_for_run`].
 fn prepare_workload(loaded: &mut crate::workloads::types::LoadedWorkload, ctx: Option<&str>) -> Result<()> {
     refuse_keys_another_provider_ignores(loaded)?;
+    refuse_writes_over_eval_roles(loaded)?;
     // (#3386) A criteria registry the grader cannot grade is refused before any
     // model runs; its anchors are checked once the fixture is resolved
     // (`check_criteria_anchors`).
@@ -2644,6 +2674,42 @@ mod tests {
         assert_eq!(w2.manifest.workload.prompt.as_deref(), Some("Do the task."));
         apply_inject_context(&mut w2, Some("   "), &dir2);
         assert_eq!(w2.manifest.workload.prompt.as_deref(), Some("Do the task."));
+    }
+
+    /// (#3363) A fixture-bound coding-task workload cannot overwrite the
+    /// eval's roles: a `setupContent` entry or a sandbox seed under `roles/`
+    /// is refused, naming it; the same entry is fine on an unbound workload,
+    /// and a path that merely contains `roles` deeper down is fine.
+    #[test]
+    fn a_fixture_bound_workload_cannot_write_over_the_evals_roles() {
+        let tmp = TempDir::new().unwrap();
+        let doc = |setup: serde_json::Value, bound: bool| -> crate::workloads::types::LoadedWorkload {
+            let mut w = serde_json::json!({"id": "w", "provider": "coding-task", "prompt": "x", "setupContent": setup});
+            if bound {
+                w["requires_fixture"] = serde_json::json!("pg@2.1");
+            }
+            crate::workloads::types::LoadedWorkload {
+                manifest: serde_json::from_str(&serde_json::json!({"workload": w}).to_string()).unwrap(),
+                base_dir: tmp.path().to_path_buf(),
+                source: crate::workloads::types::WorkloadSource::OnDisk,
+            }
+        };
+        for key in ["roles/coder.md", "./roles/coder.json"] {
+            let err = refuse_writes_over_eval_roles(&doc(serde_json::json!({key: "x"}), true)).unwrap_err().to_string();
+            assert!(err.contains(&format!("setupContent entry `{key}`")) && err.contains("roles/"), "{err}");
+            assert!(refuse_writes_over_eval_roles(&doc(serde_json::json!({key: "x"}), false)).is_ok(), "unbound: {key}");
+        }
+        assert!(refuse_writes_over_eval_roles(&doc(serde_json::json!({"src/roles/x.md": "x"}), true)).is_ok());
+        // `lab run`'s pre-run workload checks give the refusal.
+        let mut bound = doc(serde_json::json!({"roles/coder.md": "x"}), true);
+        let err = prepare_workload(&mut bound, None).unwrap_err().to_string();
+        assert!(err.contains("setupContent entry `roles/coder.md`"), "{err}");
+
+        // The sandbox seed (here the default `sandbox/` beside the document).
+        std::fs::create_dir_all(tmp.path().join("sandbox/roles")).unwrap();
+        let err = refuse_writes_over_eval_roles(&doc(serde_json::json!({}), true)).unwrap_err().to_string();
+        assert!(err.contains("sandboxSeed `sandbox`") && err.contains("roles/"), "{err}");
+        assert!(refuse_writes_over_eval_roles(&doc(serde_json::json!({}), false)).is_ok());
     }
 
     /// `replyRoom` and `verify.expect` are refused on any provider but

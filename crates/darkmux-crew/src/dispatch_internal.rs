@@ -13788,6 +13788,20 @@ pub fn dispatch_window(
     }
 }
 
+/// (#3363) [`dispatch_window`] for a lab dispatch: the role from its pinned
+/// inputs (`crate::role_inputs`), as the dispatch itself resolves it, with
+/// the lab's utility-model opt-in.
+pub fn lab_dispatch_window(
+    inputs: &crate::dispatch::LabInputs,
+    role_id: &str,
+    profile_override: Option<&str>,
+    config_path: Option<&str>,
+) -> Result<Option<u32>> {
+    let role = crate::role_inputs::lab_role(inputs, role_id)?;
+    let mapped = role_profile_binding(Some(role_id), profile_override);
+    resolve_dispatch_windows_with(&role, profile_override, mapped, config_path, true)
+}
+
 pub fn resolve_context_window_internal(
     role_id: Option<&str>,
     profile_override: Option<&str>,

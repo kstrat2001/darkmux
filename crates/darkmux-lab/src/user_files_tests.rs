@@ -221,17 +221,33 @@ fn every_builtin_workload_bound_to_a_builtin_fixture_finds_its_role_there() {
         .flatten()
         .map(|e| (read(&e.path().join(".fixture.json"))["satisfies"].as_str().unwrap().to_string(), e.path()))
         .collect();
-    let mut checked = 0;
+    // A built-in workload bound to a fixture darkmux does not ship: its role
+    // files must come with that fixture, so this test cannot check them.
+    // Each entry says which role the fixture must carry; the CHANGELOG names
+    // the same workloads.
+    const USER_FIXTURE: &[(&str, &str)] =
+        &[("crawl-error-discard", "binds rust-crawl-scope@1.0, a user fixture, which must carry roles/crawler.*")];
+    let (mut checked, mut user_fixture) = (0, Vec::new());
     for path in crate::workloads::load::documents_in(&t.join("workloads")) {
         let doc = read(&path);
         let Some(requires) = doc["workload"]["requires_fixture"].as_str() else { continue };
-        let Some((_, dir)) = fixtures.iter().find(|(satisfies, _)| satisfies == requires) else { continue };
+        let id = doc["workload"]["id"].as_str().unwrap().to_string();
         let role = doc["workload"]["role"].as_str().unwrap_or_else(|| panic!("{path:?} names no role"));
+        let Some((_, dir)) = fixtures.iter().find(|(satisfies, _)| satisfies == requires) else {
+            assert!(
+                USER_FIXTURE.iter().any(|(listed, why)| *listed == id && why.contains(&format!("roles/{role}."))),
+                "{id} binds {requires}, which no built-in fixture satisfies: list it in USER_FIXTURE with the role its fixture must carry"
+            );
+            user_fixture.push(id);
+            continue;
+        };
         darkmux_crew::dispatch::check_lab_role(&darkmux_crew::dispatch::LabInputs::Eval { dir: dir.clone() }, role)
             .unwrap_or_else(|e| panic!("{path:?}: {e:#}"));
         checked += 1;
     }
     assert!(checked >= 1, "demo-quickstart binds demo-tiny-py");
+    let listed: Vec<&str> = USER_FIXTURE.iter().map(|(id, _)| *id).collect();
+    assert_eq!(user_fixture, listed, "every USER_FIXTURE entry is a built-in workload that still binds a user fixture");
 }
 
 /// A mistyped value in a workload is refused by the lab preflight, naming

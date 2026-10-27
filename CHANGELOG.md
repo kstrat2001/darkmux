@@ -16,17 +16,28 @@ darkmux release.
 
 ### Changed
 
-- **An eval owns its roles: a lab run reads nothing from the home folder
-  (#3363).** A lab run's system prompt is now built only from pinned inputs.
-  A workload bound to a fixture takes its role from the eval itself:
-  `roles/<id>.json` and `roles/<id>.md` in the fixture's checkout (list them in
-  `.fixture.json`'s `required_files`). **An eval's workloads now need their
-  role files in the eval, and a fixture-bound eval without them is refused**
-  by `lab run`, naming the missing file, before any model loads. A workload
-  bound to no fixture runs on darkmux's compiled-in role; a role darkmux does
-  not compile in is refused there too. Either way a lab run uses darkmux's
-  compiled-in preamble and never reads `~/.darkmux/roles/`, the preamble
-  override, `identity.md` or the workspace notes. On 2026-10-24 a stale
+- **An eval owns its roles: a lab run's role and prompt come from the eval,
+  not the home folder (#3363).** A lab run's system prompt is now built only
+  from pinned inputs. A workload bound to a fixture takes its role from the
+  eval itself: `roles/<id>.json` and `roles/<id>.md` in the fixture's checkout
+  (list them in `.fixture.json`'s `required_files`; neither may be a symlink).
+  **An eval's workloads now need their role files in the eval, and a
+  fixture-bound eval without them is refused** by `lab run`, naming the
+  missing file, before any model loads. That includes the coder evals
+  (pepper-grinder, salt-shaker, webhook-forgery-eval, idor-check-eval,
+  path-traversal-eval, which need `roles/coder.*`) and the shipped
+  `crawl-error-discard` workload, whose `rust-crawl-scope` fixture needs
+  `roles/crawler.*`. A workload bound to no fixture runs on darkmux's
+  compiled-in role; a role darkmux does not compile in is refused there too.
+  Either way a lab run uses darkmux's compiled-in preamble, and its prompt
+  never takes anything from `~/.darkmux/roles/`, the preamble override,
+  `identity.md` or the workspace notes. The coding-task tool check and the
+  tool bench's recorded window read the same role. A fixture-bound
+  coding-task workload may no longer write under `roles/` through
+  `setupContent` or its sandbox seed. Not yet pinned: model selection still
+  reads the skill manifests a role names from the home folder's `skills/`, and
+  a malformed role file in `~/.darkmux/roles/` still refuses a lab run at
+  preflight even though the run does not read it. On 2026-10-24 a stale
   `~/.darkmux/roles/web-probe.md` replaced an eval's pinned prompt for 19
   runs; that can no longer happen. The built-in `demo-tiny-py` fixture now
   carries `roles/coder.*` for `demo-quickstart`; re-register it with
@@ -42,7 +53,9 @@ darkmux release.
   `workspace_notes`, `role_override`, `preamble_override`). A lab dispatch
   also carries `role`: the role's id, its source (`eval` or `builtin`), and
   the SHA-256 of its `.json`, its `.md` and the preamble, hashed from the
-  bytes it loaded. `lab submit` does not share these yet.
+  bytes it loaded (the preamble hash is of the shipped file, before the
+  prompt trims its trailing whitespace). `lab submit` does not share these
+  yet.
 
 ## [5.8.0] - 2026-10-27
 
