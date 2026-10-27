@@ -34,11 +34,14 @@ darkmux release.
   `identity.md` or the workspace notes. `lab run` reads the eval's role once,
   before the run starts, and every dispatch, the coding-task tool check and
   the tool bench's recorded window use those bytes, so nothing a run writes
-  into its sandbox (`setupContent`, a seed, a link) can change the role. Not
-  yet pinned: model selection still
-  reads the skill manifests a role names from the home folder's `skills/`, and
-  a malformed role file in `~/.darkmux/roles/` still refuses a lab run at
-  preflight even though the run does not read it. On 2026-10-24 a stale
+  into its sandbox (`setupContent`, a seed) can change the role a dispatch of
+  that `lab run` sends. Not yet pinned: model selection still reads the skill
+  manifests a role names from the home folder's `skills/`; a malformed role
+  file in `~/.darkmux/roles/` still refuses a lab run at preflight even though
+  the run does not read it; darkmux does not check that the role files are
+  listed in `required_files`; and a workload's `setupContent` can still write
+  through a symlink in the fixture to outside the sandbox, including into the
+  fixture's own checkout, which a later `lab run` would then read. On 2026-10-24 a stale
   `~/.darkmux/roles/web-probe.md` replaced an eval's pinned prompt for 19
   runs; that can no longer happen. The built-in `demo-tiny-py` fixture now
   carries `roles/coder.*` for `demo-quickstart`; re-register it with
