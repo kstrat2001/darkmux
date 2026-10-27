@@ -559,6 +559,33 @@ fn recording_a_grade_ands_the_ungraded_verdict() {
     assert!(!Ungraded::from_manifest(&m).passed);
 }
 
+/// A run whose manifest has no `verify` yet gets one from the record, and a
+/// record that carries criteria raises the manifest to schema 10 (#3386).
+#[test]
+fn recording_into_a_manifest_without_verify_creates_it_and_criteria_raise_schema_10() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    fs::write(dir.join("manifest.json"), r#"{"run_id": "r1"}"#).unwrap();
+    let rec = GradeRecord {
+        passed: false,
+        checks: vec![GradeCheck { id: "suite".into(), passed: false, evidence: "e".into(), ..Default::default() }],
+        criteria: Some(vec![
+            crate::lab::manifest::CriterionResult { id: "raw-body".into(), passed: false },
+            crate::lab::manifest::CriterionResult { id: "applied-once".into(), passed: true },
+        ]),
+        ..Default::default()
+    };
+    let ungraded = Ungraded::from_manifest(&RunManifest::read(dir).unwrap());
+    assert!(ungraded.passed, "no verify reads as an ungraded pass");
+    record(dir, rec, &ungraded).unwrap();
+    let m = RunManifest::read(dir).unwrap();
+    assert_eq!(m.verify_passed(), Some(false));
+    assert_eq!(m.verify_report().unwrap().details, "graded: fail (suite: e)");
+    let recorded = m.verify_report().unwrap().grade.as_ref().unwrap().criteria.clone().unwrap();
+    assert_eq!(recorded.iter().map(|c| (c.id.as_str(), c.passed)).collect::<Vec<_>>(), [("raw-body", false), ("applied-once", true)]);
+    assert_eq!(m.schema_version, Some(10));
+}
+
 /// A test that checks the source text (here, a byte-for-byte copy) catches
 /// every planted bug for that reason alone. The control edit, which changes
 /// no behavior, shows it up.
