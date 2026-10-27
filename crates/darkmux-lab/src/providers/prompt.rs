@@ -67,7 +67,7 @@ impl WorkloadProvider for PromptProvider {
             loaded.manifest.workload.image.as_deref(),
             config_path,
             profile_name,
-            crate::providers::lab_inputs(loaded, sandbox_dir),
+            crate::providers::lab_inputs(loaded)?,
         );
         // Named and armed before the dispatch, so a dispatch that returns
         // `Err` still leaves its trajectory in the run dir (the guard's Drop).
@@ -860,6 +860,7 @@ mod tests {
             manifest: WorkloadManifest { schema_version: None, workload: spec },
             base_dir,
             source: WorkloadSource::OnDisk,
+            lab_inputs: None,
         }
     }
 
@@ -1379,38 +1380,39 @@ mod tests {
         assert_eq!(resolve_prompt_from(&bound, prompt_base(&bound, &sandbox)).unwrap(), "from the fixture");
     }
 
-    /// (#3363) End to end through the provider: a fixture-bound workload's
-    /// dispatch takes its role from the run's sandbox, so a sandbox with no
-    /// `roles/` is refused naming the sandbox's file, never run on
-    /// darkmux's compiled-in role.
+    /// (#3363) A fixture-bound prompt run dispatches the role `lab run` read
+    /// from the eval: `probe-3363` exists only there, so the dispatch reaches
+    /// model selection, where the compiled-in lookup would refuse it. With no
+    /// role read, the provider refuses rather than looking in the sandbox.
     #[test]
     #[serial_test::serial]
-    fn a_fixture_bound_prompt_run_takes_its_role_from_the_sandbox() {
+    fn a_fixture_bound_prompt_run_dispatches_the_role_read_from_the_eval() {
         let state = darkmux_types::test_isolation::IsolatedState::new();
-        let (doc_dir, sandbox, run_dir) = (state.join("doc"), state.join("sandbox"), state.join("run"));
-        for d in [&doc_dir, &sandbox, &run_dir] {
+        let (doc_dir, sandbox, run_dir, eval) = (state.join("doc"), state.join("sandbox"), state.join("run"), state.join("eval"));
+        for d in [&doc_dir, &sandbox, &run_dir, &eval.join("roles")] {
             fs::create_dir_all(d).unwrap();
         }
+        let role = serde_json::json!({"id": "probe-3363", "description": "d", "tool_palette": {"allow": [], "deny": []},
+            "escalation_contract": "bail-with-explanation"});
+        fs::write(eval.join("roles/probe-3363.json"), role.to_string()).unwrap();
+        fs::write(eval.join("roles/probe-3363.md"), "# probe\n").unwrap();
         let mut spec = spec_with_prompt("hi");
-        spec.role = Some("reviewer".into());
+        spec.role = Some("probe-3363".into());
         spec.requires_fixture = Some("biz@1.0".into());
-        let loaded = make_loaded(spec, doc_dir);
+        let mut loaded = make_loaded(spec, doc_dir);
         let registry = state.join("no-such-profiles-3363.json");
-        let err = PromptProvider
-            .run(
-                &loaded,
-                &run_dir,
-                &sandbox,
-                &darkmux_types::Profile::default(),
-                "p",
-                registry.to_str(),
-                None,
-                &RunId::lab("r3363").unwrap(),
-                &mut |_: &SessionId| {},
-            )
-            .unwrap_err();
-        let err = format!("{err:#}");
-        assert!(err.contains(&format!("{}/roles/reviewer.json is missing", sandbox.display())), "{err}");
+        let run = |loaded: &LoadedWorkload| {
+            let err = PromptProvider
+                .run(loaded, &run_dir, &sandbox, &darkmux_types::Profile::default(), "p", registry.to_str(), None,
+                    &RunId::lab("r3363").unwrap(), &mut |_: &SessionId| {})
+                .unwrap_err();
+            format!("{err:#}")
+        };
+        let err = run(&loaded);
+        assert!(err.contains("its eval's role was not read"), "{err}");
+        loaded.lab_inputs = Some(darkmux_crew::dispatch::LabInputs::load_eval(&eval, "probe-3363").unwrap());
+        let err = run(&loaded);
+        assert!(err.contains("model selection failed") && !err.contains("built-in roles"), "{err}");
     }
 
     #[test]

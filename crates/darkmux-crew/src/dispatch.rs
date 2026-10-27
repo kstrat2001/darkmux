@@ -382,25 +382,27 @@ pub struct DispatchOpts {
 /// (#3363) Where a lab dispatch takes its role from. An eval owns its roles:
 /// a workload bound to a fixture runs on the role files that fixture carries,
 /// and a workload bound to none runs on darkmux's compiled-in role.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum LabInputs {
-    /// The workload binds a fixture: `<dir>/roles/<role-id>.json` and
-    /// `<dir>/roles/<role-id>.md`, where `dir` is the run's own copy of the
-    /// fixture (its sandbox). A missing file refuses the run.
-    Eval { dir: PathBuf },
+    /// The workload binds a fixture: its role, read ONCE from the eval
+    /// ([`LabInputs::load_eval`]) before the run starts and carried here as
+    /// bytes. The dispatch, and every lab check of the role, uses these
+    /// bytes; nothing reads `roles/` again, so a write into the run's
+    /// sandbox (a workload's `setupContent`, a seed, a link) cannot change it.
+    Eval(Box<EvalRole>),
     /// The workload binds no fixture: darkmux's compiled-in role and prompt.
     Builtin,
 }
 
+pub use crate::role_inputs::EvalRole;
+
 impl LabInputs {
-    /// The inputs of a workload that does (`binds_fixture`) or does not bind
-    /// a fixture, whose copy for this run is `sandbox_dir`.
-    pub fn for_workload(binds_fixture: bool, sandbox_dir: &std::path::Path) -> Self {
-        if binds_fixture {
-            LabInputs::Eval { dir: sandbox_dir.to_path_buf() }
-        } else {
-            LabInputs::Builtin
-        }
+    /// Read `<dir>/roles/<role_id>.json` and `.md` from an eval, once:
+    /// refused when either is missing, a symlink (as is `roles/` itself),
+    /// past the size cap, or a manifest the unknown-key gate, the id check
+    /// or the family check refuses.
+    pub fn load_eval(dir: &std::path::Path, role_id: &str) -> Result<Self> {
+        crate::role_inputs::load_eval_role(dir, role_id).map(|role| LabInputs::Eval(Box::new(role)))
     }
 }
 

@@ -161,35 +161,6 @@ fn refuse_keys_another_provider_ignores(loaded: &crate::workloads::types::Loaded
     ))
 }
 
-/// (#3363) A fixture-bound workload runs on the role files its eval carries
-/// (`roles/`), so the coding-task provider must not overwrite them after the
-/// preflight checked them: a `setupContent` entry under `roles/`, or a
-/// sandbox seed holding a `roles/` folder, is refused, naming it.
-fn refuse_writes_over_eval_roles(loaded: &crate::workloads::types::LoadedWorkload) -> Result<()> {
-    let w = &loaded.manifest.workload;
-    if w.requires_fixture.is_none() || w.provider != "coding-task" {
-        return Ok(());
-    }
-    let under_roles = |rel: &str| {
-        Path::new(rel).components().find(|c| matches!(c, std::path::Component::Normal(_)))
-            == Some(std::path::Component::Normal("roles".as_ref()))
-    };
-    if let Some(key) = w.setup_content.keys().find(|k| under_roles(k)) {
-        return Err(anyhow!(
-            "workload \"{}\": setupContent entry `{key}` writes under roles/, but the workload binds a fixture and runs on the role files its eval carries there. Remove the entry; change the role in the eval",
-            w.id
-        ));
-    }
-    let seed = crate::providers::coding_task::manifest_seed_path(loaded).unwrap_or_default();
-    if std::fs::symlink_metadata(loaded.base_dir.join(&seed).join("roles")).is_ok() {
-        return Err(anyhow!(
-            "workload \"{}\": sandboxSeed `{seed}` holds a roles/ folder, which would overwrite the role files the bound fixture's eval carries. Remove it from the seed; change the role in the eval",
-            w.id
-        ));
-    }
-    Ok(())
-}
-
 /// (#1004) Loop-lab A/B "with-context" arm: splice the caller-built
 /// engagement-context blocks in FRONT of the workload's own prompt, so the
 /// dispatch carries the same context a real coder brief would. Resolves the
@@ -233,7 +204,6 @@ fn apply_inject_context(
 /// [`workload_for_run`].
 fn prepare_workload(loaded: &mut crate::workloads::types::LoadedWorkload, ctx: Option<&str>) -> Result<()> {
     refuse_keys_another_provider_ignores(loaded)?;
-    refuse_writes_over_eval_roles(loaded)?;
     // (#3386) A criteria registry the grader cannot grade is refused before any
     // model runs; its anchors are checked once the fixture is resolved
     // (`check_criteria_anchors`).
@@ -262,21 +232,25 @@ fn check_criteria_anchors(loaded: &crate::workloads::types::LoadedWorkload, path
     crate::lab::grade::check_criteria(spec, Some(&fixture)).with_context(|| format!("workload \"{id}\""))
 }
 
-/// (#3363) An eval owns its roles: the role the workload dispatches as must
-/// load from the fixture checkout the run will copy (`roles/<id>.json` and
-/// `.md`), or, for a workload bound to no fixture, be one darkmux compiles
-/// in. Checked before any model runs, with the refusal the dispatch itself
-/// would give (it checks again, against the run's own copy).
-fn check_eval_role(loaded: &crate::workloads::types::LoadedWorkload, paths: &paths::DarkmuxPaths) -> Result<()> {
+/// (#3363) An eval owns its roles. The role the workload dispatches as is
+/// read ONCE, here, before any run starts: for a workload bound to a
+/// fixture, `roles/<id>.json` and `.md` from the fixture checkout every run
+/// copies, kept as bytes that every run's dispatch uses (nothing reads
+/// `roles/` again, so nothing a run writes into its sandbox can change
+/// them); for one bound to none, a role darkmux compiles in. Refused before
+/// any model loads. Stored on the workload (`lab_inputs`), which every run's
+/// provider reads; left `None` when the provider names no role.
+fn read_lab_inputs(loaded: &mut crate::workloads::types::LoadedWorkload, paths: &paths::DarkmuxPaths) -> Result<()> {
+    use darkmux_crew::dispatch::LabInputs;
     let Some(role) = workload_role(loaded) else {
         return Ok(());
     };
     let inputs = match loaded.manifest.workload.requires_fixture {
-        Some(_) => darkmux_crew::dispatch::LabInputs::Eval { dir: resolve_source_sandbox(loaded, paths)? },
-        None => darkmux_crew::dispatch::LabInputs::Builtin,
+        Some(_) => resolve_source_sandbox(loaded, paths).and_then(|dir| LabInputs::load_eval(&dir, &role)),
+        None => darkmux_crew::dispatch::check_lab_role(&LabInputs::Builtin, &role).map(|()| LabInputs::Builtin),
     };
-    darkmux_crew::dispatch::check_lab_role(&inputs, &role)
-        .with_context(|| format!("workload \"{}\"", loaded.manifest.workload.id))
+    loaded.lab_inputs = Some(inputs.with_context(|| format!("workload \"{}\"", loaded.manifest.workload.id))?);
+    Ok(())
 }
 
 /// Whether a workload's prompt comes from its run's copy of a fixture.
@@ -322,7 +296,7 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
     paths::ensure(&paths)?;
     prepare_workload(&mut loaded_workload, opts.inject_context.as_deref())?;
     check_criteria_anchors(&loaded_workload, &paths)?;
-    check_eval_role(&loaded_workload, &paths)?;
+    read_lab_inputs(&mut loaded_workload, &paths)?;
 
     let registry_loaded = load_registry(opts.config_path.as_deref())?;
     // (#2902) With no `--profile`, the run is on the profile bound to the
@@ -1037,6 +1011,7 @@ mod tests {
             manifest,
             base_dir: std::path::PathBuf::new(),
             source: crate::workloads::types::WorkloadSource::Embedded,
+            lab_inputs: None,
         };
         assert_eq!(super::workload_role(&loaded).as_deref(), Some("provider-role"));
     }
@@ -1387,6 +1362,7 @@ mod tests {
             },
             base_dir: tmp.path().to_path_buf(),
             source: WorkloadSource::OnDisk,
+            lab_inputs: None,
         };
         let resolved = resolve_source_sandbox(&loaded, &paths).unwrap();
         assert_eq!(resolved, paths.sandboxes.join("demo"));
@@ -1429,6 +1405,7 @@ mod tests {
             },
             base_dir: tmp.path().to_path_buf(),
             source: WorkloadSource::OnDisk,
+            lab_inputs: None,
         };
         let err = resolve_source_sandbox(&loaded, &paths)
             .expect_err("a semver range operator should be rejected");
@@ -1542,7 +1519,9 @@ mod tests {
         std::fs::write(eval.join("roles/code-reviewer.json"), builtin("code-reviewer.json")).unwrap();
         std::fs::write(eval.join("roles/code-reviewer.md"), builtin("code-reviewer.md")).unwrap();
         let paths = paths::DarkmuxPaths::under_root(tmp.path().to_path_buf());
-        check_eval_role(&load("pg", Some(tmp.path())).unwrap(), &paths).expect("the eval carries its role");
+        let mut loaded = load("pg", Some(tmp.path())).unwrap();
+        read_lab_inputs(&mut loaded, &paths).expect("the eval carries its role");
+        assert!(matches!(loaded.lab_inputs, Some(darkmux_crew::dispatch::LabInputs::Eval(_))), "{:?}", loaded.lab_inputs);
     }
 
     #[test]
@@ -1769,6 +1748,7 @@ mod tests {
             },
             base_dir: tmp.path().to_path_buf(),
             source: WorkloadSource::OnDisk,
+            lab_inputs: None,
         };
 
         let resolved = resolve_source_sandbox(&loaded, &paths).unwrap();
@@ -1834,6 +1814,7 @@ mod tests {
             },
             base_dir: tmp.path().to_path_buf(),
             source: WorkloadSource::OnDisk,
+            lab_inputs: None,
         };
         let err = resolve_source_sandbox(&loaded, &paths).unwrap_err();
         let msg = format!("{err:#}");
@@ -1885,6 +1866,7 @@ mod tests {
             },
             base_dir: tmp.path().to_path_buf(),
             source: WorkloadSource::OnDisk,
+            lab_inputs: None,
         };
         let err = resolve_source_sandbox(&loaded, &paths).unwrap_err();
         let msg = format!("{err:#}");
@@ -1951,6 +1933,7 @@ mod tests {
             },
             base_dir: project.path().to_path_buf(),
             source: WorkloadSource::OnDisk,
+            lab_inputs: None,
         };
         // The registry lookup lands on the home tier.
         let err = resolve_source_sandbox(&loaded, &auto_paths).unwrap_err();
@@ -2040,6 +2023,7 @@ mod tests {
             },
             base_dir: project.path().to_path_buf(),
             source: WorkloadSource::OnDisk,
+            lab_inputs: None,
         };
 
         // The registry lookup finds the home-registered fixture.
@@ -2099,6 +2083,7 @@ mod tests {
             },
             base_dir: project.path().to_path_buf(),
             source: WorkloadSource::OnDisk,
+            lab_inputs: None,
         };
         let err = resolve_source_sandbox(&loaded, &paths).unwrap_err();
         let msg = format!("{err:#}");
@@ -2657,6 +2642,7 @@ mod tests {
             },
             base_dir: tmp.path().to_path_buf(),
             source: WorkloadSource::OnDisk,
+            lab_inputs: None,
         };
 
         // With context → prepended ahead of the original prompt.
@@ -2676,42 +2662,6 @@ mod tests {
         assert_eq!(w2.manifest.workload.prompt.as_deref(), Some("Do the task."));
     }
 
-    /// (#3363) A fixture-bound coding-task workload cannot overwrite the
-    /// eval's roles: a `setupContent` entry or a sandbox seed under `roles/`
-    /// is refused, naming it; the same entry is fine on an unbound workload,
-    /// and a path that merely contains `roles` deeper down is fine.
-    #[test]
-    fn a_fixture_bound_workload_cannot_write_over_the_evals_roles() {
-        let tmp = TempDir::new().unwrap();
-        let doc = |setup: serde_json::Value, bound: bool| -> crate::workloads::types::LoadedWorkload {
-            let mut w = serde_json::json!({"id": "w", "provider": "coding-task", "prompt": "x", "setupContent": setup});
-            if bound {
-                w["requires_fixture"] = serde_json::json!("pg@2.1");
-            }
-            crate::workloads::types::LoadedWorkload {
-                manifest: serde_json::from_str(&serde_json::json!({"workload": w}).to_string()).unwrap(),
-                base_dir: tmp.path().to_path_buf(),
-                source: crate::workloads::types::WorkloadSource::OnDisk,
-            }
-        };
-        for key in ["roles/coder.md", "./roles/coder.json"] {
-            let err = refuse_writes_over_eval_roles(&doc(serde_json::json!({key: "x"}), true)).unwrap_err().to_string();
-            assert!(err.contains(&format!("setupContent entry `{key}`")) && err.contains("roles/"), "{err}");
-            assert!(refuse_writes_over_eval_roles(&doc(serde_json::json!({key: "x"}), false)).is_ok(), "unbound: {key}");
-        }
-        assert!(refuse_writes_over_eval_roles(&doc(serde_json::json!({"src/roles/x.md": "x"}), true)).is_ok());
-        // `lab run`'s pre-run workload checks give the refusal.
-        let mut bound = doc(serde_json::json!({"roles/coder.md": "x"}), true);
-        let err = prepare_workload(&mut bound, None).unwrap_err().to_string();
-        assert!(err.contains("setupContent entry `roles/coder.md`"), "{err}");
-
-        // The sandbox seed (here the default `sandbox/` beside the document).
-        std::fs::create_dir_all(tmp.path().join("sandbox/roles")).unwrap();
-        let err = refuse_writes_over_eval_roles(&doc(serde_json::json!({}), true)).unwrap_err().to_string();
-        assert!(err.contains("sandboxSeed `sandbox`") && err.contains("roles/"), "{err}");
-        assert!(refuse_writes_over_eval_roles(&doc(serde_json::json!({}), false)).is_ok());
-    }
-
     /// `replyRoom` and `verify.expect` are refused on any provider but
     /// `prompt`, naming each key set; a prompt workload passes.
     #[test]
@@ -2724,6 +2674,7 @@ mod tests {
                 manifest: serde_json::from_str(&text).unwrap(),
                 base_dir: std::path::PathBuf::from("/nonexistent"),
                 source: crate::workloads::types::WorkloadSource::OnDisk,
+                lab_inputs: None,
             }
         };
         assert!(refuse_keys_another_provider_ignores(&doc("prompt")).is_ok());
@@ -2743,6 +2694,7 @@ mod tests {
                 manifest: serde_json::from_str(&text).unwrap(),
                 base_dir: std::path::PathBuf::from("/nonexistent"),
                 source: crate::workloads::types::WorkloadSource::OnDisk,
+                lab_inputs: None,
             }
         };
         assert!(refuse_keys_another_provider_ignores(&doc("coding-task")).is_ok());
@@ -2767,6 +2719,7 @@ mod tests {
             manifest: serde_json::from_str(&text).unwrap(),
             base_dir: tmp.path().join("doc"),
             source: crate::workloads::types::WorkloadSource::OnDisk,
+            lab_inputs: None,
         };
         apply_inject_context(&mut w, Some("CTX"), &fixture);
         assert_eq!(w.manifest.workload.prompt.as_deref(), Some("CTX\n\nfrom the fixture"));
@@ -2789,6 +2742,7 @@ mod tests {
             .unwrap(),
             base_dir: doc.clone(),
             source: crate::workloads::types::WorkloadSource::OnDisk,
+            lab_inputs: None,
         };
         let mut coding = load("coding-task");
         prepare_workload(&mut coding, Some("CTX")).unwrap();

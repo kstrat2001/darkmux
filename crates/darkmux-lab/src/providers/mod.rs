@@ -9,12 +9,21 @@ use crate::workloads::types::LoadedWorkload;
 use darkmux_crew::dispatch::LabInputs;
 use anyhow::Result;
 
-/// (#3363) A lab dispatch's pinned inputs: an eval owns its roles, so a
-/// workload bound to a fixture takes its role from `sandbox_dir`, the run's
-/// own copy of that fixture; a workload bound to none takes darkmux's
-/// compiled-in role. Every provider's `DispatchOpts` sets it.
-pub(crate) fn lab_inputs(loaded: &LoadedWorkload, sandbox_dir: &std::path::Path) -> LabInputs {
-    LabInputs::for_workload(loaded.manifest.workload.requires_fixture.is_some(), sandbox_dir)
+/// (#3363) A lab dispatch's pinned inputs, which every provider's
+/// `DispatchOpts` sets: the role `lab run` read once before the run started
+/// (`LoadedWorkload::lab_inputs`). A workload bound to no fixture that was
+/// not given one runs on darkmux's compiled-in role; one bound to a fixture
+/// is refused, because its role must come from the eval as read before the
+/// run, never from the sandbox the run writes to.
+pub(crate) fn lab_inputs(loaded: &LoadedWorkload) -> Result<LabInputs> {
+    match (&loaded.lab_inputs, &loaded.manifest.workload.requires_fixture) {
+        (Some(inputs), _) => Ok(inputs.clone()),
+        (None, None) => Ok(LabInputs::Builtin),
+        (None, Some(_)) => anyhow::bail!(
+            "workload \"{}\" binds a fixture, but its eval's role was not read: `lab run` reads it once from the eval before the run starts",
+            loaded.manifest.workload.id
+        ),
+    }
 }
 
 pub fn register_builtins() -> Result<()> {

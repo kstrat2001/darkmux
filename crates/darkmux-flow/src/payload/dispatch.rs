@@ -317,8 +317,8 @@ pub struct PromptAdditions {
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub enum RoleInputSource {
-    /// The eval's own `roles/<id>.json` and `roles/<id>.md`, from the run's
-    /// copy of the fixture the workload binds.
+    /// The eval's own `roles/<id>.json` and `roles/<id>.md`, read once from
+    /// the fixture checkout the workload binds, before the run started.
     Eval,
     /// darkmux's compiled-in role, for a workload bound to no fixture.
     Builtin,

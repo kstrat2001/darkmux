@@ -111,6 +111,11 @@ fn probe_opts() -> DispatchOpts {
     }
 }
 
+/// The eval's role, read once as `lab run` reads it.
+fn eval_inputs(eval: &TempDir) -> LabInputs {
+    LabInputs::load_eval(eval.path(), ROLE).expect("the eval carries its role")
+}
+
 /// Options that reach prompt assembly and stop at model selection: the
 /// registry file does not exist (see `dispatch_appends_no_note_at_the_call_site_for_a_plain_workdir`).
 fn opts(home: &TempDir, role: &str, lab_inputs: Option<LabInputs>) -> DispatchOpts {
@@ -148,7 +153,7 @@ fn a_lab_dispatch_sends_the_evals_role_not_a_stale_copy_in_the_home_folder() {
     let home = home_with_overrides();
     let eval = eval_with_role(PINNED_EVAL_MD);
     let _env = env_for(&home);
-    let lab = Some(LabInputs::Eval { dir: eval.path().to_path_buf() });
+    let lab = Some(eval_inputs(&eval));
 
     let (prompt, err) = dispatched_prompt(opts(&home, ROLE, lab.clone()));
     assert!(err.contains("model selection failed"), "the dispatch reaches the model, and no further: {err}");
@@ -169,24 +174,71 @@ fn a_lab_dispatch_sends_the_evals_role_not_a_stale_copy_in_the_home_folder() {
     );
 }
 
-/// A lab dispatch of a workload bound to a fixture whose eval does not carry
-/// the role is refused, naming the missing file, before any model is chosen.
-/// The home folder's copy is not a fallback.
+/// An eval that does not carry the role is refused when the role is read,
+/// naming the missing file; with nothing loaded there is nothing to
+/// dispatch, and the home folder's copy is not a fallback.
 #[test]
 #[serial]
-fn a_lab_dispatch_whose_eval_lacks_the_role_is_refused_naming_the_file() {
+fn an_eval_that_lacks_the_role_is_refused_naming_the_file() {
     let home = home_with_overrides();
     let eval = eval_with_role(PINNED_EVAL_MD);
     std::fs::remove_file(eval.path().join("roles").join(format!("{ROLE}.md"))).unwrap();
     let _env = env_for(&home);
-    let lab = Some(LabInputs::Eval { dir: eval.path().to_path_buf() });
-
-    let (prompt, err) = dispatched_prompt(opts(&home, ROLE, lab));
+    let err = format!("{:#}", LabInputs::load_eval(eval.path(), ROLE).unwrap_err());
     let missing = eval.path().join("roles").join(format!("{ROLE}.md"));
     assert!(err.contains(&missing.display().to_string()), "names the missing file: {err}");
     assert!(err.contains("the eval must carry its roles"), "says what to do: {err}");
-    assert!(!err.contains("model selection"), "refused before any model is chosen: {err}");
-    assert_eq!(prompt, None, "no prompt is assembled from anywhere else");
+}
+
+/// The role a lab run loaded is the role its dispatch runs: a dispatch of
+/// another role id with those inputs is refused, not run on either.
+#[test]
+#[serial]
+fn a_lab_dispatch_of_another_role_than_the_loaded_one_is_refused() {
+    let home = home_with_overrides();
+    let eval = eval_with_role(PINNED_EVAL_MD);
+    let _env = env_for(&home);
+    let (prompt, err) = dispatched_prompt(opts(&home, "coder", Some(eval_inputs(&eval))));
+    assert!(err.contains("loaded role `web-probe` from the eval, but this dispatch runs `coder`"), "{err}");
+    assert_eq!(prompt, None);
+}
+
+/// (#3363 re-review) The role is read once, before the run writes anything
+/// into its sandbox, and the dispatch uses those bytes. A workload's
+/// `setupContent` writing `roles/coder.md`, a case-folded `Roles/...` (APFS
+/// folds it onto `roles/`), or a path through a `cfg -> roles` link the
+/// fixture carries, lands in the sandbox (the workdir) and changes nothing
+/// the dispatch sends or records.
+#[test]
+#[serial]
+fn writes_into_the_sandbox_after_the_role_is_read_cannot_change_the_prompt() {
+    let home = home_with_overrides();
+    let sandbox = eval_with_role(PINNED_EVAL_MD);
+    std::os::unix::fs::symlink("roles", sandbox.path().join("cfg")).unwrap();
+    let _env = env_for(&home);
+    let lab = eval_inputs(&sandbox);
+    for (n, key) in [format!("roles/{ROLE}.md"), format!("Roles/{ROLE}.md"), format!("cfg/{ROLE}.md")].iter().enumerate() {
+        // What the coding-task provider's setup does with a setupContent key.
+        let evil = format!("# web-probe\n\nREPLACED-BY-SETUP-{n}\n");
+        let target = sandbox.path().join(key);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, &evil).unwrap();
+        // A case-sensitive filesystem (Linux CI) keeps `Roles/` apart; macOS folds it onto `roles/`.
+        let folds_case = sandbox.path().join("ROLES").exists();
+        if folds_case || !key.starts_with("Roles") {
+            assert_eq!(std::fs::read_to_string(sandbox.path().join(format!("roles/{ROLE}.md"))).unwrap(), evil, "precondition: {key} reached roles/");
+        }
+
+        let mut o = opts(&home, ROLE, Some(lab.clone()));
+        o.workdir = Some(sandbox.path().to_path_buf());
+        let (prompt, _) = dispatched_prompt(o);
+        let prompt = prompt.expect("dispatch() assembled a system prompt");
+        assert!(prompt.contains("PINNED-EVAL-PROMPT") && !prompt.contains("REPLACED-BY-SETUP"), "{key}: {prompt}");
+        let mut o = opts(&home, ROLE, Some(lab.clone()));
+        o.workdir = Some(sandbox.path().to_path_buf());
+        let (_, _, _, prov) = container_role(&o, false, &[]).unwrap();
+        assert_eq!(prov.role.unwrap().md_sha256, darkmux_flow::sha256_hex(PINNED_EVAL_MD.as_bytes()), "{key}");
+    }
 }
 
 /// A role manifest in an eval is a user file: an unknown key refuses it the
@@ -201,7 +253,7 @@ fn an_eval_role_with_an_unknown_key_is_refused_like_any_role_manifest() {
     std::fs::write(eval.path().join("roles").join(format!("{ROLE}.json")), doc.to_string()).unwrap();
     let _env = env_for(&home);
 
-    let err = crate::dispatch::check_lab_role(&LabInputs::Eval { dir: eval.path().to_path_buf() }, ROLE).unwrap_err();
+    let err = LabInputs::load_eval(eval.path(), ROLE).unwrap_err();
     let err = format!("{err:#}");
     assert!(err.contains("tool_pallete") && err.contains("tool_palette"), "names the key and the closest one: {err}");
 }
@@ -299,7 +351,7 @@ fn the_hosted_path_leaves_identity_out_of_a_lab_prompt() {
     let home = home_with_overrides();
     let eval = eval_with_role(PINNED_EVAL_MD);
     let _env = env_for(&home);
-    let lab = opts(&home, ROLE, Some(LabInputs::Eval { dir: eval.path().to_path_buf() }));
+    let lab = opts(&home, ROLE, Some(eval_inputs(&eval)));
     let resolved = crate::role_inputs::resolve_role(&lab).unwrap().unwrap();
     let (prompt, prov) = hosted_system_prompt(&lab, &resolved, false).unwrap();
     assert!(prompt.contains("PINNED-EVAL-PROMPT") && !prompt.contains(IDENTITY) && !prompt.contains(HOME_PREAMBLE), "{prompt}");
@@ -358,7 +410,7 @@ fn an_eval_role_whose_id_differs_from_its_file_name_is_refused() {
     let eval = eval_with_role(PINNED_EVAL_MD);
     std::fs::write(eval.path().join("roles").join(format!("{ROLE}.json")), role_json("another-role")).unwrap();
     let _env = env_for(&home);
-    let err = crate::dispatch::check_lab_role(&LabInputs::Eval { dir: eval.path().to_path_buf() }, ROLE).unwrap_err();
+    let err = LabInputs::load_eval(eval.path(), ROLE).unwrap_err();
     let err = format!("{err:#}");
     assert!(err.contains("declares id `another-role`, but the workload runs `web-probe`"), "{err}");
 }
@@ -375,7 +427,7 @@ fn a_utility_eval_role_gets_no_preamble_and_records_a_null_hash() {
     std::fs::write(eval.path().join("roles").join(format!("{ROLE}.json")), doc.to_string()).unwrap();
     let _env = env_for(&home);
 
-    let o = opts(&home, ROLE, Some(LabInputs::Eval { dir: eval.path().to_path_buf() }));
+    let o = opts(&home, ROLE, Some(eval_inputs(&eval)));
     let (_, prompt, _, prov) = container_role(&o, false, &[]).unwrap();
     assert_eq!(prompt, PINNED_EVAL_MD, "the eval's prompt alone, byte for byte");
     let role = prov.role.clone().expect("recorded");
@@ -396,7 +448,7 @@ fn the_container_start_payload_carries_the_hash_beside_system_chars() {
     let home = home_with_overrides();
     let eval = eval_with_role(PINNED_EVAL_MD);
     let _env = env_for(&home);
-    let o = opts(&home, ROLE, Some(LabInputs::Eval { dir: eval.path().to_path_buf() }));
+    let o = opts(&home, ROLE, Some(eval_inputs(&eval)));
     let (_, prompt, _, prov) = container_role(&o, false, &[]).unwrap();
     let payload =
         dispatch_start_payload("img", "msg", &prompt, std::path::Path::new("/ws"), false, None, None, None, &[], &prov)
@@ -448,7 +500,7 @@ fn the_hosted_start_record_carries_the_prompt_hash_and_the_role() {
 /// exactly the bytes this module keeps out.
 #[test]
 #[serial]
-fn a_symlinked_eval_role_file_is_refused_and_never_assembled() {
+fn a_symlinked_eval_role_file_is_refused() {
     let home = home_with_overrides();
     let eval = TempDir::new().unwrap();
     let roles = eval.path().join("roles");
@@ -458,13 +510,8 @@ fn a_symlinked_eval_role_file_is_refused_and_never_assembled() {
             .unwrap();
     }
     let _env = env_for(&home);
-    let lab = LabInputs::Eval { dir: eval.path().to_path_buf() };
-
-    let err = format!("{:#}", crate::dispatch::check_lab_role(&lab, ROLE).unwrap_err());
+    let err = format!("{:#}", LabInputs::load_eval(eval.path(), ROLE).unwrap_err());
     assert!(err.contains(&format!("roles/{ROLE}.json` is a symlink")), "{err}");
-    let (prompt, err) = dispatched_prompt(opts(&home, ROLE, Some(lab)));
-    assert!(err.contains("is a symlink"), "the dispatch refuses it too: {err}");
-    assert_eq!(prompt, None, "the stale text is never assembled");
 }
 
 /// A `roles/` folder that is itself a symlink is refused the same way.
@@ -475,18 +522,9 @@ fn a_symlinked_eval_roles_folder_is_refused() {
     let eval = TempDir::new().unwrap();
     std::os::unix::fs::symlink(home.path().join("roles"), eval.path().join("roles")).unwrap();
     let _env = env_for(&home);
-    let err = crate::dispatch::check_lab_role(&LabInputs::Eval { dir: eval.path().to_path_buf() }, ROLE).unwrap_err();
+    let err = LabInputs::load_eval(eval.path(), ROLE).unwrap_err();
     let err = format!("{err:#}");
     assert!(err.contains("roles` is a symlink") && err.contains("real folder"), "{err}");
-}
-
-/// A fixture-bound workload's lab inputs name its sandbox; an unbound one's
-/// name darkmux's compiled-in roles.
-#[test]
-fn a_fixture_bound_workload_takes_its_role_from_its_sandbox() {
-    let sandbox = std::path::Path::new("/runs/r1/sandbox");
-    assert_eq!(LabInputs::for_workload(true, sandbox), LabInputs::Eval { dir: sandbox.to_path_buf() });
-    assert_eq!(LabInputs::for_workload(false, sandbox), LabInputs::Builtin);
 }
 
 /// The window a lab run records is the one its dispatch's model selection
@@ -512,7 +550,7 @@ fn the_recorded_lab_window_follows_the_evals_role_not_the_home_folders() {
     )
     .unwrap();
     let _env = env_for(&home);
-    let lab = LabInputs::Eval { dir: eval.path().to_path_buf() };
+    let lab = eval_inputs(&eval);
     assert_eq!(dispatch_window(ROLE, Some("mixed"), pf.to_str(), true).unwrap(), Some(32_000), "precondition: the home role");
     assert_eq!(lab_dispatch_window(&lab, ROLE, Some("mixed"), pf.to_str()).unwrap(), Some(128_000));
 }
@@ -524,6 +562,6 @@ fn an_oversized_eval_role_file_is_refused() {
     let home = home_with_overrides();
     let eval = eval_with_role(&"x".repeat(darkmux_types::user_files::MAX_USER_FILE_BYTES as usize + 1));
     let _env = env_for(&home);
-    let err = crate::dispatch::check_lab_role(&LabInputs::Eval { dir: eval.path().to_path_buf() }, ROLE).unwrap_err();
+    let err = LabInputs::load_eval(eval.path(), ROLE).unwrap_err();
     assert!(format!("{err:#}").contains("byte cap for a role file"), "{err:#}");
 }

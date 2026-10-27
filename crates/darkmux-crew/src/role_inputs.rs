@@ -10,7 +10,8 @@
 //! A lab run is a measurement, so its prompt is built only from pinned
 //! inputs ([`crate::dispatch::LabInputs`]): an eval owns its roles, and a
 //! workload bound to a fixture takes `roles/<id>.json` and `roles/<id>.md`
-//! from the run's copy of that fixture, refusing when either is missing; a
+//! from the eval, read once before the run starts and carried as bytes
+//! (nothing reads them again), refusing when either is missing; a
 //! workload bound to none takes darkmux's compiled-in role. The preamble is
 //! always the compiled-in one, and no addition applies. On 2026-10-24 a
 //! stale `~/.darkmux/roles/web-probe.md` replaced an eval's pinned prompt for
@@ -36,6 +37,22 @@ struct LabRole {
     source: RoleInputSource,
     json: String,
     md: String,
+}
+
+/// (#3363) An eval's role, read once before the run starts: the parsed
+/// manifest and the exact bytes of its `.json` and `.md`.
+#[derive(Debug, Clone)]
+pub struct EvalRole {
+    role: Role,
+    json: String,
+    md: String,
+}
+
+impl PartialEq for EvalRole {
+    /// The same bytes: the manifest is parsed from `json`.
+    fn eq(&self, other: &Self) -> bool {
+        (&self.json, &self.md) == (&other.json, &other.md)
+    }
 }
 
 /// A dispatch's role, resolved once. A lab role carries the bytes it was
@@ -81,14 +98,23 @@ pub(crate) fn lab_role(inputs: &LabInputs, role_id: &str) -> Result<Role> {
 
 fn load_lab_role(inputs: &LabInputs, role_id: &str) -> Result<(Role, LabRole)> {
     match inputs {
-        LabInputs::Eval { dir } => load_eval_role(dir, role_id),
+        LabInputs::Eval(eval) => {
+            if eval.role.id != role_id {
+                bail!(
+                    "the lab run loaded role `{}` from the eval, but this dispatch runs `{role_id}`",
+                    eval.role.id
+                );
+            }
+            let lab = LabRole { source: RoleInputSource::Eval, json: eval.json.clone(), md: eval.md.clone() };
+            Ok((eval.role.clone(), lab))
+        }
         LabInputs::Builtin => load_builtin_role(role_id),
     }
 }
 
 /// `<dir>/roles/<role_id>.json` and `.md`, through the same unknown-key gate
-/// and family check every role manifest gets.
-fn load_eval_role(dir: &Path, role_id: &str) -> Result<(Role, LabRole)> {
+/// and family check every role manifest gets. Read once, before the run.
+pub(crate) fn load_eval_role(dir: &Path, role_id: &str) -> Result<EvalRole> {
     let roles_dir = dir.join("roles");
     if is_symlink(&roles_dir) {
         bail!(
@@ -117,7 +143,7 @@ fn load_eval_role(dir: &Path, role_id: &str) -> Result<(Role, LabRole)> {
     crate::loader::validate_role_family(&role, crate::loader::RoleSource::Eval)
         .with_context(|| format!("role manifest {}", json_path.display()))?;
     role.prompt_path = Some(md_path);
-    Ok((role, LabRole { source: RoleInputSource::Eval, json, md }))
+    Ok(EvalRole { role, json, md })
 }
 
 /// Whether `path` itself is a symbolic link (its target is not followed).
@@ -127,7 +153,7 @@ fn is_symlink(path: &Path) -> bool {
 
 /// One of an eval's role files, bounded like every role manifest. A missing
 /// file is the refusal this module exists for: there is no fallback. A
-/// symlink is refused too: the sandbox clone keeps links, and one pointing at
+/// symlink is refused too: the fixture checkout may hold links, and one pointing at
 /// the home folder would deliver its bytes (the link itself is never followed).
 fn read_eval_role_file(path: &Path, role_id: &str) -> Result<String> {
     let cap = darkmux_types::user_files::MAX_USER_FILE_BYTES;

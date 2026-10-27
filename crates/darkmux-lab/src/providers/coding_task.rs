@@ -139,8 +139,8 @@ impl WorkloadProvider for CodingTaskProvider {
         //    dispatch runs: the eval's own for a fixture-bound workload,
         //    darkmux's compiled-in one otherwise, never the home folder's.
         let role_id = pick_role(loaded);
-        let lab_inputs = crate::providers::lab_inputs(loaded, sandbox_dir);
-        if let Ok(role) = darkmux_crew::dispatch::lab_role(&lab_inputs, &role_id) {
+        let role = crate::providers::lab_inputs(loaded).and_then(|i| darkmux_crew::dispatch::lab_role(&i, &role_id));
+        if let Ok(role) = role {
             if !role_can_modify_files(&role.tool_palette) {
                 bail!(
                     "coding-task workload `{}` is paired with role `{}` whose \
@@ -295,7 +295,7 @@ impl WorkloadProvider for CodingTaskProvider {
             loaded.manifest.workload.image.as_deref(),
             config_path,
             out_dir,
-            crate::providers::lab_inputs(loaded, sandbox_dir),
+            loaded,
         )?;
         let duration_ms = started.elapsed().as_millis();
         let (stdout, stderr) = (&dispatched.stdout, &dispatched.stderr);
@@ -517,7 +517,7 @@ fn expand_placeholders_with(input: &str, view_path: &str) -> String {
         .replace("${SANDBOX}", view_path)
 }
 
-pub(crate) fn manifest_seed_path(loaded: &LoadedWorkload) -> Option<String> {
+fn manifest_seed_path(loaded: &LoadedWorkload) -> Option<String> {
     if let Some(s) = loaded.manifest.workload.sandbox_seed.as_ref() {
         return Some(s.clone());
     }
@@ -683,8 +683,10 @@ fn dispatch_via_internal(
     image: Option<&str>,
     config_path: Option<&str>,
     host_out: PathBuf,
-    lab_inputs: darkmux_crew::dispatch::LabInputs,
+    loaded: &LoadedWorkload,
 ) -> Result<(Dispatched, Option<PathBuf>)> {
+    // (#3363) The role `lab run` read from the eval before the run.
+    let lab_inputs = crate::providers::lab_inputs(loaded)?;
     use darkmux_crew::dispatch::{dispatch, DispatchOpts};
     let opts = DispatchOpts {
         finding_sites: None,
@@ -1505,6 +1507,7 @@ mod tests {
             manifest: WorkloadManifest { schema_version: None, workload: spec },
             base_dir,
             source: WorkloadSource::OnDisk,
+            lab_inputs: None,
         }
     }
 
@@ -1764,21 +1767,56 @@ mod tests {
         let mut spec = basic_spec();
         spec.role = Some("coder".into());
         spec.requires_fixture = Some("pg@2.1".into());
-        let loaded = make_loaded(spec, state.join("doc"));
-        let run = |sandbox: &std::path::Path| CodingTaskProvider.setup(&loaded, &state.join("run"), sandbox);
+        // The role `lab run` read from the eval before the run.
+        let run = |eval: &std::path::Path| {
+            let mut loaded = make_loaded(spec.clone(), state.join("doc"));
+            loaded.lab_inputs = Some(darkmux_crew::dispatch::LabInputs::load_eval(eval, "coder").unwrap());
+            CodingTaskProvider.setup(&loaded, &state.join("run"), &state.join("sandbox"))
+        };
 
         // The home folder's coder denies edit and write; the eval's allows them.
         write_role(&home, &denying);
-        let allowing = state.join("sandbox-allowing");
+        let allowing = state.join("eval-allowing");
         write_role(&allowing, &builtin);
         run(&allowing).expect("the eval's coder can edit, whatever the home folder says");
 
         // The reverse: the home folder's coder allows, the eval's denies.
         write_role(&home, &builtin);
-        let denied = state.join("sandbox-denying");
+        let denied = state.join("eval-denying");
         write_role(&denied, &denying);
         let err = run(&denied).expect_err("the eval's coder cannot edit").to_string();
         assert!(err.contains("denies both `edit` and `write`"), "{err}");
+    }
+
+    /// (#3363) The coding-task dispatch runs the role `lab run` read from the
+    /// eval, never darkmux's compiled-in one: `probe-3363` exists only in the
+    /// eval, so the dispatch gets as far as model selection, where the
+    /// compiled-in lookup would refuse it as not built in.
+    #[test]
+    #[serial_test::serial]
+    fn a_fixture_bound_coding_task_dispatches_the_role_read_from_the_eval() {
+        let state = darkmux_types::test_isolation::IsolatedState::new();
+        let eval = state.join("eval");
+        fs::create_dir_all(eval.join("roles")).unwrap();
+        let role = serde_json::json!({"id": "probe-3363", "description": "d", "tool_palette": {"allow": ["read", "edit", "write"], "deny": []},
+            "escalation_contract": "bail-with-explanation"});
+        fs::write(eval.join("roles/probe-3363.json"), role.to_string()).unwrap();
+        fs::write(eval.join("roles/probe-3363.md"), "# probe\n").unwrap();
+        let mut spec = basic_spec();
+        spec.role = Some("probe-3363".into());
+        spec.requires_fixture = Some("pg@2.1".into());
+        let mut loaded = make_loaded(spec, state.join("doc"));
+        loaded.lab_inputs = Some(darkmux_crew::dispatch::LabInputs::load_eval(&eval, "probe-3363").unwrap());
+        let (run_dir, sandbox) = (state.join("run"), state.join("sandbox"));
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::create_dir_all(&sandbox).unwrap();
+        let registry = state.join("no-such-profiles-3363.json");
+        let err = CodingTaskProvider
+            .run(&loaded, &run_dir, &sandbox, &darkmux_types::Profile::default(), "p", registry.to_str(), None,
+                &darkmux_types::session_id::RunId::lab("r3363").unwrap(), &mut |_: &darkmux_types::session_id::SessionId| {})
+            .unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("model selection failed") && !err.contains("built-in roles"), "{err}");
     }
 
     #[test]

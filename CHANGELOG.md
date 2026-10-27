@@ -31,10 +31,11 @@ darkmux release.
   compiled-in role; a role darkmux does not compile in is refused there too.
   Either way a lab run uses darkmux's compiled-in preamble, and its prompt
   never takes anything from `~/.darkmux/roles/`, the preamble override,
-  `identity.md` or the workspace notes. The coding-task tool check and the
-  tool bench's recorded window read the same role. A fixture-bound
-  coding-task workload may no longer write under `roles/` through
-  `setupContent` or its sandbox seed. Not yet pinned: model selection still
+  `identity.md` or the workspace notes. `lab run` reads the eval's role once,
+  before the run starts, and every dispatch, the coding-task tool check and
+  the tool bench's recorded window use those bytes, so nothing a run writes
+  into its sandbox (`setupContent`, a seed, a link) can change the role. Not
+  yet pinned: model selection still
   reads the skill manifests a role names from the home folder's `skills/`, and
   a malformed role file in `~/.darkmux/roles/` still refuses a lab run at
   preflight even though the run does not read it. On 2026-10-24 a stale

@@ -241,7 +241,7 @@ fn every_builtin_workload_bound_to_a_builtin_fixture_finds_its_role_there() {
             user_fixture.push(id);
             continue;
         };
-        darkmux_crew::dispatch::check_lab_role(&darkmux_crew::dispatch::LabInputs::Eval { dir: dir.clone() }, role)
+        darkmux_crew::dispatch::LabInputs::load_eval(dir, role)
             .unwrap_or_else(|e| panic!("{path:?}: {e:#}"));
         checked += 1;
     }
