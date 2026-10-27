@@ -29,8 +29,11 @@ pub const BUNDLE_FORMAT: &str = "darkmux-evals-bundle";
 /// is still written as 3, without those keys, so a site that reads only 3
 /// keeps taking every other result. 5 adds the eval's own workload document
 /// each run used (`workloadPath`, `workloadSha256`, #3361), which every
-/// bundle `lab submit` writes carries.
-pub const BUNDLE_FORMAT_VERSION: u64 = 5;
+/// bundle `lab submit` writes carries. 6 adds each run's criteria, met or
+/// missed (`criteria`, #3386), written only when a run's grader recorded them.
+pub const BUNDLE_FORMAT_VERSION: u64 = 6;
+/// The version a bundle naming its workloads, with no criteria, is written as.
+const BUNDLE_FORMAT_VERSION_WORKLOAD: u64 = 5;
 /// The version a bundle with format 4's fields and no workload is written as.
 const BUNDLE_FORMAT_VERSION_FIELDS: u64 = 4;
 /// The version a bundle with nothing format 4 added is written as.
@@ -522,7 +525,28 @@ pub fn bundle_run(run_id: &str, manifest: &Value, stats: &Value, ran_by: &RanBy,
         "startedAt": started.map(iso_utc),
         "stack": with_reply_cap(stack.to_json(), manifest),
         "detail": detail_from(manifest, stats, names),
+        "criteria": criteria_from(manifest),
     })
+}
+
+/// (#3386) Each criterion the grader recorded (`verify.grade.criteria`), as
+/// `{id, passed}`; null when it recorded none.
+pub fn criteria_from(manifest: &Value) -> Value {
+    let Some(list) = manifest.pointer("/verify/grade/criteria").and_then(Value::as_array) else {
+        return Value::Null;
+    };
+    let results: Option<Vec<Value>> = list
+        .iter()
+        .map(|c| {
+            let id = c.get("id").and_then(Value::as_str)?;
+            let passed = c.get("passed").and_then(Value::as_bool)?;
+            Some(json!({ "id": id, "passed": passed }))
+        })
+        .collect();
+    match results {
+        Some(r) if !r.is_empty() => Value::Array(r),
+        _ => Value::Null,
+    }
 }
 
 /// The stack with the reply cap the run's dispatch sent (`replyRoom`), null
@@ -580,11 +604,20 @@ pub fn assemble(repo: &str, commit_sha: &str, fixture_manifest: &Value, runs: Ve
     }))
 }
 
-/// Format 4 when any run carries what 4 added; otherwise 3, with those keys
-/// (null in every run) left out.
+/// Format 6 when any run carries criteria; otherwise without that key, 5
+/// when any names its workload, 4 when any carries what 4 added, else 3,
+/// with those keys (null in every run) left out.
 fn format_for(mut runs: Vec<Value>) -> (u64, Vec<Value>) {
-    if runs.iter().any(|r| r.get("workloadSha256").is_some_and(|v| !v.is_null())) {
+    if runs.iter().any(|r| r.get("criteria").is_some_and(|v| !v.is_null())) {
         return (BUNDLE_FORMAT_VERSION, runs);
+    }
+    for r in &mut runs {
+        if let Some(run) = r.as_object_mut() {
+            run.remove("criteria");
+        }
+    }
+    if runs.iter().any(|r| r.get("workloadSha256").is_some_and(|v| !v.is_null())) {
+        return (BUNDLE_FORMAT_VERSION_WORKLOAD, runs);
     }
     let carries = |r: &Value| {
         !r["stack"]["maxCompletionTokens"].is_null()

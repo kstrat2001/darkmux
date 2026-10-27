@@ -204,6 +204,12 @@ fn apply_inject_context(
 /// [`workload_for_run`].
 fn prepare_workload(loaded: &mut crate::workloads::types::LoadedWorkload, ctx: Option<&str>) -> Result<()> {
     refuse_keys_another_provider_ignores(loaded)?;
+    // (#3386) A criteria registry the grader cannot grade is refused before any
+    // model runs; its anchors are checked against the fixture when it grades.
+    if let Some(spec) = loaded.manifest.workload.verify.as_ref().and_then(|v| v.grade.as_ref()) {
+        crate::lab::grade::check_criteria(spec, None)
+            .with_context(|| format!("workload \"{}\"", loaded.manifest.workload.id))?;
+    }
     if !context_reads_the_run_copy(loaded) {
         let base_dir = loaded.base_dir.clone();
         apply_inject_context(loaded, ctx, &base_dir);

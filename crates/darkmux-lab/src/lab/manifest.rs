@@ -162,9 +162,21 @@ pub struct GradeRecord {
     /// Why the ungraded verdict failed, when it did, kept for the same reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ungraded_details: Option<String>,
+    /// (#3386) Each criterion the workload declares (`verify.grade.criteria`),
+    /// met or missed, in its order; none when it declares none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub criteria: Option<Vec<CriterionResult>>,
     /// A key this type does not name (a newer darkmux's field), kept.
     #[serde(flatten)]
     pub extras: Map<String, Value>,
+}
+
+/// (#3386) One criterion, met or missed: what `lab submit` shares as the run's
+/// `criteria` (bundle format 6).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct CriterionResult {
+    pub id: String,
+    pub passed: bool,
 }
 
 /// One grader check.

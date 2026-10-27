@@ -132,6 +132,34 @@ fn format_4_only_when_a_run_carries_what_it_added() {
     assert!(three["runs"][0]["detail"]["verify"].get("fieldsExpected").is_none());
 }
 
+/// (#3386) A run whose grader recorded criteria shares them, each id with
+/// met or missed, as format 6 (the site's `tests/fixtures/darkmux_evals/criteria`
+/// sample). A bundle with none stays format 5 or older, without the key, so a
+/// site that reads only 5 keeps taking it.
+#[test]
+fn format_6_only_when_a_run_carries_criteria() {
+    let mut m = manifest();
+    m["verify"] = json!({"passed": false, "details": "d", "grade": {"passed": false, "checks": [],
+        "criteria": [{"id": "raw-body", "passed": false}, {"id": "timestamp-tolerance", "passed": true}]}});
+    let mut graded = bundle_run("r", &m, &stats(), &RanBy::default(), &stack(), &[]);
+    graded["workloadPath"] = json!("eval/workloads/w.json");
+    graded["workloadSha256"] = json!("b".repeat(64));
+    let mut plain = bundle_run("q", &manifest(), &stats(), &RanBy::default(), &stack(), &[]);
+    plain["workloadPath"] = json!("eval/workloads/w.json");
+    plain["workloadSha256"] = json!("b".repeat(64));
+    let fixture = json!({ "name": "webhook-forgery", "version": "1.2" });
+    let six = assemble("kstrat2001/webhook-forgery-eval", &"a".repeat(40), &fixture, vec![graded, plain.clone()]).unwrap();
+    assert_eq!(six["formatVersion"], 6);
+    assert_eq!(
+        six["runs"][0]["criteria"],
+        json!([{"id": "raw-body", "passed": false}, {"id": "timestamp-tolerance", "passed": true}])
+    );
+    assert!(six["runs"][1]["criteria"].is_null(), "the other run says null");
+    let five = assemble("kstrat2001/webhook-forgery-eval", &"a".repeat(40), &fixture, vec![plain]).unwrap();
+    assert_eq!(five["formatVersion"], 5, "no criteria: still format 5");
+    assert!(five["runs"][0].get("criteria").is_none());
+}
+
 /// Counts that do not add up are sent as nothing, the site's own rule.
 #[test]
 fn a_fields_count_that_does_not_add_up_is_left_out() {

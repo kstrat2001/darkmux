@@ -80,12 +80,14 @@ fn spec() -> GradeSpec {
                 file: "src/a.txt".into(),
                 find: "value=1".into(),
                 replace: "value=9".into(),
+                criterion: None,
             }],
         }),
         reply: Some(ReplyGrade {
             asks: vec!["Say what you did.".into()],
             required: true,
         }),
+        criteria: None,
     }
 }
 
@@ -1410,6 +1412,7 @@ fn surviving_bugs_of_one_behavior_are_named_together() {
         file: "src/a.txt".into(),
         find: "value=1".into(),
         replace: "value=8".into(),
+        criterion: None,
     });
     let record = run(&s, &f, &r, DispatchEnd::Completed, Some("done"), tmp.path()).unwrap();
     let ev = &record
@@ -1456,4 +1459,141 @@ fn the_eval_folder_is_not_a_deletion() {
     fs::write(result.join("eval/planted.txt"), "x").unwrap();
     let changes = super::files::compare(&fixture, &result).unwrap();
     assert_eq!(changes.added, vec!["eval/planted.txt".to_string()]);
+}
+
+// (#3386) Criteria: each met or missed, recorded with the run.
+
+fn criterion(id: &str, anchor: &str, tests: &[&str]) -> Criterion {
+    Criterion {
+        id: id.into(),
+        name: id.into(),
+        description: format!("{id} is graded"),
+        source: CriterionSource {
+            path: "src/a.txt".into(),
+            anchor: anchor.into(),
+        },
+        tests: tests.iter().map(|t| t.to_string()).collect(),
+    }
+}
+
+fn bug(criterion: &str, find: &str, replace: &str) -> Mutant {
+    Mutant {
+        behavior: criterion.into(),
+        file: "src/a.txt".into(),
+        find: find.into(),
+        replace: replace.into(),
+        criterion: Some(criterion.into()),
+    }
+}
+
+/// A spec whose planted bugs and test names grade five criteria, on a
+/// fixture with a third line no test checks.
+fn criteria_spec() -> GradeSpec {
+    let mut s = spec();
+    s.behaviors.as_mut().unwrap().mutants = vec![
+        bug("value-checked", "value=1", "value=9"),
+        bug("other-checked", "other=2", "other=7"),
+        bug("third-checked", "third=3", "third=4"),
+    ];
+    s.criteria = Some(vec![
+        criterion("value-checked", "value=1", &[]),
+        criterion("other-checked", "other=2", &[]),
+        criterion("third-checked", "third=3", &[]),
+        criterion("b-passes", "value=1\nother", &["test/b.t"]),
+        criterion("missing-passes", "third", &["test/missing.t"]),
+    ]);
+    s
+}
+
+fn criteria_fixture(root: &Path) -> PathBuf {
+    let f = fixture(root);
+    write(&f, "src/a.txt", "value=1\nother=2\nthird=3\n");
+    f
+}
+
+fn results(record: &GradeRecord) -> Vec<(String, bool)> {
+    record
+        .criteria
+        .as_ref()
+        .expect("criteria recorded")
+        .iter()
+        .map(|c| (c.id.clone(), c.passed))
+        .collect()
+}
+
+#[test]
+fn each_criterion_is_recorded_met_or_missed_in_the_registry_order() {
+    let tmp = TempDir::new().unwrap();
+    let f = criteria_fixture(tmp.path());
+    let r = result_from(tmp.path(), &f);
+    write(&r, "test/b.t", "value=1");
+    let record = run(&criteria_spec(), &f, &r, DispatchEnd::Completed, Some("done"), tmp.path()).unwrap();
+    assert_eq!(
+        results(&record),
+        [
+            ("value-checked".to_string(), true),
+            ("other-checked".to_string(), true),
+            // No test reads the third line: its planted bug survives.
+            ("third-checked".to_string(), false),
+            ("b-passes".to_string(), true),
+            ("missing-passes".to_string(), false),
+        ]
+    );
+}
+
+#[test]
+fn every_criterion_is_missed_when_the_suite_is_red() {
+    let tmp = TempDir::new().unwrap();
+    let f = criteria_fixture(tmp.path());
+    let r = result_from(tmp.path(), &f);
+    write(&r, "test/b.t", "value=1");
+    write(&r, "test/c.t", "nowhere=0");
+    let record = run(&criteria_spec(), &f, &r, DispatchEnd::Completed, Some("done"), tmp.path()).unwrap();
+    // test/b.t still passes by name; the planted bugs could not be graded.
+    assert_eq!(
+        results(&record),
+        [
+            ("value-checked".to_string(), false),
+            ("other-checked".to_string(), false),
+            ("third-checked".to_string(), false),
+            ("b-passes".to_string(), true),
+            ("missing-passes".to_string(), false),
+        ]
+    );
+}
+
+#[test]
+fn a_workload_without_criteria_records_none() {
+    let tmp = TempDir::new().unwrap();
+    let f = fixture(tmp.path());
+    let r = result_from(tmp.path(), &f);
+    write(&r, "test/b.t", "value=1");
+    let record = run(&spec(), &f, &r, DispatchEnd::Completed, Some("done"), tmp.path()).unwrap();
+    assert!(record.criteria.is_none());
+}
+
+#[test]
+fn a_registry_that_cannot_be_graded_refuses_to_grade_naming_why() {
+    let tmp = TempDir::new().unwrap();
+    let f = criteria_fixture(tmp.path());
+    let r = result_from(tmp.path(), &f);
+    let refused = |edit: &dyn Fn(&mut GradeSpec)| {
+        let mut s = criteria_spec();
+        edit(&mut s);
+        format!("{:#}", run(&s, &f, &r, DispatchEnd::Completed, Some("done"), tmp.path()).unwrap_err())
+    };
+    let undeclared = refused(&|s| s.behaviors.as_mut().unwrap().mutants[0].criterion = Some("made-up".into()));
+    assert!(undeclared.contains("made-up") && undeclared.contains("not declared"), "{undeclared}");
+    let ungraded = refused(&|s| s.criteria.as_mut().unwrap()[3].tests.clear());
+    assert!(ungraded.contains("b-passes") && ungraded.contains("graded by nothing"), "{ungraded}");
+    let twice = refused(&|s| s.criteria.as_mut().unwrap()[1].id = "value-checked".into());
+    assert!(twice.contains("value-checked") && twice.contains("twice"), "{twice}");
+    let bad_id = refused(&|s| s.criteria.as_mut().unwrap()[0].id = "Value Checked".into());
+    assert!(bad_id.contains("Value Checked"), "{bad_id}");
+    let gone = refused(&|s| s.criteria.as_mut().unwrap()[0].source.anchor = "not in the file".into());
+    assert!(gone.contains("src/a.txt") && gone.contains("exactly once"), "{gone}");
+    let repeated = refused(&|s| s.criteria.as_mut().unwrap()[0].source.anchor = "=".into());
+    assert!(repeated.contains("exactly once"), "{repeated}");
+    let outside = refused(&|s| s.criteria.as_mut().unwrap()[0].source.path = "../a.txt".into());
+    assert!(outside.contains("../a.txt"), "{outside}");
 }
