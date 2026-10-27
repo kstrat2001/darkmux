@@ -30,6 +30,42 @@ pub(crate) struct GradeSpec {
     pub behaviors: Option<BehaviorsGrade>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply: Option<ReplyGrade>,
+    /// (#3386) What the eval grades, named: each criterion met or missed is
+    /// recorded with the run, and the evals site shows which a run missed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub criteria: Option<Vec<Criterion>>,
+}
+
+/// (#3386) One thing the eval grades, as readers see it. It is graded by the
+/// planted bugs that name it (`Mutant::criterion`: met when every one turns
+/// the suite red) and by the tests it names (`tests`: met when every one
+/// passes in the grader's run of the suite), both when it has both. The
+/// evals site reads `id`, `name`, `description` and `source` from the
+/// workload at the eval's commit and links each to `source`.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct Criterion {
+    /// A slug: lowercase letters, digits and `-`, at most 48 characters.
+    pub id: String,
+    /// At most 60 characters.
+    pub name: String,
+    /// What a run must do to meet it, at most 280 characters.
+    pub description: String,
+    /// Where it is defined in the eval's repo.
+    pub source: CriterionSource,
+    /// Test names, as the suite's report names them, that must all pass.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tests: Vec<String>,
+}
+
+/// A file in the eval's repo and a piece of its text that occurs there
+/// exactly once (a test's name, a planted bug's `find`): the site links to
+/// the lines it spans at the eval's commit.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct CriterionSource {
+    /// Relative to the repo root, plain names joined by `/`.
+    pub path: String,
+    /// At most 500 characters.
+    pub anchor: String,
 }
 
 /// The test results format a suite command writes to `${REPORT}`.
@@ -108,6 +144,9 @@ pub(crate) struct Mutant {
     /// Text that occurs exactly once in the fixture's file.
     pub find: String,
     pub replace: String,
+    /// (#3386) The criterion (`verify.grade.criteria[].id`) this bug tests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub criterion: Option<String>,
 }
 
 /// `required: true`: the run must end with a final reply. Its content is

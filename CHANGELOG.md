@@ -14,6 +14,28 @@ darkmux release.
 
 ## [Unreleased]
 
+### Added
+
+- **Eval criteria (#3386).** A workload can name what it grades in
+  `verify.grade.criteria`. Each criterion has an `id`, a `name`, a
+  `description` and a `source` (a file in the eval's repo, plus anchor text
+  that occurs there exactly once). A criterion is graded in two ways:
+  - by the planted bugs that name it (`criterion` on a mutant), met when every
+    one of them turns the suite red;
+  - by the tests it lists in `tests`, met when every one passes.
+
+  The grader records each criterion as met or missed in the run's manifest
+  (`verify.grade.criteria`, manifest schema 10). `lab submit` shares them as
+  bundle format 6, so the evals site can show which criteria a run missed.
+  A bundle without criteria is still written as format 5.
+  `lab run` refuses a registry it cannot grade, anchors included, before any
+  model loads.
+- A criteria registry the grader cannot grade is refused before a run, naming
+  every problem: an undeclared or ungraded criterion, a repeated id, or an
+  anchor that is not in its file exactly once.
+- To add criteria to runs shared before their eval declared any, grade each kept
+  run again with `darkmux lab grade <run> --record` and share it again.
+
 ## [5.7.1] - 2026-10-25
 
 A darkmux installed from a release tag with `cargo install --git` (the Linux

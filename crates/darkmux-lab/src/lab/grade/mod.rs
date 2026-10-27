@@ -43,7 +43,7 @@ use crate::lab::dispatch_end::DispatchEnd;
 use darkmux_crew::bounded_command::Bounded;
 use darkmux_crew::contained_command;
 use crate::lab::manifest::{
-    GradeCheck, GradeRecord, ManifestVerify, ManifestVerifyReport, RunManifest,
+    CriterionResult, GradeCheck, GradeRecord, ManifestVerify, ManifestVerifyReport, RunManifest,
 };
 use crate::lab::verify_gate::WorkGateResult;
 use crate::workloads::grade_spec::{GradeSpec, SuiteGrade, TestReport};
@@ -116,6 +116,7 @@ impl<'a> Copies<'a> {
 /// a suite that could not be started): the caller fails the run closed.
 pub(crate) fn grade(input: &GradeInput) -> Result<GradeRecord> {
     check_asks(input.spec, input.prompt)?;
+    check_criteria(input.spec, Some(input.fixture))?;
     let changes = files::compare(input.fixture, input.result)?;
     let copies = Copies::new(input.work);
     let mut checks = vec![run_finished(input.dispatch, input.result_kind)];
@@ -124,14 +125,185 @@ pub(crate) fn grade(input: &GradeInput) -> Result<GradeRecord> {
     checks.extend(suite_checks);
     checks.extend(style_row(input, &changes)?);
     let green = run.as_ref().is_some_and(|run| run.green());
-    checks.extend(behaviors_row(input, green, &copies)?);
+    let (behaviors, survived) = behaviors_row(input, green, &copies)?;
+    checks.extend(behaviors);
     checks.extend(reply_row(input));
     Ok(GradeRecord {
         passed: checks.iter().all(|c| c.passed),
         checks,
+        criteria: criteria_met(input.spec, survived.as_deref(), run.as_ref()),
         tests_passed: run.and_then(|run| run.counts.as_ref().map(|c| c.passed())),
         ..Default::default()
     })
+}
+
+/// (#3386) Each declared criterion, met or missed, in the registry's order.
+/// A criterion is met when every planted bug that names it turned the suite
+/// red (`survived` lists the bugs, by index, that did not; `None` when the
+/// bugs could not be graded, so none is met) and every test it names passed
+/// in the grader's run of the suite.
+fn criteria_met(
+    spec: &GradeSpec,
+    survived: Option<&[usize]>,
+    run: Option<&SuiteRun>,
+) -> Option<Vec<CriterionResult>> {
+    let criteria = spec.criteria.as_ref()?;
+    let mutants = spec.behaviors.as_ref().map_or(&[][..], |b| &b.mutants[..]);
+    let passing: Vec<&str> = run
+        .and_then(|r| r.counts.as_ref())
+        .map(|c| c.passing.iter().map(String::as_str).collect())
+        .unwrap_or_default();
+    Some(
+        criteria
+            .iter()
+            .map(|c| {
+                let bugs_caught = mutants
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, m)| m.criterion.as_deref() == Some(c.id.as_str()))
+                    .all(|(i, _)| survived.is_some_and(|s| !s.contains(&i)));
+                let tests_pass = c.tests.iter().all(|t| passing.contains(&t.as_str()));
+                CriterionResult {
+                    id: c.id.clone(),
+                    passed: bugs_caught && tests_pass,
+                }
+            })
+            .collect(),
+    )
+}
+
+/// The longest criterion id, name, description and anchor, and how many
+/// criteria a workload may declare: the evals site's own bounds.
+const MAX_CRITERIA: usize = 50;
+const MAX_CRITERION_ID: usize = 48;
+const MAX_CRITERION_NAME: usize = 60;
+const MAX_CRITERION_DESCRIPTION: usize = 280;
+const MAX_ANCHOR: usize = 500;
+
+/// (#3386) A criteria registry the grader can grade and the evals site can
+/// link: ids are unique slugs, every planted bug's `criterion` is declared,
+/// every criterion is graded by a planted bug or a named test, and, given
+/// the fixture checkout `root`, each `source.anchor` occurs exactly once in
+/// its `source.path` (the site places the link there). Every problem is
+/// named, not only the first.
+pub(crate) fn check_criteria(spec: &GradeSpec, root: Option<&Path>) -> Result<()> {
+    let mutants = spec.behaviors.as_ref().map_or(&[][..], |b| &b.mutants[..]);
+    let Some(criteria) = &spec.criteria else {
+        return match mutants.iter().find_map(|m| m.criterion.as_deref()) {
+            Some(id) => bail!(
+                "verify.grade.behaviors: a planted bug names criterion \"{id}\", but the workload declares no verify.grade.criteria"
+            ),
+            None => Ok(()),
+        };
+    };
+    let mut problems = Vec::new();
+    if criteria.is_empty() || criteria.len() > MAX_CRITERIA {
+        problems.push(format!("declare 1 to {MAX_CRITERIA} criteria, not {}", criteria.len()));
+    }
+    for (i, c) in criteria.iter().enumerate() {
+        let at = format!("criteria[{i}] ({})", c.id);
+        problems.extend(criterion_shape_problems(&at, c, &criteria[..i]));
+        problems.extend(criterion_grading_problems(&at, c, mutants, spec.suite.is_some()));
+        problems.extend(criterion_source_problem(&at, c, root));
+    }
+    problems.extend(undeclared_criteria(mutants, criteria));
+    if problems.is_empty() {
+        return Ok(());
+    }
+    bail!("verify.grade.criteria cannot be graded:\n  {}", problems.join("\n  "))
+}
+
+/// A criterion id: lowercase letters, digits and `-`, not starting with `-`.
+fn is_criterion_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_CRITERION_ID
+        && !id.starts_with('-')
+        && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Its id a slug not used by an earlier criterion, its texts within the site's bounds.
+fn criterion_shape_problems(
+    at: &str,
+    c: &crate::workloads::grade_spec::Criterion,
+    earlier: &[crate::workloads::grade_spec::Criterion],
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    if !is_criterion_id(&c.id) {
+        problems.push(format!(
+            "{at}: an id is lowercase letters, digits and `-`, at most {MAX_CRITERION_ID} characters"
+        ));
+    }
+    if earlier.iter().any(|o| o.id == c.id) {
+        problems.push(format!("{at}: declared twice"));
+    }
+    for (key, text, max) in [
+        ("name", &c.name, MAX_CRITERION_NAME),
+        ("description", &c.description, MAX_CRITERION_DESCRIPTION),
+        ("source.anchor", &c.source.anchor, MAX_ANCHOR),
+    ] {
+        if text.trim().is_empty() || text.chars().count() > max {
+            problems.push(format!("{at}: {key} is 1 to {max} characters"));
+        }
+    }
+    problems
+}
+
+/// Graded by a planted bug that names it or by the tests it names (which need a suite).
+fn criterion_grading_problems(
+    at: &str,
+    c: &crate::workloads::grade_spec::Criterion,
+    mutants: &[crate::workloads::grade_spec::Mutant],
+    has_suite: bool,
+) -> Vec<String> {
+    let named = mutants.iter().any(|m| m.criterion.as_deref() == Some(c.id.as_str()));
+    let mut problems = Vec::new();
+    if c.tests.is_empty() && !named {
+        problems.push(format!(
+            "{at}: graded by nothing (no planted bug names it and it names no tests)"
+        ));
+    }
+    if !c.tests.is_empty() && !has_suite {
+        problems.push(format!("{at}: names tests, which need verify.grade.suite"));
+    }
+    problems
+}
+
+/// Its source a plain path in the repo; given the checkout `root`, a file
+/// holding its anchor exactly once.
+fn criterion_source_problem(
+    at: &str,
+    c: &crate::workloads::grade_spec::Criterion,
+    root: Option<&Path>,
+) -> Option<String> {
+    let path = &c.source.path;
+    if path.is_empty() || !path.split('/').all(crate::lab::fixture::is_plain_name) {
+        return Some(format!("{at}: source.path {path} is not a plain path inside the repo"));
+    }
+    let text = fs::read_to_string(root?.join(path));
+    match text.map(|t| t.matches(c.source.anchor.as_str()).count()) {
+        Ok(1) => None,
+        Ok(n) => Some(format!("{at}: its anchor occurs {n} times in {path}, not exactly once")),
+        Err(_) => Some(format!(
+            "{at}: {path} is not a readable file in the fixture, so its anchor is not there exactly once"
+        )),
+    }
+}
+
+/// Each planted bug naming a criterion the registry does not declare.
+fn undeclared_criteria(
+    mutants: &[crate::workloads::grade_spec::Mutant],
+    criteria: &[crate::workloads::grade_spec::Criterion],
+) -> Vec<String> {
+    mutants
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| {
+            let id = m.criterion.as_deref()?;
+            (!criteria.iter().any(|c| c.id == id)).then(|| {
+                format!("behaviors.mutants[{i}]: criterion \"{id}\" is not declared in verify.grade.criteria")
+            })
+        })
+        .collect()
 }
 
 /// The suite's row and, when declared, the portable row, with the suite's
@@ -213,24 +385,27 @@ fn style_row(input: &GradeInput, changes: &files::Changes) -> Result<Option<Grad
     )))
 }
 
+/// The behaviors row, and the planted bugs (by index) the suite stayed green
+/// through: `None` when they could not be graded (no behaviors declared, a
+/// red suite, or tests that check the source text).
 fn behaviors_row(
     input: &GradeInput,
     suite_green: bool,
     copies: &Copies,
-) -> Result<Option<GradeCheck>> {
+) -> Result<(Option<GradeCheck>, Option<Vec<usize>>)> {
     let Some(behaviors) = &input.spec.behaviors else {
-        return Ok(None);
+        return Ok((None, None));
     };
-    let problems = if suite_green {
+    let (problems, survived) = if suite_green {
         missed_behaviors(input, behaviors, copies)?
     } else {
-        vec!["not graded: the suite is red without any planted bug".to_string()]
+        (vec!["not graded: the suite is red without any planted bug".to_string()], None)
     };
     let caught = format!(
         "every planted bug turns the suite red ({})",
         behavior_names(behaviors).join(", ")
     );
-    Ok(Some(row("behaviors", &behaviors.asks, problems, &caught)))
+    Ok((Some(row("behaviors", &behaviors.asks, problems, &caught)), survived))
 }
 
 fn reply_row(input: &GradeInput) -> Option<GradeCheck> {
@@ -498,7 +673,9 @@ fn behavior_names(spec: &crate::workloads::grade_spec::BehaviorsGrade) -> Vec<St
     names
 }
 
-/// Run every planted bug; return one problem per behavior a bug survived in.
+/// Run every planted bug; return one problem per behavior a bug survived in,
+/// and the bugs (by index) that survived (`None` when the control failed and
+/// no bug was graded).
 ///
 /// First, a control: each file a bug is planted in gets an edit that changes
 /// no behavior (a trailing blank line), written the same way. The suite must
@@ -509,7 +686,7 @@ fn missed_behaviors(
     input: &GradeInput,
     spec: &crate::workloads::grade_spec::BehaviorsGrade,
     copies: &Copies,
-) -> Result<Vec<String>> {
+) -> Result<(Vec<String>, Option<Vec<usize>>)> {
     let suite = input
         .spec
         .suite
@@ -517,9 +694,11 @@ fn missed_behaviors(
         .ok_or_else(|| anyhow!("verify.grade.behaviors needs a suite"))?;
     let originals = planted_files(input.fixture, spec)?;
     if let Some(problem) = control_problem(input, spec, suite, copies, &originals)? {
-        return Ok(vec![problem]);
+        return Ok((vec![problem], None));
     }
-    Ok(surviving_bugs(input, spec, suite, copies, &originals)?
+    let survived = surviving_bugs(input, spec, suite, copies, &originals)?;
+    let indices = survived.iter().flat_map(|(_, ids)| ids.iter().map(|i| i - 1)).collect();
+    let problems = survived
         .into_iter()
         .map(|(b, ids)| {
             let ids: Vec<String> = ids.iter().map(|i| format!("#{i}")).collect();
@@ -528,7 +707,8 @@ fn missed_behaviors(
                 ids.join(", ")
             )
         })
-        .collect())
+        .collect();
+    Ok((problems, Some(indices)))
 }
 
 /// Each behavior with a planted bug the suite stayed green through, and the
@@ -865,8 +1045,8 @@ pub(crate) fn record(
         format!("{}; {}", ungraded.details, summary(&record))
     };
     report.grade = Some(record.clone());
-    // v9: `verify.grade`.
-    manifest.raise_schema_version(9);
+    // v9: `verify.grade`; v10: its `criteria` (#3386).
+    manifest.raise_schema_version(if record.criteria.is_some() { 10 } else { 9 });
     manifest.write(run_dir)?;
     Ok(record)
 }
