@@ -1007,6 +1007,36 @@ impl Ungraded {
     }
 }
 
+/// The manifest's verify report, created empty when the run has none yet.
+/// A `verify` that is not an object is refused rather than overwritten.
+fn verify_report_mut(manifest: &mut RunManifest) -> Result<&mut ManifestVerifyReport> {
+    if !matches!(manifest.verify, Some(Some(_))) {
+        manifest.verify = Some(Some(ManifestVerify::Report(Box::new(ManifestVerifyReport {
+            passed: true,
+            details: String::new(),
+            work_gate: None,
+            grade: None,
+            extras: Default::default(),
+        }))));
+    }
+    match manifest.verify.as_mut() {
+        Some(Some(ManifestVerify::Report(report))) => Ok(report.as_mut()),
+        _ => bail!("manifest `verify` is not a JSON object: cannot record a grade"),
+    }
+}
+
+/// The verify details a graded run records: the grade's summary, after the
+/// ungraded check's failure when it failed.
+fn graded_details(ungraded: &Ungraded, record: &GradeRecord) -> String {
+    if ungraded.passed {
+        summary(record)
+    } else if ungraded.details.is_empty() {
+        format!("ungraded check failed; {}", summary(record))
+    } else {
+        format!("{}; {}", ungraded.details, summary(record))
+    }
+}
+
 /// Write a record into the run's manifest. The verdict is the ungraded one
 /// AND the grader's.
 pub(crate) fn record(
@@ -1015,35 +1045,11 @@ pub(crate) fn record(
     ungraded: &Ungraded,
 ) -> Result<GradeRecord> {
     let mut manifest = RunManifest::read(run_dir)?;
-    let report = match manifest.verify.as_mut() {
-        Some(Some(ManifestVerify::Report(report))) => report.as_mut(),
-        Some(Some(_)) => bail!("manifest `verify` is not a JSON object: cannot record a grade"),
-        _ => {
-            manifest.verify = Some(Some(ManifestVerify::Report(Box::new(
-                ManifestVerifyReport {
-                    passed: true,
-                    details: String::new(),
-                    work_gate: None,
-                    grade: None,
-                    extras: Default::default(),
-                },
-            ))));
-            let Some(Some(ManifestVerify::Report(report))) = manifest.verify.as_mut() else {
-                return Err(anyhow!("manifest `verify` vanished"));
-            };
-            report.as_mut()
-        }
-    };
+    let report = verify_report_mut(&mut manifest)?;
     record.ungraded_passed = Some(ungraded.passed);
     record.ungraded_details = (!ungraded.passed).then(|| ungraded.details.clone());
     report.passed = ungraded.passed && record.passed;
-    report.details = if ungraded.passed {
-        summary(&record)
-    } else if ungraded.details.is_empty() {
-        format!("ungraded check failed; {}", summary(&record))
-    } else {
-        format!("{}; {}", ungraded.details, summary(&record))
-    };
+    report.details = graded_details(ungraded, &record);
     report.grade = Some(record.clone());
     // v9: `verify.grade`; v10: its `criteria` (#3386).
     manifest.raise_schema_version(if record.criteria.is_some() { 10 } else { 9 });
