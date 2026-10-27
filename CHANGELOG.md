@@ -28,6 +28,8 @@ darkmux release.
   (`verify.grade.criteria`, manifest schema 10). `lab submit` shares them as
   bundle format 6, so the evals site can show which criteria a run missed.
   A bundle without criteria is still written as format 5.
+  `lab run` refuses a registry it cannot grade, anchors included, before any
+  model loads.
 - A criteria registry the grader cannot grade is refused before a run, naming
   every problem: an undeclared or ungraded criterion, a repeated id, or an
   anchor that is not in its file exactly once.

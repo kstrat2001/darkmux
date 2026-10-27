@@ -205,7 +205,8 @@ fn apply_inject_context(
 fn prepare_workload(loaded: &mut crate::workloads::types::LoadedWorkload, ctx: Option<&str>) -> Result<()> {
     refuse_keys_another_provider_ignores(loaded)?;
     // (#3386) A criteria registry the grader cannot grade is refused before any
-    // model runs; its anchors are checked against the fixture when it grades.
+    // model runs; its anchors are checked once the fixture is resolved
+    // (`check_criteria_anchors`).
     if let Some(spec) = loaded.manifest.workload.verify.as_ref().and_then(|v| v.grade.as_ref()) {
         crate::lab::grade::check_criteria(spec, None)
             .with_context(|| format!("workload \"{}\"", loaded.manifest.workload.id))?;
@@ -215,6 +216,20 @@ fn prepare_workload(loaded: &mut crate::workloads::types::LoadedWorkload, ctx: O
         apply_inject_context(loaded, ctx, &base_dir);
     }
     Ok(())
+}
+
+/// (#3386) A criteria registry's anchors, checked against the fixture the
+/// run will copy before any model runs (the grader checks them again).
+fn check_criteria_anchors(loaded: &crate::workloads::types::LoadedWorkload, paths: &paths::DarkmuxPaths) -> Result<()> {
+    let Some(spec) = loaded.manifest.workload.verify.as_ref().and_then(|v| v.grade.as_ref()) else {
+        return Ok(());
+    };
+    if spec.criteria.is_none() {
+        return Ok(());
+    }
+    let id = &loaded.manifest.workload.id;
+    let fixture = resolve_source_sandbox(loaded, paths)?;
+    crate::lab::grade::check_criteria(spec, Some(&fixture)).with_context(|| format!("workload \"{id}\""))
 }
 
 /// Whether a workload's prompt comes from its run's copy of a fixture.
@@ -259,6 +274,7 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
     let paths = paths::resolve(ResolveScope::ForceUser);
     paths::ensure(&paths)?;
     prepare_workload(&mut loaded_workload, opts.inject_context.as_deref())?;
+    check_criteria_anchors(&loaded_workload, &paths)?;
 
     let registry_loaded = load_registry(opts.config_path.as_deref())?;
     // (#2902) With no `--profile`, the run is on the profile bound to the
@@ -1408,6 +1424,34 @@ mod tests {
             registry.register(d, Some((*name).to_string()), false).unwrap();
         }
         registry.save(&default_registry_path(&paths::DarkmuxPaths::under_root(root.to_path_buf()))).unwrap();
+    }
+
+    /// (#3386) A criterion's anchor is checked against the fixture the run
+    /// will copy before any model runs, not first when the run is graded.
+    #[test]
+    #[serial_test::serial]
+    fn a_criterion_anchor_missing_from_the_fixture_is_refused_before_the_run() {
+        let tmp = TempDir::new().unwrap();
+        let _home_guard = HomeGuard::set(tmp.path());
+        let eval = tmp.path().join("eval-fx");
+        eval_fixture(&eval, "pg@2.1", "pg", None);
+        register_all(tmp.path(), &[("eval-fx", &eval)]);
+        let write = |anchor: &str| {
+            let doc = serde_json::json!({"workload": {"id": "pg", "provider": "coding-task", "prompt": "p",
+                "requires_fixture": "pg@2.1", "verify": {"grade": {
+                    "behaviors": {"asks": ["p"], "mutants": [
+                        {"behavior": "a", "file": "src/a.js", "find": "a", "replace": "b", "criterion": "a-kept"}]},
+                    "criteria": [{"id": "a-kept", "name": "A kept", "description": "a is kept",
+                        "source": {"path": "src/a.js", "anchor": anchor}}]}}}});
+            std::fs::write(eval.join("eval/workloads/pg.json"), doc.to_string()).unwrap();
+        };
+        let paths = paths::DarkmuxPaths::under_root(tmp.path().to_path_buf());
+        write("a");
+        check_criteria_anchors(&load("pg", Some(tmp.path())).unwrap(), &paths).unwrap();
+        write("not in the file");
+        let err = check_criteria_anchors(&load("pg", Some(tmp.path())).unwrap(), &paths).unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("workload \"pg\"") && err.contains("occurs 0 times in src/a.js"), "{err}");
     }
 
     #[test]
