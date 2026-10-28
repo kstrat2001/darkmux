@@ -5,7 +5,7 @@
 #
 # Operator-facing install path:
 #   brew tap kstrat2001/tap
-#   brew install darkmux                # stable release (v5.9.0)
+#   brew install darkmux                # stable release (v5.9.1)
 #   brew install --HEAD darkmux         # build from main instead
 #
 # For local development / smoke testing:
@@ -17,7 +17,7 @@
 class Darkmux < Formula
   desc "Mission orchestrator and lab for local AI, running your models or a cloud endpoint"
   homepage "https://darkmux.com"
-  # Stable release: v5.9.0, eval-owned roles and whether a run's hardware is known (bundle format 7).
+  # Stable release: v5.9.1, a security fix: the evals upload token is sent only to the site it was stored for.
   # See CHANGELOG.md.
   #
   # The tarball has no `.git`, so the full commit the lab needs for
@@ -30,10 +30,9 @@ class Darkmux < Formula
   # hash. A stale commit here means the lab submits an empty/mismatched
   # `darkmuxCommit` for the release that actually shipped. After bumping,
   # update the `sha256` on the url line too.
-  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v5.9.0.tar.gz"
-  sha256 "e9f24a5c9867b30dcb3b70980b482e3ec716f468458236854931d3b92b898076"
+  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v5.9.1.tar.gz"
+  sha256 "06f47eca47c33855e3457ac17f9fb56a28a532c204914f2afe3ad0683b2fe437"
   license "MIT"
-  revision 1
   head "https://github.com/kstrat2001/darkmux.git", branch: "main"
 
   depends_on "rust" => :build
@@ -54,7 +53,7 @@ class Darkmux < Formula
     # the run's `darkmuxCommit` carries the commit the lab actually ran against
     # instead of being empty (the tarball has no `.git` for build.rs to read).
     ENV["DARKMUX_RELEASE"] = "1" unless build.head?
-    ENV["DARKMUX_COMMIT"] = "85528155f17e09e7fbbdb3e781abff43000268ea" unless build.head?
+    ENV["DARKMUX_COMMIT"] = "d85aab9c6c59f0bf010ca131d4255d4c7d8ed252" unless build.head?
 
     # Workspace-aware install. The root [[bin]] target in Cargo.toml is the
     # only thing that needs to land in bin/. The std_cargo_args helper sets
