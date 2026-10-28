@@ -16,37 +16,61 @@ darkmux release.
 
 ### Changed
 
-- **An eval owns its roles: a lab run's role and prompt come from the eval,
-  not the home folder (#3363).** A lab run's system prompt is now built only
-  from pinned inputs. A workload bound to a fixture takes its role from the
-  eval itself: `roles/<id>.json` and `roles/<id>.md` in the fixture's checkout
-  (list them in `.fixture.json`'s `required_files`; neither may be a symlink).
-  **An eval's workloads now need their role files in the eval, and a
-  fixture-bound eval without them is refused** by `lab run`, naming the
-  missing file, before any model loads. That includes the coder evals
-  (pepper-grinder, salt-shaker, webhook-forgery-eval, idor-check-eval,
-  path-traversal-eval, which need `roles/coder.*`) and the shipped
-  `crawl-error-discard` workload, whose `rust-crawl-scope` fixture needs
-  `roles/crawler.*`. A workload bound to no fixture runs on darkmux's
-  compiled-in role; a role darkmux does not compile in is refused there too.
-  Either way a lab run uses darkmux's compiled-in preamble, and its prompt
-  never takes anything from `~/.darkmux/roles/`, the preamble override,
-  `identity.md` or the workspace notes. `lab run` reads the eval's role once,
-  before the run starts, and every dispatch, the coding-task tool check and
-  the tool bench's recorded window use those bytes, so nothing a run writes
-  into its sandbox (`setupContent`, a seed) can change the role a dispatch of
-  that `lab run` sends. Not yet pinned: model selection still reads the skill
-  manifests a role names from the home folder's `skills/`; a malformed role
-  file in `~/.darkmux/roles/` still refuses a lab run at preflight even though
-  the run does not read it; darkmux does not check that the role files are
-  listed in `required_files`; and a workload's `setupContent` can still write
-  through a symlink in the fixture to outside the sandbox, including into the
-  fixture's own checkout, which a later `lab run` would then read. On 2026-10-24 a stale
+- **An eval owns its roles: a lab run's role and prompt come from the eval
+  or from darkmux, never from the home folder (#3363).** A lab run's system
+  prompt is now built only from pinned inputs. Where a fixture-bound
+  workload's role comes from is keyed on the eval's declared fixture schema
+  (`.fixture.json`'s `schema_version`), not on the darkmux version:
+  - **Fixture schema 1.2 (new): the eval owns its roles.** The role must be at
+    `<eval_dir>/roles/<id>.json` and `.md` (`eval/roles/` in every eval
+    today), and a 1.2 manifest must declare `eval_dir`. A missing,
+    symlinked, oversized, unknown-key or id-mismatched role file refuses the
+    run before any model loads, naming the file. There is no fallback, not
+    even to darkmux's built-in role of the same id. These files live in the
+    eval folder, so they never reach the model's sandbox.
+  - **Fixture schema below 1.2 (1.0 or 1.1) or none, which is every eval
+    published today, keeps running.** A run uses `roles/<id>.json` and `.md` at the fixture root
+    when the eval carries them (biz-scrape-fixture 1.1's `web-probe`), with
+    the same checks, and otherwise darkmux's compiled-in role (pepper-grinder
+    2.2, salt-shaker 1.2, webhook-forgery-eval 1.2, idor-check-eval 1.2,
+    path-traversal-eval 1.2, and the shipped `crawl-error-discard` workload,
+    run `coder` or `crawler` that way). A role that is neither is refused,
+    naming it. The lookup is case-exact on every OS: `ROLES/` is not
+    `roles/`, on macOS as on Linux. A legacy eval that carries `<eval_dir>/roles/<id>.*` is
+    refused too, naming the schema to declare, since a legacy run would
+    never read those files. A `schema_version` darkmux cannot parse (`" 1.2"`,
+    `"v1.2"`, `"1.2-rc1"`) is never read as legacy: `lab run` and `lab fixture
+    register` refuse it and `lab doctor` and `darkmux doctor` report it, each
+    naming the file and the value. `lab run` of a workload defined by a
+    registered fixture whose manifest does not load, for this or any reason,
+    names that fixture and the problem instead of "not found". An `eval_dir`
+    the checkout holds only under another case (`Eval/` for `eval`) is
+    refused. A run reads the fixture's manifest once, before the first run,
+    and every run's sandbox prunes the `eval_dir` read then, so a manifest
+    that goes missing or stops loading mid-`runs: N` cannot put the eval
+    folder in a sandbox.
+
+  Whatever the schema, a lab run uses darkmux's compiled-in preamble, and
+  its prompt never takes anything from `~/.darkmux/roles/`, the preamble
+  override, `identity.md` or the workspace notes. Each run records which
+  source it used (below). `lab run` reads the role once, before the run
+  starts, and every dispatch, the coding-task tool check and the tool
+  bench's recorded window use those bytes, so nothing a run writes into its
+  sandbox (`setupContent`, a seed) can change the role a dispatch of that
+  `lab run` sends. darkmux 5.0 through 5.8 refuse a fixture declaring schema
+  1.2 at `lab run`'s preflight ("written by a newer darkmux ... Upgrade
+  darkmux"), so a 1.2 eval never runs there on the home folder's roles. Not yet pinned:
+  model selection still reads the skill manifests a role names from the home
+  folder's `skills/`; a malformed role file in `~/.darkmux/roles/` still
+  refuses a lab run at preflight even though the run does not read it; and a
+  workload's `setupContent` can still write through a symlink in the fixture
+  to outside the sandbox, including into the fixture's own checkout, which a
+  later `lab run` would then read. On 2026-10-24 a stale
   `~/.darkmux/roles/web-probe.md` replaced an eval's pinned prompt for 19
-  runs; that can no longer happen. The built-in `demo-tiny-py` fixture now
-  carries `roles/coder.*` for `demo-quickstart`; re-register it with
-  `scripts/lab-init.sh --force` (its content hash changed). Dispatches
-  outside the lab are unchanged.
+  runs; that can no longer happen. The built-in `demo-tiny-py` fixture moves
+  to schema 1.2 with `eval/roles/coder.*` for `demo-quickstart`; re-register
+  it with `scripts/lab-init.sh --force` (its content hash changed).
+  Dispatches outside the lab are unchanged.
 
 ### Added
 
@@ -55,9 +79,10 @@ darkmux release.
   `system_sha256`, the SHA-256 of the assembled system prompt, and
   `prompt_additions`, which of darkmux's own additions applied (`identity`,
   `workspace_notes`, `role_override`, `preamble_override`). A lab dispatch
-  also carries `role`: the role's id, its source (`eval` or `builtin`), and
-  the SHA-256 of its `.json`, its `.md` and the preamble, hashed from the
-  bytes it loaded (the preamble hash is of the shipped file, before the
+  also carries `role`: the role's id, its source (`eval` for a schema-1.2
+  eval's `<eval_dir>/roles/`, `legacy_root` for an older eval's root
+  `roles/`, or `builtin`), and the SHA-256 of its `.json`, its `.md` and the
+  preamble, hashed from the bytes it loaded (the preamble hash is of the shipped file, before the
   prompt trims its trailing whitespace). `lab submit` does not share these
   yet.
 - **`lab submit` records which machine served a run (#3397).** A run on an

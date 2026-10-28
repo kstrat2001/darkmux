@@ -372,45 +372,56 @@ pub struct DispatchOpts {
     /// (#3363) Set by every lab dispatch, `None` on every other: where the
     /// role comes from when a lab run is the caller. A lab run's system
     /// prompt is built only from pinned inputs: the eval's own role files
-    /// (or darkmux's compiled-in role, for a workload bound to no fixture)
-    /// and darkmux's compiled-in preamble. It never reads the home folder's
-    /// `roles/`, its preamble override, `identity.md` or workspace notes.
-    /// See [`LabInputs`] and `role_inputs`.
+    /// where its fixture schema puts them ([`RoleLayout`]), or darkmux's
+    /// compiled-in role, and darkmux's compiled-in preamble. It never reads
+    /// the home folder's `roles/`, its preamble override, `identity.md` or
+    /// workspace notes. See [`LabInputs`] and `role_inputs`.
     pub lab_inputs: Option<LabInputs>,
 }
 
 /// (#3363) Where a lab dispatch takes its role from. An eval owns its roles:
-/// a workload bound to a fixture runs on the role files that fixture carries,
-/// and a workload bound to none runs on darkmux's compiled-in role.
+/// a workload bound to a fixture runs on the role files that fixture carries
+/// where its schema puts them ([`RoleLayout`]); a workload bound to none, or
+/// to a legacy eval that carries none, runs on darkmux's compiled-in role.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LabInputs {
-    /// The workload binds a fixture: its role, read ONCE from the eval
-    /// ([`LabInputs::load_eval`]) before the run starts and carried here as
+    /// The workload binds a fixture that carries its role: read ONCE from
+    /// the eval ([`LabInputs::for_fixture`]) before the run starts and carried here as
     /// bytes. The dispatch, and every lab check of the role, uses these
     /// bytes; nothing reads `roles/` again, so a write into the run's
     /// sandbox (a workload's `setupContent`, a seed, a link) cannot change it.
     Eval(Box<EvalRole>),
-    /// The workload binds no fixture: darkmux's compiled-in role and prompt.
+    /// darkmux's compiled-in role and prompt: the workload binds no
+    /// fixture, or a legacy eval (fixture schema below 1.2, or none) that carries
+    /// no `roles/<id>.*` at its root.
     Builtin,
 }
 
 pub use crate::role_inputs::EvalRole;
 
+pub use crate::role_inputs::RoleLayout;
+
 impl LabInputs {
-    /// Read `<dir>/roles/<role_id>.json` and `.md` from an eval, once:
-    /// refused when either is missing, a symlink (as is `roles/` itself),
-    /// past the size cap, or a manifest the unknown-key gate, the id check
-    /// or the family check refuses.
-    pub fn load_eval(dir: &std::path::Path, role_id: &str) -> Result<Self> {
-        crate::role_inputs::load_eval_role(dir, role_id).map(|role| LabInputs::Eval(Box::new(role)))
+    /// THE role a workload bound to a fixture runs, read once from the
+    /// fixture checkout at `fixture_dir`, where `layout` (the eval's fixture
+    /// schema) says it lives. See [`RoleLayout`].
+    pub fn for_fixture(fixture_dir: &std::path::Path, layout: &RoleLayout, role_id: &str) -> Result<Self> {
+        crate::role_inputs::read_fixture_role(fixture_dir, layout, role_id)
+    }
+
+    /// Where these inputs' role comes from, as `dispatch.start` records it.
+    pub fn source(&self) -> darkmux_flow::payload::RoleInputSource {
+        match self {
+            LabInputs::Eval(eval) => eval.source(),
+            LabInputs::Builtin => darkmux_flow::payload::RoleInputSource::Builtin,
+        }
     }
 }
 
 /// (#3363) Refuse a lab run whose role cannot be loaded from `inputs`: a
-/// fixture-bound workload whose eval lacks `roles/<id>.json` or `.md`, a
-/// role manifest the unknown-key gate refuses, or (bound to no fixture) a
-/// role darkmux does not compile in. The same refusal the dispatch would
-/// give, for the lab's preflight to give before any model loads.
+/// role the inputs were not read for, or (bound to no fixture) a role
+/// darkmux does not compile in. The same refusal the dispatch would give,
+/// for the lab's preflight to give before any model loads.
 pub fn check_lab_role(inputs: &LabInputs, role_id: &str) -> Result<()> {
     crate::role_inputs::check_lab_role(inputs, role_id)
 }

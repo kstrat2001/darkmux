@@ -3,4 +3,4 @@
 /**
  * (#3363) Where a lab dispatch's role came from.
  */
-export type RoleInputSource = "eval" | "builtin" | "unknown";
+export type RoleInputSource = "eval" | "builtin" | "legacy_root" | "unknown";

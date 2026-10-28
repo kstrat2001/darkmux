@@ -26,9 +26,13 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.6.0";
 //           role_override, preamble_override}`: which of darkmux's own
 //           additions reached the prompt) on every dispatch that assembles
 //           one, and, on a lab dispatch only, `payload.role` (`{id, source:
-//           "eval" | "builtin", json_sha256, md_sha256, preamble_sha256}`, the
-//           role files and preamble hashed from the bytes loaded;
-//           `preamble_sha256` is `null` for a role that is not a specialist).
+//           "eval" | "builtin" | "legacy_root", json_sha256, md_sha256,
+//           preamble_sha256}`, the role files and preamble hashed from the
+//           bytes loaded; `preamble_sha256` is `null` for a role that is not
+//           a specialist). `eval` is a fixture-schema-1.2 eval's
+//           `<eval_dir>/roles/`, `legacy_root` an older eval's root `roles/`,
+//           `builtin` darkmux's compiled-in role. (`legacy_root` joined
+//           before 2.6.0 shipped in a release, so it stays 2.6.0.)
 //           A lab dispatch's additions are all `false`: its prompt is built
 //           from pinned inputs only.
 //

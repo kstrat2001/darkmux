@@ -4077,7 +4077,8 @@ mod tests {
         //            (a total with no rails) and `now.sensors` (board
         //            temperatures and fan), both on Omarchy.
         //   2.6.0 — (#3363) additive: `dispatch.start`'s `system_sha256` and
-        //            `prompt_additions`, and a lab dispatch's `role` block.
+        //            `prompt_additions`, and a lab dispatch's `role` block
+        //            (`source`: eval | builtin | legacy_root).
         //   2.0.0 — (4.0) MAJOR: one wire spelling per action, dotted on
         //            write; a retired spelling reads as an unknown action
         //            (5.0, #3036). Also drops

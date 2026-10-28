@@ -4,7 +4,7 @@
 //! home folder. A non-lab dispatch is unchanged.
 
 use super::*;
-use crate::dispatch::LabInputs;
+use crate::dispatch::{LabInputs, RoleLayout};
 use darkmux_flow::payload::RoleInputSource;
 use serial_test::serial;
 use tempfile::TempDir;
@@ -64,14 +64,47 @@ fn home_with_overrides() -> TempDir {
     home
 }
 
-/// An eval checkout carrying `roles/web-probe.json` and `roles/web-probe.md`.
+/// An eval checkout at fixture schema 1.2, carrying `eval/roles/web-probe.json`
+/// and `eval/roles/web-probe.md`.
 fn eval_with_role(md: &str) -> TempDir {
     let eval = TempDir::new().unwrap();
-    let roles = eval.path().join("roles");
-    std::fs::create_dir_all(&roles).unwrap();
+    write_role(&eval.path().join("eval/roles"), md);
+    eval
+}
+
+/// A legacy eval checkout (fixture schema 1.1) carrying `roles/web-probe.*`
+/// at its root, as biz-scrape-fixture 1.1 does.
+fn legacy_eval_with_root_role(md: &str) -> TempDir {
+    let eval = TempDir::new().unwrap();
+    write_role(&eval.path().join("roles"), md);
+    eval
+}
+
+fn write_role(roles: &std::path::Path, md: &str) {
+    std::fs::create_dir_all(roles).unwrap();
     std::fs::write(roles.join(format!("{ROLE}.json")), role_json(ROLE)).unwrap();
     std::fs::write(roles.join(format!("{ROLE}.md")), md).unwrap();
-    eval
+}
+
+/// Where a schema-1.2 eval keeps its roles.
+fn roles_of(eval: &TempDir) -> std::path::PathBuf {
+    eval.path().join("eval/roles")
+}
+
+/// The layout of a fixture at schema 1.2 with `eval_dir: "eval"`.
+fn owned() -> RoleLayout {
+    RoleLayout::Eval { eval_dir: "eval".into() }
+}
+
+/// The layout of a fixture at schema 1.1 with `eval_dir: "eval"`, as every
+/// eval published before 1.2 declares.
+fn legacy() -> RoleLayout {
+    RoleLayout::Legacy { eval_dir: Some("eval".into()) }
+}
+
+/// Read the role of a schema-1.2 eval, as `lab run` reads it.
+fn load_owned(eval: &TempDir, role: &str) -> anyhow::Result<LabInputs> {
+    LabInputs::for_fixture(eval.path(), &owned(), role)
 }
 
 /// A local dispatch with every optional input off.
@@ -113,7 +146,7 @@ fn probe_opts() -> DispatchOpts {
 
 /// The eval's role, read once as `lab run` reads it.
 fn eval_inputs(eval: &TempDir) -> LabInputs {
-    LabInputs::load_eval(eval.path(), ROLE).expect("the eval carries its role")
+    load_owned(eval, ROLE).expect("the eval carries its role")
 }
 
 /// Options that reach prompt assembly and stop at model selection: the
@@ -182,10 +215,10 @@ fn a_lab_dispatch_sends_the_evals_role_not_a_stale_copy_in_the_home_folder() {
 fn an_eval_that_lacks_the_role_is_refused_naming_the_file() {
     let home = home_with_overrides();
     let eval = eval_with_role(PINNED_EVAL_MD);
-    std::fs::remove_file(eval.path().join("roles").join(format!("{ROLE}.md"))).unwrap();
+    std::fs::remove_file(roles_of(&eval).join(format!("{ROLE}.md"))).unwrap();
     let _env = env_for(&home);
-    let err = format!("{:#}", LabInputs::load_eval(eval.path(), ROLE).unwrap_err());
-    let missing = eval.path().join("roles").join(format!("{ROLE}.md"));
+    let err = format!("{:#}", load_owned(&eval, ROLE).unwrap_err());
+    let missing = roles_of(&eval).join(format!("{ROLE}.md"));
     assert!(err.contains(&missing.display().to_string()), "names the missing file: {err}");
     assert!(err.contains("the eval must carry its roles"), "says what to do: {err}");
 }
@@ -213,10 +246,11 @@ fn a_lab_dispatch_of_another_role_than_the_loaded_one_is_refused() {
 #[serial]
 fn writes_into_the_sandbox_after_the_role_is_read_cannot_change_the_prompt() {
     let home = home_with_overrides();
-    let sandbox = eval_with_role(PINNED_EVAL_MD);
+    // A legacy eval's root `roles/` is the one the sandbox holds.
+    let sandbox = legacy_eval_with_root_role(PINNED_EVAL_MD);
     std::os::unix::fs::symlink("roles", sandbox.path().join("cfg")).unwrap();
     let _env = env_for(&home);
-    let lab = eval_inputs(&sandbox);
+    let lab = LabInputs::for_fixture(sandbox.path(), &legacy(), ROLE).expect("the eval carries its role at its root");
     for (n, key) in [format!("roles/{ROLE}.md"), format!("Roles/{ROLE}.md"), format!("cfg/{ROLE}.md")].iter().enumerate() {
         // What the coding-task provider's setup does with a setupContent key.
         let evil = format!("# web-probe\n\nREPLACED-BY-SETUP-{n}\n");
@@ -250,10 +284,10 @@ fn an_eval_role_with_an_unknown_key_is_refused_like_any_role_manifest() {
     let eval = eval_with_role(PINNED_EVAL_MD);
     let mut doc: serde_json::Value = serde_json::from_str(&role_json(ROLE)).unwrap();
     doc["tool_pallete"] = serde_json::json!({"allow": []});
-    std::fs::write(eval.path().join("roles").join(format!("{ROLE}.json")), doc.to_string()).unwrap();
+    std::fs::write(roles_of(&eval).join(format!("{ROLE}.json")), doc.to_string()).unwrap();
     let _env = env_for(&home);
 
-    let err = LabInputs::load_eval(eval.path(), ROLE).unwrap_err();
+    let err = load_owned(&eval, ROLE).unwrap_err();
     let err = format!("{err:#}");
     assert!(err.contains("tool_pallete") && err.contains("tool_palette"), "names the key and the closest one: {err}");
 }
@@ -408,9 +442,9 @@ fn the_start_record_carries_the_prompt_hash_the_additions_and_the_role() {
 fn an_eval_role_whose_id_differs_from_its_file_name_is_refused() {
     let home = home_with_overrides();
     let eval = eval_with_role(PINNED_EVAL_MD);
-    std::fs::write(eval.path().join("roles").join(format!("{ROLE}.json")), role_json("another-role")).unwrap();
+    std::fs::write(roles_of(&eval).join(format!("{ROLE}.json")), role_json("another-role")).unwrap();
     let _env = env_for(&home);
-    let err = LabInputs::load_eval(eval.path(), ROLE).unwrap_err();
+    let err = load_owned(&eval, ROLE).unwrap_err();
     let err = format!("{err:#}");
     assert!(err.contains("declares id `another-role`, but the workload runs `web-probe`"), "{err}");
 }
@@ -424,7 +458,7 @@ fn a_utility_eval_role_gets_no_preamble_and_records_a_null_hash() {
     let eval = eval_with_role(PINNED_EVAL_MD);
     let mut doc: serde_json::Value = serde_json::from_str(&role_json(ROLE)).unwrap();
     doc["role_family"] = serde_json::json!("utility");
-    std::fs::write(eval.path().join("roles").join(format!("{ROLE}.json")), doc.to_string()).unwrap();
+    std::fs::write(roles_of(&eval).join(format!("{ROLE}.json")), doc.to_string()).unwrap();
     let _env = env_for(&home);
 
     let o = opts(&home, ROLE, Some(eval_inputs(&eval)));
@@ -503,14 +537,14 @@ fn the_hosted_start_record_carries_the_prompt_hash_and_the_role() {
 fn a_symlinked_eval_role_file_is_refused() {
     let home = home_with_overrides();
     let eval = TempDir::new().unwrap();
-    let roles = eval.path().join("roles");
+    let roles = roles_of(&eval);
     std::fs::create_dir_all(&roles).unwrap();
     for ext in ["json", "md"] {
         std::os::unix::fs::symlink(home.path().join(format!("roles/{ROLE}.{ext}")), roles.join(format!("{ROLE}.{ext}")))
             .unwrap();
     }
     let _env = env_for(&home);
-    let err = format!("{:#}", LabInputs::load_eval(eval.path(), ROLE).unwrap_err());
+    let err = format!("{:#}", load_owned(&eval, ROLE).unwrap_err());
     assert!(err.contains(&format!("roles/{ROLE}.json` is a symlink")), "{err}");
 }
 
@@ -520,9 +554,10 @@ fn a_symlinked_eval_role_file_is_refused() {
 fn a_symlinked_eval_roles_folder_is_refused() {
     let home = home_with_overrides();
     let eval = TempDir::new().unwrap();
-    std::os::unix::fs::symlink(home.path().join("roles"), eval.path().join("roles")).unwrap();
+    std::fs::create_dir_all(eval.path().join("eval")).unwrap();
+    std::os::unix::fs::symlink(home.path().join("roles"), roles_of(&eval)).unwrap();
     let _env = env_for(&home);
-    let err = LabInputs::load_eval(eval.path(), ROLE).unwrap_err();
+    let err = load_owned(&eval, ROLE).unwrap_err();
     let err = format!("{err:#}");
     assert!(err.contains("roles` is a symlink") && err.contains("real folder"), "{err}");
 }
@@ -538,7 +573,7 @@ fn the_recorded_lab_window_follows_the_evals_role_not_the_home_folders() {
     let eval = eval_with_role(PINNED_EVAL_MD);
     let mut doc: serde_json::Value = serde_json::from_str(&role_json(ROLE)).unwrap();
     doc["skills"] = serde_json::json!(["coding"]);
-    std::fs::write(eval.path().join("roles").join(format!("{ROLE}.json")), doc.to_string()).unwrap();
+    std::fs::write(roles_of(&eval).join(format!("{ROLE}.json")), doc.to_string()).unwrap();
     let pf = home.path().join("profiles-3363-window.json");
     std::fs::write(
         &pf,
@@ -562,6 +597,228 @@ fn an_oversized_eval_role_file_is_refused() {
     let home = home_with_overrides();
     let eval = eval_with_role(&"x".repeat(darkmux_types::user_files::MAX_USER_FILE_BYTES as usize + 1));
     let _env = env_for(&home);
-    let err = LabInputs::load_eval(eval.path(), ROLE).unwrap_err();
+    let err = load_owned(&eval, ROLE).unwrap_err();
     assert!(format!("{err:#}").contains("byte cap for a role file"), "{err:#}");
+}
+
+/// The builtin coder prompt, as darkmux compiles it in.
+fn builtin_md(id: &str) -> &'static str {
+    crate::loader::BUILTIN_ROLE_PROMPTS.iter().find(|(r, _)| *r == id).unwrap().1
+}
+
+/// (#3363, fixture schema) darkmux 5.9 still runs pepper-grinder 2.2
+/// unchanged: a schema-1.1 eval with `eval_dir: "eval"` and no roles anywhere
+/// runs darkmux's compiled-in role and records `builtin`. The home folder's
+/// stale `roles/coder.md` is never read.
+#[test]
+#[serial]
+fn a_legacy_eval_with_no_roles_runs_the_builtin_role_and_records_builtin() {
+    let home = home_with_overrides();
+    std::fs::write(home.path().join("roles/coder.md"), STALE_HOME_MD).unwrap();
+    let eval = TempDir::new().unwrap();
+    std::fs::create_dir_all(eval.path().join("eval/workloads")).unwrap();
+    std::fs::create_dir_all(eval.path().join("src")).unwrap();
+    let _env = env_for(&home);
+
+    let lab = LabInputs::for_fixture(eval.path(), &legacy(), "coder").expect("a legacy eval runs the built-in coder");
+    assert_eq!(lab, LabInputs::Builtin);
+    assert_eq!(lab.source(), RoleInputSource::Builtin);
+    let (prompt, _) = dispatched_prompt(opts(&home, "coder", Some(lab.clone())));
+    let prompt = prompt.expect("dispatch() assembled a system prompt");
+    assert!(prompt.contains(builtin_md("coder").trim_end()), "the compiled-in coder prompt");
+    assert!(!prompt.contains("STALE-HOME-PROMPT"), "never the home folder's copy: {prompt}");
+    let (_, _, _, prov) = container_role(&opts(&home, "coder", Some(lab)), false, &[]).unwrap();
+    let role = prov.role.expect("recorded");
+    assert_eq!(role.source, RoleInputSource::Builtin);
+    assert_eq!(role.md_sha256, darkmux_flow::sha256_hex(builtin_md("coder").as_bytes()));
+}
+
+/// A legacy eval carrying `roles/<id>.*` at its root (biz-scrape-fixture
+/// 1.1's `web-probe`, which darkmux does not compile in) runs on them and
+/// records `legacy_root`, never the home folder's stale copy.
+#[test]
+#[serial]
+fn a_legacy_eval_with_root_roles_uses_them_and_records_legacy_root() {
+    let home = home_with_overrides();
+    let eval = legacy_eval_with_root_role(PINNED_EVAL_MD);
+    let _env = env_for(&home);
+
+    let lab = LabInputs::for_fixture(eval.path(), &legacy(), ROLE).expect("the root roles/ carries web-probe");
+    assert_eq!(lab.source(), RoleInputSource::LegacyRoot);
+    let (prompt, _) = dispatched_prompt(opts(&home, ROLE, Some(lab.clone())));
+    let prompt = prompt.expect("dispatch() assembled a system prompt");
+    assert!(prompt.contains("PINNED-EVAL-PROMPT") && !prompt.contains("STALE-HOME-PROMPT"), "{prompt}");
+    let (_, prompt, _, prov) = container_role(&opts(&home, ROLE, Some(lab)), false, &[]).unwrap();
+    let role = prov.role.clone().expect("recorded");
+    assert_eq!(role.source, RoleInputSource::LegacyRoot);
+    assert_eq!(role.md_sha256, darkmux_flow::sha256_hex(PINNED_EVAL_MD.as_bytes()));
+    let mut payload = DispatchStartPayload::default();
+    crate::role_inputs::stamp_prompt_inputs(&mut payload, &prompt, &prov);
+    assert_eq!(serde_json::to_value(&payload).unwrap()["role"]["source"], "legacy_root");
+}
+
+/// A legacy eval naming a role that is neither at its root nor built in is
+/// refused when `lab run` reads it, before any model loads, naming the role.
+/// The home folder's copy of that role is not a fallback.
+#[test]
+#[serial]
+fn a_legacy_eval_naming_a_role_neither_at_its_root_nor_built_in_is_refused() {
+    let home = home_with_overrides();
+    let eval = TempDir::new().unwrap();
+    std::fs::create_dir_all(eval.path().join("eval/workloads")).unwrap();
+    let _env = env_for(&home);
+    let err = format!("{:#}", LabInputs::for_fixture(eval.path(), &legacy(), ROLE).unwrap_err());
+    assert!(err.contains("`web-probe`") && err.contains("not one of darkmux's built-in roles"), "names the role: {err}");
+    assert!(err.contains("roles/web-probe.json"), "says where the eval could carry it: {err}");
+}
+
+/// A schema-1.2 eval owns its roles: no `eval/roles/<id>.*` refuses the run,
+/// even when the fixture root carries `roles/<id>.*` and even when darkmux
+/// compiles the role in. There is no fallback.
+#[test]
+#[serial]
+fn a_schema_1_2_eval_without_eval_roles_is_refused_with_no_fallback() {
+    let home = home_with_overrides();
+    let _env = env_for(&home);
+    // The root carries the role.
+    let eval = legacy_eval_with_root_role(PINNED_EVAL_MD);
+    std::fs::create_dir_all(eval.path().join("eval")).unwrap();
+    let err = format!("{:#}", load_owned(&eval, ROLE).unwrap_err());
+    assert!(err.contains(&roles_of(&eval).join(format!("{ROLE}.json")).display().to_string()), "names eval/roles: {err}");
+    assert!(err.contains("the eval must carry its roles"), "{err}");
+    // darkmux compiles the role in.
+    let err = format!("{:#}", load_owned(&eval, "coder").unwrap_err());
+    assert!(err.contains("eval/roles/coder.json is missing"), "the built-in coder is no fallback: {err}");
+}
+
+/// A schema-1.2 eval whose `eval_dir` itself is a symlink is refused: a link
+/// could deliver a role from anywhere.
+#[test]
+#[serial]
+fn a_schema_1_2_eval_whose_eval_dir_is_a_symlink_is_refused() {
+    let home = home_with_overrides();
+    let elsewhere = eval_with_role(PINNED_EVAL_MD);
+    let eval = TempDir::new().unwrap();
+    std::os::unix::fs::symlink(elsewhere.path().join("eval"), eval.path().join("eval")).unwrap();
+    let _env = env_for(&home);
+    let err = format!("{:#}", load_owned(&eval, ROLE).unwrap_err());
+    assert!(err.contains("eval` is a symlink") && err.contains("real folder"), "{err}");
+}
+
+/// A legacy eval's root `roles/` that is a symlink is refused, as #3392
+/// refused it: a link could deliver the home folder's bytes.
+#[test]
+#[serial]
+fn a_legacy_eval_whose_root_roles_is_a_symlink_is_refused() {
+    let home = home_with_overrides();
+    let eval = TempDir::new().unwrap();
+    std::os::unix::fs::symlink(home.path().join("roles"), eval.path().join("roles")).unwrap();
+    let _env = env_for(&home);
+    let err = format!("{:#}", LabInputs::for_fixture(eval.path(), &legacy(), ROLE).unwrap_err());
+    assert!(err.contains("roles` is a symlink") && err.contains("real folder"), "{err}");
+}
+
+/// A legacy eval that carries `eval/roles/<id>.*` declared the old schema by
+/// mistake: those files would never be read, so the run is refused, naming
+/// the schema to declare, rather than silently running darkmux's built-in
+/// role of the same id.
+#[test]
+#[serial]
+fn a_legacy_eval_carrying_eval_roles_is_refused_naming_schema_1_2() {
+    let home = home_with_overrides();
+    let eval = TempDir::new().unwrap();
+    let roles = roles_of(&eval);
+    std::fs::create_dir_all(&roles).unwrap();
+    std::fs::write(roles.join("coder.json"), role_json("coder")).unwrap();
+    std::fs::write(roles.join("coder.md"), PINNED_EVAL_MD).unwrap();
+    let _env = env_for(&home);
+    let err = format!("{:#}", LabInputs::for_fixture(eval.path(), &legacy(), "coder").unwrap_err());
+    assert!(err.contains("would never read them") && err.contains("\"schema_version\": \"1.2\""), "names the fix: {err}");
+}
+
+/// Write `files` (name, bytes) under `dir`, creating it.
+fn write_files(dir: &std::path::Path, files: &[(&str, &str)]) {
+    std::fs::create_dir_all(dir).unwrap();
+    for (name, text) in files {
+        std::fs::write(dir.join(name), text).unwrap();
+    }
+}
+
+/// (#3396 review) A legacy eval carrying only `roles/coder.md` at its root
+/// meant to carry the role: the run is refused, naming the missing `.json`,
+/// rather than silently running darkmux's built-in coder.
+#[test]
+#[serial]
+fn a_legacy_eval_with_only_a_root_role_md_is_refused_not_run_built_in() {
+    let home = home_with_overrides();
+    let eval = TempDir::new().unwrap();
+    write_files(&eval.path().join("roles"), &[("coder.md", PINNED_EVAL_MD)]);
+    let _env = env_for(&home);
+    let err = format!("{:#}", LabInputs::for_fixture(eval.path(), &legacy(), "coder").unwrap_err());
+    assert!(err.contains("roles/coder.json is missing"), "{err}");
+}
+
+/// (#3396 review) A legacy eval carrying only `eval/roles/coder.md` gets the
+/// "declare 1.2" refusal too.
+#[test]
+#[serial]
+fn a_legacy_eval_with_only_an_eval_roles_md_is_refused_naming_schema_1_2() {
+    let home = home_with_overrides();
+    let eval = TempDir::new().unwrap();
+    write_files(&roles_of(&eval), &[("coder.md", PINNED_EVAL_MD)]);
+    let _env = env_for(&home);
+    let err = format!("{:#}", LabInputs::for_fixture(eval.path(), &legacy(), "coder").unwrap_err());
+    assert!(err.contains("would never read them"), "{err}");
+}
+
+/// (#3396 review) A legacy eval's root `roles/` that links to a folder
+/// without the role is refused, not resolved to the built-in role: what the
+/// eval runs must depend only on its own checkout, never on what a link's
+/// target happens to hold today.
+#[test]
+#[serial]
+fn a_legacy_eval_whose_root_roles_links_to_a_folder_without_the_role_is_refused() {
+    let home = home_with_overrides();
+    let elsewhere = TempDir::new().unwrap();
+    let eval = TempDir::new().unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), eval.path().join("roles")).unwrap();
+    let _env = env_for(&home);
+    let err = format!("{:#}", LabInputs::for_fixture(eval.path(), &legacy(), "coder").unwrap_err());
+    assert!(err.contains("roles` is a symlink"), "{err}");
+}
+
+/// (#3396 review) The legacy root lookup is case-exact, so an eval resolves
+/// the same way on every OS: `ROLES/coder.*` is not `roles/`, on a
+/// case-folding filesystem (macOS) as on Linux, and the run takes the
+/// built-in coder.
+#[test]
+#[serial]
+fn a_legacy_root_roles_folder_is_matched_case_exactly() {
+    let home = home_with_overrides();
+    let eval = TempDir::new().unwrap();
+    write_files(&eval.path().join("ROLES"), &[("coder.json", &role_json("coder")), ("coder.md", PINNED_EVAL_MD)]);
+    let _env = env_for(&home);
+    assert_eq!(LabInputs::for_fixture(eval.path(), &legacy(), "coder").unwrap(), LabInputs::Builtin);
+}
+
+/// (#3396 review) A schema-1.2 eval's role is found by exact names only:
+/// `eval/ROLES/`, a differently cased role file, or an `eval_dir` cased
+/// unlike the manifest's are all missing, on every OS.
+#[test]
+#[serial]
+fn a_schema_1_2_evals_role_path_is_matched_case_exactly() {
+    let home = home_with_overrides();
+    let _env = env_for(&home);
+    let json = role_json(ROLE);
+    let cases: [(&str, [(&str, &str); 2]); 3] = [
+        ("eval/ROLES", [("web-probe.json", &json), ("web-probe.md", PINNED_EVAL_MD)]),
+        ("eval/roles", [("web-probe.json", &json), ("Web-Probe.md", PINNED_EVAL_MD)]),
+        ("Eval/roles", [("web-probe.json", &json), ("web-probe.md", PINNED_EVAL_MD)]),
+    ];
+    for (dir, files) in cases {
+        let eval = TempDir::new().unwrap();
+        write_files(&eval.path().join(dir), &files);
+        let err = format!("{:#}", load_owned(&eval, ROLE).expect_err(dir));
+        assert!(err.contains("is missing"), "{dir}: {err}");
+    }
 }

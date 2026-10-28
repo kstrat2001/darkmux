@@ -5,7 +5,7 @@
 
 use darkmux_types::config_enum::{PreflightRefusal, Scope};
 use darkmux_types::paths::{self, ResolveScope};
-use darkmux_types::user_files::{check_path, check_tiered, FileProblem, Reach, UserFileKind};
+use darkmux_types::user_files::{check_path_and, check_tiered, FileProblem, Reach, UserFileKind};
 
 use crate::lab::fixture::FixtureManifest;
 use crate::lab::registry::{default_registry_path, LabRegistry};
@@ -50,7 +50,8 @@ pub fn problems(kind: UserFileKind, reach: Reach) -> Vec<FileProblem> {
         (UserFileKind::LabFixture, Reach::Every) => registered_fixtures()
             .into_iter()
             .filter_map(|(satisfies, manifest)| {
-                let mut found = check_path::<FixtureManifest>(kind, &manifest, &fixture_retired)?;
+                let mut found =
+                    check_path_and::<FixtureManifest>(kind, &manifest, &fixture_retired, &crate::lab::fixture::schema_version_issues)?;
                 found.note = Some(match satisfies {
                     Some(s) => format!("only a run that binds `{}` refuses over it", darkmux_types::user_files::escape_text(&s)),
                     None => "it satisfies no requirement, so no run binds it and only a run that binds it would refuse".to_string(),
@@ -147,7 +148,12 @@ fn preflight_bound(
             .map(|(_, manifest)| manifest)
     });
     if let Some(manifest) = bound {
-        refusal.files.extend(check_path::<FixtureManifest>(UserFileKind::LabFixture, &manifest, &fixture_retired));
+        refusal.files.extend(check_path_and::<FixtureManifest>(
+            UserFileKind::LabFixture,
+            &manifest,
+            &fixture_retired,
+            &crate::lab::fixture::schema_version_issues,
+        ));
     }
     refusal.into_result()
 }

@@ -232,31 +232,82 @@ fn check_criteria_anchors(loaded: &crate::workloads::types::LoadedWorkload, path
     crate::lab::grade::check_criteria(spec, Some(&fixture)).with_context(|| format!("workload \"{id}\""))
 }
 
+/// (#3363) What each run's clone prunes from its source, settled before the
+/// first run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Prune {
+    /// The workload binds a fixture: the `eval_dir` its manifest declared at
+    /// the preflight. Never re-read, so a manifest that goes missing or stops
+    /// loading mid-`runs: N` cannot put the grader or the roles in a sandbox.
+    Pinned(Option<String>),
+    /// The workload binds none: the source's own `.fixture.json`, read
+    /// leniently per run, so a file darkmux did not write never blocks it.
+    Unbound,
+}
+
+impl Prune {
+    /// The folder to keep out of a clone of `source`.
+    fn eval_dir(&self, source: &Path) -> Option<String> {
+        match self {
+            Prune::Pinned(eval_dir) => eval_dir.clone(),
+            Prune::Unbound => crate::lab::fixture::eval_dir_of(source),
+        }
+    }
+}
+
+/// The fixture a fixture-bound workload runs on, and its manifest, read once
+/// at the preflight.
+struct PinnedFixture {
+    dir: std::path::PathBuf,
+    manifest: crate::lab::fixture::FixtureManifest,
+}
+
 /// The pre-run checks against the fixture the run will copy: the criteria
-/// anchors (#3386), then the eval's role, read once (#3363).
+/// anchors (#3386), then the fixture's manifest and the eval's role, each
+/// read once (#3363). Returns what every run's clone prunes.
 fn check_fixture_and_read_role(
     loaded: &mut crate::workloads::types::LoadedWorkload,
     paths: &paths::DarkmuxPaths,
-) -> Result<()> {
+) -> Result<Prune> {
     check_criteria_anchors(loaded, paths)?;
-    read_lab_inputs(loaded, paths)
+    let fixture = pin_fixture(loaded, paths)?;
+    read_lab_inputs(loaded, fixture.as_ref())?;
+    Ok(fixture.map_or(Prune::Unbound, |f| Prune::Pinned(f.manifest.eval_dir)))
+}
+
+/// The fixture a workload binds and its manifest, read once: `None` for a
+/// workload bound to none. A manifest that is missing or does not load
+/// refuses the run.
+fn pin_fixture(
+    loaded: &crate::workloads::types::LoadedWorkload,
+    paths: &paths::DarkmuxPaths,
+) -> Result<Option<PinnedFixture>> {
+    if loaded.manifest.workload.requires_fixture.is_none() {
+        return Ok(None);
+    }
+    let dir = resolve_source_sandbox(loaded, paths)?;
+    let manifest = crate::lab::fixture::FixtureManifest::load_from_dir(&dir)
+        .with_context(|| format!("workload \"{}\"", loaded.manifest.workload.id))?;
+    Ok(Some(PinnedFixture { dir, manifest }))
 }
 
 /// (#3363) An eval owns its roles. The role the workload dispatches as is
 /// read ONCE, here, before any run starts: for a workload bound to a
-/// fixture, `roles/<id>.json` and `.md` from the fixture checkout every run
-/// copies, kept as bytes that every run's dispatch uses (nothing reads
-/// `roles/` again, so nothing a run writes into its sandbox can change
-/// them); for one bound to none, a role darkmux compiles in. Refused before
-/// any model loads. Stored on the workload (`lab_inputs`), which every run's
-/// provider reads; left `None` when the provider names no role.
-fn read_lab_inputs(loaded: &mut crate::workloads::types::LoadedWorkload, paths: &paths::DarkmuxPaths) -> Result<()> {
+/// fixture, from the fixture checkout every run copies, where the fixture's
+/// schema puts it (`<eval_dir>/roles/` at 1.2; below 1.2 or none, the root
+/// `roles/` when there, else darkmux's compiled-in role), kept as bytes that
+/// every run's dispatch uses (nothing reads them again, so nothing a run
+/// writes into its sandbox can change them); for one bound to none, a role
+/// darkmux compiles in. Refused before any model loads. Stored on the
+/// workload (`lab_inputs`), which every run's provider reads; left `None`
+/// when the provider names no role.
+fn read_lab_inputs(loaded: &mut crate::workloads::types::LoadedWorkload, fixture: Option<&PinnedFixture>) -> Result<()> {
     use darkmux_crew::dispatch::LabInputs;
     let Some(role) = workload_role(loaded) else {
         return Ok(());
     };
-    let inputs = match loaded.manifest.workload.requires_fixture {
-        Some(_) => resolve_source_sandbox(loaded, paths).and_then(|dir| LabInputs::load_eval(&dir, &role)),
+    let inputs = match fixture {
+        Some(f) => LabInputs::for_fixture(&f.dir, &f.manifest.role_layout(), &role),
         None => darkmux_crew::dispatch::check_lab_role(&LabInputs::Builtin, &role).map(|()| LabInputs::Builtin),
     };
     loaded.lab_inputs = Some(inputs.with_context(|| format!("workload \"{}\"", loaded.manifest.workload.id))?);
@@ -305,7 +356,7 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
     let paths = paths::resolve(ResolveScope::ForceUser);
     paths::ensure(&paths)?;
     prepare_workload(&mut loaded_workload, opts.inject_context.as_deref())?;
-    check_fixture_and_read_role(&mut loaded_workload, &paths)?;
+    let prune = check_fixture_and_read_role(&mut loaded_workload, &paths)?;
 
     let registry_loaded = load_registry(opts.config_path.as_deref())?;
     // (#2902) With no `--profile`, the run is on the profile bound to the
@@ -331,6 +382,7 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
         workload: &loaded_workload,
         profile,
         profile_name: &profile_name,
+        prune: &prune,
         model_hardware: &model_hardware,
     };
     let runs = opts.runs.max(1);
@@ -345,6 +397,8 @@ struct OneRun<'a> {
     workload: &'a crate::workloads::types::LoadedWorkload,
     profile: &'a darkmux_types::Profile,
     profile_name: &'a str,
+    /// What each run's clone prunes, settled at the preflight.
+    prune: &'a Prune,
     /// (#3397) The profile's models' hardware as the registry said at start.
     model_hardware: &'a [crate::lab::manifest::ModelHardware],
 }
@@ -377,7 +431,9 @@ impl OneRun<'_> {
         let lifecycle = lifecycle::RunLifecycle::start(&run_dir, &run_id, workload_id, self.profile_name)?;
         // (#488) Each run works on a sandbox of its own under its run dir.
         let per_run_sandbox_dir = run_dir.join("sandbox");
-        let baseline_hash = materialize_sandbox(&source_sandbox_dir, &per_run_sandbox_dir, self.opts.quiet)?;
+        let eval_dir = self.prune.eval_dir(&source_sandbox_dir);
+        let baseline_hash =
+            materialize_sandbox(&source_sandbox_dir, &per_run_sandbox_dir, eval_dir.as_deref(), self.opts.quiet)?;
         let started = std::time::Instant::now();
         let run = RunId::lab(run_id.clone())?;
         let (mut result, lifecycle) = match self.run_provider(&run, &run_dir, &per_run_sandbox_dir, lifecycle)? {
@@ -601,20 +657,45 @@ fn warn(quiet: bool, msg: &str) {
 }
 
 /// (#488, #489, #496) Materialize the per-run sandbox. With a source, it is
-/// a COW clone of it with run-artifact dirs pruned, and the returned
-/// baseline hash is of the CLONE (byte-identical, and immune to a writer
-/// racing the source). Without one, the provider's setup populates an empty
-/// dir and there is no baseline hash. A hash failure warns and yields none.
-fn materialize_sandbox(source: &Path, per_run: &Path, quiet: bool) -> Result<Option<String>> {
+/// a COW clone of it with run-artifact dirs and `eval_dir` (#3361, settled
+/// at the preflight: [`Prune`]) pruned, and the returned baseline hash is of
+/// the CLONE (byte-identical, and immune to a writer racing the source).
+/// Without one, the provider's setup populates an empty dir and there is no
+/// baseline hash. A hash failure warns and yields none.
+fn materialize_sandbox(source: &Path, per_run: &Path, eval_dir: Option<&str>, quiet: bool) -> Result<Option<String>> {
     if !source.exists() {
         fs::create_dir_all(per_run)
             .with_context(|| format!("creating empty per-run sandbox {}", per_run.display()))?;
         return Ok(None);
     }
-    // (#3361) The eval's own folder (its workloads and grading data) never
-    // reaches the sandbox: the model must not see the grader.
-    let eval_dir = crate::lab::fixture::eval_dir_of(source);
-    if let Some(dir) = &eval_dir {
+    clone_source(source, per_run, eval_dir)?;
+    Ok(baseline_hash(per_run, quiet))
+}
+
+/// The COW clone of `source` at `per_run`, leaving out [`clone_excludes`].
+fn clone_source(source: &Path, per_run: &Path, eval_dir: Option<&str>) -> Result<()> {
+    let excluded = clone_excludes(source, eval_dir)?;
+    cow_clone_dir_excluding(source, per_run, &excluded)
+        .with_context(|| format!("cow-cloning source sandbox {} → {}", source.display(), per_run.display()))
+}
+
+/// The clone's baseline hash; a failure warns and yields none.
+fn baseline_hash(per_run: &Path, quiet: bool) -> Option<String> {
+    match hash_sandbox_dir(per_run) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            warn(quiet, &format!("baseline_hash for {} skipped: {e}", per_run.display()));
+            None
+        }
+    }
+}
+
+/// What a clone of `source` leaves out: the run-artifact dirs, and the
+/// eval's own folder (its workloads, grading data and roles), which the
+/// model must never see (#3361, #3363). A linked `eval_dir` is refused: the
+/// clone cannot keep a link's target out.
+fn clone_excludes<'a>(source: &Path, eval_dir: Option<&'a str>) -> Result<Vec<&'a str>> {
+    if let Some(dir) = eval_dir {
         if fs::symlink_metadata(source.join(dir)).is_ok_and(|m| m.file_type().is_symlink()) {
             anyhow::bail!(
                 "the fixture's eval_dir `{dir}` is a symlink; the clone cannot keep the grader out of the sandbox through a link. Make it a real folder"
@@ -622,17 +703,8 @@ fn materialize_sandbox(source: &Path, per_run: &Path, quiet: bool) -> Result<Opt
         }
     }
     let mut excluded: Vec<&str> = artifact_dirs::RUN_ARTIFACT_DIRS.to_vec();
-    excluded.extend(eval_dir.as_deref());
-    cow_clone_dir_excluding(source, per_run, &excluded).with_context(|| {
-        format!("cow-cloning source sandbox {} → {}", source.display(), per_run.display())
-    })?;
-    match hash_sandbox_dir(per_run) {
-        Ok(h) => Ok(Some(h)),
-        Err(e) => {
-            warn(quiet, &format!("baseline_hash for {} skipped: {e}", per_run.display()));
-            Ok(None)
-        }
-    }
+    excluded.extend(eval_dir);
+    Ok(excluded)
 }
 
 /// (#2833) Bring the in-memory verify in line with the work gate, so the
@@ -1492,6 +1564,31 @@ mod tests {
         registry.save(&default_registry_path(&paths::DarkmuxPaths::under_root(root.to_path_buf()))).unwrap();
     }
 
+    /// (#3396 re-review) A registered fixture whose manifest does not load
+    /// defines workloads nobody can look up. `lab run <id>` of a workload it
+    /// defines names that fixture, its manifest and the problem, instead of
+    /// a bare "not found": for an unreadable `schema_version` and for a 1.2
+    /// manifest without `eval_dir`, through the one mechanism.
+    #[test]
+    #[serial_test::serial]
+    fn a_workload_of_an_unreadable_registered_fixture_names_the_fixture_not_not_found() {
+        let cases = [
+            (r#"{"schema_version": " 1.2", "name": "x", "satisfies": "pg@2.1", "eval_dir": "eval"}"#, "` 1.2`"),
+            (r#"{"schema_version": "1.2", "name": "x", "satisfies": "pg@2.1"}"#, "needs `eval_dir`"),
+        ];
+        for (manifest, problem) in cases {
+            let tmp = TempDir::new().unwrap();
+            let _home_guard = HomeGuard::set(tmp.path());
+            let eval = tmp.path().join("eval-fx");
+            eval_fixture(&eval, "pg@2.1", "pg", None);
+            register_all(tmp.path(), &[("eval-fx", &eval)]);
+            std::fs::write(eval.join(".fixture.json"), manifest).unwrap();
+            let err = format!("{:#}", lab_run(one_run("pg")).unwrap_err());
+            assert!(err.contains("eval-fx/.fixture.json") && err.contains(problem), "{problem}: {err}");
+            assert!(err.contains("`eval-fx`"), "names the registered fixture: {err}");
+        }
+    }
+
     /// (#3386) A criterion's anchor is checked against the fixture the run
     /// will copy before any model runs, not first when the run is graded.
     #[test]
@@ -1520,49 +1617,229 @@ mod tests {
         assert!(err.contains("workload \"pg\"") && err.contains("occurs 0 times in src/a.js"), "{err}");
     }
 
-    /// (#3363) An eval owns its roles: a workload bound to a fixture whose
-    /// checkout lacks `roles/<id>.json` or `.md` is refused before any run
-    /// directory is claimed or any model chosen, naming the missing file.
-    /// Once the eval carries both, the check passes.
-    #[test]
-    #[serial_test::serial]
-    fn a_workload_whose_eval_lacks_its_role_is_refused_before_the_run() {
-        // The role is the provider's to name, as `main` registers them.
-        let _ = crate::providers::register_builtins();
-        let tmp = TempDir::new().unwrap();
-        let _home_guard = HomeGuard::set(tmp.path());
-        let eval = tmp.path().join("eval-fx");
-        eval_fixture(&eval, "pg@2.1", "pg", None);
-        register_all(tmp.path(), &[("eval-fx", &eval)]);
-        let run_opts = || RunOpts {
-            workload_id: "pg".into(),
+    /// (#3363) Rewrite a fixture's `.fixture.json` to declare `schema`.
+    fn declare_schema(dir: &Path, schema: &str) {
+        let path = dir.join(".fixture.json");
+        let mut doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        doc["schema_version"] = serde_json::json!(schema);
+        std::fs::write(&path, doc.to_string()).unwrap();
+    }
+
+    fn one_run(id: &str) -> RunOpts {
+        RunOpts {
+            workload_id: id.into(),
             profile_name: None,
             runs: 1,
             config_path: None,
             quiet: true,
             loop_override: None,
             inject_context: None,
-        };
+        }
+    }
 
-        let err = format!("{:#}", lab_run(run_opts()).unwrap_err());
+    /// (#3363) A schema-1.2 eval owns its roles: a workload bound to it whose
+    /// checkout lacks `eval/roles/<id>.json` or `.md` is refused before any
+    /// run directory is claimed or any model chosen, naming the missing file,
+    /// although darkmux compiles the role in. Once the eval carries both, the
+    /// run reads them and records `eval`.
+    #[test]
+    #[serial_test::serial]
+    fn a_workload_whose_schema_1_2_eval_lacks_its_role_is_refused_before_the_run() {
+        // The role is the provider's to name, as `main` registers them.
+        let _ = crate::providers::register_builtins();
+        let tmp = TempDir::new().unwrap();
+        let _home_guard = HomeGuard::set(tmp.path());
+        let eval = tmp.path().join("eval-fx");
+        eval_fixture(&eval, "pg@2.1", "pg", None);
+        declare_schema(&eval, "1.2");
+        register_all(tmp.path(), &[("eval-fx", &eval)]);
+
+        let err = format!("{:#}", lab_run(one_run("pg")).unwrap_err());
         // The prompt provider's default role; the registry canonicalizes the checkout's path.
-        assert!(err.contains("eval-fx/roles/code-reviewer.json is missing"), "names the missing role file: {err}");
+        assert!(err.contains("eval-fx/eval/roles/code-reviewer.json is missing"), "names the missing role file: {err}");
         assert!(err.contains("the eval must carry its roles"), "{err}");
         assert!(!tmp.path().join("runs").exists(), "refused before a run directory is claimed");
 
-        std::fs::create_dir_all(eval.join("roles")).unwrap();
+        std::fs::create_dir_all(eval.join("eval/roles")).unwrap();
         let builtin = |file: &str| {
             std::fs::read_to_string(
                 std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates/builtin/roles").join(file),
             )
             .unwrap()
         };
-        std::fs::write(eval.join("roles/code-reviewer.json"), builtin("code-reviewer.json")).unwrap();
-        std::fs::write(eval.join("roles/code-reviewer.md"), builtin("code-reviewer.md")).unwrap();
+        std::fs::write(eval.join("eval/roles/code-reviewer.json"), builtin("code-reviewer.json")).unwrap();
+        std::fs::write(eval.join("eval/roles/code-reviewer.md"), builtin("code-reviewer.md")).unwrap();
         let paths = paths::DarkmuxPaths::under_root(tmp.path().to_path_buf());
         let mut loaded = load("pg", Some(tmp.path())).unwrap();
-        read_lab_inputs(&mut loaded, &paths).expect("the eval carries its role");
-        assert!(matches!(loaded.lab_inputs, Some(darkmux_crew::dispatch::LabInputs::Eval(_))), "{:?}", loaded.lab_inputs);
+        check_fixture_and_read_role(&mut loaded, &paths).expect("the eval carries its role");
+        let inputs = loaded.lab_inputs.expect("read");
+        assert_eq!(inputs.source(), darkmux_flow::payload::RoleInputSource::Eval);
+    }
+
+    /// (#3363) darkmux still runs pepper-grinder 2.2 unchanged: its shape is a
+    /// `.fixture.json` at schema 1.1 with `eval_dir: "eval"`, a coding-task
+    /// workload in `eval/workloads/` running `coder`, and no roles anywhere.
+    /// The run reads darkmux's compiled-in coder (recorded `builtin`). That
+    /// the dispatch then sends the compiled-in bytes, whatever the home
+    /// folder holds, is the crew's
+    /// `a_legacy_eval_with_no_roles_runs_the_builtin_role_and_records_builtin`.
+    #[test]
+    #[serial_test::serial]
+    fn a_schema_1_1_eval_with_no_roles_runs_on_darkmuxs_builtin_role() {
+        let _ = crate::providers::register_builtins();
+        let tmp = TempDir::new().unwrap();
+        let _home_guard = HomeGuard::set(tmp.path());
+        let eval = tmp.path().join("pepper-grinder");
+        eval_fixture(&eval, "node-pepper-grinder-js@2.1", "pepper-grinder", None);
+        declare_schema(&eval, "1.1");
+        std::fs::write(
+            eval.join("eval/workloads/pepper-grinder.json"),
+            r#"{"schema_version": "1.2", "workload": {"id": "pepper-grinder", "provider": "coding-task", "role": "coder",
+                "prompt": "p", "requires_fixture": "node-pepper-grinder-js@2.1"}}"#,
+        )
+        .unwrap();
+        register_all(tmp.path(), &[("pepper-grinder", &eval)]);
+
+        let paths = paths::DarkmuxPaths::under_root(tmp.path().to_path_buf());
+        let mut loaded = load("pepper-grinder", Some(tmp.path())).unwrap();
+        check_fixture_and_read_role(&mut loaded, &paths).expect("a legacy eval with no roles runs the built-in coder");
+        assert_eq!(loaded.lab_inputs, Some(darkmux_crew::dispatch::LabInputs::Builtin));
+
+        // With `roles/coder.*` at its root, the same eval runs those (legacy).
+        std::fs::create_dir_all(eval.join("roles")).unwrap();
+        let builtin_json = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates/builtin/roles/coder.json"),
+        )
+        .unwrap();
+        std::fs::write(eval.join("roles/coder.json"), builtin_json).unwrap();
+        std::fs::write(eval.join("roles/coder.md"), "# coder\n\nTHE EVAL'S CODER\n").unwrap();
+        check_fixture_and_read_role(&mut loaded, &paths).expect("the root roles/ carries coder");
+        let inputs = loaded.lab_inputs.expect("read");
+        assert_eq!(inputs.source(), darkmux_flow::payload::RoleInputSource::LegacyRoot);
+    }
+
+    /// (#3363) A schema-1.2 eval's role files live in its `eval_dir`, so they
+    /// never reach the model's sandbox; a legacy eval's root `roles/` does.
+    #[test]
+    #[serial_test::serial]
+    fn a_schema_1_2_evals_role_files_never_reach_the_sandbox() {
+        let tmp = TempDir::new().unwrap();
+        let _home_guard = HomeGuard::set(tmp.path());
+        let eval = tmp.path().join("eval-fx");
+        eval_fixture(&eval, "pg@2.1", "pg", None);
+        declare_schema(&eval, "1.2");
+        std::fs::create_dir_all(eval.join("eval/roles")).unwrap();
+        std::fs::write(eval.join("eval/roles/coder.json"), "{}").unwrap();
+        std::fs::write(eval.join("eval/roles/coder.md"), "EVAL-ROLE-PROMPT").unwrap();
+        let per_run = tmp.path().join("run/sandbox");
+        std::fs::create_dir_all(tmp.path().join("run")).unwrap();
+        materialize_sandbox(&eval, &per_run, Some("eval"), true).unwrap();
+        assert!(per_run.join("src/a.js").is_file(), "precondition: the clone ran");
+        let reached: Vec<_> = walkdir_files(&per_run)
+            .into_iter()
+            .filter(|p| std::fs::read_to_string(p).is_ok_and(|t| t.contains("EVAL-ROLE-PROMPT")))
+            .collect();
+        assert!(reached.is_empty(), "the eval's role reached the model's sandbox: {reached:?}");
+        assert!(!per_run.join("eval").exists());
+
+        // The inverse, which is the difference the schema makes: a legacy
+        // eval's root `roles/` is cloned into the sandbox like any file.
+        let legacy = tmp.path().join("legacy-fx");
+        eval_fixture(&legacy, "pg@2.0", "pg-legacy", None);
+        declare_schema(&legacy, "1.1");
+        std::fs::create_dir_all(legacy.join("roles")).unwrap();
+        std::fs::write(legacy.join("roles/coder.md"), "LEGACY-ROOT-ROLE").unwrap();
+        let legacy_run = tmp.path().join("run-legacy/sandbox");
+        std::fs::create_dir_all(tmp.path().join("run-legacy")).unwrap();
+        materialize_sandbox(&legacy, &legacy_run, Some("eval"), true).unwrap();
+        assert_eq!(std::fs::read_to_string(legacy_run.join("roles/coder.md")).unwrap(), "LEGACY-ROOT-ROLE");
+        assert!(!legacy_run.join("eval").exists(), "the eval folder is pruned at every schema");
+    }
+
+    /// (#3396 re-review, from #3361) A fixture-bound run prunes the
+    /// `eval_dir` its manifest declared at the preflight, and never reads the
+    /// manifest again: one that goes missing (a dangling link, a checkout to
+    /// a commit without it) or stops loading mid-`runs: N` still keeps the
+    /// grader and the roles out of every run's sandbox. A manifest that is
+    /// already missing at the preflight refuses the run.
+    #[test]
+    #[serial_test::serial]
+    fn a_bound_fixtures_eval_dir_is_pinned_at_the_preflight_and_never_reread() {
+        let tmp = TempDir::new().unwrap();
+        let _home_guard = HomeGuard::set(tmp.path());
+        let eval = tmp.path().join("eval-fx");
+        eval_fixture(&eval, "pg@2.1", "pg", None);
+        register_all(tmp.path(), &[("eval-fx", &eval)]);
+        let paths = paths::DarkmuxPaths::under_root(tmp.path().to_path_buf());
+        let mut loaded = load("pg", Some(tmp.path())).unwrap();
+        let prune = check_fixture_and_read_role(&mut loaded, &paths).unwrap();
+        assert_eq!(prune, Prune::Pinned(Some("eval".into())));
+
+        for (n, change) in ["missing", "unloadable"].iter().enumerate() {
+            match *change {
+                "missing" => std::fs::remove_file(eval.join(".fixture.json")).unwrap(),
+                _ => std::fs::write(eval.join(".fixture.json"), r#"{"name": ""}"#).unwrap(),
+            }
+            let per_run = tmp.path().join(format!("run{n}/sandbox"));
+            std::fs::create_dir_all(per_run.parent().unwrap()).unwrap();
+            materialize_sandbox(&eval, &per_run, prune.eval_dir(&eval).as_deref(), true).unwrap();
+            assert!(per_run.join("src/a.js").is_file(), "{change}: precondition: the clone ran");
+            assert!(!per_run.join("eval").exists(), "{change}: the grader's folder reached the model's sandbox");
+        }
+
+        // Missing before the run: a workload bound to it is refused at the preflight.
+        std::fs::remove_file(eval.join(".fixture.json")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("workloads")).unwrap();
+        std::fs::write(
+            tmp.path().join("workloads/bound.json"),
+            r#"{"workload":{"id":"bound","provider":"prompt","prompt":"p","requires_fixture":"pg@2.1"}}"#,
+        )
+        .unwrap();
+        let mut bound = load("bound", Some(tmp.path())).unwrap();
+        let err = format!("{:#}", check_fixture_and_read_role(&mut bound, &paths).unwrap_err());
+        assert!(err.contains(".fixture.json"), "{err}");
+    }
+
+    /// (#3396 re-review) A run bound to no fixture clones its
+    /// `{sandboxes}/<id>/` source as before, even when a `.fixture.json`
+    /// darkmux did not write sits there: it is read leniently, and never
+    /// blocks the run.
+    #[test]
+    #[serial_test::serial]
+    fn a_run_bound_to_no_fixture_clones_past_a_stray_fixture_json() {
+        let tmp = TempDir::new().unwrap();
+        let _home_guard = HomeGuard::set(tmp.path());
+        let source = tmp.path().join("sandboxes/w");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join(".fixture.json"), r#"{"tool": "something-else"}"#).unwrap();
+        std::fs::write(source.join("a.txt"), "a").unwrap();
+        let per_run = tmp.path().join("run/sandbox");
+        std::fs::create_dir_all(tmp.path().join("run")).unwrap();
+        materialize_sandbox(&source, &per_run, Prune::Unbound.eval_dir(&source).as_deref(), true).unwrap();
+        assert!(per_run.join("a.txt").is_file());
+    }
+
+    /// A workload with no source sandbox gets an empty one, and no baseline.
+    #[test]
+    fn a_missing_source_materializes_an_empty_sandbox() {
+        let tmp = TempDir::new().unwrap();
+        let per_run = tmp.path().join("run/sandbox");
+        assert_eq!(materialize_sandbox(&tmp.path().join("no-such-source"), &per_run, Some("eval"), true).unwrap(), None);
+        assert!(per_run.is_dir());
+    }
+
+    /// Every file under `dir`, recursively.
+    fn walkdir_files(dir: &Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(walkdir_files(&p));
+            } else {
+                out.push(p);
+            }
+        }
+        out
     }
 
     #[test]
@@ -1628,7 +1905,7 @@ mod tests {
         register_all(tmp.path(), &[("eval-fx", &eval)]);
         let per_run = tmp.path().join("run/sandbox");
         std::fs::create_dir_all(tmp.path().join("run")).unwrap();
-        materialize_sandbox(&eval, &per_run, true).unwrap();
+        materialize_sandbox(&eval, &per_run, Prune::Unbound.eval_dir(&eval).as_deref(), true).unwrap();
         assert!(per_run.join("src/a.js").is_file());
         assert!(!per_run.join("eval").exists(), "the grader's folder reached the model's sandbox");
 
@@ -1682,7 +1959,7 @@ mod tests {
         symlink("secret", linked_dir.join("eval")).unwrap();
         let per_run = tmp.path().join("run2/sandbox");
         std::fs::create_dir_all(tmp.path().join("run2")).unwrap();
-        let err = materialize_sandbox(&linked_dir, &per_run, true).unwrap_err().to_string();
+        let err = materialize_sandbox(&linked_dir, &per_run, Some("eval"), true).unwrap_err().to_string();
         assert!(err.contains("eval_dir") && err.contains("symlink"), "{err}");
         assert!(!per_run.join("secret").exists());
     }
