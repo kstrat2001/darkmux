@@ -314,6 +314,61 @@ fn phase_review_abort_record(
     )
 }
 
+/// The `code-reviewer` dispatch a phase review runs over its diff `prompt`,
+/// under the review's own `session_id`.
+fn review_dispatch_opts(prompt: String, session_id: &SessionId) -> crate::crew::dispatch::DispatchOpts {
+    crate::crew::dispatch::DispatchOpts {
+        finding_sites: None,
+        // (#2914) Work never runs on the utility model.
+        allow_utility_model: false,
+        remote_origin: None,
+        live_channel: true,
+        brief_refs: Vec::new(),
+        workspace_read_only: false,
+        record_context: None,
+        resume_from: None,
+        host_out: None,
+        max_turns_override: None,
+        timeout_override_seconds: None, // (#2480)
+        role_id: "code-reviewer".to_string(),
+        message: prompt,
+        session: session_id.clone(),
+        timeout_seconds: 600,
+        skip_preflight: false,
+        // Phase review parses the SIGNOFF text from the dispatch's
+        // human-readable stdout — no JSON envelope needed.
+        json: false,
+        // Phase review doesn't ask the reviewer to write files — it
+        // parses the SIGNOFF text from the dispatch's stdout. Skip the
+        // watched-state echo to keep phase review output focused.
+        // Phase review reads operator-supplied diffs; no scope override.
+        workdir: None,
+        // Phase review is a code-reviewer dispatch on the phase's diff,
+        // not on the phase's own work. No cross-phase context needed.
+        phase_id: None,
+        // Phase review dispatches through the internal Docker-bounded
+        // runtime — the only dispatch path (#309, #1405).
+        machine: None,
+        wait: true,
+        // Phase dispatch defaults to runtime's built-in compaction;
+        // phase context isn't tied to a profile in this entry path.
+        compaction: crate::crew::dispatch::CompactionDispatchArgs::default(),
+        // (#549) No `--profile` override; fall back to `default_profile`.
+        profile_name: None,
+        // (#984) No --profiles-file here; dispatch resolves from env > default.
+        config_path: None,
+        // (#703) default image.
+        // (#1199) Bench-only knobs; defaults preserve existing behavior.
+        force_container: false,
+        max_completion_tokens: None,
+        image: None,
+        model_base_url_override: None,
+        step_id: None, // (#1483) set on the graph-step path only
+        system_prompt_override: None,
+        lab_inputs: None,
+    }
+}
+
 /// The code-review core (#1463): run the `code-reviewer` role against `path`'s
 /// diff vs `base` and return the structured [`PhaseReviewOutput`] (verdict +
 /// findings). Does NOT print or map an exit code — callers decide how to
@@ -451,56 +506,7 @@ pub(crate) fn phase_review_output_at(
         "You are the darkmux `code-reviewer` role. Your job: read this PR's diff and emit a structured QA-REVIEW-SIGNOFF block.\n\n## The diff\n\nBranch `{branch}` vs base `{base_ref}`:\n\n```\n{truncated_diff}\n```\n\n## Reporting format (strict)\n\nEmit findings as:\n\nQA-REVIEW-SIGNOFF\n- [SEVERITY] <file>:<line> — <one-sentence finding>\n- ...\n\nSummary: <N blockers, M flags, K nits>\n\nSeverity levels:\n- BLOCK: must fix before merge (security, correctness, broken tests)\n- FLAG: should address but mergeable with operator awareness\n- NIT: style / consistency / minor\n\nIf you find no issues at all, say so explicitly: `No findings. PR is mergeable.`\n\nBe specific. \"logic error\" without a line is useless. \"src/foo.rs:192 — sum is missing `tool_schemas`\" is a real finding.",
     );
 
-    let dispatch_opts = crate::crew::dispatch::DispatchOpts {
-        finding_sites: None,
-        // (#2914) Work never runs on the utility model.
-        allow_utility_model: false,
-        remote_origin: None,
-        live_channel: true,
-        brief_refs: Vec::new(),
-        workspace_read_only: false,
-        record_context: None,
-        resume_from: None,
-        host_out: None,
-        max_turns_override: None,
-        timeout_override_seconds: None, // (#2480)
-        role_id: "code-reviewer".to_string(),
-        message: prompt,
-        session: session_id.clone(),
-        timeout_seconds: 600,
-        skip_preflight: false,
-        // Phase review parses the SIGNOFF text from the dispatch's
-        // human-readable stdout — no JSON envelope needed.
-        json: false,
-        // Phase review doesn't ask the reviewer to write files — it
-        // parses the SIGNOFF text from the dispatch's stdout. Skip the
-        // watched-state echo to keep phase review output focused.
-        // Phase review reads operator-supplied diffs; no scope override.
-        workdir: None,
-        // Phase review is a code-reviewer dispatch on the phase's diff,
-        // not on the phase's own work. No cross-phase context needed.
-        phase_id: None,
-        // Phase review dispatches through the internal Docker-bounded
-        // runtime — the only dispatch path (#309, #1405).
-        machine: None,
-        wait: true,
-        // Phase dispatch defaults to runtime's built-in compaction;
-        // phase context isn't tied to a profile in this entry path.
-        compaction: crate::crew::dispatch::CompactionDispatchArgs::default(),
-        // (#549) No `--profile` override; fall back to `default_profile`.
-        profile_name: None,
-        // (#984) No --profiles-file here; dispatch resolves from env > default.
-        config_path: None,
-        // (#703) default image.
-        // (#1199) Bench-only knobs; defaults preserve existing behavior.
-        force_container: false,
-        max_completion_tokens: None,
-        image: None,
-        model_base_url_override: None,
-        step_id: None, // (#1483) set on the graph-step path only
-        system_prompt_override: None,
-        lab_inputs: None,
-    };
+    let dispatch_opts = review_dispatch_opts(prompt, &session_id);
 
     // Emit dispatch flow record. This is a mid-point progress emit, not a
     // terminal, so it goes through `emit_now` (the open unit stays armed).

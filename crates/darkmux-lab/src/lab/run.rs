@@ -232,6 +232,16 @@ fn check_criteria_anchors(loaded: &crate::workloads::types::LoadedWorkload, path
     crate::lab::grade::check_criteria(spec, Some(&fixture)).with_context(|| format!("workload \"{id}\""))
 }
 
+/// The pre-run checks against the fixture the run will copy: the criteria
+/// anchors (#3386), then the eval's role, read once (#3363).
+fn check_fixture_and_read_role(
+    loaded: &mut crate::workloads::types::LoadedWorkload,
+    paths: &paths::DarkmuxPaths,
+) -> Result<()> {
+    check_criteria_anchors(loaded, paths)?;
+    read_lab_inputs(loaded, paths)
+}
+
 /// (#3363) An eval owns its roles. The role the workload dispatches as is
 /// read ONCE, here, before any run starts: for a workload bound to a
 /// fixture, `roles/<id>.json` and `.md` from the fixture checkout every run
@@ -295,8 +305,7 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
     let paths = paths::resolve(ResolveScope::ForceUser);
     paths::ensure(&paths)?;
     prepare_workload(&mut loaded_workload, opts.inject_context.as_deref())?;
-    check_criteria_anchors(&loaded_workload, &paths)?;
-    read_lab_inputs(&mut loaded_workload, &paths)?;
+    check_fixture_and_read_role(&mut loaded_workload, &paths)?;
 
     let registry_loaded = load_registry(opts.config_path.as_deref())?;
     // (#2902) With no `--profile`, the run is on the profile bound to the

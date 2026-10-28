@@ -285,18 +285,18 @@ impl WorkloadProvider for CodingTaskProvider {
         let mut preserve = TrajectoryPreserver::new(out_dir.clone(), run_dir.to_path_buf());
         // Pass sandbox_dir as --workdir so the runtime mounts it at
         // /workspace, matching the placeholder substitution above (#337 fix).
-        let (dispatched, dispatch_out_dir) = dispatch_via_internal(
+        let (dispatched, dispatch_out_dir) = dispatch_opts(
             &role,
             &prompt,
             &session_id,
             Some(sandbox_dir.to_path_buf()),
             compaction,
             profile_name,
-            loaded.manifest.workload.image.as_deref(),
             config_path,
             out_dir,
             loaded,
-        )?;
+        )
+        .and_then(dispatch_via_internal)?;
         let duration_ms = started.elapsed().as_millis();
         let (stdout, stderr) = (&dispatched.stdout, &dispatched.stderr);
 
@@ -667,28 +667,26 @@ fn pick_role(loaded: &LoadedWorkload) -> String {
     darkmux_types::config_access::default_role().unwrap_or_else(|| "coder".to_string())
 }
 
-/// Dispatch via darkmux's internal Docker-bounded runtime through the
-/// crew::dispatch substrate. `workdir` (when `Some`) passes as
-/// `--workdir` so the runtime mounts the host path at `/workspace`
-/// inside the container, giving the agent access to the workload's
-/// sandbox files (#337 fix).
+/// The lab's dispatch options for one coding-task run. `workdir` (when
+/// `Some`) passes as `--workdir` so the runtime mounts the host path at
+/// `/workspace` inside the container, giving the agent access to the
+/// workload's sandbox files (#337 fix). (#3363) The role is the one `lab run`
+/// read from the eval before the run (`loaded.lab_inputs`).
 #[allow(clippy::too_many_arguments)]
-fn dispatch_via_internal(
+fn dispatch_opts(
     role_id: &str,
     prompt: &str,
     session_id: &SessionId,
     workdir: Option<PathBuf>,
     compaction: darkmux_crew::dispatch::CompactionDispatchArgs,
     profile_name: &str,
-    image: Option<&str>,
     config_path: Option<&str>,
     host_out: PathBuf,
     loaded: &LoadedWorkload,
-) -> Result<(Dispatched, Option<PathBuf>)> {
-    // (#3363) The role `lab run` read from the eval before the run.
+) -> Result<darkmux_crew::dispatch::DispatchOpts> {
     let lab_inputs = crate::providers::lab_inputs(loaded)?;
-    use darkmux_crew::dispatch::{dispatch, DispatchOpts};
-    let opts = DispatchOpts {
+    let image = loaded.manifest.workload.image.as_deref();
+    Ok(darkmux_crew::dispatch::DispatchOpts {
         finding_sites: None,
         // (#2914) The lab benchmarks candidate utility models.
         allow_utility_model: true,
@@ -732,8 +730,13 @@ fn dispatch_via_internal(
         system_prompt_override: None,
         // (#3363) The role from the eval, or darkmux's compiled-in one.
         lab_inputs: Some(lab_inputs),
-    };
-    let result = dispatch(opts).context("internal-runtime dispatch via lab harness")?;
+    })
+}
+
+/// Dispatch via darkmux's internal Docker-bounded runtime through the
+/// crew::dispatch substrate.
+fn dispatch_via_internal(opts: darkmux_crew::dispatch::DispatchOpts) -> Result<(Dispatched, Option<PathBuf>)> {
+    let result = darkmux_crew::dispatch::dispatch(opts).context("internal-runtime dispatch via lab harness")?;
     // `out_dir` is the host path where the runtime wrote its
     // `.darkmux-runtime/` bookkeeping (trajectory, findings). Threaded
     // back to the copy-into-run_dir site. `None` pre-image-rebuild ⇒
@@ -1789,9 +1792,11 @@ mod tests {
     }
 
     /// (#3363) The coding-task dispatch runs the role `lab run` read from the
-    /// eval, never darkmux's compiled-in one: `probe-3363` exists only in the
-    /// eval, so the dispatch gets as far as model selection, where the
-    /// compiled-in lookup would refuse it as not built in.
+    /// eval: the opts a fixture-bound run builds carry those exact inputs
+    /// (the eval's bytes), never darkmux's compiled-in role. Checked at the
+    /// `DispatchOpts` boundary, so it needs no Docker; that the dispatch
+    /// resolves its role from these inputs is the crew's
+    /// `writes_into_the_sandbox_after_the_role_is_read_cannot_change_the_prompt`.
     #[test]
     #[serial_test::serial]
     fn a_fixture_bound_coding_task_dispatches_the_role_read_from_the_eval() {
@@ -1806,17 +1811,19 @@ mod tests {
         spec.role = Some("probe-3363".into());
         spec.requires_fixture = Some("pg@2.1".into());
         let mut loaded = make_loaded(spec, state.join("doc"));
-        loaded.lab_inputs = Some(darkmux_crew::dispatch::LabInputs::load_eval(&eval, "probe-3363").unwrap());
-        let (run_dir, sandbox) = (state.join("run"), state.join("sandbox"));
-        fs::create_dir_all(&run_dir).unwrap();
-        fs::create_dir_all(&sandbox).unwrap();
-        let registry = state.join("no-such-profiles-3363.json");
-        let err = CodingTaskProvider
-            .run(&loaded, &run_dir, &sandbox, &darkmux_types::Profile::default(), "p", registry.to_str(), None,
-                &darkmux_types::session_id::RunId::lab("r3363").unwrap(), &mut |_: &darkmux_types::session_id::SessionId| {})
-            .unwrap_err();
-        let err = format!("{err:#}");
-        assert!(err.contains("model selection failed") && !err.contains("built-in roles"), "{err}");
+        let inputs = darkmux_crew::dispatch::LabInputs::load_eval(&eval, "probe-3363").unwrap();
+        loaded.lab_inputs = Some(inputs.clone());
+        let session = darkmux_types::session_id::SessionId::adhoc(darkmux_types::session_id::RunId::lab("r3363").unwrap(), "probe-3363", "coding");
+        let build = |loaded: &LoadedWorkload| {
+            dispatch_opts("probe-3363", "p", &session, Some(state.join("sandbox")), Default::default(), "p", None, state.join("out"), loaded)
+        };
+        let opts = build(&loaded).unwrap();
+        assert_eq!(opts.lab_inputs.as_ref(), Some(&inputs), "the eval's exact role bytes");
+        let carried = darkmux_crew::dispatch::lab_role(opts.lab_inputs.as_ref().unwrap(), "probe-3363").unwrap();
+        assert_eq!(carried.id, "probe-3363", "a role darkmux does not compile in, so not the Builtin inputs");
+        loaded.lab_inputs = None;
+        let err = build(&loaded).unwrap_err().to_string();
+        assert!(err.contains("its eval's role was not read"), "{err}");
     }
 
     #[test]
