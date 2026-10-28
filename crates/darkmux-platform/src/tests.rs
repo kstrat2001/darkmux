@@ -781,6 +781,20 @@ fn only_the_mac_has_a_keychain_to_keep_a_secret_in() {
     }
 }
 
+/// (#3400 review) `security -i` cuts a line at about 4095 bytes and runs
+/// the rest as a new command, so a store's command line must be one short
+/// line: anything else is refused before `security` runs, and the refusal
+/// says nothing of the secret. Pure: no test runs `security`.
+#[test]
+fn a_keychain_store_is_one_short_command_line() {
+    let line = crate::macos::security_store_line("darkmux-evals-token", "kain@http://evals.localhost:3419", "secret-value").unwrap();
+    assert_eq!(line, "add-generic-password -U -a \"kain@http://evals.localhost:3419\" -s darkmux-evals-token -w \"secret-value\"\n");
+    for (account, secret) in [("a".repeat(4096), "secret-value".to_string()), ("kain".into(), format!("secret-value{}", "s".repeat(4096))), ("kain\nadd".into(), "secret-value".into())] {
+        let err = crate::macos::security_store_line("darkmux-evals-token", &account, &secret).unwrap_err();
+        assert!(!err.contains("secret-value"), "{err}");
+    }
+}
+
 #[test]
 fn rfc3339_reads_utc_only() {
     assert_eq!(crate::dates::rfc3339_utc_ms("1970-01-01T00:00:00Z"), Some(0));

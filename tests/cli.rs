@@ -2338,7 +2338,7 @@ fn lab_with_no_subcommand_reports() {
 }
 
 /// `lab submit` refuses before reading anything: no runs named, no token
-/// stored (before any weights are hashed), a token that is not one.
+/// stored for the site (before any weights are hashed), a token that is not one.
 #[test]
 fn lab_submit_refuses_early_and_plainly() {
     darkmux_cmd()
@@ -2346,16 +2346,15 @@ fn lab_submit_refuses_early_and_plainly() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("name the lab runs to share"));
+    // (#3400) A site no one has logged in to, so the refusal is the same on
+    // every machine and a maintainer's evals.darkmux.com token is never read.
     darkmux_cmd()
-        .args(["lab", "submit", "no-such-run"])
+        .args(["lab", "submit", "no-such-run", "--site", "https://no-token.invalid"])
         .assert()
         .failure()
-        // A machine with a token stored (a maintainer's Mac, whose keychain is not isolated) gets past it to the run.
-        .stderr(
-            predicate::str::contains("no upload token stored")
-                .and(predicate::str::contains("lab submit login"))
-                .or(predicate::str::contains("no-such-run")),
-        );
+        .stderr(predicate::str::contains(
+            "no upload token for https://no-token.invalid: run `darkmux lab submit login --site https://no-token.invalid`",
+        ));
     darkmux_cmd()
         .args(["lab", "submit", "login", "--site", "http://127.0.0.1:9"])
         .write_stdin("not-a-token\n")

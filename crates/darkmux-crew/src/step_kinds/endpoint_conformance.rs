@@ -94,6 +94,7 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     ("crates/darkmux-crew/src/target.rs", "select_model(", 1, "THE resolver's selection (select_in_profile)"),
     ("crates/darkmux-types/src/endpoint.rs", ".keychain", 3, "THE credential order (credential_source), and validate()'s source check with its message"),
     ("crates/darkmux-crew/src/dispatch_internal.rs", ".keychain", 2, "resolve_endpoint_secret: the env var vanished between credential_source and the read, fall to the same declared item; and a message naming the field"),
+    ("crates/darkmux-lab/src/lab/submit/upload.rs", ".keychain", 6, "the evals upload token's own secret store (#3400: a Keychain trait object behind the per-origin token); it holds no endpoint credential and never decides an endpoint"),
     ("crates/darkmux-doctor/src/lib.rs", ".keychain", 3, "the probe's dedup key (two credentials to one deployment both probe) and two messages naming the field"),
     ("crates/darkmux-flow/src/hooks.rs", "strip_prefix(\"http://\")", 2, "the hooks destination URL policy, not a model endpoint"),
     ("crates/darkmux-serve/src/runs.rs", ".endpoint.is_some()", 1, "a run aggregate's recorded `endpoint` label (from flow records), not a profile endpoint"),

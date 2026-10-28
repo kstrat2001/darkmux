@@ -14,6 +14,26 @@ darkmux release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`lab submit`'s upload token is kept per site and sent only to the site it was stored for
+  (#3400).** One token was kept per user, so `lab submit --site <other site>` sent the
+  evals.darkmux.com token to whatever https host was named, and `lab submit login --site
+  <preview>` replaced it. A token is now keyed by the site's origin (scheme, host and port,
+  normalized): a `--site` with no token of its own is refused before anything is sent, naming
+  `darkmux lab submit login --site <site>`, and another site's token is never used in its place.
+  `login --site` stores only that site's token, and `logout` takes `--site` and forgets only
+  that site's. The evals.darkmux.com token stays where it was (keychain account `$USER`, or
+  `~/.darkmux/evals-token`), so an existing login keeps working; any other site's is kept as
+  account `$USER@<origin>`, or in `~/.darkmux/evals-tokens/`. A site's host is held to DNS's
+  limits (253 characters, labels of 63), so a long `--site` can no longer split the keychain
+  command, and a failed keychain store no longer repeats the keychain command's output, which
+  could carry part of the token.
+- **`lab submit` never sends a preview's upload token through a proxy.** An `http_proxy` setting
+  used to route a preview's (plain http) login and uploads through the proxy, Authorization header
+  and all. A plain-http preview now always goes straight to its site. https keeps your proxy
+  settings: the proxy sees only an encrypted connection, and some networks have no other way out.
+
 ## [5.9.0] - 2026-10-28
 
 A lab run's prompt is now pinned: an eval owns its roles, and nothing in the
