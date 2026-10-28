@@ -114,6 +114,7 @@ mod user_file_tests {
     }
 
     #[test]
+    #[serial_test::serial] // the preflight reads DARKMUX_DEFAULT_ENGINE, which a sibling test sets
     fn known_keys_load_and_pass_the_preflight() {
         let (_d, path) = write(CLEAN);
         crate::profiles::load_registry_quiet(Some(&path)).unwrap();
@@ -121,6 +122,7 @@ mod user_file_tests {
     }
 
     #[test]
+    #[serial_test::serial] // the preflight reads DARKMUX_DEFAULT_ENGINE, which a sibling test sets
     fn an_unknown_key_is_refused_by_every_dispatching_preflight_naming_the_closest() {
         for (doc, key, closest) in probes() {
             let (_d, path) = write(&doc);
@@ -140,6 +142,7 @@ mod user_file_tests {
     /// dispatching preflight, naming the exact rewrite (the `endpoints` id to
     /// move it to). The same document with the endpoint named by id passes.
     #[test]
+    #[serial_test::serial] // the preflight reads DARKMUX_DEFAULT_ENGINE, which a sibling test sets
     fn an_inline_endpoint_object_is_refused_naming_the_rewrite() {
         let inline = r#"{"profiles": {"p": {"models": [{"id": "gpt", "endpoint": {"url": "https://api.example/v1"}}]}}}"#;
         let (_d, path) = write(inline);
@@ -189,6 +192,7 @@ mod user_file_tests {
     /// where it is and both valid values; it is never read as either
     /// machine. A registered value passes.
     #[test]
+    #[serial_test::serial] // the preflight reads DARKMUX_DEFAULT_ENGINE, which a sibling test sets
     fn an_unregistered_endpoint_hardware_is_refused_by_every_dispatching_preflight() {
         let doc = |hardware: &str| {
             format!(r#"{{"profiles": {{"p": {{"models": [{{"id": "flint", "endpoint": "studio"}}]}}}},
@@ -213,6 +217,7 @@ mod user_file_tests {
     /// host darkmux cannot read unambiguously, named by its `url` key and
     /// never by the URL, which may carry a credential.
     #[test]
+    #[serial_test::serial] // the preflight reads DARKMUX_DEFAULT_ENGINE, which a sibling test sets
     fn misplaced_hardware_and_an_unreadable_host_are_refused_by_every_dispatching_preflight() {
         let (_d, path) = write(
             r#"{"profiles": {"p": {"models": [{"id": "m", "n_ctx": 1, "endpoint": "lms"}, {"id": "g", "endpoint": "oa"},
