@@ -70,14 +70,19 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    naming the role; a legacy fixture carrying `<eval_dir>/roles/<id>.*` is refused, naming
    the schema to declare. The rule is keyed on the schema the EVAL declares, never on the
    darkmux version, so no published eval breaks and every eval that opts in is strict.
-   A marker darkmux cannot parse is refused at every entry point that consumes the manifest
-   (the `lab run` preflight and `darkmux doctor` through the gate's `extra` issues,
-   `lab fixture register` and `lab doctor` through `FixtureManifest::validate`), naming the
-   file and the value, never read as legacy; lookups match names exactly, so an eval resolves
-   the same way on every OS. darkmux 5.0 through 5.8 refuse a 1.2 manifest at `lab run`'s
+   A marker darkmux cannot parse is never read as legacy: `FixtureManifest::validate`
+   refuses it, so `lab fixture register` refuses it and `lab doctor` reports it; the gate's
+   `extra` issues refuse it at the `lab run` preflight of a workload bound to the fixture and
+   fail it in `darkmux doctor`; and `lab run` of a workload the fixture's eval defines, which
+   cannot be found while the manifest does not load, names the registered fixture, its
+   manifest and the problem instead of "not found". Each names the file and the value. The
+   same holds for any manifest that does not load. Lookups match names exactly, and an
+   `eval_dir` the checkout holds only under another case is refused, so an eval resolves
+   the same way on every OS. A fixture-bound run reads the manifest once, at the preflight,
+   and every run's clone prunes the `eval_dir` read then, never re-reading it. darkmux 5.0 through 5.8 refuse a 1.2 manifest at `lab run`'s
    preflight as written by a newer darkmux. darkmux before 5.0 has no such gate and would run
    a 1.2 eval on its own roles, so the guarantee holds from 5.0 on. One resolver for every dispatch path (`darkmux_crew::role_inputs::read_fixture_role`,
-   fed `darkmux_lab::lab::fixture::role_layout_of`); `dispatch.start`'s `role.source` names
+   fed `FixtureManifest::role_layout` from the manifest read once at the preflight); `dispatch.start`'s `role.source` names
    which rule applied (`eval`, `legacy_root`, `builtin`). Conformance: the crew's
    `lab_role_tests` (each layout, the no-fallback, symlink and legacy cases), the lab's
    `a_schema_1_1_eval_with_no_roles_runs_on_darkmuxs_builtin_role`,

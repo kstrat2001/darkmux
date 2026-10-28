@@ -105,6 +105,7 @@ impl FixtureManifest {
         let manifest: FixtureManifest = serde_json::from_str(&raw)
             .with_context(|| format!("parsing {} as fixture manifest", manifest_path.display()))?;
         manifest.validate()?;
+        manifest.check_eval_dir_case(dir)?;
         Ok(manifest)
     }
 
@@ -159,6 +160,25 @@ impl FixtureManifest {
             ));
         }
         Ok(())
+    }
+
+    /// (#3396 re-review) Refuse an `eval_dir` the checkout holds only under
+    /// another case (`Eval/` for `eval`): a case-folding filesystem would open
+    /// it while every exact-name lookup misses it, and a case-sensitive one
+    /// would clone it into the model's sandbox. A declared folder that is
+    /// absent altogether is not this check's to refuse.
+    fn check_eval_dir_case(&self, dir: &Path) -> Result<()> {
+        let Some(eval_dir) = &self.eval_dir else { return Ok(()) };
+        let names: Vec<String> = std::fs::read_dir(dir)
+            .map(|entries| entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+            .unwrap_or_default();
+        match names.iter().find(|n| n.eq_ignore_ascii_case(eval_dir)) {
+            Some(found) if found != eval_dir && !names.contains(eval_dir) => Err(anyhow!(
+                "eval_dir `{eval_dir}` names no folder by that exact name; the checkout has `{found}`. \
+                 Rename one so they match: names are matched exactly, on every OS"
+            )),
+            _ => Ok(()),
+        }
     }
 
     /// (#3363) Whether this eval owns its roles: its `schema_version` is
@@ -227,34 +247,17 @@ pub(crate) fn eval_dir_of(fixture_dir: &Path) -> Option<String> {
     FixtureManifest::load_from_dir(fixture_dir).ok()?.eval_dir
 }
 
-/// (#3396 review, from #3361) The eval folder to prune when a run clones the
-/// fixture at `fixture_dir`: `None` when it has no `.fixture.json` or
-/// declares none. A manifest that exists but no longer loads is refused,
-/// because without it darkmux cannot name the folder to keep out of the
-/// model's sandbox.
-pub(crate) fn eval_dir_for_clone(fixture_dir: &Path) -> Result<Option<String>> {
-    if !fixture_dir.join(".fixture.json").exists() {
-        return Ok(None);
+impl FixtureManifest {
+    /// (#3363) Where a lab run of a workload bound to this fixture takes its
+    /// role, which the fixture's schema decides. `validate` already refused
+    /// a 1.2 manifest without `eval_dir` and a marker that does not parse.
+    pub(crate) fn role_layout(&self) -> darkmux_crew::dispatch::RoleLayout {
+        use darkmux_crew::dispatch::RoleLayout;
+        match &self.eval_dir {
+            Some(eval_dir) if self.owns_its_roles() => RoleLayout::Eval { eval_dir: eval_dir.clone() },
+            eval_dir => RoleLayout::Legacy { eval_dir: eval_dir.clone() },
+        }
     }
-    Ok(FixtureManifest::load_from_dir(fixture_dir)?.eval_dir)
-}
-
-/// (#3363) Where a lab run of a workload bound to the fixture at
-/// `fixture_dir` takes its role, which the fixture's schema decides. A
-/// checkout with no `.fixture.json` is legacy; one whose manifest does not
-/// load is refused.
-pub(crate) fn role_layout_of(fixture_dir: &Path) -> Result<darkmux_crew::dispatch::RoleLayout> {
-    use darkmux_crew::dispatch::RoleLayout;
-    if !fixture_dir.join(".fixture.json").exists() {
-        return Ok(RoleLayout::Legacy { eval_dir: None });
-    }
-    let manifest = FixtureManifest::load_from_dir(fixture_dir)?;
-    let owns = manifest.owns_its_roles();
-    Ok(match manifest.eval_dir {
-        // `validate` refused a schema-1.2 manifest with no `eval_dir`.
-        Some(eval_dir) if owns => RoleLayout::Eval { eval_dir },
-        eval_dir => RoleLayout::Legacy { eval_dir },
-    })
 }
 
 #[cfg(test)]
@@ -309,6 +312,25 @@ mod tests {
         assert_eq!(eval_dir_of(none.path()), None);
     }
 
+    /// (#3396 re-review) An `eval_dir` the checkout holds only under another
+    /// case (`Eval/` for `eval`) is refused, on every OS: macOS would open it
+    /// for the role lookup's purposes while the exact-name lookup and the
+    /// sandbox pruning disagree, and Linux would clone it into the sandbox.
+    /// A declared `eval_dir` with no folder at all is left to the run.
+    #[test]
+    fn an_eval_dir_cased_unlike_its_folder_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        write_manifest(tmp.path(), r#"{"name": "pg", "satisfies": "pg@2.1", "eval_dir": "eval"}"#);
+        std::fs::create_dir_all(tmp.path().join("Eval/roles")).unwrap();
+        let err = format!("{:#}", FixtureManifest::load_from_dir(tmp.path()).unwrap_err());
+        assert!(err.contains("eval_dir `eval`") && err.contains("`Eval`"), "{err}");
+        let exact = TempDir::new().unwrap();
+        write_manifest(exact.path(), r#"{"name": "pg", "satisfies": "pg@2.1", "eval_dir": "eval"}"#);
+        FixtureManifest::load_from_dir(exact.path()).expect("no folder at all is not this refusal");
+        std::fs::create_dir_all(exact.path().join("eval")).unwrap();
+        FixtureManifest::load_from_dir(exact.path()).expect("the exact folder loads");
+    }
+
     #[test]
     fn eval_dir_must_stay_inside_the_fixture() {
         for bad in ["", ".", "..", "../grader", "/abs", "./eval", "eval/../..", "a\\b", "grading/v1", "my eval"] {
@@ -349,32 +371,25 @@ mod tests {
             assert!(err.contains("schema_version") && err.contains(&format!("`{bad}`")), "{bad:?}: {err}");
             let tmp = TempDir::new().unwrap();
             write_manifest(tmp.path(), &doc.to_string());
-            assert!(role_layout_of(tmp.path()).is_err(), "{bad:?}");
+            assert!(FixtureManifest::load_from_dir(tmp.path()).is_err(), "{bad:?}");
         }
     }
 
     /// (#3363) The role layout is keyed on the fixture's declared schema:
-    /// 1.2 or newer owns its roles in `eval_dir`; 1.1, none, or no manifest
-    /// at all is legacy.
+    /// 1.2 or newer owns its roles in `eval_dir`; below 1.2 or none is legacy.
     #[test]
     fn the_role_layout_follows_the_fixtures_schema() {
         use darkmux_crew::dispatch::RoleLayout;
-        let layout = |manifest: Option<&str>| {
-            let tmp = TempDir::new().unwrap();
-            if let Some(json) = manifest {
-                write_manifest(tmp.path(), json);
-            }
-            role_layout_of(tmp.path()).unwrap()
-        };
+        let layout = |json: &str| serde_json::from_str::<FixtureManifest>(json).unwrap().role_layout();
         let eval = || RoleLayout::Eval { eval_dir: "eval".into() };
         let legacy = |dir: Option<&str>| RoleLayout::Legacy { eval_dir: dir.map(String::from) };
-        assert_eq!(layout(Some(r#"{"schema_version": "1.2", "name": "pg", "satisfies": "pg@2.1", "eval_dir": "eval"}"#)), eval());
-        assert_eq!(layout(Some(r#"{"schema_version": "1.10", "name": "pg", "satisfies": "pg@2.1", "eval_dir": "eval"}"#)), eval());
-        assert_eq!(layout(Some(r#"{"schema_version": "2", "name": "pg", "satisfies": "pg@2.1", "eval_dir": "eval"}"#)), eval());
-        assert_eq!(layout(Some(r#"{"schema_version": "1.1", "name": "pg", "satisfies": "pg@2.1", "eval_dir": "eval"}"#)), legacy(Some("eval")));
-        assert_eq!(layout(Some(r#"{"name": "pg", "satisfies": "pg@2.1", "eval_dir": "eval"}"#)), legacy(Some("eval")));
-        assert_eq!(layout(Some(r#"{"name": "pg"}"#)), legacy(None));
-        assert_eq!(layout(None), legacy(None));
+        assert_eq!(layout(r#"{"schema_version": "1.2", "name": "pg", "satisfies": "pg@2.1", "eval_dir": "eval"}"#), eval());
+        assert_eq!(layout(r#"{"schema_version": "1.10", "name": "pg", "satisfies": "pg@2.1", "eval_dir": "eval"}"#), eval());
+        assert_eq!(layout(r#"{"schema_version": "2", "name": "pg", "satisfies": "pg@2.1", "eval_dir": "eval"}"#), eval());
+        assert_eq!(layout(r#"{"schema_version": "1.1", "name": "pg", "satisfies": "pg@2.1", "eval_dir": "eval"}"#), legacy(Some("eval")));
+        assert_eq!(layout(r#"{"schema_version": "1.0", "name": "pg", "satisfies": "pg@2.1", "eval_dir": "eval"}"#), legacy(Some("eval")));
+        assert_eq!(layout(r#"{"name": "pg", "satisfies": "pg@2.1", "eval_dir": "eval"}"#), legacy(Some("eval")));
+        assert_eq!(layout(r#"{"name": "pg"}"#), legacy(None));
     }
 
     #[test]

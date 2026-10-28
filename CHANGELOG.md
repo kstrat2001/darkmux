@@ -39,9 +39,16 @@ darkmux release.
     `roles/`, on macOS as on Linux. A legacy eval that carries `<eval_dir>/roles/<id>.*` is
     refused too, naming the schema to declare, since a legacy run would
     never read those files. A `schema_version` darkmux cannot parse (`" 1.2"`,
-    `"v1.2"`, `"1.2-rc1"`) is refused by `lab run`, `lab fixture register`,
-    `lab doctor` and `darkmux doctor`, naming the file and the value, instead
-    of being read as legacy.
+    `"v1.2"`, `"1.2-rc1"`) is never read as legacy: `lab run` and `lab fixture
+    register` refuse it and `lab doctor` and `darkmux doctor` report it, each
+    naming the file and the value. `lab run` of a workload defined by a
+    registered fixture whose manifest does not load, for this or any reason,
+    names that fixture and the problem instead of "not found". An `eval_dir`
+    the checkout holds only under another case (`Eval/` for `eval`) is
+    refused. A run reads the fixture's manifest once, before the first run,
+    and every run's sandbox prunes the `eval_dir` read then, so a manifest
+    that goes missing or stops loading mid-`runs: N` cannot put the eval
+    folder in a sandbox.
 
   Whatever the schema, a lab run uses darkmux's compiled-in preamble, and
   its prompt never takes anything from `~/.darkmux/roles/`, the preamble

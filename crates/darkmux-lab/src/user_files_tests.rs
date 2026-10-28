@@ -235,7 +235,7 @@ fn every_builtin_workload_bound_to_a_builtin_fixture_finds_its_role_there() {
             user_fixture.push(id);
             continue;
         };
-        let layout = crate::lab::fixture::role_layout_of(dir).unwrap();
+        let layout = crate::lab::fixture::FixtureManifest::load_from_dir(dir).unwrap().role_layout();
         darkmux_crew::dispatch::LabInputs::for_fixture(dir, &layout, role).unwrap_or_else(|e| panic!("{path:?}: {e:#}"));
         checked += 1;
     }
