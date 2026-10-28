@@ -14,6 +14,21 @@ darkmux release.
 
 ## [Unreleased]
 
+## [5.9.0] - 2026-10-28
+
+A lab run's prompt is now pinned: an eval owns its roles, and nothing in the
+home folder reaches a lab prompt. And a run records whether the hardware that
+served its model is known, so a run on a provider's API or on another machine
+is no longer shared with the submitting Mac's chip and power.
+
+Every eval published before this keeps running unchanged (fixture schema 1.1,
+recorded as darkmux's built-in role or the eval's root `roles/`). New eval
+versions declare fixture schema 1.2 and carry `eval/roles/`; darkmux 5.0 to
+5.8 refuse them. Schemas moved additively: flow 2.6.0, fixture manifest 1.2,
+run manifest 1.3, profiles 2.2, and `lab submit` bundle format 7, written only
+when a run's hardware is unknown (a bundle of local runs is byte for byte what
+5.8 wrote, so today's evals site keeps taking it).
+
 ### Changed
 
 - **An eval owns its roles: a lab run's role and prompt come from the eval
@@ -4150,6 +4165,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   does. `FLOW_SCHEMA_VERSION` unchanged at 1.52.0; `RULES_SCHEMA_VERSION`
   unchanged at 3.0.0.
 
+[5.9.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.9.0
 [5.8.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.8.0
 [5.7.1]: https://github.com/kstrat2001/darkmux/releases/tag/v5.7.1
 [5.7.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.7.0
