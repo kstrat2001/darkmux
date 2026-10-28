@@ -185,7 +185,9 @@ fn anonymous_attempt(
     deadline: std::time::Instant,
     budget: Duration,
 ) -> Result<Option<std::result::Result<(), String>>> {
-    let host = match std::env::var_os("DOCKER_HOST") {
+    // An empty DOCKER_HOST is unset to the docker CLI, which then uses the
+    // context, so it is unset here too (#3422 re-review).
+    let host = match std::env::var_os("DOCKER_HOST").filter(|v| !v.is_empty()) {
         Some(_) => None,
         None => match context_endpoint() {
             Some(h) => Some(h),
@@ -1011,6 +1013,19 @@ mod tests {
         // Generous: the budget also covers the (fake) context lookup, which a
         // loaded test host can make slow. Without the skip the anonymous
         // attempt hangs to the bound and this fails.
+        let got = pull_public_image(&ghcr_image(), Duration::from_secs(5));
+        assert!(got.is_ok(), "{got:?}");
+    }
+
+    /// (#3422 re-review) An exported but EMPTY DOCKER_HOST is "unset" to the
+    /// docker CLI (it uses the context), so it must not stop the context
+    /// lookup: otherwise the anonymous pull goes to the default socket.
+    #[test]
+    #[serial_test::serial] // mutates PATH and DOCKER_HOST
+    fn an_empty_docker_host_still_uses_the_context_endpoint() {
+        let _fake = FakeDocker::install(PULL_OK_ONLY_IF_ANONYMOUS);
+        // SAFETY: #[serial]; FakeDocker's drop restores DOCKER_HOST.
+        unsafe { std::env::set_var("DOCKER_HOST", "") };
         let got = pull_public_image(&ghcr_image(), Duration::from_secs(5));
         assert!(got.is_ok(), "{got:?}");
     }
