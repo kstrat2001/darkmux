@@ -14,7 +14,18 @@ darkmux release.
 
 ## [Unreleased]
 
-### Fixed
+## [5.9.1] - 2026-10-28
+
+A security fix for `darkmux lab submit`. Upgrade if you share runs on darkmux evals.
+
+In darkmux 5.4 through 5.9.0, the evals upload token wasn't tied to the site that issued it, so
+`lab submit --site <url>` sent your evals.darkmux.com token to whatever https host the command
+named. That only happened if you ran a command with someone else's `--site` (a copied command,
+say). The token can upload runs and propose evals as you, and can't approve or moderate. If you
+ever ran `lab submit` with a `--site` you don't trust, make a new token on your account page;
+otherwise there's nothing to do, and your existing login keeps working.
+
+### Security
 
 - **`lab submit`'s upload token is kept per site and sent only to the site it was stored for
   (#3400).** One token was kept per user, so `lab submit --site <other site>` sent the
@@ -4185,6 +4196,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   does. `FLOW_SCHEMA_VERSION` unchanged at 1.52.0; `RULES_SCHEMA_VERSION`
   unchanged at 3.0.0.
 
+[5.9.1]: https://github.com/kstrat2001/darkmux/releases/tag/v5.9.1
 [5.9.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.9.0
 [5.8.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.8.0
 [5.7.1]: https://github.com/kstrat2001/darkmux/releases/tag/v5.7.1
