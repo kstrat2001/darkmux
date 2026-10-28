@@ -5602,18 +5602,20 @@ fn classify_daemon_freshness(
 // ─── B. binary vs source ──────────────────────────────────────────────────
 
 /// The git short SHA this binary was built from, or `None` when that is not a
-/// meaningful question: a packaged release (`(release)`) or a source-tarball
-/// build (no tag) has no commit to compare against.
+/// meaningful question: a packaged release that names no commit (`(release)`)
+/// or a source-tarball build (no tag) has no commit to compare against.
 ///
-/// Parses the tag `darkmux_types::build_version()` renders — `"2.0.0 (a1b2c3d)"`
-/// or `"2.0.0 (a1b2c3d✱)"` (`✱` = built from a dirty tree). The dirty marker is
+/// Parses the tag `darkmux_types::build_version()` renders — `"2.0.0 (a1b2c3d)"`,
+/// `"2.0.0 (a1b2c3d✱)"` (`✱` = built from a dirty tree), or a release naming its
+/// commit, `"2.0.0 (release a1b2c3d)"` (#3373, #3420). The dirty marker is
 /// stripped: it says the tree had uncommitted edits at build time, which does
 /// not change WHICH commit the binary came from.
 fn built_from_sha(build_version: &str) -> Option<String> {
     let start = build_version.find('(')? + 1;
     let end = build_version.rfind(')')?;
     let tag = build_version.get(start..end)?.trim();
-    if tag.is_empty() || tag == "release" {
+    let tag = tag.strip_prefix("release").map(str::trim).unwrap_or(tag);
+    if tag.is_empty() {
         return None;
     }
     Some(tag.trim_end_matches('\u{2731}').to_string())
@@ -11206,6 +11208,13 @@ mod tests {
         assert!(built_from_sha("2.0.0 (release)").is_none());
         // ...and neither does a bare source-tarball build.
         assert!(built_from_sha("2.0.0").is_none());
+    }
+
+    #[test]
+    fn built_from_sha_reads_the_commit_a_release_build_names() {
+        // (#3420) Since #3373 a release names its commit (`release d85aab9`);
+        // that commit, not the whole tag, is what the binary was built from.
+        assert_eq!(built_from_sha("5.9.1 (release d85aab9)").as_deref(), Some("d85aab9"));
     }
 
     #[test]
