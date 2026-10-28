@@ -342,16 +342,21 @@ mod tests {
     fn survivors(m: &str) -> String {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            let found = Command::new("pgrep")
-                .args(["-f", &format!("sleep {m}")])
-                .output()
-                .expect("pgrep must be available");
-            let out = String::from_utf8_lossy(&found.stdout).trim().to_string();
+            let out = survivors_now(m);
             if out.is_empty() || Instant::now() >= deadline {
                 return out;
             }
             std::thread::sleep(Duration::from_millis(200));
         }
+    }
+
+    /// One `pgrep -f "sleep <marker>"`, no retry: the pids running now.
+    fn survivors_now(m: &str) -> String {
+        let found = Command::new("pgrep")
+            .args(["-f", &format!("sleep {m}")])
+            .output()
+            .expect("pgrep must be available");
+        String::from_utf8_lossy(&found.stdout).trim().to_string()
     }
 
     /// (regression, found by this module's own suite) A command that
@@ -437,6 +442,16 @@ mod tests {
     /// lets the launcher's `LaunchFinalizeGuard` write the mission's
     /// terminal record instead of the mission sitting Active until a
     /// `test_command` that may never return does.
+    ///
+    /// The signal lands WHILE the command runs, which is the case this
+    /// test exists for. It used to be raised before `run_bounded`, and since
+    /// #3074 that returns at the pre-spawn guard: nothing spawned, the
+    /// survivors check had nothing to find, and the poll loop's own
+    /// interrupt branch ran only when some other test's timing happened to
+    /// reach it (a CRAP wobble on `spawn_and_poll`, 12.1 to 12.3). The
+    /// raiser waits until `pgrep` sees the command (its `sh -c` or its
+    /// `sleep`), which can only exist after `spawn`, so the pre-spawn guard
+    /// is already behind it and the poll loop is the one that sees the flag.
     #[test]
     #[serial_test::serial] // the interrupt flag is process-wide
     #[cfg(unix)]
@@ -445,11 +460,23 @@ mod tests {
         darkmux_types::run_in_own_process!();
         let m = marker(4);
         darkmux_types::interrupt::reset_for_test();
-        darkmux_types::interrupt::simulate_sigterm_for_test();
+        let raiser = {
+            let m = m.clone();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while survivors_now(&m).is_empty() {
+                    assert!(Instant::now() < deadline, "the command `sleep {m} & wait` never started");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                darkmux_types::interrupt::simulate_sigterm_for_test();
+            })
+        };
         let started = Instant::now();
         let out = run_bounded(sh(&format!("sleep {m} & wait")), Duration::from_secs(600));
         let elapsed = started.elapsed();
+        let raised = raiser.join();
         darkmux_types::interrupt::reset_for_test();
+        raised.expect("the raiser must see the command running, then raise the flag");
         assert!(matches!(out, Bounded::Interrupted), "got {out:?}");
         assert!(elapsed < Duration::from_secs(5), "a signal must not wait out the bound, took {elapsed:?}");
         let left = survivors(&m);
