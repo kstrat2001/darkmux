@@ -134,30 +134,31 @@ impl WorkloadProvider for CodingTaskProvider {
         //    forbids the only tools for execution.
         //
         //    The validator silently skips when the role can't be loaded
-        //    (unknown id) so the existing dispatch path produces its
-        //    own canonical "role not found" error without double-failing.
+        //    so the dispatch path produces its own canonical refusal
+        //    without double-failing. (#3363) The role is the one the
+        //    dispatch runs: the eval's own for a fixture-bound workload,
+        //    darkmux's compiled-in one otherwise, never the home folder's.
         let role_id = pick_role(loaded);
-        if let Ok(roles) = darkmux_crew::loader::load_roles() {
-            if let Some(role) = roles.iter().find(|r| r.id == role_id) {
-                if !role_can_modify_files(&role.tool_palette) {
-                    bail!(
-                        "coding-task workload `{}` is paired with role `{}` whose \
-                         tool_palette denies both `edit` and `write` — the agent has no \
-                         tools to apply a fix and the dispatch will inevitably waste \
-                         wall-clock on a 'describe-but-don't-execute' pattern.\n\
-                         \n\
-                         Fix one of:\n\
-                         \n\
-                           1. Set the workload's `role:` field to one that allows edit\n\
-                              (e.g. `\"role\": \"coder\"`).\n\
-                           2. Unset / override `DARKMUX_DEFAULT_ROLE` if it's pointing\n\
-                              at a review-shaped role.\n\
-                           3. Use a different workload that's review-shaped (where the\n\
-                              prompt asks the agent to FIND issues, not FIX them).",
-                        loaded.manifest.workload.id,
-                        role_id
-                    );
-                }
+        let role = crate::providers::lab_inputs(loaded).and_then(|i| darkmux_crew::dispatch::lab_role(&i, &role_id));
+        if let Ok(role) = role {
+            if !role_can_modify_files(&role.tool_palette) {
+                bail!(
+                    "coding-task workload `{}` is paired with role `{}` whose \
+                     tool_palette denies both `edit` and `write` — the agent has no \
+                     tools to apply a fix and the dispatch will inevitably waste \
+                     wall-clock on a 'describe-but-don't-execute' pattern.\n\
+                     \n\
+                     Fix one of:\n\
+                     \n\
+                       1. Set the workload's `role:` field to one that allows edit\n\
+                          (e.g. `\"role\": \"coder\"`).\n\
+                       2. Unset / override `DARKMUX_DEFAULT_ROLE` if it's pointing\n\
+                          at a review-shaped role.\n\
+                       3. Use a different workload that's review-shaped (where the\n\
+                          prompt asks the agent to FIND issues, not FIX them).",
+                    loaded.manifest.workload.id,
+                    role_id
+                );
             }
         }
 
@@ -284,17 +285,18 @@ impl WorkloadProvider for CodingTaskProvider {
         let mut preserve = TrajectoryPreserver::new(out_dir.clone(), run_dir.to_path_buf());
         // Pass sandbox_dir as --workdir so the runtime mounts it at
         // /workspace, matching the placeholder substitution above (#337 fix).
-        let (dispatched, dispatch_out_dir) = dispatch_via_internal(
+        let (dispatched, dispatch_out_dir) = dispatch_opts(
             &role,
             &prompt,
             &session_id,
             Some(sandbox_dir.to_path_buf()),
             compaction,
             profile_name,
-            loaded.manifest.workload.image.as_deref(),
             config_path,
             out_dir,
-        )?;
+            loaded,
+        )
+        .and_then(dispatch_via_internal)?;
         let duration_ms = started.elapsed().as_millis();
         let (stdout, stderr) = (&dispatched.stdout, &dispatched.stderr);
 
@@ -665,25 +667,26 @@ fn pick_role(loaded: &LoadedWorkload) -> String {
     darkmux_types::config_access::default_role().unwrap_or_else(|| "coder".to_string())
 }
 
-/// Dispatch via darkmux's internal Docker-bounded runtime through the
-/// crew::dispatch substrate. `workdir` (when `Some`) passes as
-/// `--workdir` so the runtime mounts the host path at `/workspace`
-/// inside the container, giving the agent access to the workload's
-/// sandbox files (#337 fix).
+/// The lab's dispatch options for one coding-task run. `workdir` (when
+/// `Some`) passes as `--workdir` so the runtime mounts the host path at
+/// `/workspace` inside the container, giving the agent access to the
+/// workload's sandbox files (#337 fix). (#3363) The role is the one `lab run`
+/// read from the eval before the run (`loaded.lab_inputs`).
 #[allow(clippy::too_many_arguments)]
-fn dispatch_via_internal(
+fn dispatch_opts(
     role_id: &str,
     prompt: &str,
     session_id: &SessionId,
     workdir: Option<PathBuf>,
     compaction: darkmux_crew::dispatch::CompactionDispatchArgs,
     profile_name: &str,
-    image: Option<&str>,
     config_path: Option<&str>,
     host_out: PathBuf,
-) -> Result<(Dispatched, Option<PathBuf>)> {
-    use darkmux_crew::dispatch::{dispatch, DispatchOpts};
-    let opts = DispatchOpts {
+    loaded: &LoadedWorkload,
+) -> Result<darkmux_crew::dispatch::DispatchOpts> {
+    let lab_inputs = crate::providers::lab_inputs(loaded)?;
+    let image = loaded.manifest.workload.image.as_deref();
+    Ok(darkmux_crew::dispatch::DispatchOpts {
         finding_sites: None,
         // (#2914) The lab benchmarks candidate utility models.
         allow_utility_model: true,
@@ -725,8 +728,15 @@ fn dispatch_via_internal(
         model_base_url_override: None,
         step_id: None, // (#1483) set on the graph-step path only
         system_prompt_override: None,
-    };
-    let result = dispatch(opts).context("internal-runtime dispatch via lab harness")?;
+        // (#3363) The role from the eval, or darkmux's compiled-in one.
+        lab_inputs: Some(lab_inputs),
+    })
+}
+
+/// Dispatch via darkmux's internal Docker-bounded runtime through the
+/// crew::dispatch substrate.
+fn dispatch_via_internal(opts: darkmux_crew::dispatch::DispatchOpts) -> Result<(Dispatched, Option<PathBuf>)> {
+    let result = darkmux_crew::dispatch::dispatch(opts).context("internal-runtime dispatch via lab harness")?;
     // `out_dir` is the host path where the runtime wrote its
     // `.darkmux-runtime/` bookkeeping (trajectory, findings). Threaded
     // back to the copy-into-run_dir site. `None` pre-image-rebuild ⇒
@@ -1500,6 +1510,7 @@ mod tests {
             manifest: WorkloadManifest { schema_version: None, workload: spec },
             base_dir,
             source: WorkloadSource::OnDisk,
+            lab_inputs: None,
         }
     }
 
@@ -1734,6 +1745,85 @@ mod tests {
         CodingTaskProvider
             .setup(&loaded, &run_dir, &sandbox_dir)
             .expect("default coder role must pass validation");
+    }
+
+    /// (#3363) The palette check reads the role the dispatch will run: for a
+    /// fixture-bound workload, the eval's own `roles/coder.json` in the
+    /// sandbox, never the home folder's. Both directions.
+    #[test]
+    #[serial_test::serial]
+    fn setup_checks_the_palette_of_the_evals_role_not_the_home_folders() {
+        let state = darkmux_types::test_isolation::IsolatedState::new();
+        let home = std::path::PathBuf::from(std::env::var("DARKMUX_HOME").expect("isolated home"));
+        let builtin = fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates/builtin/roles/coder.json"),
+        )
+        .unwrap();
+        let mut denying: serde_json::Value = serde_json::from_str(&builtin).unwrap();
+        denying["tool_palette"] = serde_json::json!({"allow": ["read"], "deny": ["edit", "write"]});
+        let denying = denying.to_string();
+        let write_role = |dir: &std::path::Path, json: &str| {
+            fs::create_dir_all(dir.join("roles")).unwrap();
+            fs::write(dir.join("roles/coder.json"), json).unwrap();
+            fs::write(dir.join("roles/coder.md"), "# coder\n").unwrap();
+        };
+        let mut spec = basic_spec();
+        spec.role = Some("coder".into());
+        spec.requires_fixture = Some("pg@2.1".into());
+        // The role `lab run` read from the eval before the run.
+        let run = |eval: &std::path::Path| {
+            let mut loaded = make_loaded(spec.clone(), state.join("doc"));
+            loaded.lab_inputs = Some(darkmux_crew::dispatch::LabInputs::load_eval(eval, "coder").unwrap());
+            CodingTaskProvider.setup(&loaded, &state.join("run"), &state.join("sandbox"))
+        };
+
+        // The home folder's coder denies edit and write; the eval's allows them.
+        write_role(&home, &denying);
+        let allowing = state.join("eval-allowing");
+        write_role(&allowing, &builtin);
+        run(&allowing).expect("the eval's coder can edit, whatever the home folder says");
+
+        // The reverse: the home folder's coder allows, the eval's denies.
+        write_role(&home, &builtin);
+        let denied = state.join("eval-denying");
+        write_role(&denied, &denying);
+        let err = run(&denied).expect_err("the eval's coder cannot edit").to_string();
+        assert!(err.contains("denies both `edit` and `write`"), "{err}");
+    }
+
+    /// (#3363) The coding-task dispatch runs the role `lab run` read from the
+    /// eval: the opts a fixture-bound run builds carry those exact inputs
+    /// (the eval's bytes), never darkmux's compiled-in role. Checked at the
+    /// `DispatchOpts` boundary, so it needs no Docker; that the dispatch
+    /// resolves its role from these inputs is the crew's
+    /// `writes_into_the_sandbox_after_the_role_is_read_cannot_change_the_prompt`.
+    #[test]
+    #[serial_test::serial]
+    fn a_fixture_bound_coding_task_dispatches_the_role_read_from_the_eval() {
+        let state = darkmux_types::test_isolation::IsolatedState::new();
+        let eval = state.join("eval");
+        fs::create_dir_all(eval.join("roles")).unwrap();
+        let role = serde_json::json!({"id": "probe-3363", "description": "d", "tool_palette": {"allow": ["read", "edit", "write"], "deny": []},
+            "escalation_contract": "bail-with-explanation"});
+        fs::write(eval.join("roles/probe-3363.json"), role.to_string()).unwrap();
+        fs::write(eval.join("roles/probe-3363.md"), "# probe\n").unwrap();
+        let mut spec = basic_spec();
+        spec.role = Some("probe-3363".into());
+        spec.requires_fixture = Some("pg@2.1".into());
+        let mut loaded = make_loaded(spec, state.join("doc"));
+        let inputs = darkmux_crew::dispatch::LabInputs::load_eval(&eval, "probe-3363").unwrap();
+        loaded.lab_inputs = Some(inputs.clone());
+        let session = darkmux_types::session_id::SessionId::adhoc(darkmux_types::session_id::RunId::lab("r3363").unwrap(), "probe-3363", "coding");
+        let build = |loaded: &LoadedWorkload| {
+            dispatch_opts("probe-3363", "p", &session, Some(state.join("sandbox")), Default::default(), "p", None, state.join("out"), loaded)
+        };
+        let opts = build(&loaded).unwrap();
+        assert_eq!(opts.lab_inputs.as_ref(), Some(&inputs), "the eval's exact role bytes");
+        let carried = darkmux_crew::dispatch::lab_role(opts.lab_inputs.as_ref().unwrap(), "probe-3363").unwrap();
+        assert_eq!(carried.id, "probe-3363", "a role darkmux does not compile in, so not the Builtin inputs");
+        loaded.lab_inputs = None;
+        let err = build(&loaded).unwrap_err().to_string();
+        assert!(err.contains("its eval's role was not read"), "{err}");
     }
 
     #[test]

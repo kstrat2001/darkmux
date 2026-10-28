@@ -28,7 +28,7 @@ use crate::dispatch::DispatchOpts;
 use darkmux_types::execution_id::ExecutionId;
 use darkmux_types::session_id::SessionId;
 use darkmux_types::shell::quote as shell_quote;
-use crate::loader::{load_autonomous_dispatch_preamble, load_roles};
+use crate::loader::load_roles;
 use anyhow::{anyhow, bail, Context, Result};
 use darkmux_profiles::engine;
 use std::fs;
@@ -3181,24 +3181,33 @@ fn single_shot_cap(cap: Option<u32>, reasoning_effort: Option<&str>) -> u32 {
 /// main path raises the canonical "role not found") or no registry loads.
 /// Both the hosted route and the container route read their endpoint's
 /// limits from this one resolution (#3035: limits apply to any endpoint).
-fn resolve_dispatch_route(opts: &DispatchOpts) -> Result<Option<(crate::types::Role, crate::target::Target)>> {
-    let roles = load_roles().context("loading crew roles for internal dispatch")?;
-    let role = match roles.iter().find(|r| r.id == opts.role_id) {
-        Some(r) => r.clone(),
-        None => return Ok(None), // let the main path raise the canonical "role not found"
+///
+/// (#3363) The role comes from [`crate::role_inputs::resolve_role`], the one
+/// resolution every path makes: a lab dispatch's from its pinned inputs.
+fn resolve_dispatch_route(
+    opts: &DispatchOpts,
+) -> Result<Option<(crate::role_inputs::ResolvedRole, crate::target::Target)>> {
+    let Some(resolved) = crate::role_inputs::resolve_role(opts)? else {
+        return Ok(None); // let the main path raise the canonical "role not found"
     };
     let target = resolve_target(
-        &role,
+        &resolved.role,
         opts.profile_name.as_deref(),
         opts.config_path.as_deref(),
         opts.allow_utility_model,
     )?;
-    Ok(target.map(|t| (role, t)))
+    Ok(target.map(|t| (resolved, t)))
 }
 
 /// The system prompt of a HOSTED dispatch: the caller's override verbatim,
-/// else the role's prompt (with the specialist preamble for a specialist).
-fn unmanaged_system_prompt(opts: &DispatchOpts, role: &crate::types::Role) -> Result<String> {
+/// else the role's prompt (with the specialist preamble for a specialist),
+/// plus the operator identity when the brain stays on this machine
+/// (`leaves_this_machine` false). Never the identity for a lab dispatch.
+fn hosted_system_prompt(
+    opts: &DispatchOpts,
+    resolved: &crate::role_inputs::ResolvedRole,
+    leaves_this_machine: bool,
+) -> Result<(String, crate::role_inputs::PromptProvenance)> {
     // (#1698 Packet B2) `system_prompt_override` is honored HERE too, not
     // just in `dispatch_local_single_shot` — a caller-supplied override
     // must be sent verbatim regardless of which underlying path a profile
@@ -3207,29 +3216,20 @@ fn unmanaged_system_prompt(opts: &DispatchOpts, role: &crate::types::Role) -> Re
     // endpoint would silently get the UNSUBSTITUTED loader-resolved prompt
     // instead (e.g. a literal `{{humor}}` placeholder) plus the specialist
     // preamble the override caller explicitly opted out of — see that
-    // field's own doc on `DispatchOpts`.
+    // field's own doc on `DispatchOpts`. An override is sent verbatim, so it
+    // gets no identity either.
     if let Some(text) = &opts.system_prompt_override {
-        return Ok(text.clone());
+        return Ok((text.clone(), crate::role_inputs::PromptProvenance::default()));
     }
-    // (#1550 cluster item 3) `load_role_prompt_for` honors an
-    // explicit `role.prompt_path` (if the manifest set one) before
-    // falling to the conventional sibling-file/embedded search —
-    // `load_role_prompt` alone never checked it, which let
-    // `darkmux role show` display a path that dispatch then
-    // couldn't find.
-    let role_prompt = crate::loader::load_role_prompt_for(role).ok_or_else(|| {
-        anyhow!(
-            "role '{}' has no readable .md system prompt (checked prompt_path={:?}, the \
-             conventional roles dir, and the embedded table): hosted dispatch requires one",
-            opts.role_id,
-            role.prompt_path
-        )
-    })?;
-    Ok(if role.is_specialist() {
-        format!("{}\n\n{}", load_autonomous_dispatch_preamble().trim_end(), role_prompt)
-    } else {
-        role_prompt
-    })
+    // (#1550 cluster item 3) The role prompt honors an explicit
+    // `role.prompt_path` (if the manifest set one) before falling to the
+    // conventional sibling-file/embedded search (`load_role_prompt_for`).
+    let (system_prompt, mut provenance) = resolved.role_and_preamble(": hosted dispatch requires one")?;
+    // (#316) A brain that stays on this machine (the default engine on
+    // loopback) gets the operator's identity, as LM Studio does.
+    let system_prompt =
+        resolved.with_identity(system_prompt, identity_augmentation_allowed(leaves_this_machine), &mut provenance);
+    Ok((system_prompt, provenance))
 }
 
 /// `crate::dispatch::one_call_context`: the same route resolution
@@ -3237,7 +3237,7 @@ fn unmanaged_system_prompt(opts: &DispatchOpts, role: &crate::types::Role) -> Re
 /// an unmanaged target with a role that needs no container.
 pub fn one_call_context(opts: &DispatchOpts) -> Result<Option<crate::dispatch::OneCallContext>> {
     Ok(match route_dispatch(opts)? {
-        Some(DispatchRoute::Unmanaged { role, system_prompt, target })
+        Some(DispatchRoute::Unmanaged { role, system_prompt, target, .. })
             if !container_path_required(&role, opts.force_container) =>
         {
             Some(crate::dispatch::OneCallContext {
@@ -3255,31 +3255,33 @@ pub fn one_call_context(opts: &DispatchOpts) -> Result<Option<crate::dispatch::O
 /// How a dispatch's resolved target routes: hosted (an endpoint darkmux only
 /// sends requests to) or through the container/local path (a managed one).
 enum DispatchRoute {
-    Unmanaged { role: Box<crate::types::Role>, system_prompt: String, target: Box<crate::target::Target> },
+    Unmanaged {
+        role: Box<crate::types::Role>,
+        system_prompt: String,
+        /// (#3363) What `system_prompt` was built from, for `dispatch.start`.
+        provenance: Box<crate::role_inputs::PromptProvenance>,
+        target: Box<crate::target::Target>,
+    },
     Managed(Box<crate::target::Target>),
 }
 
 /// [`resolve_dispatch_route`], classified by the target's kind and, for a
 /// hosted one, with its system prompt. `Ok(None)` ⇒ no role or registry.
 fn route_dispatch(opts: &DispatchOpts) -> Result<Option<DispatchRoute>> {
-    let Some((role, target)) = resolve_dispatch_route(opts)? else { return Ok(None) };
+    let Some((resolved, target)) = resolve_dispatch_route(opts)? else { return Ok(None) };
     // (#2902 review C4) An exhaustive match on the kind, so a new kind
     // (#2916's fleet machine) is a compile error here, not a silent
     // fall onto one arm.
     Ok(Some(match target.kind {
         darkmux_types::EndpointKind::Unmanaged => {
-            let system_prompt = unmanaged_system_prompt(opts, &role)?;
-            // (#316) A brain that stays on this machine (the default engine
-            // on loopback) gets the operator's identity, as LM Studio does;
-            // an override is sent verbatim.
-            let system_prompt = if opts.system_prompt_override.is_none()
-                && identity_augmentation_allowed(brain_leaves_this_machine(&target))
-            {
-                crate::dispatch::augment_prompt_with_identity(&system_prompt)
-            } else {
-                system_prompt
-            };
-            DispatchRoute::Unmanaged { role: Box::new(role), system_prompt, target: Box::new(target) }
+            let (system_prompt, provenance) =
+                hosted_system_prompt(opts, &resolved, brain_leaves_this_machine(&target))?;
+            DispatchRoute::Unmanaged {
+                role: Box::new(resolved.role),
+                system_prompt,
+                provenance: Box::new(provenance),
+                target: Box::new(target),
+            }
         }
         darkmux_types::EndpointKind::Managed(_) => DispatchRoute::Managed(Box::new(target)),
     }))
@@ -3292,7 +3294,7 @@ fn try_resolve_unmanaged_target(
     opts: &DispatchOpts,
 ) -> Result<Option<(crate::types::Role, String, crate::target::Target)>> {
     Ok(match route_dispatch(opts)? {
-        Some(DispatchRoute::Unmanaged { role, system_prompt, target }) => Some((*role, system_prompt, *target)),
+        Some(DispatchRoute::Unmanaged { role, system_prompt, target, .. }) => Some((*role, system_prompt, *target)),
         Some(DispatchRoute::Managed(_)) | None => None,
     })
 }
@@ -4426,8 +4428,8 @@ pub(crate) fn single_call_complete(tokens: &crate::dispatch_envelope::DirectToke
 fn dispatch_unmanaged(
     opts: &DispatchOpts,
     execution: &ExecutionId,
-    _role: &crate::types::Role,
     system_prompt: &str,
+    provenance: &crate::role_inputs::PromptProvenance,
     target: &crate::target::Target,
 ) -> Result<DispatchResult> {
     let ep = &target.endpoint;
@@ -4509,29 +4511,25 @@ fn dispatch_unmanaged(
 
     // (#1177) Cap the prompt in the record (a brief can be KB-long) — capped
     // text + full `prompt_chars`, matching the container path.
+    let mut start = DispatchStartPayload {
+        endpoint: Some(label.clone()),
+        prompt: Some(crate::dispatch::capped_prompt(&opts.message)),
+        prompt_chars: Some(opts.message.chars().count() as u64),
+        // (#2295) Same field, same reason as the container path's
+        // `dispatch_start_payload`: the prompt is capped in the
+        // record, so which records a dispatch was briefed on has to be
+        // its own key on EVERY dispatch path, not just one.
+        brief_refs: Some(opts.brief_refs.clone()),
+        // (#3125) Its emitter (above) published its first beat.
+        beats: darkmux_flow::session_presence::beats(session_emitter.as_ref()),
+        ..Default::default()
+    };
+    // (#3363) What the system prompt was built from, as on every path.
+    crate::role_inputs::stamp_prompt_inputs(&mut start, system_prompt, provenance);
     bookend.open(
         "dispatch",
         "dispatch",
-        build_unmanaged_record(
-            &opts.role_id,
-            session,
-            execution,
-            &pm.id,
-            phase,
-            darkmux_flow::Payload::DispatchStart(DispatchStartPayload {
-                endpoint: Some(label.clone()),
-                prompt: Some(crate::dispatch::capped_prompt(&opts.message)),
-                prompt_chars: Some(opts.message.chars().count() as u64),
-                // (#2295) Same field, same reason as the container path's
-                // `dispatch_start_payload`: the prompt is capped in the
-                // record, so which records a dispatch was briefed on has to be
-                // its own key on EVERY dispatch path, not just one.
-                brief_refs: Some(opts.brief_refs.clone()),
-                // (#3125) Its emitter (above) published its first beat.
-                beats: darkmux_flow::session_presence::beats(session_emitter.as_ref()),
-                ..Default::default()
-            }),
-        ),
+        build_unmanaged_record(&opts.role_id, session, execution, &pm.id, phase, darkmux_flow::Payload::DispatchStart(start)),
     );
 
     // (#3211) The turn's live evidence, as a container turn has it: the
@@ -4687,6 +4685,37 @@ fn dispatch_unmanaged(
     })
 }
 
+/// The system prompt of a LOCAL single-shot dispatch: the caller's override
+/// verbatim, else the role's prompt with the specialist preamble; then the
+/// operator identity, never for a lab dispatch.
+fn local_single_shot_system_prompt(
+    opts: &DispatchOpts,
+    resolved: &crate::role_inputs::ResolvedRole,
+) -> Result<(String, crate::role_inputs::PromptProvenance)> {
+    // (#1698 Packet B2) `system_prompt_override` skips BOTH the loader
+    // lookup and the specialist-preamble prepend below — see the field's
+    // own doc on `DispatchOpts` for why an override caller wants the exact
+    // text it built, verbatim.
+    let (system_prompt, mut provenance) = match &opts.system_prompt_override {
+        Some(text) => (text.clone(), crate::role_inputs::PromptProvenance::default()),
+        None => resolved.role_and_preamble(" — single-shot dispatch requires one")?,
+    };
+    // (#147, fresh-review finding) Operator-identity augmentation — this
+    // path is only reached once the resolved brain is known to be LOCAL (a
+    // remote resolution returns earlier via `dispatch_unmanaged`), so
+    // `identity_augmentation_allowed`'s own remote-vs-local gate is
+    // trivially satisfied here, and it applies even to an override.
+    // Load-bearing, not cosmetic: `radio-router` was TOOL-LESS pre-#1698
+    // Packet B too, so it already rode `dispatch()`'s CONTAINER path (every
+    // tool-less local dispatch is augmented there — `identity_augmentation_
+    // allowed` has no specialist/utility carve-out, only remote-vs-local).
+    // Wiring this LIGHTER path without it would have been a silent
+    // behavior regression for radio-router's live production dispatch, not
+    // just an omission for some hypothetical future caller.
+    let system_prompt = resolved.with_identity(system_prompt, true, &mut provenance);
+    Ok((system_prompt, provenance))
+}
+
 /// (#1698 Packet B carry-list item — the container-path fix named in the
 /// issue's live dogfood comment: "the route rides the FULL internal-runtime
 /// container dispatch (image/workspace/out-dir spin) for a tool-less
@@ -4752,11 +4781,9 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
     // (#2947) Bad enum config refuses before anything, same as `dispatch`.
     crate::user_files::preflight_with(darkmux_types::config_enum::Scope::Dispatch, opts.config_path.as_deref())?;
     darkmux_flow::daemon_probe::nudge_if_daemon_unreachable("dispatch");
-    let roles = load_roles().context("loading crew roles for internal dispatch")?;
-    let role = roles
-        .iter()
-        .find(|r| r.id == opts.role_id)
-        .ok_or_else(|| anyhow!("role not found: {}", opts.role_id))?;
+    let resolved =
+        crate::role_inputs::resolve_role(&opts)?.ok_or_else(|| anyhow!("role not found: {}", opts.role_id))?;
+    let role = &resolved.role;
 
     if role_wants_agentic_remote(role) {
         bail!(
@@ -4774,7 +4801,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
     // through the container for a remote target.
     // (#3035) A managed target's endpoint carries limits like any other.
     let (hosted, managed_pm) = split_route(route_dispatch(&opts)?);
-    if let Some((remote_role, system_prompt, pm)) = hosted {
+    if let Some((_remote_role, system_prompt, pm, provenance)) = hosted {
         // (#2580 follow-up, same class as `dispatch()`'s own guard a few
         // hundred lines below) `dispatch_unmanaged` never reads `resume_from`
         // — no checkpoint, no container, nothing to resume INTO. This
@@ -4799,49 +4826,10 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
                 opts.role_id
             );
         }
-        return dispatch_unmanaged(&opts, execution, &remote_role, &system_prompt, &pm);
+        return dispatch_unmanaged(&opts, execution, &system_prompt, &provenance, &pm);
     }
 
-    // (#1698 Packet B2) `system_prompt_override` skips BOTH the loader
-    // lookup and the specialist-preamble prepend below — see the field's
-    // own doc on `DispatchOpts` for why an override caller wants the exact
-    // text it built, verbatim.
-    let system_prompt = match &opts.system_prompt_override {
-        Some(text) => text.clone(),
-        None => {
-            let role_prompt = crate::loader::load_role_prompt_for(role).ok_or_else(|| {
-                anyhow!(
-                    "role '{}' has no readable .md system prompt (checked prompt_path={:?}, the \
-                     conventional roles dir, and the embedded table) — single-shot dispatch requires one",
-                    opts.role_id,
-                    role.prompt_path
-                )
-            })?;
-            if role.is_specialist() {
-                format!(
-                    "{}\n\n{}",
-                    load_autonomous_dispatch_preamble().trim_end(),
-                    role_prompt
-                )
-            } else {
-                role_prompt
-            }
-        }
-    };
-    // (#147, fresh-review finding) Operator-identity augmentation — this
-    // function's execution has ALREADY established, by reaching this line,
-    // that the resolved brain is LOCAL (a remote resolution returned above
-    // via `dispatch_unmanaged`), so `identity_augmentation_allowed`'s own
-    // remote-vs-local gate is trivially satisfied here; called
-    // unconditionally rather than re-deriving that already-settled check.
-    // Load-bearing, not cosmetic: `radio-router` was TOOL-LESS pre-#1698
-    // Packet B too, so it already rode `dispatch()`'s CONTAINER path (every
-    // tool-less local dispatch is augmented there — `identity_augmentation_
-    // allowed` has no specialist/utility carve-out, only remote-vs-local).
-    // Wiring this LIGHTER path without it would have been a silent
-    // behavior regression for radio-router's live production dispatch, not
-    // just an omission for some hypothetical future caller.
-    let system_prompt = crate::dispatch::augment_prompt_with_identity(&system_prompt);
+    let (system_prompt, provenance) = local_single_shot_system_prompt(&opts, &resolved)?;
 
     // (#1135-safe) Resolves the profile's model AND ensures it's loaded at
     // the profile's declared n_ctx — the same path the container dispatch
@@ -4924,13 +4912,18 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
             execution,
             &model_id,
             phase,
-            darkmux_flow::Payload::DispatchStart(DispatchStartPayload {
-                prompt: Some(crate::dispatch::capped_prompt(&opts.message)),
-                prompt_chars: Some(opts.message.chars().count() as u64),
-                // (#2295) Same field, same reason — see the hosted path above.
-                brief_refs: Some(opts.brief_refs.clone()),
-                beats: darkmux_flow::session_presence::beats(session_emitter.as_ref()),
-                ..Default::default()
+            darkmux_flow::Payload::DispatchStart({
+                let mut start = DispatchStartPayload {
+                    prompt: Some(crate::dispatch::capped_prompt(&opts.message)),
+                    prompt_chars: Some(opts.message.chars().count() as u64),
+                    // (#2295) Same field, same reason — see the hosted path above.
+                    brief_refs: Some(opts.brief_refs.clone()),
+                    beats: darkmux_flow::session_presence::beats(session_emitter.as_ref()),
+                    ..Default::default()
+                };
+                // (#3363) What the system prompt was built from, as on every path.
+                crate::role_inputs::stamp_prompt_inputs(&mut start, &system_prompt, &provenance);
+                start
             }),
         ),
     );
@@ -6235,7 +6228,11 @@ fn pacer_for(
 
 /// A classified route as its two halves: the hosted pieces
 /// (role, system prompt, target) and the managed target.
-type SplitRoute = (Option<(crate::types::Role, String, crate::target::Target)>, Option<crate::target::Target>);
+type SplitRoute = (Option<HostedRoute>, Option<crate::target::Target>);
+
+/// A hosted route's pieces: the role, its system prompt, the target, and
+/// what the prompt was built from (#3363).
+type HostedRoute = (crate::types::Role, String, crate::target::Target, crate::role_inputs::PromptProvenance);
 
 /// [`DispatchRoute`] as its hosted and managed halves (at most one is set).
 fn split_route(route: Option<DispatchRoute>) -> SplitRoute {
@@ -6247,7 +6244,9 @@ fn split_route(route: Option<DispatchRoute>) -> SplitRoute {
         }
     }
     match route {
-        Some(DispatchRoute::Unmanaged { role, system_prompt, target }) => (Some((*role, system_prompt, *target)), None),
+        Some(DispatchRoute::Unmanaged { role, system_prompt, provenance, target }) => {
+            (Some((*role, system_prompt, *target, *provenance)), None)
+        }
         Some(DispatchRoute::Managed(target)) => (None, Some(*target)),
         None => (None, None),
     }
@@ -6370,7 +6369,7 @@ fn route_hosted_or_container(
     // window gate, its per-dispatch cap and its `endpoint_id` stamp.
     let (hosted, managed_pm) = split_route(route_dispatch(opts)?);
     let mut agentic_pm: Option<crate::target::Target> = None;
-    if let Some((role, system_prompt, pm)) = hosted {
+    if let Some((role, system_prompt, pm, provenance)) = hosted {
         // (#1199) `force_container` routes even a tool-less role through the
         // container/agentic path so benches get one consistent substrate
         // (trajectory + per-turn telemetry) regardless of where the brain is.
@@ -6402,7 +6401,7 @@ fn route_hosted_or_container(
                 // still covers this guard.
                 bail!(resume_from_bare_hosted_refusal(&opts.role_id));
             }
-            return dispatch_unmanaged(opts, execution, &role, &system_prompt, &pm).map(ControlFlow::Break);
+            return dispatch_unmanaged(opts, execution, &system_prompt, &provenance, &pm).map(ControlFlow::Break);
         }
     }
     Ok(ControlFlow::Continue(ContainerBrain { agentic_pm, managed_pm }))
@@ -6422,6 +6421,8 @@ struct ContainerRun {
     image: RuntimeImage,
     role: crate::types::Role,
     system_prompt: String,
+    /// (#3363) What `system_prompt` was built from, for `dispatch.start`.
+    provenance: crate::role_inputs::PromptProvenance,
     allowed_tools: Option<Vec<String>>,
     model: String,
     resolved_profile: String,
@@ -6454,7 +6455,7 @@ fn prepare_container_run(
     admit_container_start(opts, execution, brain.limits_pm())?;
     let workdir_split_gitdirs = warn_split_gitdirs(opts);
     let image = resolve_runtime_image(image_arg.as_deref(), opts.skip_preflight)?;
-    let (role, system_prompt, allowed_tools) =
+    let (role, system_prompt, allowed_tools, provenance) =
         container_role(opts, brain.agentic_pm.as_ref().is_some_and(brain_leaves_this_machine), &workdir_split_gitdirs)?;
     let workspace_plan = plan_workspace(opts, unix_micros)?;
     let (model, resolved_profile, unmanaged_endpoint_raw_label) =
@@ -6488,6 +6489,7 @@ fn prepare_container_run(
         image,
         role,
         system_prompt,
+        provenance,
         allowed_tools,
         model,
         resolved_profile,
@@ -6639,13 +6641,12 @@ fn container_role(
     opts: &DispatchOpts,
     leaves_this_machine: bool,
     workdir_split_gitdirs: &[darkmux_types::workdir::SplitGitdir],
-) -> Result<(crate::types::Role, String, Option<Vec<String>>)> {
-    let roles = load_roles().context("loading crew roles for internal dispatch")?;
-    let role = roles
-        .into_iter()
-        .find(|r| r.id == opts.role_id)
-        .ok_or_else(|| anyhow!("role not found: {}", opts.role_id))?;
-    let system_prompt = container_system_prompt(&role, opts, leaves_this_machine, workdir_split_gitdirs)?;
+) -> Result<(crate::types::Role, String, Option<Vec<String>>, crate::role_inputs::PromptProvenance)> {
+    let resolved =
+        crate::role_inputs::resolve_role(opts)?.ok_or_else(|| anyhow!("role not found: {}", opts.role_id))?;
+    let (system_prompt, provenance) =
+        container_system_prompt(&resolved, opts, leaves_this_machine, workdir_split_gitdirs)?;
+    let role = resolved.role;
     warn_unknown_role_vocab(&role, &opts.role_id);
     // Compute the runtime tool catalog from the role's tool_palette
     // (allow minus deny). When the palette is empty, returns None and
@@ -6656,44 +6657,28 @@ fn container_role(
     // a model from ignoring its .md doctrine and calling a denied tool
     // (the gap that let D call `edit` despite code-reviewer denying it).
     let allowed_tools = compute_runtime_allowed_tools(&role.tool_palette);
-    Ok((role, system_prompt, allowed_tools))
+    Ok((role, system_prompt, allowed_tools, provenance))
 }
 
 /// The container's system prompt, assembled in its fixed order: the role
 /// prompt, the autonomous-dispatch preamble, operator identity, then the
-/// workspace notes.
+/// workspace notes. (#3363) A lab dispatch gets neither addition.
 fn container_system_prompt(
-    role: &crate::types::Role,
+    resolved: &crate::role_inputs::ResolvedRole,
     opts: &DispatchOpts,
     leaves_this_machine: bool,
     workdir_split_gitdirs: &[darkmux_types::workdir::SplitGitdir],
-) -> Result<String> {
+) -> Result<(String, crate::role_inputs::PromptProvenance)> {
     // (#1550 cluster item 3) See the hosted-dispatch call site's comment —
     // `load_role_prompt_for` honors an explicit `role.prompt_path` first.
-    let role_prompt = crate::loader::load_role_prompt_for(role).ok_or_else(|| {
-        anyhow!(
-            "role '{}' has no readable .md system prompt (checked prompt_path={:?}, the \
-             conventional roles dir, and the embedded table) — internal runtime requires one",
-            opts.role_id,
-            role.prompt_path
-        )
-    })?;
-    // (#425) Prepend the autonomous-dispatch preamble for specialist
+    // (#425) The autonomous-dispatch preamble is prepended for specialist
     // roles. Utility roles (bounded-I/O transformers like mission-
     // compiler) skip it — they don't run agent loops and structurally
     // can't enter the asking-mode failure shape the preamble guards
     // against. Default (role_family unset) = specialist (preventive
     // safety: better to prepend an unneeded preamble than to miss
     // prepending a needed one).
-    let system_prompt = if role.is_specialist() {
-        // Trim + always insert a `\n\n` separator so operator-edited
-        // override files that forgot a trailing newline still produce
-        // a well-shaped joined prompt (no `...content# Role…` smashing).
-        let preamble = load_autonomous_dispatch_preamble();
-        format!("{}\n\n{}", preamble.trim_end(), role_prompt)
-    } else {
-        role_prompt
-    };
+    let (system_prompt, mut provenance) = resolved.role_and_preamble(" — internal runtime requires one")?;
     // (#147) Operator-identity augmentation (~/.darkmux/identity.md), no-op
     // when the file is absent. Data-boundary rule: operator identity never
     // leaves the machine — local dispatches only (data-boundary decision,
@@ -6701,20 +6686,21 @@ fn container_system_prompt(
     // for this container's brain (#316): LM Studio and the default engine on
     // loopback get the identity, any other endpoint does not. The single-shot
     // unmanaged path applies the same predicate in `route_dispatch`.
-    let system_prompt = if identity_augmentation_allowed(leaves_this_machine) {
-        crate::dispatch::augment_prompt_with_identity(&system_prompt)
-    } else {
-        system_prompt
-    };
+    let system_prompt = resolved.with_identity(
+        system_prompt,
+        identity_augmentation_allowed(leaves_this_machine),
+        &mut provenance,
+    );
     // (#2294) Consumer 2 of the preflight detection ([`warn_split_gitdirs`]):
     // tell the MODEL that git is dead in this workspace. Without it the model
     // retries git indefinitely — see `no_git_system_prompt_note`'s own doc
     // for why no existing detector brakes that, and why warning the operator
     // alone isn't a remedy on the paths that produce this shape.
-    let system_prompt = with_workspace_notes(
+    let system_prompt = resolved.with_workspace_notes(
         system_prompt,
         opts.workdir.as_deref(),
         workdir_split_gitdirs,
+        &mut provenance,
     );
     // (#2294) A no-op in production; in tests this is the seam
     // `dispatch_appends_the_no_git_note_at_the_call_site` reads, so deleting
@@ -6722,7 +6708,7 @@ fn container_system_prompt(
     // clean. Placed after the LAST thing that composes the prompt so it
     // pins what actually reaches the runtime.
     capture_assembled_system_prompt(&system_prompt);
-    Ok(system_prompt)
+    Ok((system_prompt, provenance))
 }
 
 /// #340 — surface unknown role-vocab tokens loudly. Unknown tokens
@@ -7337,6 +7323,7 @@ fn container_dispatch_start_payload(
         opts.timeout_override_seconds,
         run.allowed_tools.as_deref(),
         &opts.brief_refs,
+        &run.provenance,
     )?;
     Ok(container_start_payload(
         dispatch_start_payload,
@@ -8525,8 +8512,9 @@ fn dispatch_start_payload(
     timeout_override_seconds: Option<u32>,
     tools_requested: Option<&[String]>,
     brief_refs: &[crate::brief_refs::BriefRef],
+    provenance: &crate::role_inputs::PromptProvenance,
 ) -> Result<DispatchStartPayload, darkmux_types::config_enum::BadEnumValue> {
-    Ok(DispatchStartPayload {
+    let mut payload = DispatchStartPayload {
         // (#1126) The resolved runtime image (operator `--image` or the default
         // darkmux image) — the environment the coder ran in. The viewer's run
         // brief + recent-runs rail read `payload.image`; it was a dead
@@ -8584,7 +8572,11 @@ fn dispatch_start_payload(
         // carry a schema stamp of its own).
         flow_schema: Some(darkmux_flow::FLOW_SCHEMA_VERSION.to_string()),
         ..Default::default()
-    })
+    };
+    // (#3363) Beside `system_chars`, from the same assembled prompt: its
+    // SHA-256, the additions that applied, and a lab dispatch's role block.
+    crate::role_inputs::stamp_prompt_inputs(&mut payload, system_prompt, provenance);
+    Ok(payload)
 }
 
 /// (#2165) The dispatch's resolved runtime bounds, WITH provenance, exactly
@@ -13794,6 +13786,20 @@ pub fn dispatch_window(
             Ok(profile.as_ref().and_then(profile_context_window))
         }
     }
+}
+
+/// (#3363) [`dispatch_window`] for a lab dispatch: the role from its pinned
+/// inputs (`crate::role_inputs`), as the dispatch itself resolves it, with
+/// the lab's utility-model opt-in.
+pub fn lab_dispatch_window(
+    inputs: &crate::dispatch::LabInputs,
+    role_id: &str,
+    profile_override: Option<&str>,
+    config_path: Option<&str>,
+) -> Result<Option<u32>> {
+    let role = crate::role_inputs::lab_role(inputs, role_id)?;
+    let mapped = role_profile_binding(Some(role_id), profile_override);
+    resolve_dispatch_windows_with(&role, profile_override, mapped, config_path, true)
 }
 
 pub fn resolve_context_window_internal(

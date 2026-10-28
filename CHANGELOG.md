@@ -14,6 +14,53 @@ darkmux release.
 
 ## [Unreleased]
 
+### Changed
+
+- **An eval owns its roles: a lab run's role and prompt come from the eval,
+  not the home folder (#3363).** A lab run's system prompt is now built only
+  from pinned inputs. A workload bound to a fixture takes its role from the
+  eval itself: `roles/<id>.json` and `roles/<id>.md` in the fixture's checkout
+  (list them in `.fixture.json`'s `required_files`; neither may be a symlink).
+  **An eval's workloads now need their role files in the eval, and a
+  fixture-bound eval without them is refused** by `lab run`, naming the
+  missing file, before any model loads. That includes the coder evals
+  (pepper-grinder, salt-shaker, webhook-forgery-eval, idor-check-eval,
+  path-traversal-eval, which need `roles/coder.*`) and the shipped
+  `crawl-error-discard` workload, whose `rust-crawl-scope` fixture needs
+  `roles/crawler.*`. A workload bound to no fixture runs on darkmux's
+  compiled-in role; a role darkmux does not compile in is refused there too.
+  Either way a lab run uses darkmux's compiled-in preamble, and its prompt
+  never takes anything from `~/.darkmux/roles/`, the preamble override,
+  `identity.md` or the workspace notes. `lab run` reads the eval's role once,
+  before the run starts, and every dispatch, the coding-task tool check and
+  the tool bench's recorded window use those bytes, so nothing a run writes
+  into its sandbox (`setupContent`, a seed) can change the role a dispatch of
+  that `lab run` sends. Not yet pinned: model selection still reads the skill
+  manifests a role names from the home folder's `skills/`; a malformed role
+  file in `~/.darkmux/roles/` still refuses a lab run at preflight even though
+  the run does not read it; darkmux does not check that the role files are
+  listed in `required_files`; and a workload's `setupContent` can still write
+  through a symlink in the fixture to outside the sandbox, including into the
+  fixture's own checkout, which a later `lab run` would then read. On 2026-10-24 a stale
+  `~/.darkmux/roles/web-probe.md` replaced an eval's pinned prompt for 19
+  runs; that can no longer happen. The built-in `demo-tiny-py` fixture now
+  carries `roles/coder.*` for `demo-quickstart`; re-register it with
+  `scripts/lab-init.sh --force` (its content hash changed). Dispatches
+  outside the lab are unchanged.
+
+### Added
+
+- **`dispatch.start` records what the system prompt was built from (#3363,
+  flow schema 2.6.0).** Every dispatch's start record carries
+  `system_sha256`, the SHA-256 of the assembled system prompt, and
+  `prompt_additions`, which of darkmux's own additions applied (`identity`,
+  `workspace_notes`, `role_override`, `preamble_override`). A lab dispatch
+  also carries `role`: the role's id, its source (`eval` or `builtin`), and
+  the SHA-256 of its `.json`, its `.md` and the preamble, hashed from the
+  bytes it loaded (the preamble hash is of the shipped file, before the
+  prompt trims its trailing whitespace). `lab submit` does not share these
+  yet.
+
 ## [5.8.0] - 2026-10-27
 
 Evals can name what they grade. Each criterion an eval declares is recorded

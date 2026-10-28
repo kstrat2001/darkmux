@@ -60,14 +60,7 @@ impl WorkloadProvider for PromptProvider {
         on_session_id(&session_id);
 
         let started = std::time::Instant::now();
-        let mut opts = dispatch_opts(
-            &role,
-            &prompt,
-            &session_id,
-            loaded.manifest.workload.image.as_deref(),
-            config_path,
-            profile_name,
-        );
+        let mut opts = run_dispatch_opts(loaded, &role, &prompt, &session_id, config_path, profile_name)?;
         // Named and armed before the dispatch, so a dispatch that returns
         // `Err` still leaves its trajectory in the run dir (the guard's Drop).
         let guard = PromptDispatchGuard::arm(&role, &loaded.manifest.workload.id, run_dir, &mut opts);
@@ -592,6 +585,27 @@ fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
+/// The dispatch options a prompt run of `loaded` builds: (#3363) its role is
+/// the one `lab run` read from the eval before the run (`loaded.lab_inputs`).
+fn run_dispatch_opts(
+    loaded: &LoadedWorkload,
+    role_id: &str,
+    prompt: &str,
+    session_id: &SessionId,
+    config_path: Option<&str>,
+    profile_name: &str,
+) -> Result<darkmux_crew::dispatch::DispatchOpts> {
+    Ok(dispatch_opts(
+        role_id,
+        prompt,
+        session_id,
+        loaded.manifest.workload.image.as_deref(),
+        config_path,
+        profile_name,
+        crate::providers::lab_inputs(loaded)?,
+    ))
+}
+
 /// The lab's dispatch options for one prompt run.
 fn dispatch_opts(
     role_id: &str,
@@ -600,6 +614,7 @@ fn dispatch_opts(
     image: Option<&str>,
     config_path: Option<&str>,
     profile_name: &str,
+    lab_inputs: darkmux_crew::dispatch::LabInputs,
 ) -> darkmux_crew::dispatch::DispatchOpts {
     darkmux_crew::dispatch::DispatchOpts {
         finding_sites: None,
@@ -650,6 +665,8 @@ fn dispatch_opts(
         model_base_url_override: None,
         step_id: None, // (#1483) set on the graph-step path only
         system_prompt_override: None,
+        // (#3363) The role from the eval, or darkmux's compiled-in one.
+        lab_inputs: Some(lab_inputs),
     }
 }
 
@@ -856,6 +873,7 @@ mod tests {
             manifest: WorkloadManifest { schema_version: None, workload: spec },
             base_dir,
             source: WorkloadSource::OnDisk,
+            lab_inputs: None,
         }
     }
 
@@ -1246,7 +1264,7 @@ mod tests {
         let run = tmp.path().join("run");
         fs::create_dir_all(&run).unwrap();
         let session = SessionId::adhoc(RunId::lab("run1").unwrap(), "reviewer", "w");
-        let mut opts = dispatch_opts("reviewer", "hi", &session, None, None, "p");
+        let mut opts = dispatch_opts("reviewer", "hi", &session, None, None, "p", darkmux_crew::dispatch::LabInputs::Builtin);
         let guard = PromptDispatchGuard::arm("reviewer-a", "w", &run, &mut opts);
         let out = opts.host_out.clone().expect("the out dir is named before dispatch");
         let _remove_out = RemoveOut(out.clone());
@@ -1273,7 +1291,7 @@ mod tests {
         let run = tmp.path().join("run");
         fs::create_dir_all(&run).unwrap();
         let session = SessionId::adhoc(RunId::lab("run1").unwrap(), "reviewer", "w");
-        let mut opts = dispatch_opts("reviewer", "hi", &session, None, None, "p");
+        let mut opts = dispatch_opts("reviewer", "hi", &session, None, None, "p", darkmux_crew::dispatch::LabInputs::Builtin);
         let guard = PromptDispatchGuard::arm("reviewer-b", "w", &run, &mut opts);
         let out = opts.host_out.clone().unwrap();
         let _remove_out = RemoveOut(out.clone());
@@ -1308,7 +1326,7 @@ mod tests {
         let run = tmp.path().join("run");
         fs::create_dir_all(&run).unwrap();
         let session = SessionId::adhoc(RunId::lab("run1").unwrap(), "reviewer", "w");
-        let mut opts = dispatch_opts("reviewer", "hi", &session, None, None, "p");
+        let mut opts = dispatch_opts("reviewer", "hi", &session, None, None, "p", darkmux_crew::dispatch::LabInputs::Builtin);
         let guard = PromptDispatchGuard::arm("reviewer-c", "w", &run, &mut opts);
         let out = opts.host_out.clone().unwrap();
         let _remove_out = RemoveOut(out.clone());
@@ -1373,6 +1391,46 @@ mod tests {
         spec.requires_fixture = Some("biz@1.0".into());
         let bound = make_loaded(spec, doc_dir);
         assert_eq!(resolve_prompt_from(&bound, prompt_base(&bound, &sandbox)).unwrap(), "from the fixture");
+    }
+
+    /// (#3363) A fixture-bound prompt run dispatches the role `lab run` read
+    /// from the eval: the opts its run builds carry those exact inputs (the
+    /// eval's bytes), never darkmux's compiled-in role, and with no role read
+    /// the run is refused rather than looking in the sandbox. Checked at the
+    /// `DispatchOpts` boundary, so it needs no Docker; that the dispatch
+    /// resolves its role from these inputs is the crew's
+    /// `writes_into_the_sandbox_after_the_role_is_read_cannot_change_the_prompt`.
+    #[test]
+    #[serial_test::serial]
+    fn a_fixture_bound_prompt_run_dispatches_the_role_read_from_the_eval() {
+        let state = darkmux_types::test_isolation::IsolatedState::new();
+        let (doc_dir, sandbox, run_dir, eval) = (state.join("doc"), state.join("sandbox"), state.join("run"), state.join("eval"));
+        for d in [&doc_dir, &sandbox, &run_dir, &eval.join("roles")] {
+            fs::create_dir_all(d).unwrap();
+        }
+        let role = serde_json::json!({"id": "probe-3363", "description": "d", "tool_palette": {"allow": [], "deny": []},
+            "escalation_contract": "bail-with-explanation"});
+        fs::write(eval.join("roles/probe-3363.json"), role.to_string()).unwrap();
+        fs::write(eval.join("roles/probe-3363.md"), "# probe\n").unwrap();
+        let mut spec = spec_with_prompt("hi");
+        spec.role = Some("probe-3363".into());
+        spec.requires_fixture = Some("biz@1.0".into());
+        let mut loaded = make_loaded(spec, doc_dir);
+        let registry = state.join("no-such-profiles-3363.json");
+        // With no role read, the run refuses before it dispatches.
+        let err = PromptProvider
+            .run(&loaded, &run_dir, &sandbox, &darkmux_types::Profile::default(), "p", registry.to_str(), None,
+                &RunId::lab("r3363").unwrap(), &mut |_: &SessionId| {})
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("its eval's role was not read"), "{err:#}");
+        // With it read, the run's dispatch opts carry exactly those inputs.
+        let inputs = darkmux_crew::dispatch::LabInputs::load_eval(&eval, "probe-3363").unwrap();
+        loaded.lab_inputs = Some(inputs.clone());
+        let session = SessionId::adhoc(RunId::lab("r3363").unwrap(), "probe-3363", "t");
+        let opts = run_dispatch_opts(&loaded, "probe-3363", "hi", &session, registry.to_str(), "p").unwrap();
+        assert_eq!(opts.lab_inputs.as_ref(), Some(&inputs), "the eval's exact role bytes");
+        let carried = darkmux_crew::dispatch::lab_role(opts.lab_inputs.as_ref().unwrap(), "probe-3363").unwrap();
+        assert_eq!(carried.id, "probe-3363", "a role darkmux does not compile in, so not the Builtin inputs");
     }
 
     #[test]

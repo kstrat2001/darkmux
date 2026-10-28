@@ -1227,6 +1227,7 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         model_base_url_override: None,
         step_id: None, // (#1483) set on the graph-step path only
         system_prompt_override: None,
+        lab_inputs: None,
         // (#2114 follow-up) `--resume-from <dir>` — the trigger for a
         // checkpoint resume. `dispatch_internal::dispatch` verifies +
         // stages the checkpoint; `None` (the default) preserves the

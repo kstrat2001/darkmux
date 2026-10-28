@@ -417,6 +417,7 @@ fn parse(path: &Path, source: WorkloadSource) -> Result<LoadedWorkload> {
         manifest,
         base_dir,
         source,
+        lab_inputs: None,
     })
 }
 
@@ -461,6 +462,7 @@ fn parse_str(raw: &str, id: &str) -> Result<LoadedWorkload> {
         manifest,
         base_dir: base,
         source: WorkloadSource::Embedded,
+        lab_inputs: None,
     })
 }
 

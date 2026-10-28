@@ -293,6 +293,64 @@ pub struct RuntimeBounds {
     pub battery_pause_floor_pct: Option<Knob>,
 }
 
+/// (#3363, flow 2.6.0) Which of darkmux's own additions reached a dispatch's
+/// system prompt, beyond the role's prompt and the compiled-in preamble. Every
+/// one is `false` on a lab dispatch, which uses none of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
+pub struct PromptAdditions {
+    /// The operator's identity file (`identity.md`) was appended.
+    pub identity: bool,
+    /// A workspace note (git is not available in a checkout) was appended.
+    pub workspace_notes: bool,
+    /// The role came from the home folder (`<root>/roles/`): its manifest, its
+    /// `.md`, or a `prompt_path` its manifest declares.
+    pub role_override: bool,
+    /// The preamble was the home folder's `AUTONOMOUS_DISPATCH_PREAMBLE.md`.
+    pub preamble_override: bool,
+}
+
+/// (#3363) Where a lab dispatch's role came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
+pub enum RoleInputSource {
+    /// The eval's own `roles/<id>.json` and `roles/<id>.md`, read once from
+    /// the fixture checkout the workload binds, before the run started.
+    Eval,
+    /// darkmux's compiled-in role, for a workload bound to no fixture.
+    Builtin,
+    /// A value this build does not name, read from an archive written by another version.
+    /// Never written.
+    #[serde(other)]
+    Unknown,
+}
+
+/// (#3363, flow 2.6.0) The role a lab dispatch ran, with the SHA-256 of the
+/// bytes it loaded: hashed as read, never read again to hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
+pub struct DispatchRoleInputs {
+    /// The role's id.
+    pub id: String,
+    /// Where the role came from.
+    pub source: RoleInputSource,
+    /// The role manifest (`<id>.json`).
+    pub json_sha256: String,
+    /// The role's system prompt (`<id>.md`).
+    pub md_sha256: String,
+    /// darkmux's compiled-in preamble, `null` when the role is not a
+    /// specialist and so gets none. It hashes the preamble file exactly as
+    /// the release ships it (`templates/builtin/AUTONOMOUS_DISPATCH_PREAMBLE.md`
+    /// at the release's commit, trailing newline included), while the prompt
+    /// carries it with trailing whitespace trimmed: verify it against that
+    /// file, not against the prompt's text.
+    pub preamble_sha256: Option<String>,
+}
+
 /// A role execution began: the payload of `dispatch.start`. One type for every producer of the
 /// record: the container path (image, tools, bounds), the hosted and local single-shot paths
 /// (endpoint, prompt), and a step kind's per-call bookend (kind, item index). A field a producer
@@ -381,6 +439,22 @@ pub struct DispatchStartPayload {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     #[cfg_attr(feature = "ts-export", ts(as = "Option<bool>", optional))]
     pub beats: bool,
+    /// (#3363, flow 2.6.0) SHA-256 of the assembled system prompt, taken
+    /// where its length is. Absent on a record from before 2.6.0, and on a
+    /// step kind's per-call bookend, whose system text is the step's own
+    /// `config.system` from its mission config, not an assembled prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub system_sha256: Option<String>,
+    /// (#3363, flow 2.6.0) Which of darkmux's prompt additions applied.
+    #[serde(default, deserialize_with = "super::context::lenient", skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub prompt_additions: Option<PromptAdditions>,
+    /// (#3363, flow 2.6.0) A lab dispatch's role and the hashes of what it
+    /// loaded. Absent on every other dispatch.
+    #[serde(default, deserialize_with = "super::context::lenient", skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub role: Option<DispatchRoleInputs>,
 }
 
 impl Attribution for DispatchStartPayload {

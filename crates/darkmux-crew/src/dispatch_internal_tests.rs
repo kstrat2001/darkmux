@@ -435,7 +435,7 @@
         );
         let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::full_window().stopped_after(1, "mission `m` is aborted"));
         let result = crate::budget::with_test_env(env.clone(), || {
-            dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), &quarantine_test_role(), "system prompt", &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap())
+            dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), "system prompt", &Default::default(), &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap())
         });
         unsafe {
             match prev_home {
@@ -1406,6 +1406,7 @@
             None,
             None,
             &[],
+            &Default::default(),
         ).unwrap()).unwrap();
 
         // The wiring itself: this key would be ABSENT entirely if the
@@ -1463,6 +1464,7 @@
             None,
             None,
             &[],
+            &Default::default(),
         ).unwrap()).unwrap();
         assert_eq!(payload["bounds"]["turn_delay_ms"]["source"], serde_json::json!("forced-agentic-remote"));
         assert_eq!(payload["turn_delay_ms"], serde_json::json!(0), "the top-level stamp is also forced");
@@ -3182,6 +3184,7 @@
             model_base_url_override: None,
             step_id: None,
             system_prompt_override: None,
+            lab_inputs: None,
         }
     }
 
@@ -3393,10 +3396,9 @@
         opts.phase_id = Some(PHASE_ID.to_string());
         opts.json = false;
 
-        let role = quarantine_test_role(); // `dispatch_unmanaged` ignores `_role` entirely
         let pm = darkmux_types::ProfileModel::hosted_for_test("gpt-remote", Some(100000), serde_json::json!({"url": base_url}));
 
-        let result = dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), &role, "system prompt", &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap());
+        let result = dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), "system prompt", &Default::default(), &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap());
 
         unsafe {
             match prev_home {
@@ -3492,7 +3494,7 @@
             let pm = darkmux_types::ProfileModel::hosted_for_test("gpt-remote", Some(100000), serde_json::json!({"url": base_url}));
             let target = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
             let result = with_redis_url(&url, || {
-                dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), &quarantine_test_role(), "system prompt", &target)
+                dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), "system prompt", &Default::default(), &target)
             });
             unsafe {
                 match prev_home {
@@ -3584,7 +3586,6 @@
         // The SAME config-derived default `dispatch_opts_for` hands an
         // unconfigured `dispatch.internal` step — literal out of the
         // mission config document, identical whichever mission launches it.
-        let role = quarantine_test_role();
 
         let mut seen_session_ids = std::collections::HashSet::new();
         for (mission_id, phase_id) in [("mission-a-1645", "p1-a-1645"), ("mission-b-1645", "p1-b-1645")] {
@@ -3602,7 +3603,7 @@
             opts.json = false;
             let pm = darkmux_types::ProfileModel::hosted_for_test("gpt-remote", Some(100000), serde_json::json!({"url": base_url}));
             let result =
-                dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), &role, "system prompt", &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap()).expect("dispatch_unmanaged must succeed");
+                dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), "system prompt", &Default::default(), &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap()).expect("dispatch_unmanaged must succeed");
             assert_eq!(result.session_id, step_session, "dispatch_unmanaged runs under its caller's session");
             seen_session_ids.insert(result.session_id);
         }
@@ -3651,7 +3652,7 @@
             opts.role_id = "pr-reviewer".to_string();
             opts.json = true;
             let pm = darkmux_types::ProfileModel::hosted_for_test("gpt-remote", Some(100000), serde_json::json!({"url": base_url}));
-            let result = dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), &quarantine_test_role(), "system prompt", &crate::target::target_for("p".into(), Default::default(), pm).unwrap())
+            let result = dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), "system prompt", &Default::default(), &crate::target::target_for("p".into(), Default::default(), pm).unwrap())
                 .expect("dispatch_unmanaged must succeed");
             let envelope: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
             seen.push(envelope["metrics"].get("finish_reason").cloned());
@@ -3854,7 +3855,7 @@
         let target = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
         let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
         let result = crate::budget::with_test_env(env.clone(), || {
-            dispatch_unmanaged(&opts, &ExecutionId::mint(), &quarantine_test_role(), "system prompt", &target)
+            dispatch_unmanaged(&opts, &ExecutionId::mint(), "system prompt", &Default::default(), &target)
         });
         unsafe {
             match prev_home {
@@ -10667,7 +10668,7 @@
             crate::brief_refs::BriefRef::mod_("mod-1-aaa"),
         ];
         let with = serde_json::to_value(dispatch_start_payload(
-            "img", "msg", "sys", std::path::Path::new("/ws"), false, None, None, None, &refs,
+            "img", "msg", "sys", std::path::Path::new("/ws"), false, None, None, None, &refs, &Default::default(),
         ).unwrap()).unwrap();
         assert_eq!(
             with["brief_refs"],
@@ -10679,7 +10680,7 @@
         // Every other dispatch carries the field EMPTY rather than absent — an
         // absent key would be indistinguishable from an older writer's record.
         let without = serde_json::to_value(dispatch_start_payload(
-            "img", "msg", "sys", std::path::Path::new("/ws"), false, None, None, None, &[],
+            "img", "msg", "sys", std::path::Path::new("/ws"), false, None, None, None, &[], &Default::default(),
         ).unwrap()).unwrap();
         assert_eq!(without["brief_refs"], serde_json::json!([]));
     }
@@ -19208,6 +19209,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             None,
             None,
             &[],
+            &Default::default(),
         ).unwrap()).unwrap();
         assert!(none["tools_requested"].is_null(), "{}", none);
         let names = vec!["read".to_string(), "search".to_string(), "bash".to_string(), "create_finding".to_string()];
@@ -19221,6 +19223,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             None,
             Some(&names),
             &[],
+            &Default::default(),
         ).unwrap()).unwrap();
         assert_eq!(some["tools_requested"], serde_json::json!(["read", "search", "bash", "create_finding"]));
     }
@@ -20034,8 +20037,8 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         let result = crate::budget::with_test_env(env.clone(), || {
             dispatch_unmanaged(
                 &opts, &darkmux_types::execution_id::ExecutionId::mint(),
-                &quarantine_test_role(),
                 "system prompt",
+                &Default::default(),
                 &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap(),
             )
         });
@@ -20191,8 +20194,8 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         let result = dispatch_unmanaged(
             &opts,
             &darkmux_types::execution_id::ExecutionId::mint(),
-            &quarantine_test_role(),
             "system prompt",
+            &Default::default(),
             &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap(),
         );
         let records = drain_flow_records_for_session(flows_dir.path(), &crate::test_session(&session));
@@ -20248,8 +20251,8 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         let result = crate::budget::with_test_env(env.clone(), || {
             dispatch_unmanaged(
                 &opts, &darkmux_types::execution_id::ExecutionId::mint(),
-                &quarantine_test_role(),
                 "system prompt",
+                &Default::default(),
                 &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap(),
             )
         });
@@ -20661,8 +20664,8 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         );
         let result = dispatch_unmanaged(
             &opts, &darkmux_types::execution_id::ExecutionId::mint(),
-            &quarantine_test_role(),
             "system prompt",
+            &Default::default(),
             &crate::target::target_for("p".into(), Default::default(), pm).unwrap(),
         );
         unsafe {
@@ -20702,7 +20705,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         opts.phase_id = None;
         opts.json = false;
         let pm = darkmux_types::ProfileModel::hosted_for_test("gpt-remote", Some(100000), serde_json::json!({"url": base_url}));
-        let result = dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), &quarantine_test_role(), "system prompt", &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap());
+        let result = dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), "system prompt", &Default::default(), &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap());
         unsafe {
             match prev_home {
                 Some(v) => std::env::set_var("DARKMUX_HOME", v),
@@ -20866,7 +20869,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         opts.json = false;
         let pm = darkmux_types::ProfileModel::hosted_for_test("gpt-remote", Some(100000), endpoint);
         let target = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
-        let result = dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), &quarantine_test_role(), "system prompt", &target);
+        let result = dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), "system prompt", &Default::default(), &target);
         for (k, v) in prev {
             unsafe {
                 match v {
@@ -22086,3 +22089,9 @@ fn container_reply_is_the_envelopes_final_assistant_or_the_text_output() {
     assert_eq!(container_reply(true, "not an envelope"), "");
     assert_eq!(container_reply(true, r#"{"result":"error","final_assistant":null}"#), "");
 }
+
+    // (#3363) The lab-role tests live in their own file, a child of this
+    // module, so `dispatch_internal.rs` keeps exactly one test module (the
+    // `dispatch_unmanaged` scan's premise).
+    #[path = "dispatch_lab_role_tests.rs"]
+    mod lab_role_tests;

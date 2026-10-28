@@ -1,0 +1,22 @@
+{
+  "schema_version": "1.0",
+  "id": "coder",
+  "role_family": "specialist",
+  "description": "Implements features described by the user. Reads existing code first; follows patterns; runs tests before reporting done.",
+  "skills": [
+    "coding",
+    "test-designing"
+  ],
+  "tool_palette": {
+    "allow": [
+      "read",
+      "edit",
+      "write",
+      "exec",
+      "process",
+      "create_mod"
+    ],
+    "deny": []
+  },
+  "escalation_contract": "bail-with-explanation"
+}

@@ -18,8 +18,24 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const FLOW_SCHEMA_VERSION: &str = "2.5.0";
+pub const FLOW_SCHEMA_VERSION: &str = "2.6.0";
 // Version history:
+//   2.6.0 (#3363): `dispatch.start` gains `payload.system_sha256` (SHA-256 of
+//           the assembled system prompt, taken where `system_chars` is) and
+//           `payload.prompt_additions` (`{identity, workspace_notes,
+//           role_override, preamble_override}`: which of darkmux's own
+//           additions reached the prompt) on every dispatch that assembles
+//           one, and, on a lab dispatch only, `payload.role` (`{id, source:
+//           "eval" | "builtin", json_sha256, md_sha256, preamble_sha256}`, the
+//           role files and preamble hashed from the bytes loaded;
+//           `preamble_sha256` is `null` for a role that is not a specialist).
+//           A lab dispatch's additions are all `false`: its prompt is built
+//           from pinned inputs only.
+//
+//           ADDITIVE: absent on a record from before 2.6.0 and on a step
+//           kind's per-call bookend (its system text is the step's own
+//           `config.system`); a reader that does not know the keys ignores
+//           them.
 //   2.5.0 (#3331): `machine.telemetry` gains `now.package_power_mw`, the
 //           package total in milliwatts where the host reads one with no
 //           per-rail split (Omarchy on Asahi: the SMC's `Heatpipe Power`).

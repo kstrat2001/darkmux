@@ -234,6 +234,14 @@ pub(crate) struct LoadedWorkload {
     pub manifest: WorkloadManifest,
     pub base_dir: std::path::PathBuf,
     pub source: WorkloadSource,
+    /// (#3363) The role this workload's dispatches run, read ONCE by `lab
+    /// run` before the run starts (its preflight, `lab::run::read_lab_inputs`):
+    /// for a workload bound to a fixture, the eval's own role files as bytes,
+    /// so nothing a provider writes into the sandbox can change them. `None`
+    /// until then; a provider then uses darkmux's compiled-in role for a
+    /// workload bound to no fixture and refuses one bound to a fixture
+    /// (`providers::lab_inputs`).
+    pub lab_inputs: Option<darkmux_crew::dispatch::LabInputs>,
 }
 
 /// Which tier a loaded workload actually resolved from — the WINNING tier of

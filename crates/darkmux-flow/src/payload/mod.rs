@@ -44,7 +44,8 @@ pub use hook::{HookDeliveryPayload, HookDryRunPayload, HookFailedPayload, HookNo
 pub use dispatch::{
     BoundRef, BriefRef, BriefRefKind, CheckpointVerdict, DispatchCheckpointPayload, DispatchCompactionPayload,
     DispatchDegeneracyWarningPayload, DispatchEndPayload, DispatchFeedbackPayload, DispatchHeartbeatPayload,
-    DispatchReasoningPayload, DispatchRestPayload, DispatchRoutePayload, DispatchStartPayload, DispatchToolPayload,
+    DispatchReasoningPayload, DispatchRestPayload, DispatchRoleInputs, DispatchRoutePayload, DispatchStartPayload,
+    DispatchToolPayload, PromptAdditions, RoleInputSource,
     DispatchTurnPayload, DispatchWorkdirGitUnavailablePayload, GitCheckout, GitdirKind, HostWindow, Knob, KnobSource, KnobValue,
     LiveSummary, ResultClass, RouteDecision, RuntimeBounds, StreamPhase, ToolOutcome, TurnUsage,
 };

@@ -772,6 +772,7 @@ fn the_lab_run_step_grades_records_and_returns_the_verdict() {
         .unwrap(),
         base_dir: tmp.path().to_path_buf(),
         source: crate::workloads::types::WorkloadSource::OnDisk,
+        lab_inputs: None,
     };
     let mut s = spec();
     s.suite.as_mut().unwrap().more_than_baseline = false;
@@ -854,6 +855,7 @@ fn the_lab_run_step_records_a_fail_when_the_gate_errs() {
         .unwrap(),
         base_dir: tmp.path().to_path_buf(),
         source: crate::workloads::types::WorkloadSource::OnDisk,
+        lab_inputs: None,
     };
     let got = apply(
         &run_dir,

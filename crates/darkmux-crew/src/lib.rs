@@ -155,6 +155,9 @@ pub mod state_file;
 // for why this lives here rather than in `darkmux-serve`.
 pub mod records_emitted;
 pub mod resourcing;
+// (#3363) The one role resolution every dispatch path makes, and the
+// prompt provenance `dispatch.start` records.
+pub(crate) mod role_inputs;
 // (#1959) The rule registry — a named, searchable property bound to files
 // by glob, with match/no-match prose. Promoted out of the crawl module
 // (originally `darkmux_lab::crawl::rules`) to a general template kind so

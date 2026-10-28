@@ -1414,6 +1414,7 @@ impl StepKind for DispatchUnitStepKind {
                 model_base_url_override: None,
                 step_id: Some(step.id.clone()),
                 system_prompt_override: None,
+                lab_inputs: None,
                 workspace_read_only: true,
                 host_out: Some(draw_host_out.clone()),
                 // (#2301) Per-unit resume is the scheduler's step-output reuse

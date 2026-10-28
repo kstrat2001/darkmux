@@ -188,6 +188,7 @@ fn container_free_single_shot_dispatch_round_trips_through_a_real_http_mock_serv
         model_base_url_override: Some(server.base_url()),
         step_id: None,
         system_prompt_override: None,
+        lab_inputs: None,
     };
 
     let result = dispatch_local_single_shot(opts);
@@ -235,6 +236,12 @@ fn container_free_single_shot_dispatch_round_trips_through_a_real_http_mock_serv
     }
     assert!(saw_start, "no dispatch.start flow record found for session {session_id}");
     assert!(saw_complete, "no terminal dispatch.complete/dispatch.error flow record found for session {session_id}");
+    // (#3363) The start records what the system prompt was built from, as on
+    // every dispatch path: its SHA-256 and which additions applied.
+    let start = records.iter().find(|r| r["action"] == "dispatch.start").expect("checked above");
+    let sha = start["payload"]["system_sha256"].as_str().unwrap_or_default();
+    assert!(sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()), "{start}");
+    assert!(start["payload"]["prompt_additions"].is_object(), "{start}");
 
     // One call is one role execution: its bookends and its usage record all
     // name the id the result carries, and no other.
@@ -344,6 +351,7 @@ fn a_refused_local_single_shot_ends_in_an_error_terminal_with_its_context() {
         model_base_url_override: Some(server.base_url()),
         step_id: None,
         system_prompt_override: None,
+        lab_inputs: None,
     };
     let result = dispatch_local_single_shot(opts);
     match prev_flows_dir {
@@ -460,6 +468,7 @@ fn container_free_single_shot_dispatch_stamps_mission_id_resolved_from_phase() {
         model_base_url_override: Some(server.base_url()),
         step_id: None,
         system_prompt_override: None,
+        lab_inputs: None,
     };
 
     let result = dispatch_local_single_shot(opts);
@@ -571,6 +580,7 @@ fn a_local_single_shot_promises_its_beat_exactly_when_the_first_beat_landed() {
             model_base_url_override: Some(server.base_url()),
             step_id: None,
             system_prompt_override: None,
+            lab_inputs: None,
         };
         let result = dispatch_local_single_shot(opts);
         unsafe {

@@ -191,6 +191,8 @@ fn every_shipped_template_file_has_no_unknown_keys() {
     found.extend(workloads.iter().filter_map(|p| check_path::<WorkloadManifest>(UserFileKind::Workload, p, &no_retired)));
     for fixture in std::fs::read_dir(t.join("lab-fixtures")).unwrap().flatten() {
         found.extend(check_path::<FixtureManifest>(UserFileKind::LabFixture, &fixture.path().join(".fixture.json"), &no_retired));
+        // (#3363) The roles an eval carries are role manifests too.
+        found.extend(check_dir::<Role>(UserFileKind::Role, &fixture.path().join("roles"), &no_retired));
     }
     found.extend(check_path::<darkmux_types::config::DarkmuxConfig>(
         UserFileKind::Config,
@@ -204,6 +206,48 @@ fn every_shipped_template_file_has_no_unknown_keys() {
     ));
     let lines: Vec<String> = found.iter().map(ToString::to_string).collect();
     assert!(lines.is_empty(), "{lines:#?}");
+}
+
+/// (#3363) An eval owns its roles, darkmux's own included: a built-in
+/// workload bound to a built-in fixture runs on the role that fixture
+/// carries, so every such pair must load (`lab run demo-quickstart` would
+/// otherwise be refused).
+#[test]
+fn every_builtin_workload_bound_to_a_builtin_fixture_finds_its_role_there() {
+    let t = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates/builtin");
+    let read = |p: &std::path::Path| -> serde_json::Value { serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap() };
+    let fixtures: Vec<(String, std::path::PathBuf)> = std::fs::read_dir(t.join("lab-fixtures"))
+        .unwrap()
+        .flatten()
+        .map(|e| (read(&e.path().join(".fixture.json"))["satisfies"].as_str().unwrap().to_string(), e.path()))
+        .collect();
+    // A built-in workload bound to a fixture darkmux does not ship: its role
+    // files must come with that fixture, so this test cannot check them.
+    // Each entry says which role the fixture must carry; the CHANGELOG names
+    // the same workloads.
+    const USER_FIXTURE: &[(&str, &str)] =
+        &[("crawl-error-discard", "binds rust-crawl-scope@1.0, a user fixture, which must carry roles/crawler.*")];
+    let (mut checked, mut user_fixture) = (0, Vec::new());
+    for path in crate::workloads::load::documents_in(&t.join("workloads")) {
+        let doc = read(&path);
+        let Some(requires) = doc["workload"]["requires_fixture"].as_str() else { continue };
+        let id = doc["workload"]["id"].as_str().unwrap().to_string();
+        let role = doc["workload"]["role"].as_str().unwrap_or_else(|| panic!("{path:?} names no role"));
+        let Some((_, dir)) = fixtures.iter().find(|(satisfies, _)| satisfies == requires) else {
+            assert!(
+                USER_FIXTURE.iter().any(|(listed, why)| *listed == id && why.contains(&format!("roles/{role}."))),
+                "{id} binds {requires}, which no built-in fixture satisfies: list it in USER_FIXTURE with the role its fixture must carry"
+            );
+            user_fixture.push(id);
+            continue;
+        };
+        darkmux_crew::dispatch::LabInputs::load_eval(dir, role)
+            .unwrap_or_else(|e| panic!("{path:?}: {e:#}"));
+        checked += 1;
+    }
+    assert!(checked >= 1, "demo-quickstart binds demo-tiny-py");
+    let listed: Vec<&str> = USER_FIXTURE.iter().map(|(id, _)| *id).collect();
+    assert_eq!(user_fixture, listed, "every USER_FIXTURE entry is a built-in workload that still binds a user fixture");
 }
 
 /// A mistyped value in a workload is refused by the lab preflight, naming

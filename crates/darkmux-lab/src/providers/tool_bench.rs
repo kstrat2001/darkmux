@@ -1147,6 +1147,7 @@ impl WorkloadProvider for ToolBenchProvider {
                     config_path,
                     timeout,
                     timeout_override_seconds,
+                    loaded,
                     &self.dispatch,
                 )?;
 
@@ -1219,11 +1220,9 @@ impl WorkloadProvider for ToolBenchProvider {
             backend: None,
             // (#2902 review M2) The window of the model the dispatches RAN on
             // (the one resolver's selection, with the lab's utility opt-in),
-            // not the profile's default model's.
-            n_ctx: darkmux_crew::dispatch_internal::dispatch_window(&role, Some(profile_name), config_path, true)
-                .ok()
-                .flatten()
-                .map(u64::from),
+            // not the profile's default model's. (#3363) Selected from the
+            // role the dispatches ran, the lab's pinned one.
+            n_ctx: bench_window(loaded, &role, profile_name, config_path),
         };
         let rows = build_rows(&trial_refs, trials_per_task, &artifact);
         let machine_id = darkmux_types::config_access::machine_id()
@@ -1407,6 +1406,16 @@ fn extract_reply(stdout: &str) -> String {
     scores::envelope_reply_text(stdout)
 }
 
+/// (#3363) The window of the model the bench's dispatches ran on, selected
+/// from the role `lab run` read for them; `None` when it cannot be resolved.
+fn bench_window(loaded: &LoadedWorkload, role: &str, profile_name: &str, config_path: Option<&str>) -> Option<u64> {
+    let inputs = crate::providers::lab_inputs(loaded).ok()?;
+    darkmux_crew::dispatch_internal::lab_dispatch_window(&inputs, role, Some(profile_name), config_path)
+        .ok()
+        .flatten()
+        .map(u64::from)
+}
+
 /// Dispatch one task via the internal runtime. Same shape as the coding-task
 /// provider's helper; `timeout` is the bench's per-task inactivity cap.
 ///
@@ -1439,12 +1448,15 @@ fn dispatch_task(
     // `run()`'s own comment on `timeout_override_seconds` for why this is
     // separate from `timeout` above.
     timeout_override_seconds: Option<u32>,
+    loaded: &LoadedWorkload,
     dispatch_fn: &ToolBenchDispatchFn,
     // (#2685) Returns the raw exit CODE, not a collapsed `ok` bool: the
     // shared infra predicate needs "did this exit non-zero" alongside what
     // the envelope carried, and `envelope_meta_with_exit` takes the code.
 ) -> Result<(String, String, i32, Option<PathBuf>)> {
     use darkmux_crew::dispatch::DispatchOpts;
+    // (#3363) The role `lab run` read from the eval before the run.
+    let lab_inputs = crate::providers::lab_inputs(loaded)?;
     let opts = DispatchOpts {
         finding_sites: None,
         // (#2914) The lab benchmarks candidate utility models.
@@ -1479,6 +1491,8 @@ fn dispatch_task(
         model_base_url_override: None,
         step_id: None, // (#1483) set on the graph-step path only
         system_prompt_override: None,
+        // (#3363) The role from the eval, or darkmux's compiled-in one.
+        lab_inputs: Some(lab_inputs),
     };
     let result = (dispatch_fn)(opts).context("internal-runtime dispatch via tool-bench")?;
     Ok((result.stdout, result.stderr, result.exit_code, result.out_dir))
@@ -2325,6 +2339,7 @@ not json — tolerated
             manifest,
             base_dir: PathBuf::new(),
             source: crate::workloads::types::WorkloadSource::Embedded,
+            lab_inputs: None,
         }
     }
 
@@ -2433,6 +2448,53 @@ not json — tolerated
         let doc = scores::read_scores(&run_dir.path().join("scores.json")).expect("the run wrote scores.json");
         assert!(!doc.rows.is_empty());
         assert!(doc.rows.iter().all(|r| r.artifact.n_ctx == Some(128_000)), "{:?}", doc.rows[0].artifact);
+    }
+
+    /// (#3363) For a fixture-bound bench the recorded window is selected
+    /// from the eval's role in the sandbox: its `web-probe` asks for coding
+    /// (the 128k model). No other tier defines `web-probe`, so a lookup
+    /// through the home folder falls back to the profile's default (32k).
+    #[test]
+    #[serial_test::serial]
+    fn a_fixture_bound_bench_records_the_window_of_the_evals_role() {
+        let state = darkmux_types::test_isolation::IsolatedState::new();
+        let pf = state.join("profiles.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{"mixed":{"default_model":"generalist","models":[
+                    {"id":"generalist","n_ctx":32000,"capabilities":{"reasoning":1.0}},
+                    {"id":"codestar","n_ctx":128000,"capabilities":{"code":1.0}}]}},
+                "default_profile":"mixed"}"#,
+        )
+        .unwrap();
+        let sandbox_dir = state.join("sandbox");
+        std::fs::create_dir_all(sandbox_dir.join("roles")).unwrap();
+        let role = serde_json::json!({"id": "web-probe", "description": "d", "skills": ["coding"],
+            "tool_palette": {"allow": ["read"], "deny": []}, "escalation_contract": "bail-with-explanation"});
+        std::fs::write(sandbox_dir.join("roles/web-probe.json"), role.to_string()).unwrap();
+        std::fs::write(sandbox_dir.join("roles/web-probe.md"), "# web-probe\n").unwrap();
+        let mut loaded = loaded_workload(serde_json::json!({ "chainDepths": [2], "role": "web-probe", "requires_fixture": "biz@1.0" }));
+        // The role `lab run` read from the eval before the run.
+        let inputs = darkmux_crew::dispatch::LabInputs::load_eval(&sandbox_dir, "web-probe").unwrap();
+        loaded.lab_inputs = Some(inputs.clone());
+        let run_dir = state.join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        // Every task's dispatch carries exactly those inputs.
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_by_dispatch = seen.clone();
+        let provider = ToolBenchProvider::with_dispatch(Arc::new(move |opts: DispatchOpts| {
+            seen_by_dispatch.lock().unwrap().push(opts.lab_inputs);
+            mock_ok_result()
+        }));
+        let profile = darkmux_profiles::profiles::load_registry(pf.to_str()).unwrap().registry.profiles["mixed"].clone();
+        provider
+            .run(&loaded, &run_dir, &sandbox_dir, &profile, "mixed", pf.to_str(), None, &darkmux_types::session_id::RunId::lab("r").unwrap(), &mut |_sid: &SessionId| {})
+            .expect("run completes");
+        let doc = scores::read_scores(&run_dir.join("scores.json")).expect("the run wrote scores.json");
+        assert!(!doc.rows.is_empty());
+        assert!(doc.rows.iter().all(|r| r.artifact.n_ctx == Some(128_000)), "{:?}", doc.rows[0].artifact);
+        let seen = seen.lock().unwrap();
+        assert!(!seen.is_empty() && seen.iter().all(|i| i.as_ref() == Some(&inputs)), "{seen:?}");
     }
 
     /// (#2902 re-review C3) `lab run` chooses the profile for the role the
