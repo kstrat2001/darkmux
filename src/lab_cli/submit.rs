@@ -59,29 +59,25 @@ pub(crate) fn cmd_submit(args: SubmitArgs) -> Result<i32> {
     if args.runs.is_empty() {
         bail!("name the lab runs to share: `darkmux lab submit <run>...` (see `darkmux run list`)");
     }
-    // Before any hashing: a submit with no token would do that work for nothing.
-    let token = if args.dry_run { None } else { Some(stored_token()?) };
+    // Before any hashing: a submit with no token for its site would do that work for nothing.
+    let credential = if args.dry_run { None } else { Some(upload::read_token(&args.site)?) };
     let built = submit::gather(&args.runs, &args.stated, &mut |line| eprintln!("{line}"))?;
-    print!("{}", deliver(&args, &built, token.as_deref())?);
+    print!("{}", deliver(&args, &built, credential.as_ref())?);
     Ok(0)
 }
 
-fn stored_token() -> Result<String> {
-    upload::read_token().context("no upload token stored: make one on the site's account page, then `darkmux lab submit login`")
-}
-
 /// A built bundle's notes to stderr, the bundle to its file, and to the site
-/// with a token (none is a dry run). Returns what to print.
-fn deliver(args: &SubmitArgs, built: &submit::Built, token: Option<&str>) -> Result<String> {
+/// with the token stored for it (none is a dry run). Returns what to print.
+fn deliver(args: &SubmitArgs, built: &submit::Built, credential: Option<&upload::Credential>) -> Result<String> {
     for note in &built.notes {
         eprintln!("{note}");
     }
     let text = serde_json::to_string_pretty(&built.bundle)? + "\n";
     let wrote = write_out(args, built, &text)?;
-    let Some(token) = token else {
+    let Some(credential) = credential else {
         return Ok(format!("{wrote}Dry run: nothing was sent.\n"));
     };
-    let answer = send(args, token, &text)?;
+    let answer = send(args, credential, &text)?;
     Ok(wrote + &shared_text(&args.site, &built.fixture, &answer.body["data"]))
 }
 
@@ -103,14 +99,14 @@ fn write_out(args: &SubmitArgs, built: &submit::Built, text: &str) -> Result<Str
 }
 
 /// Uploads the bundle; an answer outside 2xx is the site's refusal.
-fn send(args: &SubmitArgs, token: &str, text: &str) -> Result<upload::Answer> {
+fn send(args: &SubmitArgs, credential: &upload::Credential, text: &str) -> Result<upload::Answer> {
     // curl reads the body from a file, removed after. It holds nothing secret.
     static SENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = SENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let body = std::env::temp_dir().join(format!("darkmux-evals-bundle-{}-{n}.json", std::process::id()));
     upload::write_private(&body, text.as_bytes())?;
     let path = if args.replace { "/api/v1/uploads?replace=1" } else { "/api/v1/uploads" };
-    let answer = upload::call(&args.site, "POST", path, token, Some(&body));
+    let answer = upload::call(&args.site, "POST", path, credential, Some(&body));
     let _ = std::fs::remove_file(&body);
     let answer = answer?;
     if !(200..300).contains(&answer.status) {
@@ -144,17 +140,21 @@ pub(crate) fn cmd_submit_token(sub: SubmitCmd) -> Result<i32> {
 }
 
 /// `login` (a token read from `input`, kept with `store`) or `logout`
-/// (`forget`). Returns what to print.
+/// (`forget`), each for its `--site` only. Returns what to print.
 fn token_command(
     sub: SubmitCmd,
     input: &mut dyn std::io::BufRead,
     prompt: bool,
-    store: impl FnOnce(&str) -> Result<String>,
-    forget: impl FnOnce() -> Result<()>,
+    store: impl FnOnce(&upload::Credential) -> Result<String>,
+    forget: impl FnOnce(&upload::Origin) -> Result<()>,
 ) -> Result<String> {
-    let SubmitCmd::Login { site } = sub else {
-        forget()?;
-        return Ok("Forgot the upload token.\n".to_string());
+    let site = match sub {
+        SubmitCmd::Login { site } => site,
+        SubmitCmd::Logout { site } => {
+            let origin = upload::Origin::of(&site)?;
+            forget(&origin)?;
+            return Ok(format!("Forgot the upload token for {origin}.\n"));
+        }
     };
     if prompt {
         eprintln!("Paste your upload token (from the site's account page), then press Enter:");
@@ -164,20 +164,21 @@ fn token_command(
     login_with(&site, &line, store)
 }
 
-/// Checks a pasted token with the site, then keeps it with `store` (which
-/// says where). Returns what to print.
-fn login_with(site: &str, line: &str, store: impl FnOnce(&str) -> Result<String>) -> Result<String> {
-    let token = line.trim();
-    if !upload::is_token(token) {
-        bail!("that is not an upload token (they start with {}); make one on the site's account page", upload::TOKEN_PREFIX);
-    }
-    let answer = upload::call(site, "GET", "/api/v1/account", token, None)?;
+/// Checks a pasted token with the site, then keeps it for the site's origin
+/// with `store` (which says where). Returns what to print.
+fn login_with(site: &str, line: &str, store: impl FnOnce(&upload::Credential) -> Result<String>) -> Result<String> {
+    let credential = upload::Credential::pasted(site, line.trim())?;
+    let answer = upload::call(site, "GET", "/api/v1/account", &credential, None)?;
     if answer.status != 200 {
         bail!("{site} did not accept the token: {}", answer.refusal());
     }
-    let where_ = store(token)?;
+    let where_ = store(&credential)?;
     let data = &answer.body["data"];
-    let mut text = format!("Stored the upload token for {} in {where_}.\n", data["email"].as_str().unwrap_or("your account"));
+    let mut text = format!(
+        "Stored the upload token for {} on {} in {where_}.\n",
+        data["email"].as_str().unwrap_or("your account"),
+        credential.origin()
+    );
     match (data["mayUpload"].as_bool(), data["reason"].as_str()) {
         (Some(true), _) => text.push_str("This account may upload: `darkmux lab submit <run>...`.\n"),
         (_, Some(reason)) => text.push_str(&format!("This account cannot upload yet: {reason}\n")),
@@ -229,6 +230,11 @@ mod tests {
 
     fn token() -> String {
         format!("{}{}", upload::TOKEN_PREFIX, "ab12".repeat(8))
+    }
+
+    /// The test token, as stored for `site`.
+    fn cred(site: &str) -> upload::Credential {
+        upload::Credential::pasted(site, &token()).unwrap()
     }
 
     /// A one-request HTTP server on this machine: answers `status` and
@@ -296,7 +302,7 @@ mod tests {
         );
         let mut a = args(&site, false, None);
         a.replace = true;
-        let said = deliver(&a, &built(), Some(&token())).unwrap();
+        let said = deliver(&a, &built(), Some(&cred(&site))).unwrap();
         let request = server.join().unwrap();
         assert!(request.starts_with("POST /api/v1/uploads?replace=1 "), "{request}");
         assert_eq!(said, format!("Shared o/r@abc1234 (f 1) of {site}: 1 added, 0 already there, 0 replaced.\n  eval: https://e/x\n  run: https://e/r (pending)\n"));
@@ -305,9 +311,21 @@ mod tests {
     #[test]
     fn a_refused_upload_is_the_sites_words() {
         let (site, server) = serve_once(403, r#"{"error":"Uploads are not open yet"}"#);
-        let err = deliver(&args(&site, false, None), &built(), Some(&token())).unwrap_err().to_string();
+        let err = deliver(&args(&site, false, None), &built(), Some(&cred(&site))).unwrap_err().to_string();
         assert_eq!(err, format!("{site} refused the upload: Uploads are not open yet (HTTP 403)"));
         assert!(server.join().unwrap().starts_with("POST /api/v1/uploads "));
+    }
+
+    /// (#3400) A submit to another `--site` never carries evals.darkmux.com's
+    /// token: it is refused before curl runs (no "could not reach").
+    #[test]
+    fn a_submit_never_sends_one_sites_token_to_another() {
+        let production = cred(submit::DEFAULT_SITE);
+        // `.invalid` never resolves and port 9 is closed, so even a broken guard reaches no one.
+        for other in ["https://evil.invalid", "https://evals.darkmux.com.evil.invalid", "http://127.0.0.1:9"] {
+            let err = deliver(&args(other, false, None), &built(), Some(&production)).unwrap_err().to_string();
+            assert!(err.starts_with("the upload token for https://evals.darkmux.com is never sent to "), "{other}: {err}");
+        }
     }
 
     #[test]
@@ -325,14 +343,14 @@ mod tests {
     fn login_checks_the_token_with_the_site_before_keeping_it() {
         let (site, server) = serve_once(200, r#"{"data":{"email":"me@example.com","mayUpload":true}}"#);
         let mut kept = None;
-        let said = login_with(&site, &format!("{}\n", token()), |t| {
-            kept = Some(t.to_string());
+        let said = login_with(&site, &format!("{}\n", token()), |c| {
+            kept = Some(c.origin().to_string());
             Ok("the test store".into())
         })
         .unwrap();
         assert!(server.join().unwrap().starts_with("GET /api/v1/account "));
-        assert_eq!(kept, Some(token()));
-        assert_eq!(said, "Stored the upload token for me@example.com in the test store.\nThis account may upload: `darkmux lab submit <run>...`.\n");
+        assert_eq!(kept, Some(site.clone()), "kept for the site it was checked with");
+        assert_eq!(said, format!("Stored the upload token for me@example.com on {site} in the test store.\nThis account may upload: `darkmux lab submit <run>...`.\n"));
 
         let (site, _server) = serve_once(200, r#"{"data":{"mayUpload":false,"reason":"uploads open soon"}}"#);
         let said = login_with(&site, &token(), |_| Ok("x".into())).unwrap();
@@ -344,22 +362,25 @@ mod tests {
 
     #[test]
     fn logout_forgets_and_login_reads_the_token_from_its_input() {
-        let mut forgot = false;
-        let said = token_command(SubmitCmd::Logout, &mut std::io::empty(), false, |_| unreachable!(), || {
-            forgot = true;
+        let mut forgot = None;
+        let logout = SubmitCmd::Logout { site: "HTTP://Evals.Localhost:3419/".into() };
+        let said = token_command(logout, &mut std::io::empty(), false, |_| unreachable!(), |o| {
+            forgot = Some(o.to_string());
             Ok(())
         })
         .unwrap();
-        assert!(forgot);
-        assert_eq!(said, "Forgot the upload token.\n");
+        assert_eq!(forgot.as_deref(), Some("http://evals.localhost:3419"), "only the named site's token");
+        assert_eq!(said, "Forgot the upload token for http://evals.localhost:3419.\n");
+        let odd = token_command(SubmitCmd::Logout { site: "https://a@b".into() }, &mut std::io::empty(), false, |_| unreachable!(), |_| unreachable!());
+        assert!(odd.unwrap_err().to_string().contains("cannot use"), "an unreadable site forgets nothing");
 
         let (site, server) = serve_once(200, r#"{"data":{"email":"me@example.com"}}"#);
         let mut input = std::io::Cursor::new(format!("{}\nignored\n", token()));
-        let said = token_command(SubmitCmd::Login { site }, &mut input, true, |_| Ok("the test store".into()), || unreachable!()).unwrap();
-        assert!(said.starts_with("Stored the upload token for me@example.com in the test store."), "{said}");
+        let said = token_command(SubmitCmd::Login { site: site.clone() }, &mut input, true, |_| Ok("the test store".into()), |_| unreachable!()).unwrap();
+        assert!(said.starts_with(&format!("Stored the upload token for me@example.com on {site} in the test store.")), "{said}");
         assert!(server.join().unwrap().starts_with("GET /api/v1/account "));
 
-        let empty = token_command(SubmitCmd::Login { site: "http://127.0.0.1:9".into() }, &mut std::io::empty(), false, |_| unreachable!(), || unreachable!());
+        let empty = token_command(SubmitCmd::Login { site: "http://127.0.0.1:9".into() }, &mut std::io::empty(), false, |_| unreachable!(), |_| unreachable!());
         assert!(empty.unwrap_err().to_string().contains("not an upload token"), "nothing pasted is no token");
     }
 

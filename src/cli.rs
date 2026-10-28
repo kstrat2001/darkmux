@@ -1600,9 +1600,9 @@ pub(crate) enum LabCmd {
     },
     /// Share lab runs on the darkmux evals site (evals.darkmux.com). Builds
     /// one bundle of the runs, with no paths and nothing it cannot vouch for
-    /// as of the run, and uploads it with your upload token (`lab submit
-    /// login`). The eval must be approved on the site first. `--dry-run`
-    /// writes the bundle and sends nothing.
+    /// as of the run, and uploads it with your upload token for the site
+    /// (`lab submit login`). The eval must be approved on the site first.
+    /// `--dry-run` writes the bundle and sends nothing.
     #[command(args_conflicts_with_subcommands = true)]
     Submit {
         #[command(subcommand)]
@@ -1616,7 +1616,9 @@ pub(crate) enum LabCmd {
         /// darkmux-evals-<first run>.json).
         #[arg(long)]
         out: Option<String>,
-        /// The site to send it to.
+        /// The site to send it to, with the token stored for that site
+        /// (`lab submit login --site`); refused when none is, never sent
+        /// with another site's.
         #[arg(long, default_value = darkmux_lab::lab::submit::DEFAULT_SITE)]
         site: String,
         /// Replace these runs where the site already has them.
@@ -1663,15 +1665,21 @@ fn parse_hardware(raw: &str) -> Result<darkmux_types::Hardware, String> {
         .ok_or_else(|| format!("expected {}, got `{raw}`", darkmux_types::Hardware::TOKENS.join(" or ")))
 }
 
-/// `darkmux lab submit login|logout`: the upload token.
+/// `darkmux lab submit login|logout`: the upload token, one per site.
 #[derive(Subcommand)]
 pub(crate) enum SubmitCmd {
     /// Store your upload token (made on the site's account page), read from
-    /// stdin, after checking it with the site.
+    /// stdin, after checking it with the site. It is kept for that site
+    /// only, beside any other site's.
     Login {
+        /// The site the token is for (scheme, host and port).
         #[arg(long, default_value = darkmux_lab::lab::submit::DEFAULT_SITE)]
         site: String,
     },
-    /// Forget the stored upload token.
-    Logout,
+    /// Forget the upload token stored for one site; other sites' stay.
+    Logout {
+        /// The site whose token to forget.
+        #[arg(long, default_value = darkmux_lab::lab::submit::DEFAULT_SITE)]
+        site: String,
+    },
 }

@@ -107,6 +107,7 @@ darkmux run inspect &lt;run id&gt;     <span class="comment"># the verdict, time
     </ol>
     <pre><code>darkmux lab submit login     <span class="comment"># paste the token; darkmux checks it with the site</span></code></pre>
     <p>The token lives in the login keychain on macOS and in a file only you can read on Omarchy. Treat it like a password. <code>darkmux lab submit logout</code> forgets it.</p>
+    <p>A token is kept for the site that made it, and sent only there. To try a preview of the site, log in to it by name: <code>darkmux lab submit login --site http://evals.localhost:3419</code> keeps that token beside your evals.darkmux.com one, and <code>darkmux lab submit &lt;run id&gt; --site http://evals.localhost:3419</code> sends the preview's. A <code>--site</code> you have not logged in to is refused before anything is sent, naming the login to run; <code>logout --site</code> forgets that site's token only.</p>
   </div>
 </section>
 
