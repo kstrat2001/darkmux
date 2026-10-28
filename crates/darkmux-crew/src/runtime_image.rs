@@ -137,6 +137,72 @@ impl ImageInspector for DockerImageInspector {
     }
 }
 
+/// Bound on pulling the runtime image (#3419). The image is about 236 MB, so
+/// ten minutes allows a ~3 Mbit/s link; a pull past that is wedged (a
+/// credential prompt nobody can answer, a stalled registry), and the dispatch
+/// ends with a remedy instead of hanging.
+pub const PULL_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// `docker pull` a PUBLIC image (#3419), anonymously first: `DOCKER_CONFIG`
+/// names an empty directory, so the user's credential store is never asked.
+/// Docker Desktop's helper (`credsStore: "desktop"`) waits for a GUI session a
+/// launchd-started daemon does not have, which hung a brew-service daemon's
+/// first dispatch. `DOCKER_HOST` carries the endpoint the user's own context
+/// names, since the empty config has no context. A pull refused anonymously
+/// (a private mirror, a rate limit) is tried once more with the user's own
+/// config. Each attempt is bounded by `timeout`.
+pub fn pull_public_image(image: &str, timeout: Duration) -> Result<()> {
+    let anon = tempfile::TempDir::new()?;
+    let mut cmd = Command::new("docker");
+    cmd.args(["pull", image]).env("DOCKER_CONFIG", anon.path());
+    if std::env::var_os("DOCKER_HOST").is_none() {
+        if let Some(host) = context_endpoint() {
+            cmd.env("DOCKER_HOST", host);
+        }
+    }
+    let anonymous_refusal = match run_pull(cmd, image, timeout)? {
+        Ok(()) => return Ok(()),
+        Err(why) => why,
+    };
+    let mut cmd = Command::new("docker");
+    cmd.args(["pull", image]);
+    run_pull(cmd, image, timeout)?.map_err(|why| {
+        anyhow::anyhow!("`docker pull {image}` failed: {why} (anonymously: {anonymous_refusal})")
+    })
+}
+
+/// The Docker endpoint the user's current context names, e.g.
+/// `unix:///Users/me/.docker/run/docker.sock` for Docker Desktop. Reading a
+/// context never touches the credential store. `None` when docker cannot say.
+fn context_endpoint() -> Option<String> {
+    use crate::bounded_command::{run_bounded, Bounded};
+    let mut cmd = Command::new("docker");
+    cmd.args(["context", "inspect", "--format", "{{.Endpoints.docker.Host}}"]);
+    match run_bounded(cmd, INSPECT_TIMEOUT) {
+        Bounded::Finished { success: true, stdout, .. } => {
+            let host = String::from_utf8_lossy(&stdout).trim().to_string();
+            (!host.is_empty()).then_some(host)
+        }
+        _ => None,
+    }
+}
+
+/// One bounded pull attempt: `Ok(Ok(()))` pulled, `Ok(Err(stderr))` docker
+/// refused it, `Err` for an attempt that never finished.
+fn run_pull(cmd: Command, image: &str, timeout: Duration) -> Result<std::result::Result<(), String>> {
+    use crate::bounded_command::{run_bounded, Bounded};
+    match run_bounded(cmd, timeout) {
+        Bounded::Finished { success: true, .. } => Ok(Ok(())),
+        Bounded::Finished { stderr, .. } => Ok(Err(String::from_utf8_lossy(&stderr).trim().to_string())),
+        Bounded::TimedOut { seconds } => bail!(
+            "`docker pull {image}` did not finish within {seconds}s. Pull it once from a logged-in \
+             shell, `docker pull {image}`, then retry"
+        ),
+        Bounded::Interrupted => bail!("`docker pull {image}` was interrupted"),
+        Bounded::SpawnFailed(e) => bail!("could not run `docker pull {image}`: {e}"),
+    }
+}
+
 /// Parse one `{{.Id}}|<label>` line. An answer with no id is not a usable
 /// answer: nothing could be run by it.
 pub fn parse_inspect_line(stdout: &str) -> ImageInspection {
@@ -745,6 +811,88 @@ mod tests {
         }
         assert!(matches!(got, ImageInspection::Unreadable(_)), "{got:?}");
         assert!(took < Duration::from_secs(10), "bounded, took {took:?}");
+    }
+
+    /// A fake `docker` on PATH for the pull tests. `context inspect` answers
+    /// `unix:///fake.sock`; `pull` runs `pull_body`. Restores PATH on drop.
+    struct FakeDocker {
+        _dir: tempfile::TempDir,
+        prev_path: Option<String>,
+    }
+
+    impl FakeDocker {
+        fn install(pull_body: &str) -> Self {
+            let dir = tempfile::TempDir::new().unwrap();
+            let docker = dir.path().join("docker");
+            let script = format!(
+                "#!/bin/sh\ncase \"$1\" in\n  context) echo unix:///fake.sock; exit 0;;\n  pull)\n{pull_body}\n;;\nesac\nexit 2\n"
+            );
+            std::fs::write(&docker, script).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let prev_path = std::env::var("PATH").ok();
+            // SAFETY: every caller is #[serial].
+            unsafe {
+                std::env::set_var("PATH", format!("{}:{}", dir.path().display(), prev_path.clone().unwrap_or_default()))
+            };
+            Self { _dir: dir, prev_path }
+        }
+    }
+
+    impl Drop for FakeDocker {
+        fn drop(&mut self) {
+            // SAFETY: #[serial].
+            unsafe {
+                match self.prev_path.take() {
+                    Some(p) => std::env::set_var("PATH", p),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+        }
+    }
+
+    /// The pull answers at once only when it is anonymous: DOCKER_CONFIG names
+    /// a directory with no config.json (so no credential helper runs) and
+    /// DOCKER_HOST carries the endpoint the user's context names. Anything
+    /// else hangs, as Docker Desktop's credential helper does under launchd.
+    const PULL_OK_ONLY_IF_ANONYMOUS: &str = "    if [ -n \"$DOCKER_CONFIG\" ] && [ ! -e \"$DOCKER_CONFIG/config.json\" ] \\\n       && [ \"$DOCKER_HOST\" = unix:///fake.sock ]; then exit 0; fi\n    sleep 30; exit 1";
+
+    /// (#3419) A daemon started by launchd hung its first dispatch on `docker
+    /// pull` waiting for Docker Desktop's credential helper. The runtime image
+    /// is public, so the pull must not consult the user's credential store.
+    #[test]
+    #[serial_test::serial] // mutates PATH
+    fn the_runtime_image_is_pulled_anonymously_without_the_users_credential_helper() {
+        let _fake = FakeDocker::install(PULL_OK_ONLY_IF_ANONYMOUS);
+        let started = std::time::Instant::now();
+        let got = pull_public_image(RUNTIME_IMAGE, Duration::from_secs(5));
+        assert!(got.is_ok(), "{got:?}");
+        assert!(started.elapsed() < Duration::from_secs(4), "took {:?}", started.elapsed());
+    }
+
+    /// (#3419) A pull that never answers ends in an error naming the remedy,
+    /// within the bound, instead of hanging the dispatch.
+    #[test]
+    #[serial_test::serial] // mutates PATH
+    fn a_pull_that_never_answers_is_bounded_and_names_the_remedy() {
+        let _fake = FakeDocker::install("    sleep 30; exit 1");
+        let started = std::time::Instant::now();
+        let msg = pull_public_image(RUNTIME_IMAGE, Duration::from_millis(400)).unwrap_err().to_string();
+        assert!(started.elapsed() < Duration::from_secs(10), "took {:?}", started.elapsed());
+        assert!(msg.contains("did not finish") && msg.contains(&format!("docker pull {RUNTIME_IMAGE}")), "{msg}");
+    }
+
+    /// (#3419) An anonymous pull the registry refuses (a private mirror, a
+    /// rate limit) falls back to the user's own docker config once.
+    #[test]
+    #[serial_test::serial] // mutates PATH
+    fn a_refused_anonymous_pull_falls_back_to_the_users_docker_config() {
+        let _fake = FakeDocker::install("    if [ -z \"$DOCKER_CONFIG\" ]; then exit 0; fi\n    exit 1");
+        let got = pull_public_image(RUNTIME_IMAGE, Duration::from_secs(5));
+        assert!(got.is_ok(), "{got:?}");
     }
 
     #[test]

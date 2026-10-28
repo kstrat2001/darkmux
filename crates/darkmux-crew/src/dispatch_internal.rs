@@ -100,29 +100,27 @@ fn is_darkmux_runtime_image(tag: &str) -> bool {
 /// The two effects image resolution needs: inspecting, and pulling.
 type ImageSeams<'a> = (&'a dyn crate::runtime_image::ImageInspector, &'a dyn Fn(&str) -> Result<()>);
 
-/// `docker pull` the version-pinned GHCR runtime image (#759). Streams docker's
-/// own progress to stderr so a multi-second first-dispatch pull isn't a silent
-/// hang. Bails with an actionable message (auth / network / build-locally) on
-/// failure.
+/// `docker pull` the version-pinned GHCR runtime image (#759), anonymously and
+/// bounded (`runtime_image::pull_public_image`, #3419). Bails with an
+/// actionable message (network / build-locally) on failure.
 #[cfg_attr(test, allow(dead_code))]
 fn pull_runtime_image(image: &str) -> Result<()> {
-    eprintln!("darkmux dispatch: pulling the version-pinned runtime image `{image}` from GHCR (one-time, #759)…");
-    let status = Command::new("docker")
-        .args(["pull", image])
-        .status()
-        .with_context(|| format!("running `docker pull {image}`"))?;
-    if !status.success() {
-        bail!(
-            "failed to pull the runtime image `{image}` from GHCR.\n\
+    use crate::runtime_image::{pull_public_image, PULL_TIMEOUT};
+    eprintln!(
+        "darkmux dispatch: pulling the version-pinned runtime image `{image}` from GHCR (one-time, #759; up to {}s)…",
+        PULL_TIMEOUT.as_secs()
+    );
+    pull_public_image(image, PULL_TIMEOUT).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to pull the runtime image `{image}` from GHCR: {e}\n\
              Options:\n  \
-             - Check network / `docker login ghcr.io` if the package is private, OR\n  \
+             - Check the network, and pull it from a logged-in shell: `docker pull {image}`, OR\n  \
              - Build it locally from the root of a darkmux {version} source checkout:\n      \
              {build}",
             version = env!("CARGO_PKG_VERSION"),
             build = crate::runtime_image::rebuild_command(RUNTIME_IMAGE, env!("CARGO_PKG_VERSION")),
-        );
-    }
-    Ok(())
+        )
+    })
 }
 
 /// Resolve + ensure a darkmux runtime image built for THIS darkmux is present
