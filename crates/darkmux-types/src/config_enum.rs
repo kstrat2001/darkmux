@@ -518,6 +518,44 @@ pub fn bad_endpoint_hardware(reg: &crate::ProfileRegistry) -> Vec<BadEnumValue> 
     out
 }
 
+/// (#3399 review) Every unmanaged endpoint whose host darkmux cannot read
+/// unambiguously (`ModelEndpoint::host_problem`): a client could reach a
+/// provider there that darkmux would not recognize, so neither the provider
+/// registry nor a declared `hardware` can be trusted for it. Refused at every
+/// dispatching preflight and Fail in doctor, naming `endpoints.<id>.url` and
+/// why, never the URL itself (it may carry credentials).
+pub fn invalid_endpoint_hosts(reg: &crate::ProfileRegistry) -> Vec<InvalidSetting> {
+    reg.endpoints
+        .iter()
+        .filter_map(|(id, ep)| {
+            ep.host_problem().map(|why| InvalidSetting {
+                set_in: SetIn::Profiles(format!("endpoints.{id}.url")),
+                problem: format!("darkmux cannot read its host unambiguously: {why}"),
+                valid: "`https://<host>[:<port>]/<path>`, the host plain ASCII letters, digits, dots and hyphens (or \
+                        an IP address), with no percent-encoding, backslash or whitespace"
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
+/// (#3397) Every `hardware` declared where darkmux already knows the answer
+/// (`ModelEndpoint::misplaced_hardware`): on a managed endpoint, or on a host
+/// the provider registry lists. Refused at every dispatching preflight and
+/// Fail in doctor, naming `endpoints.<id>.hardware` and why.
+pub fn misplaced_endpoint_hardware(reg: &crate::ProfileRegistry) -> Vec<InvalidSetting> {
+    reg.endpoints
+        .iter()
+        .filter_map(|(id, ep)| {
+            ep.misplaced_hardware().map(|why| InvalidSetting {
+                set_in: SetIn::Profiles(format!("endpoints.{id}.hardware")),
+                problem: why,
+                valid: "`hardware` only on a `url` endpoint whose host the provider registry does not list".to_string(),
+            })
+        })
+        .collect()
+}
+
 /// (#2902 step 5) The valid shape of an endpoint's `limits`, for a refusal.
 pub const LIMITS_SHAPE: &str = "`limits`: {\"window\": {\"period\": \"<n>m|<n>h|<n>d\", \"tokens\": <integer>, \
      \"calls\": <integer>}, \"policy\": \"off\"|\"warn\"|\"wait\", \"warn_at\": <a fraction between 0 and 1>, \

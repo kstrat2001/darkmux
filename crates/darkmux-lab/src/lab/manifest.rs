@@ -120,6 +120,12 @@ pub struct RunManifest {
     /// name, or absent when the replies named none or more than one.
     #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     pub served_model: Option<String>,
+    /// (run manifest 1.3, #3397) The `reasoning_effort` the run's dispatch
+    /// sent, byte for byte, as its hosted call reported it. Absent when it
+    /// sent none, which is every dispatch with tools: the container's runtime
+    /// never sends one.
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     /// A key this type does not name (an older run's camelCase spelling, a newer
     /// darkmux's field), kept and re-serialized flat.
     #[serde(flatten)]
@@ -158,10 +164,6 @@ pub struct ModelHardware {
     /// The `endpoints` id the model named, for a message (never shared).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
-    /// The reasoning effort the endpoint declared, when its dialect sends it
-    /// (`reasoning_effort`, verbatim); `None` when none is sent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effort: Option<String>,
 }
 
 /// (#3397) The model a run's replies say answered, from its trajectory's
@@ -199,7 +201,8 @@ pub fn model_hardware_of(profile: &darkmux_types::Profile) -> Vec<ModelHardware>
                 HardwareBasis::Managed => HardwareFrom::Managed,
                 HardwareBasis::Provider(_) => HardwareFrom::Provider,
                 HardwareBasis::Declared(_) | HardwareBasis::Undeclared => HardwareFrom::Endpoint,
-                HardwareBasis::Unusable => return None,
+                // Preflight refuses an unreadable host before a run starts.
+                HardwareBasis::Unusable | HardwareBasis::UnreadableHost => return None,
             };
             Some(ModelHardware {
                 model: m.id.clone(),
@@ -211,17 +214,9 @@ pub fn model_hardware_of(profile: &darkmux_types::Profile) -> Vec<ModelHardware>
                     _ => None,
                 },
                 endpoint: m.endpoint.as_ref().and_then(|e| e.named_id()).map(str::to_string),
-                effort: m.endpoint.as_ref().and_then(effort_sent),
             })
         })
         .collect()
-}
-
-/// The `reasoning_effort` an endpoint sends: declared, non-blank, and in the
-/// one dialect that carries it (`chat-completions`); `None` otherwise.
-fn effort_sent(ep: &darkmux_types::ModelEndpoint) -> Option<String> {
-    let sent = ep.resolved_dialect().is_ok_and(|d| d == darkmux_types::Dialect::ChatCompletions);
-    ep.reasoning_effort.as_deref().map(str::trim).filter(|e| sent && !e.is_empty()).map(str::to_string)
 }
 
 /// A run's verify result. A run from before the object form wrote a bare
@@ -529,7 +524,6 @@ mod tests {
         let row = |m: &str| snap.iter().find(|r| r.model == m).cloned();
         use darkmux_types::Hardware::{SubmittingMachine, Unknown};
         assert_eq!(row("qwen").map(|r| (r.from, r.hardware)), Some((HardwareFrom::Managed, Some(SubmittingMachine))));
-        assert_eq!(row("qwen").and_then(|r| r.effort), None, "LM Studio is never sent an effort");
         let haiku = row("haiku").unwrap();
         assert_eq!((haiku.from, haiku.hardware, haiku.provider.as_deref()), (HardwareFrom::Provider, Some(Unknown), Some("Anthropic API")));
         assert_eq!(haiku.identifier.as_deref(), Some("claude-haiku"));
@@ -541,30 +535,6 @@ mod tests {
         assert_eq!(back.model_hardware, Some(snap));
         let raw = serde_json::to_value(&m).unwrap();
         assert!(!raw.to_string().contains("anthropic.com") && !raw.to_string().contains("studio.local"), "no host: {raw}");
-    }
-
-    /// (#3397) The effort a run records is the one its endpoint sends: the
-    /// declared `reasoning_effort` in the `chat-completions` dialect, never
-    /// one the dialect drops.
-    #[test]
-    fn the_snapshot_records_the_effort_the_endpoint_sends() {
-        let mut reg: darkmux_types::ProfileRegistry = serde_json::from_value(json!({
-            "profiles": {"p": {"models": [
-                {"id": "gpt", "endpoint": "openai"}, {"id": "plain", "endpoint": "plain"}, {"id": "lms", "n_ctx": 1, "endpoint": "lms"}]}},
-            "endpoints": {"openai": {"url": "https://api.openai.com/v1", "reasoning_effort": "high"},
-                "plain": {"url": "https://api.openai.com/v1", "reasoning_effort": "  "},
-                "lms": {"managed": "lmstudio"}}})).unwrap();
-        reg.materialize_endpoints();
-        let snap = model_hardware_of(&reg.profiles["p"]);
-        let effort = |m: &str| snap.iter().find(|r| r.model == m).and_then(|r| r.effort.clone());
-        assert_eq!(effort("gpt").as_deref(), Some("high"));
-        assert_eq!(effort("plain"), None, "a blank effort is none");
-        assert_eq!(effort("lms"), None);
-        let mut messages: darkmux_types::ModelEndpoint = serde_json::from_value(json!({"url": "https://h.example/v1",
-            "dialect": "chat-completions-max-tokens", "reasoning_effort": "high"})).unwrap();
-        assert_eq!(effort_sent(&messages), None, "a dialect that never sends it");
-        messages.dialect = None;
-        assert_eq!(effort_sent(&messages).as_deref(), Some("high"));
     }
 
     /// (#3397) The served model is the one name the replies agree on: none

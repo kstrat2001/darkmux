@@ -968,14 +968,14 @@ fn snap(model: &str, from: HardwareFrom, hardware: Option<darkmux_types::Hardwar
         hardware,
         provider: (from == HardwareFrom::Provider).then(|| "Anthropic API".to_string()),
         endpoint: (from != HardwareFrom::Managed).then(|| "studio".to_string()),
-        effort: None,
     }
 }
 
 fn profile_model(json: Value) -> darkmux_types::ProfileModel {
     let mut reg: darkmux_types::ProfileRegistry = serde_json::from_value(json!({
         "profiles": {"p": {"models": [json]}},
-        "endpoints": {"claude": {"url": "https://api.anthropic.com/v1"}, "studio": {"url": "http://studio.local:8080/v1", "hardware": "unknown"}}
+        "endpoints": {"claude": {"url": "https://api.anthropic.com/v1"}, "studio": {"url": "http://studio.local:8080/v1", "hardware": "unknown"},
+            "spoof": {"url": "https://api%2eanthropic.com/v1", "hardware": "submitting-machine"}}
     }))
     .unwrap();
     reg.materialize_endpoints();
@@ -1003,6 +1003,16 @@ fn hardware_precedence_is_registry_then_flag_then_snapshot() {
     for says in ["--hardware submitting-machine", "--hardware unknown", r#""hardware""#, "endpoints.studio"] {
         assert!(refused.contains(says), "names what to set ({says}): {refused}");
     }
+    // (#3399 review) Never downgrade: a run recorded `unknown` is not made the submitting machine's.
+    let recorded_elsewhere = [snap("flint", HardwareFrom::Endpoint, Some(Unknown))];
+    let down = at(Some(&recorded_elsewhere), None, Some(SubmittingMachine)).unwrap_err();
+    assert!(down.starts_with("r1: ") && down.contains("never the reverse"), "{down}");
+    assert!(down.contains("`studio`"), "names the endpoint: {down}");
+    assert_eq!(at(Some(&recorded_elsewhere), None, Some(Unknown)).unwrap().hardware, Unknown);
+    // (#3399 review) A host darkmux cannot read takes no answer, not even a flag.
+    let spoof = profile_model(json!({"id": "flint", "endpoint": "spoof"}));
+    let e = at(None, Some(&spoof), Some(SubmittingMachine)).unwrap_err();
+    assert!(e.starts_with("r1: ") && e.contains("cannot read the host") && e.contains("percent-encoded"), "{e}");
 
     // Fixed: a provider host and a managed model, from the snapshot.
     let claude = [snap("flint", HardwareFrom::Provider, Some(Unknown))];
@@ -1011,6 +1021,7 @@ fn hardware_precedence_is_registry_then_flag_then_snapshot() {
     assert_eq!(at(Some(&claude), None, Some(Unknown)).unwrap().hardware, Unknown, "a flag that agrees is fine");
     let e = at(Some(&claude), None, Some(SubmittingMachine)).unwrap_err();
     assert!(e.contains("Anthropic API") && e.contains("--hardware submitting-machine"), "{e}");
+    assert!(e.contains("in another without it"), "names the two-submit way through: {e}");
     let managed = [snap("flint", HardwareFrom::Managed, Some(SubmittingMachine))];
     assert!(at(Some(&managed), None, None).unwrap().lmstudio);
     assert!(at(Some(&managed), None, Some(Unknown)).unwrap_err().contains("LM Studio"));
@@ -1138,8 +1149,28 @@ fn a_run_on_an_endpoint_submits_where_it_was_served_and_never_its_host() {
     assert_eq!(built.bundle["formatVersion"], 5, "all on the submitting machine: no hardware key, the old format");
     assert!(built.bundle["runs"][0]["stack"].get("hardware").is_none());
 
-    let e = b.gather(&b.machine(None), &[haiku], &Stated { engine: Some("rec".into()), ..Default::default() }).unwrap_err().to_string();
+    let e = b.gather(&b.machine(None), std::slice::from_ref(&haiku), &Stated { engine: Some("rec".into()), ..Default::default() }).unwrap_err().to_string();
     assert!(e.contains("Anthropic API") && e.contains("--engine"), "{e}");
+    // (#3399 review) --engine-backend is refused the same way, never dropped.
+    let backend = Stated { engine_backend: Some("metal".into()), ..Default::default() };
+    let e = b.gather(&b.machine(None), &[haiku], &backend).unwrap_err().to_string();
+    assert!(e.contains("Anthropic API") && e.contains("--engine-backend"), "{e}");
+
+    // (#3399 review) Non-vacuous: a run recorded before the snapshot reads its
+    // endpoint from the registry, whose URL holds the provider's host and a
+    // credential; neither reaches the bundle.
+    let mut by_url = b.machine(None);
+    by_url.registry = serde_json::from_value(json!({"profiles": {"p": {"models": [{"id": "claude-haiku-4-5", "endpoint": "claude"}]}},
+        "endpoints": {"claude": {"url": "https://tok@api.anthropic.com/v1"}}})).ok();
+    if let Some(r) = by_url.registry.as_mut() {
+        r.materialize_endpoints();
+    }
+    let old_haiku = b.run("old-haiku", "claude-haiku-4-5", json!({}));
+    let (built, _) = b.gather(&by_url, &[old_haiku], &Stated::default()).unwrap();
+    let stack = &built.bundle["runs"][0]["stack"];
+    assert_eq!((stack["hardware"].as_str(), stack["engine"].as_str()), (Some("unknown"), Some("Anthropic API")));
+    let text = serde_json::to_string_pretty(&built.bundle).unwrap();
+    assert!(!text.contains("anthropic.com") && !text.contains("tok@") && !text.contains("\"claude\""), "{text}");
 }
 
 /// (#3397) Format 7's three stack keys ride on EVERY run, the submitting
@@ -1176,6 +1207,11 @@ fn every_run_of_a_format_7_carries_all_three_keys_and_the_site_holds_them() {
     assert!(r.iter().any(|e| e.starts_with("runs[0].stack.effort: longer than 20")), "{r:?}");
     let r = refused(&|v| v["runs"][0]["stack"]["servedModel"] = json!("two  spaces"));
     assert!(r.iter().any(|e| e.starts_with("runs[0].stack.servedModel")), "{r:?}");
+    // (#3399 review) The site's `noLinks`, on every stack string darkmux mirrors.
+    for (k, v) in [("servedModel", "qwen3-30b@q4_k_m.gguf"), ("model", "www.example-model"), ("engine", "org@model.ai")] {
+        let r = refused(&|b| b["runs"][0]["stack"][k] = json!(v));
+        assert!(r.iter().any(|e| e.starts_with(&format!("runs[0].stack.{k}: looks like a link"))), "{k}: {r:?}");
+    }
     let r = refused(&|v| {
         v["formatVersion"] = json!(6);
         for run in v["runs"].as_array_mut().unwrap() {
@@ -1198,6 +1234,11 @@ fn a_served_model_or_effort_the_site_refuses_is_null_with_the_reason() {
     assert_eq!(stack_string("servedModel", Some("/Users/kain/model".into()), 200, &mut why), None);
     assert_eq!(stack_string("servedModel", None, 200, &mut why), None);
     assert_eq!(why.len(), 3, "{why:?}");
+    // (#3399 review) The site's `noLinks`: an email-shaped or `www.` name is refused there, so null here.
+    for link in ["qwen3-30b@q4_k_m.gguf", "org@model.ai", "www.example-model", "WWW.example"] {
+        assert_eq!(stack_string("servedModel", Some(link.into()), 200, &mut why), None, "{link}");
+    }
+    assert_eq!(stack_string("servedModel", Some("qwen3@4bit".into()), 200, &mut why).as_deref(), Some("qwen3@4bit"), "no domain after the @");
     assert!(why[0].starts_with("effort is not in the form the site takes"), "{why:?}");
 }
 
@@ -1206,8 +1247,8 @@ fn a_served_model_or_effort_the_site_refuses_is_null_with_the_reason() {
 #[test]
 fn a_provider_run_sends_its_served_model_and_effort_beside_a_local_run() {
     let b = bench();
-    let haiku = b.run("haiku", "claude-haiku-4-5", json!({"served_model": "claude-haiku-4-5-20251001", "model_hardware": [
-        {"model": "claude-haiku-4-5", "from": "provider", "hardware": "unknown", "provider": "Anthropic API", "effort": "high"}]}));
+    let haiku = b.run("haiku", "claude-haiku-4-5", json!({"served_model": "claude-haiku-4-5-20251001", "effort": "high", "model_hardware": [
+        {"model": "claude-haiku-4-5", "from": "provider", "hardware": "unknown", "provider": "Anthropic API"}]}));
     let local = b.run("local", "darkmux:m1", json!({"served_model": "darkmux:m1"}));
     let (built, _) = b.gather(&b.machine(Some(b.provenance())), &[haiku, local], &Stated::default()).unwrap();
     assert_eq!(built.bundle["formatVersion"], 7);

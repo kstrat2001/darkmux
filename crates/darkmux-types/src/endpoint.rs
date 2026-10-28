@@ -175,6 +175,11 @@ pub enum HardwareBasis {
     Undeclared,
     /// An endpoint darkmux cannot use as written (`kind()` refuses it).
     Unusable,
+    /// (#3399 review) An unmanaged endpoint whose host darkmux cannot read
+    /// unambiguously ([`readable_host`]): a client may reach a provider there
+    /// that darkmux would not see, so it fixes no answer, the declaration is
+    /// never taken, and every dispatching preflight refuses the endpoint.
+    UnreadableHost,
 }
 
 impl HardwareBasis {
@@ -184,7 +189,7 @@ impl HardwareBasis {
             HardwareBasis::Managed => Some(Hardware::SubmittingMachine),
             HardwareBasis::Provider(_) => Some(Hardware::Unknown),
             HardwareBasis::Declared(h) => Some(h),
-            HardwareBasis::Undeclared | HardwareBasis::Unusable => None,
+            HardwareBasis::Undeclared | HardwareBasis::Unusable | HardwareBasis::UnreadableHost => None,
         }
     }
 }
@@ -760,7 +765,22 @@ impl ModelEndpoint {
     /// port, a trailing dot); `None` for an unlisted host or a managed
     /// endpoint.
     pub fn provider(&self) -> Option<&'static crate::provider::Provider> {
-        self.host().and_then(|h| crate::provider::provider_of_host(&h))
+        match self.kind() {
+            Ok(EndpointKind::Unmanaged) => self.url.as_deref().and_then(|u| readable_host(u).ok()),
+            _ => None,
+        }
+        .and_then(|h| crate::provider::provider_of_host(&h))
+    }
+
+    /// (#3399 review) Why darkmux cannot read this unmanaged endpoint's host
+    /// unambiguously ([`readable_host`]); `None` when it can, and for a
+    /// managed or unusable endpoint. Every dispatching preflight refuses an
+    /// endpoint with one (`config_enum::invalid_endpoint_hosts`).
+    pub fn host_problem(&self) -> Option<String> {
+        match self.kind() {
+            Ok(EndpointKind::Unmanaged) => readable_host(self.url.as_deref().unwrap_or_default()).err(),
+            _ => None,
+        }
     }
 
     /// (#3397) How darkmux knows which machine serves this endpoint.
@@ -768,6 +788,7 @@ impl ModelEndpoint {
         match self.kind() {
             Err(_) => HardwareBasis::Unusable,
             Ok(EndpointKind::Managed(_)) => HardwareBasis::Managed,
+            Ok(EndpointKind::Unmanaged) if self.host_problem().is_some() => HardwareBasis::UnreadableHost,
             Ok(EndpointKind::Unmanaged) => match (self.provider(), &self.hardware) {
                 (Some(p), _) => HardwareBasis::Provider(p),
                 (None, Some(Lenient::Known(h))) => HardwareBasis::Declared(*h),
@@ -888,19 +909,29 @@ impl ModelEndpoint {
     /// own: a managed endpoint is always the submitting machine, and a host
     /// the provider registry lists is always `unknown`.
     fn hardware_applies(&self) -> Result<(), String> {
-        if self.hardware.is_none() {
-            return Ok(());
-        }
-        match self.hardware_basis() {
-            HardwareBasis::Managed => Err("`hardware` is for an endpoint darkmux only sends requests to: a managed \
+        self.misplaced_hardware().map_or(Ok(()), Err)
+    }
+
+    /// (#3397) Why this endpoint's `hardware` is not the operator's to set,
+    /// when it is not: a managed endpoint is always the submitting machine,
+    /// and a host the provider registry lists is always `unknown`. Every
+    /// dispatching preflight refuses it (`config_enum::misplaced_endpoint_hardware`).
+    pub fn misplaced_hardware(&self) -> Option<String> {
+        self.hardware.as_ref()?;
+        self.hardware_misplaced_on(self.hardware_basis())
+    }
+
+    fn hardware_misplaced_on(&self, basis: HardwareBasis) -> Option<String> {
+        match basis {
+            HardwareBasis::Managed => Some("`hardware` is for an endpoint darkmux only sends requests to: a managed \
                  endpoint is always the submitting machine. Remove it"
                 .to_string()),
-            HardwareBasis::Provider(p) => Err(format!(
+            HardwareBasis::Provider(p) => Some(format!(
                 "`hardware` is not yours to set on {}'s host: darkmux's provider registry lists it, so its \
                  hardware is always `unknown`. Remove it",
                 p.name
             )),
-            _ => Ok(()),
+            _ => None,
         }
     }
 
@@ -959,6 +990,46 @@ pub fn url_host(url: &str) -> Option<String> {
     let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
     let hostport = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
     is_hostport(hostport).then(|| hostport.to_string())
+}
+
+/// (#3399 review) IDNA's full stops, which a WHATWG URL parser (the one
+/// behind `ureq` and Node's `URL`) maps to `.`.
+const IDN_FULL_STOPS: [char; 3] = ['\u{3002}', '\u{FF0E}', '\u{FF61}'];
+
+/// (#3399 review) The host (and port) of an unmanaged endpoint's `url` as
+/// every client would read it, or why darkmux cannot read it unambiguously.
+/// Two spellings are normalized the way a WHATWG parser does: IDNA's full
+/// stops become `.`, and an empty port (`host:`) is the scheme's default.
+/// Anything a client might read differently from darkmux fails closed
+/// (#3079, the same rule as [`url_names_this_machine`]): a backslash (WHATWG
+/// reads it as `/`, curl does not), whitespace or a control character, a
+/// percent-encoded host, any other non-ASCII host, or an authority that is
+/// not a host and an optional numeric port. Userinfo is dropped and never
+/// named in the reason.
+pub fn readable_host(url: &str) -> Result<String, String> {
+    if let Some(c) = url.chars().find(|c| *c == '\\' || c.is_whitespace() || c.is_control()) {
+        let what = if c == '\\' { "a backslash".to_string() } else { format!("the character U+{:04X}", c as u32) };
+        return Err(format!("its URL has {what} in it, which clients read differently"));
+    }
+    let Some((_, rest)) = url.split_once("://") else {
+        return Err("its URL has no `scheme://`".to_string());
+    };
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    let hostport: String = authority.rsplit_once('@').map_or(authority, |(_, h)| h).chars()
+        .map(|c| if IDN_FULL_STOPS.contains(&c) { '.' } else { c })
+        .collect();
+    if hostport.contains('%') {
+        return Err("its host is percent-encoded, which clients decode differently".to_string());
+    }
+    if let Some(c) = hostport.chars().find(|c| !c.is_ascii()) {
+        return Err(format!("its host has the non-ASCII character U+{:04X}, which an IDN-aware client reads differently", c as u32));
+    }
+    let hostport = hostport.strip_suffix(':').unwrap_or(hostport.as_str());
+    if is_hostport(hostport) {
+        Ok(hostport.to_string())
+    } else {
+        Err(format!("its host `{hostport}` is not a host name or address with an optional numeric port"))
+    }
 }
 
 /// Whether `host` (no port; an IPv6 literal in brackets) names this machine:
@@ -1794,5 +1865,58 @@ mod tests {
         let listed = ep(r#"{"url":"https://api.openai.com/v1","hardware":"submitting-machine"}"#).validate().unwrap_err();
         assert!(listed.contains("OpenAI API") && listed.contains("unknown"), "{listed}");
         assert_eq!(ep(r#"{"url":"http://studio.local:8080/v1","hardware":"unknown"}"#).validate(), Ok(()));
+    }
+
+    /// (#3399 review) False NEGATIVES: a provider's host spelled the way a
+    /// WHATWG parser (`ureq`, Node's `URL`) or curl still reaches it is never
+    /// taken as `submitting-machine`. An empty port and IDNA's full stops are
+    /// read as the provider, so the registry's answer and its dialect hold;
+    /// a spelling darkmux cannot read unambiguously fixes no answer at all
+    /// and names why, without echoing the URL's credentials.
+    #[test]
+    fn a_provider_host_however_a_client_spells_it_is_never_the_submitting_machine() {
+        let ep = |url: &str| -> ModelEndpoint {
+            serde_json::from_value(serde_json::json!({"url": url, "hardware": "submitting-machine"})).unwrap()
+        };
+        for (url, provider) in [
+            ("https://api.anthropic.com:/v1", "Anthropic API"),
+            ("https://u:p@api.anthropic.com:/v1", "Anthropic API"),
+            ("https://api\u{3002}anthropic\u{3002}com/v1", "Anthropic API"),
+            ("https://api\u{FF0E}openai\u{FF61}com/v1", "OpenAI API"),
+            ("https://api.openai.com:/v1", "OpenAI API"),
+        ] {
+            let e = ep(url);
+            assert!(matches!(e.hardware_basis(), HardwareBasis::Provider(p) if p.name == provider), "{url}: {:?}", e.hardware_basis());
+            assert_eq!(e.host_problem(), None, "{url}");
+        }
+        assert_eq!(ep("https://api.anthropic.com:/v1").resolved_dialect().unwrap(), Dialect::Messages, "and its caching");
+        for url in [
+            "https://api%2eanthropic.com/v1",
+            "https://api.anthropic.com\\v1",
+            "https://api.anth\tropic.com/v1",
+            "https://api.anthropic.com /v1",
+            "https://api.anthr\u{00F6}pic.com/v1",
+            "https://tok@api.anthropic.com:x/v1",
+        ] {
+            let e = ep(url);
+            assert_eq!(e.hardware_basis(), HardwareBasis::UnreadableHost, "{url}");
+            assert_eq!(e.hardware_basis().hardware(), None, "{url}: never the declared submitting-machine");
+            let why = e.host_problem().unwrap_or_else(|| panic!("{url}: a reason"));
+            assert!(!why.contains("tok"), "{url}: the reason never names credentials: {why}");
+        }
+        // Each reason names what darkmux could not read.
+        for (url, says) in [
+            ("https://api.anthropic.com\\v1", "backslash"),
+            ("https://api.anth\tropic.com/v1", "U+0009"),
+            ("https://api.anthropic.com/v1 x", "U+0020"),
+            ("https://api%2eanthropic.com/v1", "percent-encoded"),
+            ("https://api.anthr\u{00F6}pic.com/v1", "U+00F6"),
+        ] {
+            let why = readable_host(url).unwrap_err();
+            assert!(why.contains(says), "{url}: {why}");
+        }
+        assert_eq!(readable_host("https://tok@[::1]:/v1").as_deref(), Ok("[::1]"));
+        assert_eq!(readable_host("http://studio.local:8080/v1").as_deref(), Ok("studio.local:8080"));
+        assert_eq!(ModelEndpoint::managed_lmstudio().host_problem(), None);
     }
 }

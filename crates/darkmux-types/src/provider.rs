@@ -16,7 +16,11 @@
 //! A host is matched label by label, case-insensitively, with any port and
 //! one trailing dot dropped. `*` in a pattern stands for exactly one DNS
 //! label, so `*.openai.azure.com` takes `myres.openai.azure.com` and never
-//! `evil-openai.azure.com.attacker.net` or `a.b.openai.azure.com`.
+//! `evil-openai.azure.com.attacker.net` or `a.b.openai.azure.com`; `*-x` is
+//! one label ending in `-x` with something before it (`us-central1-aiplatform`).
+//! The host is first read the way every client would
+//! ([`crate::endpoint::readable_host`]): one darkmux cannot read
+//! unambiguously is never matched, and preflight refuses its endpoint.
 
 use crate::endpoint::Dialect;
 
@@ -37,14 +41,29 @@ pub struct Provider {
 pub static PROVIDERS: &[Provider] = &[
     Provider { name: "Anthropic API", hosts: &["api.anthropic.com"], default_dialect: Some(Dialect::Messages) },
     Provider { name: "OpenAI API", hosts: &["api.openai.com"], default_dialect: None },
-    Provider { name: "Azure OpenAI", hosts: &["*.openai.azure.com"], default_dialect: None },
+    Provider {
+        name: "Azure OpenAI",
+        hosts: &["*.openai.azure.com", "*.cognitiveservices.azure.com"],
+        default_dialect: None,
+    },
+    Provider { name: "Azure AI Foundry", hosts: &["*.services.ai.azure.com"], default_dialect: None },
     Provider { name: "Google Gemini API", hosts: &["generativelanguage.googleapis.com"], default_dialect: None },
     Provider {
+        name: "Google Vertex AI",
+        hosts: &["aiplatform.googleapis.com", "*-aiplatform.googleapis.com"],
+        default_dialect: None,
+    },
+    Provider {
         name: "Amazon Bedrock",
-        hosts: &["bedrock-runtime.*.amazonaws.com", "bedrock-runtime-fips.*.amazonaws.com"],
+        hosts: &[
+            "bedrock-runtime.*.amazonaws.com",
+            "bedrock-runtime-fips.*.amazonaws.com",
+            "bedrock-runtime.*.amazonaws.com.cn",
+        ],
         default_dialect: None,
     },
     Provider { name: "OpenRouter", hosts: &["openrouter.ai"], default_dialect: None },
+    Provider { name: "xAI API", hosts: &["api.x.ai"], default_dialect: None },
 ];
 
 /// The provider whose API is at `hostport` (an authority without userinfo,
@@ -58,13 +77,16 @@ pub fn provider_of_host(hostport: &str) -> Option<&'static Provider> {
 
 /// `host` (lowercase, no port, no trailing dot) against one pattern, label
 /// by label. A wildcard label is one non-empty run of letters, digits and
-/// hyphens: never a dot, so it never spans two labels.
+/// hyphens: never a dot, so it never spans two labels. `*-x` is such a run
+/// followed by `-x`.
 fn host_matches(pattern: &str, host: &str) -> bool {
     let (want, got): (Vec<&str>, Vec<&str>) = (pattern.split('.').collect(), host.split('.').collect());
+    let label_chars = |l: &str| !l.is_empty() && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
     want.len() == got.len()
-        && want.iter().zip(&got).all(|(w, g)| match *w {
-            "*" => !g.is_empty() && g.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'),
-            label => label == *g,
+        && want.iter().zip(&got).all(|(w, g)| match w.strip_prefix('*') {
+            Some("") => label_chars(g),
+            Some(tail) => g.strip_suffix(tail).is_some_and(label_chars),
+            None => w == g,
         })
 }
 
@@ -93,6 +115,12 @@ mod tests {
             ("bedrock-runtime.us-east-1.amazonaws.com", "Amazon Bedrock"),
             ("bedrock-runtime-fips.us-gov-west-1.amazonaws.com", "Amazon Bedrock"),
             ("openrouter.ai", "OpenRouter"),
+            ("my-res.cognitiveservices.azure.com", "Azure OpenAI"),
+            ("my-res.services.ai.azure.com", "Azure AI Foundry"),
+            ("aiplatform.googleapis.com", "Google Vertex AI"),
+            ("us-central1-aiplatform.googleapis.com", "Google Vertex AI"),
+            ("bedrock-runtime.cn-north-1.amazonaws.com.cn", "Amazon Bedrock"),
+            ("api.x.ai", "xAI API"),
         ] {
             assert_eq!(name(host), Some(want), "{host}");
         }
@@ -119,6 +147,15 @@ mod tests {
             "openrouter.ai.attacker.net",
             "api.openrouter.ai",
             "api.anthropic.com..",
+            "x.ai",
+            "api.x.ai.evil.net",
+            "-aiplatform.googleapis.com",
+            "aiplatform.googleapis.com.evil.net",
+            "us.central1-aiplatform.googleapis.com",
+            "evilaiplatform.googleapis.com",
+            "a.b.cognitiveservices.azure.com",
+            "services.ai.azure.com",
+            "bedrock-runtime.cn-north-1.amazonaws.com.cn.evil.net",
             "localhost:1234",
             "192.168.1.20:8080",
             "[::1]:8080",

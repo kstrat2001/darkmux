@@ -66,35 +66,54 @@ darkmux release.
   memory as if that Mac had run the model. darkmux now has one built-in
   provider registry, in code with no config override: Anthropic
   (`api.anthropic.com`), OpenAI (`api.openai.com`), Azure OpenAI
-  (`*.openai.azure.com`), the Gemini API
-  (`generativelanguage.googleapis.com`), Amazon Bedrock
-  (`bedrock-runtime.<region>.amazonaws.com`) and OpenRouter (`openrouter.ai`).
-  It replaces the Anthropic-only host check, so the Messages dialect (#3173)
-  and served-on read the same table. A run on a listed host has hardware
-  `unknown`, and its `engine` is the provider's name (`Anthropic API`). Every
-  other `url` endpoint declares `"hardware": "submitting-machine"` or
-  `"unknown"` in `profiles.json` (schema 2.2). An unknown value is refused
-  by every dispatch, mission launch and lab run, and so is an unknown key.
-  `darkmux doctor` lists each endpoint's hardware and warns on one that
-  declares none. A lab run records each model's hardware when it starts
+  (`*.openai.azure.com`, `*.cognitiveservices.azure.com`), Azure AI Foundry
+  (`*.services.ai.azure.com`), the Gemini API
+  (`generativelanguage.googleapis.com`), Google Vertex AI
+  (`aiplatform.googleapis.com`, `<region>-aiplatform.googleapis.com`), Amazon
+  Bedrock (`bedrock-runtime.<region>.amazonaws.com`, its `-fips` form, and
+  `bedrock-runtime.<region>.amazonaws.com.cn`), OpenRouter (`openrouter.ai`)
+  and xAI (`api.x.ai`). It replaces the Anthropic-only host check, so the
+  Messages dialect (#3173) and the hardware question read the same table. A
+  run on a listed host has hardware `unknown`, and its `engine` is the
+  provider's name (`Anthropic API`). Every other `url` endpoint declares
+  `"hardware": "submitting-machine"` or `"unknown"` in `profiles.json`
+  (schema 2.2). An unknown value, an unknown key, and `hardware` on a managed
+  endpoint or a listed host are refused by every dispatch, mission launch and
+  lab run, and `darkmux doctor` fails them; doctor lists each endpoint's
+  hardware and warns on one that declares none. **An unmanaged endpoint whose
+  host darkmux cannot read unambiguously is now refused the same way** (a
+  percent-encoded host, a backslash, whitespace, a non-ASCII host
+  character): a client could reach a provider there that darkmux would not
+  see. An empty port and IDNA's full stops are read as a WHATWG parser reads
+  them, so `https://api.anthropic.com:/v1` is Anthropic's host, Messages
+  dialect included. A lab run records each model's hardware when it starts
   (run manifest 1.3), so a later edit never rewrites it. A managed (LM
   Studio) model is always the submitting machine.
   `lab submit --hardware submitting-machine|unknown` supplies the value for a
-  run recorded before this, or corrects a wrong one. It cannot override an
-  LM Studio model or a listed host. Submit refuses an endpoint run with no
-  value to go on, naming what to set. On macOS, a claim the run's own GPU
-  reading disagrees with (idle on the submitting machine, or busy while
-  served elsewhere) gets a note, never a refusal. **The bundle is format 7
-  only when a run's hardware is unknown.** Every run of it then carries
-  `stack.hardware`, `stack.servedModel` (the model the endpoint's replies
-  said answered, so an alias resolves to the exact version; null when they
-  named none, or more than one) and `stack.effort` (the `reasoning_effort`
-  the endpoint was sent, or null). It needs a site that reads format 7
-  (darklyenergized#379); a site that reads up to 6 refuses it by its version.
-  A run records its served model when it ends, and `dispatch --json` on a
-  hosted endpoint now carries `metrics.reported_model`. A bundle whose runs were all served on
-  the submitting machine is unchanged, byte for byte. The URL and host are
-  never sent, and the submitting machine's fields still are.
+  run recorded before this (**such a run on an unlisted endpoint now needs
+  it**), or corrects a wrong one. It cannot override an LM Studio model or a
+  listed host, never turns a run recorded `unknown` into the submitting
+  machine's, and applies to every run of one submit. Submit refuses an
+  endpoint run with no value to go on, naming what to set. On macOS, a claim
+  the run's own GPU reading disagrees with (idle on the submitting machine,
+  or busy while served elsewhere) gets a note, never a refusal; the reading
+  is the whole machine's, so overlapping hosted and local runs can trip it.
+  **The bundle is format 7 only when a run's hardware is unknown.** Every
+  run of it then carries `stack.hardware`, `stack.servedModel` (the model
+  the endpoint's replies said answered, so an alias resolves to the exact
+  version; null when they named none, or more than one) and `stack.effort`
+  (the `reasoning_effort` the dispatch actually sent, byte for byte; null
+  when it sent none, which is every dispatch to a role with tools, since the
+  container's runtime never sends one). It needs a site that reads format 7
+  (darklyenergized#379); a site that reads up to 6 refuses it for its
+  version and its new keys. A bundle whose runs were all served on the
+  submitting machine is unchanged, byte for byte. A served model or effort
+  the site would refuse (including one shaped like a link or an email
+  address) is sent as null, with the reason. The URL and host are never
+  sent, and the submitting machine's fields still are. A run records its
+  served model and effort when it ends, and `dispatch --json` on a hosted
+  endpoint now carries `metrics.reported_model` and
+  `metrics.reasoning_effort`.
 
 ## [5.8.0] - 2026-10-27
 

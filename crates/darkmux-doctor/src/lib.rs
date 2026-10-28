@@ -4007,7 +4007,10 @@ fn keychain_item_present(name: &str) -> bool {
 /// reader the gate uses). An unregistered budget `policy` or `hardware` is
 /// Fail: every dispatch, mission launch and lab run refuses it at preflight.
 /// An unmanaged endpoint on a host the provider registry does not list that
-/// declares no `hardware` warns (#3397): `lab submit` refuses its runs.
+/// declares no `hardware` warns (#3397): `lab submit` refuses its runs unless
+/// `--hardware` names the machine. `hardware` on a managed endpoint or a
+/// listed host, and an unmanaged endpoint whose host darkmux cannot read
+/// unambiguously, are Fail: every dispatching preflight refuses them.
 fn check_endpoints() -> Check {
     match profiles::load_registry(None) {
         Ok(l) => {
@@ -4170,14 +4173,19 @@ fn endpoints_status(
     let name = "endpoints".to_string();
     let mut bad = darkmux_types::config_enum::bad_endpoint_budget_policies(registry);
     bad.extend(darkmux_types::config_enum::bad_endpoint_hardware(registry));
-    let invalid = darkmux_types::config_enum::invalid_endpoint_limits(registry);
+    let limits = darkmux_types::config_enum::invalid_endpoint_limits(registry);
+    let mut invalid = limits.clone();
+    invalid.extend(darkmux_types::config_enum::invalid_endpoint_hosts(registry));
+    invalid.extend(darkmux_types::config_enum::misplaced_endpoint_hardware(registry));
     if !bad.is_empty() || !invalid.is_empty() {
         let mut problems: Vec<String> = bad.iter().map(|b| format!("{}; {}", b.summary(), b.valid_line())).collect();
         problems.extend(invalid.iter().map(|v| format!("{}: {}", v.set_in, v.problem)));
         let mut fixes: Vec<String> = bad.iter().map(|b| b.fix()).collect();
-        if let Some(v) = invalid.first() {
+        if let Some(v) = limits.first() {
             fixes.push(format!("write `limits` in the valid shape, {}", v.valid));
         }
+        // (#3397, #3399 review) A host darkmux cannot read, or `hardware` it already knows.
+        fixes.extend(invalid[limits.len()..].iter().map(|v| format!("{}: valid {}", v.set_in, v.valid)));
         return Check {
             name,
             status: Status::Fail,
@@ -4228,6 +4236,7 @@ fn hardware_note(ep: &darkmux_types::ModelEndpoint) -> String {
         darkmux_types::HardwareBasis::Provider(p) => format!(" ({}, hardware unknown)", p.name),
         darkmux_types::HardwareBasis::Declared(h) => format!(", hardware {}", h.as_str()),
         darkmux_types::HardwareBasis::Undeclared => ", hardware undeclared".to_string(),
+        darkmux_types::HardwareBasis::UnreadableHost => ", host unreadable".to_string(),
         darkmux_types::HardwareBasis::Managed | darkmux_types::HardwareBasis::Unusable => String::new(),
     }
 }
@@ -11892,6 +11901,27 @@ mod tests {
         assert!(c.message.contains("`another-machine`") && c.message.contains("endpoints.studio.hardware"), "{}", c.message);
     }
 
+    /// (#3397, #3399 review) `hardware` where darkmux already knows the
+    /// answer, and an endpoint whose host it cannot read unambiguously, are
+    /// Fail: every dispatching preflight refuses them. The URL (it may carry
+    /// a credential) is never echoed.
+    #[test]
+    fn misplaced_hardware_and_an_unreadable_host_fail() {
+        let r = materialized(
+            r#"{"profiles":{"p":{"models":[{"id":"g","endpoint":"oa"}]}},
+                "endpoints":{"oa":{"url":"https://api.openai.com/v1","hardware":"submitting-machine"},
+                             "lms":{"managed":"lmstudio","hardware":"unknown"},
+                             "spoof":{"url":"https://tok@api%2eanthropic.com/v1"}}}"#,
+        );
+        let c = endpoints_status(&r, &mut no_spend, REGISTRY);
+        assert_eq!(c.status, Status::Fail, "{}", c.message);
+        for needle in ["endpoints.oa.hardware", "endpoints.lms.hardware", "endpoints.spoof.url", "percent-encoded"] {
+            assert!(c.message.contains(needle), "{needle}: {}", c.message);
+        }
+        assert!(!c.message.contains("tok@") && !c.hint.clone().unwrap_or_default().contains("tok@"), "{}", c.message);
+        assert!(c.hint.unwrap_or_default().contains("`endpoints.spoof.url`: valid"), "the fix names the key");
+    }
+
     /// (#3173) A Claude endpoint declared onto the OpenAI-compatible layer
     /// pays full input price for the whole conversation every turn: that
     /// layer neither caches nor reports caching. Doctor warns and gives the
@@ -11905,7 +11935,7 @@ mod tests {
                 "endpoints":{"claude":{"url":"https://api.anthropic.com/v1","auth":{"type":"bearer","keychain":"k"}},
                              "haiku":{"url":"https://api.anthropic.com/v1/","dialect":"chat-completions"},
                              "opus":{"url":"https://api.anthropic.com/v1","dialect":"chat-completions-max-tokens"},
-                             "grok":{"url":"https://api.x.ai/v1","hardware":"unknown"}}}"#,
+                             "grok":{"url":"https://api.x.ai/v1"}}}"#,
         );
         let c = endpoints_status(&uncached, &mut no_spend, REGISTRY);
         assert_eq!(c.status, Status::Warn, "{}", c.message);
@@ -11918,7 +11948,7 @@ mod tests {
         let cached = materialized(
             r#"{"profiles":{"p":{"models":[{"id":"claude-sonnet-5-5","endpoint":"claude"}]}},
                 "endpoints":{"claude":{"url":"https://api.anthropic.com/v1","dialect":"messages"},
-                             "grok":{"url":"https://api.x.ai/v1","hardware":"unknown"}}}"#,
+                             "grok":{"url":"https://api.x.ai/v1"}}}"#,
         );
         let c = endpoints_status(&cached, &mut no_spend, REGISTRY);
         assert_eq!((c.status, c.hint), (Status::Pass, None), "{}", c.message);

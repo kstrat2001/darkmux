@@ -278,6 +278,10 @@ pub struct DirectMetrics {
     /// named none. Never copied from the request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reported_model: Option<String>,
+    /// (#3397) The `reasoning_effort` this call's request carried, byte for
+    /// byte ([`effort_sent_in`]); absent when it sent none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     #[serde(flatten)]
     pub tokens: DirectTokens,
 }
@@ -293,6 +297,14 @@ pub struct DirectTokens {
     pub total_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
     pub cached_tokens: Option<u64>,
+}
+
+/// (#3397) The `reasoning_effort` a request body carries, exactly as sent
+/// (never trimmed: the sender does not trim it); `None` when it carries none.
+/// Read from the body that went on the wire, so a dialect or path that drops
+/// the endpoint's declared effort never reports one.
+pub fn effort_sent_in(request_body: &serde_json::Value) -> Option<String> {
+    request_body.get("reasoning_effort").and_then(serde_json::Value::as_str).map(str::to_string)
 }
 
 impl DirectTokens {
@@ -313,5 +325,19 @@ impl DirectTokens {
             reasoning_tokens: counts.reasoning,
             cached_tokens: counts.cached,
         }
+    }
+}
+
+#[cfg(test)]
+mod effort_tests {
+    /// (#3397) The effort a call reports is the one its request body carried,
+    /// byte for byte, and none when the body carried none.
+    #[test]
+    fn the_effort_sent_is_read_from_the_request_body_as_sent() {
+        let body = crate::single_shot::hosted_chat_body("m", "s", "u", 16, Some(" high "));
+        assert_eq!(super::effort_sent_in(&body).as_deref(), Some(" high "), "never trimmed");
+        let none = crate::single_shot::hosted_chat_body("m", "s", "u", 16, None);
+        assert_eq!(super::effort_sent_in(&none), None);
+        assert_eq!(super::effort_sent_in(&serde_json::json!({"model": "m", "max_tokens": 1})), None);
     }
 }

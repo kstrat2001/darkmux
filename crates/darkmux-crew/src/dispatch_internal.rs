@@ -4667,6 +4667,7 @@ fn dispatch_unmanaged(
                 first_token_ms: evidence.first_token_ms(),
                 output_chunks: evidence.output_events(),
                 reported_model: reply.model.clone(),
+                reasoning_effort: crate::dispatch_envelope::effort_sent_in(&req_body),
                 tokens: crate::dispatch_envelope::DirectTokens::of(&counts),
             },
         })

@@ -36,8 +36,9 @@ pub const BUNDLE_FORMAT: &str = "darkmux-evals-bundle";
 /// effort it was sent (`stack.effort`), every run of a 7 carrying all three;
 /// written only when a run's hardware is `unknown`: a bundle whose runs were all
 /// served on the submitting machine stays 6 or older, byte for byte, so a
-/// site that reads only up to 6 keeps taking it, and one it cannot read is
-/// refused there by its version, never by a key it does not know.
+/// site that reads only up to 6 keeps taking it. A site that reads only up
+/// to 6 refuses a 7 for its version, and also names each of its keys it does
+/// not know (`stack.hardware`, `stack.servedModel`, `stack.effort`).
 pub const BUNDLE_FORMAT_VERSION: u64 = 7;
 /// The version a bundle with criteria, every run served on the submitting machine, is written as.
 const BUNDLE_FORMAT_VERSION_CRITERIA: u64 = 6;
@@ -747,6 +748,9 @@ struct Forms {
     /// The site's `STACK_TEXT`, its no-double-space lookahead written as a
     /// space that must be followed by one of the allowed characters.
     stack_text: regex::Regex,
+    /// The site's `LINK` (its stack strings' `noLinks`): a scheme, a `www.`,
+    /// or anything shaped like an email address.
+    link: regex::Regex,
 }
 
 impl Forms {
@@ -763,6 +767,7 @@ impl Forms {
             model_id: re(r"^[A-Za-z]{1,20}\d{1,3},\d{1,3}$"),
             cluster: re(r"^[A-Z][A-Za-z]{0,19}$"),
             stack_text: re(r"^[A-Za-z0-9](?:[A-Za-z0-9._:/@()+,-]| [A-Za-z0-9._:/@()+,-])*$"),
+            link: re(r"(?i)://|(?-u:\b)www\.|[^\s@]+@[^\s@]+\.[A-Za-z]{2,}"),
         }
     }
 }
@@ -799,8 +804,19 @@ impl Refusals {
         for (k, max) in [("servedModel", 200), ("effort", MAX_EFFORT)] {
             match stack.get(k) {
                 None => self.errs.push(format!("{}: missing (use null when not reported)", st(k))),
-                Some(v) => self.text(v, &st(k), max, Some(&forms.stack_text), true),
+                Some(v) => self.stack_text(v, &st(k), max, Some(&forms.stack_text), forms),
             }
+        }
+    }
+
+    /// (#3399 review) A stack string as the site holds it (`stackText`): a
+    /// string or null, within `max`, its own characters (where darkmux
+    /// mirrors that form) and never a link or an email address (`noLinks`).
+    fn stack_text(&mut self, v: &Value, at: &str, max: usize, form: Option<&regex::Regex>, forms: &Forms) {
+        let before = self.errs.len();
+        self.text(v, at, max, form, true);
+        if self.errs.len() == before && v.as_str().is_some_and(|s| forms.link.is_match(s)) {
+            self.errs.push(format!("{at}: looks like a link or an email address; leave them out"));
         }
     }
 
@@ -826,14 +842,15 @@ impl Refusals {
         let s = &r["stack"];
         let st = |k: &str| format!("runs[{i}].stack.{k}");
         self.text(&s["chip"], &st("chip"), 200, Some(&forms.apple), false);
-        self.text(&s["accelerator"], &st("accelerator"), 32, None, true);
+        self.stack_text(&s["accelerator"], &st("accelerator"), 32, None, forms);
         self.text(&s["os"], &st("os"), 80, Some(&forms.os), true);
-        for k in ["engine", "engineBackend", "engineVersion"] {
-            self.text(&s[k], &st(k), 80, None, true);
+        for k in ["engine", "engineBackend"] {
+            self.stack_text(&s[k], &st(k), 80, None, forms);
         }
-        self.text(&s["model"], &st("model"), 200, None, true);
+        self.text(&s["engineVersion"], &st("engineVersion"), 80, None, true);
+        self.stack_text(&s["model"], &st("model"), 200, None, forms);
         self.text(&s["weightsHash"], &st("weightsHash"), 200, Some(&forms.hex64), true);
-        self.text(&s["quant"], &st("quant"), 40, None, true);
+        self.stack_text(&s["quant"], &st("quant"), 40, None, forms);
         self.text(&s["modelId"], &st("modelId"), 40, Some(&forms.model_id), true);
         if let Some(clusters) = s["cpuCores"].as_array() {
             if !(1..=4).contains(&clusters.len()) {
@@ -970,23 +987,23 @@ pub struct ServedBy {
     pub lmstudio: bool,
     /// The snapshot's value, when `--hardware` corrected a different one.
     pub corrected: Option<darkmux_types::Hardware>,
-    /// The reasoning effort the run's snapshot says its endpoint was sent;
-    /// `None` for a run recorded before the snapshot.
-    pub effort: Option<String>,
 }
 
 impl ServedBy {
     fn fixed(hardware: darkmux_types::Hardware, provider: Option<String>, lmstudio: bool) -> Self {
-        ServedBy { hardware, provider, lmstudio, corrected: None, effort: None }
+        ServedBy { hardware, provider, lmstudio, corrected: None }
     }
 }
 
 /// (#3397) THE precedence for one run's hardware. What darkmux knows on its
 /// own is fixed: a managed model is the submitting machine, a host on the
 /// provider registry is `unknown`, and a `--hardware` that contradicts
-/// either is refused. For any other endpoint the flag wins over the run's
-/// snapshot (it corrects a wrong one), the snapshot stands in for no flag,
-/// and with neither the run is refused, naming what to set. A run recorded
+/// either is refused. For any other endpoint the flag corrects the run's
+/// snapshot in one direction only: `unknown` may correct a recorded
+/// `submitting-machine`, but `submitting-machine` never downgrades a recorded
+/// `unknown` (that is refused, naming the run). The snapshot stands in for no
+/// flag, and with neither the run is refused, naming what to set. An
+/// endpoint whose host darkmux cannot read unambiguously is refused outright. A run recorded
 /// before the snapshot (run manifest 1.3) reads the registry as it is now for
 /// a managed model or a listed host only: an endpoint's declaration today is
 /// not the run's. A model the registry does not list reads as LM Studio's,
@@ -1000,8 +1017,7 @@ pub fn served_by(
 ) -> std::result::Result<ServedBy, String> {
     let entry = snapshot
         .and_then(|s| s.iter().find(|e| e.model == model_id || e.identifier.as_deref() == Some(model_id)));
-    let effort = entry.and_then(|e| e.effort.clone());
-    served_by_entry(run_id, model_id, entry, current, flag).map(|by| ServedBy { effort, ..by })
+    served_by_entry(run_id, model_id, entry, current, flag)
 }
 
 /// [`served_by`] for the run's own snapshot entry, when it has one.
@@ -1019,6 +1035,10 @@ fn served_by_entry(
     match known {
         Known::Fixed(fixed) => fixed_against_flag(run_id, model_id, fixed, flag),
         Known::Endpoint { recorded, endpoint } => endpoint_hardware(run_id, model_id, recorded, endpoint, flag),
+        Known::Unreadable(why) => Err(format!(
+            "{run_id}: darkmux cannot read the host of the endpoint that served {model_id} unambiguously ({why}), so \
+             it cannot say which machine served it; fix the endpoint's `url` in profiles.json"
+        )),
     }
 }
 
@@ -1028,6 +1048,9 @@ enum Known {
     Fixed(ServedBy),
     /// Any other endpoint: what the run recorded, and the endpoint's id.
     Endpoint { recorded: Option<darkmux_types::Hardware>, endpoint: Option<String> },
+    /// (#3399 review) An endpoint whose host darkmux cannot read
+    /// unambiguously, and why: no answer is taken for it, not even a flag.
+    Unreadable(String),
 }
 
 /// From the run's own snapshot entry.
@@ -1050,7 +1073,10 @@ fn known_from_registry(current: Option<&darkmux_types::ProfileModel>) -> Known {
     match ep.map_or(HardwareBasis::Managed, |e| e.hardware_basis()) {
         HardwareBasis::Managed => Known::Fixed(ServedBy::fixed(Hardware::SubmittingMachine, None, true)),
         HardwareBasis::Provider(p) => Known::Fixed(ServedBy::fixed(Hardware::Unknown, Some(p.name.to_string()), false)),
-        _ => Known::Endpoint { recorded: None, endpoint: ep.and_then(|e| e.named_id()).map(str::to_string) },
+        HardwareBasis::UnreadableHost => Known::Unreadable(ep.and_then(|e| e.host_problem()).unwrap_or_default()),
+        HardwareBasis::Declared(_) | HardwareBasis::Undeclared | HardwareBasis::Unusable => {
+            Known::Endpoint { recorded: None, endpoint: ep.and_then(|e| e.named_id()).map(str::to_string) }
+        }
     }
 }
 
@@ -1063,7 +1089,9 @@ fn fixed_against_flag(
 ) -> std::result::Result<ServedBy, String> {
     match flag {
         Some(f) if f != fixed.hardware => Err(format!(
-            "{run_id}: --hardware {} contradicts what darkmux knows: {} served {model_id}, so its hardware is {}; drop --hardware, or submit this run on its own",
+            "{run_id}: --hardware {} contradicts what darkmux knows: {} served {model_id}, so its hardware is {}. \
+             --hardware applies to every run of a submit: submit the runs that need it in one `lab submit`, and \
+             this run in another without it",
             f.as_str(),
             fixed.provider.as_deref().unwrap_or("LM Studio on the submitting machine"),
             fixed.hardware.as_str()
@@ -1072,8 +1100,10 @@ fn fixed_against_flag(
     }
 }
 
-/// Any other endpoint: the flag wins over what the run recorded, which
-/// stands in for no flag; with neither, the refusal names what to set.
+/// Any other endpoint: the flag corrects what the run recorded, except that
+/// it never downgrades a recorded `unknown` to `submitting-machine`; what the
+/// run recorded stands in for no flag; with neither, the refusal names what
+/// to set.
 fn endpoint_hardware(
     run_id: &str,
     model_id: &str,
@@ -1081,11 +1111,17 @@ fn endpoint_hardware(
     endpoint: Option<String>,
     flag: Option<darkmux_types::Hardware>,
 ) -> std::result::Result<ServedBy, String> {
+    use darkmux_types::Hardware::{SubmittingMachine, Unknown};
+    let id = endpoint.unwrap_or_else(|| "<id>".to_string());
     match (flag, recorded) {
+        (Some(SubmittingMachine), Some(Unknown)) => Err(format!(
+            "{run_id}: --hardware submitting-machine contradicts the run's own record: endpoint `{id}` said another \
+             machine served {model_id} (`unknown`) when the run started. The flag may mark a run as served elsewhere, \
+             never the reverse; submit this run in another `lab submit` without --hardware"
+        )),
         (Some(f), r) => Ok(ServedBy { corrected: r.filter(|r| *r != f), ..ServedBy::fixed(f, None, false) }),
         (None, Some(r)) => Ok(ServedBy::fixed(r, None, false)),
         (None, None) => {
-            let id = endpoint.unwrap_or_else(|| "<id>".to_string());
             Err(format!(
                 "{run_id}: {model_id} was served by endpoint `{id}`, and the run did not record which machine served it \
                  (it ran before darkmux recorded that, or the endpoint declared none). Pass --hardware submitting-machine \
@@ -1101,7 +1137,10 @@ fn endpoint_hardware(
 /// or above the busy line, `stats::BUSY_GPU_PCT`) while stated as served on
 /// the submitting machine, or busy while stated as served elsewhere. `None`
 /// when they agree, and when the run has no GPU reading (Omarchy, or no
-/// telemetry): a note, never a refusal.
+/// telemetry): a note, never a refusal. The reading is the whole machine's,
+/// so a hosted run that overlapped a local one (on this machine, in another
+/// process) can read busy, and the note then misfires; it asks a person to
+/// look, nothing more.
 pub fn hardware_check(hardware: darkmux_types::Hardware, stats: &Value) -> Option<String> {
     let duty = stats.get("gpu_duty_pct").and_then(Value::as_f64)?;
     let busy = stats.get("samples_busy").and_then(Value::as_u64)?;
@@ -1231,7 +1270,7 @@ fn one_fixture(inputs: &[Input], stated: &Stated) -> Result<PathBuf> {
     let models: BTreeSet<Option<String>> = inputs.iter().map(Input::model_id).collect();
     if stated.describes_a_model() && models.len() > 1 {
         bail!(
-            "--engine, --quant and --weights-dir describe one model; these runs used {}",
+            "--engine, --engine-backend, --engine-version, --quant and --weights-dir describe one model; these runs used {}",
             models.iter().flatten().cloned().collect::<Vec<_>>().join(", ")
         );
     }
@@ -1241,7 +1280,14 @@ fn one_fixture(inputs: &[Input], stated: &Stated) -> Result<PathBuf> {
 impl Stated {
     /// Whether it states anything that holds for one model only.
     fn describes_a_model(&self) -> bool {
-        [self.engine.is_some(), self.quant.is_some(), self.weights_dir.is_some(), self.engine_version.is_some()].contains(&true)
+        [
+            self.engine.is_some(),
+            self.engine_backend.is_some(),
+            self.engine_version.is_some(),
+            self.quant.is_some(),
+            self.weights_dir.is_some(),
+        ]
+        .contains(&true)
     }
 }
 
@@ -1370,7 +1416,7 @@ impl Machine {
             let current = self.profile_model(&input.manifest, &model_id);
             match served_by(&input.run_id, &model_id, snapshot.as_deref(), current.as_ref(), stated.hardware) {
                 Ok(ServedBy { provider: Some(p), .. }) if stated.describes_a_model() => refused.push(format!(
-                    "{}: {p} served {model_id}, and darkmux names it itself: --engine, --quant and --weights-dir describe a model this machine served; drop them",
+                    "{}: {p} served {model_id}, and darkmux names it itself: --engine, --engine-backend, --engine-version, --quant and --weights-dir describe a model this machine served; drop them",
                     input.run_id
                 )),
                 Ok(by) => served.push(by),
@@ -1436,7 +1482,13 @@ impl Machine {
                 200,
                 &mut why,
             ),
-            effort: stack_string("effort", served.effort.clone(), MAX_EFFORT, &mut why),
+            // What the run's dispatch sent, byte for byte (run manifest 1.3).
+            effort: stack_string(
+                "effort",
+                input.manifest.get("effort").and_then(Value::as_str).map(str::to_string),
+                MAX_EFFORT,
+                &mut why,
+            ),
         };
         let run = bundle_run(&input.run_id, &input.manifest, &input.stats, &ran_by, &stack, &self.identifying);
         Ok((run, note_for(input, &model_id, &stack, &why)))
@@ -1515,7 +1567,8 @@ impl Machine {
 /// a value it refuses would fail the whole bundle, and null is allowed.
 fn stack_string(key: &str, value: Option<String>, max: usize, why: &mut Vec<String>) -> Option<String> {
     let v = value?;
-    let ok = v.encode_utf16().count() <= max && Forms::new().stack_text.is_match(&v) && !v.contains("://") && !looks_like_path(&v);
+    let forms = Forms::new();
+    let ok = v.encode_utf16().count() <= max && forms.stack_text.is_match(&v) && !forms.link.is_match(&v) && !looks_like_path(&v);
     if !ok {
         why.push(format!("{key} is not in the form the site takes ({v})"));
     }

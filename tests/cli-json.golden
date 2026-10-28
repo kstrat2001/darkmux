@@ -255,6 +255,7 @@ DirectMetrics
   first_token_ms?: uint64 | null
   output_chunks?: uint64 | null
   reported_model?: string | null
+  reasoning_effort?: string | null
   prompt_tokens: uint64 | null
   completion_tokens: uint64 | null
   total_tokens: uint64 | null
