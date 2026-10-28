@@ -353,6 +353,9 @@ gh release create vNEW --title "darkmux NEW" --notes-file <(...)   # notes disti
 SHA=$(curl -sL "https://github.com/kstrat2001/darkmux/archive/refs/tags/vNEW.tar.gz" | shasum -a 256 | cut -d' ' -f1)
 git checkout -b formula-$NEW
 # in packaging/homebrew/darkmux.rb: url → .../tags/vNEW.tar.gz ; sha256 → $SHA ; comment vLAST → vNEW
+# AND ENV["DARKMUX_COMMIT"] → $(git rev-parse vNEW^{commit}) — the tarball has no .git, so this line
+# is the commit every brew build stamps; left stale, the evals site refuses its runs (5.9.0, 2026-10-28).
+# Step 6's verify-tap-pin.py now fails on a stale DARKMUX_COMMIT.
 git commit -am "feat(homebrew): pin formula to stable vNEW (url + sha256)"
 git push -u origin formula-$NEW
 gh pr create --title "feat(homebrew): pin formula to stable vNEW" --body "Stable-pin for vNEW. sha256 from the live tarball. Merge triggers the tap-sync workflow."

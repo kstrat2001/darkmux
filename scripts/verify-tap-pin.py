@@ -20,9 +20,10 @@ import sys
 
 URL_RE = re.compile(r'url\s+"([^"]+)"')
 SHA_RE = re.compile(r'sha256\s+"([0-9a-f]{64})"')
+COMMIT_RE = re.compile(r'ENV\["DARKMUX_COMMIT"\]\s*=\s*"([0-9a-f]{40})"')
 
 
-def tap_pin_problems(formula_text: str, expected_tag: str, tarball_sha256: str) -> list:
+def tap_pin_problems(formula_text: str, expected_tag: str, tarball_sha256: str, tag_commit: str) -> list:
     """Return a list of problems with the tap's pin. Empty list means correct.
 
     Absence is a PROBLEM, never a pass: a formula with no `url` or no `sha256`
@@ -50,16 +51,33 @@ def tap_pin_problems(formula_text: str, expected_tag: str, tarball_sha256: str) 
             f"the {expected_tag} tarball is {tarball_sha256[:12]}..."
         )
 
+    # The tarball has no `.git`, so a brew build's `darkmuxCommit` comes from
+    # DARKMUX_COMMIT. Bumping url and sha256 but not this line (2026-10-28,
+    # v5.9.0) built a binary that stamped the previous release's commit, and
+    # the evals site refuses runs whose commit is not the tag's.
+    commits = COMMIT_RE.findall(formula_text)
+    if not commits:
+        problems.append("formula has no DARKMUX_COMMIT line")
+    elif commits[0] != tag_commit:
+        problems.append(
+            f"DARKMUX_COMMIT mismatch: formula has {commits[0][:12]}..., "
+            f"{expected_tag} is commit {tag_commit[:12]}..."
+        )
+
     return problems
 
 
+COMMIT_C = '    ENV["DARKMUX_COMMIT"] = "' + "c" * 40 + '" unless build.head?\n'
+
 SELF_TEST_CASES = [
-    # (formula_text, expected_tag, tarball_sha, should_flag, why)
+    # (formula_text, expected_tag, tarball_sha, tag_commit, should_flag, why)
     (
         'url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v3.8.0.tar.gz"\n'
-        '  sha256 "' + "a" * 64 + '"\n',
+        '  sha256 "' + "a" * 64 + '"\n'
+        + COMMIT_C,
         "v3.8.0",
         "a" * 64,
+        "c" * 40,
         False,
         "url and sha both match the released tag",
     ),
@@ -69,6 +87,7 @@ SELF_TEST_CASES = [
         '  sha256 "' + "b" * 64 + '"\n',
         "v3.8.0",
         "a" * 64,
+        "c" * 40,
         True,
         "tap still serves the PREVIOUS tag after a failed sync",
     ),
@@ -77,6 +96,7 @@ SELF_TEST_CASES = [
         '  sha256 "' + "b" * 64 + '"\n',
         "v3.8.0",
         "a" * 64,
+        "c" * 40,
         True,
         "right tag, WRONG sha256 — a hand-edit or a stale pin",
     ),
@@ -84,6 +104,7 @@ SELF_TEST_CASES = [
         'url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v3.8.0.tar.gz"\n',
         "v3.8.0",
         "a" * 64,
+        "c" * 40,
         True,
         "no sha256 at all must FLAG, never pass silently",
     ),
@@ -91,6 +112,7 @@ SELF_TEST_CASES = [
         'sha256 "' + "a" * 64 + '"\n',
         "v3.8.0",
         "a" * 64,
+        "c" * 40,
         True,
         "no url at all must FLAG — a matching sha alone proves nothing",
     ),
@@ -102,28 +124,54 @@ SELF_TEST_CASES = [
         # flag it and the suite could not tell them apart. A trailing suffix
         # is what separates them: the tag appears in full, but not at the end.
         'url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v3.8.0.tar.gz.sig"\n'
-        '  sha256 "' + "a" * 64 + '"\n',
+        '  sha256 "' + "a" * 64 + '"\n'
+        + COMMIT_C,
         "v3.8.0",
         "a" * 64,
+        "c" * 40,
         True,
         "url must END at the tag tarball; a trailing suffix is a different artifact",
     ),
     (
         # A tag that is a PREFIX of another must not satisfy the check.
         'url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v3.8.01.tar.gz"\n'
+        '  sha256 "' + "a" * 64 + '"\n'
+        + COMMIT_C,
+        "v3.8.0",
+        "a" * 64,
+        "c" * 40,
+        True,
+        "v3.8.01 must not count as v3.8.0 — substring match would pass this",
+    ),
+    (
+        # THE case of 2026-10-28: url and sha256 bumped to the new tag, but
+        # DARKMUX_COMMIT left at the previous release's commit, so every brew
+        # build stamped the old commit and the evals site refused its runs.
+        'url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v3.8.0.tar.gz"\n'
+        '  sha256 "' + "a" * 64 + '"\n'
+        '    ENV["DARKMUX_COMMIT"] = "' + "d" * 40 + '" unless build.head?\n',
+        "v3.8.0",
+        "a" * 64,
+        "c" * 40,
+        True,
+        "DARKMUX_COMMIT still names the previous release's commit",
+    ),
+    (
+        'url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v3.8.0.tar.gz"\n'
         '  sha256 "' + "a" * 64 + '"\n',
         "v3.8.0",
         "a" * 64,
+        "c" * 40,
         True,
-        "v3.8.01 must not count as v3.8.0 — substring match would pass this",
+        "no DARKMUX_COMMIT at all must FLAG: the build would stamp no commit",
     ),
 ]
 
 
 def self_test() -> int:
     failures = []
-    for text, tag, sha, should_flag, why in SELF_TEST_CASES:
-        got = bool(tap_pin_problems(text, tag, sha))
+    for text, tag, sha, commit, should_flag, why in SELF_TEST_CASES:
+        got = bool(tap_pin_problems(text, tag, sha, commit))
         if got != should_flag:
             verb = "flagged" if got else "passed"
             want = "flag" if should_flag else "pass"
@@ -139,6 +187,7 @@ TAP_FORMULA_URL = (
     "https://raw.githubusercontent.com/kstrat2001/homebrew-tap/main/Formula/darkmux.rb"
 )
 TARBALL_URL = "https://github.com/kstrat2001/darkmux/archive/refs/tags/{tag}.tar.gz"
+COMMIT_URL = "https://api.github.com/repos/kstrat2001/darkmux/commits/{tag}"
 
 
 def _fetch(url: str) -> bytes:
@@ -167,7 +216,16 @@ def live_check(tag: str) -> int:
         print(f"could not read the {tag} tarball: {e}")
         return 2
 
-    problems = tap_pin_problems(formula, tag, tarball_sha)
+    try:
+        import json
+
+        # The commits endpoint resolves a tag (lightweight or annotated) to its commit.
+        tag_commit = json.loads(_fetch(COMMIT_URL.format(tag=tag)))["sha"]
+    except Exception as e:
+        print(f"could not read the commit of {tag}: {e}")
+        return 2
+
+    problems = tap_pin_problems(formula, tag, tarball_sha, tag_commit)
     if problems:
         print(f"TAP IS NOT SERVING {tag}:")
         for p in problems:
@@ -178,7 +236,7 @@ def live_check(tag: str) -> int:
             "users the previous version. See #2825."
         )
         return 1
-    print(f"tap serves {tag}, sha256 matches the live tarball")
+    print(f"tap serves {tag}, sha256 matches the live tarball, DARKMUX_COMMIT is the tag's commit")
     return 0
 
 

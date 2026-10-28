@@ -53,7 +53,7 @@ class Darkmux < Formula
     # the run's `darkmuxCommit` carries the commit the lab actually ran against
     # instead of being empty (the tarball has no `.git` for build.rs to read).
     ENV["DARKMUX_RELEASE"] = "1" unless build.head?
-    ENV["DARKMUX_COMMIT"] = "18e7f34ed32f948078e90a6b12bd2a41bb75ca0a" unless build.head?
+    ENV["DARKMUX_COMMIT"] = "85528155f17e09e7fbbdb3e781abff43000268ea" unless build.head?
 
     # Workspace-aware install. The root [[bin]] target in Cargo.toml is the
     # only thing that needs to land in bin/. The std_cargo_args helper sets
