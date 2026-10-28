@@ -32,7 +32,7 @@
   <div class="wrap">
     <div class="label">12 <span class="dot">·</span> contribute</div>
     <h1>Run an eval and share it</h1>
-    <p class="lede"><a href="https://evals.darkmux.com">darkmux evals</a> collects lab runs of public evals on Apple Silicon, so you can see what a model does on a given Mac before you download it. This page takes you from a fresh machine to a shared run: set up, run one approved eval, and send the result. Or hand the whole job to an AI agent with the <a href="#agent">prompt at the end</a>.</p>
+    <p class="lede"><a href="https://evals.darkmux.com">darkmux evals</a> collects lab runs of public evals on Apple Silicon, so you can see how a model did on a Mac like yours before you download it. This page takes you from a fresh machine to a shared run: set up, run one approved eval, and send the result. Or hand the whole job to an AI agent with the <a href="#agent">prompt at the end</a>.</p>
   </div>
 </header>
 
@@ -40,11 +40,11 @@
   <div class="wrap">
     <h2>What counts</h2>
     <ul>
-      <li><strong>An Apple Silicon Mac</strong>, on macOS or on <a href="omarchy.html">Omarchy</a> (Asahi Linux). Nothing else is taken.</li>
+      <li><strong>An Apple Silicon Mac</strong>, on macOS or on <a href="omarchy.html">Omarchy</a> (Asahi Linux). The site accepts runs from no other hardware.</li>
       <li><strong>A tagged darkmux release.</strong> On macOS that is the Homebrew formula; on Omarchy, the release build from the tag. A development build is refused when you share.</li>
       <li><strong>An approved eval, at its approved commit.</strong> Each eval on the site names its GitHub repository and the exact commit that is approved. A run from any other commit, or from a checkout with changes in it, is refused.</li>
-      <li><strong>One model at a time.</strong> The run measures the model, so nothing else should be using the GPU or the memory while it goes.</li>
-      <li><strong>No caps below what the eval asks.</strong> Don't shorten the context length or the reply length to make a model fit: each run records both.</li>
+      <li><strong>One model at a time.</strong> Anything else on the GPU or in memory during the run ends up in its numbers, so leave the Mac to it.</li>
+      <li><strong>The eval's limits, not lower ones.</strong> Don't shorten the context length or the reply length to make a model fit. Each run records both, so a shortened run shows as one, and it no longer measures the eval as written.</li>
     </ul>
     <p>A failed run is a result too. Share it as it is; don't re-run to get a pass.</p>
   </div>
@@ -65,7 +65,13 @@ darkmux doctor</code></pre>
 <section>
   <div class="wrap">
     <h2>Set up on Omarchy</h2>
-    <p>Omarchy has no Homebrew and no LM Studio, so the setup is longer. Follow the <a href="omarchy.html">Omarchy page</a> for three things: the release build from the tag (its Build and install section, so the build counts as a release), a local model server on the Apple GPU, and Docker Engine with the model server on the Docker bridge, so the run's container can reach it. Pick a model that fits your RAM with room to spare. <code>darkmux doctor</code> warns on its macOS-only checks there; that is expected.</p>
+    <p>On Omarchy, darkmux uses neither Homebrew nor LM Studio, so the setup is longer. The <a href="omarchy.html">Omarchy page</a> covers three things:</p>
+    <ul>
+      <li>darkmux built from the release tag, by its Build and install section, so the build counts as a release;</li>
+      <li>a local model server on the Apple GPU;</li>
+      <li>Docker Engine, with the model server listening on the Docker bridge so the run's container can reach it.</li>
+    </ul>
+    <p>Pick a model that fits your RAM with room to spare. <code>darkmux doctor</code> warns on its macOS-only checks there; that is expected.</p>
   </div>
 </section>
 
@@ -77,14 +83,14 @@ darkmux doctor</code></pre>
 cd &lt;repo&gt;
 git checkout &lt;approved commit&gt;
 darkmux lab fixture register .</code></pre>
-    <p>Leave the checkout unchanged. The eval's workloads are the files in its <code>eval/workloads/</code> folder; the workload name is the file name without <code>.json</code>.</p>
+    <p>Leave the checkout unchanged. The eval's workloads are the files in its <code>workloads/</code> folder, inside the eval folder its <code>.fixture.json</code> names (<code>eval/</code> in the evals listed so far); the workload name is the file name without <code>.json</code>.</p>
   </div>
 </section>
 
 <section>
   <div class="wrap">
     <h2>Run it</h2>
-    <p>Pick the profile that names your model (<code>darkmux profile list</code>; edit <code>~/.darkmux/profiles.json</code> to add one). On macOS, unload every model in LM Studio first: darkmux loads what the run needs itself. Then run it and leave the Mac to it:</p>
+    <p>Pick the profile that names your model (<code>darkmux profile list</code>; edit <code>~/.darkmux/profiles.json</code> to add one). On macOS, unload every model in LM Studio first, so the run has the memory and GPU to itself (darkmux loads its own copy under its own name). Then start it and leave the Mac to it:</p>
     <pre><code>darkmux lab run &lt;workload&gt; -p &lt;profile&gt;
 darkmux run inspect &lt;run id&gt;     <span class="comment"># the verdict, time and turns</span></code></pre>
     <p>A coding eval can take a long time on a small model. The run prints its id when it finishes. The <a href="lab.html">lab page</a> says what the run records and how it is graded.</p>
@@ -96,8 +102,8 @@ darkmux run inspect &lt;run id&gt;     <span class="comment"># the verdict, time
     <h2>Get upload access</h2>
     <ol>
       <li>Sign in on <a href="https://evals.darkmux.com">evals.darkmux.com</a> with a free darklyenergized.com account, and accept the current Terms and Privacy Policy.</li>
-      <li>On <a href="https://evals.darkmux.com/account?tab=token">Contribute</a>, ask for upload access. The maintainer grants it, and you get an email either way.</li>
-      <li>Once you have it, make an upload token on the same tab and store it in darkmux:</li>
+      <li>On the Tokens tab of <a href="https://evals.darkmux.com/account?tab=token">Contribute</a>, ask for upload access. The maintainer grants it, and you get an email either way.</li>
+      <li>Once you have it, make an upload token on that tab and store it in darkmux:</li>
     </ol>
     <pre><code>darkmux lab submit login     <span class="comment"># paste the token; darkmux checks it with the site</span></code></pre>
     <p>The token lives in the login keychain on macOS and in a file only you can read on Omarchy. Treat it like a password. <code>darkmux lab submit logout</code> forgets it.</p>
@@ -109,9 +115,9 @@ darkmux run inspect &lt;run id&gt;     <span class="comment"># the verdict, time
     <h2>Share it</h2>
     <pre><code>darkmux lab submit &lt;run id&gt; --dry-run    <span class="comment"># write the bundle, send nothing</span>
 darkmux lab submit &lt;run id&gt;</code></pre>
-    <p>Look at the dry run first: it is exactly what would be sent. If <code>submit</code> refuses a run, it says why; don't work around it.</p>
+    <p>Look at the dry run first: it writes <code>darkmux-evals-&lt;run id&gt;.json</code> in the current folder, exactly what would be sent. If <code>submit</code> refuses a run, it says why; don't work around it.</p>
     <h3>What is sent, and what never is</h3>
-    <p>Your chip, RAM and OS, the engine, runtime and quantization, a hash of the model's weights, the darkmux build that ran it, the eval and its commit, the verdict, and the measurements. A fact that may have changed since the run is sent as "not reported". It never sends a file path, your machine's name, your prompts, or who you are, and the site never shows who shared a run.</p>
+    <p>Your chip, RAM and OS, the engine, runtime and quantization, a hash of the model's weights, the darkmux build that ran it, the eval and its commit, the verdict, and the measurements. A fact darkmux can't vouch for as of the run is sent as "not reported", and the command says why: re-download the model between the run and the upload, for example, and its quantization and weights hash go up as not reported. The bundle carries no file path, no machine or user name, and none of the conversation: <code>submit</code> refuses to build one that would. The site knows which account uploaded a run, because your token signs it, but it never shows who shared one.</p>
     <h3>After you share</h3>
     <p>A run waits for the maintainer's review before it is shown. Your runs are listed on <a href="https://evals.darkmux.com/account?tab=runs">Contribute › Runs</a>, where you can see their status and archive one.</p>
   </div>
@@ -120,7 +126,7 @@ darkmux lab submit &lt;run id&gt;</code></pre>
 <section id="agent">
   <div class="wrap">
     <h2>Hand it to an AI agent</h2>
-    <p>Each prompt below walks any AI agent through the whole job. With an agent that can run commands on your computer, it runs them one at a time and asks before it installs, downloads, changes your darkmux config or uploads anything. With one that can only chat, it gives you each command and waits for the output. Either way you choose the model, and you store the upload token yourself, so it never passes through the agent. The same prompts are on your <a href="https://evals.darkmux.com/account?tab=token">Contribute</a> page once you have upload access.</p>
+    <p>Each prompt below walks an AI agent through the whole job. It tells an agent that can run commands on your computer to run them one at a time and to ask before it installs, downloads, changes your darkmux config or uploads anything. An agent that can only chat is told to give you each command and wait for the output. Either way you choose the model, and you store the upload token yourself, so the agent never has to see it. If you don't have upload access yet, the prompt has you ask for it first, so it can come through while the run goes. The same prompts are on your <a href="https://evals.darkmux.com/account?tab=token">Contribute</a> page once you have upload access.</p>
     <h3>macOS</h3>
     <pre><code>You are helping me run a darkmux eval on this computer and share the result on
 darkmux evals (https://evals.darkmux.com). darkmux is a command-line tool for
@@ -142,9 +148,9 @@ Rules for a run that counts:
   development build.
 - I choose the model. If the one I pick looks too big for this Mac's memory,
   say so, but don't choose a different one for me.
-- One model at a time: before the run, unload every model in LM Studio (darkmux
-  loads what the run needs itself), and start no other model work on this
-  computer until the run finishes.
+- One model at a time: before the run, unload every model in LM Studio, so the
+  run has the memory and GPU to itself (darkmux loads its own copy), and start
+  no other model work on this computer until the run finishes.
 - Don't set the context length or the reply length lower than the eval asks for.
 - Never edit the eval's files or the run's sandbox, and don't run it again to
   get a pass. A failed run is a result, and it can be shared.
@@ -152,23 +158,27 @@ Rules for a run that counts:
 Steps:
 1. Check darkmux --version, that Docker is running, and that LM Studio is
    installed. Run darkmux init if darkmux has no config yet, then darkmux doctor.
-2. Show me the evals on https://evals.darkmux.com/evals (as data:
+2. If I don't have upload access on darkmux evals yet, ask me to request it now
+   on the Tokens tab of https://evals.darkmux.com/account. The maintainer grants
+   it, and I get an email either way. The run can go ahead while I wait.
+3. Show me the evals on https://evals.darkmux.com/evals (as data:
    https://evals.darkmux.com/api/v1/evals). Ask me which eval to run and with
    which model. Each eval names its GitHub repository and its approved commit.
-3. Clone that repository, check out that exact commit, and leave the checkout
+4. Clone that repository, check out that exact commit, and leave the checkout
    unchanged. Register it: darkmux lab fixture register &lt;checkout folder&gt;
-4. Find or make a darkmux profile for the model I chose (darkmux profile list).
-   The workload names are the files in the eval's eval/workloads folder. Run:
+5. Find or make a darkmux profile for the model I chose (darkmux profile list).
+   The workload names are the files in the workloads folder inside the eval's
+   folder (its .fixture.json names that folder, usually eval). Run:
    darkmux lab run &lt;workload&gt; -p &lt;profile&gt;
    It can take a long time. Wait for it to finish.
-5. Show me the result: darkmux run inspect &lt;run id&gt;
-6. Show me what would be sent: darkmux lab submit &lt;run id&gt; --dry-run
-7. Ask me to make an upload token on https://evals.darkmux.com/account (Tokens
-   tab) and to run darkmux lab submit login myself, so the token never passes
-   through you.
-8. When I say so, send it: darkmux lab submit &lt;run id&gt;
-9. Tell me the run waits for the maintainer's review before it is shown, and
-   that I can see it at https://evals.darkmux.com/account?tab=runs</code></pre>
+6. Show me the result: darkmux run inspect &lt;run id&gt;
+7. Show me what would be sent: darkmux lab submit &lt;run id&gt; --dry-run
+8. Ask me to make an upload token on https://evals.darkmux.com/account (Tokens
+   tab) and to run darkmux lab submit login myself, so you never need to
+   see the token.
+9. When I say so, send it: darkmux lab submit &lt;run id&gt;
+10. Tell me the run waits for the maintainer's review before it is shown, and
+    that I can see it at https://evals.darkmux.com/account?tab=runs</code></pre>
     <h3>Omarchy</h3>
     <pre><code>You are helping me run a darkmux eval on this computer and share the result on
 darkmux evals (https://evals.darkmux.com). darkmux is a command-line tool for
@@ -206,23 +216,27 @@ Steps:
    the Omarchy guide: the server must listen on the Docker bridge and the
    profile must point at it, so the run's container can reach it. Then run
    darkmux doctor. Warnings on checks that only apply to macOS are expected.
-2. Show me the evals on https://evals.darkmux.com/evals (as data:
+2. If I don't have upload access on darkmux evals yet, ask me to request it now
+   on the Tokens tab of https://evals.darkmux.com/account. The maintainer grants
+   it, and I get an email either way. The run can go ahead while I wait.
+3. Show me the evals on https://evals.darkmux.com/evals (as data:
    https://evals.darkmux.com/api/v1/evals). Ask me which eval to run and with
    which model. Each eval names its GitHub repository and its approved commit.
-3. Clone that repository, check out that exact commit, and leave the checkout
+4. Clone that repository, check out that exact commit, and leave the checkout
    unchanged. Register it: darkmux lab fixture register &lt;checkout folder&gt;
-4. Make sure a darkmux profile serves the model I chose (darkmux profile list).
-   The workload names are the files in the eval's eval/workloads folder. Run:
+5. Make sure a darkmux profile serves the model I chose (darkmux profile list).
+   The workload names are the files in the workloads folder inside the eval's
+   folder (its .fixture.json names that folder, usually eval). Run:
    darkmux lab run &lt;workload&gt; -p &lt;profile&gt;
    It can take a long time. Wait for it to finish.
-5. Show me the result: darkmux run inspect &lt;run id&gt;
-6. Show me what would be sent: darkmux lab submit &lt;run id&gt; --dry-run
-7. Ask me to make an upload token on https://evals.darkmux.com/account (Tokens
-   tab) and to run darkmux lab submit login myself, so the token never passes
-   through you.
-8. When I say so, send it: darkmux lab submit &lt;run id&gt;
-9. Tell me the run waits for the maintainer's review before it is shown, and
-   that I can see it at https://evals.darkmux.com/account?tab=runs</code></pre>
+6. Show me the result: darkmux run inspect &lt;run id&gt;
+7. Show me what would be sent: darkmux lab submit &lt;run id&gt; --dry-run
+8. Ask me to make an upload token on https://evals.darkmux.com/account (Tokens
+   tab) and to run darkmux lab submit login myself, so you never need to
+   see the token.
+9. When I say so, send it: darkmux lab submit &lt;run id&gt;
+10. Tell me the run waits for the maintainer's review before it is shown, and
+    that I can see it at https://evals.darkmux.com/account?tab=runs</code></pre>
   </div>
 </section>
 
