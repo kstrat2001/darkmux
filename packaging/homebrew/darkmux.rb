@@ -33,6 +33,7 @@ class Darkmux < Formula
   url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v5.9.0.tar.gz"
   sha256 "e9f24a5c9867b30dcb3b70980b482e3ec716f468458236854931d3b92b898076"
   license "MIT"
+  revision 1
   head "https://github.com/kstrat2001/darkmux.git", branch: "main"
 
   depends_on "rust" => :build
