@@ -33,6 +33,7 @@ class Darkmux < Formula
   url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v5.9.1.tar.gz"
   sha256 "06f47eca47c33855e3457ac17f9fb56a28a532c204914f2afe3ad0683b2fe437"
   license "MIT"
+  revision 1
   head "https://github.com/kstrat2001/darkmux.git", branch: "main"
 
   depends_on "rust" => :build
@@ -96,6 +97,10 @@ class Darkmux < Formula
   def caveats
     <<~EOS
       darkmux is installed but the `serve` daemon is NOT started by default.
+
+      Already running it as a brew service? Run `brew services restart darkmux`
+      once: the service now gets a PATH that finds `docker`, so dispatches it
+      runs (or accepts from a fleet peer) can start their runtime container.
 
       Scope: this formula ships the `darkmux` CLI + `serve` daemon + the
       keychain wrapper + bundled skills. The `darkmux-runtime` Docker image
