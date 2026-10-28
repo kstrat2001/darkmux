@@ -2704,11 +2704,16 @@ mod tests {
                              Transfer-Encoding: chunked\r\n\r\n{:x}\r\n{payload}\r\n0\r\n\r\n",
                             payload.len()
                         );
+                        // (#3405) Count the request BEFORE writing its
+                        // response: the client can only finish the stream
+                        // after reading these bytes, so the count is already
+                        // visible when the test reads it. Counting after the
+                        // write raced the client's assert.
+                        sv2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         if sock.write_all(resp.as_bytes()).is_err() {
                             return;
                         }
                         let _ = sock.flush();
-                        sv2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }
                 });
             }
