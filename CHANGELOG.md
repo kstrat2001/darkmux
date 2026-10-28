@@ -29,9 +29,10 @@ darkmux release.
   limits (253 characters, labels of 63), so a long `--site` can no longer split the keychain
   command, and a failed keychain store no longer repeats the keychain command's output, which
   could carry part of the token.
-- **`lab submit` never sends the upload token through a proxy.** An `http_proxy` setting used to
-  route a preview's (plain http) login and uploads through the proxy, Authorization header and
-  all. The token now always goes straight to its site.
+- **`lab submit` never sends a preview's upload token through a proxy.** An `http_proxy` setting
+  used to route a preview's (plain http) login and uploads through the proxy, Authorization header
+  and all. A plain-http preview now always goes straight to its site. https keeps your proxy
+  settings: the proxy sees only an encrypted connection, and some networks have no other way out.
 
 ## [5.9.0] - 2026-10-28
 

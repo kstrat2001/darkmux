@@ -281,7 +281,7 @@ impl TokenStore<'_> {
                 // own words can echo the token.
                 let _ = self.keychain.store(&origin.keychain_account(&self.user), token);
                 if self.read(origin).as_deref() != Some(token.as_str()) {
-                    bail!("the login keychain did not keep the token");
+                    bail!("the login keychain did not keep the token (is the login keychain unlocked?)");
                 }
                 Ok("the login keychain".to_string())
             }
@@ -370,8 +370,10 @@ pub fn call(site: &str, method: &str, path: &str, credential: &Credential, body_
 /// `site` reads as an origin and a path, is safe for a token
 /// ([`site_is_safe`]), and is the origin `credential` was stored for. The URL
 /// is rebuilt from what darkmux read, so curl dials the host the token
-/// belongs to, and never through a proxy (`noproxy`: an `http_proxy` would
-/// read a preview's token in clear, and any proxy is another host).
+/// belongs to. A plain-http preview never goes through a proxy (`noproxy`:
+/// an `http_proxy` would read its token in clear); https keeps the user's
+/// proxy settings, since a proxy sees only CONNECT and some networks have no
+/// other way out.
 fn request_config(site: &str, method: &str, path: &str, credential: &Credential, body_file: Option<&Path>) -> Result<String> {
     let (origin, base) = split_site(site)?;
     // Judged on the address as rebuilt, which is what curl is handed.
@@ -383,8 +385,13 @@ fn request_config(site: &str, method: &str, path: &str, credential: &Credential,
     }
     let url = format!("{origin}{base}{path}");
     let quote = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    // A plain-http preview (loopback or *.localhost) never goes through a
+    // proxy, which would read its token in clear. https keeps the user's proxy
+    // settings: the proxy sees only CONNECT, and some networks reach the
+    // internet only through one.
+    let noproxy = if !origin.https { "noproxy = \"*\"\n" } else { "" };
     let mut config = format!(
-        "url = \"{}\"\nnoproxy = \"*\"\nrequest = \"{method}\"\nheader = \"Authorization: Bearer {}\"\nheader = \"Accept: application/json\"\n",
+        "url = \"{}\"\n{noproxy}request = \"{method}\"\nheader = \"Authorization: Bearer {}\"\nheader = \"Accept: application/json\"\n",
         quote(&url),
         quote(&credential.token)
     );
@@ -678,18 +685,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = TokenStore { secret_store: SecretStore::Keychain, keychain: &Leaky, root: dir.path().to_path_buf(), user: "kain".into() };
         let err = store.store(&Credential::pasted(PREVIEW, &token()).unwrap()).unwrap_err().to_string();
-        assert_eq!(err, "the login keychain did not keep the token");
+        assert_eq!(err, "the login keychain did not keep the token (is the login keychain unlocked?)");
     }
 
     /// (#3400 review) The URL curl is handed is rebuilt from the origin that
-    /// was checked, never the address as typed; a token never goes through a
-    /// proxy (an `http_proxy` would see a preview's in clear).
+    /// was checked, never the address as typed; a plain-http preview's token
+    /// never goes through a proxy (an `http_proxy` would see it in clear).
     #[test]
     fn the_request_is_rebuilt_from_the_checked_origin_and_skips_proxies() {
         let production = Credential::pasted(super::super::DEFAULT_SITE, &token()).unwrap();
         let config = request_config("HTTPS://EVALS.DARKMUX.COM:00443/", "GET", "/api/v1/account", &production, None).unwrap();
         assert!(config.contains("url = \"https://evals.darkmux.com/api/v1/account\"\n"), "{config}");
-        assert!(config.contains("noproxy = \"*\"\n"), "{config}");
+        // https keeps the user's proxy settings: a proxy sees only CONNECT,
+        // the token travels inside TLS, and a proxy-only network needs it.
+        assert!(!config.contains("noproxy"), "{config}");
+        // A plain-http preview never goes through a proxy, which would see its token in clear.
         let preview = Credential::pasted(PREVIEW, &token()).unwrap();
         assert!(request_config(PREVIEW, "GET", "/api/v1/account", &preview, None).unwrap().contains("noproxy = \"*\"\n"));
     }
