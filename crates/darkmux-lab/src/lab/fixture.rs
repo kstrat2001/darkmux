@@ -128,6 +128,12 @@ impl FixtureManifest {
                 ));
             }
         }
+        self.validate_eval_dir()
+    }
+
+    /// `eval_dir`'s invariants: one plain folder name, bound by `satisfies`,
+    /// and declared by every fixture whose eval owns its roles (#3363).
+    fn validate_eval_dir(&self) -> Result<()> {
         if let Some(dir) = &self.eval_dir {
             if !is_plain_name(dir) {
                 return Err(anyhow!(
@@ -141,7 +147,23 @@ impl FixtureManifest {
                 ));
             }
         }
+        if self.owns_its_roles() && self.eval_dir.is_none() {
+            return Err(anyhow!(
+                "schema_version `{}` means the eval owns its roles, at `<eval_dir>/roles/<id>.json` and `.md`, \
+                 so it needs `eval_dir` (e.g. `\"eval_dir\": \"eval\"`)",
+                self.schema_version.as_deref().unwrap_or_default()
+            ));
+        }
         Ok(())
+    }
+
+    /// (#3363) Whether this eval owns its roles: its `schema_version` is
+    /// 1.2 or newer. Absent, older or unreadable is the legacy rule.
+    pub(crate) fn owns_its_roles(&self) -> bool {
+        use darkmux_types::data_version::{at_least, LAB_FIXTURE_EVAL_ROLES_SINCE};
+        self.schema_version
+            .as_ref()
+            .is_some_and(|v| at_least(&serde_json::Value::String(v.clone()), LAB_FIXTURE_EVAL_ROLES_SINCE))
     }
 
     /// Check whether on-disk fixture dir has all `required_files`
@@ -171,6 +193,24 @@ pub(crate) fn eval_dir_of(fixture_dir: &Path) -> Option<String> {
         return None;
     }
     FixtureManifest::load_from_dir(fixture_dir).ok()?.eval_dir
+}
+
+/// (#3363) Where a lab run of a workload bound to the fixture at
+/// `fixture_dir` takes its role, which the fixture's schema decides. A
+/// checkout with no `.fixture.json` is legacy; one whose manifest does not
+/// load is refused.
+pub(crate) fn role_layout_of(fixture_dir: &Path) -> Result<darkmux_crew::dispatch::RoleLayout> {
+    use darkmux_crew::dispatch::RoleLayout;
+    if !fixture_dir.join(".fixture.json").exists() {
+        return Ok(RoleLayout::Legacy { eval_dir: None });
+    }
+    let manifest = FixtureManifest::load_from_dir(fixture_dir)?;
+    let owns = manifest.owns_its_roles();
+    Ok(match manifest.eval_dir {
+        // `validate` refused a schema-1.2 manifest with no `eval_dir`.
+        Some(eval_dir) if owns => RoleLayout::Eval { eval_dir },
+        eval_dir => RoleLayout::Legacy { eval_dir },
+    })
 }
 
 #[cfg(test)]
@@ -236,6 +276,45 @@ mod tests {
         let plain: FixtureManifest =
             serde_json::from_value(serde_json::json!({"name": "pg", "satisfies": "pg@2.1", "eval_dir": "eval-v1.2"})).unwrap();
         plain.validate().unwrap();
+    }
+
+    /// (#3363) Fixture schema 1.2 means the eval owns its roles, at
+    /// `<eval_dir>/roles/`, so a 1.2 manifest must declare `eval_dir`.
+    #[test]
+    fn a_schema_1_2_fixture_must_declare_eval_dir() {
+        let m: FixtureManifest =
+            serde_json::from_value(serde_json::json!({"schema_version": "1.2", "name": "pg", "satisfies": "pg@2.1"})).unwrap();
+        let err = m.validate().unwrap_err().to_string();
+        assert!(err.contains("schema_version") && err.contains("eval_dir"), "{err}");
+        for legacy in [serde_json::json!("1.1"), serde_json::json!(null)] {
+            let m: FixtureManifest =
+                serde_json::from_value(serde_json::json!({"schema_version": legacy, "name": "pg", "satisfies": "pg@2.1"})).unwrap();
+            m.validate().unwrap();
+        }
+    }
+
+    /// (#3363) The role layout is keyed on the fixture's declared schema:
+    /// 1.2 or newer owns its roles in `eval_dir`; 1.1, none, or no manifest
+    /// at all is legacy.
+    #[test]
+    fn the_role_layout_follows_the_fixtures_schema() {
+        use darkmux_crew::dispatch::RoleLayout;
+        let layout = |manifest: Option<&str>| {
+            let tmp = TempDir::new().unwrap();
+            if let Some(json) = manifest {
+                write_manifest(tmp.path(), json);
+            }
+            role_layout_of(tmp.path()).unwrap()
+        };
+        let eval = || RoleLayout::Eval { eval_dir: "eval".into() };
+        let legacy = |dir: Option<&str>| RoleLayout::Legacy { eval_dir: dir.map(String::from) };
+        assert_eq!(layout(Some(r#"{"schema_version": "1.2", "name": "pg", "satisfies": "pg@2.1", "eval_dir": "eval"}"#)), eval());
+        assert_eq!(layout(Some(r#"{"schema_version": "1.10", "name": "pg", "satisfies": "pg@2.1", "eval_dir": "eval"}"#)), eval());
+        assert_eq!(layout(Some(r#"{"schema_version": "2", "name": "pg", "satisfies": "pg@2.1", "eval_dir": "eval"}"#)), eval());
+        assert_eq!(layout(Some(r#"{"schema_version": "1.1", "name": "pg", "satisfies": "pg@2.1", "eval_dir": "eval"}"#)), legacy(Some("eval")));
+        assert_eq!(layout(Some(r#"{"name": "pg", "satisfies": "pg@2.1", "eval_dir": "eval"}"#)), legacy(Some("eval")));
+        assert_eq!(layout(Some(r#"{"name": "pg"}"#)), legacy(None));
+        assert_eq!(layout(None), legacy(None));
     }
 
     #[test]

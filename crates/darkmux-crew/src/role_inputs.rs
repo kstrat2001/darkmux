@@ -8,14 +8,22 @@
 //! folder's override, and the additions apply as each path decides.
 //!
 //! A lab run is a measurement, so its prompt is built only from pinned
-//! inputs ([`crate::dispatch::LabInputs`]): an eval owns its roles, and a
-//! workload bound to a fixture takes `roles/<id>.json` and `roles/<id>.md`
-//! from the eval, read once before the run starts and carried as bytes
-//! (nothing reads them again), refusing when either is missing; a
-//! workload bound to none takes darkmux's compiled-in role. The preamble is
-//! always the compiled-in one, and no addition applies. On 2026-10-24 a
-//! stale `~/.darkmux/roles/web-probe.md` replaced an eval's pinned prompt for
-//! 19 runs; this module is why that cannot happen again.
+//! inputs ([`crate::dispatch::LabInputs`]), read once before the run starts
+//! and carried as bytes (nothing reads them again). An eval owns its roles,
+//! and the eval's fixture schema ([`RoleLayout`]) says where they live:
+//!
+//! - **schema 1.2 or newer**: `<eval_dir>/roles/<id>.json` and `.md`, and
+//!   nothing else. A missing file refuses the run; there is no fallback.
+//!   `eval_dir` never reaches the model's sandbox, so neither do they.
+//! - **schema 1.1 or none** (every eval published before 1.2): `roles/<id>.*`
+//!   at the fixture root when the eval carries them, else darkmux's
+//!   compiled-in role, else refused.
+//!
+//! A workload bound to no fixture takes darkmux's compiled-in role. The
+//! preamble is always the compiled-in one, no addition applies, and the
+//! home folder is never read, whatever the schema. On 2026-10-24 a stale
+//! `~/.darkmux/roles/web-probe.md` replaced an eval's pinned prompt for 19
+//! runs; this module is why that cannot happen again.
 //!
 //! [`PromptProvenance`] is what a dispatch used, stamped on `dispatch.start`
 //! by [`stamp_prompt_inputs`]: the assembled prompt's SHA-256 on every
@@ -46,13 +54,98 @@ pub struct EvalRole {
     role: Role,
     json: String,
     md: String,
+    source: RoleInputSource,
 }
 
 impl PartialEq for EvalRole {
-    /// The same bytes: the manifest is parsed from `json`.
+    /// The same bytes from the same place: the manifest is parsed from `json`.
     fn eq(&self, other: &Self) -> bool {
-        (&self.json, &self.md) == (&other.json, &other.md)
+        (&self.json, &self.md, self.source) == (&other.json, &other.md, other.source)
     }
+}
+
+impl EvalRole {
+    /// Where the role was read: the eval's `<eval_dir>/roles/`, or a legacy
+    /// eval's root `roles/`.
+    pub(crate) fn source(&self) -> RoleInputSource {
+        self.source
+    }
+}
+
+/// (#3363) Where a fixture-bound lab run's role lives. The eval's fixture
+/// schema (`.fixture.json`'s `schema_version`) decides it, not darkmux's
+/// version: an eval opts into the strict rule, and every eval published
+/// before it keeps running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoleLayout {
+    /// Fixture schema 1.2 or newer: the eval owns its roles, at
+    /// `<eval_dir>/roles/<id>.json` and `.md`. Nothing else is read: a
+    /// missing file refuses the run, whatever darkmux compiles in or the
+    /// fixture root holds.
+    Eval { eval_dir: String },
+    /// Fixture schema 1.1, or none declared: every eval published before
+    /// 1.2. `roles/<id>.json` and `.md` at the fixture root when the eval
+    /// carries them, else darkmux's compiled-in role, else refused.
+    /// `eval_dir` is the folder the fixture declares, if any.
+    Legacy { eval_dir: Option<String> },
+}
+
+/// THE role resolution of a fixture-bound lab run, read once from the
+/// fixture checkout before the run starts. See [`RoleLayout`]. Whatever the
+/// layout, the home folder's `roles/` is never read.
+pub(crate) fn read_fixture_role(fixture_dir: &Path, layout: &RoleLayout, role_id: &str) -> Result<LabInputs> {
+    let eval = |role| Ok(LabInputs::Eval(Box::new(role)));
+    match layout {
+        RoleLayout::Eval { eval_dir } => {
+            let dir = fixture_dir.join(eval_dir);
+            refuse_symlink(&dir, "folder")?;
+            eval(load_role_files(&dir, role_id, RoleInputSource::Eval)?)
+        }
+        RoleLayout::Legacy { eval_dir } => {
+            if let Some(dir) = eval_dir.as_deref().filter(|d| carries_role(&fixture_dir.join(d).join("roles"), role_id)) {
+                bail!(
+                    "{} carries {dir}/roles/{role_id}.json or .md, but its .fixture.json declares fixture schema 1.1 \
+                     or none, so a lab run would never read them. Declare `\"schema_version\": \"1.2\"`: the eval \
+                     then owns its roles in {dir}/roles/",
+                    fixture_dir.display()
+                );
+            }
+            let roles = fixture_dir.join("roles");
+            if is_symlink(&roles) || carries_role(&roles, role_id) {
+                return eval(load_role_files(fixture_dir, role_id, RoleInputSource::LegacyRoot)?);
+            }
+            builtin_role_text(role_id).map(|_| LabInputs::Builtin).ok_or_else(|| {
+                anyhow!(
+                    "role `{role_id}` is not in the eval (roles/{role_id}.json and roles/{role_id}.md at {}) and is \
+                     not one of darkmux's built-in roles. The eval declares fixture schema 1.1 or none, so a lab run takes \
+                     its role from the fixture root's roles/ when there, else from darkmux's compiled-in roles; never \
+                     from the home folder's roles/. To measure this role, add it to the eval: {}roles/{role_id}.json \
+                     and .md, with `\"schema_version\": \"1.2\"`.",
+                    fixture_dir.display(),
+                    eval_dir.as_deref().map(|d| format!("{d}/")).unwrap_or_else(|| "<eval_dir>/".into())
+                )
+            })
+        }
+    }
+}
+
+/// Whether `roles` holds either of `role_id`'s files (a link counts, and is
+/// then refused by the read).
+fn carries_role(roles: &Path, role_id: &str) -> bool {
+    ["json", "md"].iter().any(|ext| std::fs::symlink_metadata(roles.join(format!("{role_id}.{ext}"))).is_ok())
+}
+
+/// Refuse `path` when it is a symbolic link: the fixture checkout may hold
+/// links, and one could deliver a role from anywhere.
+fn refuse_symlink(path: &Path, what: &str) -> Result<()> {
+    if is_symlink(path) {
+        bail!(
+            "the eval's `{}` is a symlink; a lab run takes its role from the eval itself, and a link could \
+             deliver a role from anywhere. Make it a real {what}",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 /// A dispatch's role, resolved once. A lab role carries the bytes it was
@@ -105,7 +198,7 @@ fn load_lab_role(inputs: &LabInputs, role_id: &str) -> Result<(Role, LabRole)> {
                     eval.role.id
                 );
             }
-            let lab = LabRole { source: RoleInputSource::Eval, json: eval.json.clone(), md: eval.md.clone() };
+            let lab = LabRole { source: eval.source, json: eval.json.clone(), md: eval.md.clone() };
             Ok((eval.role.clone(), lab))
         }
         LabInputs::Builtin => load_builtin_role(role_id),
@@ -114,19 +207,15 @@ fn load_lab_role(inputs: &LabInputs, role_id: &str) -> Result<(Role, LabRole)> {
 
 /// `<dir>/roles/<role_id>.json` and `.md`, through the same unknown-key gate
 /// and family check every role manifest gets. Read once, before the run.
-pub(crate) fn load_eval_role(dir: &Path, role_id: &str) -> Result<EvalRole> {
+/// Missing, a symlink (as is `roles/` itself), past the size cap, an unknown
+/// key or another id refuses it.
+fn load_role_files(dir: &Path, role_id: &str, source: RoleInputSource) -> Result<EvalRole> {
     let roles_dir = dir.join("roles");
-    if is_symlink(&roles_dir) {
-        bail!(
-            "the eval's `{}` is a symlink; a lab run takes its role from the eval itself, and a link could \
-             deliver a role from anywhere. Make it a real folder",
-            roles_dir.display()
-        );
-    }
+    refuse_symlink(&roles_dir, "folder")?;
     let json_path = roles_dir.join(format!("{role_id}.json"));
     let md_path = roles_dir.join(format!("{role_id}.md"));
-    let json = read_eval_role_file(&json_path, role_id)?;
-    let md = read_eval_role_file(&md_path, role_id)?;
+    let json = read_eval_role_file(&json_path, role_id, source)?;
+    let md = read_eval_role_file(&md_path, role_id, source)?;
     use darkmux_types::user_files::{check_text, UserFileKind};
     if let Some(problem) = check_text::<Role>(UserFileKind::Role, &json_path, &json, &crate::user_files::role_retired) {
         bail!("{problem}");
@@ -143,7 +232,7 @@ pub(crate) fn load_eval_role(dir: &Path, role_id: &str) -> Result<EvalRole> {
     crate::loader::validate_role_family(&role, crate::loader::RoleSource::Eval)
         .with_context(|| format!("role manifest {}", json_path.display()))?;
     role.prompt_path = Some(md_path);
-    Ok(EvalRole { role, json, md })
+    Ok(EvalRole { role, json, md, source })
 }
 
 /// Whether `path` itself is a symbolic link (its target is not followed).
@@ -155,15 +244,10 @@ fn is_symlink(path: &Path) -> bool {
 /// file is the refusal this module exists for: there is no fallback. A
 /// symlink is refused too: the fixture checkout may hold links, and one pointing at
 /// the home folder would deliver its bytes (the link itself is never followed).
-fn read_eval_role_file(path: &Path, role_id: &str) -> Result<String> {
+fn read_eval_role_file(path: &Path, role_id: &str, source: RoleInputSource) -> Result<String> {
     let cap = darkmux_types::user_files::MAX_USER_FILE_BYTES;
     match std::fs::symlink_metadata(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!(
-            "{} is missing: a lab run of a workload bound to a fixture takes its role from the eval, so the \
-             eval must carry its roles (roles/{role_id}.json and roles/{role_id}.md, listed in .fixture.json's \
-             required_files). darkmux's built-in role and the home folder's roles/ are never used instead.",
-            path.display()
-        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(missing_role_file(path, role_id, source)),
         Ok(meta) if meta.file_type().is_symlink() => bail!(
             "the eval's `{}` is a symlink; a lab run takes its role from the eval itself, and a link could \
              deliver a role from anywhere. Make it a real file",
@@ -176,16 +260,41 @@ fn read_eval_role_file(path: &Path, role_id: &str) -> Result<String> {
     }
 }
 
-/// darkmux's compiled-in role and prompt, for a workload bound to no fixture.
-fn load_builtin_role(role_id: &str) -> Result<(Role, LabRole)> {
+/// The refusal for a role file the eval does not carry: there is no
+/// fallback, whichever layout the eval declares.
+fn missing_role_file(path: &Path, role_id: &str, source: RoleInputSource) -> anyhow::Error {
+    if source == RoleInputSource::Eval {
+        return anyhow!(
+            "{} is missing: the eval declares fixture schema 1.2 or newer, under which the eval must carry \
+             its roles (<eval_dir>/roles/{role_id}.json and .md). darkmux's built-in role, a roles/ folder at the \
+             fixture root and the home folder's roles/ are never used instead.",
+            path.display()
+        );
+    }
+    anyhow!(
+        "{} is missing: the eval carries roles/{role_id}.* at its root, so both roles/{role_id}.json and \
+         roles/{role_id}.md must be there. darkmux's built-in role and the home folder's roles/ are never \
+         used in place of one.",
+        path.display()
+    )
+}
+
+/// darkmux's compiled-in manifest and prompt for `role_id`, if it compiles
+/// one in.
+fn builtin_role_text(role_id: &str) -> Option<(&'static str, &'static str)> {
     let builtin = |table: &[(&str, &'static str)]| table.iter().find(|(id, _)| *id == role_id).map(|(_, text)| *text);
-    let (Some(json), Some(md)) =
-        (builtin(crate::loader::BUILTIN_ROLES), builtin(crate::loader::BUILTIN_ROLE_PROMPTS))
-    else {
+    Some((builtin(crate::loader::BUILTIN_ROLES)?, builtin(crate::loader::BUILTIN_ROLE_PROMPTS)?))
+}
+
+/// darkmux's compiled-in role and prompt: for a workload bound to no
+/// fixture, and for a legacy eval that carries no role of its own.
+fn load_builtin_role(role_id: &str) -> Result<(Role, LabRole)> {
+    let Some((json, md)) = builtin_role_text(role_id) else {
         bail!(
             "role `{role_id}` is not one of darkmux's built-in roles. A lab workload bound to no fixture runs on \
              darkmux's compiled-in roles only, never the home folder's roles/; to measure another role, put \
-             roles/{role_id}.json and roles/{role_id}.md in an eval and bind the workload to it (requires_fixture)."
+             <eval_dir>/roles/{role_id}.json and .md in an eval at fixture schema 1.2 and bind the workload to it \
+             (requires_fixture)."
         );
     };
     let role: Role = serde_json::from_str(json).with_context(|| format!("builtin role `{role_id}` failed to parse"))?;

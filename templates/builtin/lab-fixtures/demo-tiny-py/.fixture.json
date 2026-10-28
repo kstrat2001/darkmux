@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.1",
+  "schema_version": "1.2",
   "name": "demo-tiny-py",
   "version": "1.0",
   "satisfies": "tiny-python-suite@1.0",
@@ -9,7 +9,8 @@
   "required_files": [
     "src/parser.py",
     "tests/test_parser.py",
-    "roles/coder.json",
-    "roles/coder.md"
-  ]
+    "eval/roles/coder.json",
+    "eval/roles/coder.md"
+  ],
+  "eval_dir": "eval"
 }

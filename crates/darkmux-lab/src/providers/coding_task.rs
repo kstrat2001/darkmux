@@ -1773,7 +1773,7 @@ mod tests {
         // The role `lab run` read from the eval before the run.
         let run = |eval: &std::path::Path| {
             let mut loaded = make_loaded(spec.clone(), state.join("doc"));
-            loaded.lab_inputs = Some(darkmux_crew::dispatch::LabInputs::load_eval(eval, "coder").unwrap());
+            loaded.lab_inputs = Some(darkmux_crew::dispatch::LabInputs::for_fixture(eval, &darkmux_crew::dispatch::RoleLayout::Legacy { eval_dir: None }, "coder").unwrap());
             CodingTaskProvider.setup(&loaded, &state.join("run"), &state.join("sandbox"))
         };
 
@@ -1811,7 +1811,7 @@ mod tests {
         spec.role = Some("probe-3363".into());
         spec.requires_fixture = Some("pg@2.1".into());
         let mut loaded = make_loaded(spec, state.join("doc"));
-        let inputs = darkmux_crew::dispatch::LabInputs::load_eval(&eval, "probe-3363").unwrap();
+        let inputs = darkmux_crew::dispatch::LabInputs::for_fixture(&eval, &darkmux_crew::dispatch::RoleLayout::Legacy { eval_dir: None }, "probe-3363").unwrap();
         loaded.lab_inputs = Some(inputs.clone());
         let session = darkmux_types::session_id::SessionId::adhoc(darkmux_types::session_id::RunId::lab("r3363").unwrap(), "probe-3363", "coding");
         let build = |loaded: &LoadedWorkload| {
