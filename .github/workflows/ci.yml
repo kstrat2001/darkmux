@@ -97,7 +97,11 @@ jobs:
     # step having failed, which `gh pr checks` renders indistinguishably from a
     # real test failure. A timeout this tight stops being a runaway guard and
     # becomes a coin flip on job scheduling; 25 still bounds a genuine hang.
-    timeout-minutes: 25
+    # Raised 25 -> 40 (2026-10-28): the push-to-main run adds the isolation
+    # leak check (~13 min) to the tests (~10 min) and clippy (~2 min), and
+    # the release commit d85aab9c6 was CANCELLED at 26m48s twice with every
+    # step green. 40 is ~1.5x that run and still bounds a genuine hang.
+    timeout-minutes: 40
 
     steps:
       - name: Checkout
