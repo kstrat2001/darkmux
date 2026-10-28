@@ -31,7 +31,14 @@ pub const BUNDLE_FORMAT: &str = "darkmux-evals-bundle";
 /// each run used (`workloadPath`, `workloadSha256`, #3361), which every
 /// bundle `lab submit` writes carries. 6 adds each run's criteria, met or
 /// missed (`criteria`, #3386), written only when a run's grader recorded them.
-pub const BUNDLE_FORMAT_VERSION: u64 = 6;
+/// 7 adds which machine served each run (`stack.hardware`, #3397), written
+/// only when a run's hardware is `unknown`: a bundle whose runs were all
+/// served on the submitting machine stays 6 or older, byte for byte, so a
+/// site that reads only up to 6 keeps taking it, and one it cannot read is
+/// refused there by its version, never by a key it does not know.
+pub const BUNDLE_FORMAT_VERSION: u64 = 7;
+/// The version a bundle with criteria, every run served on the submitting machine, is written as.
+const BUNDLE_FORMAT_VERSION_CRITERIA: u64 = 6;
 /// The version a bundle naming its workloads, with no criteria, is written as.
 const BUNDLE_FORMAT_VERSION_WORKLOAD: u64 = 5;
 /// The version a bundle with format 4's fields and no workload is written as.
@@ -436,8 +443,9 @@ pub struct RanBy {
     pub build: Option<String>,
 }
 
-/// One run's stack: the field names are the site's.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// One run's stack: the field names are the site's. No `Default`: which
+/// machine served a run is never assumed.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Stack {
     pub chip: String,
     pub ram_gb: Option<u64>,
@@ -455,6 +463,9 @@ pub struct Stack {
     pub gpu_cores: Option<u32>,
     /// The Mac's model identifier (`Mac16,5`).
     pub model_id: Option<String>,
+    /// (#3397) Which machine served the run. The submitting machine's own
+    /// fields above are sent either way; the site decides what to show.
+    pub hardware: darkmux_types::Hardware,
 }
 
 impl Stack {
@@ -477,6 +488,8 @@ impl Stack {
             }),
             "gpuCores": self.gpu_cores,
             "modelId": self.model_id,
+            // Left out again unless a run's hardware is unknown (format 7).
+            "hardware": self.hardware.as_str(),
         })
     }
 
@@ -604,14 +617,32 @@ pub fn assemble(repo: &str, commit_sha: &str, fixture_manifest: &Value, runs: Ve
     }))
 }
 
-/// Format 6 when any run carries criteria; otherwise without that key, 5
-/// when any names its workload, 4 when any carries what 4 added, else 3,
-/// with those keys (null in every run) left out.
+/// Format 7 when any run's hardware is unknown; otherwise without that key,
+/// 6 when any run carries criteria; otherwise without that key, 5 when any
+/// names its workload, 4 when any carries what 4 added, else 3, with those
+/// keys (null in every run) left out.
 fn format_for(runs: Vec<Value>) -> (u64, Vec<Value>) {
-    match without_criteria(runs) {
-        Ok(runs) => format_before_criteria(runs),
+    match without_hardware(runs) {
         Err(runs) => (BUNDLE_FORMAT_VERSION, runs),
+        Ok(runs) => match without_criteria(runs) {
+            Ok(runs) => format_before_criteria(runs),
+            Err(runs) => (BUNDLE_FORMAT_VERSION_CRITERIA, runs),
+        },
     }
+}
+
+/// (#3397) The runs without `stack.hardware` when every one was served on
+/// the submitting machine (`Ok`), or as they are when one was not (`Err`:
+/// format 7, where every run says which).
+fn without_hardware(mut runs: Vec<Value>) -> std::result::Result<Vec<Value>, Vec<Value>> {
+    let unknown = darkmux_types::Hardware::Unknown.as_str();
+    if runs.iter().any(|r| r["stack"]["hardware"] == unknown) {
+        return Err(runs);
+    }
+    for stack in runs.iter_mut().filter_map(|r| r.get_mut("stack").and_then(Value::as_object_mut)) {
+        stack.remove("hardware");
+    }
+    Ok(runs)
 }
 
 /// A bundle with no criteria: the version its other keys need.
@@ -663,6 +694,10 @@ pub fn site_refusals(bundle: &Value) -> Vec<String> {
     r.text(&f["commitSha"], "fixture.commitSha", 200, Some(&forms.hex40), false);
     r.text(&f["name"], "fixture.name", 60, None, false);
     r.text(&f["version"], "fixture.version", 200, Some(&forms.semverish), false);
+    let version = bundle["formatVersion"].as_u64().filter(|v| (1..=BUNDLE_FORMAT_VERSION).contains(v));
+    if version.is_none() {
+        r.errs.push(format!("formatVersion: the site reads versions 1 to {BUNDLE_FORMAT_VERSION}"));
+    }
     let runs = bundle["runs"].as_array().cloned().unwrap_or_default();
     let mut keys = BTreeSet::new();
     for (i, run) in runs.iter().enumerate() {
@@ -670,6 +705,7 @@ pub fn site_refusals(bundle: &Value) -> Vec<String> {
             r.numbers.push(format!("runs[{i}]: the same run twice"));
         }
         r.run(i, run, &forms);
+        r.hardware(i, &run["stack"], version.unwrap_or(BUNDLE_FORMAT_VERSION));
     }
     let mut errs = r.errs;
     errs.extend(r.numbers);
@@ -720,6 +756,19 @@ struct Refusals {
 }
 
 impl Refusals {
+    /// (#3397) `stack.hardware`: required in format 7, one of its two
+    /// values; an unknown key below it, as the site's strict parser reads it.
+    fn hardware(&mut self, i: usize, stack: &Value, version: u64) {
+        let at = format!("runs[{i}].stack.hardware");
+        let tokens = <darkmux_types::Hardware as darkmux_types::config_enum::ConfigEnum>::TOKENS;
+        match (version >= BUNDLE_FORMAT_VERSION, stack.get("hardware")) {
+            (true, Some(Value::String(h))) if tokens.contains(&h.as_str()) => {}
+            (true, _) => self.errs.push(format!("{at}: expected {}", tokens.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(" or "))),
+            (false, Some(_)) => self.errs.push(format!("{at}: unknown key below format {BUNDLE_FORMAT_VERSION}")),
+            (false, None) => {}
+        }
+    }
+
     /// A non-blank string within `max` UTF-16 units, in `form` when given; null when `nullable`.
     fn text(&mut self, v: &Value, at: &str, max: usize, form: Option<&regex::Regex>, nullable: bool) {
         match v {
@@ -783,13 +832,18 @@ pub struct Stated {
     pub weights_dir: Option<PathBuf>,
     pub darkmux_version: Option<String>,
     pub commit: Option<String>,
+    /// (#3397) `--hardware`: which machine served runs on an endpoint the
+    /// provider registry does not list, for a run recorded before the
+    /// snapshot or one that recorded the wrong one.
+    pub hardware: Option<darkmux_types::Hardware>,
 }
 
 /// A bundle, and what it leaves out and why.
 #[derive(Debug)]
 pub struct Built {
     pub bundle: Value,
-    /// One line per run: its verdict, its model, what it does not report.
+    /// One line per run: its verdict, its model, what it does not report;
+    /// then a line per hardware check that disagrees, and one for format 7.
     pub notes: Vec<String>,
     /// `owner/repo@sha7 (name version)`.
     pub fixture: String,
@@ -805,11 +859,17 @@ pub fn gather_on(machine: &Machine, runs: &[String], stated: &Stated, flows_dir:
     refuse_repeats(runs)?;
     let inputs = read_runs(runs, flows_dir)?;
     let source = one_fixture(&inputs, stated)?;
-    let Bundled { runs: mut bundled, notes, starts } = bundle_all(machine, &inputs, stated, progress)?;
+    let served = machine.served_all(&inputs, stated)?;
+    let Bundled { runs: mut bundled, mut notes, starts } = bundle_all(machine, &inputs, &served, stated, progress)?;
     let (repo, commit_sha, fixture_manifest) = fixture_at(&source, &starts, stated.commit.as_deref())?;
     name_eval_workloads(&mut bundled, eval_workloads(&source, &commit_sha, &fixture_manifest, &inputs)?);
     let bundle = assemble(&repo, &commit_sha, &fixture_manifest, bundled)?;
     refuse_unshareable_bundle(&bundle, &machine.identifying)?;
+    if bundle["formatVersion"] == BUNDLE_FORMAT_VERSION {
+        notes.push(format!(
+            "the bundle is format {BUNDLE_FORMAT_VERSION}, since a run's hardware is unknown: a site that reads formats up to {BUNDLE_FORMAT_VERSION_CRITERIA} refuses it"
+        ));
+    }
     Ok(Built { fixture: fixture_label(&repo, &commit_sha, &bundle), bundle, notes })
 }
 
@@ -837,16 +897,125 @@ struct Bundled {
     starts: Vec<Option<u64>>,
 }
 
-fn bundle_all(machine: &Machine, inputs: &[Input], stated: &Stated, progress: &mut dyn FnMut(&str)) -> Result<Bundled> {
+fn bundle_all(
+    machine: &Machine,
+    inputs: &[Input],
+    served: &[ServedBy],
+    stated: &Stated,
+    progress: &mut dyn FnMut(&str),
+) -> Result<Bundled> {
     let mut caches = Caches::default();
     let mut out = Bundled { runs: Vec::new(), notes: Vec::new(), starts: Vec::new() };
-    for input in inputs {
-        let (run, note) = machine.bundle_one(input, stated, &mut caches, progress)?;
+    for (input, by) in inputs.iter().zip(served) {
+        let (run, note) = machine.bundle_one(input, by, stated, &mut caches, progress)?;
         out.starts.push(input.started());
         out.runs.push(run);
         out.notes.push(note);
+        // (#3397) A claim the run's own GPU reading disagrees with is said,
+        // for the submitter and the site's owner to weigh; never refused.
+        if let Some(check) = hardware_check(by.hardware, &input.stats) {
+            out.notes.push(format!("{}: check the hardware: {check}", input.run_id));
+        }
     }
     Ok(out)
+}
+
+/// (#3397) Which machine served one run, and how darkmux knows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServedBy {
+    pub hardware: darkmux_types::Hardware,
+    /// The provider registry's name for the host, which fills `engine`.
+    pub provider: Option<String>,
+    /// A managed (LM Studio) model: its provenance is read from LM Studio.
+    pub lmstudio: bool,
+    /// The snapshot's value, when `--hardware` corrected a different one.
+    pub corrected: Option<darkmux_types::Hardware>,
+}
+
+impl ServedBy {
+    fn fixed(hardware: darkmux_types::Hardware, provider: Option<String>, lmstudio: bool) -> Self {
+        ServedBy { hardware, provider, lmstudio, corrected: None }
+    }
+}
+
+/// (#3397) THE precedence for one run's hardware. What darkmux knows on its
+/// own is fixed: a managed model is the submitting machine, a host on the
+/// provider registry is `unknown`, and a `--hardware` that contradicts
+/// either is refused. For any other endpoint the flag wins over the run's
+/// snapshot (it corrects a wrong one), the snapshot stands in for no flag,
+/// and with neither the run is refused, naming what to set. A run recorded
+/// before the snapshot (run manifest 1.3) reads the registry as it is now for
+/// a managed model or a listed host only: an endpoint's declaration today is
+/// not the run's. A model the registry does not list reads as LM Studio's,
+/// as before.
+pub fn served_by(
+    run_id: &str,
+    model_id: &str,
+    snapshot: Option<&[crate::lab::manifest::ModelHardware]>,
+    current: Option<&darkmux_types::ProfileModel>,
+    flag: Option<darkmux_types::Hardware>,
+) -> std::result::Result<ServedBy, String> {
+    use crate::lab::manifest::HardwareFrom;
+    use darkmux_types::{Hardware, HardwareBasis};
+    let entry = snapshot
+        .and_then(|s| s.iter().find(|e| e.model == model_id || e.identifier.as_deref() == Some(model_id)));
+    let (fixed, recorded, endpoint) = match entry {
+        Some(e) => match e.from {
+            HardwareFrom::Managed => (Some(ServedBy::fixed(Hardware::SubmittingMachine, None, true)), None, None),
+            HardwareFrom::Provider => (Some(ServedBy::fixed(Hardware::Unknown, e.provider.clone(), false)), None, None),
+            HardwareFrom::Endpoint => (None, e.hardware, e.endpoint.clone()),
+        },
+        None => match current.map(|m| m.endpoint.as_ref().map_or(HardwareBasis::Managed, |ep| ep.hardware_basis())) {
+            None | Some(HardwareBasis::Managed) => (Some(ServedBy::fixed(Hardware::SubmittingMachine, None, true)), None, None),
+            Some(HardwareBasis::Provider(p)) => (Some(ServedBy::fixed(Hardware::Unknown, Some(p.name.to_string()), false)), None, None),
+            Some(_) => (None, None, current.and_then(|m| m.endpoint.as_ref()).and_then(|e| e.named_id()).map(str::to_string)),
+        },
+    };
+    if let Some(fixed) = fixed {
+        return match flag {
+            Some(f) if f != fixed.hardware => Err(format!(
+                "{run_id}: --hardware {} contradicts what darkmux knows: {} served {model_id}, so its hardware is {}; drop --hardware, or submit this run on its own",
+                f.as_str(),
+                fixed.provider.as_deref().unwrap_or("LM Studio on the submitting machine"),
+                fixed.hardware.as_str()
+            )),
+            _ => Ok(fixed),
+        };
+    }
+    match (flag, recorded) {
+        (Some(f), r) => Ok(ServedBy { hardware: f, provider: None, lmstudio: false, corrected: r.filter(|r| *r != f) }),
+        (None, Some(r)) => Ok(ServedBy::fixed(r, None, false)),
+        (None, None) => {
+            let id = endpoint.unwrap_or_else(|| "<id>".to_string());
+            Err(format!(
+                "{run_id}: {model_id} was served by endpoint `{id}`, and the run did not record which machine served it \
+                 (it ran before darkmux recorded that, or the endpoint declared none). Pass --hardware submitting-machine \
+                 (this machine served it) or --hardware unknown (another machine did); for later runs, set \
+                 \"hardware\" on endpoints.{id} in profiles.json"
+            ))
+        }
+    }
+}
+
+/// (#3397, macOS) What the run's own GPU reading says against the stated
+/// hardware, when they disagree: the GPU never busy (no telemetry sample at
+/// or above the busy line, `stats::BUSY_GPU_PCT`) while stated as served on
+/// the submitting machine, or busy while stated as served elsewhere. `None`
+/// when they agree, and when the run has no GPU reading (Omarchy, or no
+/// telemetry): a note, never a refusal.
+pub fn hardware_check(hardware: darkmux_types::Hardware, stats: &Value) -> Option<String> {
+    let duty = stats.get("gpu_duty_pct").and_then(Value::as_f64)?;
+    let busy = stats.get("samples_busy").and_then(Value::as_u64)?;
+    let line = crate::lab::stats::BUSY_GPU_PCT;
+    match hardware {
+        darkmux_types::Hardware::SubmittingMachine if busy == 0 => Some(format!(
+            "stated as served on the submitting machine (submitting-machine), but this machine's GPU stayed idle through the run (no sample at or above {line}% GPU)"
+        )),
+        darkmux_types::Hardware::Unknown if busy > 0 => Some(format!(
+            "stated as served elsewhere (unknown), but this machine's GPU was busy for {duty}% of the run"
+        )),
+        _ => None,
+    }
 }
 
 /// (#3361) Each run states the eval workload it used, proven against the
@@ -1087,32 +1256,65 @@ impl Machine {
         })
     }
 
+    /// (#3397) Which machine served each run, every refusal named at once.
+    /// A run on a provider's host cannot also take the flags that describe
+    /// a model this machine served.
+    fn served_all(&self, inputs: &[Input], stated: &Stated) -> Result<Vec<ServedBy>> {
+        let mut served = Vec::new();
+        let mut refused = Vec::new();
+        for input in inputs {
+            let model_id = input.model_id().unwrap_or_default();
+            let snapshot = input
+                .manifest
+                .get("model_hardware")
+                .and_then(|v| serde_json::from_value::<Vec<crate::lab::manifest::ModelHardware>>(v.clone()).ok());
+            let current = self.profile_model(&input.manifest, &model_id);
+            match served_by(&input.run_id, &model_id, snapshot.as_deref(), current.as_ref(), stated.hardware) {
+                Ok(ServedBy { provider: Some(p), .. }) if stated.describes_a_model() => refused.push(format!(
+                    "{}: {p} served {model_id}, and darkmux names it itself: --engine, --quant and --weights-dir describe a model this machine served; drop them",
+                    input.run_id
+                )),
+                Ok(by) => served.push(by),
+                Err(why) => refused.push(why),
+            }
+        }
+        if !refused.is_empty() {
+            bail!("not submitted:\n  {}", refused.join("\n  "));
+        }
+        Ok(served)
+    }
+
     /// One run's bundle entry, and its note: its verdict, its model, what it does not report.
-    fn bundle_one(&self, input: &Input, stated: &Stated, caches: &mut Caches, progress: &mut dyn FnMut(&str)) -> Result<(Value, String)> {
+    fn bundle_one(
+        &self,
+        input: &Input,
+        served: &ServedBy,
+        stated: &Stated,
+        caches: &mut Caches,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<(Value, String)> {
         let started = input.started();
         let mut why = Vec::new();
         let model_id = input.model_id().unwrap_or_default();
         let profile_model = self.profile_model(&input.manifest, &model_id);
-        // A model the profile serves from an unmanaged endpoint is not LM Studio's (contract 1).
-        let managed = profile_model.as_ref().is_none_or(|m| m.is_managed());
-        let provenance = match stated.engine {
-            None if managed => caches.provenance(&self.provenance, &model_id),
-            _ => None,
-        };
-        if stated.engine.is_none() && provenance.is_none() {
-            why.push("LM Studio does not list this model (pass --engine)".to_string());
+        if let Some(was) = served.corrected {
+            why.push(format!("--hardware {} corrects the recorded {}", served.hardware.as_str(), was.as_str()));
         }
-        let weights_path = stated.weights_dir.clone().or_else(|| provenance.as_ref().and_then(|p| p.weights_path.clone()));
-        let (weights_hash, weights_changed) = match &weights_path {
-            Some(path) => caches.weights(path, &input.run_id, &model_id, started, &mut why, progress)?,
-            None => {
-                why.push("weights unknown (pass --weights-dir)".to_string());
-                (None, None)
-            }
+        // (#3397) A provider's model: its name is the engine, and nothing of
+        // it is on this machine to read or hash.
+        if let Some(p) = &served.provider {
+            why.push(format!("hardware unknown: served by {p}"));
+        }
+        let (provenance, weights_hash, weights_changed) = match served.provider {
+            Some(_) => (None, None, None),
+            None => self.model_on_this_side(input, served, stated, caches, &model_id, &mut why, progress)?,
         };
         let ran_by = self.ran_by(&input.manifest, stated, started, &mut why);
         let os = self.os_as_of(&input.manifest, started, &mut why);
-        let engine = engine_of(stated, provenance.as_ref(), weights_changed, started, &mut why);
+        let engine = match &served.provider {
+            Some(p) => EngineFields { engine: Some(p.clone()), ..Default::default() },
+            None => engine_of(stated, provenance.as_ref(), weights_changed, started, &mut why),
+        };
         let stack = Stack {
             chip: self.chip.clone(),
             ram_gb: self.ram_gb,
@@ -1128,9 +1330,41 @@ impl Machine {
             cpu_cores: self.config.cpu_clusters.clone(),
             gpu_cores: self.config.gpu_cores,
             model_id: self.config.model_id.clone(),
+            hardware: served.hardware,
         };
         let run = bundle_run(&input.run_id, &input.manifest, &input.stats, &ran_by, &stack, &self.identifying);
         Ok((run, note_for(input, &model_id, &stack, &why)))
+    }
+
+    /// What LM Studio says of a model this side served, and its weights' hash
+    /// and last change. Only a managed model's provenance is read (contract 1).
+    #[allow(clippy::too_many_arguments)]
+    fn model_on_this_side(
+        &self,
+        input: &Input,
+        served: &ServedBy,
+        stated: &Stated,
+        caches: &mut Caches,
+        model_id: &str,
+        why: &mut Vec<String>,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<(Option<darkmux_profiles::engine::ModelProvenance>, Option<String>, Option<u64>)> {
+        let provenance = match stated.engine {
+            None if served.lmstudio => caches.provenance(&self.provenance, model_id),
+            _ => None,
+        };
+        if stated.engine.is_none() && provenance.is_none() {
+            why.push("LM Studio does not list this model (pass --engine)".to_string());
+        }
+        let weights_path = stated.weights_dir.clone().or_else(|| provenance.as_ref().and_then(|p| p.weights_path.clone()));
+        let (weights_hash, weights_changed) = match &weights_path {
+            Some(path) => caches.weights(path, &input.run_id, model_id, input.started(), why, progress)?,
+            None => {
+                why.push("weights unknown (pass --weights-dir)".to_string());
+                (None, None)
+            }
+        };
+        Ok((provenance, weights_hash, weights_changed))
     }
 
     /// The model as the run's profile declares it, when it does.

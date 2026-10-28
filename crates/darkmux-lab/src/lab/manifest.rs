@@ -109,10 +109,81 @@ pub struct RunManifest {
     /// manifest 1.2). The endpoint's own count stays on the trajectory.
     #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     pub prompt_tokens_counted: Option<u32>,
+    /// (run manifest 1.3, #3397) Which machine served each model of the
+    /// run's profile, taken from the registry as it was loaded when the run
+    /// started, so editing an endpoint later never rewrites an old run.
+    /// `lab submit` reads it. Absent on a run from before it was recorded.
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    pub model_hardware: Option<Vec<ModelHardware>>,
     /// A key this type does not name (an older run's camelCase spelling, a newer
     /// darkmux's field), kept and re-serialized flat.
     #[serde(flatten)]
     pub extras: Map<String, Value>,
+}
+
+/// (#3397) How darkmux knew which machine served a model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HardwareFrom {
+    /// A managed (LM Studio) model: always the submitting machine.
+    Managed,
+    /// An endpoint on a host the built-in provider registry lists: always
+    /// `unknown`, served by `provider`.
+    Provider,
+    /// Any other endpoint: its own `hardware`, or none when it declared none.
+    Endpoint,
+}
+
+/// (#3397) One model of a run's profile and the machine that served it, as
+/// the profile registry said when the run started.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelHardware {
+    /// The profile model's id.
+    pub model: String,
+    /// The profile model's explicit `identifier`, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identifier: Option<String>,
+    pub from: HardwareFrom,
+    /// `None` only for an endpoint that declared no `hardware`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware: Option<darkmux_types::Hardware>,
+    /// The provider's name, for [`HardwareFrom::Provider`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// The `endpoints` id the model named, for a message (never shared).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+}
+
+/// (#3397) The snapshot for a run on `profile`: one entry per model whose
+/// endpoint darkmux can use, in the profile's order. Read through the one
+/// classification, [`darkmux_types::ModelEndpoint::hardware_basis`].
+pub fn model_hardware_of(profile: &darkmux_types::Profile) -> Vec<ModelHardware> {
+    use darkmux_types::HardwareBasis;
+    profile
+        .models
+        .iter()
+        .filter_map(|m| {
+            let basis = m.endpoint.as_ref().map_or(HardwareBasis::Managed, |e| e.hardware_basis());
+            let from = match basis {
+                HardwareBasis::Managed => HardwareFrom::Managed,
+                HardwareBasis::Provider(_) => HardwareFrom::Provider,
+                HardwareBasis::Declared(_) | HardwareBasis::Undeclared => HardwareFrom::Endpoint,
+                HardwareBasis::Unusable => return None,
+            };
+            Some(ModelHardware {
+                model: m.id.clone(),
+                identifier: m.identifier.clone(),
+                from,
+                hardware: basis.hardware(),
+                provider: match basis {
+                    HardwareBasis::Provider(p) => Some(p.name.to_string()),
+                    _ => None,
+                },
+                endpoint: m.endpoint.as_ref().and_then(|e| e.named_id()).map(str::to_string),
+            })
+        })
+        .collect()
 }
 
 /// A run's verify result. A run from before the object form wrote a bare
@@ -397,6 +468,40 @@ mod tests {
         assert_eq!(m.verify_passed(), Some(false));
         let m: RunManifest = serde_json::from_value(json!({"verify": {"passed": "yes", "details": 4}})).unwrap();
         assert_eq!(m.verify_passed(), Some(false));
+    }
+
+    /// (#3397) The snapshot names each model's machine as the registry
+    /// says: managed is the submitting machine, a listed host its provider's,
+    /// any other endpoint its own declaration or none. An unusable endpoint
+    /// is left out, and the snapshot round-trips through the manifest.
+    #[test]
+    fn the_model_hardware_snapshot_reads_the_registry_as_loaded() {
+        let mut reg: darkmux_types::ProfileRegistry = serde_json::from_value(json!({
+            "profiles": {"p": {"models": [
+                {"id": "qwen", "n_ctx": 1},
+                {"id": "haiku", "identifier": "claude-haiku", "endpoint": "claude"},
+                {"id": "flint", "endpoint": "studio"},
+                {"id": "bare", "endpoint": "bare"},
+                {"id": "gone", "endpoint": "missing"}]}},
+            "endpoints": {"claude": {"url": "https://api.anthropic.com/v1"},
+                "studio": {"url": "http://studio.local:8080/v1", "hardware": "unknown"},
+                "bare": {"url": "http://127.0.0.1:8080/v1"}}})).unwrap();
+        reg.materialize_endpoints();
+        let snap = model_hardware_of(&reg.profiles["p"]);
+        let row = |m: &str| snap.iter().find(|r| r.model == m).cloned();
+        use darkmux_types::Hardware::{SubmittingMachine, Unknown};
+        assert_eq!(row("qwen").map(|r| (r.from, r.hardware)), Some((HardwareFrom::Managed, Some(SubmittingMachine))));
+        let haiku = row("haiku").unwrap();
+        assert_eq!((haiku.from, haiku.hardware, haiku.provider.as_deref()), (HardwareFrom::Provider, Some(Unknown), Some("Anthropic API")));
+        assert_eq!(haiku.identifier.as_deref(), Some("claude-haiku"));
+        assert_eq!(row("flint").map(|r| (r.from, r.hardware, r.endpoint)), Some((HardwareFrom::Endpoint, Some(Unknown), Some("studio".into()))));
+        assert_eq!(row("bare").map(|r| (r.from, r.hardware)), Some((HardwareFrom::Endpoint, None)), "undeclared stays undeclared");
+        assert!(row("gone").is_none(), "an endpoint darkmux cannot use says nothing");
+        let m = RunManifest { model_hardware: Some(snap.clone()), ..RunManifest::default() };
+        let back: RunManifest = serde_json::from_value(serde_json::to_value(&m).unwrap()).unwrap();
+        assert_eq!(back.model_hardware, Some(snap));
+        let raw = serde_json::to_value(&m).unwrap();
+        assert!(!raw.to_string().contains("anthropic.com") && !raw.to_string().contains("studio.local"), "no host: {raw}");
     }
 
     #[test]
