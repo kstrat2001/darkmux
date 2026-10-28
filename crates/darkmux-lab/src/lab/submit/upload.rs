@@ -214,10 +214,8 @@ struct LoginKeychain;
 
 impl Keychain for LoginKeychain {
     fn read(&self, account: &str) -> Option<String> {
-        match darkmux_flow::read_keychain_bounded(TOKEN_ITEM, Some(account), std::time::Duration::from_secs(5)) {
-            darkmux_flow::KeychainRead::Found(v) => Some(v),
-            _ => None,
-        }
+        let read = darkmux_flow::read_keychain_bounded(TOKEN_ITEM, Some(account), std::time::Duration::from_secs(5));
+        if let darkmux_flow::KeychainRead::Found(v) = read { Some(v) } else { None }
     }
 
     fn store(&self, account: &str, token: &str) -> Result<(), String> {
