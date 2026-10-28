@@ -895,3 +895,37 @@ fn an_eval_document_path_is_plain_names_inside_the_eval_dir() {
         assert!(!super::is_eval_document(bad, "eval"), "{bad}");
     }
 }
+
+/// (#3397) The bundles `lab submit` writes for runs served on the submitting
+/// machine (LM Studio), one without criteria (format 5) and one with (format
+/// 6), as the text `deliver` writes and uploads.
+fn submitting_machine_bundles() -> [(String, &'static str); 2] {
+    let ran_by = RanBy { version: Some("5.8.0".into()), commit: Some("abc1234".into()), build: Some("release".into()) };
+    let with_workload = |mut run: Value| {
+        run["workloadPath"] = json!("eval/workloads/w.json");
+        run["workloadSha256"] = json!("b".repeat(64));
+        run
+    };
+    let fixture = json!({ "name": "webhook-forgery", "version": "1.2", "eval_dir": "eval" });
+    let plain = with_workload(bundle_run("plain-p-1761120000-1", &manifest(), &stats(), &ran_by, &stack(), &[]));
+    let mut m = manifest();
+    m["verify"]["grade"] = json!({"passed": true, "checks": [], "criteria": [{"id": "raw-body", "passed": true}]});
+    let graded = with_workload(bundle_run("graded-p-1761120000-2", &m, &stats(), &ran_by, &stack(), &[]));
+    let text = |runs: Vec<Value>| {
+        serde_json::to_string_pretty(&assemble("kstrat2001/webhook-forgery-eval", &"a".repeat(40), &fixture, runs).unwrap()).unwrap() + "\n"
+    };
+    [
+        (text(vec![plain.clone()]), include_str!("golden/submitting_machine_v5.json")),
+        (text(vec![graded, plain]), include_str!("golden/submitting_machine_v6.json")),
+    ]
+}
+
+/// (#3397) A bundle whose runs were all served on the submitting machine is
+/// byte for byte what main wrote before `hardware` existed (the goldens were
+/// written by 666395b39), so a site that reads formats up to 6 keeps taking it.
+#[test]
+fn a_submitting_machine_bundle_is_byte_for_byte_what_main_wrote() {
+    for (i, (now, then)) in submitting_machine_bundles().iter().enumerate() {
+        assert_eq!(now, then, "bundle {i}");
+    }
+}

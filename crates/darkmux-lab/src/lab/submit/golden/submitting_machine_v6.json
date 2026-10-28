@@ -1,0 +1,188 @@
+{
+  "format": "darkmux-evals-bundle",
+  "formatVersion": 6,
+  "fixture": {
+    "repo": "kstrat2001/webhook-forgery-eval",
+    "commitSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "name": "webhook-forgery",
+    "version": "1.2",
+    "manifest": {
+      "name": "webhook-forgery",
+      "version": "1.2",
+      "eval_dir": "eval"
+    }
+  },
+  "runs": [
+    {
+      "key": "ffbddfcffe101f6812aaa16830b10ed024c1f49d5f1969df30ade185b1d77134",
+      "darkmuxVersion": "5.8.0",
+      "darkmuxCommit": "abc1234",
+      "darkmuxBuild": "release",
+      "passed": true,
+      "activeSeconds": 123.5,
+      "tokensPerSecond": 41.27,
+      "peakMemoryGb": null,
+      "startedAt": "2025-10-22T08:00:00.123Z",
+      "stack": {
+        "chip": "Apple M5 Max",
+        "ramGb": 128,
+        "accelerator": "Metal",
+        "os": "macOS 26.1",
+        "engine": "LM Studio",
+        "engineBackend": "MLX",
+        "engineVersion": "mlx-llm 1.13.1",
+        "model": "qwen3-coder-30b",
+        "weightsHash": null,
+        "quant": "4bit",
+        "contextLength": 65536,
+        "kvCacheDtype": null,
+        "cpuCores": [
+          {
+            "cluster": "Super",
+            "cores": 6
+          },
+          {
+            "cluster": "Performance",
+            "cores": 12
+          }
+        ],
+        "gpuCores": 40,
+        "modelId": "Mac17,7",
+        "maxCompletionTokens": null
+      },
+      "detail": {
+        "wallSeconds": 150.0,
+        "restSeconds": 26.6,
+        "turns": 12,
+        "toolCalls": 30,
+        "toolCallsFailed": 2,
+        "completionTokens": 9000,
+        "reasoningTokens": 3000,
+        "packageWatts": 31.3,
+        "cpuWatts": 5.0,
+        "gpuWatts": 25.0,
+        "gpuBusyPct": 87.5,
+        "joulesPer1kTokens": 410.3,
+        "memoryPressureMaxPct": 62.0,
+        "thermalStates": {
+          "nominal": 38,
+          "fair": 2
+        },
+        "cpuSpeedLimitMinPct": 100,
+        "throttledSamples": 0,
+        "compactions": 2,
+        "contextPeakTokens": 48211,
+        "firstTokenMsMedian": 1840,
+        "firstTokenMsMax": 9120,
+        "decodeTokensPerSecond": 58.4,
+        "verify": {
+          "summary": null,
+          "forcedFailureReason": null,
+          "baselineTests": 10,
+          "testsTotal": 14,
+          "testsPassed": 14,
+          "testsAdded": 4,
+          "testsFailed": 0,
+          "sandboxChanged": true,
+          "coveragePct": 91.2,
+          "coverageMinPct": 80.0,
+          "commandPassed": true,
+          "fieldsCorrect": null,
+          "fieldsExpected": null,
+          "fieldsMissed": null
+        }
+      },
+      "criteria": [
+        {
+          "id": "raw-body",
+          "passed": true
+        }
+      ],
+      "workloadPath": "eval/workloads/w.json",
+      "workloadSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    {
+      "key": "c306010a36aca6a9075ed0e18018b7acea150771098d0d46869a69030901255c",
+      "darkmuxVersion": "5.8.0",
+      "darkmuxCommit": "abc1234",
+      "darkmuxBuild": "release",
+      "passed": true,
+      "activeSeconds": 123.5,
+      "tokensPerSecond": 41.27,
+      "peakMemoryGb": null,
+      "startedAt": "2025-10-22T08:00:00.123Z",
+      "stack": {
+        "chip": "Apple M5 Max",
+        "ramGb": 128,
+        "accelerator": "Metal",
+        "os": "macOS 26.1",
+        "engine": "LM Studio",
+        "engineBackend": "MLX",
+        "engineVersion": "mlx-llm 1.13.1",
+        "model": "qwen3-coder-30b",
+        "weightsHash": null,
+        "quant": "4bit",
+        "contextLength": 65536,
+        "kvCacheDtype": null,
+        "cpuCores": [
+          {
+            "cluster": "Super",
+            "cores": 6
+          },
+          {
+            "cluster": "Performance",
+            "cores": 12
+          }
+        ],
+        "gpuCores": 40,
+        "modelId": "Mac17,7",
+        "maxCompletionTokens": null
+      },
+      "detail": {
+        "wallSeconds": 150.0,
+        "restSeconds": 26.6,
+        "turns": 12,
+        "toolCalls": 30,
+        "toolCallsFailed": 2,
+        "completionTokens": 9000,
+        "reasoningTokens": 3000,
+        "packageWatts": 31.3,
+        "cpuWatts": 5.0,
+        "gpuWatts": 25.0,
+        "gpuBusyPct": 87.5,
+        "joulesPer1kTokens": 410.3,
+        "memoryPressureMaxPct": 62.0,
+        "thermalStates": {
+          "nominal": 38,
+          "fair": 2
+        },
+        "cpuSpeedLimitMinPct": 100,
+        "throttledSamples": 0,
+        "compactions": 2,
+        "contextPeakTokens": 48211,
+        "firstTokenMsMedian": 1840,
+        "firstTokenMsMax": 9120,
+        "decodeTokensPerSecond": 58.4,
+        "verify": {
+          "summary": null,
+          "forcedFailureReason": null,
+          "baselineTests": 10,
+          "testsTotal": 14,
+          "testsPassed": 14,
+          "testsAdded": 4,
+          "testsFailed": 0,
+          "sandboxChanged": true,
+          "coveragePct": 91.2,
+          "coverageMinPct": 80.0,
+          "commandPassed": true,
+          "fieldsCorrect": null,
+          "fieldsExpected": null,
+          "fieldsMissed": null
+        }
+      },
+      "criteria": null,
+      "workloadPath": "eval/workloads/w.json",
+      "workloadSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  ]
+}
