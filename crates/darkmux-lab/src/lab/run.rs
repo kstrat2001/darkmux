@@ -372,9 +372,19 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
         &registry_loaded.path,
     )?;
     let profile = get_profile(&registry_loaded.registry, &profile_name)?;
+    // (#3397) Which machine serves each of the profile's models, read now,
+    // before any run starts: an endpoint edited later never rewrites a run.
+    let model_hardware = crate::lab::manifest::model_hardware_of(profile);
 
-    let run =
-        OneRun { opts: &opts, paths: &paths, workload: &loaded_workload, profile, profile_name: &profile_name, prune: &prune };
+    let run = OneRun {
+        opts: &opts,
+        paths: &paths,
+        workload: &loaded_workload,
+        profile,
+        profile_name: &profile_name,
+        prune: &prune,
+        model_hardware: &model_hardware,
+    };
     let runs = opts.runs.max(1);
     let mut envelope = EnvelopeWarnings::default();
     (1..=runs).map(|i| run.run(i, runs, &mut envelope)).collect()
@@ -389,6 +399,8 @@ struct OneRun<'a> {
     profile_name: &'a str,
     /// What each run's clone prunes, settled at the preflight.
     prune: &'a Prune,
+    /// (#3397) The profile's models' hardware as the registry said at start.
+    model_hardware: &'a [crate::lab::manifest::ModelHardware],
 }
 
 impl OneRun<'_> {
@@ -469,6 +481,9 @@ impl OneRun<'_> {
         // the run.
         if let Err(e) = enrich_manifest_with_fixture_info(run_dir, baseline_hash, source) {
             warn(self.opts.quiet, &format!("enriching manifest with fixture info skipped: {e}"));
+        }
+        if let Err(e) = record_model_hardware(run_dir, self.model_hardware) {
+            warn(self.opts.quiet, &format!("recording which machine served the models skipped: {e}"));
         }
         if let Some(home) = crate::workloads::load::eval_home_of(self.workload) {
             if let Err(e) = record_eval_workload(run_dir, &home, &self.workload.manifest.workload.id) {
@@ -837,6 +852,23 @@ fn enrich_manifest_with_fixture_info(
     }
     manifest.write(run_dir)?;
     Ok(())
+}
+
+/// (#3397) Write the snapshot taken when the run started into its manifest,
+/// with the model its replies said answered, for `lab submit` (run manifest
+/// 1.3). Best-effort like the fixture
+/// enrichment: a run whose provider wrote no manifest cannot be submitted
+/// anyway.
+fn record_model_hardware(run_dir: &Path, snapshot: &[crate::lab::manifest::ModelHardware]) -> Result<()> {
+    if !run_dir.join(MANIFEST_FILE).exists() {
+        return Ok(());
+    }
+    let mut manifest = RunManifest::read(run_dir)?;
+    manifest.model_hardware = Some(snapshot.to_vec());
+    // The model the run's replies said answered, now that they are all in.
+    let trajectory = fs::read_to_string(run_dir.join(darkmux_trajectory::TRAJECTORY_FILE)).unwrap_or_default();
+    manifest.served_model = crate::lab::manifest::served_model_in(&trajectory);
+    manifest.write(run_dir)
 }
 
 /// (#3361) Name the eval's own workload document in the run's `fixture`

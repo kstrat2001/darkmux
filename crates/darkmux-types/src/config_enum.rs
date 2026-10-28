@@ -494,6 +494,68 @@ pub fn bad_endpoint_budget_policies(reg: &crate::ProfileRegistry) -> Vec<BadEnum
     out
 }
 
+/// (#3397) Every unregistered `hardware` in a profile registry: each
+/// `endpoints.<id>.hardware`. Contract 9 like a budget `policy`: never
+/// resolved to a fallback (an unknown value is never read as either
+/// machine), refused at preflight by every entry point that dispatches
+/// (`darkmux_profiles::preflight`), since a lab run snapshots it, and Fail
+/// in doctor.
+pub fn bad_endpoint_hardware(reg: &crate::ProfileRegistry) -> Vec<BadEnumValue> {
+    use crate::endpoint::{Hardware, Lenient};
+    let mut out = Vec::new();
+    for (id, ep) in &reg.endpoints {
+        if let Some(Lenient::Unrecognized(v)) = &ep.hardware {
+            out.push(BadEnumValue {
+                key: "endpoints.<id>.hardware",
+                kind: Hardware::KIND,
+                raw: v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()),
+                renamed_to: None,
+                set_in: SetIn::Profiles(format!("endpoints.{id}.hardware")),
+                values: Hardware::TABLE,
+            });
+        }
+    }
+    out
+}
+
+/// (#3399 review) Every unmanaged endpoint whose host darkmux cannot read
+/// unambiguously (`ModelEndpoint::host_problem`): a client could reach a
+/// provider there that darkmux would not recognize, so neither the provider
+/// registry nor a declared `hardware` can be trusted for it. Refused at every
+/// dispatching preflight and Fail in doctor, naming `endpoints.<id>.url` and
+/// why, never the URL itself (it may carry credentials).
+pub fn invalid_endpoint_hosts(reg: &crate::ProfileRegistry) -> Vec<InvalidSetting> {
+    reg.endpoints
+        .iter()
+        .filter_map(|(id, ep)| {
+            ep.host_problem().map(|why| InvalidSetting {
+                set_in: SetIn::Profiles(format!("endpoints.{id}.url")),
+                problem: format!("darkmux cannot read its host unambiguously: {why}"),
+                valid: "`https://<host>[:<port>]/<path>`, the host plain ASCII letters, digits, dots and hyphens (or \
+                        an IP address), with no percent-encoding, backslash or whitespace"
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
+/// (#3397) Every `hardware` declared where darkmux already knows the answer
+/// (`ModelEndpoint::misplaced_hardware`): on a managed endpoint, or on a host
+/// the provider registry lists. Refused at every dispatching preflight and
+/// Fail in doctor, naming `endpoints.<id>.hardware` and why.
+pub fn misplaced_endpoint_hardware(reg: &crate::ProfileRegistry) -> Vec<InvalidSetting> {
+    reg.endpoints
+        .iter()
+        .filter_map(|(id, ep)| {
+            ep.misplaced_hardware().map(|why| InvalidSetting {
+                set_in: SetIn::Profiles(format!("endpoints.{id}.hardware")),
+                problem: why,
+                valid: "`hardware` only on a `url` endpoint whose host the provider registry does not list".to_string(),
+            })
+        })
+        .collect()
+}
+
 /// (#2902 step 5) The valid shape of an endpoint's `limits`, for a refusal.
 pub const LIMITS_SHAPE: &str = "`limits`: {\"window\": {\"period\": \"<n>m|<n>h|<n>d\", \"tokens\": <integer>, \
      \"calls\": <integer>}, \"policy\": \"off\"|\"warn\"|\"wait\", \"warn_at\": <a fraction between 0 and 1>, \
@@ -1079,6 +1141,7 @@ mod tests {
             ("ClientAddrSource", "where a client on this machine found the daemon's address (`config_access`), runtime-only provenance, never a setting"),
             ("FixedKind", "a session kind whose wire fields have a fixed count (`session_id`), never a setting"),
             ("EndpointKind", "derived from `managed` + `url`, never written"),
+            ("HardwareBasis", "derived from `managed`, the url's host and `hardware` (#3397), never written"),
             ("EngineChoice", "what `default_engine` resolved to; its values are an open set checked against profiles.json (`default_engine`), not a token list"),
             ("Lenient", "the lenient-read wrapper itself"),
             ("BuildKind", "whether the running binary is a release or a dev build (`build_info`), baked in at build time, never a setting"),
@@ -1115,7 +1178,7 @@ mod tests {
             ("LeftoverValue", "how a retired config key's leftover value is judged, fixed per retired setting, not a setting"),
             ("OldDefault", "a value a retired config key held by default, matched by the leftover check, not a setting"),
         ];
-        const PROFILE_ENUMS: &[&str] = &["ManagedBackend", "Dialect", "BudgetPolicy"];
+        const PROFILE_ENUMS: &[&str] = &["ManagedBackend", "Dialect", "BudgetPolicy", "Hardware"];
         const LITERAL_ARMS_ALLOWED: &[(&str, &str)] = &[(
             "parse_bool_token",
             "the one boolean-token vocabulary (1/true/yes/on, 0/false/no/off), not an enum setting",

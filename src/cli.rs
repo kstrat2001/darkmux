@@ -1645,7 +1645,22 @@ pub(crate) enum LabCmd {
         /// made by a darkmux since replaced.
         #[arg(long = "darkmux-version")]
         darkmux_version: Option<String>,
+        /// Which machine served the runs, for a run on an endpoint darkmux's
+        /// provider registry does not list that recorded none (before 5.9) or
+        /// the wrong one: `submitting-machine` (this machine) or `unknown`
+        /// (another machine). It corrects what the run recorded; it never
+        /// overrides an LM Studio model or a provider's host.
+        #[arg(long, value_parser = parse_hardware)]
+        hardware: Option<darkmux_types::Hardware>,
     },
+}
+
+/// (#3397) `--hardware`: one of the endpoint `hardware` values, refused
+/// otherwise (contract 9's rule: an unregistered value is never defaulted).
+fn parse_hardware(raw: &str) -> Result<darkmux_types::Hardware, String> {
+    use darkmux_types::config_enum::ConfigEnum;
+    darkmux_types::Hardware::from_token(raw)
+        .ok_or_else(|| format!("expected {}, got `{raw}`", darkmux_types::Hardware::TOKENS.join(" or ")))
 }
 
 /// `darkmux lab submit login|logout`: the upload token.

@@ -20,14 +20,38 @@ pub(crate) struct SubmitArgs {
 
 /// `lab submit`, from its parsed command line: `login` / `logout`, or a submit.
 pub(crate) fn cmd_lab_submit(cmd: LabCmd) -> Result<i32> {
-    let LabCmd::Submit { sub, runs, dry_run, out, site, replace, commit, engine, engine_backend, engine_version, quant, weights_dir, darkmux_version } = cmd
+    let LabCmd::Submit {
+        sub,
+        runs,
+        dry_run,
+        out,
+        site,
+        replace,
+        commit,
+        engine,
+        engine_backend,
+        engine_version,
+        quant,
+        weights_dir,
+        darkmux_version,
+        hardware,
+    } = cmd
     else {
         unreachable!("cmd_lab_submit takes `lab submit` only")
     };
     if let Some(sub) = sub {
         return cmd_submit_token(sub);
     }
-    let stated = submit::Stated { engine, engine_backend, engine_version, quant, weights_dir: weights_dir.map(Into::into), darkmux_version, commit };
+    let stated = submit::Stated {
+        engine,
+        engine_backend,
+        engine_version,
+        quant,
+        weights_dir: weights_dir.map(Into::into),
+        darkmux_version,
+        commit,
+        hardware,
+    };
     cmd_submit(SubmitArgs { runs, dry_run, out, site, replace, stated })
 }
 
@@ -188,6 +212,19 @@ mod tests {
             assert!(err.contains("--engine"), "{err}");
             assert!(parse(&[flag[0], flag[1], "--engine", "rec"]).is_ok(), "{} with --engine", flag[0]);
         }
+    }
+
+    /// (#3397) `--hardware` takes the two endpoint values and refuses any
+    /// other, naming both.
+    #[test]
+    fn hardware_takes_its_two_values_only() {
+        use clap::Parser;
+        let parse = |v: &str| crate::cli::Cli::try_parse_from(["darkmux", "lab", "submit", "r", "--dry-run", "--hardware", v]);
+        for ok in ["submitting-machine", "unknown"] {
+            assert!(parse(ok).is_ok(), "{ok}");
+        }
+        let err = parse("another-machine").err().expect("an unregistered value").to_string();
+        assert!(err.contains("submitting-machine or unknown") && err.contains("another-machine"), "{err}");
     }
 
     fn token() -> String {

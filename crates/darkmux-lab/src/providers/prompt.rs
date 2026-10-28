@@ -78,7 +78,10 @@ impl WorkloadProvider for PromptProvider {
         if one_call {
             write_one_call_trajectory(&dispatched.stdout, route.system_chars, prompt.chars().count(), run_dir, now_ms());
         }
-        finish_run(
+        // (#3397) Only the one-call path can send a `reasoning_effort` (a
+        // container's runtime never does), and only what it sent is recorded.
+        let effort = effort_of(&dispatched.stdout).filter(|_| one_call);
+        let result = finish_run(
             &FinishInputs {
                 loaded,
                 run_dir,
@@ -94,7 +97,9 @@ impl WorkloadProvider for PromptProvider {
                 refused: &refused,
             },
             &dispatched,
-        )
+        )?;
+        record_effort(run_dir, effort)?;
+        Ok(result)
     }
 
     fn inspect(&self, loaded: &LoadedWorkload, run_dir: &Path) -> Result<InspectionReport> {
@@ -537,6 +542,8 @@ fn write_one_call_trajectory(stdout: &str, system_chars: usize, prompt_chars: us
         ts: end_ms,
         finish_reason: metrics.get("finish_reason").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
         usage: Some(usage),
+        // (#3397) What the endpoint said answered, for `lab submit`'s `servedModel`.
+        reported_model: metrics.get("reported_model").and_then(|v| v.as_str()).map(str::to_string),
         ..Default::default()
     }));
     events.push(TrajectoryEvent::DispatchComplete(DispatchComplete {
@@ -547,6 +554,22 @@ fn write_one_call_trajectory(stdout: &str, system_chars: usize, prompt_chars: us
     }));
     let lines: Vec<String> = events.iter().filter_map(|e| serde_json::to_string(e).ok()).collect();
     let _ = fs::write(run_dir.join(darkmux_trajectory::TRAJECTORY_FILE), lines.join("\n") + "\n");
+}
+
+/// (#3397) The `reasoning_effort` a hosted one-call dispatch says it sent
+/// (`metrics.reasoning_effort`, byte for byte); `None` for any other output.
+fn effort_of(stdout: &str) -> Option<String> {
+    let envelope = serde_json::from_str::<serde_json::Value>(stdout).ok()?;
+    envelope.pointer("/metrics/reasoning_effort")?.as_str().map(str::to_string)
+}
+
+/// (#3397) Write the effort the dispatch sent into the run's manifest (run
+/// manifest 1.3, for `lab submit`); nothing when it sent none.
+fn record_effort(run_dir: &Path, effort: Option<String>) -> Result<()> {
+    let Some(effort) = effort else { return Ok(()) };
+    let mut manifest = RunManifest::read(run_dir)?;
+    manifest.effort = Some(effort);
+    manifest.write(run_dir)
 }
 
 /// The first-output marks a hosted stream can support. One mark when the
@@ -1138,6 +1161,26 @@ mod tests {
         assert!(err.contains("declares max_output_tokens 0"), "{err}");
     }
 
+    /// (#3397) The effort a run records is the one its hosted call says it
+    /// sent, byte for byte; none for any other output (a container's envelope
+    /// carries none), and nothing is written when there is none.
+    #[test]
+    fn a_run_records_only_the_effort_its_call_sent() {
+        let sent = serde_json::json!({"result": "stop", "final_assistant": "{}", "metrics": {
+            "model": "m", "endpoint": "e", "wall_ms": 1, "turns": 1, "reasoning_effort": " high "}}).to_string();
+        assert_eq!(effort_of(&sent).as_deref(), Some(" high "), "never trimmed");
+        let unsent = serde_json::json!({"result": "stop", "final_assistant": "{}", "metrics": {"model": "m"}}).to_string();
+        assert_eq!(effort_of(&unsent), None);
+        assert_eq!(effort_of("plain text"), None);
+        let tmp = TempDir::new().unwrap();
+        RunManifest { ok: Some(true), ..RunManifest::default() }.write(tmp.path()).unwrap();
+        record_effort(tmp.path(), None).unwrap();
+        assert_eq!(RunManifest::read(tmp.path()).unwrap().effort, None);
+        record_effort(tmp.path(), Some("low".into())).unwrap();
+        let m = RunManifest::read(tmp.path()).unwrap();
+        assert_eq!((m.effort.as_deref(), m.ok), (Some("low"), Some(true)), "the rest of the manifest is kept");
+    }
+
     /// A one-call run writes the trajectory of its one call, from the counts
     /// the call itself reported, so `run stats` and `lab submit` can read it.
     #[test]
@@ -1157,6 +1200,16 @@ mod tests {
         assert_eq!((start.model.as_str(), start.system_chars, start.prompt_chars, start.ts), ("m", 5_700, 21_000, 1_000_000 - 13_100));
         let complete = fold.complete.as_ref().unwrap();
         assert_eq!((complete.result.as_str(), complete.wall_ms), ("stop", 13_100));
+        let text = fs::read_to_string(tmp.path().join(darkmux_trajectory::TRAJECTORY_FILE)).unwrap();
+        assert_eq!(crate::lab::manifest::served_model_in(&text), None, "the envelope named no answering model");
+        let served = TempDir::new().unwrap();
+        let named = serde_json::json!({"result": "stop", "final_assistant": "{}", "metrics": {
+            "model": "claude-haiku", "endpoint": "e", "wall_ms": 100, "turns": 1, "reported_model": "claude-haiku-4-5-20251001",
+            "prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}})
+        .to_string();
+        write_one_call_trajectory(&named, 1, 1, served.path(), 1_000_000);
+        let text = fs::read_to_string(served.path().join(darkmux_trajectory::TRAJECTORY_FILE)).unwrap();
+        assert_eq!(crate::lab::manifest::served_model_in(&text).as_deref(), Some("claude-haiku-4-5-20251001"), "(#3397) the reply's model");
         let stats = crate::lab::stats::compute_from_dir(tmp.path(), &tmp.path().join("flows")).expect("the run's numbers can be read");
         // The call is one stream, start to end, so the run has a rate and
         // reconciles: no rate means `lab submit` uploads tokensPerSecond null.

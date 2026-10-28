@@ -54,6 +54,9 @@ fn stack() -> Stack {
         cpu_cores: vec![("Super".into(), 6), ("Performance".into(), 12)],
         gpu_cores: Some(40),
         model_id: Some("Mac17,7".into()),
+        hardware: darkmux_types::Hardware::SubmittingMachine,
+        served_model: None,
+        effort: None,
     }
 }
 
@@ -640,6 +643,7 @@ fn what_the_operator_states_stands_in_for_what_the_machine_cannot_say() {
         weights_dir: Some(b.weights.clone()),
         darkmux_version: Some("5.3.0".into()),
         commit: Some(git(&b.fixture, &["rev-parse", "--short", "HEAD"])),
+        hardware: None,
     };
     let (built, _) = b.gather(&b.machine(Some(b.provenance())), &runs, &stated).unwrap();
     let r1 = &built.bundle["runs"][0];
@@ -707,7 +711,26 @@ fn small_readers_say_none_rather_than_guess() {
     let mut all = stack();
     all.weights_hash = Some("h".into());
     assert_eq!(all.unreported(), vec!["kvCacheDtype"]);
-    assert_eq!(Stack::default().unreported().len(), 13);
+    let none = Stack {
+        chip: "Apple M2".into(),
+        ram_gb: None,
+        accelerator: None,
+        os: None,
+        engine: None,
+        engine_backend: None,
+        engine_version: None,
+        model: None,
+        weights_hash: None,
+        quant: None,
+        context_length: None,
+        cpu_cores: Vec::new(),
+        gpu_cores: None,
+        model_id: None,
+        hardware: darkmux_types::Hardware::Unknown,
+        served_model: None,
+        effort: None,
+    };
+    assert_eq!(none.unreported().len(), 13);
 }
 
 #[test]
@@ -894,4 +917,343 @@ fn an_eval_document_path_is_plain_names_inside_the_eval_dir() {
     for bad in ["eval/../secret.json", "eval/workloads/pg.txt", "other/pg.json", "eval/my doc.json", "/eval/pg.json", "eval/./pg.json", "pg.json"] {
         assert!(!super::is_eval_document(bad, "eval"), "{bad}");
     }
+}
+
+/// (#3397) The bundles `lab submit` writes for runs served on the submitting
+/// machine (LM Studio), one without criteria (format 5) and one with (format
+/// 6), as the text `deliver` writes and uploads.
+fn submitting_machine_bundles() -> [(String, &'static str); 2] {
+    let ran_by = RanBy { version: Some("5.8.0".into()), commit: Some("abc1234".into()), build: Some("release".into()) };
+    let with_workload = |mut run: Value| {
+        run["workloadPath"] = json!("eval/workloads/w.json");
+        run["workloadSha256"] = json!("b".repeat(64));
+        run
+    };
+    let fixture = json!({ "name": "webhook-forgery", "version": "1.2", "eval_dir": "eval" });
+    let plain = with_workload(bundle_run("plain-p-1761120000-1", &manifest(), &stats(), &ran_by, &stack(), &[]));
+    let mut m = manifest();
+    m["verify"]["grade"] = json!({"passed": true, "checks": [], "criteria": [{"id": "raw-body", "passed": true}]});
+    let graded = with_workload(bundle_run("graded-p-1761120000-2", &m, &stats(), &ran_by, &stack(), &[]));
+    let text = |runs: Vec<Value>| {
+        serde_json::to_string_pretty(&assemble("kstrat2001/webhook-forgery-eval", &"a".repeat(40), &fixture, runs).unwrap()).unwrap() + "\n"
+    };
+    [
+        (text(vec![plain.clone()]), include_str!("golden/submitting_machine_v5.json")),
+        (text(vec![graded, plain]), include_str!("golden/submitting_machine_v6.json")),
+    ]
+}
+
+/// (#3397) A bundle whose runs were all served on the submitting machine is
+/// byte for byte what main wrote before `hardware` existed (the goldens were
+/// written by 666395b39), so a site that reads formats up to 6 keeps taking it.
+#[test]
+fn a_submitting_machine_bundle_is_byte_for_byte_what_main_wrote() {
+    for (i, (now, then)) in submitting_machine_bundles().iter().enumerate() {
+        assert_eq!(now, then, "bundle {i}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (#3397) Which machine served a run
+// ---------------------------------------------------------------------------
+
+use crate::lab::manifest::{HardwareFrom, ModelHardware};
+use darkmux_types::Hardware::{SubmittingMachine, Unknown};
+
+fn snap(model: &str, from: HardwareFrom, hardware: Option<darkmux_types::Hardware>) -> ModelHardware {
+    ModelHardware {
+        model: model.into(),
+        identifier: None,
+        from,
+        hardware,
+        provider: (from == HardwareFrom::Provider).then(|| "Anthropic API".to_string()),
+        endpoint: (from != HardwareFrom::Managed).then(|| "studio".to_string()),
+    }
+}
+
+fn profile_model(json: Value) -> darkmux_types::ProfileModel {
+    let mut reg: darkmux_types::ProfileRegistry = serde_json::from_value(json!({
+        "profiles": {"p": {"models": [json]}},
+        "endpoints": {"claude": {"url": "https://api.anthropic.com/v1"}, "studio": {"url": "http://studio.local:8080/v1", "hardware": "unknown"},
+            "spoof": {"url": "https://api%2eanthropic.com/v1", "hardware": "submitting-machine"}}
+    }))
+    .unwrap();
+    reg.materialize_endpoints();
+    reg.profiles["p"].models[0].clone()
+}
+
+/// The precedence, decided once: what darkmux knows on its own (a managed
+/// model, a host on the provider registry) is fixed and a flag that
+/// contradicts it is refused; for any other endpoint `--hardware` wins over
+/// the run's snapshot (it corrects a wrong one), the snapshot stands in for
+/// no flag, and with neither the run is refused. A run recorded before the
+/// snapshot falls back to the registry for a managed model or a listed host
+/// only, never to an endpoint's declaration as it is now.
+#[test]
+fn hardware_precedence_is_registry_then_flag_then_snapshot() {
+    let flint = [snap("flint", HardwareFrom::Endpoint, Some(SubmittingMachine))];
+    let at = |s: Option<&[ModelHardware]>, cur: Option<&darkmux_types::ProfileModel>, flag| served_by("r1", "flint", s, cur, flag);
+    assert_eq!(at(Some(&flint), None, None).unwrap().hardware, SubmittingMachine, "the snapshot with no flag");
+    let corrected = at(Some(&flint), None, Some(Unknown)).unwrap();
+    assert_eq!((corrected.hardware, corrected.corrected), (Unknown, Some(SubmittingMachine)), "the flag corrects the snapshot");
+    let undeclared = [snap("flint", HardwareFrom::Endpoint, None)];
+    assert_eq!(at(Some(&undeclared), None, Some(SubmittingMachine)).unwrap().hardware, SubmittingMachine, "the flag supplies it");
+    let refused = at(Some(&undeclared), None, None).unwrap_err();
+    assert!(refused.starts_with("r1: "), "{refused}");
+    for says in ["--hardware submitting-machine", "--hardware unknown", r#""hardware""#, "endpoints.studio"] {
+        assert!(refused.contains(says), "names what to set ({says}): {refused}");
+    }
+    // (#3399 review) Never downgrade: a run recorded `unknown` is not made the submitting machine's.
+    let recorded_elsewhere = [snap("flint", HardwareFrom::Endpoint, Some(Unknown))];
+    let down = at(Some(&recorded_elsewhere), None, Some(SubmittingMachine)).unwrap_err();
+    assert!(down.starts_with("r1: ") && down.contains("never the reverse"), "{down}");
+    assert!(down.contains("`studio`"), "names the endpoint: {down}");
+    assert_eq!(at(Some(&recorded_elsewhere), None, Some(Unknown)).unwrap().hardware, Unknown);
+    // (#3399 review) A host darkmux cannot read takes no answer, not even a flag.
+    let spoof = profile_model(json!({"id": "flint", "endpoint": "spoof"}));
+    let e = at(None, Some(&spoof), Some(SubmittingMachine)).unwrap_err();
+    assert!(e.starts_with("r1: ") && e.contains("cannot read the host") && e.contains("percent-encoded"), "{e}");
+
+    // Fixed: a provider host and a managed model, from the snapshot.
+    let claude = [snap("flint", HardwareFrom::Provider, Some(Unknown))];
+    let by = at(Some(&claude), None, None).unwrap();
+    assert_eq!((by.hardware, by.provider.as_deref()), (Unknown, Some("Anthropic API")));
+    assert_eq!(at(Some(&claude), None, Some(Unknown)).unwrap().hardware, Unknown, "a flag that agrees is fine");
+    let e = at(Some(&claude), None, Some(SubmittingMachine)).unwrap_err();
+    assert!(e.contains("Anthropic API") && e.contains("--hardware submitting-machine"), "{e}");
+    assert!(e.contains("in another without it"), "names the two-submit way through: {e}");
+    let managed = [snap("flint", HardwareFrom::Managed, Some(SubmittingMachine))];
+    assert!(at(Some(&managed), None, None).unwrap().lmstudio);
+    assert!(at(Some(&managed), None, Some(Unknown)).unwrap_err().contains("LM Studio"));
+
+    // Before the snapshot: the registry's provider row or a managed model, never a declaration read now.
+    let old_claude = profile_model(json!({"id": "flint", "endpoint": "claude"}));
+    assert_eq!(at(None, Some(&old_claude), None).unwrap().provider.as_deref(), Some("Anthropic API"));
+    let old_studio = profile_model(json!({"id": "flint", "endpoint": "studio"}));
+    assert!(at(None, Some(&old_studio), None).is_err(), "today's `hardware` was not the run's");
+    assert_eq!(at(None, Some(&old_studio), Some(Unknown)).unwrap().hardware, Unknown);
+    let old_local = profile_model(json!({"id": "flint", "n_ctx": 1}));
+    assert!(at(None, Some(&old_local), None).unwrap().lmstudio);
+    assert!(at(None, None, None).unwrap().lmstudio, "a model no registry lists reads as LM Studio's, as before");
+    // A model matched by its identifier.
+    let mut by_identifier = snap("flint-id", HardwareFrom::Endpoint, Some(Unknown));
+    by_identifier.identifier = Some("flint".into());
+    assert_eq!(at(Some(&[by_identifier]), None, None).unwrap().hardware, Unknown);
+}
+
+/// (macOS) The GPU cross-check flags a claim the run's own GPU reading
+/// disagrees with, both ways, and says nothing when the reading agrees or
+/// when there is none.
+#[test]
+fn the_gpu_cross_check_flags_a_disagreeing_claim_and_is_silent_without_a_reading() {
+    let busy = json!({"samples_busy": 40, "gpu_duty_pct": 87.5});
+    let idle = json!({"samples_busy": 0, "samples_idle": 12, "gpu_duty_pct": 0.0});
+    let no_gpu = json!({"samples_busy": 3});
+    let e = hardware_check(Unknown, &busy).expect("busy while stated elsewhere");
+    assert!(e.contains("unknown") && e.contains("87.5%"), "{e}");
+    let e = hardware_check(SubmittingMachine, &idle).expect("idle while stated here");
+    assert!(e.contains("submitting-machine") && e.contains("idle"), "{e}");
+    assert_eq!(hardware_check(SubmittingMachine, &busy), None);
+    assert_eq!(hardware_check(Unknown, &idle), None);
+    assert_eq!(hardware_check(Unknown, &no_gpu), None, "no GPU reading (Omarchy), no note");
+    assert_eq!(hardware_check(SubmittingMachine, &json!({})), None, "no telemetry, no note");
+}
+
+/// Format 7 only when a run's hardware is unknown, and then every run says
+/// which; otherwise the key is left out and the version is what it was.
+/// The URL and host are never in the bundle.
+#[test]
+fn format_7_only_when_a_runs_hardware_is_unknown() {
+    let mut elsewhere = stack();
+    elsewhere.hardware = Unknown;
+    elsewhere.engine = Some("Anthropic API".into());
+    let with_workload = |mut run: Value| {
+        run["workloadPath"] = json!("eval/workloads/w.json");
+        run["workloadSha256"] = json!("b".repeat(64));
+        run
+    };
+    let far = with_workload(bundle_run("far", &manifest(), &stats(), &RanBy::default(), &elsewhere, &[]));
+    let here = with_workload(bundle_run("here", &manifest(), &stats(), &RanBy::default(), &stack(), &[]));
+    let fixture = json!({ "name": "webhook-forgery", "version": "1.2" });
+    let seven = assemble("kstrat2001/webhook-forgery-eval", &"a".repeat(40), &fixture, vec![far, here.clone()]).unwrap();
+    assert_eq!(seven["formatVersion"], 7);
+    assert_eq!((&seven["runs"][0]["stack"]["hardware"], &seven["runs"][1]["stack"]["hardware"]), (&json!("unknown"), &json!("submitting-machine")));
+    assert!(seven["runs"][1].get("criteria").is_some_and(Value::is_null), "7 carries what 6 does");
+    assert_eq!(site_refusals(&seven), Vec::<String>::new());
+    let five = assemble("kstrat2001/webhook-forgery-eval", &"a".repeat(40), &fixture, vec![here]).unwrap();
+    assert_eq!(five["formatVersion"], 5);
+    assert!(five["runs"][0]["stack"].get("hardware").is_none());
+}
+
+/// `site_refusals` holds `stack.hardware` to the site's reading: one of the
+/// two values in format 7, and no key at all below it.
+#[test]
+fn the_site_takes_hardware_only_in_format_7_and_only_its_two_values() {
+    let mut elsewhere = stack();
+    elsewhere.hardware = Unknown;
+    let run = bundle_run("far", &manifest(), &stats(), &RanBy::default(), &elsewhere, &[]);
+    let fixture = json!({ "name": "pepper-grinder", "version": "2" });
+    let mut seven = assemble("kstrat2001/pepper-grinder", &"a".repeat(40), &fixture, vec![run]).unwrap();
+    seven["runs"][0]["stack"]["hardware"] = json!("another-machine");
+    assert!(site_refusals(&seven).iter().any(|r| r.starts_with("runs[0].stack.hardware")), "{:?}", site_refusals(&seven));
+    seven["runs"][0]["stack"].as_object_mut().unwrap().remove("hardware");
+    assert!(site_refusals(&seven).iter().any(|r| r.starts_with("runs[0].stack.hardware")), "required in 7");
+    seven["formatVersion"] = json!(6);
+    seven["runs"][0]["stack"]["hardware"] = json!("unknown");
+    assert!(site_refusals(&seven).iter().any(|r| r.starts_with("runs[0].stack.hardware")), "unknown below 7");
+    seven["formatVersion"] = json!(8);
+    seven["runs"][0]["stack"].as_object_mut().unwrap().remove("hardware");
+    assert!(site_refusals(&seven).iter().any(|r| r.starts_with("formatVersion")), "{:?}", site_refusals(&seven));
+}
+
+/// End to end: a run on a provider host is sent as format 7 with the
+/// provider as its engine and no LM Studio or weights reading; a run on an
+/// unlisted endpoint that recorded its hardware keeps it; one that recorded
+/// none is refused naming what to set, and submits with --hardware. The
+/// host never reaches the bundle.
+#[test]
+fn a_run_on_an_endpoint_submits_where_it_was_served_and_never_its_host() {
+    let b = bench();
+    let haiku = b.run("haiku", "claude-haiku-4-5", json!({"model_hardware": [
+        {"model": "claude-haiku-4-5", "from": "provider", "hardware": "unknown", "provider": "Anthropic API", "endpoint": "claude"}]}));
+    let (built, said) = b.gather(&b.machine(None), std::slice::from_ref(&haiku), &Stated::default()).unwrap();
+    assert!(said.is_empty(), "nothing hashed for a provider's model: {said:?}");
+    assert_eq!(built.bundle["formatVersion"], 7);
+    let stack = &built.bundle["runs"][0]["stack"];
+    assert_eq!((stack["hardware"].as_str(), stack["engine"].as_str()), (Some("unknown"), Some("Anthropic API")));
+    for k in ["engineBackend", "engineVersion", "quant", "weightsHash"] {
+        assert!(stack[k].is_null(), "{k}: {stack}");
+    }
+    assert_eq!(stack["chip"], "Apple M2", "the submitting machine's fields are still sent");
+    assert!(!built.notes[0].contains("pass --engine") && !built.notes[0].contains("--weights-dir"), "{}", built.notes[0]);
+    assert!(built.notes.iter().any(|n| n.contains("format 7")), "{:?}", built.notes);
+    let text = serde_json::to_string_pretty(&built.bundle).unwrap();
+    assert!(!text.contains("anthropic.com") && !text.contains("\"claude\""), "no host and no endpoint id: {text}");
+
+    let mut registry = b.machine(None);
+    registry.registry = serde_json::from_value(json!({"profiles": {"p": {"models": [{"id": "flint", "endpoint": "studio"}]}},
+        "endpoints": {"studio": {"url": "http://studio.local:8080/v1", "hardware": "submitting-machine"}}})).ok();
+    if let Some(r) = registry.registry.as_mut() {
+        r.materialize_endpoints();
+    }
+    let declared = b.run("flint-declared", "flint", json!({"model_hardware": [
+        {"model": "flint", "from": "endpoint", "hardware": "unknown", "endpoint": "studio"}]}));
+    let (built, _) = b.gather(&registry, std::slice::from_ref(&declared), &Stated::default()).unwrap();
+    assert_eq!(built.bundle["runs"][0]["stack"]["hardware"], "unknown", "the snapshot, not today's declaration");
+    assert!(!serde_json::to_string(&built.bundle).unwrap().contains("studio"), "no host or endpoint id");
+
+    let old = b.run("flint-old", "flint", json!({}));
+    let e = b.gather(&registry, std::slice::from_ref(&old), &Stated::default()).unwrap_err().to_string();
+    assert!(e.contains("flint-old: ") && e.contains("--hardware") && e.contains("endpoints.studio"), "{e}");
+    let (built, _) = b.gather(&registry, &[old], &Stated { hardware: Some(SubmittingMachine), ..Default::default() }).unwrap();
+    assert_eq!(built.bundle["formatVersion"], 5, "all on the submitting machine: no hardware key, the old format");
+    assert!(built.bundle["runs"][0]["stack"].get("hardware").is_none());
+
+    let e = b.gather(&b.machine(None), std::slice::from_ref(&haiku), &Stated { engine: Some("rec".into()), ..Default::default() }).unwrap_err().to_string();
+    assert!(e.contains("Anthropic API") && e.contains("--engine"), "{e}");
+    // (#3399 review) --engine-backend is refused the same way, never dropped.
+    let backend = Stated { engine_backend: Some("metal".into()), ..Default::default() };
+    let e = b.gather(&b.machine(None), &[haiku], &backend).unwrap_err().to_string();
+    assert!(e.contains("Anthropic API") && e.contains("--engine-backend"), "{e}");
+
+    // (#3399 review) Non-vacuous: a run recorded before the snapshot reads its
+    // endpoint from the registry, whose URL holds the provider's host and a
+    // credential; neither reaches the bundle.
+    let mut by_url = b.machine(None);
+    by_url.registry = serde_json::from_value(json!({"profiles": {"p": {"models": [{"id": "claude-haiku-4-5", "endpoint": "claude"}]}},
+        "endpoints": {"claude": {"url": "https://tok@api.anthropic.com/v1"}}})).ok();
+    if let Some(r) = by_url.registry.as_mut() {
+        r.materialize_endpoints();
+    }
+    let old_haiku = b.run("old-haiku", "claude-haiku-4-5", json!({}));
+    let (built, _) = b.gather(&by_url, &[old_haiku], &Stated::default()).unwrap();
+    let stack = &built.bundle["runs"][0]["stack"];
+    assert_eq!((stack["hardware"].as_str(), stack["engine"].as_str()), (Some("unknown"), Some("Anthropic API")));
+    let text = serde_json::to_string_pretty(&built.bundle).unwrap();
+    assert!(!text.contains("anthropic.com") && !text.contains("tok@") && !text.contains("\"claude\""), "{text}");
+}
+
+/// (#3397) Format 7's three stack keys ride on EVERY run, the submitting
+/// machine's too; `site_refusals` holds them to the site's `hardwareFields`:
+/// present in 7 (null allowed), `servedModel` a stack string of at most 200,
+/// `effort` of at most 20, and none of them below 7.
+#[test]
+fn every_run_of_a_format_7_carries_all_three_keys_and_the_site_holds_them() {
+    let mut elsewhere = stack();
+    elsewhere.hardware = Unknown;
+    elsewhere.served_model = Some("claude-haiku-4-5-20251001".into());
+    elsewhere.effort = Some("high".into());
+    let far = bundle_run("far", &manifest(), &stats(), &RanBy::default(), &elsewhere, &[]);
+    let here = bundle_run("here", &manifest(), &stats(), &RanBy::default(), &stack(), &[]);
+    let fixture = json!({ "name": "pepper-grinder", "version": "2" });
+    let seven = assemble("kstrat2001/pepper-grinder", &"a".repeat(40), &fixture, vec![far, here]).unwrap();
+    assert_eq!(seven["formatVersion"], 7);
+    let (a, b) = (&seven["runs"][0]["stack"], &seven["runs"][1]["stack"]);
+    assert_eq!((&a["servedModel"], &a["effort"]), (&json!("claude-haiku-4-5-20251001"), &json!("high")));
+    for k in ["hardware", "servedModel", "effort"] {
+        assert!(b.get(k).is_some(), "the submitting machine's run carries {k} too: {b}");
+    }
+    assert_eq!(site_refusals(&seven), Vec::<String>::new());
+    let refused = |mutate: &dyn Fn(&mut Value)| {
+        let mut v = seven.clone();
+        mutate(&mut v);
+        site_refusals(&v)
+    };
+    let r = refused(&|v| {
+        v["runs"][1]["stack"].as_object_mut().unwrap().remove("servedModel");
+    });
+    assert!(r.iter().any(|e| e.starts_with("runs[1].stack.servedModel: missing")), "{r:?}");
+    let r = refused(&|v| v["runs"][0]["stack"]["effort"] = json!("x".repeat(21)));
+    assert!(r.iter().any(|e| e.starts_with("runs[0].stack.effort: longer than 20")), "{r:?}");
+    let r = refused(&|v| v["runs"][0]["stack"]["servedModel"] = json!("two  spaces"));
+    assert!(r.iter().any(|e| e.starts_with("runs[0].stack.servedModel")), "{r:?}");
+    // (#3399 review) The site's `noLinks`, on every stack string darkmux mirrors.
+    for (k, v) in [("servedModel", "qwen3-30b@q4_k_m.gguf"), ("model", "www.example-model"), ("engine", "org@model.ai")] {
+        let r = refused(&|b| b["runs"][0]["stack"][k] = json!(v));
+        assert!(r.iter().any(|e| e.starts_with(&format!("runs[0].stack.{k}: looks like a link"))), "{k}: {r:?}");
+    }
+    let r = refused(&|v| {
+        v["formatVersion"] = json!(6);
+        for run in v["runs"].as_array_mut().unwrap() {
+            run["stack"].as_object_mut().unwrap().remove("hardware");
+        }
+    });
+    assert!(r.iter().any(|e| e.starts_with("runs[0].stack.servedModel: unknown key")), "{r:?}");
+}
+
+/// (#3397) A served model or effort the site would refuse is sent as null,
+/// with the reason, never failing the bundle; the `darkmux:` namespace is
+/// darkmux's own and never part of the served model.
+#[test]
+fn a_served_model_or_effort_the_site_refuses_is_null_with_the_reason() {
+    let mut why = Vec::new();
+    assert_eq!(stack_string("effort", Some("high".into()), MAX_EFFORT, &mut why).as_deref(), Some("high"));
+    assert_eq!(stack_string("effort", Some("x".repeat(21)), MAX_EFFORT, &mut why), None);
+    assert_eq!(stack_string("effort", Some("x".repeat(20)), MAX_EFFORT, &mut why).as_deref(), Some("x".repeat(20).as_str()));
+    assert_eq!(stack_string("servedModel", Some("see https://x.example".into()), 200, &mut why), None);
+    assert_eq!(stack_string("servedModel", Some("/Users/kain/model".into()), 200, &mut why), None);
+    assert_eq!(stack_string("servedModel", None, 200, &mut why), None);
+    assert_eq!(why.len(), 3, "{why:?}");
+    // (#3399 review) The site's `noLinks`: an email-shaped or `www.` name is refused there, so null here.
+    for link in ["qwen3-30b@q4_k_m.gguf", "org@model.ai", "www.example-model", "WWW.example"] {
+        assert_eq!(stack_string("servedModel", Some(link.into()), 200, &mut why), None, "{link}");
+    }
+    assert_eq!(stack_string("servedModel", Some("qwen3@4bit".into()), 200, &mut why).as_deref(), Some("qwen3@4bit"), "no domain after the @");
+    assert!(why[0].starts_with("effort is not in the form the site takes"), "{why:?}");
+}
+
+/// End to end: a provider run records its served model and effort, and a
+/// mixed bundle sends all three keys on the local run too.
+#[test]
+fn a_provider_run_sends_its_served_model_and_effort_beside_a_local_run() {
+    let b = bench();
+    let haiku = b.run("haiku", "claude-haiku-4-5", json!({"served_model": "claude-haiku-4-5-20251001", "effort": "high", "model_hardware": [
+        {"model": "claude-haiku-4-5", "from": "provider", "hardware": "unknown", "provider": "Anthropic API"}]}));
+    let local = b.run("local", "darkmux:m1", json!({"served_model": "darkmux:m1"}));
+    let (built, _) = b.gather(&b.machine(Some(b.provenance())), &[haiku, local], &Stated::default()).unwrap();
+    assert_eq!(built.bundle["formatVersion"], 7);
+    let (far, here) = (&built.bundle["runs"][0]["stack"], &built.bundle["runs"][1]["stack"]);
+    assert_eq!((far["servedModel"].as_str(), far["effort"].as_str()), (Some("claude-haiku-4-5-20251001"), Some("high")));
+    assert_eq!((here["hardware"].as_str(), here["servedModel"].as_str()), (Some("submitting-machine"), Some("m1")), "the namespace is darkmux's");
+    assert!(here.get("effort").is_some_and(Value::is_null), "{here}");
 }

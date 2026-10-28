@@ -380,7 +380,9 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    hand-rolled string-literal token match at a config accessor. Its limit: a string compared
    with `==` against a literal outside those files is not seen, and stays a review question. `docs/ENVIRONMENT.md`'s value lists are drift-tested
    against the registry. Per-endpoint `profiles.json` enums (`managed`, `dialect`) share the
-   `ConfigEnum` value tables but keep their own refuse-at-use path through `Lenient<T>`.
+   `ConfigEnum` value tables but keep their own refuse-at-use path through `Lenient<T>`;
+   `limits.policy` and `hardware` (#3397) are read the same way and refused at every dispatching
+   preflight (`config_enum::bad_endpoint_budget_policies`, `bad_endpoint_hardware`).
 
 Enforcement is structural, not procedural: every contract gets a conformance test where one
 is expressible (golden files, emission-sequence assertions, boundary tests), and every review

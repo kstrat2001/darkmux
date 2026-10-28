@@ -24,6 +24,9 @@ pub(crate) struct Script {
     pub(crate) run_err_on_call: Option<u32>,
     /// The runtime's `escalation_*` result the scripted dispatch ends with.
     pub(crate) escalation: Option<String>,
+    /// A file the scripted dispatch rewrites while it runs, and its new text
+    /// (the operator editing `profiles.json` mid-run).
+    pub(crate) rewrite: Option<(std::path::PathBuf, String)>,
 }
 
 static SCRIPT: Mutex<Option<Script>> = Mutex::new(None);
@@ -75,6 +78,9 @@ impl WorkloadProvider for ScriptedProvider {
         }
         if s.run_err {
             return Err(anyhow!("scripted run failure"));
+        }
+        if let Some((path, text)) = &s.rewrite {
+            fs::write(path, text)?;
         }
         // Which call wrote this dir, so a test can tell whose artifacts it holds.
         let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -780,4 +786,32 @@ fn a_profile_with_nothing_on_lm_studio_is_not_checked_against_it() {
     }
     assert_eq!(unmanaged, Vec::<String>::new());
     assert!(managed.iter().any(|w| w.contains("could not verify")), "a managed profile still is: {managed:?}");
+}
+
+/// (#3397) A run records which machine served each model of its profile as
+/// the registry said when it STARTED: an endpoint edited while the run is
+/// going (or after) never rewrites it, and a managed model is the
+/// submitting machine.
+#[test]
+#[serial_test::serial]
+fn a_run_snapshots_each_models_hardware_when_it_starts() {
+    let profiles = |hardware: &str| {
+        format!(
+            r#"{{"default_profile":"fast","profiles":{{"fast":{{"models":[{{"id":"model-a","n_ctx":32000}},{{"id":"flint","endpoint":"studio"}}]}}}},
+                "endpoints":{{"studio":{{"url":"http://studio.local:8080/v1","hardware":"{hardware}"}}}}}}"#
+        )
+    };
+    let docs = [serde_json::json!({ "id": "hw", "provider": SCRIPTED, "prompt": "hi" })];
+    let lab = Lab::new(&profiles("unknown"), &docs);
+    let edit = (std::path::PathBuf::from(&lab.profiles), profiles("submitting-machine"));
+    script(Script { ok: true, write_manifest: true, rewrite: Some(edit), ..Default::default() });
+    let o = lab.run("hw", 1).unwrap().remove(0);
+    let snap = &manifest(&o)["model_hardware"];
+    assert_eq!(snap[0], serde_json::json!({"model": "model-a", "from": "managed", "hardware": "submitting-machine"}), "{snap}");
+    assert_eq!(
+        snap[1],
+        serde_json::json!({"model": "flint", "from": "endpoint", "hardware": "unknown", "endpoint": "studio"}),
+        "the value when the run started, not the edit made while it ran: {snap}"
+    );
+    assert_eq!(manifest(&o)["manifest_schema_version"], serde_json::Value::Null, "the scripted provider stamps none");
 }

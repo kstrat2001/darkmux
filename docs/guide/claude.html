@@ -55,6 +55,7 @@
               30m; calls run one at a time (no limits.concurrent_calls); budget wait, early
               warning at 80%: spent 38492046 tokens in 1613 calls over the last 30d</code></pre>
     <p><code>messages</code> is the part that matters. You do not declare it: an endpoint on <code>api.anthropic.com</code> with no <code>dialect</code> gets it. Declaring another dialect there sends the OpenAI-compatible layer, which neither caches nor reports caching, and <code>doctor</code> warns with the edit to undo it.</p>
+    <p>darkmux knows the host from its built-in provider registry, the one table that also tells <code>lab submit</code> a run there was served by Anthropic: its hardware is <code>unknown</code> and its engine is <code>Anthropic API</code>. You do not declare <code>hardware</code> on this endpoint, and <code>doctor</code>'s line names the provider beside the host.</p>
   </div>
 </section>
 

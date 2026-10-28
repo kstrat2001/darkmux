@@ -60,9 +60,6 @@ pub enum ManagedBackend {
     /// LM Studio, loaded and unloaded through `lms`.
     Lmstudio,
 }
-/// (#3173) The host whose endpoints default to [`Dialect::Messages`].
-pub const ANTHROPIC_API_HOST: &str = "api.anthropic.com";
-
 
 /// The request shape an endpoint accepts. Both are OpenAI-compatible chat
 /// completions; they differ in the fields around the messages, which are
@@ -128,6 +125,74 @@ crate::config_enum!(Dialect, "endpoint dialect", [
     Messages = "messages" =>
         "Anthropic's native Messages API at `{url}/messages`, with prompt caching (Claude endpoints)",
 ]);
+
+/// (#3397) Which machine served an unmanaged endpoint's runs, as far as
+/// darkmux can vouch: the one that submits them, or one whose hardware it
+/// does not know. Declared per endpoint (`"hardware"`) for every `url`
+/// endpoint whose host the built-in provider registry
+/// ([`crate::provider`]) does not list; a listed host is always `unknown`,
+/// and a managed (LM Studio) endpoint always the submitting machine.
+/// darkmux never infers it from the address: the same Mac can serve a model
+/// to itself on one port and to another machine on the next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum Hardware {
+    /// The machine that submits the run served it: its chip, memory and
+    /// power figures are the run's own.
+    SubmittingMachine,
+    /// Another machine served it (a provider's, or another Mac): the
+    /// submitting machine's figures describe a waiting client.
+    Unknown,
+}
+
+crate::config_enum!(Hardware, "endpoint hardware", [
+    SubmittingMachine = "submitting-machine" =>
+        "this machine serves the endpoint, so a run's hardware figures are its own",
+    Unknown = "unknown" =>
+        "another machine serves it (a provider, or another Mac), so its hardware is not known",
+]);
+
+impl Hardware {
+    /// The `serde` spelling, for a bundle and a message.
+    pub fn as_str(self) -> &'static str {
+        crate::config_enum::ConfigEnum::token(self)
+    }
+}
+
+/// (#3397) How darkmux knows which machine served an endpoint's runs. The
+/// one classification: the lab run's snapshot and `lab submit` both read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HardwareBasis {
+    /// A managed (LM Studio) endpoint: always the submitting machine.
+    Managed,
+    /// An unmanaged endpoint on a host the built-in registry lists: always
+    /// `unknown`, served by this provider.
+    Provider(&'static crate::provider::Provider),
+    /// Any other unmanaged endpoint, which declares `hardware`.
+    Declared(Hardware),
+    /// Any other unmanaged endpoint that declares none (or a value this
+    /// darkmux does not know, which preflight refuses).
+    Undeclared,
+    /// An endpoint darkmux cannot use as written (`kind()` refuses it).
+    Unusable,
+    /// (#3399 review) An unmanaged endpoint whose host darkmux cannot read
+    /// unambiguously ([`readable_host`]): a client may reach a provider there
+    /// that darkmux would not see, so it fixes no answer, the declaration is
+    /// never taken, and every dispatching preflight refuses the endpoint.
+    UnreadableHost,
+}
+
+impl HardwareBasis {
+    /// The hardware it fixes, when it fixes one.
+    pub fn hardware(self) -> Option<Hardware> {
+        match self {
+            HardwareBasis::Managed => Some(Hardware::SubmittingMachine),
+            HardwareBasis::Provider(_) => Some(Hardware::Unknown),
+            HardwareBasis::Declared(h) => Some(h),
+            HardwareBasis::Undeclared | HardwareBasis::Unusable | HardwareBasis::UnreadableHost => None,
+        }
+    }
+}
 
 /// (#2902 step 5) What darkmux does when an endpoint's budget is reached.
 /// Registered on the #2947 `ConfigEnum` rule: an unregistered value is
@@ -536,6 +601,12 @@ pub struct ModelEndpoint {
     /// are enforced).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<Lenient<UsageLimits>>,
+    /// (#3397) Which machine serves this endpoint (see [`Hardware`]): for a
+    /// `url` endpoint whose host the built-in provider registry does not
+    /// list. A lab run snapshots it when it starts. Read leniently: an
+    /// unknown value is kept and refused by name at preflight (contract 9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware: Option<Lenient<Hardware>>,
     /// How this value was written. Runtime-only.
     #[serde(skip)]
     pub source: EndpointSource,
@@ -678,22 +749,52 @@ impl ModelEndpoint {
         }
     }
 
-    /// (#3173) An unmanaged endpoint on `api.anthropic.com` that declares no
-    /// dialect is sent Anthropic's native Messages API: the OpenAI-compatible
-    /// layer there neither caches nor reports caching, so every agent-loop
-    /// turn would pay full input price for the whole conversation again. The
-    /// host is matched exactly, never as a prefix. A declared dialect wins.
+    /// (#3173) An unmanaged endpoint that declares no dialect, on a host
+    /// whose provider defaults one (Anthropic's: the OpenAI-compatible layer
+    /// there neither caches nor reports caching, so every agent-loop turn
+    /// would pay full input price for the whole conversation again), speaks
+    /// that provider's dialect. The host is matched through the one
+    /// registry ([`crate::provider`]), never as a prefix. A declared dialect
+    /// wins.
     fn speaks_messages_by_host(&self) -> bool {
-        self.dialect.is_none() && self.is_anthropic_host()
+        self.dialect.is_none() && self.provider().is_some_and(|p| p.default_dialect == Some(Dialect::Messages))
     }
 
-    /// (#3173) True when this unmanaged endpoint's host is
-    /// [`ANTHROPIC_API_HOST`], however the URL spells it: any case, an
-    /// explicit port, a trailing dot. Exact otherwise, never a prefix.
-    pub fn is_anthropic_host(&self) -> bool {
-        self.host().is_some_and(|h| {
-            crate::panel_audience::host_of(&h).trim_end_matches('.').eq_ignore_ascii_case(ANTHROPIC_API_HOST)
-        })
+    /// (#3397) The provider the built-in registry lists for this unmanaged
+    /// endpoint's host, however the URL spells it (any case, an explicit
+    /// port, a trailing dot); `None` for an unlisted host or a managed
+    /// endpoint.
+    pub fn provider(&self) -> Option<&'static crate::provider::Provider> {
+        match self.kind() {
+            Ok(EndpointKind::Unmanaged) => self.url.as_deref().and_then(|u| readable_host(u).ok()),
+            _ => None,
+        }
+        .and_then(|h| crate::provider::provider_of_host(&h))
+    }
+
+    /// (#3399 review) Why darkmux cannot read this unmanaged endpoint's host
+    /// unambiguously ([`readable_host`]); `None` when it can, and for a
+    /// managed or unusable endpoint. Every dispatching preflight refuses an
+    /// endpoint with one (`config_enum::invalid_endpoint_hosts`).
+    pub fn host_problem(&self) -> Option<String> {
+        match self.kind() {
+            Ok(EndpointKind::Unmanaged) => readable_host(self.url.as_deref().unwrap_or_default()).err(),
+            _ => None,
+        }
+    }
+
+    /// (#3397) How darkmux knows which machine serves this endpoint.
+    pub fn hardware_basis(&self) -> HardwareBasis {
+        match self.kind() {
+            Err(_) => HardwareBasis::Unusable,
+            Ok(EndpointKind::Managed(_)) => HardwareBasis::Managed,
+            Ok(EndpointKind::Unmanaged) if self.host_problem().is_some() => HardwareBasis::UnreadableHost,
+            Ok(EndpointKind::Unmanaged) => match (self.provider(), &self.hardware) {
+                (Some(p), _) => HardwareBasis::Provider(p),
+                (None, Some(Lenient::Known(h))) => HardwareBasis::Declared(*h),
+                (None, _) => HardwareBasis::Undeclared,
+            },
+        }
     }
 
     /// THE chat-completions URL builder. Managed: the configured LM Studio
@@ -755,8 +856,10 @@ impl ModelEndpoint {
         // (#3173) An inferred `messages` has no declared dialect to drop: the
         // remedy names where it came from and how to keep the old shape.
         let remedy = if self.speaks_messages_by_host() {
+            let host = self.host().unwrap_or_default();
+            let host = crate::panel_audience::host_of(&host).trim_end_matches('.').to_ascii_lowercase();
             format!(
-                "the endpoint declares no dialect, so on {ANTHROPIC_API_HOST} it speaks `messages` (the only \
+                "the endpoint declares no dialect, so on {host} it speaks `messages` (the only \
                  way its prompt caching applies); drop the field, or declare \"dialect\": \"chat-completions\" \
                  to keep the uncached OpenAI-compatible layer"
             )
@@ -799,7 +902,37 @@ impl ModelEndpoint {
                     .to_string());
             }
         }
-        self.validate_limits()
+        self.hardware_applies().and_then(|()| self.validate_limits())
+    }
+
+    /// (#3397) `hardware` is declared only where darkmux cannot tell on its
+    /// own: a managed endpoint is always the submitting machine, and a host
+    /// the provider registry lists is always `unknown`.
+    fn hardware_applies(&self) -> Result<(), String> {
+        self.misplaced_hardware().map_or(Ok(()), Err)
+    }
+
+    /// (#3397) Why this endpoint's `hardware` is not the operator's to set,
+    /// when it is not: a managed endpoint is always the submitting machine,
+    /// and a host the provider registry lists is always `unknown`. Every
+    /// dispatching preflight refuses it (`config_enum::misplaced_endpoint_hardware`).
+    pub fn misplaced_hardware(&self) -> Option<String> {
+        self.hardware.as_ref()?;
+        self.hardware_misplaced_on(self.hardware_basis())
+    }
+
+    fn hardware_misplaced_on(&self, basis: HardwareBasis) -> Option<String> {
+        match basis {
+            HardwareBasis::Managed => Some("`hardware` is for an endpoint darkmux only sends requests to: a managed \
+                 endpoint is always the submitting machine. Remove it"
+                .to_string()),
+            HardwareBasis::Provider(p) => Some(format!(
+                "`hardware` is not yours to set on {}'s host: darkmux's provider registry lists it, so its \
+                 hardware is always `unknown`. Remove it",
+                p.name
+            )),
+            _ => None,
+        }
     }
 
     /// THE rule (#3035) that `limits.concurrent_calls` is for an endpoint
@@ -857,6 +990,46 @@ pub fn url_host(url: &str) -> Option<String> {
     let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
     let hostport = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
     is_hostport(hostport).then(|| hostport.to_string())
+}
+
+/// (#3399 review) IDNA's full stops, which a WHATWG URL parser (the one
+/// behind `ureq` and Node's `URL`) maps to `.`.
+const IDN_FULL_STOPS: [char; 3] = ['\u{3002}', '\u{FF0E}', '\u{FF61}'];
+
+/// (#3399 review) The host (and port) of an unmanaged endpoint's `url` as
+/// every client would read it, or why darkmux cannot read it unambiguously.
+/// Two spellings are normalized the way a WHATWG parser does: IDNA's full
+/// stops become `.`, and an empty port (`host:`) is the scheme's default.
+/// Anything a client might read differently from darkmux fails closed
+/// (#3079, the same rule as [`url_names_this_machine`]): a backslash (WHATWG
+/// reads it as `/`, curl does not), whitespace or a control character, a
+/// percent-encoded host, any other non-ASCII host, or an authority that is
+/// not a host and an optional numeric port. Userinfo is dropped and never
+/// named in the reason.
+pub fn readable_host(url: &str) -> Result<String, String> {
+    if let Some(c) = url.chars().find(|c| *c == '\\' || c.is_whitespace() || c.is_control()) {
+        let what = if c == '\\' { "a backslash".to_string() } else { format!("the character U+{:04X}", c as u32) };
+        return Err(format!("its URL has {what} in it, which clients read differently"));
+    }
+    let Some((_, rest)) = url.split_once("://") else {
+        return Err("its URL has no `scheme://`".to_string());
+    };
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    let hostport: String = authority.rsplit_once('@').map_or(authority, |(_, h)| h).chars()
+        .map(|c| if IDN_FULL_STOPS.contains(&c) { '.' } else { c })
+        .collect();
+    if hostport.contains('%') {
+        return Err("its host is percent-encoded, which clients decode differently".to_string());
+    }
+    if let Some(c) = hostport.chars().find(|c| !c.is_ascii()) {
+        return Err(format!("its host has the non-ASCII character U+{:04X}, which an IDN-aware client reads differently", c as u32));
+    }
+    let hostport = hostport.strip_suffix(':').unwrap_or(hostport.as_str());
+    if is_hostport(hostport) {
+        Ok(hostport.to_string())
+    } else {
+        Err(format!("its host `{hostport}` is not a host name or address with an optional numeric port"))
+    }
 }
 
 /// Whether `host` (no port; an IPv6 literal in brackets) names this machine:
@@ -1089,6 +1262,7 @@ mod tests {
         }
         check::<ManagedBackend>();
         check::<Dialect>();
+        check::<Hardware>();
     }
 
     use super::*;
@@ -1220,7 +1394,7 @@ mod tests {
         assert_eq!(other.resolved_dialect().unwrap(), Dialect::ChatCompletions);
         for spelling in ["https://api.anthropic.com:443/v1", "https://API.Anthropic.com/v1", "https://api.anthropic.com./v1"] {
             assert_eq!(ep(spelling, None).resolved_dialect().unwrap(), Dialect::Messages, "{spelling}: the same host");
-            assert!(ep(spelling, None).is_anthropic_host(), "{spelling}");
+            assert_eq!(ep(spelling, None).provider().map(|p| p.name), Some("Anthropic API"), "{spelling}");
         }
         let lookalike = ep("https://api.anthropic.com.evil.example/v1", None);
         assert_eq!(lookalike.resolved_dialect().unwrap(), Dialect::ChatCompletions, "the host, not a prefix");
@@ -1636,5 +1810,113 @@ mod tests {
         let warn = UsageLimits { policy: None, ..ok };
         let why = warn.validate().unwrap_err();
         assert!(why.contains("max_wait") && why.contains("`wait`"), "{why}");
+    }
+
+    /// (#3397) Caching reads the same registry as served-on: only the
+    /// provider whose row defaults `messages` (Anthropic) is sent it; every
+    /// other listed provider keeps the unmanaged default, and so does a
+    /// lookalike host.
+    #[test]
+    fn only_the_registry_row_that_defaults_messages_is_sent_it() {
+        let ep = |url: &str| ModelEndpoint { url: Some(url.into()), ..Default::default() };
+        for url in [
+            "https://api.openai.com/v1",
+            "https://res.openai.azure.com/openai/deployments/d",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1",
+            "https://openrouter.ai/api/v1",
+            "https://evil-openai.azure.com.attacker.net/v1",
+        ] {
+            assert_eq!(ep(url).resolved_dialect().unwrap(), Dialect::ChatCompletions, "{url}");
+        }
+        assert_eq!(ep("https://openrouter.ai/api/v1").provider().map(|p| p.name), Some("OpenRouter"));
+        assert_eq!(ep("https://evil-openai.azure.com.attacker.net/v1").provider(), None);
+        assert_eq!(ModelEndpoint::managed_lmstudio().provider(), None, "a managed endpoint has no host");
+    }
+
+    /// (#3397) Which machine served an endpoint: managed is the submitting
+    /// machine, a listed host is its provider's (`unknown`), any other `url`
+    /// endpoint says so itself, and one that does not is undeclared.
+    #[test]
+    fn hardware_is_fixed_for_managed_and_listed_hosts_and_declared_otherwise() {
+        let ep = |json: &str| -> ModelEndpoint { serde_json::from_str(json).unwrap() };
+        assert_eq!(ModelEndpoint::managed_lmstudio().hardware_basis(), HardwareBasis::Managed);
+        let claude = ep(r#"{"url":"https://api.anthropic.com/v1"}"#).hardware_basis();
+        assert!(matches!(claude, HardwareBasis::Provider(p) if p.name == "Anthropic API"), "{claude:?}");
+        assert_eq!(claude.hardware(), Some(Hardware::Unknown));
+        let flint = ep(r#"{"url":"http://studio.local:8080/v1","hardware":"unknown"}"#);
+        assert_eq!(flint.hardware_basis(), HardwareBasis::Declared(Hardware::Unknown));
+        let here = ep(r#"{"url":"http://127.0.0.1:8080/v1","hardware":"submitting-machine"}"#);
+        assert_eq!(here.hardware_basis().hardware(), Some(Hardware::SubmittingMachine));
+        let bare = ep(r#"{"url":"http://127.0.0.1:8080/v1"}"#);
+        assert_eq!(bare.hardware_basis(), HardwareBasis::Undeclared, "the address is never read as the answer");
+        let typo = ep(r#"{"url":"http://h:8080/v1","hardware":"this-machine"}"#);
+        assert_eq!(typo.hardware_basis(), HardwareBasis::Undeclared, "an unknown value is never guessed");
+        assert_eq!(ModelEndpoint::reference("gone").hardware_basis(), HardwareBasis::Unusable);
+    }
+
+    /// (#3397) `hardware` where darkmux already knows the answer is refused
+    /// beside it rather than silently ignored.
+    #[test]
+    fn hardware_on_a_managed_endpoint_or_a_listed_host_is_refused() {
+        let ep = |json: &str| -> ModelEndpoint { serde_json::from_str(json).unwrap() };
+        let managed = ep(r#"{"managed":"lmstudio","hardware":"unknown"}"#).validate().unwrap_err();
+        assert!(managed.contains("managed") && managed.contains("hardware"), "{managed}");
+        let listed = ep(r#"{"url":"https://api.openai.com/v1","hardware":"submitting-machine"}"#).validate().unwrap_err();
+        assert!(listed.contains("OpenAI API") && listed.contains("unknown"), "{listed}");
+        assert_eq!(ep(r#"{"url":"http://studio.local:8080/v1","hardware":"unknown"}"#).validate(), Ok(()));
+    }
+
+    /// (#3399 review) False NEGATIVES: a provider's host spelled the way a
+    /// WHATWG parser (`ureq`, Node's `URL`) or curl still reaches it is never
+    /// taken as `submitting-machine`. An empty port and IDNA's full stops are
+    /// read as the provider, so the registry's answer and its dialect hold;
+    /// a spelling darkmux cannot read unambiguously fixes no answer at all
+    /// and names why, without echoing the URL's credentials.
+    #[test]
+    fn a_provider_host_however_a_client_spells_it_is_never_the_submitting_machine() {
+        let ep = |url: &str| -> ModelEndpoint {
+            serde_json::from_value(serde_json::json!({"url": url, "hardware": "submitting-machine"})).unwrap()
+        };
+        for (url, provider) in [
+            ("https://api.anthropic.com:/v1", "Anthropic API"),
+            ("https://u:p@api.anthropic.com:/v1", "Anthropic API"),
+            ("https://api\u{3002}anthropic\u{3002}com/v1", "Anthropic API"),
+            ("https://api\u{FF0E}openai\u{FF61}com/v1", "OpenAI API"),
+            ("https://api.openai.com:/v1", "OpenAI API"),
+        ] {
+            let e = ep(url);
+            assert!(matches!(e.hardware_basis(), HardwareBasis::Provider(p) if p.name == provider), "{url}: {:?}", e.hardware_basis());
+            assert_eq!(e.host_problem(), None, "{url}");
+        }
+        assert_eq!(ep("https://api.anthropic.com:/v1").resolved_dialect().unwrap(), Dialect::Messages, "and its caching");
+        for url in [
+            "https://api%2eanthropic.com/v1",
+            "https://api.anthropic.com\\v1",
+            "https://api.anth\tropic.com/v1",
+            "https://api.anthropic.com /v1",
+            "https://api.anthr\u{00F6}pic.com/v1",
+            "https://tok@api.anthropic.com:x/v1",
+        ] {
+            let e = ep(url);
+            assert_eq!(e.hardware_basis(), HardwareBasis::UnreadableHost, "{url}");
+            assert_eq!(e.hardware_basis().hardware(), None, "{url}: never the declared submitting-machine");
+            let why = e.host_problem().unwrap_or_else(|| panic!("{url}: a reason"));
+            assert!(!why.contains("tok"), "{url}: the reason never names credentials: {why}");
+        }
+        // Each reason names what darkmux could not read.
+        for (url, says) in [
+            ("https://api.anthropic.com\\v1", "backslash"),
+            ("https://api.anth\tropic.com/v1", "U+0009"),
+            ("https://api.anthropic.com/v1 x", "U+0020"),
+            ("https://api%2eanthropic.com/v1", "percent-encoded"),
+            ("https://api.anthr\u{00F6}pic.com/v1", "U+00F6"),
+        ] {
+            let why = readable_host(url).unwrap_err();
+            assert!(why.contains(says), "{url}: {why}");
+        }
+        assert_eq!(readable_host("https://tok@[::1]:/v1").as_deref(), Ok("[::1]"));
+        assert_eq!(readable_host("http://studio.local:8080/v1").as_deref(), Ok("studio.local:8080"));
+        assert_eq!(ModelEndpoint::managed_lmstudio().host_problem(), None);
     }
 }
