@@ -42,6 +42,7 @@
 //! implementation that shells out, bounded by [`INSPECT_TIMEOUT`].
 
 use anyhow::{bail, Result};
+use darkmux_types::BuildKind;
 use std::process::Command;
 use std::time::Duration;
 
@@ -69,13 +70,19 @@ pub fn pinned_runtime_image(host_version: &str) -> String {
 /// `Some(build string)` when this binary is a development build (a git build:
 /// `darkmux_types::build_version()` carries a SHA tag), `None` for a release
 /// or a source-tarball build. Only a development build can be newer than the
-/// release image of its own version number.
+/// release image of its own version number. A release is told by the build
+/// kind `build.rs` baked, not the display string: a release names its commit
+/// (`release d85aab9`, #3373), so no string suffix marks it (#3420).
 pub fn host_dev_build() -> Option<String> {
-    dev_build_from(&darkmux_types::build_version(), env!("CARGO_PKG_VERSION"))
+    dev_build_from(
+        &darkmux_types::build_version(),
+        env!("CARGO_PKG_VERSION"),
+        darkmux_types::build_info().build,
+    )
 }
 
-fn dev_build_from(build: &str, version: &str) -> Option<String> {
-    (build != version && !build.ends_with("(release)")).then(|| build.to_string())
+fn dev_build_from(build: &str, version: &str, kind: Option<BuildKind>) -> Option<String> {
+    (build != version && kind != Some(BuildKind::Release)).then(|| build.to_string())
 }
 
 /// What `docker image inspect` could say about one ref.
@@ -684,12 +691,22 @@ mod tests {
 
     #[test]
     fn only_a_git_build_counts_as_a_development_build() {
-        assert_eq!(dev_build_from("3.13.0 (release)", "3.13.0"), None);
-        assert_eq!(dev_build_from("3.13.0", "3.13.0"), None);
+        let release = Some(BuildKind::Release);
+        let dev = Some(BuildKind::Dev);
+        assert_eq!(dev_build_from("3.13.0 (release)", "3.13.0", release), None);
+        assert_eq!(dev_build_from("3.13.0", "3.13.0", None), None);
         assert_eq!(
-            dev_build_from("3.13.0 (2c3ee0fdd✱)", "3.13.0").as_deref(),
+            dev_build_from("3.13.0 (2c3ee0fdd✱)", "3.13.0", dev).as_deref(),
             Some("3.13.0 (2c3ee0fdd✱)")
         );
+    }
+
+    #[test]
+    fn a_release_build_that_names_its_commit_is_not_a_development_build() {
+        // (#3420) Release builds have printed `release <short sha>` since
+        // #3373 (git at the tag, or the formula's DARKMUX_COMMIT); a brew
+        // 5.9.1 was told it was "a development build" at every dispatch.
+        assert_eq!(dev_build_from("5.9.1 (release d85aab9)", "5.9.1", Some(BuildKind::Release)), None);
     }
 
     #[test]
@@ -699,7 +716,8 @@ mod tests {
         // string; a release or tagless build is not one.
         let build = darkmux_types::build_version();
         let tagged = build.len() > env!("CARGO_PKG_VERSION").len();
-        let want = (tagged && !build.ends_with("(release)")).then(|| build.clone());
+        let release = darkmux_types::build_info().build == Some(BuildKind::Release);
+        let want = (tagged && !release).then(|| build.clone());
         assert_eq!(host_dev_build(), want, "build = {build}");
     }
 
