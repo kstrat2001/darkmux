@@ -268,6 +268,13 @@ pub(crate) fn load(id: &str, user_dir: Option<&Path>) -> Result<LoadedWorkload> 
     if let Some(json) = find_embedded(id) {
         return parse_str(json, id);
     }
+    Err(not_found(id, user_dir))
+}
+
+/// The refusal for a workload `id` no tier defines: what is available, and
+/// why `id` may be hiding (an unreadable registered fixture, a document in
+/// the working directory's ignored `.darkmux/`).
+fn not_found(id: &str, user_dir: Option<&Path>) -> anyhow::Error {
     let avail = list_available(user_dir);
     let listed = if avail.is_empty() {
         "(none)".to_string()
@@ -282,10 +289,42 @@ pub(crate) fn load(id: &str, user_dir: Option<&Path>) -> Result<LoadedWorkload> 
     // darkmux actually searches, the operator got a bare "not found" that
     // never mentioned the document sitting right there in cwd. Name it,
     // same remedy shape as that sibling fix.
-    if let Some(note) = ignored_project_local_note(id) {
-        bail!("workload \"{id}\" not found. Available: {listed}\n\n{note}");
+    // (#3396 re-review) A registered fixture whose manifest does not load
+    // defines workloads no tier above could see: name it, its manifest and
+    // the problem, rather than claim the workload does not exist.
+    let unreadable = unreadable_fixtures();
+    if !unreadable.is_empty() {
+        return anyhow!(
+            "workload \"{id}\" was not found where darkmux could read, and {} registered fixture(s) could not be \
+             read, so any workload they define is unknown:\n{}\nFix the manifest, or drop the entry with \
+             `darkmux lab fixture unregister <name>`. Available: {listed}",
+            unreadable.len(),
+            unreadable.join("\n")
+        );
     }
-    bail!("workload \"{id}\" not found. Available: {listed}")
+    if let Some(note) = ignored_project_local_note(id) {
+        return anyhow!("workload \"{id}\" not found. Available: {listed}\n\n{note}");
+    }
+    anyhow!("workload \"{id}\" not found. Available: {listed}")
+}
+
+/// (#3396 re-review) One line per registered fixture whose `.fixture.json`
+/// does not load: its registry name, the manifest's path and the problem.
+/// [`eval_homes`] skips such a fixture, so the workloads it defines are
+/// invisible until it is fixed.
+fn unreadable_fixtures() -> Vec<String> {
+    let reg_path = crate::lab::registry::default_registry_path(&darkmux_types::paths::resolve(
+        darkmux_types::paths::ResolveScope::ForceUser,
+    ));
+    let Ok(registry) = crate::lab::registry::LabRegistry::load(&reg_path) else { return Vec::new() };
+    registry
+        .fixtures
+        .iter()
+        .filter_map(|(name, f)| {
+            let err = crate::lab::fixture::FixtureManifest::load_from_dir(&f.path).err()?;
+            Some(format!("  fixture `{name}` ({}): {err:#}", f.path.join(".fixture.json").display()))
+        })
+        .collect()
 }
 
 /// Callers only reach this from [`load`]'s "not found" tail, after every

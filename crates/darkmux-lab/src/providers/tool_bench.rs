@@ -2475,7 +2475,7 @@ not json — tolerated
         std::fs::write(sandbox_dir.join("roles/web-probe.md"), "# web-probe\n").unwrap();
         let mut loaded = loaded_workload(serde_json::json!({ "chainDepths": [2], "role": "web-probe", "requires_fixture": "biz@1.0" }));
         // The role `lab run` read from the eval before the run.
-        let inputs = darkmux_crew::dispatch::LabInputs::load_eval(&sandbox_dir, "web-probe").unwrap();
+        let inputs = darkmux_crew::dispatch::LabInputs::for_fixture(&sandbox_dir, &darkmux_crew::dispatch::RoleLayout::Legacy { eval_dir: None }, "web-probe").unwrap();
         loaded.lab_inputs = Some(inputs.clone());
         let run_dir = state.join("run");
         std::fs::create_dir_all(&run_dir).unwrap();

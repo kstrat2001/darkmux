@@ -317,11 +317,19 @@ pub struct PromptAdditions {
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub enum RoleInputSource {
-    /// The eval's own `roles/<id>.json` and `roles/<id>.md`, read once from
-    /// the fixture checkout the workload binds, before the run started.
+    /// The eval's own `<eval_dir>/roles/<id>.json` and `.md`: an eval whose
+    /// `.fixture.json` declares schema 1.2 or newer owns its roles there.
+    /// Read once from the fixture checkout the workload binds, before the
+    /// run started.
     Eval,
-    /// darkmux's compiled-in role, for a workload bound to no fixture.
+    /// darkmux's compiled-in role: for a workload bound to no fixture, and
+    /// for a legacy eval (fixture schema below 1.2, or none) that carries no
+    /// `roles/<id>.*` at its root.
     Builtin,
+    /// A legacy eval's `roles/<id>.json` and `.md` at the fixture root
+    /// (fixture schema below 1.2, or none). That folder is cloned into the model's
+    /// sandbox, so the model can see it.
+    LegacyRoot,
     /// A value this build does not name, read from an archive written by another version.
     /// Never written.
     #[serde(other)]
@@ -1348,5 +1356,25 @@ impl DispatchEndPayload {
             endpoint,
             ..Self::new(0)
         }
+    }
+}
+
+#[cfg(test)]
+mod role_source_tests {
+    use super::RoleInputSource;
+
+    /// (#3363) The wire spelling of each role source, and what a source this
+    /// build does not name reads as.
+    #[test]
+    fn role_sources_spell_snake_case_and_an_unknown_one_reads_as_unknown() {
+        for (source, wire) in [
+            (RoleInputSource::Eval, "eval"),
+            (RoleInputSource::Builtin, "builtin"),
+            (RoleInputSource::LegacyRoot, "legacy_root"),
+        ] {
+            assert_eq!(serde_json::to_value(source).unwrap(), wire);
+            assert_eq!(serde_json::from_value::<RoleInputSource>(wire.into()).unwrap(), source);
+        }
+        assert_eq!(serde_json::from_value::<RoleInputSource>("from_the_future".into()).unwrap(), RoleInputSource::Unknown);
     }
 }

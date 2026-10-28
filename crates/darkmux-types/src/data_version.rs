@@ -42,8 +42,15 @@ pub const RULE_SCHEMA_VERSION: &str = "1.0";
 /// adds `verify.grade` (the grader, #3353).
 pub const WORKLOAD_SCHEMA_VERSION: &str = "1.2";
 /// Lab fixture manifest (`.fixture.json`). 1.1 adds `eval_dir`, the folder
-/// holding the eval's own workloads and grading data (#3361).
-pub const LAB_FIXTURE_SCHEMA_VERSION: &str = "1.1";
+/// holding the eval's own workloads and grading data (#3361). 1.2 means the
+/// eval owns its roles (#3363): a lab run takes its role only from
+/// `<eval_dir>/roles/<id>.json` and `.md`, and a 1.2 manifest must declare
+/// `eval_dir`. It adds no key; a fixture below 1.2 (1.0, 1.1) or with no marker keeps the
+/// legacy rule (`roles/` at its root, else darkmux's compiled-in role).
+pub const LAB_FIXTURE_SCHEMA_VERSION: &str = "1.2";
+/// (#3363) The first lab fixture schema whose eval owns its roles
+/// ([`LAB_FIXTURE_SCHEMA_VERSION`]'s 1.2).
+pub const LAB_FIXTURE_EVAL_ROLES_SINCE: &str = "1.2";
 /// `mission.json`.
 pub const MISSION_SCHEMA_VERSION: &str = "1.0";
 /// A phase JSON.
@@ -270,6 +277,19 @@ pub fn is_newer(file: &Value, known: &str) -> bool {
     f > k
 }
 
+/// Whether `file` is `version` or newer, compared as [`is_newer`] compares.
+/// A marker that does not parse is never at least anything: an absent or
+/// unreadable marker reads as the oldest shape.
+pub fn at_least(file: &Value, version: &str) -> bool {
+    let (Some(mut f), Some(mut v)) = (parse(file), parse(&Value::String(version.to_string()))) else {
+        return false;
+    };
+    let len = f.len().max(v.len());
+    f.resize(len, 0);
+    v.resize(len, 0);
+    f >= v
+}
+
 /// The document's marker under `key`, when it is newer than `known`.
 pub fn newer_under(doc: &Value, key: &str, known: &str) -> Option<String> {
     let v = doc.get(key)?;
@@ -331,6 +351,19 @@ mod tests {
         assert!(!is_newer(&json!("banana"), "1.0"));
         assert!(!is_newer(&json!(null), "1.0"));
         assert!(!is_newer(&json!("1.x"), "1.0"));
+    }
+
+    /// (#3363) `at_least` is `is_newer` or equal, and an unparseable marker
+    /// is the oldest shape.
+    #[test]
+    fn at_least_compares_like_newer_and_counts_equal() {
+        assert!(at_least(&json!("1.2"), "1.2"));
+        assert!(at_least(&json!("1.10"), "1.2"), "numeric, not lexicographic");
+        assert!(at_least(&json!(2), "1.2"));
+        assert!(!at_least(&json!("1.1"), "1.2"));
+        assert!(!at_least(&json!("1.1.9"), "1.2"));
+        assert!(!at_least(&json!(null), "1.2"));
+        assert!(!at_least(&json!("banana"), "1.2"));
     }
 
     #[test]

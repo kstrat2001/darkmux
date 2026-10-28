@@ -1424,7 +1424,7 @@ mod tests {
             .unwrap_err();
         assert!(format!("{err:#}").contains("its eval's role was not read"), "{err:#}");
         // With it read, the run's dispatch opts carry exactly those inputs.
-        let inputs = darkmux_crew::dispatch::LabInputs::load_eval(&eval, "probe-3363").unwrap();
+        let inputs = darkmux_crew::dispatch::LabInputs::for_fixture(&eval, &darkmux_crew::dispatch::RoleLayout::Legacy { eval_dir: None }, "probe-3363").unwrap();
         loaded.lab_inputs = Some(inputs.clone());
         let session = SessionId::adhoc(RunId::lab("r3363").unwrap(), "probe-3363", "t");
         let opts = run_dispatch_opts(&loaded, "probe-3363", "hi", &session, registry.to_str(), "p").unwrap();

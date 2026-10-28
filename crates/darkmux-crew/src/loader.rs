@@ -480,7 +480,8 @@ pub fn load_roles() -> Result<Vec<Role>> {
 pub(crate) enum RoleSource {
     /// Operator-authored manifest under `roles_dir()`.
     User,
-    /// (#3363) An eval's `roles/<id>.json`, which the caller names.
+    /// (#3363) An eval's `roles/<id>.json` (in its `eval_dir`, or a legacy
+    /// eval's root), which the caller names.
     Eval,
     /// Embedded manifest from `templates/builtin/roles/` — operator
     /// cannot edit it, so the actionable repair is "file an issue."
