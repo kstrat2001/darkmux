@@ -493,7 +493,7 @@ A script or an orchestrator binds to what a verb prints under `--json`, so from 
 - `FindingRecord.emitted` and `ForFinding.emitted`: the model's tool-call arguments, verbatim and opaque by design. A model chooses its own keys, and an emission that is not an object is kept as it came.
 - `InputJson.default`: a mission input's declared default, the same free-form JSON an operator passes for that input with `--input` (a string, a number, a bool, or an object such as a workspace spec).
 - `Profile.use_when`: the profile author's free-form routing hint, kept as written. Nothing in darkmux reads it.
-- `Lenient`, `Lenient2`, `Lenient3`, `Lenient4` (a `ManagedBackend`, `Dialect`, `UsageLimits` and `BudgetPolicy` as read from `profiles.json`): each is `T | any` because an unrecognized value from a newer darkmux or a typo is kept and printed as read rather than failing the registry (an enum value on a registry entry is refused where it is used, contract 9); `doctor` reports it.
+- `Lenient`, `Lenient2`, `Lenient3`, `Lenient4`, `Lenient5` (a `ManagedBackend`, `Dialect`, `UsageLimits`, `BudgetPolicy` and `Hardware` as read from `profiles.json`): each is `T | any` because an unrecognized value from a newer darkmux or a typo is kept and printed as read rather than failing the registry (an enum value on a registry entry is refused where it is used, contract 9); `doctor` reports it.
 
 ## Schema isolation: darkmux owns its own config
 

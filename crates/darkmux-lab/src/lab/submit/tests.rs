@@ -55,6 +55,8 @@ fn stack() -> Stack {
         gpu_cores: Some(40),
         model_id: Some("Mac17,7".into()),
         hardware: darkmux_types::Hardware::SubmittingMachine,
+        served_model: None,
+        effort: None,
     }
 }
 
@@ -725,6 +727,8 @@ fn small_readers_say_none_rather_than_guess() {
         gpu_cores: None,
         model_id: None,
         hardware: darkmux_types::Hardware::Unknown,
+        served_model: None,
+        effort: None,
     };
     assert_eq!(none.unreported().len(), 13);
 }
@@ -964,6 +968,7 @@ fn snap(model: &str, from: HardwareFrom, hardware: Option<darkmux_types::Hardwar
         hardware,
         provider: (from == HardwareFrom::Provider).then(|| "Anthropic API".to_string()),
         endpoint: (from != HardwareFrom::Managed).then(|| "studio".to_string()),
+        effort: None,
     }
 }
 
@@ -1135,4 +1140,79 @@ fn a_run_on_an_endpoint_submits_where_it_was_served_and_never_its_host() {
 
     let e = b.gather(&b.machine(None), &[haiku], &Stated { engine: Some("rec".into()), ..Default::default() }).unwrap_err().to_string();
     assert!(e.contains("Anthropic API") && e.contains("--engine"), "{e}");
+}
+
+/// (#3397) Format 7's three stack keys ride on EVERY run, the submitting
+/// machine's too; `site_refusals` holds them to the site's `hardwareFields`:
+/// present in 7 (null allowed), `servedModel` a stack string of at most 200,
+/// `effort` of at most 20, and none of them below 7.
+#[test]
+fn every_run_of_a_format_7_carries_all_three_keys_and_the_site_holds_them() {
+    let mut elsewhere = stack();
+    elsewhere.hardware = Unknown;
+    elsewhere.served_model = Some("claude-haiku-4-5-20251001".into());
+    elsewhere.effort = Some("high".into());
+    let far = bundle_run("far", &manifest(), &stats(), &RanBy::default(), &elsewhere, &[]);
+    let here = bundle_run("here", &manifest(), &stats(), &RanBy::default(), &stack(), &[]);
+    let fixture = json!({ "name": "pepper-grinder", "version": "2" });
+    let seven = assemble("kstrat2001/pepper-grinder", &"a".repeat(40), &fixture, vec![far, here]).unwrap();
+    assert_eq!(seven["formatVersion"], 7);
+    let (a, b) = (&seven["runs"][0]["stack"], &seven["runs"][1]["stack"]);
+    assert_eq!((&a["servedModel"], &a["effort"]), (&json!("claude-haiku-4-5-20251001"), &json!("high")));
+    for k in ["hardware", "servedModel", "effort"] {
+        assert!(b.get(k).is_some(), "the submitting machine's run carries {k} too: {b}");
+    }
+    assert_eq!(site_refusals(&seven), Vec::<String>::new());
+    let refused = |mutate: &dyn Fn(&mut Value)| {
+        let mut v = seven.clone();
+        mutate(&mut v);
+        site_refusals(&v)
+    };
+    let r = refused(&|v| {
+        v["runs"][1]["stack"].as_object_mut().unwrap().remove("servedModel");
+    });
+    assert!(r.iter().any(|e| e.starts_with("runs[1].stack.servedModel: missing")), "{r:?}");
+    let r = refused(&|v| v["runs"][0]["stack"]["effort"] = json!("x".repeat(21)));
+    assert!(r.iter().any(|e| e.starts_with("runs[0].stack.effort: longer than 20")), "{r:?}");
+    let r = refused(&|v| v["runs"][0]["stack"]["servedModel"] = json!("two  spaces"));
+    assert!(r.iter().any(|e| e.starts_with("runs[0].stack.servedModel")), "{r:?}");
+    let r = refused(&|v| {
+        v["formatVersion"] = json!(6);
+        for run in v["runs"].as_array_mut().unwrap() {
+            run["stack"].as_object_mut().unwrap().remove("hardware");
+        }
+    });
+    assert!(r.iter().any(|e| e.starts_with("runs[0].stack.servedModel: unknown key")), "{r:?}");
+}
+
+/// (#3397) A served model or effort the site would refuse is sent as null,
+/// with the reason, never failing the bundle; the `darkmux:` namespace is
+/// darkmux's own and never part of the served model.
+#[test]
+fn a_served_model_or_effort_the_site_refuses_is_null_with_the_reason() {
+    let mut why = Vec::new();
+    assert_eq!(stack_string("effort", Some("high".into()), MAX_EFFORT, &mut why).as_deref(), Some("high"));
+    assert_eq!(stack_string("effort", Some("x".repeat(21)), MAX_EFFORT, &mut why), None);
+    assert_eq!(stack_string("effort", Some("x".repeat(20)), MAX_EFFORT, &mut why).as_deref(), Some("x".repeat(20).as_str()));
+    assert_eq!(stack_string("servedModel", Some("see https://x.example".into()), 200, &mut why), None);
+    assert_eq!(stack_string("servedModel", Some("/Users/kain/model".into()), 200, &mut why), None);
+    assert_eq!(stack_string("servedModel", None, 200, &mut why), None);
+    assert_eq!(why.len(), 3, "{why:?}");
+    assert!(why[0].starts_with("effort is not in the form the site takes"), "{why:?}");
+}
+
+/// End to end: a provider run records its served model and effort, and a
+/// mixed bundle sends all three keys on the local run too.
+#[test]
+fn a_provider_run_sends_its_served_model_and_effort_beside_a_local_run() {
+    let b = bench();
+    let haiku = b.run("haiku", "claude-haiku-4-5", json!({"served_model": "claude-haiku-4-5-20251001", "model_hardware": [
+        {"model": "claude-haiku-4-5", "from": "provider", "hardware": "unknown", "provider": "Anthropic API", "effort": "high"}]}));
+    let local = b.run("local", "darkmux:m1", json!({"served_model": "darkmux:m1"}));
+    let (built, _) = b.gather(&b.machine(Some(b.provenance())), &[haiku, local], &Stated::default()).unwrap();
+    assert_eq!(built.bundle["formatVersion"], 7);
+    let (far, here) = (&built.bundle["runs"][0]["stack"], &built.bundle["runs"][1]["stack"]);
+    assert_eq!((far["servedModel"].as_str(), far["effort"].as_str()), (Some("claude-haiku-4-5-20251001"), Some("high")));
+    assert_eq!((here["hardware"].as_str(), here["servedModel"].as_str()), (Some("submitting-machine"), Some("m1")), "the namespace is darkmux's");
+    assert!(here.get("effort").is_some_and(Value::is_null), "{here}");
 }

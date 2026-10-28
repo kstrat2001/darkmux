@@ -783,7 +783,8 @@ fn enrich_manifest_with_fixture_info(
 }
 
 /// (#3397) Write the snapshot taken when the run started into its manifest,
-/// for `lab submit` (run manifest 1.3). Best-effort like the fixture
+/// with the model its replies said answered, for `lab submit` (run manifest
+/// 1.3). Best-effort like the fixture
 /// enrichment: a run whose provider wrote no manifest cannot be submitted
 /// anyway.
 fn record_model_hardware(run_dir: &Path, snapshot: &[crate::lab::manifest::ModelHardware]) -> Result<()> {
@@ -792,6 +793,9 @@ fn record_model_hardware(run_dir: &Path, snapshot: &[crate::lab::manifest::Model
     }
     let mut manifest = RunManifest::read(run_dir)?;
     manifest.model_hardware = Some(snapshot.to_vec());
+    // The model the run's replies said answered, now that they are all in.
+    let trajectory = fs::read_to_string(run_dir.join(darkmux_trajectory::TRAJECTORY_FILE)).unwrap_or_default();
+    manifest.served_model = crate::lab::manifest::served_model_in(&trajectory);
     manifest.write(run_dir)
 }
 

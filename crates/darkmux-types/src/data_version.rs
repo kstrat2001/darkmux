@@ -61,7 +61,9 @@ pub const RESUME_ORIGIN_SCHEMA_VERSION: &str = "1.0";
 /// the run), `n_ctx` (the window the run's profile declared for the model it
 /// dispatched) and `prompt_tokens_counted` (the reply-room estimate). 1.3
 /// adds `model_hardware` (#3397): which machine served each model of the
-/// run's profile, as the registry said when the run started.
+/// run's profile and the effort its endpoint sends, as the registry said
+/// when the run started, and `served_model`, the model the replies said
+/// answered.
 pub const RUN_MANIFEST_SCHEMA_VERSION: &str = "1.3";
 /// The key the lab run manifest's shared marker lives under.
 pub const RUN_MANIFEST_KEY: &str = "manifest_schema_version";

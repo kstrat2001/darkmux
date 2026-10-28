@@ -254,6 +254,7 @@ DirectMetrics
   finish_reason?: string | null
   first_token_ms?: uint64 | null
   output_chunks?: uint64 | null
+  reported_model?: string | null
   prompt_tokens: uint64 | null
   completion_tokens: uint64 | null
   total_tokens: uint64 | null
@@ -447,6 +448,7 @@ Grown
   source: string
   items: uint
   minted: string[]
+Hardware = "submitting-machine" | "unknown"
 HealthState = "ok" | "warn" | "fail" | "unknown"
 HookRuleStatus
   index: uint
@@ -529,6 +531,7 @@ Lenient = ManagedBackend | any
 Lenient2 = Dialect | any
 Lenient3 = UsageLimits | any
 Lenient4 = BudgetPolicy | any
+Lenient5 = Hardware | any
 Lesson
   id?: int64 | null
   title: string
@@ -736,6 +739,7 @@ ModelEndpoint
   managed?: Lenient | null
   dialect?: Lenient2 | null
   limits?: Lenient3 | null
+  hardware?: Lenient5 | null
 ModelJson
   id: string
   unmanaged: boolean
@@ -1280,4 +1284,5 @@ Lenient
 Lenient2
 Lenient3
 Lenient4
+Lenient5
 Profile.use_when

@@ -282,3 +282,15 @@ Limits belong to an endpoint, managed or not: `endpoints.<id>.limits` in `profil
 An unregistered `policy`, `limits` that cannot be read, a misspelled key (named with the nearest valid one), a `period` that does not parse, a `policy` with no budget, a `wait` with no `window`, or `concurrent_calls` on a managed endpoint is bad config: every `dispatch`, `mission launch` and `lab run` refuses at preflight naming the `profiles.json` path and the valid shape, and `darkmux doctor` reports it as Fail. `darkmux doctor`'s `endpoints` row shows each endpoint's declared limits, its per-dispatch cap, how many of its calls run at once, and the spend so far in its window.
 
 **Cost.** The window is read before every call to an endpoint with a counting window budget. The first read in a process pays for every day file the window spans (measured on release builds: about 5 ms for a 1d window, 45 ms for 7d, 180 ms for 30d on a busy machine); every later read reads only the bytes appended since, about 0.1 to 0.7 ms.
+
+### Endpoint hardware (`profiles.json`, not env) (#3397)
+
+`endpoints.<id>.hardware` says which machine serves a `url` endpoint, so `darkmux lab submit` sends a run's numbers against the right hardware. Two values: `submitting-machine` (this machine serves it) and `unknown` (another machine does: a provider, or another Mac). darkmux never reads the answer from the address.
+
+| Endpoint | Hardware |
+|---|---|
+| managed (LM Studio) | always `submitting-machine`; declaring `hardware` is refused |
+| a host on the built-in provider registry: `api.anthropic.com` (Anthropic API), `api.openai.com` (OpenAI API), `*.openai.azure.com` (Azure OpenAI), `generativelanguage.googleapis.com` (Google Gemini API), `bedrock-runtime.<region>.amazonaws.com` (Amazon Bedrock), `openrouter.ai` (OpenRouter) | always `unknown`, and the run's `engine` is the provider's name; declaring `hardware` is refused |
+| any other `url` endpoint | its own `hardware`; `darkmux doctor` warns when it declares none, and `lab submit` refuses such a run unless `--hardware` names it |
+
+The registry lives in darkmux's code (`darkmux_types::provider`); no setting adds or changes a row. It also decides the dialect an endpoint speaks when it declares none (`messages` on Anthropic's host, #3173). An unregistered `hardware` value, or a misspelled key, is bad config: every `dispatch`, `mission launch` and `lab run` refuses at preflight, naming the `profiles.json` path and both values, and `darkmux doctor` reports it as Fail. A lab run records each model's hardware when it starts (run manifest 1.3), so editing the endpoint later does not change a recorded run; `lab submit --hardware submitting-machine|unknown` supplies the value for an older run or corrects a wrong one.

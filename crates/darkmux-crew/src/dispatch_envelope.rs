@@ -273,6 +273,11 @@ pub struct DirectMetrics {
     /// stream. One event has a first-token time and no decode interval.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_chunks: Option<u64>,
+    /// (#3397) The model the endpoint said answered (its reply's `model`),
+    /// which resolves an alias to the exact version. Absent when the reply
+    /// named none. Never copied from the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_model: Option<String>,
     #[serde(flatten)]
     pub tokens: DirectTokens,
 }

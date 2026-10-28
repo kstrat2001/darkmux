@@ -115,6 +115,11 @@ pub struct RunManifest {
     /// `lab submit` reads it. Absent on a run from before it was recorded.
     #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     pub model_hardware: Option<Vec<ModelHardware>>,
+    /// (run manifest 1.3, #3397) The model the endpoint said answered, read
+    /// from the run's own replies once it ends ([`served_model_in`]): one
+    /// name, or absent when the replies named none or more than one.
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    pub served_model: Option<String>,
     /// A key this type does not name (an older run's camelCase spelling, a newer
     /// darkmux's field), kept and re-serialized flat.
     #[serde(flatten)]
@@ -153,6 +158,31 @@ pub struct ModelHardware {
     /// The `endpoints` id the model named, for a message (never shared).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// The reasoning effort the endpoint declared, when its dialect sends it
+    /// (`reasoning_effort`, verbatim); `None` when none is sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+/// (#3397) The model a run's replies say answered, from its trajectory's
+/// `model.completed` events (`reported_model`): the one name they agree on,
+/// `None` when they named none, or more than one. A compactor's calls are
+/// their own events (`compaction.call`) and never count: the compactor is
+/// not the model being measured.
+pub fn served_model_in(trajectory: &str) -> Option<String> {
+    use darkmux_trajectory::event::{parse_line, TrajectoryEvent};
+    let names: std::collections::BTreeSet<String> = trajectory
+        .lines()
+        .filter_map(parse_line)
+        .filter_map(|e| match e {
+            TrajectoryEvent::ModelCompleted(c) => c.reported_model.filter(|m| !m.trim().is_empty()),
+            _ => None,
+        })
+        .collect();
+    match names.len() {
+        1 => names.into_iter().next(),
+        _ => None,
+    }
 }
 
 /// (#3397) The snapshot for a run on `profile`: one entry per model whose
@@ -181,9 +211,17 @@ pub fn model_hardware_of(profile: &darkmux_types::Profile) -> Vec<ModelHardware>
                     _ => None,
                 },
                 endpoint: m.endpoint.as_ref().and_then(|e| e.named_id()).map(str::to_string),
+                effort: m.endpoint.as_ref().and_then(effort_sent),
             })
         })
         .collect()
+}
+
+/// The `reasoning_effort` an endpoint sends: declared, non-blank, and in the
+/// one dialect that carries it (`chat-completions`); `None` otherwise.
+fn effort_sent(ep: &darkmux_types::ModelEndpoint) -> Option<String> {
+    let sent = ep.resolved_dialect().is_ok_and(|d| d == darkmux_types::Dialect::ChatCompletions);
+    ep.reasoning_effort.as_deref().map(str::trim).filter(|e| sent && !e.is_empty()).map(str::to_string)
 }
 
 /// A run's verify result. A run from before the object form wrote a bare
@@ -491,6 +529,7 @@ mod tests {
         let row = |m: &str| snap.iter().find(|r| r.model == m).cloned();
         use darkmux_types::Hardware::{SubmittingMachine, Unknown};
         assert_eq!(row("qwen").map(|r| (r.from, r.hardware)), Some((HardwareFrom::Managed, Some(SubmittingMachine))));
+        assert_eq!(row("qwen").and_then(|r| r.effort), None, "LM Studio is never sent an effort");
         let haiku = row("haiku").unwrap();
         assert_eq!((haiku.from, haiku.hardware, haiku.provider.as_deref()), (HardwareFrom::Provider, Some(Unknown), Some("Anthropic API")));
         assert_eq!(haiku.identifier.as_deref(), Some("claude-haiku"));
@@ -502,6 +541,51 @@ mod tests {
         assert_eq!(back.model_hardware, Some(snap));
         let raw = serde_json::to_value(&m).unwrap();
         assert!(!raw.to_string().contains("anthropic.com") && !raw.to_string().contains("studio.local"), "no host: {raw}");
+    }
+
+    /// (#3397) The effort a run records is the one its endpoint sends: the
+    /// declared `reasoning_effort` in the `chat-completions` dialect, never
+    /// one the dialect drops.
+    #[test]
+    fn the_snapshot_records_the_effort_the_endpoint_sends() {
+        let mut reg: darkmux_types::ProfileRegistry = serde_json::from_value(json!({
+            "profiles": {"p": {"models": [
+                {"id": "gpt", "endpoint": "openai"}, {"id": "plain", "endpoint": "plain"}, {"id": "lms", "n_ctx": 1, "endpoint": "lms"}]}},
+            "endpoints": {"openai": {"url": "https://api.openai.com/v1", "reasoning_effort": "high"},
+                "plain": {"url": "https://api.openai.com/v1", "reasoning_effort": "  "},
+                "lms": {"managed": "lmstudio"}}})).unwrap();
+        reg.materialize_endpoints();
+        let snap = model_hardware_of(&reg.profiles["p"]);
+        let effort = |m: &str| snap.iter().find(|r| r.model == m).and_then(|r| r.effort.clone());
+        assert_eq!(effort("gpt").as_deref(), Some("high"));
+        assert_eq!(effort("plain"), None, "a blank effort is none");
+        assert_eq!(effort("lms"), None);
+        let mut messages: darkmux_types::ModelEndpoint = serde_json::from_value(json!({"url": "https://h.example/v1",
+            "dialect": "chat-completions-max-tokens", "reasoning_effort": "high"})).unwrap();
+        assert_eq!(effort_sent(&messages), None, "a dialect that never sends it");
+        messages.dialect = None;
+        assert_eq!(effort_sent(&messages).as_deref(), Some("high"));
+    }
+
+    /// (#3397) The served model is the one name the replies agree on: none
+    /// named, or two different, is none; a compactor's call never counts.
+    #[test]
+    fn the_served_model_is_the_one_name_the_replies_agree_on() {
+        let completed = |m: Option<&str>| {
+            let mut v = json!({"type": "model.completed", "seq": 1, "ts": 1, "finish_reason": "stop"});
+            if let Some(m) = m {
+                v["reported_model"] = json!(m);
+            }
+            v.to_string()
+        };
+        let compaction = json!({"type": "compaction.call", "generation": 1, "ts": 1, "requested_model": "util",
+            "reported_model": "util-4b"}).to_string();
+        let doc = |lines: &[String]| lines.join("\n");
+        assert_eq!(served_model_in(&doc(&[completed(Some("a-1")), completed(Some("a-1")), compaction.clone()])).as_deref(), Some("a-1"));
+        assert_eq!(served_model_in(&doc(&[completed(Some("a-1")), completed(None)])).as_deref(), Some("a-1"), "a reply that named none adds no name");
+        assert_eq!(served_model_in(&doc(&[completed(Some("a-1")), completed(Some("a-2"))])), None, "more than one");
+        assert_eq!(served_model_in(&doc(&[completed(None), compaction])), None, "none, and the compactor's name is not the run's");
+        assert_eq!(served_model_in(&doc(&[completed(Some(" "))])), None);
     }
 
     #[test]

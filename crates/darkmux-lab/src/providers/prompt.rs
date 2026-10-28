@@ -537,6 +537,8 @@ fn write_one_call_trajectory(stdout: &str, system_chars: usize, prompt_chars: us
         ts: end_ms,
         finish_reason: metrics.get("finish_reason").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
         usage: Some(usage),
+        // (#3397) What the endpoint said answered, for `lab submit`'s `servedModel`.
+        reported_model: metrics.get("reported_model").and_then(|v| v.as_str()).map(str::to_string),
         ..Default::default()
     }));
     events.push(TrajectoryEvent::DispatchComplete(DispatchComplete {
@@ -1157,6 +1159,16 @@ mod tests {
         assert_eq!((start.model.as_str(), start.system_chars, start.prompt_chars, start.ts), ("m", 5_700, 21_000, 1_000_000 - 13_100));
         let complete = fold.complete.as_ref().unwrap();
         assert_eq!((complete.result.as_str(), complete.wall_ms), ("stop", 13_100));
+        let text = fs::read_to_string(tmp.path().join(darkmux_trajectory::TRAJECTORY_FILE)).unwrap();
+        assert_eq!(crate::lab::manifest::served_model_in(&text), None, "the envelope named no answering model");
+        let served = TempDir::new().unwrap();
+        let named = serde_json::json!({"result": "stop", "final_assistant": "{}", "metrics": {
+            "model": "claude-haiku", "endpoint": "e", "wall_ms": 100, "turns": 1, "reported_model": "claude-haiku-4-5-20251001",
+            "prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}})
+        .to_string();
+        write_one_call_trajectory(&named, 1, 1, served.path(), 1_000_000);
+        let text = fs::read_to_string(served.path().join(darkmux_trajectory::TRAJECTORY_FILE)).unwrap();
+        assert_eq!(crate::lab::manifest::served_model_in(&text).as_deref(), Some("claude-haiku-4-5-20251001"), "(#3397) the reply's model");
         let stats = crate::lab::stats::compute_from_dir(tmp.path(), &tmp.path().join("flows")).expect("the run's numbers can be read");
         // The call is one stream, start to end, so the run has a rate and
         // reconciles: no rate means `lab submit` uploads tokensPerSecond null.

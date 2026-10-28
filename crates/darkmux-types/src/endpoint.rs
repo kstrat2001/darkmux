@@ -881,8 +881,7 @@ impl ModelEndpoint {
                     .to_string());
             }
         }
-        self.hardware_applies()?;
-        self.validate_limits()
+        self.hardware_applies().and_then(|()| self.validate_limits())
     }
 
     /// (#3397) `hardware` is declared only where darkmux cannot tell on its

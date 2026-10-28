@@ -4018,7 +4018,7 @@ fn check_endpoints() -> Check {
             let mut ledger = darkmux_crew::budget::Ledger::new(darkmux_types::config_access::flows_dir());
             // The hints name the file this check loaded, so an edit is made where it is read.
             let file = format!("`{}`", l.path.display());
-            endpoints_status_in(&l.registry, &mut |b| ledger.window(&b.endpoint_id, now, b.window.period_secs), &file)
+            endpoints_status(&l.registry, &mut |b| ledger.window(&b.endpoint_id, now, b.window.period_secs), &file)
         }
         Err(e) => Check {
             name: "endpoints".into(),
@@ -4160,17 +4160,9 @@ fn endpoint_budget_note(
     notes
 }
 
-/// Pure decision for [`check_endpoints`]; `spend` reads one budget's window.
-#[cfg(test)]
+/// Pure decision for [`check_endpoints`]; `spend` reads one budget's window,
+/// and the hints name `file` as the registry to edit.
 fn endpoints_status(
-    registry: &darkmux_types::ProfileRegistry,
-    spend: &mut dyn FnMut(&darkmux_crew::budget::EndpointBudget) -> darkmux_crew::budget::WindowEntries,
-) -> Check {
-    endpoints_status_in(registry, spend, "the profile registry")
-}
-
-/// [`endpoints_status`], its hints naming `file` as the registry to edit.
-fn endpoints_status_in(
     registry: &darkmux_types::ProfileRegistry,
     spend: &mut dyn FnMut(&darkmux_crew::budget::EndpointBudget) -> darkmux_crew::budget::WindowEntries,
     file: &str,
@@ -11872,7 +11864,7 @@ mod tests {
                              "claude":{"url":"https://api.anthropic.com/v1"},
                              "lms":{"managed":"lmstudio"}}}"#,
         );
-        let c = endpoints_status(&r, &mut no_spend);
+        let c = endpoints_status(&r, &mut no_spend, REGISTRY);
         assert_eq!(c.status, Status::Warn, "{}", c.message);
         assert!(c.message.contains("`endpoints.studio` is not declared"), "{}", c.message);
         assert!(!c.message.contains("`endpoints.here`") && !c.message.contains("`endpoints.claude`"), "{}", c.message);
@@ -11890,12 +11882,12 @@ mod tests {
             r#"{"profiles":{"p":{"models":[{"id":"flint","endpoint":"studio"}]}},
                 "endpoints":{"studio":{"url":"http://studio.local:8080/v1","hardware":"unknown"}}}"#,
         );
-        assert_eq!(endpoints_status(&declared, &mut no_spend).status, Status::Pass);
+        assert_eq!(endpoints_status(&declared, &mut no_spend, REGISTRY).status, Status::Pass);
         let typo = materialized(
             r#"{"profiles":{"p":{"models":[{"id":"flint","endpoint":"studio"}]}},
                 "endpoints":{"studio":{"url":"http://studio.local:8080/v1","hardware":"another-machine"}}}"#,
         );
-        let c = endpoints_status(&typo, &mut no_spend);
+        let c = endpoints_status(&typo, &mut no_spend, REGISTRY);
         assert_eq!(c.status, Status::Fail, "{}", c.message);
         assert!(c.message.contains("`another-machine`") && c.message.contains("endpoints.studio.hardware"), "{}", c.message);
     }
@@ -11915,7 +11907,7 @@ mod tests {
                              "opus":{"url":"https://api.anthropic.com/v1","dialect":"chat-completions-max-tokens"},
                              "grok":{"url":"https://api.x.ai/v1","hardware":"unknown"}}}"#,
         );
-        let c = endpoints_status(&uncached, &mut no_spend);
+        let c = endpoints_status(&uncached, &mut no_spend, REGISTRY);
         assert_eq!(c.status, Status::Warn, "{}", c.message);
         let hint = c.hint.unwrap_or_default();
         assert!(hint.contains(r#""dialect": "messages""#), "the exact edit: {hint}");
@@ -11928,7 +11920,7 @@ mod tests {
                 "endpoints":{"claude":{"url":"https://api.anthropic.com/v1","dialect":"messages"},
                              "grok":{"url":"https://api.x.ai/v1","hardware":"unknown"}}}"#,
         );
-        let c = endpoints_status(&cached, &mut no_spend);
+        let c = endpoints_status(&cached, &mut no_spend, REGISTRY);
         assert_eq!((c.status, c.hint), (Status::Pass, None), "{}", c.message);
     }
 
@@ -12054,6 +12046,9 @@ mod tests {
         assert_eq!(renamed_settings_status(&both).status, Status::Fail);
     }
 
+    /// How an endpoints hint names the registry when no file was loaded.
+    const REGISTRY: &str = "the profile registry";
+
     fn no_spend(_: &darkmux_crew::budget::EndpointBudget) -> darkmux_crew::budget::WindowEntries {
         Vec::new()
     }
@@ -12076,7 +12071,7 @@ mod tests {
         let c = endpoints_status(&r, &mut |b| {
             asked.push(b.endpoint_id.clone());
             vec![(1, darkmux_crew::budget::Spend::full(1_200_000)), (2, darkmux_crew::budget::Spend::full(300_000))]
-        });
+        }, REGISTRY);
         assert_eq!(c.status, Status::Pass, "{}", c.message);
         assert!(c.message.contains("`azure`: unmanaged, r.example"), "host only, userinfo stripped: {}", c.message);
         assert!(!c.message.contains("tok@") && !c.message.contains("deployments"), "{}", c.message);
@@ -12096,7 +12091,7 @@ mod tests {
         assert!(c.message.contains("`lms`: managed (lmstudio), chat-completions-max-tokens"), "{}", c.message);
         assert!(c.message.contains("parallelism is the scheduler's"), "{}", c.message);
         assert_eq!(asked, vec!["azure".to_string()], "only a counting budget reads the window");
-        let floor = endpoints_status(&r, &mut |_| vec![(1, darkmux_crew::budget::Spend::full(1_200_000)), (2, darkmux_crew::budget::Spend::partial(500))]);
+        let floor = endpoints_status(&r, &mut |_| vec![(1, darkmux_crew::budget::Spend::full(1_200_000)), (2, darkmux_crew::budget::Spend::partial(500))], REGISTRY);
         assert!(
             floor.message.contains("spent at least 1200500 tokens (1 with an unknown spend) in 2 calls"),
             "an unknown spend is a floor, never a small number: {}",
@@ -12120,7 +12115,7 @@ mod tests {
         let c = endpoints_status(&r, &mut |b| {
             asked.push(b.endpoint_id.clone());
             vec![(1, darkmux_crew::budget::Spend::full(40_000))]
-        });
+        }, REGISTRY);
         assert_eq!(c.status, Status::Pass, "{}", c.message);
         assert_eq!(asked, vec!["lms".to_string()], "the managed endpoint's window is read: {}", c.message);
         assert!(c.message.contains("per-dispatch cap 9000 tokens (warn)") && c.message.contains("spent 40000 tokens"), "{}", c.message);
@@ -12130,7 +12125,7 @@ mod tests {
             r#"{"profiles":{"p":{"models":[{"id":"m","n_ctx":1,"endpoint":"lms"}]}},
                 "endpoints":{"lms":{"managed":"lmstudio","limits":{"concurrent_calls":2}}}}"#,
         );
-        let c = endpoints_status(&bad, &mut no_spend);
+        let c = endpoints_status(&bad, &mut no_spend, REGISTRY);
         assert_eq!(c.status, Status::Fail, "{}", c.message);
         assert!(c.message.contains("endpoints.lms.limits") && c.message.contains("scheduler"), "{}", c.message);
     }
@@ -12143,7 +12138,7 @@ mod tests {
             r#"{"profiles":{"p":{"models":[{"id":"m","endpoint":"e"}]}},
                 "endpoints":{"e":{"url":"https://h.example/v1","limits":{"policy":"stop","window":{"period":"1d","tokens":5}}}}}"#,
         );
-        let c = endpoints_status(&bad, &mut no_spend);
+        let c = endpoints_status(&bad, &mut no_spend, REGISTRY);
         assert_eq!(c.status, Status::Fail, "{}", c.message);
         assert!(c.message.contains("`stop`") && c.message.contains("endpoints.e.limits.policy"), "{}", c.message);
         for v in ["off", "warn", "wait"] {
@@ -12153,14 +12148,14 @@ mod tests {
             r#"{"profiles":{"p":{"models":[{"id":"m","endpoint":"e"}]}},
                 "endpoints":{"e":{"url":"https://h.example/v1","limits":{"policy":"off","window":{"period":"1d","tokens":5}}}}}"#,
         );
-        let c = endpoints_status(&off, &mut |_| panic!("an `off` budget must not read the window"));
+        let c = endpoints_status(&off, &mut |_| panic!("an `off` budget must not read the window"), REGISTRY);
         assert!(c.message.contains("window budget off (nothing is counted)"), "{}", c.message);
         // (review M2) Unreadable limits are Fail too, by path, never "no budget".
         let typo = materialized(
             r#"{"profiles":{"p":{"models":[{"id":"m","endpoint":"e"}]}},
                 "endpoints":{"e":{"url":"https://h.example/v1","limits":{"window":{"period":"1d","tokens":"2M"}}}}}"#,
         );
-        let c = endpoints_status(&typo, &mut no_spend);
+        let c = endpoints_status(&typo, &mut no_spend, REGISTRY);
         assert_eq!(c.status, Status::Fail, "{}", c.message);
         assert!(c.message.contains("endpoints.e.limits") && c.message.contains("2M"), "{}", c.message);
         // (zero doctrine) A zero window is not a budget: Fail, naming the
@@ -12169,7 +12164,7 @@ mod tests {
             r#"{"profiles":{"p":{"models":[{"id":"m","endpoint":"e"}]}},
                 "endpoints":{"e":{"url":"https://h.example/v1","limits":{"window":{"period":"1d","tokens":0}}}}}"#,
         );
-        let c = endpoints_status(&zero, &mut |_| panic!("a refused budget must not read the window"));
+        let c = endpoints_status(&zero, &mut |_| panic!("a refused budget must not read the window"), REGISTRY);
         assert_eq!(c.status, Status::Fail, "{}", c.message);
         assert!(c.message.contains("limits.window.tokens is 0") && c.message.contains("set policy off"), "{}", c.message);
     }
