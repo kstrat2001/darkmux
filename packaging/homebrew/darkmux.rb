@@ -80,7 +80,14 @@ class Darkmux < Formula
     # operator-named DARKMUX_MACHINE_ID) is handled by the wrapper script
     # above, which reads them at exec time. The static defaults below are
     # the safe-to-bake values.
+    #
+    # PATH: launchd starts the job with only /usr/bin:/bin:/usr/sbin:/sbin and
+    # the wrapper is a non-login zsh, so without this the daemon cannot find
+    # `docker` (Homebrew's, or Docker Desktop's /usr/local/bin and ~/.docker/bin
+    # links) and every dispatch it runs or accepts from a peer fails.
     environment_variables(
+      PATH:                 "#{std_service_path_env}:/usr/local/bin:" \
+                            "#{Dir.home}/.docker/bin:#{Dir.home}/.lmstudio/bin",
       DARKMUX_REDIS_STREAM: "darkmux:flow",
       DARKMUX_REDIS_MAXLEN: "10000",
     )
