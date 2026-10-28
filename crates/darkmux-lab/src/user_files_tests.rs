@@ -445,6 +445,32 @@ fn a_bad_fixture_blocks_only_the_run_that_binds_it() {
     assert!(every[0].to_string().contains("only a run that binds"), "{}", every[0]);
 }
 
+/// (#3396 review) A fixture `schema_version` darkmux cannot parse is refused
+/// by every entry point that consumes the manifest: the lab-run preflight and
+/// `darkmux doctor` (both through the gate), and `lab fixture register` and
+/// `lab doctor` (both through the manifest's load). Each names the file or
+/// the value.
+#[test]
+#[serial_test::serial]
+fn an_unparseable_fixture_schema_version_is_refused_by_every_consuming_entry_point() {
+    for bad in [" 1.2", "1.2 ", "v1.2", "1.2-rc1"] {
+        let state = IsolatedState::new();
+        let mut doc = tiny_fixture();
+        doc["schema_version"] = json!(bad);
+        let path = register_fixture(&state, &doc);
+        let refusal = preflight_with(Scope::LabRun, None, Some(PROBE_FIXTURE)).expect_err(bad).to_string();
+        assert!(refusal.contains(&path.display().to_string()) && refusal.contains(&format!("`{bad}`")), "{bad:?}: {refusal}");
+        let every = problems(UserFileKind::LabFixture, Reach::Every);
+        assert_eq!(every.len(), 1, "{bad:?}: doctor reports it");
+        assert!(every[0].to_string().contains(&format!("`{bad}`")), "{}", every[0]);
+        let dir = path.parent().unwrap();
+        let err = crate::lab::registry::LabRegistry::default().register(dir, None, false).map(|_| ()).unwrap_err();
+        assert!(format!("{err:#}").contains(&format!("`{bad}`")), "register: {err:#}");
+        let doctor = crate::lab::fixture::FixtureManifest::load_from_dir(dir).unwrap_err();
+        assert!(format!("{doctor:#}").contains(&format!("`{bad}`")), "lab doctor's load: {doctor:#}");
+    }
+}
+
 /// (review C4) A workload copy another tier shadows is never loaded.
 #[test]
 #[serial_test::serial]

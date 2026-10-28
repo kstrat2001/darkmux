@@ -245,7 +245,7 @@ fn check_fixture_and_read_role(
 /// (#3363) An eval owns its roles. The role the workload dispatches as is
 /// read ONCE, here, before any run starts: for a workload bound to a
 /// fixture, from the fixture checkout every run copies, where the fixture's
-/// schema puts it (`<eval_dir>/roles/` at 1.2; at 1.1 or none, the root
+/// schema puts it (`<eval_dir>/roles/` at 1.2; below 1.2 or none, the root
 /// `roles/` when there, else darkmux's compiled-in role), kept as bytes that
 /// every run's dispatch uses (nothing reads them again, so nothing a run
 /// writes into its sandbox can change them); for one bound to none, a role
@@ -603,7 +603,8 @@ fn materialize_sandbox(source: &Path, per_run: &Path, quiet: bool) -> Result<Opt
     }
     // (#3361) The eval's own folder (its workloads and grading data) never
     // reaches the sandbox: the model must not see the grader.
-    let eval_dir = crate::lab::fixture::eval_dir_of(source);
+    let eval_dir = crate::lab::fixture::eval_dir_for_clone(source)
+        .with_context(|| format!("the fixture's .fixture.json at {} no longer loads, so the run cannot keep its eval folder out of the sandbox", source.display()))?;
     if let Some(dir) = &eval_dir {
         if fs::symlink_metadata(source.join(dir)).is_ok_and(|m| m.file_type().is_symlink()) {
             anyhow::bail!(
@@ -1555,16 +1556,16 @@ mod tests {
     /// (#3363) darkmux still runs pepper-grinder 2.2 unchanged: its shape is a
     /// `.fixture.json` at schema 1.1 with `eval_dir: "eval"`, a coding-task
     /// workload in `eval/workloads/` running `coder`, and no roles anywhere.
-    /// The run reads darkmux's compiled-in coder (recorded `builtin`), and a
-    /// stale `~/.darkmux/roles/coder.md` changes nothing.
+    /// The run reads darkmux's compiled-in coder (recorded `builtin`). That
+    /// the dispatch then sends the compiled-in bytes, whatever the home
+    /// folder holds, is the crew's
+    /// `a_legacy_eval_with_no_roles_runs_the_builtin_role_and_records_builtin`.
     #[test]
     #[serial_test::serial]
     fn a_schema_1_1_eval_with_no_roles_runs_on_darkmuxs_builtin_role() {
         let _ = crate::providers::register_builtins();
         let tmp = TempDir::new().unwrap();
         let _home_guard = HomeGuard::set(tmp.path());
-        std::fs::create_dir_all(tmp.path().join("roles")).unwrap();
-        std::fs::write(tmp.path().join("roles/coder.md"), "STALE-HOME-CODER").unwrap();
         let eval = tmp.path().join("pepper-grinder");
         eval_fixture(&eval, "node-pepper-grinder-js@2.1", "pepper-grinder", None);
         declare_schema(&eval, "1.1");
@@ -1617,6 +1618,38 @@ mod tests {
             .collect();
         assert!(reached.is_empty(), "the eval's role reached the model's sandbox: {reached:?}");
         assert!(!per_run.join("eval").exists());
+
+        // The inverse, which is the difference the schema makes: a legacy
+        // eval's root `roles/` is cloned into the sandbox like any file.
+        let legacy = tmp.path().join("legacy-fx");
+        eval_fixture(&legacy, "pg@2.0", "pg-legacy", None);
+        declare_schema(&legacy, "1.1");
+        std::fs::create_dir_all(legacy.join("roles")).unwrap();
+        std::fs::write(legacy.join("roles/coder.md"), "LEGACY-ROOT-ROLE").unwrap();
+        let legacy_run = tmp.path().join("run-legacy/sandbox");
+        std::fs::create_dir_all(tmp.path().join("run-legacy")).unwrap();
+        materialize_sandbox(&legacy, &legacy_run, true).unwrap();
+        assert_eq!(std::fs::read_to_string(legacy_run.join("roles/coder.md")).unwrap(), "LEGACY-ROOT-ROLE");
+        assert!(!legacy_run.join("eval").exists(), "the eval folder is pruned at every schema");
+    }
+
+    /// (#3396 review, from #3361) A fixture whose manifest no longer loads
+    /// when a run clones it (a checkout mid-`runs: N`, say) is refused, not
+    /// cloned whole: without the manifest darkmux cannot name the eval
+    /// folder, and cloning it would hand the model the grader and the roles.
+    #[test]
+    #[serial_test::serial]
+    fn a_fixture_whose_manifest_no_longer_loads_is_refused_not_cloned_with_its_eval_folder() {
+        let tmp = TempDir::new().unwrap();
+        let _home_guard = HomeGuard::set(tmp.path());
+        let eval = tmp.path().join("eval-fx");
+        eval_fixture(&eval, "pg@2.1", "pg", None);
+        std::fs::write(eval.join(".fixture.json"), r#"{"name": "", "satisfies": "pg@2.1", "eval_dir": "eval"}"#).unwrap();
+        let per_run = tmp.path().join("run/sandbox");
+        std::fs::create_dir_all(tmp.path().join("run")).unwrap();
+        let err = format!("{:#}", materialize_sandbox(&eval, &per_run, true).unwrap_err());
+        assert!(err.contains(".fixture.json"), "{err}");
+        assert!(!per_run.join("eval").exists(), "the grader's folder reached the model's sandbox");
     }
 
     /// Every file under `dir`, recursively.

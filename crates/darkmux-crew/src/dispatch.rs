@@ -392,7 +392,7 @@ pub enum LabInputs {
     /// sandbox (a workload's `setupContent`, a seed, a link) cannot change it.
     Eval(Box<EvalRole>),
     /// darkmux's compiled-in role and prompt: the workload binds no
-    /// fixture, or a legacy eval (fixture schema 1.1 or none) that carries
+    /// fixture, or a legacy eval (fixture schema below 1.2, or none) that carries
     /// no `roles/<id>.*` at its root.
     Builtin,
 }

@@ -132,8 +132,12 @@ impl FixtureManifest {
     }
 
     /// `eval_dir`'s invariants: one plain folder name, bound by `satisfies`,
-    /// and declared by every fixture whose eval owns its roles (#3363).
+    /// and declared by every fixture whose eval owns its roles (#3363). The
+    /// schema marker must parse first, since it decides that.
     fn validate_eval_dir(&self) -> Result<()> {
+        if let Some(problem) = self.schema_version.as_deref().and_then(unreadable_schema_version) {
+            return Err(anyhow!("{problem}"));
+        }
         if let Some(dir) = &self.eval_dir {
             if !is_plain_name(dir) {
                 return Err(anyhow!(
@@ -177,6 +181,34 @@ impl FixtureManifest {
     }
 }
 
+/// (#3396 review) Why a fixture's `schema_version` cannot be read, or
+/// `None` when it can. The marker decides where an eval's role comes from
+/// (1.2 or newer owns its roles), so a value darkmux cannot compare is
+/// refused rather than read as the legacy rule. `data_version::newer` reads
+/// such a value as "not newer" for every kind (5.8 did too); this refusal is
+/// the fixture's own, on top of that.
+pub(crate) fn unreadable_schema_version(version: &str) -> Option<String> {
+    let parsed = darkmux_types::data_version::parse(&serde_json::Value::String(version.to_string()));
+    parsed.is_none().then(|| {
+        format!(
+            "schema_version `{}` is not a version darkmux can read: write digits and dots, such as `1.2`. \
+             A fixture's schema decides where its eval's role comes from, so darkmux does not guess",
+            darkmux_types::user_files::escape_text(version)
+        )
+    })
+}
+
+/// [`unreadable_schema_version`] as a gate issue, for the unknown-key gate's
+/// `extra` (the lab-run preflight and `darkmux doctor`).
+pub(crate) fn schema_version_issues(doc: &serde_json::Value) -> Vec<darkmux_types::user_files::KeyIssue> {
+    use darkmux_types::user_files::{Issue, KeyIssue};
+    let Some(version) = doc.get("schema_version").and_then(serde_json::Value::as_str) else { return Vec::new() };
+    unreadable_schema_version(version)
+        .map(|line| KeyIssue { path: "schema_version".into(), issue: Issue::Rule(line) })
+        .into_iter()
+        .collect()
+}
+
 /// One plain name: letters, digits, `.`, `_` and `-`, and not `.` or `..`.
 /// The grammar the site reads a workload path in, so a path built of these
 /// names is one it accepts; a name is also never a path that could leave the
@@ -193,6 +225,18 @@ pub(crate) fn eval_dir_of(fixture_dir: &Path) -> Option<String> {
         return None;
     }
     FixtureManifest::load_from_dir(fixture_dir).ok()?.eval_dir
+}
+
+/// (#3396 review, from #3361) The eval folder to prune when a run clones the
+/// fixture at `fixture_dir`: `None` when it has no `.fixture.json` or
+/// declares none. A manifest that exists but no longer loads is refused,
+/// because without it darkmux cannot name the folder to keep out of the
+/// model's sandbox.
+pub(crate) fn eval_dir_for_clone(fixture_dir: &Path) -> Result<Option<String>> {
+    if !fixture_dir.join(".fixture.json").exists() {
+        return Ok(None);
+    }
+    Ok(FixtureManifest::load_from_dir(fixture_dir)?.eval_dir)
 }
 
 /// (#3363) Where a lab run of a workload bound to the fixture at
@@ -290,6 +334,22 @@ mod tests {
             let m: FixtureManifest =
                 serde_json::from_value(serde_json::json!({"schema_version": legacy, "name": "pg", "satisfies": "pg@2.1"})).unwrap();
             m.validate().unwrap();
+        }
+    }
+
+    /// (#3396 review) A `schema_version` darkmux cannot parse is refused,
+    /// naming the value, rather than read as the legacy rule: the marker
+    /// decides where the eval's role comes from.
+    #[test]
+    fn an_unparseable_schema_version_is_refused() {
+        for bad in [" 1.2", "1.2 ", "v1.2", "1.2-rc1", ""] {
+            let doc = serde_json::json!({"schema_version": bad, "name": "pg", "satisfies": "pg@2.1", "eval_dir": "eval"});
+            let m: FixtureManifest = serde_json::from_value(doc.clone()).unwrap();
+            let err = m.validate().unwrap_err().to_string();
+            assert!(err.contains("schema_version") && err.contains(&format!("`{bad}`")), "{bad:?}: {err}");
+            let tmp = TempDir::new().unwrap();
+            write_manifest(tmp.path(), &doc.to_string());
+            assert!(role_layout_of(tmp.path()).is_err(), "{bad:?}");
         }
     }
 

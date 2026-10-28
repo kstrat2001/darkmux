@@ -735,3 +735,90 @@ fn a_legacy_eval_carrying_eval_roles_is_refused_naming_schema_1_2() {
     let err = format!("{:#}", LabInputs::for_fixture(eval.path(), &legacy(), "coder").unwrap_err());
     assert!(err.contains("would never read them") && err.contains("\"schema_version\": \"1.2\""), "names the fix: {err}");
 }
+
+/// Write `files` (name, bytes) under `dir`, creating it.
+fn write_files(dir: &std::path::Path, files: &[(&str, &str)]) {
+    std::fs::create_dir_all(dir).unwrap();
+    for (name, text) in files {
+        std::fs::write(dir.join(name), text).unwrap();
+    }
+}
+
+/// (#3396 review) A legacy eval carrying only `roles/coder.md` at its root
+/// meant to carry the role: the run is refused, naming the missing `.json`,
+/// rather than silently running darkmux's built-in coder.
+#[test]
+#[serial]
+fn a_legacy_eval_with_only_a_root_role_md_is_refused_not_run_built_in() {
+    let home = home_with_overrides();
+    let eval = TempDir::new().unwrap();
+    write_files(&eval.path().join("roles"), &[("coder.md", PINNED_EVAL_MD)]);
+    let _env = env_for(&home);
+    let err = format!("{:#}", LabInputs::for_fixture(eval.path(), &legacy(), "coder").unwrap_err());
+    assert!(err.contains("roles/coder.json is missing"), "{err}");
+}
+
+/// (#3396 review) A legacy eval carrying only `eval/roles/coder.md` gets the
+/// "declare 1.2" refusal too.
+#[test]
+#[serial]
+fn a_legacy_eval_with_only_an_eval_roles_md_is_refused_naming_schema_1_2() {
+    let home = home_with_overrides();
+    let eval = TempDir::new().unwrap();
+    write_files(&roles_of(&eval), &[("coder.md", PINNED_EVAL_MD)]);
+    let _env = env_for(&home);
+    let err = format!("{:#}", LabInputs::for_fixture(eval.path(), &legacy(), "coder").unwrap_err());
+    assert!(err.contains("would never read them"), "{err}");
+}
+
+/// (#3396 review) A legacy eval's root `roles/` that links to a folder
+/// without the role is refused, not resolved to the built-in role: what the
+/// eval runs must depend only on its own checkout, never on what a link's
+/// target happens to hold today.
+#[test]
+#[serial]
+fn a_legacy_eval_whose_root_roles_links_to_a_folder_without_the_role_is_refused() {
+    let home = home_with_overrides();
+    let elsewhere = TempDir::new().unwrap();
+    let eval = TempDir::new().unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), eval.path().join("roles")).unwrap();
+    let _env = env_for(&home);
+    let err = format!("{:#}", LabInputs::for_fixture(eval.path(), &legacy(), "coder").unwrap_err());
+    assert!(err.contains("roles` is a symlink"), "{err}");
+}
+
+/// (#3396 review) The legacy root lookup is case-exact, so an eval resolves
+/// the same way on every OS: `ROLES/coder.*` is not `roles/`, on a
+/// case-folding filesystem (macOS) as on Linux, and the run takes the
+/// built-in coder.
+#[test]
+#[serial]
+fn a_legacy_root_roles_folder_is_matched_case_exactly() {
+    let home = home_with_overrides();
+    let eval = TempDir::new().unwrap();
+    write_files(&eval.path().join("ROLES"), &[("coder.json", &role_json("coder")), ("coder.md", PINNED_EVAL_MD)]);
+    let _env = env_for(&home);
+    assert_eq!(LabInputs::for_fixture(eval.path(), &legacy(), "coder").unwrap(), LabInputs::Builtin);
+}
+
+/// (#3396 review) A schema-1.2 eval's role is found by exact names only:
+/// `eval/ROLES/`, a differently cased role file, or an `eval_dir` cased
+/// unlike the manifest's are all missing, on every OS.
+#[test]
+#[serial]
+fn a_schema_1_2_evals_role_path_is_matched_case_exactly() {
+    let home = home_with_overrides();
+    let _env = env_for(&home);
+    let json = role_json(ROLE);
+    let cases: [(&str, [(&str, &str); 2]); 3] = [
+        ("eval/ROLES", [("web-probe.json", &json), ("web-probe.md", PINNED_EVAL_MD)]),
+        ("eval/roles", [("web-probe.json", &json), ("Web-Probe.md", PINNED_EVAL_MD)]),
+        ("Eval/roles", [("web-probe.json", &json), ("web-probe.md", PINNED_EVAL_MD)]),
+    ];
+    for (dir, files) in cases {
+        let eval = TempDir::new().unwrap();
+        write_files(&eval.path().join(dir), &files);
+        let err = format!("{:#}", load_owned(&eval, ROLE).expect_err(dir));
+        assert!(err.contains("is missing"), "{dir}: {err}");
+    }
+}

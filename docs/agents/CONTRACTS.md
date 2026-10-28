@@ -64,15 +64,19 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    its role only from `<eval_dir>/roles/<id>.json` and `.md`, a 1.2 manifest must declare
    `eval_dir`, and a missing, symlinked, oversized, unknown-key or id-mismatched role file
    refuses the run before any model loads, with no fallback (not the fixture root, not
-   darkmux's built-in role of the same id). A fixture at 1.1 or with no marker is **legacy**,
+   darkmux's built-in role of the same id). A fixture below 1.2 (1.0 or 1.1) or with no marker is **legacy**,
    which is every eval published before 1.2: the run takes `roles/<id>.*` at the fixture root
    when the eval carries them (same checks), else darkmux's compiled-in role, else refuses
    naming the role; a legacy fixture carrying `<eval_dir>/roles/<id>.*` is refused, naming
    the schema to declare. The rule is keyed on the schema the EVAL declares, never on the
    darkmux version, so no published eval breaks and every eval that opts in is strict.
-   darkmux 5.0 through 5.8 refuse a 1.2 manifest at `lab run`'s preflight as written by a
-   newer darkmux, so an eval that opts in never runs on a darkmux that would ignore its
-   roles. One resolver for every dispatch path (`darkmux_crew::role_inputs::read_fixture_role`,
+   A marker darkmux cannot parse is refused at every entry point that consumes the manifest
+   (the `lab run` preflight and `darkmux doctor` through the gate's `extra` issues,
+   `lab fixture register` and `lab doctor` through `FixtureManifest::validate`), naming the
+   file and the value, never read as legacy; lookups match names exactly, so an eval resolves
+   the same way on every OS. darkmux 5.0 through 5.8 refuse a 1.2 manifest at `lab run`'s
+   preflight as written by a newer darkmux. darkmux before 5.0 has no such gate and would run
+   a 1.2 eval on its own roles, so the guarantee holds from 5.0 on. One resolver for every dispatch path (`darkmux_crew::role_inputs::read_fixture_role`,
    fed `darkmux_lab::lab::fixture::role_layout_of`); `dispatch.start`'s `role.source` names
    which rule applied (`eval`, `legacy_root`, `builtin`). Conformance: the crew's
    `lab_role_tests` (each layout, the no-fallback, symlink and legacy cases), the lab's

@@ -28,16 +28,20 @@ darkmux release.
     run before any model loads, naming the file. There is no fallback, not
     even to darkmux's built-in role of the same id. These files live in the
     eval folder, so they never reach the model's sandbox.
-  - **Fixture schema 1.1 or none (every eval published today) keeps
-    running.** A run uses `roles/<id>.json` and `.md` at the fixture root
+  - **Fixture schema below 1.2 (1.0 or 1.1) or none, which is every eval
+    published today, keeps running.** A run uses `roles/<id>.json` and `.md` at the fixture root
     when the eval carries them (biz-scrape-fixture 1.1's `web-probe`), with
     the same checks, and otherwise darkmux's compiled-in role (pepper-grinder
     2.2, salt-shaker 1.2, webhook-forgery-eval 1.2, idor-check-eval 1.2,
     path-traversal-eval 1.2, and the shipped `crawl-error-discard` workload,
     run `coder` or `crawler` that way). A role that is neither is refused,
-    naming it. A legacy eval that carries `<eval_dir>/roles/<id>.*` is
-    refused too, naming the schema to declare, since a 1.1 run would never
-    read those files.
+    naming it. The lookup is case-exact on every OS: `ROLES/` is not
+    `roles/`, on macOS as on Linux. A legacy eval that carries `<eval_dir>/roles/<id>.*` is
+    refused too, naming the schema to declare, since a legacy run would
+    never read those files. A `schema_version` darkmux cannot parse (`" 1.2"`,
+    `"v1.2"`, `"1.2-rc1"`) is refused by `lab run`, `lab fixture register`,
+    `lab doctor` and `darkmux doctor`, naming the file and the value, instead
+    of being read as legacy.
 
   Whatever the schema, a lab run uses darkmux's compiled-in preamble, and
   its prompt never takes anything from `~/.darkmux/roles/`, the preamble

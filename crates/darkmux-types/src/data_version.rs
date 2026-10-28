@@ -45,7 +45,7 @@ pub const WORKLOAD_SCHEMA_VERSION: &str = "1.2";
 /// holding the eval's own workloads and grading data (#3361). 1.2 means the
 /// eval owns its roles (#3363): a lab run takes its role only from
 /// `<eval_dir>/roles/<id>.json` and `.md`, and a 1.2 manifest must declare
-/// `eval_dir`. It adds no key; a fixture at 1.1 or with no marker keeps the
+/// `eval_dir`. It adds no key; a fixture below 1.2 (1.0, 1.1) or with no marker keeps the
 /// legacy rule (`roles/` at its root, else darkmux's compiled-in role).
 pub const LAB_FIXTURE_SCHEMA_VERSION: &str = "1.2";
 /// (#3363) The first lab fixture schema whose eval owns its roles

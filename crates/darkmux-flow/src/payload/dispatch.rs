@@ -323,11 +323,11 @@ pub enum RoleInputSource {
     /// run started.
     Eval,
     /// darkmux's compiled-in role: for a workload bound to no fixture, and
-    /// for a legacy eval (fixture schema 1.1 or none) that carries no
+    /// for a legacy eval (fixture schema below 1.2, or none) that carries no
     /// `roles/<id>.*` at its root.
     Builtin,
     /// A legacy eval's `roles/<id>.json` and `.md` at the fixture root
-    /// (fixture schema 1.1 or none). That folder is cloned into the model's
+    /// (fixture schema below 1.2, or none). That folder is cloned into the model's
     /// sandbox, so the model can see it.
     LegacyRoot,
     /// A value this build does not name, read from an archive written by another version.

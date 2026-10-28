@@ -15,7 +15,7 @@
 //! - **schema 1.2 or newer**: `<eval_dir>/roles/<id>.json` and `.md`, and
 //!   nothing else. A missing file refuses the run; there is no fallback.
 //!   `eval_dir` never reaches the model's sandbox, so neither do they.
-//! - **schema 1.1 or none** (every eval published before 1.2): `roles/<id>.*`
+//! - **below 1.2, or none** (every eval published before 1.2): `roles/<id>.*`
 //!   at the fixture root when the eval carries them, else darkmux's
 //!   compiled-in role, else refused.
 //!
@@ -83,7 +83,7 @@ pub enum RoleLayout {
     /// missing file refuses the run, whatever darkmux compiles in or the
     /// fixture root holds.
     Eval { eval_dir: String },
-    /// Fixture schema 1.1, or none declared: every eval published before
+    /// Fixture schema below 1.2 (1.0, 1.1), or none: every eval published before
     /// 1.2. `roles/<id>.json` and `.md` at the fixture root when the eval
     /// carries them, else darkmux's compiled-in role, else refused.
     /// `eval_dir` is the folder the fixture declares, if any.
@@ -97,30 +97,30 @@ pub(crate) fn read_fixture_role(fixture_dir: &Path, layout: &RoleLayout, role_id
     let eval = |role| Ok(LabInputs::Eval(Box::new(role)));
     match layout {
         RoleLayout::Eval { eval_dir } => {
-            let dir = fixture_dir.join(eval_dir);
-            refuse_symlink(&dir, "folder")?;
-            eval(load_role_files(&dir, role_id, RoleInputSource::Eval)?)
+            eval(load_role_files(fixture_dir, &[eval_dir, "roles"], role_id, RoleInputSource::Eval)?)
         }
         RoleLayout::Legacy { eval_dir } => {
-            if let Some(dir) = eval_dir.as_deref().filter(|d| carries_role(&fixture_dir.join(d).join("roles"), role_id)) {
+            if let Some(dir) = eval_dir.as_deref().filter(|d| carries_role(fixture_dir, &[d, "roles"], role_id)) {
                 bail!(
-                    "{} carries {dir}/roles/{role_id}.json or .md, but its .fixture.json declares fixture schema 1.1 \
-                     or none, so a lab run would never read them. Declare `\"schema_version\": \"1.2\"`: the eval \
-                     then owns its roles in {dir}/roles/",
+                    "{} carries {dir}/roles/{role_id}.json or .md, but its .fixture.json declares a fixture schema \
+                     below 1.2, or none, so a lab run would never read them. Declare `\"schema_version\": \"1.2\"`: \
+                     the eval then owns its roles in {dir}/roles/",
                     fixture_dir.display()
                 );
             }
-            let roles = fixture_dir.join("roles");
-            if is_symlink(&roles) || carries_role(&roles, role_id) {
-                return eval(load_role_files(fixture_dir, role_id, RoleInputSource::LegacyRoot)?);
+            // A linked root `roles/` is refused even when its target lacks
+            // the role: what the eval runs depends only on its own checkout.
+            let linked = has_entry(fixture_dir, "roles") && is_symlink(&fixture_dir.join("roles"));
+            if linked || carries_role(fixture_dir, &["roles"], role_id) {
+                return eval(load_role_files(fixture_dir, &["roles"], role_id, RoleInputSource::LegacyRoot)?);
             }
             builtin_role_text(role_id).map(|_| LabInputs::Builtin).ok_or_else(|| {
                 anyhow!(
                     "role `{role_id}` is not in the eval (roles/{role_id}.json and roles/{role_id}.md at {}) and is \
-                     not one of darkmux's built-in roles. The eval declares fixture schema 1.1 or none, so a lab run takes \
-                     its role from the fixture root's roles/ when there, else from darkmux's compiled-in roles; never \
-                     from the home folder's roles/. To measure this role, add it to the eval: {}roles/{role_id}.json \
-                     and .md, with `\"schema_version\": \"1.2\"`.",
+                     not one of darkmux's built-in roles. The eval declares a fixture schema below 1.2, or none, so a \
+                     lab run takes its role from the fixture root's roles/ when there, else from darkmux's compiled-in \
+                     roles; never from the home folder's roles/. To measure this role, add it to the eval: \
+                     {}roles/{role_id}.json and .md, with `\"schema_version\": \"1.2\"`.",
                     fixture_dir.display(),
                     eval_dir.as_deref().map(|d| format!("{d}/")).unwrap_or_else(|| "<eval_dir>/".into())
                 )
@@ -129,10 +129,28 @@ pub(crate) fn read_fixture_role(fixture_dir: &Path, layout: &RoleLayout, role_id
     }
 }
 
-/// Whether `roles` holds either of `role_id`'s files (a link counts, and is
-/// then refused by the read).
-fn carries_role(roles: &Path, role_id: &str) -> bool {
-    ["json", "md"].iter().any(|ext| std::fs::symlink_metadata(roles.join(format!("{role_id}.{ext}"))).is_ok())
+/// Whether `base/<dirs..>/` holds either of `role_id`'s files, by exact
+/// names (a link counts, and is then refused by the read).
+fn carries_role(base: &Path, dirs: &[&str], role_id: &str) -> bool {
+    ["json", "md"].iter().any(|ext| exact_path(base, dirs, &format!("{role_id}.{ext}")))
+}
+
+/// Whether `base/<dirs..>/<file>` exists with every component named exactly
+/// so. A case-folding filesystem (macOS) would also open `ROLES/Coder.md`
+/// for `roles/coder.md`; matching directory entries by name makes an eval
+/// resolve the same way on every OS.
+fn exact_path(base: &Path, dirs: &[&str], file: &str) -> bool {
+    let mut here = base.to_path_buf();
+    dirs.iter().chain([&file]).all(|name| {
+        let found = has_entry(&here, name);
+        here.push(name);
+        found
+    })
+}
+
+/// Whether `dir` has an entry named exactly `name`.
+fn has_entry(dir: &Path, name: &str) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|entries| entries.flatten().any(|e| e.file_name() == name))
 }
 
 /// Refuse `path` when it is a symbolic link: the fixture checkout may hold
@@ -205,17 +223,23 @@ fn load_lab_role(inputs: &LabInputs, role_id: &str) -> Result<(Role, LabRole)> {
     }
 }
 
-/// `<dir>/roles/<role_id>.json` and `.md`, through the same unknown-key gate
-/// and family check every role manifest gets. Read once, before the run.
-/// Missing, a symlink (as is `roles/` itself), past the size cap, an unknown
-/// key or another id refuses it.
-fn load_role_files(dir: &Path, role_id: &str, source: RoleInputSource) -> Result<EvalRole> {
-    let roles_dir = dir.join("roles");
-    refuse_symlink(&roles_dir, "folder")?;
-    let json_path = roles_dir.join(format!("{role_id}.json"));
-    let md_path = roles_dir.join(format!("{role_id}.md"));
-    let json = read_eval_role_file(&json_path, role_id, source)?;
-    let md = read_eval_role_file(&md_path, role_id, source)?;
+/// `base/<dirs..>/<role_id>.json` and `.md`, through the same unknown-key
+/// gate and family check every role manifest gets. Read once, before the
+/// run. Missing (by exact names), a symlink (as is any folder on the way),
+/// past the size cap, an unknown key or another id refuses it.
+fn load_role_files(base: &Path, dirs: &[&str], role_id: &str, source: RoleInputSource) -> Result<EvalRole> {
+    let mut roles_dir = base.to_path_buf();
+    for dir in dirs {
+        roles_dir.push(dir);
+        refuse_symlink(&roles_dir, "folder")?;
+    }
+    let read = |file: String| {
+        let path = roles_dir.join(&file);
+        let found = exact_path(base, dirs, &file);
+        read_eval_role_file(&path, found, role_id, source).map(|text| (path, text))
+    };
+    let (json_path, json) = read(format!("{role_id}.json"))?;
+    let (md_path, md) = read(format!("{role_id}.md"))?;
     use darkmux_types::user_files::{check_text, UserFileKind};
     if let Some(problem) = check_text::<Role>(UserFileKind::Role, &json_path, &json, &crate::user_files::role_retired) {
         bail!("{problem}");
@@ -241,11 +265,15 @@ fn is_symlink(path: &Path) -> bool {
 }
 
 /// One of an eval's role files, bounded like every role manifest. A missing
-/// file is the refusal this module exists for: there is no fallback. A
+/// file (`found` false: no entry by that exact name) is the refusal this
+/// module exists for: there is no fallback. A
 /// symlink is refused too: the fixture checkout may hold links, and one pointing at
 /// the home folder would deliver its bytes (the link itself is never followed).
-fn read_eval_role_file(path: &Path, role_id: &str, source: RoleInputSource) -> Result<String> {
+fn read_eval_role_file(path: &Path, found: bool, role_id: &str, source: RoleInputSource) -> Result<String> {
     let cap = darkmux_types::user_files::MAX_USER_FILE_BYTES;
+    if !found {
+        return Err(missing_role_file(path, role_id, source));
+    }
     match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(missing_role_file(path, role_id, source)),
         Ok(meta) if meta.file_type().is_symlink() => bail!(
