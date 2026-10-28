@@ -164,29 +164,41 @@ pub const PULL_TIMEOUT: Duration = Duration::from_secs(600);
 /// share one budget, `timeout`.
 pub fn pull_public_image(image: &str, timeout: Duration) -> Result<()> {
     let deadline = std::time::Instant::now() + timeout;
-    let host = match std::env::var_os("DOCKER_HOST") {
-        Some(_) => None,
-        None => Some(context_endpoint()),
+    let anonymous_refusal = match anonymous_attempt(image, deadline, timeout)? {
+        Some(Ok(())) => return Ok(()),
+        Some(Err(why)) => Some(why),
+        None => None,
     };
-    let mut anonymous_refusal = None;
-    if !matches!(host, Some(None)) {
-        let anon = anonymous_docker_config(image)?;
-        let mut cmd = Command::new("docker");
-        cmd.args(["pull", image]).env("DOCKER_CONFIG", anon.path());
-        if let Some(Some(h)) = &host {
-            cmd.env("DOCKER_HOST", h);
-        }
-        match run_pull(cmd, image, deadline, timeout)? {
-            Ok(()) => return Ok(()),
-            Err(why) => anonymous_refusal = Some(why),
-        }
-    }
     let mut cmd = Command::new("docker");
     cmd.args(["pull", image]);
     run_pull(cmd, image, deadline, timeout)?.map_err(|why| match anonymous_refusal {
         Some(anon) => anyhow::anyhow!("`docker pull {image}` failed: {why} (anonymously: {anon})"),
         None => anyhow::anyhow!("`docker pull {image}` failed: {why}"),
     })
+}
+
+/// The anonymous half of [`pull_public_image`]: `None` when it is skipped
+/// (no `DOCKER_HOST` and no context endpoint to aim it at), else the attempt's
+/// outcome as [`run_pull`] reports it.
+fn anonymous_attempt(
+    image: &str,
+    deadline: std::time::Instant,
+    budget: Duration,
+) -> Result<Option<std::result::Result<(), String>>> {
+    let host = match std::env::var_os("DOCKER_HOST") {
+        Some(_) => None,
+        None => match context_endpoint() {
+            Some(h) => Some(h),
+            None => return Ok(None),
+        },
+    };
+    let anon = anonymous_docker_config(image)?;
+    let mut cmd = Command::new("docker");
+    cmd.args(["pull", image]).env("DOCKER_CONFIG", anon.path());
+    if let Some(h) = &host {
+        cmd.env("DOCKER_HOST", h);
+    }
+    run_pull(cmd, image, deadline, budget).map(Some)
 }
 
 /// A scratch `DOCKER_CONFIG` holding only `{"auths":{"<registry>":{}}}`: no
@@ -996,7 +1008,10 @@ mod tests {
     #[serial_test::serial] // mutates PATH
     fn with_no_known_endpoint_the_anonymous_attempt_is_skipped() {
         let _fake = FakeDocker::install_with("exit 1", "    if [ -n \"$DOCKER_CONFIG\" ]; then sleep 30; exit 1; fi\n    exit 0");
-        let got = pull_public_image(&ghcr_image(), Duration::from_millis(800));
+        // Generous: the budget also covers the (fake) context lookup, which a
+        // loaded test host can make slow. Without the skip the anonymous
+        // attempt hangs to the bound and this fails.
+        let got = pull_public_image(&ghcr_image(), Duration::from_secs(5));
         assert!(got.is_ok(), "{got:?}");
     }
 
