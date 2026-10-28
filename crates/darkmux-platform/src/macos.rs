@@ -153,7 +153,7 @@ impl Platform for MacPlatform {
     /// `security -i` reads the command from stdin, so the secret is never on
     /// an argv. It can exit 0 when the command failed: the caller reads back.
     fn store_secret(&self, item: &str, account: &str, secret: &str) -> Result<(), String> {
-        security_interactive(&format!("add-generic-password -U -a \"{account}\" -s {item} -w \"{secret}\"\n"))
+        security_interactive(&security_store_line(item, account, secret)?)
     }
 
     fn forget_secret(&self, item: &str, account: &str) {
@@ -161,7 +161,23 @@ impl Platform for MacPlatform {
     }
 }
 
-/// Runs one `security -i` command line, fed on stdin.
+/// The longest command line handed to `security -i`, well inside the ~4095
+/// bytes after which it cuts a line and runs the rest as another command.
+const SECURITY_LINE_MAX: usize = 2048;
+
+/// The `security -i` line that stores `secret`, or why it is not sent (#3400
+/// review): longer than [`SECURITY_LINE_MAX`], or holding a line break, it
+/// would run as more than one command. The refusal never names the secret.
+pub(crate) fn security_store_line(item: &str, account: &str, secret: &str) -> Result<String, String> {
+    let line = format!("add-generic-password -U -a \"{account}\" -s {item} -w \"{secret}\"\n");
+    if line.len() > SECURITY_LINE_MAX || line.trim_end_matches('\n').contains(['\n', '\r']) {
+        return Err("the keychain command would not be one short line, so it was not run".to_string());
+    }
+    Ok(line)
+}
+
+/// Runs one `security -i` command line, fed on stdin. Its stderr is never
+/// read: `security` can echo the command, secret and all.
 #[cfg(target_os = "macos")]
 fn security_interactive(line: &str) -> Result<(), String> {
     use std::io::Write;
@@ -170,13 +186,13 @@ fn security_interactive(line: &str) -> Result<(), String> {
         .arg("-i")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("running `security`: {e}"))?;
     child.stdin.take().expect("piped").write_all(line.as_bytes()).map_err(|e| e.to_string())?;
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    let status = child.wait().map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err(format!("`security` exited with {status}"));
     }
     Ok(())
 }

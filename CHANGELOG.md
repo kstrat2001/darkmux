@@ -25,7 +25,13 @@ darkmux release.
   `login --site` stores only that site's token, and `logout` takes `--site` and forgets only
   that site's. The evals.darkmux.com token stays where it was (keychain account `$USER`, or
   `~/.darkmux/evals-token`), so an existing login keeps working; any other site's is kept as
-  account `$USER@<origin>`, or in `~/.darkmux/evals-tokens/`.
+  account `$USER@<origin>`, or in `~/.darkmux/evals-tokens/`. A site's host is held to DNS's
+  limits (253 characters, labels of 63), so a long `--site` can no longer split the keychain
+  command, and a failed keychain store no longer repeats the keychain command's output, which
+  could carry part of the token.
+- **`lab submit` never sends the upload token through a proxy.** An `http_proxy` setting used to
+  route a preview's (plain http) login and uploads through the proxy, Authorization header and
+  all. The token now always goes straight to its site.
 
 ## [5.9.0] - 2026-10-28
 

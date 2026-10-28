@@ -5,8 +5,8 @@
 //! The token is made on the site's account page and handed to `darkmux lab
 //! submit login`. It is kept where the platform keeps secrets (the login
 //! keychain on macOS, a 0600 file elsewhere) and never on a command line: it
-//! reaches `curl` through a 0600 config file, removed after the call, the way
-//! hosted dispatch sends its key.
+//! reaches `curl` in a config curl reads on stdin, so no file holds it while
+//! a call is in flight.
 
 use anyhow::{anyhow, bail, Context, Result};
 use darkmux_platform::SecretStore;
@@ -114,22 +114,35 @@ fn split_site(site: &str) -> Result<(Origin, String)> {
 }
 
 /// The host (lowercase; an IPv6 address bracketed, in its short form) and
-/// the port of an authority, or `None` when it is not one.
+/// the port of an authority, or `None` when it is not one. A name is at most
+/// 253 characters of labels of at most 63 (DNS's limits), so no origin is
+/// longer than 267 and the keychain command an origin reaches stays short.
 fn split_authority(authority: &str) -> Option<(String, Option<u16>)> {
     let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
         let (addr, after) = v6.split_once(']')?;
         (format!("[{}]", addr.parse::<std::net::Ipv6Addr>().ok()?), after)
     } else {
         let (host, after) = authority.split_at(authority.find(':').unwrap_or(authority.len()));
-        let host = host.to_ascii_lowercase();
-        let labels = host.split('.').all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'));
-        (labels.then_some(host)?, after)
+        (dns_name(host)?, after)
     };
-    if port.is_empty() {
-        return Some((host, None));
+    Some((host, port_after_host(port)?))
+}
+
+/// A host name lowercased, when it is one within DNS's limits.
+fn dns_name(host: &str) -> Option<String> {
+    let host = host.to_ascii_lowercase();
+    let label_ok = |l: &str| (1..=63).contains(&l.len()) && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    (host.len() <= 253 && host.split('.').all(label_ok)).then_some(host)
+}
+
+/// What follows the host: nothing (`Some(None)`), or `:` and a non-zero
+/// port of digits only. `None` when it is anything else.
+fn port_after_host(rest: &str) -> Option<Option<u16>> {
+    if rest.is_empty() {
+        return Some(None);
     }
-    let digits = port.strip_prefix(':').filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))?;
-    Some((host, Some(digits.parse::<u16>().ok().filter(|p| *p != 0)?)))
+    let digits = rest.strip_prefix(':').filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))?;
+    Some(Some(digits.parse::<u16>().ok().filter(|p| *p != 0)?))
 }
 
 /// An upload token and the origin it belongs to: [`call`] sends it there
@@ -263,10 +276,12 @@ impl TokenStore<'_> {
         }
         match self.secret_store {
             SecretStore::Keychain => {
-                let kept = self.keychain.store(&origin.keychain_account(&self.user), token);
-                // `security -i` can exit 0 when its command failed: the read back is the check.
+                // `security -i` can exit 0 when its command failed: the read
+                // back is the check. Its error is never shown: the command's
+                // own words can echo the token.
+                let _ = self.keychain.store(&origin.keychain_account(&self.user), token);
                 if self.read(origin).as_deref() != Some(token.as_str()) {
-                    bail!("the login keychain did not keep the token: {}", kept.err().unwrap_or_default());
+                    bail!("the login keychain did not keep the token");
                 }
                 Ok("the login keychain".to_string())
             }
@@ -355,7 +370,8 @@ pub fn call(site: &str, method: &str, path: &str, credential: &Credential, body_
 /// `site` reads as an origin and a path, is safe for a token
 /// ([`site_is_safe`]), and is the origin `credential` was stored for. The URL
 /// is rebuilt from what darkmux read, so curl dials the host the token
-/// belongs to.
+/// belongs to, and never through a proxy (`noproxy`: an `http_proxy` would
+/// read a preview's token in clear, and any proxy is another host).
 fn request_config(site: &str, method: &str, path: &str, credential: &Credential, body_file: Option<&Path>) -> Result<String> {
     let (origin, base) = split_site(site)?;
     // Judged on the address as rebuilt, which is what curl is handed.
@@ -368,7 +384,7 @@ fn request_config(site: &str, method: &str, path: &str, credential: &Credential,
     let url = format!("{origin}{base}{path}");
     let quote = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
     let mut config = format!(
-        "url = \"{}\"\nrequest = \"{method}\"\nheader = \"Authorization: Bearer {}\"\nheader = \"Accept: application/json\"\n",
+        "url = \"{}\"\nnoproxy = \"*\"\nrequest = \"{method}\"\nheader = \"Authorization: Bearer {}\"\nheader = \"Accept: application/json\"\n",
         quote(&url),
         quote(&credential.token)
     );
@@ -629,6 +645,66 @@ mod tests {
         }
     }
 
+    /// (#3400 review) A host is at most 253 characters of labels of at most
+    /// 63 (DNS's limits), so an origin is at most 267 and the keychain
+    /// command it reaches never nears `security -i`'s line cutoff.
+    #[test]
+    fn an_origin_is_bounded_by_dns_limits() {
+        let label = "a".repeat(63);
+        let longest = format!("{label}.{label}.{label}.{}", "b".repeat(61)); // 253
+        assert_eq!(longest.len(), 253);
+        let at_limit = Origin::of(&format!("https://{longest}:65535")).unwrap().to_string();
+        assert_eq!(at_limit.len(), 267, "the longest origin there can be");
+        assert!(origin(&format!("https://{longest}b")).starts_with("refused: cannot use"), "254 characters");
+        assert!(origin(&format!("https://{}.localhost", "a".repeat(64))).starts_with("refused: cannot use"), "a 64-character label");
+        let huge = format!("http://{}.localhost:18906", vec!["c".repeat(60); 66].join("."));
+        assert!(origin(&huge).starts_with("refused: cannot use"), "the review's ~4000-character host");
+    }
+
+    /// (#3400 review) What a failed keychain store says never carries the
+    /// keychain command's own words, which can echo the token.
+    #[test]
+    fn a_failed_keychain_store_never_echoes_the_command() {
+        struct Leaky;
+        impl Keychain for Leaky {
+            fn read(&self, _: &str) -> Option<String> {
+                None
+            }
+            fn store(&self, _: &str, token: &str) -> Result<(), String> {
+                Err(format!("security: unknown command \"{}\"", &token[token.len() - 20..]))
+            }
+            fn forget(&self, _: &str) {}
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = TokenStore { secret_store: SecretStore::Keychain, keychain: &Leaky, root: dir.path().to_path_buf(), user: "kain".into() };
+        let err = store.store(&Credential::pasted(PREVIEW, &token()).unwrap()).unwrap_err().to_string();
+        assert_eq!(err, "the login keychain did not keep the token");
+    }
+
+    /// (#3400 review) The URL curl is handed is rebuilt from the origin that
+    /// was checked, never the address as typed; a token never goes through a
+    /// proxy (an `http_proxy` would see a preview's in clear).
+    #[test]
+    fn the_request_is_rebuilt_from_the_checked_origin_and_skips_proxies() {
+        let production = Credential::pasted(super::super::DEFAULT_SITE, &token()).unwrap();
+        let config = request_config("HTTPS://EVALS.DARKMUX.COM:00443/", "GET", "/api/v1/account", &production, None).unwrap();
+        assert!(config.contains("url = \"https://evals.darkmux.com/api/v1/account\"\n"), "{config}");
+        assert!(config.contains("noproxy = \"*\"\n"), "{config}");
+        let preview = Credential::pasted(PREVIEW, &token()).unwrap();
+        assert!(request_config(PREVIEW, "GET", "/api/v1/account", &preview, None).unwrap().contains("noproxy = \"*\"\n"));
+    }
+
+    /// (#3400 review) Safety is judged on the rebuilt address: an address
+    /// [`site_is_safe`] refuses as typed is taken once it reads as a preview.
+    #[test]
+    fn safety_is_judged_on_the_rebuilt_address() {
+        let typed = "HTTP://Evals.Localhost:3419/";
+        assert!(!site_is_safe(typed), "as typed, the scheme is not `http://`");
+        let preview = Credential::pasted(PREVIEW, &token()).unwrap();
+        let config = request_config(typed, "POST", "/api/v1/uploads", &preview, None).unwrap();
+        assert!(config.contains("url = \"http://evals.localhost:3419/api/v1/uploads\""), "{config}");
+    }
+
     #[test]
     fn a_token_kept_in_a_file_is_private_read_back_and_forgotten() {
         let dir = tempfile::tempdir().unwrap();
@@ -768,7 +844,7 @@ mod tests {
 
     #[test]
     fn the_site_must_be_https_or_local() {
-        let site = "http://evals.example.com";
+        let site = "http://evals.example.invalid";
         let err = call(site, "GET", "/api/v1/account", &cred(site), None).unwrap_err();
         assert!(err.to_string().contains("https"));
     }
