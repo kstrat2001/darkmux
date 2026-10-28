@@ -1,6 +1,6 @@
 [package]
 name = "darkmux-platform"
-version = "5.8.0"
+version = "5.9.0"
 edition = "2021"
 description = "darkmux platform strategies — how each host OS answers the questions the rest of darkmux asks"
 license = "MIT"
