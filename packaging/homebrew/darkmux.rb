@@ -5,7 +5,7 @@
 #
 # Operator-facing install path:
 #   brew tap kstrat2001/tap
-#   brew install darkmux                # stable release (v5.8.0)
+#   brew install darkmux                # stable release (v5.9.0)
 #   brew install --HEAD darkmux         # build from main instead
 #
 # For local development / smoke testing:
@@ -17,7 +17,7 @@
 class Darkmux < Formula
   desc "Mission orchestrator and lab for local AI, running your models or a cloud endpoint"
   homepage "https://darkmux.com"
-  # Stable release: v5.8.0, eval criteria recorded per run and shared in bundle format 6.
+  # Stable release: v5.9.0, eval-owned roles and whether a run's hardware is known (bundle format 7).
   # See CHANGELOG.md.
   #
   # The tarball has no `.git`, so the full commit the lab needs for
@@ -30,8 +30,8 @@ class Darkmux < Formula
   # hash. A stale commit here means the lab submits an empty/mismatched
   # `darkmuxCommit` for the release that actually shipped. After bumping,
   # update the `sha256` on the url line too.
-  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v5.8.0.tar.gz"
-  sha256 "766175576593b4fb2fbfb50484ddcfccc5633db4dff79f8410a11ef5b666fa5e"
+  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v5.9.0.tar.gz"
+  sha256 "e9f24a5c9867b30dcb3b70980b482e3ec716f468458236854931d3b92b898076"
   license "MIT"
   head "https://github.com/kstrat2001/darkmux.git", branch: "main"
 
