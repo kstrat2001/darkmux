@@ -356,6 +356,7 @@ git checkout -b formula-$NEW
 # AND ENV["DARKMUX_COMMIT"] → $(git rev-parse vNEW^{commit}) — the tarball has no .git, so this line
 # is the commit every brew build stamps; left stale, the evals site refuses its runs (5.9.0, 2026-10-28).
 # Step 6's verify-tap-pin.py now fails on a stale DARKMUX_COMMIT.
+# Drop any `revision N` line on a version bump (it exists only to ship a same-version formula fix).
 git commit -am "feat(homebrew): pin formula to stable vNEW (url + sha256)"
 git push -u origin formula-$NEW
 gh pr create --title "feat(homebrew): pin formula to stable vNEW" --body "Stable-pin for vNEW. sha256 from the live tarball. Merge triggers the tap-sync workflow."
