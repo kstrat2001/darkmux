@@ -4004,8 +4004,10 @@ fn keychain_item_present(name: &str) -> bool {
 /// For a budget that
 /// counts, the line shows its policy and the spend so far in its rolling
 /// window (this machine's usage records, read through the same window
-/// reader the gate uses). An unregistered budget `policy` is Fail: every
-/// dispatch, mission launch and lab run refuses it at preflight.
+/// reader the gate uses). An unregistered budget `policy` or `hardware` is
+/// Fail: every dispatch, mission launch and lab run refuses it at preflight.
+/// An unmanaged endpoint on a host the provider registry does not list that
+/// declares no `hardware` warns (#3397): `lab submit` refuses its runs.
 fn check_endpoints() -> Check {
     match profiles::load_registry(None) {
         Ok(l) => {
@@ -4014,12 +4016,9 @@ fn check_endpoints() -> Check {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
             let mut ledger = darkmux_crew::budget::Ledger::new(darkmux_types::config_access::flows_dir());
-            let mut c = endpoints_status(&l.registry, &mut |b| ledger.window(&b.endpoint_id, now, b.window.period_secs));
-            let uncached = uncached_claude_endpoints(&l.registry);
-            if c.status == Status::Warn && !uncached.is_empty() {
-                c.hint = Some(uncached_claude_hint(&uncached, &format!("`{}`", l.path.display())));
-            }
-            c
+            // The hints name the file this check loaded, so an edit is made where it is read.
+            let file = format!("`{}`", l.path.display());
+            endpoints_status_in(&l.registry, &mut |b| ledger.window(&b.endpoint_id, now, b.window.period_secs), &file)
         }
         Err(e) => Check {
             name: "endpoints".into(),
@@ -4162,12 +4161,23 @@ fn endpoint_budget_note(
 }
 
 /// Pure decision for [`check_endpoints`]; `spend` reads one budget's window.
+#[cfg(test)]
 fn endpoints_status(
     registry: &darkmux_types::ProfileRegistry,
     spend: &mut dyn FnMut(&darkmux_crew::budget::EndpointBudget) -> darkmux_crew::budget::WindowEntries,
 ) -> Check {
+    endpoints_status_in(registry, spend, "the profile registry")
+}
+
+/// [`endpoints_status`], its hints naming `file` as the registry to edit.
+fn endpoints_status_in(
+    registry: &darkmux_types::ProfileRegistry,
+    spend: &mut dyn FnMut(&darkmux_crew::budget::EndpointBudget) -> darkmux_crew::budget::WindowEntries,
+    file: &str,
+) -> Check {
     let name = "endpoints".to_string();
-    let bad = darkmux_types::config_enum::bad_endpoint_budget_policies(registry);
+    let mut bad = darkmux_types::config_enum::bad_endpoint_budget_policies(registry);
+    bad.extend(darkmux_types::config_enum::bad_endpoint_hardware(registry));
     let invalid = darkmux_types::config_enum::invalid_endpoint_limits(registry);
     if !bad.is_empty() || !invalid.is_empty() {
         let mut problems: Vec<String> = bad.iter().map(|b| format!("{}; {}", b.summary(), b.valid_line())).collect();
@@ -4193,7 +4203,7 @@ fn endpoints_status(
                 "managed (lmstudio)".to_string()
             }
             Ok(darkmux_types::EndpointKind::Unmanaged) => {
-                format!("unmanaged, {}", ep.host().unwrap_or_else(|| "no host".to_string()))
+                format!("unmanaged, {}{}", ep.host().unwrap_or_else(|| "no host".to_string()), hardware_note(ep))
             }
             Err(e) => format!("unusable: {e}"),
         };
@@ -4216,12 +4226,64 @@ fn endpoints_status(
     } else {
         format!("{} endpoint(s): {}", lines.len(), lines.join("; "))
     };
-    uncached_claude_check(&name, &listed, registry).unwrap_or(Check { name, status: Status::Pass, message: listed, hint: None })
+    let c = uncached_claude_check(&name, &listed, registry, file).unwrap_or(Check { name, status: Status::Pass, message: listed, hint: None });
+    with_undeclared_hardware(c, registry, file)
+}
+
+/// (#3397) Which machine serves an unmanaged endpoint, for its line.
+fn hardware_note(ep: &darkmux_types::ModelEndpoint) -> String {
+    match ep.hardware_basis() {
+        darkmux_types::HardwareBasis::Provider(p) => format!(" ({}, hardware unknown)", p.name),
+        darkmux_types::HardwareBasis::Declared(h) => format!(", hardware {}", h.as_str()),
+        darkmux_types::HardwareBasis::Undeclared => ", hardware undeclared".to_string(),
+        darkmux_types::HardwareBasis::Managed | darkmux_types::HardwareBasis::Unusable => String::new(),
+    }
+}
+
+/// (#3397) The ids of unmanaged endpoints whose host the provider registry
+/// does not list and which declare no `hardware`: a lab run on one cannot be
+/// submitted until it says which machine served it. darkmux never reads the
+/// address as the answer.
+fn undeclared_hardware_endpoints(registry: &darkmux_types::ProfileRegistry) -> Vec<String> {
+    registry
+        .endpoints
+        .iter()
+        .filter(|(_, ep)| ep.hardware_basis() == darkmux_types::HardwareBasis::Undeclared)
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// (#3397) The edit for [`undeclared_hardware_endpoints`], made in `registry`.
+fn undeclared_hardware_hint(ids: &[String], registry: &str) -> String {
+    let named = ids.iter().map(|id| format!("`endpoints.{id}`")).collect::<Vec<_>>().join(", ");
+    format!(
+        r#"set "hardware": "submitting-machine" (this machine serves it) or "unknown" (another machine does) on {named} in {registry}, so a lab run on it records which machine's figures it carries; `lab submit` refuses a run that cannot say. (#3397)"#
+    )
+}
+
+/// (#3397) `c` turned to a Warn naming each endpoint that declares no
+/// `hardware`, its hint extended with the edit; unchanged when none.
+fn with_undeclared_hardware(mut c: Check, registry: &darkmux_types::ProfileRegistry, file: &str) -> Check {
+    let undeclared = undeclared_hardware_endpoints(registry);
+    if undeclared.is_empty() || c.status == Status::Fail {
+        return c;
+    }
+    let named = undeclared.iter().map(|id| format!("`endpoints.{id}`")).collect::<Vec<_>>().join(", ");
+    c.status = Status::Warn;
+    c.message.push_str(&format!(
+        ". Which machine serves {named} is not declared, so a lab run on it cannot be submitted"
+    ));
+    let hint = undeclared_hardware_hint(&undeclared, file);
+    c.hint = Some(match c.hint.take() {
+        Some(h) => format!("{h} Also {hint}"),
+        None => hint,
+    });
+    c
 }
 
 /// (#3173) The `endpoints` row as a Warn when a Claude endpoint is declared
 /// onto the uncached layer; `None` when none is.
-fn uncached_claude_check(name: &str, listed: &str, registry: &darkmux_types::ProfileRegistry) -> Option<Check> {
+fn uncached_claude_check(name: &str, listed: &str, registry: &darkmux_types::ProfileRegistry, file: &str) -> Option<Check> {
     let uncached = uncached_claude_endpoints(registry);
     if uncached.is_empty() {
         return None;
@@ -4234,7 +4296,7 @@ fn uncached_claude_check(name: &str, listed: &str, registry: &darkmux_types::Pro
             "{listed}. A Claude endpoint declared onto the OpenAI-compatible layer does not cache: every \
              turn pays full input price for the whole conversation again ({named})"
         ),
-        hint: Some(uncached_claude_hint(&uncached, "the profile registry")),
+        hint: Some(uncached_claude_hint(&uncached, file)),
     })
 }
 
@@ -4247,15 +4309,17 @@ fn uncached_claude_hint(ids: &[String], registry: &str) -> String {
     )
 }
 
-/// (#3173) The ids of `endpoints` entries on `api.anthropic.com` whose
-/// resolved dialect is not `messages`: the OpenAI-compatible layer there
-/// neither caches nor reports caching. One that declares no dialect resolves
-/// to `messages` on its own, so only a declared other dialect is listed.
+/// (#3173) The ids of `endpoints` entries on a host whose provider (in the
+/// one registry, `darkmux_types::provider`) defaults to `messages`, whose
+/// resolved dialect is not `messages`: the OpenAI-compatible layer at
+/// Anthropic neither caches nor reports caching. One that declares no
+/// dialect resolves to `messages` on its own, so only a declared other
+/// dialect is listed.
 fn uncached_claude_endpoints(registry: &darkmux_types::ProfileRegistry) -> Vec<String> {
     registry
         .endpoints
         .iter()
-        .filter(|(_, ep)| ep.is_anthropic_host())
+        .filter(|(_, ep)| ep.provider().is_some_and(|p| p.default_dialect == Some(darkmux_types::Dialect::Messages)))
         .filter(|(_, ep)| !matches!(ep.resolved_dialect(), Ok(darkmux_types::Dialect::Messages)))
         .map(|(id, _)| id.clone())
         .collect()
@@ -11794,6 +11858,48 @@ mod tests {
         r
     }
 
+    /// (#3397) A `url` endpoint on a host the provider registry does not list
+    /// that declares no `hardware` warns, naming it and the edit: a lab run on
+    /// it cannot be submitted. A listed host, a declared one and a managed
+    /// one are silent; each line says which machine serves the endpoint; an
+    /// unregistered value is Fail.
+    #[test]
+    fn an_endpoint_that_does_not_say_which_machine_serves_it_warns() {
+        let r = materialized(
+            r#"{"profiles":{"p":{"models":[{"id":"flint","endpoint":"studio"}]}},
+                "endpoints":{"studio":{"url":"http://studio.local:8080/v1"},
+                             "here":{"url":"http://127.0.0.1:8081/v1","hardware":"submitting-machine"},
+                             "claude":{"url":"https://api.anthropic.com/v1"},
+                             "lms":{"managed":"lmstudio"}}}"#,
+        );
+        let c = endpoints_status(&r, &mut no_spend);
+        assert_eq!(c.status, Status::Warn, "{}", c.message);
+        assert!(c.message.contains("`endpoints.studio` is not declared"), "{}", c.message);
+        assert!(!c.message.contains("`endpoints.here`") && !c.message.contains("`endpoints.claude`"), "{}", c.message);
+        let hint = c.hint.unwrap_or_default();
+        assert!(hint.contains(r#""hardware": "submitting-machine""#) && hint.contains(r#""unknown""#), "{hint}");
+        assert!(hint.contains("`endpoints.studio`") && !hint.contains("endpoints.here"), "{hint}");
+        for line in [
+            "`studio`: unmanaged, studio.local:8080, hardware undeclared",
+            "`here`: unmanaged, 127.0.0.1:8081, hardware submitting-machine",
+            "`claude`: unmanaged, api.anthropic.com (Anthropic API, hardware unknown)",
+        ] {
+            assert!(c.message.contains(line), "{line}: {}", c.message);
+        }
+        let declared = materialized(
+            r#"{"profiles":{"p":{"models":[{"id":"flint","endpoint":"studio"}]}},
+                "endpoints":{"studio":{"url":"http://studio.local:8080/v1","hardware":"unknown"}}}"#,
+        );
+        assert_eq!(endpoints_status(&declared, &mut no_spend).status, Status::Pass);
+        let typo = materialized(
+            r#"{"profiles":{"p":{"models":[{"id":"flint","endpoint":"studio"}]}},
+                "endpoints":{"studio":{"url":"http://studio.local:8080/v1","hardware":"another-machine"}}}"#,
+        );
+        let c = endpoints_status(&typo, &mut no_spend);
+        assert_eq!(c.status, Status::Fail, "{}", c.message);
+        assert!(c.message.contains("`another-machine`") && c.message.contains("endpoints.studio.hardware"), "{}", c.message);
+    }
+
     /// (#3173) A Claude endpoint declared onto the OpenAI-compatible layer
     /// pays full input price for the whole conversation every turn: that
     /// layer neither caches nor reports caching. Doctor warns and gives the
@@ -11807,7 +11913,7 @@ mod tests {
                 "endpoints":{"claude":{"url":"https://api.anthropic.com/v1","auth":{"type":"bearer","keychain":"k"}},
                              "haiku":{"url":"https://api.anthropic.com/v1/","dialect":"chat-completions"},
                              "opus":{"url":"https://api.anthropic.com/v1","dialect":"chat-completions-max-tokens"},
-                             "grok":{"url":"https://api.x.ai/v1"}}}"#,
+                             "grok":{"url":"https://api.x.ai/v1","hardware":"unknown"}}}"#,
         );
         let c = endpoints_status(&uncached, &mut no_spend);
         assert_eq!(c.status, Status::Warn, "{}", c.message);
@@ -11820,7 +11926,7 @@ mod tests {
         let cached = materialized(
             r#"{"profiles":{"p":{"models":[{"id":"claude-sonnet-5-5","endpoint":"claude"}]}},
                 "endpoints":{"claude":{"url":"https://api.anthropic.com/v1","dialect":"messages"},
-                             "grok":{"url":"https://api.x.ai/v1"}}}"#,
+                             "grok":{"url":"https://api.x.ai/v1","hardware":"unknown"}}}"#,
         );
         let c = endpoints_status(&cached, &mut no_spend);
         assert_eq!((c.status, c.hint), (Status::Pass, None), "{}", c.message);
@@ -11962,7 +12068,7 @@ mod tests {
             r#"{"profiles":{"p":{"models":[{"id":"gpt-4o","endpoint":"azure"}]}},
                 "endpoints":{
                     "azure":{"url":"https://tok@r.example/openai/deployments/d","api_version":"v1",
-                        "auth":{"type":"api-key","keychain":"darkmux-azure"},
+                        "auth":{"type":"api-key","keychain":"darkmux-azure"},"hardware":"unknown",
                         "limits":{"tokens_per_dispatch":500000,"window":{"period":"1d","tokens":2000000}}},
                     "lms":{"managed":"lmstudio"}}}"#,
         );
@@ -12008,7 +12114,7 @@ mod tests {
             r#"{"profiles":{"p":{"models":[{"id":"m","n_ctx":1,"endpoint":"lms"},{"id":"g","endpoint":"azure"}]}},
                 "endpoints":{
                     "lms":{"managed":"lmstudio","limits":{"tokens_per_dispatch":9000,"window":{"period":"1h","tokens":100000}}},
-                    "azure":{"url":"https://h.example/v1","limits":{"concurrent_calls":3}}}}"#,
+                    "azure":{"url":"https://h.example/v1","hardware":"unknown","limits":{"concurrent_calls":3}}}}"#,
         );
         let mut asked = Vec::new();
         let c = endpoints_status(&r, &mut |b| {

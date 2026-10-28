@@ -494,6 +494,30 @@ pub fn bad_endpoint_budget_policies(reg: &crate::ProfileRegistry) -> Vec<BadEnum
     out
 }
 
+/// (#3397) Every unregistered `hardware` in a profile registry: each
+/// `endpoints.<id>.hardware`. Contract 9 like a budget `policy`: never
+/// resolved to a fallback (an unknown value is never read as either
+/// machine), refused at preflight by every entry point that dispatches
+/// (`darkmux_profiles::preflight`), since a lab run snapshots it, and Fail
+/// in doctor.
+pub fn bad_endpoint_hardware(reg: &crate::ProfileRegistry) -> Vec<BadEnumValue> {
+    use crate::endpoint::{Hardware, Lenient};
+    let mut out = Vec::new();
+    for (id, ep) in &reg.endpoints {
+        if let Some(Lenient::Unrecognized(v)) = &ep.hardware {
+            out.push(BadEnumValue {
+                key: "endpoints.<id>.hardware",
+                kind: Hardware::KIND,
+                raw: v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()),
+                renamed_to: None,
+                set_in: SetIn::Profiles(format!("endpoints.{id}.hardware")),
+                values: Hardware::TABLE,
+            });
+        }
+    }
+    out
+}
+
 /// (#2902 step 5) The valid shape of an endpoint's `limits`, for a refusal.
 pub const LIMITS_SHAPE: &str = "`limits`: {\"window\": {\"period\": \"<n>m|<n>h|<n>d\", \"tokens\": <integer>, \
      \"calls\": <integer>}, \"policy\": \"off\"|\"warn\"|\"wait\", \"warn_at\": <a fraction between 0 and 1>, \
@@ -1079,6 +1103,7 @@ mod tests {
             ("ClientAddrSource", "where a client on this machine found the daemon's address (`config_access`), runtime-only provenance, never a setting"),
             ("FixedKind", "a session kind whose wire fields have a fixed count (`session_id`), never a setting"),
             ("EndpointKind", "derived from `managed` + `url`, never written"),
+            ("HardwareBasis", "derived from `managed`, the url's host and `hardware` (#3397), never written"),
             ("EngineChoice", "what `default_engine` resolved to; its values are an open set checked against profiles.json (`default_engine`), not a token list"),
             ("Lenient", "the lenient-read wrapper itself"),
             ("BuildKind", "whether the running binary is a release or a dev build (`build_info`), baked in at build time, never a setting"),
@@ -1115,7 +1140,7 @@ mod tests {
             ("LeftoverValue", "how a retired config key's leftover value is judged, fixed per retired setting, not a setting"),
             ("OldDefault", "a value a retired config key held by default, matched by the leftover check, not a setting"),
         ];
-        const PROFILE_ENUMS: &[&str] = &["ManagedBackend", "Dialect", "BudgetPolicy"];
+        const PROFILE_ENUMS: &[&str] = &["ManagedBackend", "Dialect", "BudgetPolicy", "Hardware"];
         const LITERAL_ARMS_ALLOWED: &[(&str, &str)] = &[(
             "parse_bool_token",
             "the one boolean-token vocabulary (1/true/yes/on, 0/false/no/off), not an enum setting",

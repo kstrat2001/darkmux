@@ -31,7 +31,8 @@ pub mod profiles;
 /// that dispatches, the profile registry: every endpoint budget (an
 /// unregistered `policy`, `config_enum::bad_endpoint_budget_policies`, and
 /// `limits` that cannot be used as written,
-/// `config_enum::invalid_endpoint_limits`) and every key its schema does not
+/// `config_enum::invalid_endpoint_limits`), every unregistered endpoint
+/// `hardware` (`config_enum::bad_endpoint_hardware`, #3397) and every key its schema does not
 /// know (`darkmux_types::user_files`), and `default_engine`, whose values
 /// are endpoint ids (`darkmux_types::default_engine`). `profiles.json` is a file
 /// `darkmux-types` cannot locate on its own, so this crate (the registry's
@@ -61,6 +62,7 @@ pub fn preflight_with(
         match profiles::load_registry_quiet(profiles_file) {
             Ok(loaded) => {
                 refusal.bad.extend(config_enum::bad_endpoint_budget_policies(&loaded.registry));
+                refusal.bad.extend(config_enum::bad_endpoint_hardware(&loaded.registry));
                 refusal.invalid.extend(config_enum::invalid_endpoint_limits(&loaded.registry));
                 refusal.invalid.extend(darkmux_types::default_engine::invalid(&loaded.registry));
                 refusal.files.extend(profiles::user_file_problem(&loaded.path));
@@ -102,6 +104,7 @@ mod user_file_tests {
             (with_key("", "profile"), "profile", "profiles"),
             (with_key("/profiles/p/models/0", "n_ctxx"), "profiles.p.models[0].n_ctxx", "profiles.p.models[0].n_ctx"),
             (with_key("/endpoints/azure/limits/window", "tokns"), "endpoints.azure.limits.window.tokns", "endpoints.azure.limits.window.tokens"),
+            (with_key("/endpoints/azure", "hardwar"), "endpoints.azure.hardwar", "endpoints.azure.hardware"),
         ]
     }
 
@@ -174,6 +177,29 @@ mod user_file_tests {
         assert_eq!(lmstudio, Ok(()));
         let msg = no_registry.expect_err("no registry is not a pass").to_string();
         assert!(msg.contains("`azur` names an endpoint, but the profile registry"), "{msg}");
+    }
+
+    /// (#3397, contract 9) An endpoint `hardware` this darkmux does not
+    /// register is refused by every dispatching preflight, naming the value,
+    /// where it is and both valid values; it is never read as either
+    /// machine. A registered value passes.
+    #[test]
+    fn an_unregistered_endpoint_hardware_is_refused_by_every_dispatching_preflight() {
+        let doc = |hardware: &str| {
+            format!(r#"{{"profiles": {{"p": {{"models": [{{"id": "flint", "endpoint": "studio"}}]}}}},
+                "endpoints": {{"studio": {{"url": "http://studio.local:8080/v1", "hardware": "{hardware}"}}}}}}"#)
+        };
+        let (_d, path) = write(&doc("this-machine"));
+        for scope in [Scope::Dispatch, Scope::MissionLaunch, Scope::LabRun] {
+            let msg = crate::preflight_with(scope, Some(&path)).expect_err("an unregistered value").to_string();
+            assert!(msg.contains("`this-machine`") && msg.contains("profiles.json key `endpoints.studio.hardware`"), "{msg}");
+            assert!(msg.contains("submitting-machine") && msg.contains("unknown"), "lists the valid values: {msg}");
+        }
+        assert_eq!(crate::preflight_with(Scope::FleetSubmission, Some(&path)), Ok(()), "fleet submission reads no registry");
+        for ok in ["submitting-machine", "unknown"] {
+            let (_d, path) = write(&doc(ok));
+            assert_eq!(crate::preflight_with(Scope::LabRun, Some(&path)), Ok(()), "{ok}");
+        }
     }
 
     #[test]

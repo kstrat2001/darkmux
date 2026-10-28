@@ -16,6 +16,7 @@ pub mod default_engine;
 pub mod diagnostics;
 pub mod dispatch_liveness;
 pub mod endpoint;
+pub mod provider;
 #[cfg(any(test, feature = "test-support"))]
 pub mod env_audit;
 pub mod execution_id;
@@ -47,7 +48,7 @@ use std::collections::BTreeMap;
 
 pub use endpoint::{
     CredentialSource, Dialect, Lenient, EndpointAuth, EndpointAuthType, EndpointError, EndpointKind, EndpointSource,
-    BudgetPolicy, ManagedBackend, ModelEndpoint, UsageLimits, UsageWindow, WindowBudget,
+    BudgetPolicy, Hardware, HardwareBasis, ManagedBackend, ModelEndpoint, UsageLimits, UsageWindow, WindowBudget,
 };
 
 /// (#1129) The running build's identifier — single source of truth for the
@@ -686,7 +687,13 @@ impl Profile {
 // managed LM Studio binding of 2.0). A 2.0 binary given the key keeps it in
 // `UtilityBinding.extras` and refuses it at preflight (contract 7), so the
 // binary is upgraded before the key is written.
-pub const PROFILES_SCHEMA_VERSION: &str = "2.1";
+// 2.2 (#3397): additive `hardware` on an endpoint (`"submitting-machine"` or
+// `"unknown"`, a registered `ConfigEnum` read leniently and refused at
+// preflight when unregistered), declaring which machine serves a `url`
+// endpoint whose host the built-in provider registry does not list. Minor
+// bump: every 2.1 registry reads unchanged. A 2.1 binary given the key keeps
+// it in `ModelEndpoint.extras` and refuses it at preflight (contract 7).
+pub const PROFILES_SCHEMA_VERSION: &str = "2.2";
 
 /// Scopes a review probe seat's draws to a subset of fact families, and
 /// optionally caps how many bundles it considers. Carried on
