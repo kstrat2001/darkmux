@@ -2011,6 +2011,44 @@ struct RunsCache {
     failed: Option<((PathBuf, Option<PathBuf>), std::time::SystemTime)>,
 }
 
+impl RunsCache {
+    /// Whether a build of `sources` failed inside [`RUNS_CACHE_TTL`] of `now`.
+    fn backing_off(&self, sources: &(PathBuf, Option<PathBuf>), now: std::time::SystemTime) -> bool {
+        self.failed.as_ref().is_some_and(|(s, at)| s == sources && wall_clock_cache_is_fresh(*at, now, RUNS_CACHE_TTL))
+    }
+
+    /// The last build, while it read these sources and `inputs` and is
+    /// younger than [`RUNS_CACHE_TTL`] at `now`.
+    fn fresh(&self, sources: &(PathBuf, Option<PathBuf>), inputs: u64, now: std::time::SystemTime) -> Option<BuiltRuns> {
+        self.built
+            .as_ref()
+            .filter(|b| b.sources == *sources && b.inputs == inputs && wall_clock_cache_is_fresh(b.at, now, RUNS_CACHE_TTL))
+            .cloned()
+    }
+
+    /// Keep what a build of `sources` produced: the build, or the failure
+    /// (at `now`) that the next requests back off from.
+    fn record(
+        &mut self,
+        sources: (PathBuf, Option<PathBuf>),
+        built: Result<BuiltRuns, String>,
+        now: std::time::SystemTime,
+    ) -> Option<BuiltRuns> {
+        match built {
+            Ok(built) => {
+                self.built = Some(built.clone());
+                self.failed = None;
+                Some(built)
+            }
+            Err(e) => {
+                eprintln!("darkmux serve: GET /runs aggregation task failed ({e}); serving no rows");
+                self.failed = Some((sources, now));
+                None
+            }
+        }
+    }
+}
+
 fn runs_cache() -> &'static tokio::sync::Mutex<RunsCache> {
     static CACHE: std::sync::OnceLock<tokio::sync::Mutex<RunsCache>> = std::sync::OnceLock::new();
     CACHE.get_or_init(|| tokio::sync::Mutex::new(RunsCache::default()))
@@ -2061,30 +2099,17 @@ fn build_runs_list(flows_dir: PathBuf, lab_dir: Option<PathBuf>, inputs: u64) ->
 async fn served_runs_list(flows_dir: PathBuf, lab_dir: Option<PathBuf>) -> Option<BuiltRuns> {
     let mut slot = runs_cache().lock().await;
     let sources = (flows_dir, lab_dir);
-    let now = std::time::SystemTime::now();
-    if slot.failed.as_ref().is_some_and(|(s, at)| *s == sources && wall_clock_cache_is_fresh(*at, now, RUNS_CACHE_TTL)) {
+    if slot.backing_off(&sources, std::time::SystemTime::now()) {
         return None;
     }
     let dir = sources.0.clone();
     let inputs = tokio::task::spawn_blocking(move || runs_inputs(&dir)).await.ok()?;
-    if let Some(built) = slot.built.as_ref() {
-        if built.sources == sources && built.inputs == inputs && wall_clock_cache_is_fresh(built.at, now, RUNS_CACHE_TTL) {
-            return Some(built.clone());
-        }
+    if let Some(built) = slot.fresh(&sources, inputs, std::time::SystemTime::now()) {
+        return Some(built);
     }
     let (flows_dir, lab_dir) = sources.clone();
-    match tokio::task::spawn_blocking(move || build_runs_list(flows_dir, lab_dir, inputs)).await {
-        Ok(built) => {
-            slot.built = Some(built.clone());
-            slot.failed = None;
-            Some(built)
-        }
-        Err(e) => {
-            eprintln!("darkmux serve: GET /runs aggregation task failed ({e}); serving no rows");
-            slot.failed = Some((sources, std::time::SystemTime::now()));
-            None
-        }
-    }
+    let built = tokio::task::spawn_blocking(move || build_runs_list(flows_dir, lab_dir, inputs)).await;
+    slot.record(sources, built.map_err(|e| e.to_string()), std::time::SystemTime::now())
 }
 
 /// GET /runs — the flat, kind-tagged, normalized run view-model (#1508 step
@@ -5867,52 +5892,57 @@ fn xread_block_once(
         .query(conn)
         .with_context(|| format!("XREAD BLOCK on {stream_name}"))?;
 
-    // XREAD returns:
-    //   - Nil (BLOCK timeout) — no new entries; keep current last_id
-    //   - [[stream_name, [[id, [k, v, ...]], ...]]] — one or more entries
+    parse_xread_reply(raw, last_id, date_filter)
+}
+
+/// The tail's lines out of one `XREAD` reply, and the cursor to read on
+/// from. The reply is `Nil` on a BLOCK timeout (no new entries; the cursor
+/// stays), else `[[stream_name, [[id, [k, v, ...]], ...]]]`. Every entry
+/// advances the cursor, a filtered-out one included; only records of
+/// `date_filter`'s day are kept.
+fn parse_xread_reply(raw: redis::Value, last_id: &str, date_filter: &str) -> Result<(Vec<String>, String), anyhow::Error> {
+    let outer = match raw {
+        redis::Value::Nil => return Ok((Vec::new(), last_id.to_string())),
+        redis::Value::Array(v) => v,
+        other => return Err(anyhow::anyhow!("XREAD: unexpected outer shape: {other:?}")),
+    };
     let mut records = Vec::new();
     let mut new_last_id = last_id.to_string();
-    let outer = match raw {
-        redis::Value::Nil => return Ok((records, new_last_id)),
-        redis::Value::Array(v) => v,
-        other => {
-            return Err(anyhow::anyhow!(
-                "XREAD: unexpected outer shape: {other:?}"
-            ));
+    for (id, record) in outer.iter().filter_map(xread_stream_entries).flatten().filter_map(xread_entry) {
+        if let Some(id) = id {
+            new_last_id = id.to_string();
         }
-    };
-    for stream_block in outer {
-        let pair = match stream_block {
-            redis::Value::Array(v) if v.len() >= 2 => v,
-            _ => continue,
-        };
-        let entries = match &pair[1] {
-            redis::Value::Array(v) => v,
-            _ => continue,
-        };
-        for entry in entries {
-            let parts = match entry {
-                redis::Value::Array(v) if v.len() >= 2 => v,
-                _ => continue,
-            };
-            // Entry id — update last_id no matter whether we emit, so
-            // a filtered-out record still advances the cursor.
-            if let Some(id) = redis_value_as_str(&parts[0]) {
-                new_last_id = id.to_string();
-            }
-            let fields = match &parts[1] {
-                redis::Value::Array(v) => v,
-                _ => continue,
-            };
-            let Some(record_json) = extract_record_field(fields) else {
-                continue;
-            };
-            if record_ts_matches_date(record_json, date_filter) {
-                records.push(stamp_hub_id_line(record_json, redis_value_as_str(&parts[0])));
-            }
+        if let Some(record_json) = record.filter(|r| record_ts_matches_date(r, date_filter)) {
+            records.push(stamp_hub_id_line(record_json, id));
         }
     }
     Ok((records, new_last_id))
+}
+
+/// The entries of one `[stream_name, [entry, ...]]` block of an `XREAD`
+/// reply; `None` for any other shape.
+fn xread_stream_entries(block: &redis::Value) -> Option<&[redis::Value]> {
+    match block {
+        redis::Value::Array(pair) if pair.len() >= 2 => match &pair[1] {
+            redis::Value::Array(entries) => Some(entries),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// One `[id, [k, v, ...]]` stream entry: its id and its `record` field.
+/// `None` when it is not an entry at all.
+fn xread_entry(entry: &redis::Value) -> Option<(Option<&str>, Option<&str>)> {
+    let redis::Value::Array(parts) = entry else { return None };
+    if parts.len() < 2 {
+        return None;
+    }
+    let record = match &parts[1] {
+        redis::Value::Array(fields) => extract_record_field(fields),
+        _ => None,
+    };
+    Some((redis_value_as_str(&parts[0]), record))
 }
 
 /// Extract the `record` field's string value from an XADD/XREAD/XRANGE
