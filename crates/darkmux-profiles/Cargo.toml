@@ -1,6 +1,6 @@
 [package]
 name = "darkmux-profiles"
-version = "5.9.2"
+version = "5.9.3"
 edition = "2021"
 description = "darkmux profile registry + LMStudio stack-swap orchestration"
 license = "MIT"

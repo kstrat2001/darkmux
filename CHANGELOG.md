@@ -14,6 +14,49 @@ darkmux release.
 
 ## [Unreleased]
 
+## [5.9.3] - 2026-10-29
+
+A faster daemon for the viewer and the fleet. An idle viewer, or a fleet peer reading this
+machine's card, no longer keeps the daemon re-reading every flow file, rebuilding the run list,
+spawning `lms`, or reconnecting to the hub on every poll. Nothing about what the viewer shows
+changes: no wire shape, record format or schema version moves.
+
+Measured on a laptop daemon with real data: `/flow/today` went from 2.2–7.8s to 0.04–0.1s,
+`/flow-missions` from 2.1–2.6s to 0.03–0.11s warm, `/machine/specs` from ~0.4s to ~1ms, and
+`lms` spawns from 7 to 2 per 40s.
+
+On macOS, `brew upgrade darkmux && brew services restart darkmux` puts the running daemon on it.
+
+### Fixed
+
+- **`GET /flow/<date>` reads the hub through the fleet window (#3434).** Each call used to pull the
+  last 10,000 records of both hub streams over a fresh connection, about 20 MB per call. The day's
+  hub records now come from the fleet window that `/runs` and the catalog already share, with a
+  direct hub read as the fallback. The local-file union and the record order are unchanged.
+  Closes #3431.
+- **`/flow-missions` re-reads only the day files that changed; `/runs` shares one build for 10s
+  (#3435).** The catalog lens re-parsed every day file on every poll, and every open viewer rebuilt
+  the whole run list every 5s. Both are now cached against their inputs: a day file is re-read
+  only when its length or mtime changes, and the run list is rebuilt only when what it is built
+  from changes.
+- **One cached residents read and a cached `lms` catalog (#3433).** `/machine/status`,
+  `/machine/specs` and the machine card share one 10s read of the loaded models instead of each
+  running `lms ps`, sometimes twice. The `lms ls` catalog is cached for 10 minutes, and the
+  `/machine/resources` cache goes from 2s to 10s. Closes #3428 with #3435.
+- **One shared presence read per key space (#3436).** Every presence reader in the daemon (the
+  live machine and dispatch lists, `/runs`, the run board, the fleet view) shares one 5s snapshot,
+  and the beats come back in one `MGET` after the `SCAN` instead of one `GET` each. The CLI and the
+  presence reconciler use the same read.
+- **The live tail keeps its hub connection (#3437).** The viewer's live tail opened a new hub
+  connection for every 500ms `XREAD`, per stream, per open viewer, most of the hub's connects. It
+  now keeps one connection per stream and opens a new one only after a failed read. #3438 split
+  the tail's reply parsing and the `/runs` cache checks into tested helpers; behavior is unchanged.
+- **The fleet window is keyed by its hub (#3440).** The shared fleet window now checks whether a
+  hub is configured before it serves a cached window, and keeps one window per hub. A window or a
+  failed read from one hub is never served for another, and a refresh that ends after the hub
+  changed is dropped. In a running daemon the hub doesn't change, so this mostly affects tests
+  that run in one process.
+
 ## [5.9.2] - 2026-10-29
 
 Fixes for darkmux running as a background service, above all a Homebrew `brew services` daemon on
@@ -4249,6 +4292,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   does. `FLOW_SCHEMA_VERSION` unchanged at 1.52.0; `RULES_SCHEMA_VERSION`
   unchanged at 3.0.0.
 
+[5.9.3]: https://github.com/kstrat2001/darkmux/releases/tag/v5.9.3
 [5.9.2]: https://github.com/kstrat2001/darkmux/releases/tag/v5.9.2
 [5.9.1]: https://github.com/kstrat2001/darkmux/releases/tag/v5.9.1
 [5.9.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.9.0
