@@ -812,7 +812,7 @@ async fn fleet_machines_live_handler() -> axum::Json<wire::FleetMachinesLiveResp
     // env(DARKMUX_REDIS_URL) > config-assembled (#661 Slice 5).
     let redis_url = darkmux_flow::redis_url();
     let (beats, state) = match redis_url {
-        Some(url) => tokio::task::spawn_blocking(move || machine_beats(&url))
+        Some(url) => tokio::task::spawn_blocking(move || machine_beats(&url, PresenceRead::ROUTE))
             .await
             .unwrap_or_else(|e| {
                 eprintln!("darkmux serve: GET /fleet/machines/live task failed ({e})");
@@ -1037,6 +1037,7 @@ async fn fleet_roster_handler() -> axum::Json<wire::FleetRosterResponse> {
 fn read_presence_beats<T, F>(
     url: &darkmux_flow::RawRedisUrl,
     kind: &str,
+    log: bool,
     read: F,
 ) -> (Vec<T>, source_state::SourceState)
 where
@@ -1047,14 +1048,18 @@ where
     let client = match redis::Client::open(url.expose_for_probe()) {
         Ok(c) => c,
         Err(e) => {
-            darkmux_types::diag_eprintln!("darkmux serve: live-{kind} presence — opening the Redis client failed ({e})");
+            if log {
+                eprintln!("darkmux serve: live-{kind} presence — opening the Redis client failed ({e})");
+            }
             return (Vec::new(), source_state::SourceState::Unavailable { detail: PRESENCE_READ_FAILED });
         }
     };
     match read(&client) {
         Ok(beats) => (beats, source_state::SourceState::Ok),
         Err(e) => {
-            darkmux_types::diag_eprintln!("darkmux serve: live-{kind} presence — reading the beats failed ({e})");
+            if log {
+                eprintln!("darkmux serve: live-{kind} presence — reading the beats failed ({e})");
+            }
             (Vec::new(), source_state::SourceState::Unavailable { detail: PRESENCE_READ_FAILED })
         }
     }
@@ -1073,38 +1078,57 @@ pub(crate) const PRESENCE_CACHE_TTL: Duration = Duration::from_secs(5);
 /// that stalls costs one bounded read per TTL rather than one per request.
 type PresenceSlot<T> = std::sync::Mutex<Option<([u8; 32], std::time::SystemTime, (Vec<T>, source_state::SourceState))>>;
 
+/// How a reader takes a presence key space: from the shared read or a new
+/// one, and whether a failed read is logged (the daemon's routes log it; the
+/// quiet readers are ones a CLI calls, or that log once per streak).
+#[derive(Clone, Copy)]
+pub(crate) struct PresenceRead {
+    pub(crate) fresh: bool,
+    pub(crate) log: bool,
+}
+
+impl PresenceRead {
+    /// A route's read: shared, failures logged.
+    pub(crate) const ROUTE: Self = Self { fresh: false, log: true };
+    /// Shared, quiet.
+    pub(crate) const QUIET: Self = Self { fresh: false, log: false };
+    /// New (and shared from then on), quiet.
+    pub(crate) const FRESH: Self = Self { fresh: true, log: false };
+}
+
 /// The read of a presence key space every reader in this process shares: the
 /// last one from this hub while younger than [`PRESENCE_CACHE_TTL`], else a
-/// new one ([`read_presence_beats`]). Single-flight: the lock is held across
-/// the read, which is bounded. Blocking.
+/// new one ([`read_presence_beats`]), which replaces it. Single-flight: the
+/// lock is held across the read, which is bounded. Blocking.
 fn shared_presence<T: Clone>(
     slot: &PresenceSlot<T>,
     url: &darkmux_flow::RawRedisUrl,
     kind: &str,
+    how: PresenceRead,
     read: impl FnOnce(&redis::Client) -> Result<Vec<T>, anyhow::Error>,
 ) -> (Vec<T>, source_state::SourceState) {
     let hub = *blake3::hash(url.expose_for_probe().as_bytes()).as_bytes();
     let mut slot = slot.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some((h, at, read)) = slot.as_ref() {
+    if let Some((h, at, read)) = slot.as_ref().filter(|_| !how.fresh) {
         if *h == hub && wall_clock_cache_is_fresh(*at, std::time::SystemTime::now(), PRESENCE_CACHE_TTL) {
             return read.clone();
         }
     }
-    let fresh = read_presence_beats(url, kind, read);
+    let fresh = read_presence_beats(url, kind, how.log, read);
     *slot = Some((hub, std::time::SystemTime::now(), fresh.clone()));
     fresh
 }
 
 /// The live machines' beats, shared ([`shared_presence`]).
-pub(crate) fn machine_beats(url: &darkmux_flow::RawRedisUrl) -> (Vec<darkmux_flow::presence::PresenceBeat>, source_state::SourceState) {
+pub(crate) fn machine_beats(url: &darkmux_flow::RawRedisUrl, how: PresenceRead) -> (Vec<darkmux_flow::presence::PresenceBeat>, source_state::SourceState) {
     static SLOT: PresenceSlot<darkmux_flow::presence::PresenceBeat> = std::sync::Mutex::new(None);
-    shared_presence(&SLOT, url, "machines", darkmux_flow::presence::read_live)
+    shared_presence(&SLOT, url, "machines", how, darkmux_flow::presence::read_live)
 }
 
 /// The live sessions' beats, shared ([`shared_presence`]).
-pub(crate) fn session_beats(url: &darkmux_flow::RawRedisUrl) -> (Vec<darkmux_flow::session_presence::SessionBeat>, source_state::SourceState) {
+pub(crate) fn session_beats(url: &darkmux_flow::RawRedisUrl, how: PresenceRead) -> (Vec<darkmux_flow::session_presence::SessionBeat>, source_state::SourceState) {
     static SLOT: PresenceSlot<darkmux_flow::session_presence::SessionBeat> = std::sync::Mutex::new(None);
-    shared_presence(&SLOT, url, "sessions", darkmux_flow::session_presence::read_live_sessions)
+    shared_presence(&SLOT, url, "sessions", how, darkmux_flow::session_presence::read_live_sessions)
 }
 
 /// The session and mission ids with a live beat right now (a mission's own
@@ -1114,10 +1138,32 @@ pub(crate) fn session_beats(url: &darkmux_flow::RawRedisUrl) -> (Vec<darkmux_flo
 /// read failed, so [`apply_not_reporting`] marks nothing rather than marking a
 /// beating run on an empty set.
 pub fn live_session_ids() -> Option<std::collections::HashSet<String>> {
+    live_session_ids_read(PresenceRead::QUIET)
+}
+
+/// [`live_session_ids`] from the shared read (`QUIET`) or a new one (`FRESH`).
+fn live_session_ids_read(how: PresenceRead) -> Option<std::collections::HashSet<String>> {
     let Some(url) = darkmux_flow::redis_url() else { return Some(Default::default()) };
-    let (beats, state) = session_beats(&url);
+    let (beats, state) = session_beats(&url, how);
     matches!(state, source_state::SourceState::Ok)
         .then(|| beats.into_iter().flat_map(|b| [Some(b.session_id), b.mission_id]).flatten().collect())
+}
+
+/// (#3432 review) `/runs`' not-reporting marks: judged on the shared beat
+/// read (`snapshot`), and when that would mark any row, judged again on a new
+/// one (`fresh`), since a session that began after the snapshot is not in it.
+/// A board with nothing to mark costs no read.
+fn mark_not_reporting_served(
+    rows: &mut [Run],
+    view: Option<&fleet_view::FleetView>,
+    snapshot: Option<std::collections::HashSet<String>>,
+    fresh: impl FnOnce() -> Option<std::collections::HashSet<String>>,
+) {
+    apply_not_reporting(rows, view, snapshot.as_ref());
+    if rows.iter().any(|r| r.not_reporting) {
+        rows.iter_mut().for_each(|r| r.not_reporting = false);
+        apply_not_reporting(rows, view, fresh().as_ref());
+    }
 }
 
 /// Log a failed live-beat read once per failure streak (the daemon's `/runs`,
@@ -1166,7 +1212,7 @@ async fn fleet_dispatches_live_handler() -> axum::Json<wire::FleetDispatchesLive
     // env(DARKMUX_REDIS_URL) > config-assembled (#661 Slice 5).
     let redis_url = darkmux_flow::redis_url();
     let (beats, state) = match redis_url {
-        Some(url) => tokio::task::spawn_blocking(move || session_beats(&url))
+        Some(url) => tokio::task::spawn_blocking(move || session_beats(&url, PresenceRead::ROUTE))
         .await
         .unwrap_or_else(|e| {
             eprintln!("darkmux serve: GET /fleet/dispatches/live task failed ({e})");
@@ -1942,7 +1988,7 @@ async fn runs_handler(State(state): State<AppState>) -> axum::Json<wire::RunsRes
         let mut rows = built.runs;
         let live = live_session_ids();
         log_beat_read_once(live.is_none());
-        apply_not_reporting(&mut rows, view.as_ref(), live.as_ref());
+        mark_not_reporting_served(&mut rows, view.as_ref(), live, || live_session_ids_read(PresenceRead::FRESH));
         (rows, off_rows, fleet.state)
     })
     .await;

@@ -2740,10 +2740,10 @@ impl PeerClocks {
     /// unreadable: nothing is corrected then).
     fn read() -> Self {
         let Some(url) = darkmux_flow::redis_url() else { return Self::default() };
-        let (beats, _) = crate::machine_beats(&url);
+        let (beats, _) = crate::machine_beats(&url, crate::PresenceRead::ROUTE);
         // (#3125) The live session beats, read the same way; a failed read
         // knows nothing (`None`), never "every beat is gone".
-        let (sessions, state) = crate::session_beats(&url);
+        let (sessions, state) = crate::session_beats(&url, crate::PresenceRead::ROUTE);
         let live_sessions = matches!(state, crate::source_state::SourceState::Ok)
             .then(|| sessions.into_iter().map(|b| b.session_id).collect());
         Self { live_sessions, ..Self::from_beats(&beats) }

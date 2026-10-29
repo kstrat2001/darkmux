@@ -266,7 +266,7 @@ fn live_machine_names() -> HashSet<String> {
         return HashSet::new();
     };
     // (#3432) The daemon's shared read: a failed one is empty, as before.
-    crate::machine_beats(&url).0.into_iter().map(|b| b.display_name).collect()
+    crate::machine_beats(&url, crate::PresenceRead::QUIET).0.into_iter().map(|b| b.display_name).collect()
 }
 
 /// GET `<base>/mission/<mission_id>/graph.json` with the shared bearer
