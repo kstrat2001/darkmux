@@ -394,7 +394,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-trajectory"
-version = "5.9.2"
+version = "5.9.3"
 dependencies = [
  "serde",
  "serde_json",
