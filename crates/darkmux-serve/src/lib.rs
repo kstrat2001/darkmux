@@ -3052,7 +3052,9 @@ fn degraded_specs() -> wire::MachineSpecsResponse {
     }
 }
 
-/// The spec sheet with a fresh residents read. Blocking.
+/// The spec sheet with a fresh residents read, for tests that change the
+/// engine between reads. Blocking.
+#[cfg(test)]
 pub(crate) fn gather_specs() -> wire::MachineSpecsResponse {
     gather_specs_from(local_engine_residents())
 }
