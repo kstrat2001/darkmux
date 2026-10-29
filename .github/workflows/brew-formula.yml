@@ -1,0 +1,27 @@
+# brew-formula.yml — install darkmux the way a brew user does (#3423).
+#
+# CI and release-verify build with cargo; nothing else runs `brew install` or
+# `brew services`, and three brew-only breakages shipped because of that
+# (#3409, #3418, #3419). This runs scripts/brew-smoke.sh on any change to the
+# formula or its wrapper (the release formula PR included), and on demand.
+name: brew formula smoke
+
+on:
+  pull_request:
+    paths:
+      - 'packaging/homebrew/**'
+      - 'scripts/brew-smoke.sh'
+      - '.github/workflows/brew-formula.yml'
+  workflow_dispatch: {}
+
+jobs:
+  brew-smoke:
+    name: brew install + service smoke (macos-latest)
+    runs-on: macos-latest
+    # A from-source release build of the tarball under brew, plus brew's own
+    # rust. The smoke itself takes about a minute.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the formula, start the service, check what a user gets
+        run: bash scripts/brew-smoke.sh
