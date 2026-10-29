@@ -4573,6 +4573,54 @@
                 .expect("task must not panic");
         }
 
+        /// (#3432) A tail keeps its connection across `XREAD BLOCK` polls:
+        /// it opened a new one for every 500ms poll, per stream, per open
+        /// viewer (3.2 hub connects/s measured). Records still arrive on the
+        /// kept connection.
+        #[tokio::test]
+        #[serial]
+        async fn a_tail_keeps_one_connection_across_its_polls() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
+            }
+            let redis = spawn_redis();
+            let today = today_utc_date();
+            let mut conn = redis::Client::open(redis.url.as_str()).unwrap().get_connection().unwrap();
+            let connects = |conn: &mut redis::Connection| -> u64 {
+                let info: String = redis::cmd("INFO").arg("stats").query(conn).unwrap();
+                info.lines()
+                    .find_map(|l| l.strip_prefix("total_connections_received:"))
+                    .and_then(|n| n.trim().parse().ok())
+                    .unwrap()
+            };
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+            let task = tokio::spawn(redis_tail_task(tx, redis.url.clone(), "darkmux:flow".to_string(), today.clone()));
+            // Past the first poll's XINFO and connect.
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let before = connects(&mut conn);
+            // Five or so quiet polls.
+            tokio::time::sleep(Duration::from_millis(2600)).await;
+            let after = connects(&mut conn);
+            xadd_flow_record(&redis.url, &format!(r#"{{"ts":"{today}T12:00:00Z","action":"kept"}}"#));
+            let got = tokio::time::timeout(Duration::from_millis(3000), rx.recv()).await.expect("a record within 3s");
+            assert_eq!(after - before, 0, "no new connection across quiet polls");
+            assert!(got.is_some_and(|s| s.contains("kept")));
+
+            // The hub drops the tail's connection: the next poll fails, the
+            // one after reopens once, and records arrive on the new one.
+            let before_kill = connects(&mut conn);
+            let _: u64 = redis::cmd("CLIENT").arg("KILL").arg("TYPE").arg("normal").arg("SKIPME").arg("yes").query(&mut conn).unwrap();
+            tokio::time::sleep(Duration::from_millis(2000)).await;
+            xadd_flow_record(&redis.url, &format!(r#"{{"ts":"{today}T12:00:01Z","action":"reopened"}}"#));
+            let got = tokio::time::timeout(Duration::from_millis(3000), rx.recv()).await.expect("a record after the reopen");
+            let reopens = connects(&mut conn) - before_kill - 1; // less the xadd helper's own connection
+            drop(rx);
+            let _ = tokio::time::timeout(Duration::from_millis(3000), task).await;
+            assert!(got.is_some_and(|s| s.contains("reopened")));
+            assert_eq!(reopens, 1, "one reopen after the connection was dropped");
+        }
+
         /// Records for OTHER dates are filtered out by the tail.
         #[tokio::test]
         #[serial]
