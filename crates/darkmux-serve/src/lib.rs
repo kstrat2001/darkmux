@@ -4128,16 +4128,14 @@ async fn aggregate_flow_records_for_date(
     flows_dir: &std::path::Path,
 ) -> DayRead {
     // env(DARKMUX_REDIS_URL) > config-assembled (#661 Slice 5).
-    let redis_url = darkmux_flow::redis_url();
-
-    let Some(url) = redis_url else {
+    if darkmux_flow::redis_url().is_none() {
         let local = read_flow_records_from_file(date, flows_dir).await;
         return DayRead {
             records: local.records,
             fleet_state: source_state::SourceState::Off,
             cut: wire::CutSources { local: local.cut, fleet: false },
         };
-    };
+    }
 
     // (#1570) LOCAL-FIRST, Redis as a bounded enhancement — run both
     // CONCURRENTLY rather than serialising Redis ahead of a file already on
@@ -4148,30 +4146,31 @@ async fn aggregate_flow_records_for_date(
     // takes 9ms — a 50x tax paid on every request for a source that is merely
     // optional. A degraded Redis now degrades the VIEW to local-only; it can
     // never block it.
+    // (#3431) The hub half comes from the process's fleet window, shared with
+    // `/runs` and the catalog routes and brought up to date incrementally,
+    // instead of a read of the hub's whole window per request. A failed
+    // refresh serves the last window read, marked stale with its age, as the
+    // catalog routes do; with none, the day is local only, `unavailable`.
     let date_owned = date.to_string();
-    let url_owned = url.clone();
-    let redis_task = tokio::task::spawn_blocking(move || {
-        read_flow_records_from_redis(url_owned.expose_for_probe(), Some(&date_owned), FleetScope::WithSamples)
+    let window_task = tokio::task::spawn_blocking(move || {
+        hub_day(&date_owned, fleet_flow_records_in, || {
+            let url = darkmux_flow::redis_url().ok_or_else(|| anyhow::anyhow!("no hub configured"))?;
+            read_flow_records_from_redis(url.expose_for_probe(), Some(&date_owned), FleetScope::WithSamples)
+        })
     });
-    let (redis_result, local_records) = tokio::join!(redis_task, read_flow_records_from_file(date, flows_dir));
+    let (window, local_records) = tokio::join!(window_task, read_flow_records_from_file(date, flows_dir));
 
-    match redis_result {
-        Ok(Ok(redis)) => DayRead {
-            records: union_flow_records(redis.records, local_records.records),
-            fleet_state: source_state::SourceState::Ok,
-            cut: wire::CutSources { local: local_records.cut, fleet: redis.cut },
+    match window {
+        Ok((Some(day), state)) => DayRead {
+            records: union_flow_records(day.records, local_records.records),
+            fleet_state: state,
+            cut: wire::CutSources { local: local_records.cut, fleet: day.cut },
         },
-        Ok(Err(e)) => {
-            eprintln!(
-                "darkmux serve: GET /flow/{date} Redis aggregation failed ({e}); \
-                 serving local file only"
-            );
-            DayRead {
-                records: local_records.records,
-                fleet_state: source_state::SourceState::Unavailable { detail: FLEET_READ_ERROR_DETAIL },
-                cut: wire::CutSources { local: local_records.cut, fleet: false },
-            }
-        }
+        Ok((None, state)) => DayRead {
+            records: local_records.records,
+            fleet_state: state,
+            cut: wire::CutSources { local: local_records.cut, fleet: false },
+        },
         Err(e) => {
             eprintln!(
                 "darkmux serve: GET /flow/{date} blocking task join error ({e}); \
@@ -4182,6 +4181,36 @@ async fn aggregate_flow_records_for_date(
                 fleet_state: source_state::SourceState::Unavailable { detail: FLEET_READ_ERROR_DETAIL },
                 cut: wire::CutSources { local: local_records.cut, fleet: false },
             }
+        }
+    }
+}
+
+/// (#3431) The hub half of a day: from the fleet window (`window`, the
+/// process's [`fleet_flow_records_in`]) when it has records to serve, fresh
+/// or stale. When it has none (`Unavailable`: never read, or a cold read
+/// still in flight past the wait another request will give it, the case a
+/// slow first read of a busy hub hits), the day is read from the hub
+/// directly (`direct`), as before the window served this route, so two
+/// requests made together on a cold window both get the hub's records.
+/// `None` when neither has any; the state says why.
+fn hub_day(
+    date: &str,
+    window: impl Fn(FleetScope) -> FleetRead,
+    direct: impl FnOnce() -> anyhow::Result<SourceRead>,
+) -> (Option<SourceRead>, source_state::SourceState) {
+    let fleet = window(FleetScope::WithSamples);
+    match fleet.state {
+        source_state::SourceState::Off => (None, fleet.state),
+        source_state::SourceState::Unavailable { .. } => match direct() {
+            Ok(day) => (Some(day), source_state::SourceState::Ok),
+            Err(e) => {
+                eprintln!("darkmux serve: GET /flow/{date} Redis aggregation failed ({e}); serving local file only");
+                (None, fleet.state)
+            }
+        },
+        _ => {
+            let work = window(FleetScope::Work);
+            (Some(fleet_day_records(date, &fleet.records, &work.records)), fleet.state)
         }
     }
 }
@@ -4501,8 +4530,9 @@ fn bound_redis_response(conn: &redis::Connection) {
 
 /// XREVRANGE the flow stream, keeping the records whose `ts` falls on `date`
 /// (every record when `date` is `None`). Synchronous (the sync
-/// `redis::Client`): the call site wraps it in `spawn_blocking` so the
-/// daemon's async runtime stays responsive.
+/// `redis::Client`). (#3431) `GET /flow/<date>` reads this way only when the
+/// fleet window has nothing to serve ([`hub_day`]); it is also what a fresh,
+/// uncached read returns, the reference the window's tests hold it to.
 fn read_flow_records_from_redis(
     url: &str,
     date: Option<&str>,
@@ -4596,6 +4626,29 @@ fn merge_by_hub_id(a: Vec<serde_json::Value>, b: Vec<serde_json::Value>) -> Vec<
     out
 }
 
+/// Whether a newest-first read of `len` entries, the oldest at hub time
+/// `oldest_ms`, may not hold the whole of `date`: see [`records_from_xrevrange`].
+fn read_cuts_day(len: usize, oldest_ms: Option<u64>, date: &str, maxlen: usize) -> bool {
+    let bound = if maxlen == 0 { MAX_FLOW_FILE_RECORDS } else { maxlen.min(MAX_FLOW_FILE_RECORDS) };
+    len >= bound && day_start_ms(date).is_some_and(|start| oldest_ms.is_some_and(|oldest| oldest >= start))
+}
+
+/// (#3431) The hub's records for `date`, from the process's fleet window
+/// rather than a read of the hub's whole window per request (~20 MB on the
+/// operator's hub, behind every `GET /flow/<date>`): the records a fresh
+/// [`read_flow_records_from_redis`] for the date returns, in the same order,
+/// and the same cut. `fleet` is the window with the samples merged in, `work`
+/// the work stream's alone (the cut is the work stream's, as there).
+fn fleet_day_records(date: &str, fleet: &FleetRecords, work: &FleetRecords) -> SourceRead {
+    let records = fleet
+        .iter()
+        .filter(|r| r.value().get("ts").and_then(|t| t.as_str()).is_some_and(|ts| ts.starts_with(date)))
+        .map(fleet_window::FleetRecord::full)
+        .collect();
+    let oldest_ms = work.values().next().and_then(hub_id_key).map(|(ms, _)| ms);
+    SourceRead { records, cut: read_cuts_day(work.len(), oldest_ms, date, darkmux_types::config_access::redis_maxlen()) }
+}
+
 /// The records an `XREVRANGE` reply holds, read through the flow reader
 /// (so a retired spelling comes back as an unknown action), filtered to `date` when one
 /// is given, in chronological order.
@@ -4618,12 +4671,7 @@ fn records_from_xrevrange(raw: redis::Value, date: Option<&str>, maxlen: usize) 
             ));
         }
     };
-    let bound = if maxlen == 0 { MAX_FLOW_FILE_RECORDS } else { maxlen.min(MAX_FLOW_FILE_RECORDS) };
-    let hit_a_bound = entries.len() >= bound;
-    let cut = hit_a_bound
-        && date.and_then(day_start_ms).is_some_and(|start| {
-            entries.last().and_then(entry_id_ms).is_some_and(|oldest| oldest >= start)
-        });
+    let cut = date.is_some_and(|date| read_cuts_day(entries.len(), entries.last().and_then(entry_id_ms), date, maxlen));
     // (#1715 review) The last bare `10000` on this path — the same cap the
     // XREVRANGE above already single-sources, so it follows that constant
     // rather than sitting beside it as a third copy.
