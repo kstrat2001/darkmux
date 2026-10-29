@@ -5356,6 +5356,10 @@ fn resolve_current_last_id(
     Ok("0-0".to_string())
 }
 
+/// What one tail poll hands back: the connection to keep (only after a
+/// successful read) and the read.
+type TailPoll = (Option<redis::Connection>, Result<(Vec<String>, String), anyhow::Error>);
+
 /// One poll of a tail on its kept connection, or a new one when it has none
 /// (#3432). The connection comes back only when the read succeeded: after a
 /// failure (a read deadline can leave a reply on the socket) the next poll
@@ -5366,7 +5370,7 @@ fn poll_tail(
     stream_name: &str,
     last_id: &str,
     date_filter: &str,
-) -> (Option<redis::Connection>, Result<(Vec<String>, String), anyhow::Error>) {
+) -> TailPoll {
     let mut conn = match kept.map_or_else(|| tail_connection(url, stream_name), Ok) {
         Ok(conn) => conn,
         Err(e) => return (None, Err(e)),
