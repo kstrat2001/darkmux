@@ -5518,14 +5518,16 @@ fn check_daemon_docker() -> Check {
 
 /// `/health`'s `docker_on_path` (`None` when absent: no daemon, one older than
 /// #3423, or a caller it does not count as this machine) and whether its fleet
-/// listener is on (any state but `off`).
+/// listener takes dispatches or is about to: `listening`, `starting`, or
+/// `waiting` (it retries until it binds). `off` and `not started` (terminal:
+/// the listener reports its own cause) take none.
 fn parse_daemon_docker(health_body: &str) -> (Option<bool>, bool) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(health_body) else { return (None, false) };
     let docker = v.get("docker_on_path").and_then(|d| d.as_bool());
     let listener_on = v
         .get("fleet_listener")
         .and_then(|l| l.as_str())
-        .is_some_and(|l| !l.starts_with("off"));
+        .is_some_and(|l| ["listening", "starting", "waiting"].iter().any(|on| l.starts_with(on)));
     (docker, listener_on)
 }
 
@@ -5567,8 +5569,8 @@ fn daemon_without_docker(listener_on: bool, in_panel: bool) -> Check {
     } else {
         (
             Status::Warn,
-            "so it can't clean up orphaned dispatch containers, and a dispatch would fail if its \
-             fleet listener were turned on",
+            "so it can't clean up orphaned dispatch containers, and a dispatch would fail once \
+             its fleet listener runs",
         )
     };
     let check_first = if in_panel { "if `command -v docker` works in your terminal, the daemon's PATH is the problem: " } else { "" };
@@ -9603,6 +9605,11 @@ mod tests {
         assert_eq!(parse_daemon_docker(r#"{"build":"5.9.1","docker_on_path":null}"#), (None, false));
         assert_eq!(parse_daemon_docker(r#"{"build":"5.9.1"}"#), (None, false));
         assert_eq!(parse_daemon_docker("not json"), (None, false));
+        // (#3425 re-review) "not started" is terminal: the listener accepts
+        // nothing, so it is off; "waiting" retries until it binds, so it is on.
+        assert_eq!(parse_daemon_docker(r#"{"docker_on_path":false,"fleet_listener":"not started: no fleet token"}"#), (Some(false), false));
+        assert_eq!(parse_daemon_docker(r#"{"docker_on_path":false,"fleet_listener":"waiting for the tailscale network to answer"}"#), (Some(false), true));
+        assert_eq!(parse_daemon_docker(r#"{"docker_on_path":false,"fleet_listener":"starting"}"#), (Some(false), true));
     }
 
     /// (#3423) The #3418 shape: the shell finds docker, the daemon does not.
@@ -9657,6 +9664,7 @@ mod tests {
     #[test]
     fn check_daemon_docker_asks_the_configured_port_and_reads_the_shell_path() {
         let body = r#"{"build":"0.0.0","docker_on_path":false,"fleet_listener":"listening on 100.64.0.2:8766"}"#;
+        let off_body = r#"{"build":"0.0.0","docker_on_path":false,"fleet_listener":"off (fleet.listener.enabled is false)"}"#;
         let with_docker = tempfile::TempDir::new().unwrap();
         let tool = with_docker.path().join("docker");
         std::fs::write(&tool, "#!/bin/sh\n").unwrap();
@@ -9668,19 +9676,27 @@ mod tests {
         let without = tempfile::TempDir::new().unwrap();
         let (prev_port, prev_path, prev_panel) =
             (env::var("DARKMUX_SERVE_PORT").ok(), env::var_os("PATH"), env::var_os("DARKMUX_PANEL"));
-        let run_with = |path: &std::path::Path| {
+        let run_with = |body: &'static str, path: &std::path::Path, panel: bool| {
             let (port, server) = serve_health_once(body);
             unsafe {
                 env::set_var("DARKMUX_SERVE_PORT", port.to_string());
                 env::set_var("PATH", path);
-                env::remove_var("DARKMUX_PANEL");
+                if panel {
+                    env::set_var("DARKMUX_PANEL", "doctor");
+                } else {
+                    env::remove_var("DARKMUX_PANEL");
+                }
             }
             let c = check_daemon_docker();
             let _ = server.join();
             c
         };
-        let fails = run_with(with_docker.path());
-        let quiet = run_with(without.path());
+        let fails = run_with(body, with_docker.path(), false);
+        let quiet = run_with(body, without.path(), false);
+        let warns = run_with(off_body, with_docker.path(), false);
+        // In the panel doctor's PATH is the daemon's: no docker on it is
+        // still the daemon's problem, never "neither finds docker".
+        let in_panel = run_with(body, without.path(), true);
         unsafe {
             match prev_port {
                 Some(v) => env::set_var("DARKMUX_SERVE_PORT", v),
@@ -9695,7 +9711,9 @@ mod tests {
             }
         }
         assert!(matches!(fails.status, Status::Fail), "{fails:?}");
-        assert!(quiet.message.contains("not applicable"), "{quiet:?}");
+        assert!(quiet.message.contains("neither this shell"), "{quiet:?}");
+        assert!(matches!(warns.status, Status::Warn), "{warns:?}");
+        assert!(matches!(in_panel.status, Status::Fail) && !in_panel.message.contains("not applicable"), "{in_panel:?}");
     }
 
     /// One `/health` answer on an ephemeral port, deadlined so a probe that
