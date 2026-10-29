@@ -1078,22 +1078,26 @@ pub(crate) const PRESENCE_CACHE_TTL: Duration = Duration::from_secs(5);
 /// that stalls costs one bounded read per TTL rather than one per request.
 type PresenceSlot<T> = std::sync::Mutex<Option<([u8; 32], std::time::SystemTime, (Vec<T>, source_state::SourceState))>>;
 
-/// How a reader takes a presence key space: from the shared read or a new
-/// one, and whether a failed read is logged (the daemon's routes log it; the
-/// quiet readers are ones a CLI calls, or that log once per streak).
+/// How a reader takes a presence key space: how old a shared read it accepts,
+/// and whether a failed read is logged (the daemon's routes log it; the quiet
+/// readers are ones a CLI calls, or that log once per streak).
 #[derive(Clone, Copy)]
 pub(crate) struct PresenceRead {
-    pub(crate) fresh: bool,
+    pub(crate) max_age: Duration,
     pub(crate) log: bool,
 }
 
 impl PresenceRead {
     /// A route's read: shared, failures logged.
-    pub(crate) const ROUTE: Self = Self { fresh: false, log: true };
+    pub(crate) const ROUTE: Self = Self { max_age: PRESENCE_CACHE_TTL, log: true };
     /// Shared, quiet.
-    pub(crate) const QUIET: Self = Self { fresh: false, log: false };
-    /// New (and shared from then on), quiet.
-    pub(crate) const FRESH: Self = Self { fresh: true, log: false };
+    pub(crate) const QUIET: Self = Self { max_age: PRESENCE_CACHE_TTL, log: false };
+    /// `/runs`' confirming read before it marks a run not reporting: a shared
+    /// read under a second old, else a new one. Quiet.
+    pub(crate) const CONFIRM: Self = Self { max_age: Duration::from_secs(1), log: false };
+    /// Always a new read (shared from then on). Quiet.
+    #[cfg(test)]
+    pub(crate) const FRESH: Self = Self { max_age: Duration::ZERO, log: false };
 }
 
 /// The read of a presence key space every reader in this process shares: the
@@ -1109,13 +1113,23 @@ fn shared_presence<T: Clone>(
 ) -> (Vec<T>, source_state::SourceState) {
     let hub = *blake3::hash(url.expose_for_probe().as_bytes()).as_bytes();
     let mut slot = slot.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some((h, at, read)) = slot.as_ref().filter(|_| !how.fresh) {
-        if *h == hub && wall_clock_cache_is_fresh(*at, std::time::SystemTime::now(), PRESENCE_CACHE_TTL) {
+    if let Some((h, at, read)) = slot.as_ref() {
+        if *h == hub && wall_clock_cache_is_fresh(*at, std::time::SystemTime::now(), how.max_age.min(PRESENCE_CACHE_TTL)) {
             return read.clone();
         }
     }
     let fresh = read_presence_beats(url, kind, how.log, read);
-    *slot = Some((hub, std::time::SystemTime::now(), fresh.clone()));
+    // A failed read never replaces a good one from this hub still inside the
+    // TTL: the caller sees its failure, every other reader the good read.
+    let keep_good = !matches!(fresh.1, source_state::SourceState::Ok)
+        && slot.as_ref().is_some_and(|(h, at, (_, state))| {
+            *h == hub
+                && matches!(state, source_state::SourceState::Ok)
+                && wall_clock_cache_is_fresh(*at, std::time::SystemTime::now(), PRESENCE_CACHE_TTL)
+        });
+    if !keep_good {
+        *slot = Some((hub, std::time::SystemTime::now(), fresh.clone()));
+    }
     fresh
 }
 
@@ -1988,7 +2002,7 @@ async fn runs_handler(State(state): State<AppState>) -> axum::Json<wire::RunsRes
         let mut rows = built.runs;
         let live = live_session_ids();
         log_beat_read_once(live.is_none());
-        mark_not_reporting_served(&mut rows, view.as_ref(), live, || live_session_ids_read(PresenceRead::FRESH));
+        mark_not_reporting_served(&mut rows, view.as_ref(), live, || live_session_ids_read(PresenceRead::CONFIRM));
         (rows, off_rows, fleet.state)
     })
     .await;

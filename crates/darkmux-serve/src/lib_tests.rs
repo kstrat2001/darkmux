@@ -6535,6 +6535,37 @@
         assert!(!rows[0].not_reporting, "no view marks nothing");
     }
 
+    /// (#3432 re-review) A failed read never replaces a good shared one still
+    /// inside its TTL: a confirming read that failed left every other reader
+    /// `unavailable` for 5s though the snapshot was good. The failing caller
+    /// still sees its own failure.
+    #[test]
+    fn a_failed_read_never_replaces_a_good_shared_one() {
+        static SLOT: PresenceSlot<u32> = std::sync::Mutex::new(None);
+        let url = darkmux_flow::RawRedisUrl::new("redis://127.0.0.1:1".to_string());
+        let good = shared_presence(&SLOT, &url, "t", PresenceRead::QUIET, |_| Ok(vec![1]));
+        let failed = shared_presence(&SLOT, &url, "t", PresenceRead::FRESH, |_| Err(anyhow::anyhow!("down")));
+        let after = shared_presence(&SLOT, &url, "t", PresenceRead::QUIET, |_| panic!("read again inside the TTL"));
+        assert_eq!(good.0, vec![1]);
+        assert!(matches!(failed.1, source_state::SourceState::Unavailable { .. }));
+        assert_eq!(after, good, "the good read is still the shared one");
+    }
+
+    /// (#3432 re-review) `/runs`' confirming read takes a shared read under a
+    /// second old, so a row that stays not reporting (a peer that died with a
+    /// run open) does not cost a new read on every request: the steady state
+    /// is the shared read, taken fresh each TTL.
+    #[test]
+    fn a_confirming_read_takes_a_shared_read_under_a_second_old() {
+        static SLOT: PresenceSlot<u32> = std::sync::Mutex::new(None);
+        let url = darkmux_flow::RawRedisUrl::new("redis://127.0.0.1:1".to_string());
+        shared_presence(&SLOT, &url, "t", PresenceRead::QUIET, |_| Ok(vec![1]));
+        let confirmed = shared_presence(&SLOT, &url, "t", PresenceRead::CONFIRM, |_| panic!("read anew under a second"));
+        assert_eq!(confirmed.0, vec![1]);
+        let fresh = shared_presence(&SLOT, &url, "t", PresenceRead::FRESH, |_| Ok(vec![2]));
+        assert_eq!(fresh.0, vec![2], "FRESH always reads");
+    }
+
     /// (#3432 review) `/runs` marks a run not reporting only on a fresh beat
     /// read: the shared snapshot can be up to 5s old, and a session that began
     /// after it is not in it. A run the snapshot would mark is judged again on
