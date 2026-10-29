@@ -4434,8 +4434,10 @@ fn bound_redis_response(conn: &redis::Connection) {
 
 /// XREVRANGE the flow stream, keeping the records whose `ts` falls on `date`
 /// (every record when `date` is `None`). Synchronous (the sync
-/// `redis::Client`): the call site wraps it in `spawn_blocking` so the
-/// daemon's async runtime stays responsive.
+/// `redis::Client`). (#3431) No route reads the hub this way any more: it is
+/// what a fresh, uncached read returns, the reference the fleet window's
+/// tests hold the window to.
+#[cfg(test)]
 fn read_flow_records_from_redis(
     url: &str,
     date: Option<&str>,
@@ -4517,6 +4519,7 @@ fn hub_id_key(record: &serde_json::Value) -> Option<(u64, u64)> {
 /// Merge two chronological runs of hub records into one, in hub order. The hub
 /// assigns ids, so they order records across the two streams even where the
 /// writers' clocks disagree. Stable: on equal keys `a` comes first.
+#[cfg(test)]
 fn merge_by_hub_id(a: Vec<serde_json::Value>, b: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
     let mut out = Vec::with_capacity(a.len() + b.len());
     let (mut a, mut b) = (a.into_iter().peekable(), b.into_iter().peekable());
@@ -4565,6 +4568,7 @@ fn fleet_day_records(date: &str, fleet: &FleetRecords, work: &FleetRecords) -> S
 /// trim length is this machine's own `redis.maxlen`, an approximation of what
 /// the hub's writers trim to. A read with no date asks for the whole stream
 /// and is never "cut" in this sense.
+#[cfg(test)]
 fn records_from_xrevrange(raw: redis::Value, date: Option<&str>, maxlen: usize) -> Result<SourceRead> {
     let entries = match raw {
         redis::Value::Array(v) => v,
@@ -4636,6 +4640,7 @@ fn stamp_hub_id_line(line: &str, id: Option<&str>) -> String {
 }
 
 /// The millisecond part of a stream entry's `<ms>-<seq>` id.
+#[cfg(test)]
 fn entry_id_ms(entry: &redis::Value) -> Option<u64> {
     let redis::Value::Array(pair) = entry else { return None };
     redis_value_as_str(pair.first()?)?.split('-').next()?.parse().ok()
