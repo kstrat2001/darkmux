@@ -87,8 +87,6 @@ class Darkmux < Formula
     # `docker` (Homebrew's, or Docker Desktop's /usr/local/bin and ~/.docker/bin
     # links) and every dispatch it runs or accepts from a peer fails.
     environment_variables(
-      PATH:                 "#{std_service_path_env}:/usr/local/bin:" \
-                            "#{Dir.home}/.docker/bin:#{Dir.home}/.lmstudio/bin",
       DARKMUX_REDIS_STREAM: "darkmux:flow",
       DARKMUX_REDIS_MAXLEN: "10000",
     )
