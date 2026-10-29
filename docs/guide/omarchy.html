@@ -41,11 +41,11 @@
     <h2>Build and install</h2>
     <p>There is no Homebrew here, so darkmux builds from a release tag. Omarchy ships <code>mise</code> for the Rust toolchain:</p>
     <pre><code>mise use -g rust@1.97.1
-DARKMUX_RELEASE=1 cargo install --git https://github.com/kstrat2001/darkmux --tag v5.9.1 --locked darkmux
+DARKMUX_RELEASE=1 cargo install --git https://github.com/kstrat2001/darkmux --tag v5.9.2 --locked darkmux
 ln -sf ~/.cargo/bin/darkmux ~/.local/bin/darkmux   <span class="comment"># ~/.cargo/bin is not on Omarchy's PATH</span>
 darkmux --version
 darkmux init</code></pre>
-    <p>To update, re-run the <code>cargo install</code> line with the newest tag from the <a href="https://github.com/kstrat2001/darkmux/releases">releases page</a>. <code>DARKMUX_RELEASE=1</code> marks the build as the tagged release (cargo's checkout carries no tags for the build to read), so <code>darkmux --version</code> reads <code>5.9.1 (release &lt;commit&gt;)</code>. evals.darkmux.com takes runs only from a release build; without the variable, or with a <code>✱</code> after the commit, the build is a development one and <code>lab submit</code> is refused. With no LM Studio, <code>init</code> can't fill in a worker model; the next section adds one.</p>
+    <p>To update, re-run the <code>cargo install</code> line with the newest tag from the <a href="https://github.com/kstrat2001/darkmux/releases">releases page</a>. <code>DARKMUX_RELEASE=1</code> marks the build as the tagged release (cargo's checkout carries no tags for the build to read), so <code>darkmux --version</code> reads <code>5.9.2 (release &lt;commit&gt;)</code>. evals.darkmux.com takes runs only from a release build; without the variable, or with a <code>✱</code> after the commit, the build is a development one and <code>lab submit</code> is refused. With no LM Studio, <code>init</code> can't fill in a worker model; the next section adds one.</p>
   </div>
 </section>
 
