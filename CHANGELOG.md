@@ -14,6 +14,59 @@ darkmux release.
 
 ## [Unreleased]
 
+## [5.9.2] - 2026-10-29
+
+Fixes for darkmux running as a background service, above all a Homebrew `brew services` daemon on
+macOS. Upgrade if a machine of yours runs dispatches through its daemon, for example as a fleet
+peer. The image-pull fix and the new doctor row apply on Omarchy too.
+
+On macOS, run `brew upgrade darkmux && brew services restart darkmux` once: the restart is what
+gives the running daemon its new environment.
+
+### Fixed
+
+- **A brew-service daemon can find `docker` (#3418).** launchd starts `brew services` jobs with
+  only `/usr/bin:/bin:/usr/sbin:/sbin` on PATH, so the daemon never found Homebrew's or Docker
+  Desktop's `docker`. Every dispatch it ran or accepted from a fleet peer failed with "`docker`
+  binary isn't on PATH". The formula now gives the service a PATH with Homebrew's bin,
+  `/usr/local/bin`, `~/.docker/bin` and `~/.lmstudio/bin`. This shipped to the tap as `5.9.1_1`;
+  it reaches a running daemon at its next `brew services restart`.
+- **The first dispatch's runtime image pull no longer hangs (#3419).** A daemon started by launchd
+  pulled `ghcr.io/kstrat2001/darkmux-runtime` through the user's Docker credential helper, and
+  Docker Desktop's helper waits for a GUI session the daemon doesn't have. The image is public,
+  so darkmux now pulls it anonymously, with a Docker config that names the registry and holds no
+  credentials, so no helper runs, and aims the pull at the endpoint your Docker context names. A
+  pull the registry refuses anonymously is tried once with your own Docker config. A pull that
+  doesn't finish within 10 minutes ends the dispatch with an error naming the fix (`docker pull
+  <image>` from a logged-in shell) instead of hanging.
+- **Release builds no longer call themselves development builds (#3420).** Since release builds
+  began naming their commit (`5.9.1 (release d85aab9)`), every dispatch from one printed "this is
+  a development build", and `darkmux doctor` couldn't compare a release build with its source
+  checkout. Both now read the build kind instead of the version text.
+
+### Added
+
+- **`darkmux doctor` checks the running daemon's own PATH (#3423).** A new `daemon docker` row asks
+  the daemon whether `docker` is on its PATH, which a shell can't tell you because the daemon may
+  run with a different one. It fails when the daemon's fleet listener takes dispatches, warns when
+  it doesn't (the daemon then only loses its cleanup of orphaned dispatch containers), and names
+  the restart that fixes it. `/health` gains `docker_on_path`, given only to a caller on this
+  machine, and never the path itself.
+
+### Docs
+
+- **The Omarchy guide's endpoint declares its hardware (#3426).** The `mlx-local` endpoint now
+  carries `"hardware": "submitting-machine"`. Without it, the first `darkmux lab submit` from an
+  Omarchy machine was refused, asking for `--hardware`.
+
+### Under the hood
+
+- A CI job installs darkmux the way a Homebrew user does (formula from a scratch tap, `brew
+  services start`), then checks the release commit in `--version`, the daemon's `/health`, and the
+  daemon's own PATH. It runs on every change to the formula, the release's formula PR included
+  (#3424).
+- The macOS CI job's time limit went from 25 to 40 minutes (#3415).
+
 ## [5.9.1] - 2026-10-28
 
 A security fix for `darkmux lab submit`. Upgrade if you share runs on darkmux evals.
@@ -4196,6 +4249,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   does. `FLOW_SCHEMA_VERSION` unchanged at 1.52.0; `RULES_SCHEMA_VERSION`
   unchanged at 3.0.0.
 
+[5.9.2]: https://github.com/kstrat2001/darkmux/releases/tag/v5.9.2
 [5.9.1]: https://github.com/kstrat2001/darkmux/releases/tag/v5.9.1
 [5.9.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.9.0
 [5.8.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.8.0
