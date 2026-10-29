@@ -2240,6 +2240,11 @@
     async fn health_reports_whether_the_daemon_finds_docker_to_this_machine_only() {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join("docker"), "").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path().join("docker"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let prev = std::env::var_os("PATH");
         unsafe { std::env::set_var("PATH", dir.path()) };
         let found = loopback_health(&[]).await;

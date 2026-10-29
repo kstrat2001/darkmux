@@ -51,8 +51,8 @@ pub use endpoint::{
     BudgetPolicy, Hardware, HardwareBasis, ManagedBackend, ModelEndpoint, UsageLimits, UsageWindow, WindowBudget,
 };
 
-/// (#3423) Whether `name` resolves to a file on THIS process's `PATH`: what a
-/// bare `Command::new(name)` would find. `darkmux serve` reports it for
+/// (#3423) Whether `name` resolves to an executable file on THIS process's
+/// `PATH`: what a bare `Command::new(name)` would run. `darkmux serve` reports it for
 /// `docker` so `darkmux doctor`, run from a shell with a different `PATH`,
 /// can tell when the daemon can't start a dispatch's runtime container.
 pub fn on_path(name: &str) -> bool {
@@ -60,7 +60,21 @@ pub fn on_path(name: &str) -> bool {
 }
 
 fn on_path_in(name: &str, path: Option<&std::ffi::OsStr>) -> bool {
-    path.is_some_and(|p| std::env::split_paths(p).any(|dir| dir.join(name).is_file()))
+    path.is_some_and(|p| std::env::split_paths(p).any(|dir| is_executable_file(&dir.join(name))))
+}
+
+/// A regular file exec would run: on unix, one with an exec bit set.
+fn is_executable_file(p: &std::path::Path) -> bool {
+    let Ok(md) = std::fs::metadata(p) else { return false };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        md.is_file() && md.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        md.is_file()
+    }
 }
 
 #[cfg(test)]
@@ -72,6 +86,11 @@ mod on_path_tests {
         let has = tempfile::TempDir::new().unwrap();
         let lacks = tempfile::TempDir::new().unwrap();
         std::fs::write(has.path().join("docker"), "").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(has.path().join("docker"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let path = std::env::join_paths([lacks.path(), has.path()]).unwrap();
         assert!(on_path_in("docker", Some(&path)));
         let without = std::env::join_paths([lacks.path()]).unwrap();
@@ -80,6 +99,22 @@ mod on_path_tests {
         // A directory named like the tool is not the tool.
         std::fs::create_dir(lacks.path().join("lms")).unwrap();
         assert!(!on_path_in("lms", Some(&without)));
+    }
+
+    /// (#3425 review) A file that exec would refuse (no exec bit) is not
+    /// what `Command::new` finds: it fails with "Permission denied".
+    #[cfg(unix)]
+    #[test]
+    fn a_file_without_the_exec_bit_is_not_on_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let tool = dir.path().join("docker");
+        std::fs::write(&tool, "").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let path = std::env::join_paths([dir.path()]).unwrap();
+        assert!(!on_path_in("docker", Some(&path)));
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(on_path_in("docker", Some(&path)));
     }
 }
 
