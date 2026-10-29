@@ -201,7 +201,7 @@
   "crates/darkmux-serve/src/lib.rs::mission_graph_json_handler": 12,
   "crates/darkmux-serve/src/lib.rs::parse_host_header": 13,
   "crates/darkmux-serve/src/lib.rs::read_flow_records_from_file": 14,
-  "crates/darkmux-serve/src/lib.rs::records_from_xrevrange": 14,
+  "crates/darkmux-serve/src/lib.rs::records_from_xrevrange[cfg(test)]": 12,
   "crates/darkmux-serve/src/lib.rs::redis_tail_task": 17,
   "crates/darkmux-serve/src/lib.rs::resolve_current_last_id": 11,
   "crates/darkmux-serve/src/lib.rs::run": 11,
