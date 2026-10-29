@@ -1527,6 +1527,30 @@
         assert_eq!(fourth.len(), 3, "a grown file is re-read though its mtime did not move");
     }
 
+    /// (#3435 review) A day file that could not be read is never kept as
+    /// read: a past day's file never changes, so a kept failure (a transient
+    /// `EMFILE` or `EIO`, here an unreadable mode) would erase its missions
+    /// from the catalog until the daemon restarted.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn a_day_file_that_could_not_be_read_is_read_again() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("2026-05-12.jsonl");
+        fs::write(&path, "{\"action\":\"dispatch.start\",\"execution_id\":\"exec-00000001-0000-0001\",\"mission_id\":\"m1\",\"ts\":\"2026-05-12T10:00:00Z\"}\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        let during = super::scan_flow_missions(tmp.path(), &[]);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        if fs::File::open(&path).is_ok() && !during.is_empty() {
+            eprintln!("skipping: running with permission to read a 0o000 file");
+            return;
+        }
+        let after = super::scan_flow_missions(tmp.path(), &[]);
+        assert!(during.is_empty());
+        assert_eq!(after.len(), 1, "readable again: its mission shows");
+    }
+
     /// #1705: a mission that ran on a PEER reaches the missions lens even
     /// though nothing about it was ever written to this machine's flows dir.
     #[test]
@@ -6327,6 +6351,19 @@
         assert_eq!(first["runs"], second["runs"]);
         assert_eq!(first["generated_at_ms"], second["generated_at_ms"], "the build's own time");
 
+        // A new flow record (a run's terminal, which the replay's catch-up
+        // refetch waits on) changes what a build reads: the next request
+        // builds again inside the TTL.
+        let today = darkmux_flow::ts_utc_at(now_unix() as i64);
+        fs::write(
+            flows.path().join(format!("{}.jsonl", &today[..10])),
+            format!("{{\"action\":\"dispatch.start\",\"session_id\":\"S-new\",\"execution_id\":\"exec-00000001-0000-0001\",\"ts\":\"{today}\"}}\n"),
+        )
+        .unwrap();
+        let third = get().await;
+        assert_eq!(builds() - before, 2, "a new record means a new build");
+        assert_ne!(third["runs"], first["runs"], "{third}");
+
         // Another flows dir is another build (a test's router, or a
         // reconfigured daemon), never this one's copy.
         let other = TempDir::new().unwrap();
@@ -6335,7 +6372,7 @@
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(builds() - before, 2);
+        assert_eq!(builds() - before, 3);
     }
 
     #[tokio::test]
