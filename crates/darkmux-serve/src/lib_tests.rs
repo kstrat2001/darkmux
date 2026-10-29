@@ -1027,6 +1027,27 @@
         assert_eq!(again["generated_at_ms"], status["generated_at_ms"], "a cached answer keeps its read time");
     }
 
+    /// (#3428 review) The spec sheet's AI headroom is computed with the
+    /// residents it lists, at the same read, and says when that was. Headroom
+    /// is `reclaimable + resident − margin`: a cached residents list beside a
+    /// live reclaimable reading counted a just-unloaded model twice (+40 GiB,
+    /// measured by the review).
+    #[test]
+    fn the_spec_sheet_takes_its_headroom_and_time_from_one_residents_read() {
+        let read = ResidentsRead {
+            residents: EngineResidents {
+                engine: wire::MachineEngine { name: "lmstudio".into(), reports_residency: true, usable: true },
+                models: Vec::new(),
+                unknown: None,
+            },
+            ram_free_for_ai_bytes: Some(12_345),
+            read_at_ms: 42,
+        };
+        let specs = gather_specs_from(read);
+        assert_eq!(specs.ram_free_for_ai_bytes, Some(12_345), "the read's headroom, not a fresh one");
+        assert_eq!(specs.generated_at_ms, 42, "when the read happened");
+    }
+
     /// (#316 stage 3.2) The spec sheet's `loaded_models` is what `lms ps`
     /// reports, and an `lms` that cannot run is `lms_unreachable`.
     #[test]

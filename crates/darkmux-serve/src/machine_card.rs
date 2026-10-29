@@ -7,7 +7,7 @@
 //! A card states facts and never infers them. Each block is read from the
 //! thing that owns the fact:
 //!
-//! - identity, hardware, loaded and utility models: [`crate::gather_specs`],
+//! - identity, hardware, loaded and utility models: [`crate::gather_served_specs`],
 //!   the same gather `/machine/specs` serves (the card embeds its type);
 //! - profiles and their endpoint kind: the profile registry, through
 //!   `ProfileModel::endpoint_kind`, the classification every dispatch,

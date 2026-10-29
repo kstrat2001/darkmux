@@ -2824,13 +2824,37 @@ fn tail_lab_events(dir: &StdPath, offset: u64) -> wire::LabRunEventsResponse {
 /// the blocking pool to keep the axum executor free.
 async fn machine_status_handler() -> axum::Json<wire::MachineStatusResponse> {
     let result = tokio::task::spawn_blocking(served_engine_residents).await;
-    let (r, read_at_ms) = result.unwrap_or_else(|_| (EngineResidents::panicked(), current_millis()));
+    let (r, read_at_ms) = match result {
+        Ok(read) => (read.residents, read.read_at_ms),
+        Err(_) => (EngineResidents::panicked(), current_millis()),
+    };
     axum::Json(wire::MachineStatusResponse {
         lms_unreachable: r.unknown.is_some(),
         models: r.models,
         engine: r.engine,
         generated_at_ms: read_at_ms,
     })
+}
+
+/// (#3428) One read of this machine's residents and what they leave for AI:
+/// the AI headroom (`reclaimable + resident − margin`) is computed at the
+/// same moment as the listing it adds back, so a cached listing never sits
+/// beside a fresh reclaimable reading (which counted a just-unloaded model
+/// twice). `read_at_ms` is when it happened.
+#[derive(Clone)]
+pub(crate) struct ResidentsRead {
+    pub(crate) residents: EngineResidents,
+    pub(crate) ram_free_for_ai_bytes: Option<u64>,
+    pub(crate) read_at_ms: u64,
+}
+
+impl ResidentsRead {
+    /// A fresh read. Blocking: it shells out.
+    pub(crate) fn now() -> Self {
+        let residents = local_engine_residents();
+        let ram_free_for_ai_bytes = darkmux_doctor::ai_headroom_bytes_with(&residents.models);
+        Self { residents, ram_free_for_ai_bytes, read_at_ms: current_millis() }
+    }
 }
 
 /// (#3428) How long the daemon reuses one residents read. Each read spawns
@@ -2840,15 +2864,16 @@ async fn machine_status_handler() -> axum::Json<wire::MachineStatusResponse> {
 pub(crate) const SERVED_RESIDENTS_TTL: Duration = Duration::from_secs(10);
 
 /// (#3428) This machine's residents as the daemon serves them: one
-/// [`local_engine_residents`] read shared by `/machine/status`,
-/// `/machine/specs` and the machine card, reused for
-/// [`SERVED_RESIDENTS_TTL`], with the time it was read (epoch ms). Keyed by
+/// [`ResidentsRead`] shared by `/machine/status`, `/machine/specs` and the
+/// machine card, reused for [`SERVED_RESIDENTS_TTL`]. A failed read (the
+/// engine could not be asked) is kept too, so a wedged `lms` costs one
+/// bounded attempt per TTL rather than one per request. Keyed by
 /// the engine setting and the `lms` binary, so a changed setting reads
 /// afresh. Single-flight: the lock is held across the read, so a burst on a
 /// stale slot costs one. Blocking. Wall-clock time, so a daemon that slept
 /// does not serve a pre-sleep read as fresh.
-pub(crate) fn served_engine_residents() -> (EngineResidents, u64) {
-    type Slot = Option<(String, std::time::SystemTime, u64, EngineResidents)>;
+pub(crate) fn served_engine_residents() -> ResidentsRead {
+    type Slot = Option<(String, std::time::SystemTime, ResidentsRead)>;
     static SLOT: std::sync::Mutex<Slot> = std::sync::Mutex::new(None);
     let key = format!(
         "{}\0{}",
@@ -2856,15 +2881,14 @@ pub(crate) fn served_engine_residents() -> (EngineResidents, u64) {
         darkmux_types::config_access::lms_bin()
     );
     let mut slot = SLOT.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some((k, at, read_at_ms, residents)) = slot.as_ref() {
+    if let Some((k, at, read)) = slot.as_ref() {
         if *k == key && wall_clock_cache_is_fresh(*at, std::time::SystemTime::now(), SERVED_RESIDENTS_TTL) {
-            return (residents.clone(), *read_at_ms);
+            return read.clone();
         }
     }
-    let residents = local_engine_residents();
-    let read_at_ms = current_millis();
-    *slot = Some((key, std::time::SystemTime::now(), read_at_ms, residents.clone()));
-    (residents, read_at_ms)
+    let read = ResidentsRead::now();
+    *slot = Some((key, std::time::SystemTime::now(), read.clone()));
+    read
 }
 
 /// (#316) This machine's engine and what it holds.
@@ -3056,22 +3080,23 @@ fn degraded_specs() -> wire::MachineSpecsResponse {
 /// engine between reads. Blocking.
 #[cfg(test)]
 pub(crate) fn gather_specs() -> wire::MachineSpecsResponse {
-    gather_specs_from(local_engine_residents())
+    gather_specs_from(ResidentsRead::now())
 }
 
 /// The spec sheet as the daemon serves it, on its shared residents read
 /// ([`served_engine_residents`], #3428). Blocking.
 pub(crate) fn gather_served_specs() -> wire::MachineSpecsResponse {
-    gather_specs_from(served_engine_residents().0)
+    gather_specs_from(served_engine_residents())
 }
 
 /// The spec sheet `/machine/specs` serves and the machine card embeds: the
-/// ONE gather, around a residents read. Blocking (it shells out); each probe
-/// is independent, so one failure never cascades.
-pub(crate) fn gather_specs_from(residents: EngineResidents) -> wire::MachineSpecsResponse {
+/// ONE gather, around a residents read, stamped with that read's time (the
+/// rest of the sheet is static). Blocking (it shells out); each probe is
+/// independent, so one failure never cascades.
+pub(crate) fn gather_specs_from(read: ResidentsRead) -> wire::MachineSpecsResponse {
+    let ResidentsRead { residents, ram_free_for_ai_bytes: ram_free, read_at_ms } = read;
     let (engine, loaded_models, lms_unreachable) = (residents.engine, residents.models, residents.unknown.is_some());
     let ram_total = darkmux_hardware::ram_installed_bytes();
-    let ram_free = darkmux_doctor::ai_headroom_bytes_with(&loaded_models);
     let cpu_brand = darkmux_hardware::cpu_brand().map(str::to_string);
     let machine_id = darkmux_flow::resolve_machine_id();
     // (#2814) The stable HARDWARE identity beside the NAME. `machine_id` is a
@@ -3122,7 +3147,7 @@ pub(crate) fn gather_specs_from(residents: EngineResidents) -> wire::MachineSpec
         engine: Some(engine),
         utility_model,
         hub_configured,
-        generated_at_ms: current_millis(),
+        generated_at_ms: read_at_ms,
     }
 }
 

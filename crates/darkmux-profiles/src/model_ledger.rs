@@ -1568,7 +1568,8 @@ const CATALOG_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Whether a catalog read at `at` can price this gather's residents: younger
 /// than [`CATALOG_TTL`] (a clock that went backwards reads as stale) and
-/// naming every resident's model key.
+/// naming every resident's model key. A resident with no key (an `lms ps` row
+/// without `modelKey`) can't be priced from any catalog, so it forces no read.
 fn catalog_is_fresh(
     at: std::time::SystemTime,
     now: std::time::SystemTime,
@@ -1579,6 +1580,7 @@ fn catalog_is_fresh(
     young
         && resident_keys
             .iter()
+            .filter(|k| !k.is_empty())
             .all(|k| rows.iter().any(|r| r.get("modelKey").and_then(|s| s.as_str()) == Some(*k)))
 }
 
@@ -3502,6 +3504,7 @@ esac
         assert!(!fresh(at - std::time::Duration::from_secs(1), &["m"]), "a clock that went back is stale");
         assert!(!fresh(at, &["m", "other"]), "a resident it doesn't name");
         assert!(fresh(at, &[]), "no residents: any fresh catalog will do");
+        assert!(fresh(at, &["m", ""]), "a resident with no model key can't be priced from any catalog, so it forces no read");
     }
 
     /// The one gather test: a nonexistent lms binary — every probe degrades
