@@ -71,6 +71,7 @@ darkmux doctor</code></pre>
       <li>a local model server on the Apple GPU;</li>
       <li>Docker Engine, with the model server listening on the Docker bridge so the run's container can reach it.</li>
     </ul>
+    <p>Its endpoint config includes <code>"hardware": "submitting-machine"</code>, which says this Mac serves the model. Without it, <code>darkmux lab submit</code> refuses the run and asks for <code>--hardware</code>.</p>
     <p>Pick a model that fits your RAM with room to spare. <code>darkmux doctor</code> warns on its macOS-only checks there; that is expected.</p>
   </div>
 </section>

@@ -90,8 +90,13 @@ curl -s http://127.0.0.1:8080/v1/models</code></pre>
   }
 },
 "endpoints": {
-  "mlx-local": { "url": "http://127.0.0.1:8080/v1", "dialect": "chat-completions-max-tokens" }
+  "mlx-local": {
+    "url": "http://127.0.0.1:8080/v1",
+    "dialect": "chat-completions-max-tokens",
+    "hardware": "submitting-machine"
+  }
 }</code></pre>
+    <p><code>"hardware": "submitting-machine"</code> says this Mac serves the model. darkmux can't tell that from a URL, and a run you share records the machine that ran it, so without it <code>darkmux lab submit</code> asks for <code>--hardware</code>.</p>
     <p>darkmux's utility model (radio's routing seat, and compaction of long runs) defaults to an LM Studio model. Point it at the same server:</p>
     <pre><code>"internal": {
   "utility": { "id": "mlx-community/Qwen3-1.7B-4bit", "endpoint": "mlx-local", "n_ctx": 8192 }
