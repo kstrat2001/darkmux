@@ -4909,6 +4909,64 @@
         // actually composes end to end, at a gate that cannot silently
         // skip.
 
+        /// (#3432) The daemon's presence readers share one read of each key
+        /// space per [`PRESENCE_CACHE_TTL`]: `/fleet/machines/live`,
+        /// `/fleet/dispatches/live` and `/runs`' live-session read each opened
+        /// a connection and ran a `SCAN` plus a `GET` per beat, on every
+        /// request (5.85 hub connects/s measured, about 2/s of them presence).
+        /// Each read is one connection, one `SCAN` and one `MGET`.
+        #[tokio::test]
+        #[serial]
+        async fn the_presence_readers_share_one_read_per_key_space() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
+            }
+            let redis = spawn_redis();
+            let mut conn = redis::Client::open(redis.url.as_str()).unwrap().get_connection().unwrap();
+            let now = darkmux_flow::presence::now_ms();
+            for uid in ["UID-A", "UID-B"] {
+                let beat = serde_json::json!({ "machine_uid": uid, "display_name": uid, "schema_version": "1", "beat_ts_ms": now });
+                let _: () = redis::cmd("SET").arg(darkmux_flow::presence::presence_key(uid)).arg(beat.to_string()).arg("EX").arg(60).query(&mut conn).unwrap();
+            }
+            for sid in ["S-1", "S-2", "S-3"] {
+                let beat = serde_json::json!({ "session_id": sid, "display_name": "laptop", "beat_ts_ms": now, "mission_id": "M-1" });
+                let _: () = redis::cmd("SET").arg(darkmux_flow::session_presence::session_key(sid)).arg(beat.to_string()).arg("EX").arg(60).query(&mut conn).unwrap();
+            }
+            let stat = |conn: &mut redis::Connection, name: &str| -> u64 {
+                let info: String = redis::cmd("INFO").arg("all").query(conn).unwrap();
+                info.lines()
+                    .find_map(|l| l.strip_prefix(name))
+                    .and_then(|rest| rest.trim_start_matches(':').split([',', '\r']).next())
+                    .map(|v| v.trim_start_matches("calls="))
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0)
+            };
+            let (connects0, gets0) = (stat(&mut conn, "total_connections_received"), stat(&mut conn, "cmdstat_get:"));
+            unsafe { std::env::set_var("DARKMUX_REDIS_URL", &redis.url) };
+            let tmp = TempDir::new().unwrap();
+            let get = |uri: &'static str| {
+                let app = build_router_local(tmp.path().to_path_buf());
+                async move {
+                    let response = app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+                    let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+                }
+            };
+            let machines = get("/fleet/machines/live").await;
+            let dispatches = get("/fleet/dispatches/live").await;
+            let again = (get("/fleet/machines/live").await, get("/fleet/dispatches/live").await);
+            let live = tokio::task::spawn_blocking(super::super::live_session_ids).await.unwrap();
+            unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
+            let (connects, gets) = (stat(&mut conn, "total_connections_received") - connects0, stat(&mut conn, "cmdstat_get:") - gets0);
+            assert_eq!(machines["machines"].as_array().map(Vec::len), Some(2), "{machines}");
+            assert_eq!(dispatches["dispatches"].as_array().map(Vec::len), Some(3), "{dispatches}");
+            assert_eq!((&again.0, &again.1), (&machines, &dispatches), "served from the same reads");
+            assert_eq!(live.map(|s| s.len()), Some(4), "three sessions and their mission");
+            assert_eq!(connects, 2, "one connection per key space for five reads");
+            assert_eq!(gets, 0, "beats come back in one MGET, not a GET each");
+        }
+
         // ─── #3217 the fleet window is read incrementally ───────────────
         //
         // `/runs`, `/flow-missions` and the catalog routes share one cached

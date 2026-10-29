@@ -136,44 +136,15 @@ fn write_session_beat_within(
 pub fn read_live_sessions(client: &redis::Client) -> Result<Vec<SessionBeat>> {
     let mut conn = open_redis_connection_bounded(client, REDIS_CONNECT_TIMEOUT)
         .context("getting Redis connection for session-presence read")?;
-    // (#2227) Bounds each `SCAN`/`GET` below individually (the deadline is a
+    // (#2227) Bounds each `SCAN`/`MGET` below individually (the deadline is a
     // per-socket-read one, not a budget for the whole loop) — which is the
     // right shape here: `SCAN COUNT 200` is explicitly non-blocking, so no
     // single reply legitimately takes a second. This read serves the daemon's
     // `/fleet/dispatches/live` endpoint, so an unbounded stall here holds an
     // HTTP worker as well as the caller.
     bound_redis_response(&conn);
-    let pattern = format!("{SESSION_KEY_PREFIX}*");
-    let mut cursor = "0".to_string();
-    let mut keys: Vec<String> = Vec::new();
-    loop {
-        let (next, batch): (String, Vec<String>) = redis::cmd("SCAN")
-            .arg(&cursor)
-            .arg("MATCH")
-            .arg(&pattern)
-            .arg("COUNT")
-            .arg(200)
-            .query(&mut conn)
-            .context("SCAN session-presence keys")?;
-        keys.extend(batch);
-        if next == "0" {
-            break;
-        }
-        cursor = next;
-    }
-    let mut out = Vec::with_capacity(keys.len());
-    for key in keys {
-        let val: Option<String> = redis::cmd("GET")
-            .arg(&key)
-            .query(&mut conn)
-            .context("GET session-presence key")?;
-        if let Some(json) = val {
-            if let Ok(beat) = serde_json::from_str::<SessionBeat>(&json) {
-                out.push(beat);
-            }
-        }
-    }
-    Ok(out)
+    let values = crate::presence::scan_and_mget(&mut conn, &format!("{SESSION_KEY_PREFIX}*"), "session-presence")?;
+    Ok(values.iter().flatten().filter_map(|json| serde_json::from_str::<SessionBeat>(json).ok()).collect())
 }
 
 /// A running session's heartbeat emitter. Owns the background refresh thread

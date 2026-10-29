@@ -265,12 +265,8 @@ fn live_machine_names() -> HashSet<String> {
     let Some(url) = darkmux_flow::redis_url() else {
         return HashSet::new();
     };
-    let Ok(client) = redis::Client::open(url.expose_for_probe()) else {
-        return HashSet::new();
-    };
-    darkmux_flow::presence::read_live(&client)
-        .map(|beats| beats.into_iter().map(|b| b.display_name).collect())
-        .unwrap_or_default()
+    // (#3432) The daemon's shared read: a failed one is empty, as before.
+    crate::machine_beats(&url).0.into_iter().map(|b| b.display_name).collect()
 }
 
 /// GET `<base>/mission/<mission_id>/graph.json` with the shared bearer
