@@ -5374,17 +5374,14 @@
                 let t0 = SystemTime::now();
                 let first = read_at(&caches, &redis.url, FleetScope::Work, t0);
                 assert_eq!(first.records.len(), 50);
+                // Inside the cache window the hub is not asked at all: an
+                // entry added meanwhile is not seen until the window expires.
+                xadd_all(&redis.url, WORK_STREAM, &fleet_fixture::realistic_records(1, now_secs()));
                 let before = parses();
-                // Inside the cache window the hub is not asked at all.
-                let asked = std::cell::Cell::new(false);
-                let within = read_fleet_cached(&caches, FleetScope::Work, t0 + Duration::from_millis(500), || {
-                    asked.set(true);
-                    None
-                });
-                assert!(!asked.get(), "a read inside the cache window went to the hub");
+                let within = read_at(&caches, &redis.url, FleetScope::Work, t0 + Duration::from_millis(500));
+                assert_eq!(values(&within), values(&first), "a read inside the cache window went to the hub");
                 let after = read_at(&caches, &redis.url, FleetScope::Work, t0 + Duration::from_secs(10));
-                assert_eq!(parses() - before, 0, "a repeated read re-parsed entries it already held");
-                assert_eq!(values(&within), values(&first));
+                assert_eq!(parses() - before, 1, "a repeated read re-parsed entries it already held");
                 assert_eq!(values(&after), fresh(&redis.url, FleetScope::Work));
                 assert_eq!(after.state, source_state::SourceState::Ok);
             }
