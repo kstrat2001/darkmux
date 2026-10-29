@@ -5129,6 +5129,37 @@
                 assert!(first["count"].as_u64().is_some_and(|n| n > 0), "{first}");
             }
 
+            /// (#3431 review) A day whose window has nothing to serve (never
+            /// read, or a cold read still going past another request's wait)
+            /// is read from the hub directly, as before, so a request made
+            /// beside another on a cold window is never served local-only. A
+            /// window with records, fresh or stale, never reads the hub.
+            #[test]
+            fn a_day_reads_the_hub_directly_only_when_the_window_has_nothing() {
+                use crate::source_state::SourceState;
+                let day = |records: Vec<serde_json::Value>| super::super::SourceRead { records, cut: false };
+                let window = |state: SourceState| move |_: FleetScope| FleetRead { records: FleetRecords::default(), state: state.clone() };
+                let hub_record = serde_json::json!({ "ts": "2026-10-28T00:00:01Z", "action": "dispatch.start" });
+
+                let unavailable = SourceState::Unavailable { detail: "x" };
+                let (got, state) = super::super::hub_day("2026-10-28", window(unavailable.clone()), || Ok(day(vec![hub_record.clone()])));
+                assert_eq!(got.map(|d| d.records), Some(vec![hub_record.clone()]), "the direct read's records");
+                assert_eq!(state, SourceState::Ok);
+
+                let (got, state) = super::super::hub_day("2026-10-28", window(unavailable.clone()), || Err(anyhow::anyhow!("down")));
+                assert!(got.is_none());
+                assert_eq!(state, unavailable, "both failed: local only, unavailable");
+
+                for state in [SourceState::Ok, SourceState::Stale { age_ms: 5, detail: "x" }] {
+                    let (got, served) = super::super::hub_day("2026-10-28", window(state.clone()), || panic!("read the hub with a window to serve"));
+                    assert!(got.is_some());
+                    assert_eq!(served, state);
+                }
+                let (got, state) = super::super::hub_day("2026-10-28", window(SourceState::Off), || panic!("read the hub with none configured"));
+                assert!(got.is_none());
+                assert_eq!(state, SourceState::Off);
+            }
+
             /// (b) The same for the telemetry stream a dispatch replay reads
             /// beside the work stream, merged in hub order.
             #[test]

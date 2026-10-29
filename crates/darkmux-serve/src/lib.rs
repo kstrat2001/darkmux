@@ -4088,19 +4088,20 @@ async fn aggregate_flow_records_for_date(
     // catalog routes do; with none, the day is local only, `unavailable`.
     let date_owned = date.to_string();
     let window_task = tokio::task::spawn_blocking(move || {
-        let fleet = fleet_flow_records_in(FleetScope::WithSamples);
-        let work = fleet_flow_records_in(FleetScope::Work);
-        (fleet_day_records(&date_owned, &fleet.records, &work.records), fleet.state)
+        hub_day(&date_owned, fleet_flow_records_in, || {
+            let url = darkmux_flow::redis_url().ok_or_else(|| anyhow::anyhow!("no hub configured"))?;
+            read_flow_records_from_redis(url.expose_for_probe(), Some(&date_owned), FleetScope::WithSamples)
+        })
     });
     let (window, local_records) = tokio::join!(window_task, read_flow_records_from_file(date, flows_dir));
 
     match window {
-        Ok((day, state @ (source_state::SourceState::Ok | source_state::SourceState::Stale { .. }))) => DayRead {
+        Ok((Some(day), state)) => DayRead {
             records: union_flow_records(day.records, local_records.records),
             fleet_state: state,
             cut: wire::CutSources { local: local_records.cut, fleet: day.cut },
         },
-        Ok((_, state)) => DayRead {
+        Ok((None, state)) => DayRead {
             records: local_records.records,
             fleet_state: state,
             cut: wire::CutSources { local: local_records.cut, fleet: false },
@@ -4115,6 +4116,36 @@ async fn aggregate_flow_records_for_date(
                 fleet_state: source_state::SourceState::Unavailable { detail: FLEET_READ_ERROR_DETAIL },
                 cut: wire::CutSources { local: local_records.cut, fleet: false },
             }
+        }
+    }
+}
+
+/// (#3431) The hub half of a day: from the fleet window (`window`, the
+/// process's [`fleet_flow_records_in`]) when it has records to serve, fresh
+/// or stale. When it has none (`Unavailable`: never read, or a cold read
+/// still in flight past the wait another request will give it, the case a
+/// slow first read of a busy hub hits), the day is read from the hub
+/// directly (`direct`), as before the window served this route, so two
+/// requests made together on a cold window both get the hub's records.
+/// `None` when neither has any; the state says why.
+fn hub_day(
+    date: &str,
+    window: impl Fn(FleetScope) -> FleetRead,
+    direct: impl FnOnce() -> anyhow::Result<SourceRead>,
+) -> (Option<SourceRead>, source_state::SourceState) {
+    let fleet = window(FleetScope::WithSamples);
+    match fleet.state {
+        source_state::SourceState::Off => (None, fleet.state),
+        source_state::SourceState::Unavailable { .. } => match direct() {
+            Ok(day) => (Some(day), source_state::SourceState::Ok),
+            Err(e) => {
+                eprintln!("darkmux serve: GET /flow/{date} Redis aggregation failed ({e}); serving local file only");
+                (None, fleet.state)
+            }
+        },
+        _ => {
+            let work = window(FleetScope::Work);
+            (Some(fleet_day_records(date, &fleet.records, &work.records)), fleet.state)
         }
     }
 }
@@ -4434,10 +4465,9 @@ fn bound_redis_response(conn: &redis::Connection) {
 
 /// XREVRANGE the flow stream, keeping the records whose `ts` falls on `date`
 /// (every record when `date` is `None`). Synchronous (the sync
-/// `redis::Client`). (#3431) No route reads the hub this way any more: it is
-/// what a fresh, uncached read returns, the reference the fleet window's
-/// tests hold the window to.
-#[cfg(test)]
+/// `redis::Client`). (#3431) `GET /flow/<date>` reads this way only when the
+/// fleet window has nothing to serve ([`hub_day`]); it is also what a fresh,
+/// uncached read returns, the reference the window's tests hold it to.
 fn read_flow_records_from_redis(
     url: &str,
     date: Option<&str>,
@@ -4519,7 +4549,6 @@ fn hub_id_key(record: &serde_json::Value) -> Option<(u64, u64)> {
 /// Merge two chronological runs of hub records into one, in hub order. The hub
 /// assigns ids, so they order records across the two streams even where the
 /// writers' clocks disagree. Stable: on equal keys `a` comes first.
-#[cfg(test)]
 fn merge_by_hub_id(a: Vec<serde_json::Value>, b: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
     let mut out = Vec::with_capacity(a.len() + b.len());
     let (mut a, mut b) = (a.into_iter().peekable(), b.into_iter().peekable());
@@ -4568,7 +4597,6 @@ fn fleet_day_records(date: &str, fleet: &FleetRecords, work: &FleetRecords) -> S
 /// trim length is this machine's own `redis.maxlen`, an approximation of what
 /// the hub's writers trim to. A read with no date asks for the whole stream
 /// and is never "cut" in this sense.
-#[cfg(test)]
 fn records_from_xrevrange(raw: redis::Value, date: Option<&str>, maxlen: usize) -> Result<SourceRead> {
     let entries = match raw {
         redis::Value::Array(v) => v,
@@ -4640,7 +4668,6 @@ fn stamp_hub_id_line(line: &str, id: Option<&str>) -> String {
 }
 
 /// The millisecond part of a stream entry's `<ms>-<seq>` id.
-#[cfg(test)]
 fn entry_id_ms(entry: &redis::Value) -> Option<u64> {
     let redis::Value::Array(pair) = entry else { return None };
     redis_value_as_str(pair.first()?)?.split('-').next()?.parse().ok()
