@@ -153,6 +153,8 @@ pub fn run() -> DoctorReport {
         check_daemon_reachable(),
         // (#1461) Staleness: what is RUNNING vs what is INSTALLED vs the source.
         check_daemon_freshness(),
+        // (#3423) Does the RUNNING daemon find `docker` on its own PATH?
+        check_daemon_docker(),
         check_binary_vs_source(),
         check_runtime_image_freshness(),
         check_runtime_binary_cache(),
@@ -5496,6 +5498,95 @@ fn check_daemon_freshness() -> Check {
     )
 }
 
+const DAEMON_DOCKER_CHECK_NAME: &str = "daemon docker";
+
+/// (#3423) Whether the RUNNING daemon finds `docker` on its own PATH
+/// (`/health`'s `docker_on_path`). Doctor's own shell is not the daemon's: a
+/// brew service once ran with launchd's bare PATH and failed every dispatch
+/// while every shell found docker (#3418). How much it matters depends on the
+/// fleet listener (`/health`'s `fleet_listener`): it is the only way the
+/// daemon runs a dispatch. Inside the viewer's panel (`DARKMUX_PANEL`) doctor
+/// is the daemon's own child, so its PATH is no comparison.
+fn check_daemon_docker() -> Check {
+    let addr = darkmux_types::config_access::serve_client_addr();
+    let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or("127.0.0.1").to_string();
+    let health = loopback_http_body(&host, darkmux_types::config_access::serve_client_port(), "/health");
+    let (daemon, listener_on) = health.as_deref().map(parse_daemon_docker).unwrap_or((None, false));
+    let in_panel = env::var_os("DARKMUX_PANEL").is_some();
+    classify_daemon_docker(daemon, which("docker").is_some(), listener_on, in_panel)
+}
+
+/// `/health`'s `docker_on_path` (`None` when absent: no daemon, one older than
+/// #3423, or a caller it does not count as this machine) and whether its fleet
+/// listener takes dispatches or is about to: `listening`, `starting`, or
+/// `waiting` (it retries until it binds). `off` and `not started` (terminal:
+/// the listener reports its own cause) take none.
+fn parse_daemon_docker(health_body: &str) -> (Option<bool>, bool) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(health_body) else { return (None, false) };
+    let docker = v.get("docker_on_path").and_then(|d| d.as_bool());
+    let listener_on = v
+        .get("fleet_listener")
+        .and_then(|l| l.as_str())
+        .is_some_and(|l| ["listening", "starting", "waiting"].iter().any(|on| l.starts_with(on)));
+    (docker, listener_on)
+}
+
+/// Pure classifier: `daemon` is what the running daemon reports, `shell`
+/// whether doctor's own PATH finds `docker`, `listener_on` whether the daemon
+/// accepts fleet dispatches, `in_panel` whether doctor runs as the daemon's
+/// child (the viewer's panel), where `shell` says nothing new.
+fn classify_daemon_docker(daemon: Option<bool>, shell: bool, listener_on: bool, in_panel: bool) -> Check {
+    match daemon {
+        None => not_applicable(
+            DAEMON_DOCKER_CHECK_NAME,
+            "no running darkmux serve daemon reports whether it finds `docker`",
+        ),
+        Some(true) => Check {
+            name: DAEMON_DOCKER_CHECK_NAME.into(),
+            status: Status::Pass,
+            message: "the running darkmux serve daemon finds `docker` on its own PATH".into(),
+            hint: None,
+        },
+        // No docker anywhere: the `docker runtime` row already says so.
+        Some(false) if !shell && !in_panel => not_applicable(
+            DAEMON_DOCKER_CHECK_NAME,
+            "neither this shell nor the daemon finds `docker` (see `docker runtime`)",
+        ),
+        Some(false) => daemon_without_docker(listener_on, in_panel),
+    }
+}
+
+/// The row for a daemon whose PATH lacks `docker`: a Fail when its listener
+/// runs fleet dispatches, a Warn when it only loses its orphan cleanup.
+fn daemon_without_docker(listener_on: bool, in_panel: bool) -> Check {
+    let who = if in_panel {
+        "the running darkmux serve daemon cannot find `docker` on its own PATH"
+    } else {
+        "the running darkmux serve daemon cannot find `docker` on its own PATH (this shell can)"
+    };
+    let (status, effect) = if listener_on {
+        (Status::Fail, "so every dispatch it accepts from a fleet peer fails before its container starts")
+    } else {
+        (
+            Status::Warn,
+            "so it can't clean up orphaned dispatch containers, and a dispatch would fail once \
+             its fleet listener runs",
+        )
+    };
+    let check_first = if in_panel { "if `command -v docker` works in your terminal, the daemon's PATH is the problem: " } else { "" };
+    Check {
+        name: DAEMON_DOCKER_CHECK_NAME.into(),
+        status,
+        message: format!("{who}, {effect}"),
+        hint: Some(format!(
+            "{check_first}as a brew service: `brew upgrade darkmux && brew services restart darkmux` \
+             (the formula gives the service a PATH since 5.9.1_1); otherwise restart \
+             `darkmux serve` from a shell where `command -v docker` works, or add docker's \
+             directory to the PATH its service manager starts it with"
+        )),
+    }
+}
+
 /// The fix for every stale-daemon verdict. Restart is the operator's to run —
 /// doctor never touches a running process (#44).
 fn restart_daemon_hint() -> Option<String> {
@@ -9503,6 +9594,164 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parse_daemon_docker_reads_the_health_field() {
+        let on = r#""fleet_listener":"listening on 100.64.0.2:8766""#;
+        assert_eq!(parse_daemon_docker(&format!(r#"{{"docker_on_path":true,{on}}}"#)), (Some(true), true));
+        assert_eq!(
+            parse_daemon_docker(r#"{"docker_on_path":false,"fleet_listener":"off (fleet.listener.enabled is false)"}"#),
+            (Some(false), false)
+        );
+        assert_eq!(parse_daemon_docker(r#"{"build":"5.9.1","docker_on_path":null}"#), (None, false));
+        assert_eq!(parse_daemon_docker(r#"{"build":"5.9.1"}"#), (None, false));
+        assert_eq!(parse_daemon_docker("not json"), (None, false));
+        // (#3425 re-review) "not started" is terminal: the listener accepts
+        // nothing, so it is off; "waiting" retries until it binds, so it is on.
+        assert_eq!(parse_daemon_docker(r#"{"docker_on_path":false,"fleet_listener":"not started: no fleet token"}"#), (Some(false), false));
+        assert_eq!(parse_daemon_docker(r#"{"docker_on_path":false,"fleet_listener":"waiting for the tailscale network to answer"}"#), (Some(false), true));
+        assert_eq!(parse_daemon_docker(r#"{"docker_on_path":false,"fleet_listener":"starting"}"#), (Some(false), true));
+    }
+
+    /// (#3423) The #3418 shape: the shell finds docker, the daemon does not.
+    /// With its fleet listener on, the daemon runs dispatches, so that fails,
+    /// naming the restart that fixes a brew service.
+    #[test]
+    fn a_daemon_that_cannot_find_docker_fails_when_its_listener_runs_dispatches() {
+        let c = classify_daemon_docker(Some(false), true, true, false);
+        assert!(matches!(c.status, Status::Fail), "{c:?}");
+        assert!(c.message.contains("cannot find `docker`") && c.message.contains("(this shell can)"), "{}", c.message);
+        assert!(c.hint.as_deref().unwrap_or("").contains("brew services restart darkmux"), "{c:?}");
+        let ok = classify_daemon_docker(Some(true), true, true, false);
+        assert!(matches!(ok.status, Status::Pass) && !ok.message.contains("not applicable"), "{ok:?}");
+        // No daemon report, or no docker anywhere (the docker runtime row says
+        // that): nothing to add.
+        for (d, sh) in [(None, true), (None, false), (Some(false), false)] {
+            let n = classify_daemon_docker(d, sh, true, false);
+            assert!(n.message.contains("not applicable"), "{d:?}/{sh}: {n:?}");
+        }
+    }
+
+    /// (#3425 review) With its listener off the daemon runs no dispatches; a
+    /// missing docker only stops its orphaned-container cleanup. A warning,
+    /// like the `docker runtime` row for an unused capability.
+    #[test]
+    fn a_daemon_without_docker_only_warns_when_its_listener_is_off() {
+        let c = classify_daemon_docker(Some(false), true, false, false);
+        assert!(matches!(c.status, Status::Warn), "{c:?}");
+        assert!(c.message.contains("orphaned"), "{}", c.message);
+        assert!(!c.message.contains("every dispatch"), "{}", c.message);
+    }
+
+    /// (#3425 review) Inside the viewer's panel doctor runs as the daemon's
+    /// child, so "this shell" IS the daemon: no comparison is possible, and
+    /// "neither finds docker" would be wrong advice. The row says what the
+    /// daemon reports and how to tell.
+    #[test]
+    fn in_the_viewer_panel_the_row_reports_the_daemon_without_comparing_shells() {
+        let c = classify_daemon_docker(Some(false), false, true, true);
+        assert!(matches!(c.status, Status::Fail), "{c:?}");
+        assert!(!c.message.contains("this shell") && !c.message.contains("not applicable"), "{}", c.message);
+        assert!(c.hint.as_deref().unwrap_or("").contains("command -v docker"), "{c:?}");
+    }
+
+    /// (#3425 review) The row's own probe, end to end: a fake daemon on a
+    /// CONFIGURED port answers `docker_on_path: false` with its listener on,
+    /// and the shell's PATH holds an executable docker, so the row fails;
+    /// with no docker on the shell's PATH it has nothing to add. Pins the
+    /// port (the freshness probe once survived a revert to 8765, #2782 C5)
+    /// and the shell side (a hard-wired `true` would false-Fail).
+    #[serial_test::serial]
+    #[test]
+    fn check_daemon_docker_asks_the_configured_port_and_reads_the_shell_path() {
+        let body = r#"{"build":"0.0.0","docker_on_path":false,"fleet_listener":"listening on 100.64.0.2:8766"}"#;
+        let off_body = r#"{"build":"0.0.0","docker_on_path":false,"fleet_listener":"off (fleet.listener.enabled is false)"}"#;
+        let with_docker = tempfile::TempDir::new().unwrap();
+        let tool = with_docker.path().join("docker");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let without = tempfile::TempDir::new().unwrap();
+        let (prev_port, prev_path, prev_panel) =
+            (env::var("DARKMUX_SERVE_PORT").ok(), env::var_os("PATH"), env::var_os("DARKMUX_PANEL"));
+        let run_with = |body: &'static str, path: &std::path::Path, panel: bool| {
+            let (port, server) = serve_health_once(body);
+            unsafe {
+                env::set_var("DARKMUX_SERVE_PORT", port.to_string());
+                env::set_var("PATH", path);
+                if panel {
+                    env::set_var("DARKMUX_PANEL", "doctor");
+                } else {
+                    env::remove_var("DARKMUX_PANEL");
+                }
+            }
+            let c = check_daemon_docker();
+            let _ = server.join();
+            c
+        };
+        let fails = run_with(body, with_docker.path(), false);
+        let quiet = run_with(body, without.path(), false);
+        let warns = run_with(off_body, with_docker.path(), false);
+        // In the panel doctor's PATH is the daemon's: no docker on it is
+        // still the daemon's problem, never "neither finds docker".
+        let in_panel = run_with(body, without.path(), true);
+        unsafe {
+            match prev_port {
+                Some(v) => env::set_var("DARKMUX_SERVE_PORT", v),
+                None => env::remove_var("DARKMUX_SERVE_PORT"),
+            }
+            match prev_path {
+                Some(v) => env::set_var("PATH", v),
+                None => env::remove_var("PATH"),
+            }
+            if let Some(v) = prev_panel {
+                env::set_var("DARKMUX_PANEL", v);
+            }
+        }
+        assert!(matches!(fails.status, Status::Fail), "{fails:?}");
+        assert!(quiet.message.contains("neither this shell"), "{quiet:?}");
+        assert!(matches!(warns.status, Status::Warn), "{warns:?}");
+        assert!(matches!(in_panel.status, Status::Fail) && !in_panel.message.contains("not applicable"), "{in_panel:?}");
+    }
+
+    /// One `/health` answer on an ephemeral port, deadlined so a probe that
+    /// goes elsewhere fails fast instead of hanging (see the freshness test).
+    fn serve_health_once(body: &'static str) -> (u16, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).ok();
+                        stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).ok();
+                        let mut scratch = [0u8; 1024];
+                        let _ = std::io::Read::read(&mut stream, &mut scratch);
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                        return;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        (port, server)
+    }
+
     /// (#2782 C5) The FRESHNESS check probes too, and it was unpinned:
     /// reverting it to the literal `loopback_http_body("127.0.0.1", 8765,
     /// "/health")` left all 294 tests in this crate green. A surviving
@@ -12359,8 +12608,11 @@ mod tests {
         //
         // (#906) 70: `checks_container::check_lab_tests_placement` joined
         // beside the container-user row.
+        //
+        // (#3423) 71: `check_daemon_docker` joined beside the daemon
+        // freshness row.
         let expected =
-            70 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            71 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

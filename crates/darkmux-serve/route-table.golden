@@ -40,6 +40,7 @@ HealthResponse.flow_schema_version: string
 HealthResponse.fleet_listener: string | null
 HealthResponse.fleet_busy: FleetBusy | null
 HealthResponse.fleet_token_set: boolean | null
+HealthResponse.docker_on_path: boolean | null
 HealthResponse.hub_link: HubLink | null
 HealthResponse.open_file_limit: number | null
 HealthResponse.lifecycle_policy: RunsPolicy
