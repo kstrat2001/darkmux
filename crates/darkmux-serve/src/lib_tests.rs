@@ -5099,6 +5099,122 @@
         // actually composes end to end, at a gate that cannot silently
         // skip.
 
+        /// (#3432) The daemon's presence readers share one read of each key
+        /// space per [`PRESENCE_CACHE_TTL`]: `/fleet/machines/live`,
+        /// `/fleet/dispatches/live` and `/runs`' live-session read each opened
+        /// a connection and ran a `SCAN` plus a `GET` per beat, on every
+        /// request (5.85 hub connects/s measured, about 2/s of them presence).
+        /// Each read is one connection, one `SCAN` and one `MGET`.
+        #[tokio::test]
+        #[serial]
+        async fn the_presence_readers_share_one_read_per_key_space() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
+            }
+            let redis = spawn_redis();
+            let mut conn = redis::Client::open(redis.url.as_str()).unwrap().get_connection().unwrap();
+            let now = darkmux_flow::presence::now_ms();
+            for uid in ["UID-A", "UID-B"] {
+                let beat = serde_json::json!({ "machine_uid": uid, "display_name": uid, "schema_version": "1", "beat_ts_ms": now });
+                let _: () = redis::cmd("SET").arg(darkmux_flow::presence::presence_key(uid)).arg(beat.to_string()).arg("EX").arg(60).query(&mut conn).unwrap();
+            }
+            for sid in ["S-1", "S-2", "S-3"] {
+                let beat = serde_json::json!({ "session_id": sid, "display_name": "laptop", "beat_ts_ms": now, "mission_id": "M-1" });
+                let _: () = redis::cmd("SET").arg(darkmux_flow::session_presence::session_key(sid)).arg(beat.to_string()).arg("EX").arg(60).query(&mut conn).unwrap();
+            }
+            let stat = |conn: &mut redis::Connection, name: &str| -> u64 {
+                let info: String = redis::cmd("INFO").arg("all").query(conn).unwrap();
+                info.lines()
+                    .find_map(|l| l.strip_prefix(name))
+                    .and_then(|rest| rest.trim_start_matches(':').split([',', '\r']).next())
+                    .map(|v| v.trim_start_matches("calls="))
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0)
+            };
+            let (connects0, gets0) = (stat(&mut conn, "total_connections_received"), stat(&mut conn, "cmdstat_get:"));
+            unsafe { std::env::set_var("DARKMUX_REDIS_URL", &redis.url) };
+            let tmp = TempDir::new().unwrap();
+            let get = |uri: &'static str| {
+                let app = build_router_local(tmp.path().to_path_buf());
+                async move {
+                    let response = app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+                    let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+                }
+            };
+            let machines = get("/fleet/machines/live").await;
+            let dispatches = get("/fleet/dispatches/live").await;
+            let again = (get("/fleet/machines/live").await, get("/fleet/dispatches/live").await);
+            let live = tokio::task::spawn_blocking(super::super::live_session_ids).await.unwrap();
+            unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
+            let (connects, gets) = (stat(&mut conn, "total_connections_received") - connects0, stat(&mut conn, "cmdstat_get:") - gets0);
+            assert_eq!(machines["machines"].as_array().map(Vec::len), Some(2), "{machines}");
+            assert_eq!(dispatches["dispatches"].as_array().map(Vec::len), Some(3), "{dispatches}");
+            assert_eq!((&again.0, &again.1), (&machines, &dispatches), "served from the same reads");
+            assert_eq!(live.map(|s| s.len()), Some(4), "three sessions and their mission");
+            assert_eq!(connects, 2, "one connection per key space for five reads");
+            assert_eq!(gets, 0, "beats come back in one MGET, not a GET each");
+        }
+
+        /// (#3432 review) The shared presence read is the last one from THIS
+        /// hub: another hub URL reads afresh, and so does a `FRESH` read (it
+        /// sees a beat written after the snapshot, which a shared read inside
+        /// the TTL does not).
+        #[test]
+        #[serial]
+        fn a_shared_presence_read_is_this_hubs_and_a_fresh_one_reads_anew() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
+            }
+            use super::super::{session_beats, PresenceRead};
+            let (a, b) = (spawn_redis(), spawn_redis());
+            let beat = |url: &str, sid: &str| {
+                let mut conn = redis::Client::open(url).unwrap().get_connection().unwrap();
+                let json = serde_json::json!({ "session_id": sid, "display_name": "laptop", "beat_ts_ms": darkmux_flow::presence::now_ms() });
+                let _: () = redis::cmd("SET").arg(darkmux_flow::session_presence::session_key(sid)).arg(json.to_string()).arg("EX").arg(60).query(&mut conn).unwrap();
+            };
+            let ids = |r: (Vec<darkmux_flow::session_presence::SessionBeat>, _)| {
+                let mut v: Vec<String> = r.0.into_iter().map(|b| b.session_id).collect();
+                v.sort();
+                v
+            };
+            let url = |s: &str| darkmux_flow::RawRedisUrl::new(s.to_string());
+            beat(&a.url, "S-a");
+            beat(&b.url, "S-b");
+            assert_eq!(ids(session_beats(&url(&a.url), PresenceRead::QUIET)), ["S-a"]);
+            assert_eq!(ids(session_beats(&url(&b.url), PresenceRead::QUIET)), ["S-b"], "another hub is another read");
+            beat(&b.url, "S-b2");
+            assert_eq!(ids(session_beats(&url(&b.url), PresenceRead::QUIET)), ["S-b"], "inside the TTL: the shared read");
+            assert_eq!(ids(session_beats(&url(&b.url), PresenceRead::FRESH)), ["S-b", "S-b2"], "a fresh read sees the new beat");
+        }
+
+        /// (#3432) A failed presence read is kept for the TTL too, so a hub
+        /// that accepts and drops costs one attempt per TTL, not one per
+        /// request.
+        #[test]
+        #[serial]
+        fn a_failed_presence_read_is_kept_for_the_ttl() {
+            use super::super::{machine_beats, PresenceRead};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let accepts = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let counted = accepts.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    drop(stream);
+                }
+            });
+            let url = darkmux_flow::RawRedisUrl::new(format!("redis://127.0.0.1:{port}"));
+            let first = machine_beats(&url, PresenceRead::QUIET);
+            let second = machine_beats(&url, PresenceRead::QUIET);
+            assert!(matches!(first.1, crate::source_state::SourceState::Unavailable { .. }));
+            assert_eq!(first.1, second.1);
+            assert_eq!(accepts.load(std::sync::atomic::Ordering::Relaxed), 1, "one attempt for both reads");
+        }
+
         // ─── #3217 the fleet window is read incrementally ───────────────
         //
         // `/runs`, `/flow-missions` and the catalog routes share one cached
@@ -6854,6 +6970,73 @@
         let mut rows = vec![row()];
         apply_not_reporting(&mut rows, None, Some(&none));
         assert!(!rows[0].not_reporting, "no view marks nothing");
+    }
+
+    /// (#3432 re-review) A failed read never replaces a good shared one still
+    /// inside its TTL: a confirming read that failed left every other reader
+    /// `unavailable` for 5s though the snapshot was good. The failing caller
+    /// still sees its own failure.
+    #[test]
+    fn a_failed_read_never_replaces_a_good_shared_one() {
+        static SLOT: PresenceSlot<u32> = std::sync::Mutex::new(None);
+        let url = darkmux_flow::RawRedisUrl::new("redis://127.0.0.1:1".to_string());
+        let good = shared_presence(&SLOT, &url, "t", PresenceRead::QUIET, |_| Ok(vec![1]));
+        let failed = shared_presence(&SLOT, &url, "t", PresenceRead::FRESH, |_| Err(anyhow::anyhow!("down")));
+        let after = shared_presence(&SLOT, &url, "t", PresenceRead::QUIET, |_| panic!("read again inside the TTL"));
+        assert_eq!(good.0, vec![1]);
+        assert!(matches!(failed.1, source_state::SourceState::Unavailable { .. }));
+        assert_eq!(after, good, "the good read is still the shared one");
+    }
+
+    /// (#3432 re-review) `/runs`' confirming read takes a shared read under a
+    /// second old, so a row that stays not reporting (a peer that died with a
+    /// run open) does not cost a new read on every request: the steady state
+    /// is the shared read, taken fresh each TTL.
+    #[test]
+    fn a_confirming_read_takes_a_shared_read_under_a_second_old() {
+        static SLOT: PresenceSlot<u32> = std::sync::Mutex::new(None);
+        let url = darkmux_flow::RawRedisUrl::new("redis://127.0.0.1:1".to_string());
+        shared_presence(&SLOT, &url, "t", PresenceRead::QUIET, |_| Ok(vec![1]));
+        let confirmed = shared_presence(&SLOT, &url, "t", PresenceRead::CONFIRM, |_| panic!("read anew under a second"));
+        assert_eq!(confirmed.0, vec![1]);
+        let fresh = shared_presence(&SLOT, &url, "t", PresenceRead::FRESH, |_| Ok(vec![2]));
+        assert_eq!(fresh.0, vec![2], "FRESH always reads");
+    }
+
+    /// (#3432 review) `/runs` marks a run not reporting only on a fresh beat
+    /// read: the shared snapshot can be up to 5s old, and a session that began
+    /// after it is not in it. A run the snapshot would mark is judged again on
+    /// a fresh read; one it would not mark costs no read.
+    #[test]
+    fn a_snapshot_mark_is_confirmed_on_a_fresh_read() {
+        use crate::fleet_view::{gather_view, tests as fv, CardOutcome, Liveness, FLEET_VIEW_CACHE_TTL};
+        let s = fv::scripted(fv::identity("laptop", None, Some("nLAPTOP")), vec![]);
+        let mut view = gather_view(&s, FLEET_VIEW_CACHE_TTL);
+        let mut down = view.machines[0].clone();
+        down.is_this_machine = false;
+        down.entry = Some(crate::wire::RosterMachineEntry::from(&fv::entry("far-peer")));
+        down.liveness = Liveness::NoBeat;
+        down.card = CardOutcome::Unknown;
+        view.machines.push(down);
+        let row = || {
+            let mut r = crate::runs::tests_support_run("r");
+            r.machine = Some("far-peer".into());
+            r
+        };
+        let stale: std::collections::HashSet<String> = Default::default();
+        let fresh: std::collections::HashSet<String> = ["r".to_string()].into();
+
+        let mut rows = vec![row()];
+        mark_not_reporting_served(&mut rows, Some(&view), Some(stale.clone()), || Some(fresh.clone()));
+        assert!(!rows[0].not_reporting, "the fresh read holds its beat");
+
+        let mut rows = vec![row()];
+        mark_not_reporting_served(&mut rows, Some(&view), Some(stale.clone()), || Some(stale.clone()));
+        assert!(rows[0].not_reporting, "gone on the fresh read too: marked");
+
+        let mut rows = vec![row()];
+        mark_not_reporting_served(&mut rows, Some(&view), Some(fresh.clone()), || panic!("read again with nothing to mark"));
+        assert!(!rows[0].not_reporting);
     }
 
     #[tokio::test]

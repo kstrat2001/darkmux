@@ -193,43 +193,43 @@ pub fn write_beat(client: &redis::Client, beat: &PresenceBeat, ttl_secs: u64) ->
 pub fn read_live(client: &redis::Client) -> Result<Vec<PresenceBeat>> {
     let mut conn = open_redis_connection_bounded(client, REDIS_CONNECT_TIMEOUT)
         .context("getting Redis connection for presence read")?;
-    // (#2227) Bounds each `SCAN`/`GET` below individually (a per-socket-read
+    // (#2227) Bounds each `SCAN`/`MGET` below individually (a per-socket-read
     // deadline, not a budget for the whole loop). `SCAN COUNT 200` is
     // explicitly non-blocking, so no single reply legitimately takes a second.
     // This read backs the machine topology view and the reconciler's tick — an
     // unbounded stall here wedges the reconcile loop, not just one request.
     bound_redis_response(&conn);
-    let pattern = format!("{PRESENCE_KEY_PREFIX}*");
+    let values = scan_and_mget(&mut conn, &format!("{PRESENCE_KEY_PREFIX}*"), "presence")?;
+    Ok(values.iter().flatten().filter_map(|json| serde_json::from_str::<PresenceBeat>(json).ok()).collect())
+}
+
+/// Every value under the keys matching `pattern`: a cursor `SCAN` (never
+/// `KEYS`), then ONE `MGET` for all of them (#3432: a `GET` per key was a
+/// round trip per live machine or session on every read). A key that expired
+/// between the two reads is `None`. `what` names the key space in errors.
+pub(crate) fn scan_and_mget(conn: &mut redis::Connection, pattern: &str, what: &str) -> Result<Vec<Option<String>>> {
     let mut cursor = "0".to_string();
     let mut keys: Vec<String> = Vec::new();
     loop {
         let (next, batch): (String, Vec<String>) = redis::cmd("SCAN")
             .arg(&cursor)
             .arg("MATCH")
-            .arg(&pattern)
+            .arg(pattern)
             .arg("COUNT")
             .arg(200)
-            .query(&mut conn)
-            .context("SCAN presence keys")?;
+            .query(conn)
+            .with_context(|| format!("SCAN {what} keys"))?;
         keys.extend(batch);
         if next == "0" {
             break;
         }
         cursor = next;
     }
-    let mut out = Vec::with_capacity(keys.len());
-    for key in keys {
-        let val: Option<String> = redis::cmd("GET")
-            .arg(&key)
-            .query(&mut conn)
-            .context("GET presence key")?;
-        if let Some(json) = val {
-            if let Ok(beat) = serde_json::from_str::<PresenceBeat>(&json) {
-                out.push(beat);
-            }
-        }
+    if keys.is_empty() {
+        // MGET with no keys is an error, not an empty reply.
+        return Ok(Vec::new());
     }
-    Ok(out)
+    redis::cmd("MGET").arg(&keys).query(conn).with_context(|| format!("MGET {what} keys"))
 }
 
 /// Build one heartbeat payload. Pure (no I/O) — split out from the emitter

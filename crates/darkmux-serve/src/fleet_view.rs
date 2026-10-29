@@ -753,7 +753,7 @@ impl FleetSources for ProcessSources {
 
     fn presence(&self) -> (Vec<PresenceBeat>, SourceState) {
         match darkmux_flow::redis_url() {
-            Some(url) => crate::read_presence_beats(&url, "machines", darkmux_flow::presence::read_live),
+            Some(url) => crate::machine_beats(&url, crate::PresenceRead::ROUTE),
             None => (Vec::new(), SourceState::Off),
         }
     }
