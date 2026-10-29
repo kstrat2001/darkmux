@@ -472,6 +472,9 @@ struct FleetWindows {
     /// When the last refresh failed; cleared by a successful one. Inside the
     /// TTL of a failure nothing asks the hub again.
     failed_at: Option<SystemTime>,
+    /// Which hub the windows and the failure are from (a digest: the URL can
+    /// carry a password). Another hub starts over.
+    hub: Option<[u8; 32]>,
 }
 
 /// The longest a request waits on another request's refresh: one round
@@ -519,6 +522,11 @@ const FLEET_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 /// one bounded attempt per TTL, not one per request, in turn. Each new entry
 /// is parsed once.
 ///
+/// The URL is resolved before anything is served, and the windows and the
+/// backoff belong to the hub they were read from: with no URL the answer is
+/// `Off` whatever is held, and another hub's window or failure is never
+/// served.
+///
 /// Degradation is unchanged from the full-read cache it replaces: no URL is
 /// `Off` (a standalone install, not a fault); a failed read serves the
 /// last-known-good window as `Stale` with its age, or nothing as
@@ -533,6 +541,15 @@ pub(crate) fn read_fleet_cached(
     now: SystemTime,
     redis_url: impl FnOnce() -> Option<darkmux_flow::RawRedisUrl>,
 ) -> crate::FleetRead {
+    let Some(url) = redis_url() else {
+        // Not a degradation: a single-machine install has no fleet substrate
+        // by design, and warning about it would be the bug.
+        return crate::FleetRead {
+            records: FleetRecords::default(),
+            state: SourceState::Off,
+        };
+    };
+    let hub = hub_key(url.expose_for_probe());
     let within_ttl = |at: Option<SystemTime>| at.is_some_and(|at| within_ttl_of(at, now));
     let fresh = |w: &FleetWindows| {
         within_ttl(w.work.at) && (scope == FleetScope::Work || within_ttl(w.telemetry.at))
@@ -541,6 +558,7 @@ pub(crate) fn read_fleet_cached(
         .windows
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
+    windows.adopt_hub(hub);
     if fresh(&windows) {
         return crate::FleetRead {
             records: windows.assemble(scope),
@@ -558,14 +576,6 @@ pub(crate) fn read_fleet_cached(
             Err(read) => return read,
         };
     }
-    let Some(url) = redis_url() else {
-        // Not a degradation: a single-machine install has no fleet substrate
-        // by design, and warning about it would be the bug.
-        return crate::FleetRead {
-            records: FleetRecords::default(),
-            state: SourceState::Off,
-        };
-    };
     windows.refreshing = true;
     let (mut work, mut telemetry) = (windows.work.clone(), windows.telemetry.clone());
     drop(windows);
@@ -578,41 +588,19 @@ pub(crate) fn read_fleet_cached(
         &mut work,
         &mut telemetry,
     );
-    let mut windows = caches
+    let read = caches
         .windows
         .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    // A stream read successfully keeps its new window even when the other
-    // failed; one that failed is unchanged.
-    windows.work = work;
-    windows.telemetry = telemetry;
-    windows.refreshing = false;
-    let read = match result {
-        Ok(()) => {
-            windows.failed_at = None;
-            crate::FleetRead {
-                records: windows.assemble(scope),
-                state: SourceState::Ok,
-            }
-        }
-        Err(e) => {
-            // When it failed, on the caller's clock: a failure against a
-            // hub that stalls each reply takes about the TTL itself, and
-            // stamping when the attempt began left the backoff spent.
-            windows.failed_at = Some(now + attempt.elapsed());
-            // Never interpolate the url (#661 Slice 5): it can carry an
-            // inline password. The full error goes to stderr; the wire gets
-            // the classification only.
-            eprintln!(
-                "darkmux serve: fleet-wide flow aggregation could not read Redis ({e}); \
-                 serving the last-known-good fleet snapshot, if any, plus this machine's own"
-            );
-            windows.degraded(scope, now)
-        }
-    };
-    drop(windows);
+        .unwrap_or_else(PoisonError::into_inner)
+        .install(hub, result, (work, telemetry), scope, now, now + attempt.elapsed());
     drop(settle);
     read
+}
+
+/// Which hub a set of windows was read from, as a digest (the URL can carry
+/// a password).
+fn hub_key(url: &str) -> [u8; 32] {
+    *blake3::hash(url.as_bytes()).as_bytes()
 }
 
 /// Whether a time stamped `at` is within [`FLEET_CACHE_TTL`] of `now`. A time
@@ -691,6 +679,63 @@ fn refresh(
 }
 
 impl FleetWindows {
+    /// Start over when `hub` is not the hub these windows are from, keeping
+    /// only the mark of a refresh in flight.
+    fn adopt_hub(&mut self, hub: [u8; 32]) {
+        if self.hub != Some(hub) {
+            *self = FleetWindows {
+                hub: Some(hub),
+                refreshing: self.refreshing,
+                ..FleetWindows::default()
+            };
+        }
+    }
+
+    /// Install a refresh of `hub`'s windows, begun at `now` and ended at
+    /// `ended`, and answer from the result. A stream read successfully keeps
+    /// its new window even when the other failed; one that failed is
+    /// unchanged. A refresh of a hub these windows are no longer from is
+    /// dropped.
+    fn install(
+        &mut self,
+        hub: [u8; 32],
+        result: anyhow::Result<()>,
+        (work, telemetry): (StreamWindow, StreamWindow),
+        scope: FleetScope,
+        now: SystemTime,
+        ended: SystemTime,
+    ) -> crate::FleetRead {
+        self.refreshing = false;
+        if self.hub != Some(hub) {
+            return self.degraded(scope, now);
+        }
+        self.work = work;
+        self.telemetry = telemetry;
+        match result {
+            Ok(()) => {
+                self.failed_at = None;
+                crate::FleetRead {
+                    records: self.assemble(scope),
+                    state: SourceState::Ok,
+                }
+            }
+            Err(e) => {
+                // When it failed, on the caller's clock: a failure against a
+                // hub that stalls each reply takes about the TTL itself, and
+                // stamping when the attempt began left the backoff spent.
+                self.failed_at = Some(ended);
+                // Never interpolate the url (#661 Slice 5): it can carry an
+                // inline password. The full error goes to stderr; the wire
+                // gets the classification only.
+                eprintln!(
+                    "darkmux serve: fleet-wide flow aggregation could not read Redis ({e}); \
+                     serving the last-known-good fleet snapshot, if any, plus this machine's own"
+                );
+                self.degraded(scope, now)
+            }
+        }
+    }
+
     /// The records `scope` covers: the work window itself, or the two
     /// windows merged in hub order (the hub assigns ids, so they order
     /// records across the two streams even where the writers' clocks
@@ -980,6 +1025,7 @@ mod tests {
         let caches = FleetCaches::default();
         {
             let mut windows = caches.windows.lock().unwrap();
+            windows.hub = Some(hub_key(url));
             windows.work = StreamWindow {
                 at: Some(read_at),
                 source: Some(source_key(
@@ -1037,43 +1083,106 @@ mod tests {
         );
     }
 
+    /// A read of `url`, a hub that refuses every connection: `Ok` only when
+    /// the hub was not asked.
+    fn read_refused(caches: &FleetCaches, url: &str, now: SystemTime) -> crate::FleetRead {
+        let url = url.to_string();
+        read_fleet_cached(caches, FleetScope::Work, now, move || {
+            Some(darkmux_flow::RawRedisUrl::new(url))
+        })
+    }
+
     /// A request that read the clock before another request published a
     /// newer window (it waited on the lock meanwhile) is served that window:
     /// a window up to a TTL newer than the request is fresh, not a reason to
     /// read the hub again and move the window's time backward.
     #[test]
     fn a_window_published_after_the_request_began_is_fresh() {
+        let hub = "redis://127.0.0.1:1";
         let t0 = SystemTime::now();
-        let caches = seeded_past_ttl(
-            "redis://127.0.0.1:1",
-            t0 + std::time::Duration::from_millis(800),
-        );
-        let asked = std::cell::Cell::new(false);
-        let read = read_fleet_cached(&caches, FleetScope::Work, t0, || {
-            asked.set(true);
-            None
-        });
-        assert!(
-            !asked.get(),
+        let caches = seeded_past_ttl(hub, t0 + std::time::Duration::from_millis(800));
+        let read = read_refused(&caches, hub, t0);
+        assert_eq!(
+            read.state,
+            SourceState::Ok,
             "a window newer than the request sent it to the hub"
         );
-        assert_eq!(read.state, SourceState::Ok);
         assert_eq!(read.records.len(), 1);
 
         // A window an hour ahead is a clock that stepped backward (#2479):
-        // not fresh, so the hub is asked.
-        let caches = seeded_past_ttl(
-            "redis://127.0.0.1:1",
-            t0 + std::time::Duration::from_secs(3_600),
-        );
-        let asked = std::cell::Cell::new(false);
-        read_fleet_cached(&caches, FleetScope::Work, t0, || {
-            asked.set(true);
-            None
-        });
+        // not fresh, so the hub is asked (and refuses).
+        let caches = seeded_past_ttl(hub, t0 + std::time::Duration::from_secs(3_600));
+        let read = read_refused(&caches, hub, t0);
         assert!(
-            asked.get(),
-            "a window from a clock that stepped back was served as fresh"
+            matches!(read.state, SourceState::Stale { .. }),
+            "a window from a clock that stepped back was served as fresh: {:?}",
+            read.state
+        );
+    }
+
+    /// No URL is `Off` even with a fresh window held: the window came from a
+    /// hub this process is no longer configured for.
+    #[test]
+    fn no_url_is_off_whatever_the_window_holds() {
+        let t0 = SystemTime::now();
+        let caches = seeded_past_ttl("redis://127.0.0.1:1", t0);
+        let read = read_fleet_cached(&caches, FleetScope::Work, t0, || None);
+        assert_eq!(read.state, SourceState::Off);
+        assert!(read.records.is_empty(), "a hub's window was served with no URL set");
+    }
+
+    /// Another hub's fresh window, or its recent failure, is never served:
+    /// the windows start over and the new hub is asked.
+    #[test]
+    fn another_hubs_window_or_failure_is_never_served() {
+        let (a, b) = ("redis://127.0.0.1:1", "redis://127.0.0.1:2");
+        let t0 = SystemTime::now();
+        let caches = seeded_past_ttl(a, t0);
+        let read = read_refused(&caches, b, t0);
+        assert!(
+            matches!(read.state, SourceState::Unavailable { .. }),
+            "hub b was served hub a's window: {:?}",
+            read.state
+        );
+        assert!(read.records.is_empty());
+
+        let caches = seeded_past_ttl(a, t0 - std::time::Duration::from_secs(10));
+        caches.windows.lock().unwrap().failed_at = Some(t0);
+        let read = read_refused(&caches, b, t0);
+        assert!(
+            matches!(read.state, SourceState::Unavailable { .. }),
+            "hub b was served hub a's backoff and stale window: {:?}",
+            read.state
+        );
+    }
+
+    /// A refresh that ends after the windows moved to another hub installs
+    /// nothing: its records are from a hub no longer configured.
+    #[test]
+    fn a_refresh_of_a_hub_no_longer_held_is_dropped() {
+        let t0 = SystemTime::now();
+        let caches = seeded_past_ttl("redis://127.0.0.1:2", t0 - std::time::Duration::from_secs(10));
+        let mut windows = caches.windows.lock().unwrap();
+        windows.refreshing = true;
+        let other = StreamWindow {
+            at: Some(t0),
+            records: Arc::new(vec![rec("5-0", "dispatch.tool"), rec("6-0", "dispatch.tool")]),
+            ..StreamWindow::default()
+        };
+        let read = windows.install(
+            hub_key("redis://127.0.0.1:1"),
+            Ok(()),
+            (other, StreamWindow::default()),
+            FleetScope::Work,
+            t0,
+            t0,
+        );
+        assert!(!windows.refreshing);
+        assert_eq!(windows.work.records.len(), 1, "the other hub's refresh was installed");
+        assert!(
+            matches!(read.state, SourceState::Stale { .. }),
+            "{:?}",
+            read.state
         );
     }
 
