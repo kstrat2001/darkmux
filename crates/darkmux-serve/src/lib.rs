@@ -1974,6 +1974,119 @@ async fn missions_handler() -> axum::Json<wire::MissionsResponse> {
     axum::Json(wire::MissionsResponse { missions, generated_at_ms: current_millis() })
 }
 
+/// (#3428) How many times this process has built the `/runs` list: the
+/// instrument a test reads to prove requests share a build.
+pub(crate) static RUNS_BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// (#3428) How long one build of the `/runs` list is served while what it
+/// reads is unchanged. A build costs seconds on a busy machine (a 14-day fold
+/// of the flow records, every mission and lab run), and every open viewer
+/// polls the route every 5s. A new flow record, local or from the hub, means
+/// a new build ([`runs_inputs`]); this bound covers the rest (a status that
+/// turns on elapsed time, a mission or lab file written without a record).
+/// `generated_at_ms` is when the build began, so a served copy says how old
+/// its data is. A named constant, not adaptive.
+const RUNS_CACHE_TTL: Duration = Duration::from_secs(10);
+
+/// One build of the `/runs` list, before the per-request not-reporting
+/// marks (which read live presence), and the sources it was built from.
+#[derive(Clone)]
+struct BuiltRuns {
+    sources: (PathBuf, Option<PathBuf>),
+    /// What it read ([`runs_inputs`]).
+    inputs: u64,
+    at: std::time::SystemTime,
+    built_at_ms: u64,
+    rows: Vec<runs::Run>,
+    off_rows: (wire::OffRowUsage, wire::OffRowUsage),
+    fleet_state: source_state::SourceState,
+}
+
+/// The process's last `/runs` build, and when a build last failed. An async
+/// lock held across a build, so requests arriving during one wait for it
+/// instead of starting their own.
+#[derive(Default)]
+struct RunsCache {
+    built: Option<BuiltRuns>,
+    failed: Option<((PathBuf, Option<PathBuf>), std::time::SystemTime)>,
+}
+
+fn runs_cache() -> &'static tokio::sync::Mutex<RunsCache> {
+    static CACHE: std::sync::OnceLock<tokio::sync::Mutex<RunsCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| tokio::sync::Mutex::new(RunsCache::default()))
+}
+
+/// A digest of what a `/runs` build reads that changes when new work is
+/// recorded: the fleet window (its length and newest hub id) and the local
+/// day files (each one's name, length and modification time). Cheap: the
+/// window is shared and cached, and a stat per day file. Blocking.
+fn runs_inputs(flows_dir: &StdPath) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let fleet = fleet_flow_records();
+    fleet.records.len().hash(&mut h);
+    fleet.records.values().last().and_then(|v| v.get("hub_id")).and_then(|v| v.as_str()).hash(&mut h);
+    for (date, path) in flow_day_files(flows_dir) {
+        date.hash(&mut h);
+        let meta = std::fs::metadata(&path).ok();
+        meta.as_ref().map(|m| m.len()).hash(&mut h);
+        meta.and_then(|m| m.modified().ok()).hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Build the `/runs` list from these sources. Stamped when it begins, so its
+/// age counts the build. Blocking.
+fn build_runs_list(flows_dir: PathBuf, lab_dir: Option<PathBuf>, inputs: u64) -> BuiltRuns {
+    let (at, built_at_ms) = (std::time::SystemTime::now(), current_millis());
+    let fleet = fleet_flow_records();
+    RUNS_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let built = runs::build_runs_for_daemon(&flows_dir, lab_dir.as_deref(), &fleet.records);
+    let off = |s: &usage_sum::UsageSplit| wire::OffRowUsage { calls: s.calls, tokens: s.total };
+    BuiltRuns {
+        off_rows: (off(&built.usage.no_run), off(&built.usage.unlisted)),
+        rows: built.runs,
+        fleet_state: fleet.state,
+        sources: (flows_dir, lab_dir),
+        inputs,
+        at,
+        built_at_ms,
+    }
+}
+
+/// The `/runs` list for these sources: the last build while it is younger
+/// than [`RUNS_CACHE_TTL`] and read the same inputs, otherwise a new one.
+/// `None` when a build task failed, and for a TTL after, so a build that
+/// keeps failing is not retried by every waiting request in turn.
+async fn served_runs_list(flows_dir: PathBuf, lab_dir: Option<PathBuf>) -> Option<BuiltRuns> {
+    let mut slot = runs_cache().lock().await;
+    let sources = (flows_dir, lab_dir);
+    let now = std::time::SystemTime::now();
+    if slot.failed.as_ref().is_some_and(|(s, at)| *s == sources && wall_clock_cache_is_fresh(*at, now, RUNS_CACHE_TTL)) {
+        return None;
+    }
+    let dir = sources.0.clone();
+    let inputs = tokio::task::spawn_blocking(move || runs_inputs(&dir)).await.ok()?;
+    if let Some(built) = slot.built.as_ref() {
+        if built.sources == sources && built.inputs == inputs && wall_clock_cache_is_fresh(built.at, now, RUNS_CACHE_TTL) {
+            return Some(built.clone());
+        }
+    }
+    let (flows_dir, lab_dir) = sources.clone();
+    match tokio::task::spawn_blocking(move || build_runs_list(flows_dir, lab_dir, inputs)).await {
+        Ok(built) => {
+            slot.built = Some(built.clone());
+            slot.failed = None;
+            Some(built)
+        }
+        Err(e) => {
+            eprintln!("darkmux serve: GET /runs aggregation task failed ({e}); serving no rows");
+            slot.failed = Some((sources, std::time::SystemTime::now()));
+            None
+        }
+    }
+}
+
 /// GET /runs — the flat, kind-tagged, normalized run view-model (#1508 step
 /// 3): a READ-SIDE UNION over three existing sources — mission records
 /// (`/missions`'s own source), lab-bench runs (`/lab/runs`'s own scan), and
@@ -1982,44 +2095,60 @@ async fn missions_handler() -> axum::Json<wire::MissionsResponse> {
 /// this handler is a thin `spawn_blocking` + envelope wrapper, same shape
 /// as `missions_handler` above.
 ///
-/// Computed fresh per request — NO new persistence (sink-boundary contract
-/// #3 stays honored: this only READS across the lab/flow/crew boundary,
-/// never writes across it). Never a 500: `runs::build_runs` already
-/// degrades each source independently to zero contribution on failure
-/// (mirrors `missions_handler`'s `_ => Vec::new()`); the `unwrap_or_default`
-/// below covers only the outer `spawn_blocking` join itself panicking.
+/// Built at most once per [`RUNS_CACHE_TTL`] and held in memory only (#3428)
+/// — NO new persistence (sink-boundary contract #3 stays honored: this only
+/// READS across the lab/flow/crew boundary, never writes across it). Never a
+/// 500: `runs::build_runs` already degrades each source independently to
+/// zero contribution on failure (mirrors `missions_handler`'s
+/// `_ => Vec::new()`); a build or marking task that itself fails answers an
+/// empty list marked `unavailable`, never one that reads as an idle fleet.
 async fn runs_handler(State(state): State<AppState>) -> axum::Json<wire::RunsResponse> {
-    let flows_dir = state.flows_dir.clone();
-    let lab_dir = state.lab_dir.clone();
-    // (#1705) One blocking task: read the fleet stream, then build every
-    // row against local + fleet together.
-    let view = fleet_view::cached_view(&state).await.ok();
-    let result = tokio::task::spawn_blocking(move || {
-        let fleet = fleet_flow_records();
-        let built = runs::build_runs_for_daemon(&flows_dir, lab_dir.as_deref(), &fleet.records);
-        let off = |s: &usage_sum::UsageSplit| wire::OffRowUsage { calls: s.calls, tokens: s.total };
-        let off_rows = (off(&built.usage.no_run), off(&built.usage.unlisted));
-        let mut rows = built.runs;
-        let live = live_session_ids();
-        log_beat_read_once(live.is_none());
-        mark_not_reporting_served(&mut rows, view.as_ref(), live, || live_session_ids_read(PresenceRead::CONFIRM));
-        (rows, off_rows, fleet.state)
-    })
-    .await;
-    let (runs, (no_run, unlisted), fleet_state) = result.unwrap_or_else(|e| {
-        // A join failure means NOTHING was aggregated — the empty array below
-        // is a total failure, not an idle fleet. Previously this was a bare
-        // `unwrap_or_default()`: silent on stderr and indistinguishable on the
-        // wire from "no runs".
-        eprintln!("darkmux serve: GET /runs aggregation task failed ({e}); serving no rows");
-        (Vec::new(), Default::default(), source_state::SourceState::Unavailable { detail: "the run aggregation failed" })
-    });
+    // (#1705) One build reads the fleet stream, then builds every row against
+    // local + fleet together. (#3428) Shared between requests for a TTL.
+    let built = served_runs_list(state.flows_dir.clone(), state.lab_dir.clone()).await;
+    let Some(built) = built else {
+        return failed_runs_response();
+    };
+    let BuiltRuns { mut rows, off_rows: (no_run, unlisted), fleet_state, built_at_ms, .. } = built;
+    // (#3428) The view and the live beats only mark running rows not
+    // reporting, so a board with none reads neither: a gather is every peer's
+    // card over the tailnet, a beat read a bounded hub connect.
+    let rows = if rows.iter().any(|r| r.status == runs::RunStatus::Running) {
+        let view = fleet_view::cached_view(&state).await.ok();
+        let marked = tokio::task::spawn_blocking(move || {
+            let live = live_session_ids();
+            log_beat_read_once(live.is_none());
+            mark_not_reporting_served(&mut rows, view.as_ref(), live, || live_session_ids_read(PresenceRead::CONFIRM));
+            rows
+        })
+        .await;
+        let Ok(rows) = marked else {
+            eprintln!("darkmux serve: GET /runs not-reporting task failed; serving no rows");
+            return failed_runs_response();
+        };
+        rows
+    } else {
+        rows
+    };
     axum::Json(wire::RunsResponse {
-        runs,
+        runs: rows,
         no_run,
         unlisted,
-        generated_at_ms: current_millis(),
+        generated_at_ms: built_at_ms,
         meta: source_state::coverage_meta(&fleet_state),
+        policy: runs::runs_policy(),
+    })
+}
+
+/// `/runs` when its aggregation failed: NOTHING was aggregated, so the empty
+/// list is a total failure, not an idle fleet, and the coverage says so.
+fn failed_runs_response() -> axum::Json<wire::RunsResponse> {
+    axum::Json(wire::RunsResponse {
+        runs: Vec::new(),
+        no_run: Default::default(),
+        unlisted: Default::default(),
+        generated_at_ms: current_millis(),
+        meta: source_state::coverage_meta(&source_state::SourceState::Unavailable { detail: "the run aggregation failed" }),
         policy: runs::runs_policy(),
     })
 }
@@ -2928,17 +3057,76 @@ fn tail_lab_events(dir: &StdPath, offset: u64) -> wire::LabRunEventsResponse {
 /// The engine's `loaded()` is sync (subprocess invocation), so it runs on
 /// the blocking pool to keep the axum executor free.
 async fn machine_status_handler() -> axum::Json<wire::MachineStatusResponse> {
-    let result = tokio::task::spawn_blocking(local_engine_residents).await;
-    let r = result.unwrap_or_else(|_| EngineResidents::panicked());
+    let result = tokio::task::spawn_blocking(served_engine_residents).await;
+    let (r, read_at_ms) = match result {
+        Ok(read) => (read.residents, read.read_at_ms),
+        Err(_) => (EngineResidents::panicked(), current_millis()),
+    };
     axum::Json(wire::MachineStatusResponse {
         lms_unreachable: r.unknown.is_some(),
         models: r.models,
         engine: r.engine,
-        generated_at_ms: current_millis(),
+        generated_at_ms: read_at_ms,
     })
 }
 
+/// (#3428) One read of this machine's residents and what they leave for AI:
+/// the AI headroom (`reclaimable + resident − margin`) is computed at the
+/// same moment as the listing it adds back, so a cached listing never sits
+/// beside a fresh reclaimable reading (which counted a just-unloaded model
+/// twice). `read_at_ms` is when it happened.
+#[derive(Clone)]
+pub(crate) struct ResidentsRead {
+    pub(crate) residents: EngineResidents,
+    pub(crate) ram_free_for_ai_bytes: Option<u64>,
+    pub(crate) read_at_ms: u64,
+}
+
+impl ResidentsRead {
+    /// A fresh read. Blocking: it shells out.
+    pub(crate) fn now() -> Self {
+        let residents = local_engine_residents();
+        let ram_free_for_ai_bytes = darkmux_doctor::ai_headroom_bytes_with(&residents.models);
+        Self { residents, ram_free_for_ai_bytes, read_at_ms: current_millis() }
+    }
+}
+
+/// (#3428) How long the daemon reuses one residents read. Each read spawns
+/// `lms ps` (a large Node binary), and the card that every peer's fleet view
+/// reads about every 5s embeds one, so without this an idle fleet kept every
+/// machine spawning `lms`. A model loaded or unloaded shows within this bound.
+pub(crate) const SERVED_RESIDENTS_TTL: Duration = Duration::from_secs(10);
+
+/// (#3428) This machine's residents as the daemon serves them: one
+/// [`ResidentsRead`] shared by `/machine/status`, `/machine/specs` and the
+/// machine card, reused for [`SERVED_RESIDENTS_TTL`]. A failed read (the
+/// engine could not be asked) is kept too, so a wedged `lms` costs one
+/// bounded attempt per TTL rather than one per request. Keyed by
+/// the engine setting and the `lms` binary, so a changed setting reads
+/// afresh. Single-flight: the lock is held across the read, so a burst on a
+/// stale slot costs one. Blocking. Wall-clock time, so a daemon that slept
+/// does not serve a pre-sleep read as fresh.
+pub(crate) fn served_engine_residents() -> ResidentsRead {
+    type Slot = Option<(String, std::time::SystemTime, ResidentsRead)>;
+    static SLOT: std::sync::Mutex<Slot> = std::sync::Mutex::new(None);
+    let key = format!(
+        "{}\0{}",
+        darkmux_types::config_access::default_engine(),
+        darkmux_types::config_access::lms_bin()
+    );
+    let mut slot = SLOT.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((k, at, read)) = slot.as_ref() {
+        if *k == key && wall_clock_cache_is_fresh(*at, std::time::SystemTime::now(), SERVED_RESIDENTS_TTL) {
+            return read.clone();
+        }
+    }
+    let read = ResidentsRead::now();
+    *slot = Some((key, std::time::SystemTime::now(), read.clone()));
+    read
+}
+
 /// (#316) This machine's engine and what it holds.
+#[derive(Clone)]
 pub struct EngineResidents {
     pub engine: wire::MachineEngine,
     pub models: Vec<darkmux_types::LoadedModel>,
@@ -2985,8 +3173,10 @@ pub fn local_engine_residents() -> EngineResidents {
 /// (#1286) GET /machine/resources cache TTL. Computed on request with a short
 /// in-process cache so a phone-viewer poll burst costs ONE gather; the TTL
 /// is recorded in the payload (`cache_ttl_ms`) per the observer-effect
-/// constraint — cadence is a visible knob, never adaptive-silent.
-const MACHINE_RESOURCES_CACHE_TTL: Duration = Duration::from_secs(2);
+/// constraint — cadence is a visible knob, never adaptive-silent. (#3428)
+/// 10s, longer than the viewer's 3s poll: each gather spawns `lms ps`, and a
+/// 2s TTL let every poll pay one. The `load` block stays per-request.
+const MACHINE_RESOURCES_CACHE_TTL: Duration = Duration::from_secs(10);
 /// (#2479 audit — not in the original MUST FIX list, found during the audit
 /// enumeration and fixed for the same reason as [`FleetCache`]) `SystemTime`,
 /// deliberately not `Instant`: this cache's freshness gate is the same
@@ -3034,7 +3224,7 @@ fn machine_resources_cached_fresh() -> Option<darkmux_profiles::model_ledger::Mo
 /// (#2107, #1833, #2108) The host sampler's `load` block — `now`/`window` in
 /// host-sample-shape v2, see `host_sampler`'s own doc — is read AFTER the
 /// ledger cache lookup and never cached itself: the ledger gather is the
-/// expensive shelled-out part worth a 2s cache; the ring read underneath
+/// expensive shelled-out part worth a 10s cache; the ring read underneath
 /// `load` is a mutex lock plus arithmetic, cheap enough to be freshest-possible
 /// on every request rather than inheriting the ledger's cache staleness.
 /// Absent (no `load` key at all) when the sampler hasn't produced a sample
@@ -3092,7 +3282,7 @@ async fn machine_resources_handler(
 /// command. (#275 PR-A)
 async fn machine_specs_handler() -> axum::Json<wire::MachineSpecsResponse> {
     // Shell-out probes run off the async runtime.
-    let specs = tokio::task::spawn_blocking(gather_specs)
+    let specs = tokio::task::spawn_blocking(gather_served_specs)
         .await
         .unwrap_or_else(|_| degraded_specs());
     axum::Json(specs)
@@ -3120,14 +3310,27 @@ fn degraded_specs() -> wire::MachineSpecsResponse {
     }
 }
 
-/// The spec sheet `/machine/specs` serves and the machine card embeds: the
-/// ONE gather. Blocking (it shells out); each probe is independent, so one
-/// failure never cascades.
+/// The spec sheet with a fresh residents read, for tests that change the
+/// engine between reads. Blocking.
+#[cfg(test)]
 pub(crate) fn gather_specs() -> wire::MachineSpecsResponse {
-    let residents = local_engine_residents();
+    gather_specs_from(ResidentsRead::now())
+}
+
+/// The spec sheet as the daemon serves it, on its shared residents read
+/// ([`served_engine_residents`], #3428). Blocking.
+pub(crate) fn gather_served_specs() -> wire::MachineSpecsResponse {
+    gather_specs_from(served_engine_residents())
+}
+
+/// The spec sheet `/machine/specs` serves and the machine card embeds: the
+/// ONE gather, around a residents read, stamped with that read's time (the
+/// rest of the sheet is static). Blocking (it shells out); each probe is
+/// independent, so one failure never cascades.
+pub(crate) fn gather_specs_from(read: ResidentsRead) -> wire::MachineSpecsResponse {
+    let ResidentsRead { residents, ram_free_for_ai_bytes: ram_free, read_at_ms } = read;
     let (engine, loaded_models, lms_unreachable) = (residents.engine, residents.models, residents.unknown.is_some());
     let ram_total = darkmux_hardware::ram_installed_bytes();
-    let ram_free = read_ram_free_for_ai_bytes();
     let cpu_brand = darkmux_hardware::cpu_brand().map(str::to_string);
     let machine_id = darkmux_flow::resolve_machine_id();
     // (#2814) The stable HARDWARE identity beside the NAME. `machine_id` is a
@@ -3178,7 +3381,7 @@ pub(crate) fn gather_specs() -> wire::MachineSpecsResponse {
         engine: Some(engine),
         utility_model,
         hub_configured,
-        generated_at_ms: current_millis(),
+        generated_at_ms: read_at_ms,
     }
 }
 
@@ -3195,15 +3398,6 @@ pub fn local_utility_model(loaded_models: &[darkmux_types::LoadedModel]) -> Opti
 fn utility_model(id: &str, n_ctx: Option<u32>, loaded_models: &[darkmux_types::LoadedModel]) -> wire::UtilityModel {
     let loaded = loaded_models.iter().any(|m| m.identifier == id || m.model == id);
     wire::UtilityModel { id: id.to_string(), loaded, n_ctx }
-}
-
-/// Read the AI-available RAM ceiling in bytes — the same "real
-/// headroom" doctor reports, expressed in bytes for JSON precision.
-/// Wraps doctor's existing `reclaimable + resident − safety_margin`
-/// computation. Returns `None` on non-macOS (today's doctor is
-/// macOS-shaped).
-fn read_ram_free_for_ai_bytes() -> Option<u64> {
-    darkmux_doctor::ai_headroom_bytes()
 }
 
 /// GET /flow/:date/stream — SSE-tails new flow records for a UTC day.
@@ -3559,9 +3753,24 @@ pub(crate) fn for_each_flow_record_across_days(
     flows_dir: &std::path::Path,
     mut visit: impl FnMut(&str, &serde_json::Value) -> std::ops::ControlFlow<()>,
 ) {
-    use std::io::BufRead;
+    for (date, path) in flow_day_files(flows_dir) {
+        let mut stop = false;
+        for_each_record_in_day_file(&path, |v| {
+            if !stop && visit(&date, v).is_break() {
+                stop = true;
+            }
+        });
+        if stop {
+            return;
+        }
+    }
+}
+
+/// The `YYYY-MM-DD.jsonl` day files in `flows_dir`, oldest first, so a
+/// visitor sees records in chronological order across days.
+fn flow_day_files(flows_dir: &std::path::Path) -> Vec<(String, std::path::PathBuf)> {
     let Ok(entries) = std::fs::read_dir(flows_dir) else {
-        return;
+        return Vec::new();
     };
     let mut day_files: Vec<(String, std::path::PathBuf)> = Vec::new();
     for entry in entries.flatten() {
@@ -3575,29 +3784,34 @@ pub(crate) fn for_each_flow_record_across_days(
         }
         day_files.push((date.to_string(), entry.path()));
     }
-    // Oldest-first → the visitor sees records in chronological order across days.
     day_files.sort_by(|a, b| a.0.cmp(&b.0));
-    for (date, path) in day_files {
-        let Ok(file) = std::fs::File::open(&path) else {
+    day_files
+}
+
+/// Each flow record in one day file, in order: blank lines, torn lines and the
+/// schema header skipped; an unreadable line ends the file. `false` when the
+/// file could not be opened or a line could not be read, so the records seen
+/// may not be all of it.
+fn for_each_record_in_day_file(path: &std::path::Path, mut visit: impl FnMut(&serde_json::Value)) -> bool {
+    use std::io::BufRead;
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    for line in std::io::BufReader::new(file).lines() {
+        let Ok(line) = line else { return false };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some(v) = darkmux_flow::reader::parse_value(line) else {
             continue;
         };
-        for line in std::io::BufReader::new(file).lines() {
-            let Ok(line) = line else { break };
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let Some(v) = darkmux_flow::reader::parse_value(line) else {
-                continue;
-            };
-            if v.get("_type").and_then(|t| t.as_str()) == Some("schema") {
-                continue;
-            }
-            if visit(&date, &v).is_break() {
-                return;
-            }
+        if v.get("_type").and_then(|t| t.as_str()) == Some("schema") {
+            continue;
         }
+        visit(&v);
     }
+    true
 }
 
 /// Like [`for_each_flow_record_across_days`] but bounded to the day files
@@ -3700,6 +3914,92 @@ async fn flow_missions_handler(State(state): State<AppState>) -> axum::Json<wire
     })
 }
 
+/// (#3428) How many day files the missions catalog has read: the instrument
+/// a test reads to prove a repeated scan re-reads only what changed.
+pub(crate) static MISSION_DAY_FILE_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One record's part in the missions catalog: what [`scan_flow_missions`]
+/// folds, and its identity (computed from the whole record, so the fleet
+/// de-dup still matches). Typed and with its repeated strings shared, since
+/// every mission record on the machine is held (#3428 review: a cut JSON value
+/// cost ~750 bytes a record, ~140 MB for the operator's 186k).
+struct MissionMark {
+    identity: RecordIdentity,
+    mission_id: std::sync::Arc<str>,
+    /// The record's `ts`, empty when it has none.
+    ts: Box<str>,
+    /// The execution a `dispatch.start` names.
+    dispatch: Option<Box<str>>,
+    /// The record's `machine_id`, when it names one.
+    machine: Option<std::sync::Arc<str>>,
+}
+
+/// The strings a day's marks share: each mission id and machine name once.
+#[derive(Default)]
+struct MarkStrings(std::collections::HashMap<String, std::sync::Arc<str>>);
+
+impl MarkStrings {
+    fn get(&mut self, s: &str) -> std::sync::Arc<str> {
+        if let Some(shared) = self.0.get(s) {
+            return shared.clone();
+        }
+        let shared: std::sync::Arc<str> = s.into();
+        self.0.insert(s.to_string(), shared.clone());
+        shared
+    }
+}
+
+impl MissionMark {
+    /// `None` for a record that names no mission.
+    fn of(v: &serde_json::Value, identity: RecordIdentity, strings: &mut MarkStrings) -> Option<Self> {
+        let mission_id = v.get("mission_id").and_then(|m| m.as_str()).filter(|m| !m.is_empty())?;
+        let dispatch = (darkmux_flow::reader::action_of(v) == Some(darkmux_flow::FlowAction::DispatchStart))
+            .then(|| darkmux_flow::reader::execution_id_of(v).map(|id| id.to_string().into_boxed_str()))
+            .flatten();
+        let machine = v.get("machine_id").and_then(|m| m.as_str()).filter(|m| !m.is_empty());
+        Some(Self {
+            identity,
+            mission_id: strings.get(mission_id),
+            ts: v.get("ts").and_then(|t| t.as_str()).unwrap_or("").into(),
+            dispatch,
+            machine: machine.map(|m| strings.get(m)),
+        })
+    }
+}
+
+/// One day file's [`MissionMark`]s, in file order. Kept per file while its
+/// length and modification time are unchanged: a past day's file never
+/// changes, so a scan re-reads only today's (#3428). A read that failed
+/// partway (the file could not be opened, or a line could not be read) is
+/// never kept, so the next scan tries again. Blocking.
+fn day_mission_records(path: &std::path::Path) -> std::sync::Arc<Vec<MissionMark>> {
+    type Marks = std::sync::Arc<Vec<MissionMark>>;
+    type Cache = std::collections::HashMap<std::path::PathBuf, (u64, Option<std::time::SystemTime>, Marks)>;
+    static CACHE: std::sync::Mutex<Option<Cache>> = std::sync::Mutex::new(None);
+    let stamp = std::fs::metadata(path).ok().map(|m| (m.len(), m.modified().ok()));
+    if let Some((len, modified)) = stamp {
+        let cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((l, m, marks)) = cache.as_ref().and_then(|c| c.get(path)) {
+            if (*l, *m) == (len, modified) {
+                return marks.clone();
+            }
+        }
+    }
+    MISSION_DAY_FILE_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut marks = Vec::new();
+    let mut strings = MarkStrings::default();
+    let whole = for_each_record_in_day_file(path, |v| {
+        marks.extend(MissionMark::of(v, RecordIdentity::of(v), &mut strings));
+    });
+    let marks: Marks = std::sync::Arc::new(marks);
+    // Stamped as read before the read, so a write during it reads again next time.
+    if let (true, Some((len, modified))) = (whole, stamp) {
+        let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        cache.get_or_insert_with(Cache::new).insert(path.to_path_buf(), (len, modified, marks.clone()));
+    }
+    marks
+}
+
 /// Roll every flow record up per `mission_id`, across the local day-files
 /// AND the fleet stream (#1705).
 ///
@@ -3732,15 +4032,9 @@ fn scan_flow_missions(
     let mut by_mission: HashMap<String, Agg> = HashMap::new();
 
     // The per-record fold, shared by both sources so they cannot drift.
-    let fold = |by_mission: &mut HashMap<String, Agg>, date: &str, v: &serde_json::Value| {
-        let Some(mid) = v.get("mission_id").and_then(|m| m.as_str()) else {
-            return;
-        };
-        if mid.is_empty() {
-            return;
-        }
-        let ts = v.get("ts").and_then(|t| t.as_str()).unwrap_or("");
-        let e = by_mission.entry(mid.to_string()).or_insert_with(|| Agg {
+    let fold = |by_mission: &mut HashMap<String, Agg>, date: &str, mark: &MissionMark| {
+        let ts = &*mark.ts;
+        let e = by_mission.entry(mark.mission_id.to_string()).or_insert_with(|| Agg {
             records: 0,
             dispatches: BTreeSet::new(),
             machines: BTreeSet::new(),
@@ -3764,19 +4058,14 @@ fn scan_flow_missions(
         if date > e.last_date.as_str() {
             e.last_date = date.to_string();
         }
-        if darkmux_flow::reader::action_of(v) == Some(darkmux_flow::FlowAction::DispatchStart) {
-            e.dispatches.extend(darkmux_flow::reader::execution_id_of(v).map(|id| id.to_string()));
-        }
-        if let Some(mach) = v.get("machine_id").and_then(|m| m.as_str()) {
-            if !mach.is_empty() {
-                e.machines.insert(mach.to_string());
-            }
-        }
+        e.dispatches.extend(mark.dispatch.as_deref().map(str::to_string));
+        e.machines.extend(mark.machine.as_deref().map(str::to_string));
     };
 
     // Fleet first — its records win the de-dup (see this function's doc).
     let mut fleet_seen: std::collections::HashSet<RecordIdentity> =
         std::collections::HashSet::with_capacity(fleet.len());
+    let mut fleet_strings = MarkStrings::default();
     for r in fleet.iter() {
         let v = r.value();
         // A fleet record carries no day-file to name it, so its date comes
@@ -3787,17 +4076,20 @@ fn scan_flow_missions(
             .map(|t| t.chars().take(10).collect::<String>())
             .unwrap_or_default();
         fleet_seen.insert(r.identity());
-        fold(&mut by_mission, &date, v);
+        if let Some(mark) = MissionMark::of(v, r.identity(), &mut fleet_strings) {
+            fold(&mut by_mission, &date, &mark);
+        }
     }
     // Then the local day-files, skipping anything the fleet already
     // supplied — this machine's own records are written to BOTH sinks.
-    for_each_flow_record_across_days(flows_dir, |date, v| {
-        if !fleet_seen.is_empty() && fleet_seen.contains(&RecordIdentity::of(v)) {
-            return std::ops::ControlFlow::Continue(());
-        }
-        fold(&mut by_mission, date, v);
-        std::ops::ControlFlow::Continue(())
-    });
+    // (#3428) Each day's mission records come from `day_mission_records`,
+    // which re-reads only a file that changed since the last scan.
+    for (date, path) in flow_day_files(flows_dir) {
+        day_mission_records(&path)
+            .iter()
+            .filter(|mark| !fleet_seen.contains(&mark.identity))
+            .for_each(|mark| fold(&mut by_mission, &date, mark));
+    }
 
     let mut out: Vec<wire::FlowMissionSummary> = by_mission
         .into_iter()
@@ -4168,16 +4460,14 @@ async fn aggregate_flow_records_for_date(
     flows_dir: &std::path::Path,
 ) -> DayRead {
     // env(DARKMUX_REDIS_URL) > config-assembled (#661 Slice 5).
-    let redis_url = darkmux_flow::redis_url();
-
-    let Some(url) = redis_url else {
+    if darkmux_flow::redis_url().is_none() {
         let local = read_flow_records_from_file(date, flows_dir).await;
         return DayRead {
             records: local.records,
             fleet_state: source_state::SourceState::Off,
             cut: wire::CutSources { local: local.cut, fleet: false },
         };
-    };
+    }
 
     // (#1570) LOCAL-FIRST, Redis as a bounded enhancement — run both
     // CONCURRENTLY rather than serialising Redis ahead of a file already on
@@ -4188,30 +4478,31 @@ async fn aggregate_flow_records_for_date(
     // takes 9ms — a 50x tax paid on every request for a source that is merely
     // optional. A degraded Redis now degrades the VIEW to local-only; it can
     // never block it.
+    // (#3431) The hub half comes from the process's fleet window, shared with
+    // `/runs` and the catalog routes and brought up to date incrementally,
+    // instead of a read of the hub's whole window per request. A failed
+    // refresh serves the last window read, marked stale with its age, as the
+    // catalog routes do; with none, the day is local only, `unavailable`.
     let date_owned = date.to_string();
-    let url_owned = url.clone();
-    let redis_task = tokio::task::spawn_blocking(move || {
-        read_flow_records_from_redis(url_owned.expose_for_probe(), Some(&date_owned), FleetScope::WithSamples)
+    let window_task = tokio::task::spawn_blocking(move || {
+        hub_day(&date_owned, fleet_flow_records_in, || {
+            let url = darkmux_flow::redis_url().ok_or_else(|| anyhow::anyhow!("no hub configured"))?;
+            read_flow_records_from_redis(url.expose_for_probe(), Some(&date_owned), FleetScope::WithSamples)
+        })
     });
-    let (redis_result, local_records) = tokio::join!(redis_task, read_flow_records_from_file(date, flows_dir));
+    let (window, local_records) = tokio::join!(window_task, read_flow_records_from_file(date, flows_dir));
 
-    match redis_result {
-        Ok(Ok(redis)) => DayRead {
-            records: union_flow_records(redis.records, local_records.records),
-            fleet_state: source_state::SourceState::Ok,
-            cut: wire::CutSources { local: local_records.cut, fleet: redis.cut },
+    match window {
+        Ok((Some(day), state)) => DayRead {
+            records: union_flow_records(day.records, local_records.records),
+            fleet_state: state,
+            cut: wire::CutSources { local: local_records.cut, fleet: day.cut },
         },
-        Ok(Err(e)) => {
-            eprintln!(
-                "darkmux serve: GET /flow/{date} Redis aggregation failed ({e}); \
-                 serving local file only"
-            );
-            DayRead {
-                records: local_records.records,
-                fleet_state: source_state::SourceState::Unavailable { detail: FLEET_READ_ERROR_DETAIL },
-                cut: wire::CutSources { local: local_records.cut, fleet: false },
-            }
-        }
+        Ok((None, state)) => DayRead {
+            records: local_records.records,
+            fleet_state: state,
+            cut: wire::CutSources { local: local_records.cut, fleet: false },
+        },
         Err(e) => {
             eprintln!(
                 "darkmux serve: GET /flow/{date} blocking task join error ({e}); \
@@ -4222,6 +4513,36 @@ async fn aggregate_flow_records_for_date(
                 fleet_state: source_state::SourceState::Unavailable { detail: FLEET_READ_ERROR_DETAIL },
                 cut: wire::CutSources { local: local_records.cut, fleet: false },
             }
+        }
+    }
+}
+
+/// (#3431) The hub half of a day: from the fleet window (`window`, the
+/// process's [`fleet_flow_records_in`]) when it has records to serve, fresh
+/// or stale. When it has none (`Unavailable`: never read, or a cold read
+/// still in flight past the wait another request will give it, the case a
+/// slow first read of a busy hub hits), the day is read from the hub
+/// directly (`direct`), as before the window served this route, so two
+/// requests made together on a cold window both get the hub's records.
+/// `None` when neither has any; the state says why.
+fn hub_day(
+    date: &str,
+    window: impl Fn(FleetScope) -> FleetRead,
+    direct: impl FnOnce() -> anyhow::Result<SourceRead>,
+) -> (Option<SourceRead>, source_state::SourceState) {
+    let fleet = window(FleetScope::WithSamples);
+    match fleet.state {
+        source_state::SourceState::Off => (None, fleet.state),
+        source_state::SourceState::Unavailable { .. } => match direct() {
+            Ok(day) => (Some(day), source_state::SourceState::Ok),
+            Err(e) => {
+                eprintln!("darkmux serve: GET /flow/{date} Redis aggregation failed ({e}); serving local file only");
+                (None, fleet.state)
+            }
+        },
+        _ => {
+            let work = window(FleetScope::Work);
+            (Some(fleet_day_records(date, &fleet.records, &work.records)), fleet.state)
         }
     }
 }
@@ -4541,8 +4862,9 @@ fn bound_redis_response(conn: &redis::Connection) {
 
 /// XREVRANGE the flow stream, keeping the records whose `ts` falls on `date`
 /// (every record when `date` is `None`). Synchronous (the sync
-/// `redis::Client`): the call site wraps it in `spawn_blocking` so the
-/// daemon's async runtime stays responsive.
+/// `redis::Client`). (#3431) `GET /flow/<date>` reads this way only when the
+/// fleet window has nothing to serve ([`hub_day`]); it is also what a fresh,
+/// uncached read returns, the reference the window's tests hold it to.
 fn read_flow_records_from_redis(
     url: &str,
     date: Option<&str>,
@@ -4636,6 +4958,29 @@ fn merge_by_hub_id(a: Vec<serde_json::Value>, b: Vec<serde_json::Value>) -> Vec<
     out
 }
 
+/// Whether a newest-first read of `len` entries, the oldest at hub time
+/// `oldest_ms`, may not hold the whole of `date`: see [`records_from_xrevrange`].
+fn read_cuts_day(len: usize, oldest_ms: Option<u64>, date: &str, maxlen: usize) -> bool {
+    let bound = if maxlen == 0 { MAX_FLOW_FILE_RECORDS } else { maxlen.min(MAX_FLOW_FILE_RECORDS) };
+    len >= bound && day_start_ms(date).is_some_and(|start| oldest_ms.is_some_and(|oldest| oldest >= start))
+}
+
+/// (#3431) The hub's records for `date`, from the process's fleet window
+/// rather than a read of the hub's whole window per request (~20 MB on the
+/// operator's hub, behind every `GET /flow/<date>`): the records a fresh
+/// [`read_flow_records_from_redis`] for the date returns, in the same order,
+/// and the same cut. `fleet` is the window with the samples merged in, `work`
+/// the work stream's alone (the cut is the work stream's, as there).
+fn fleet_day_records(date: &str, fleet: &FleetRecords, work: &FleetRecords) -> SourceRead {
+    let records = fleet
+        .iter()
+        .filter(|r| r.value().get("ts").and_then(|t| t.as_str()).is_some_and(|ts| ts.starts_with(date)))
+        .map(fleet_window::FleetRecord::full)
+        .collect();
+    let oldest_ms = work.values().next().and_then(hub_id_key).map(|(ms, _)| ms);
+    SourceRead { records, cut: read_cuts_day(work.len(), oldest_ms, date, darkmux_types::config_access::redis_maxlen()) }
+}
+
 /// The records an `XREVRANGE` reply holds, read through the flow reader
 /// (so a retired spelling comes back as an unknown action), filtered to `date` when one
 /// is given, in chronological order.
@@ -4658,12 +5003,7 @@ fn records_from_xrevrange(raw: redis::Value, date: Option<&str>, maxlen: usize) 
             ));
         }
     };
-    let bound = if maxlen == 0 { MAX_FLOW_FILE_RECORDS } else { maxlen.min(MAX_FLOW_FILE_RECORDS) };
-    let hit_a_bound = entries.len() >= bound;
-    let cut = hit_a_bound
-        && date.and_then(day_start_ms).is_some_and(|start| {
-            entries.last().and_then(entry_id_ms).is_some_and(|oldest| oldest >= start)
-        });
+    let cut = date.is_some_and(|date| read_cuts_day(entries.len(), entries.last().and_then(entry_id_ms), date, maxlen));
     // (#1715 review) The last bare `10000` on this path — the same cap the
     // XREVRANGE above already single-sources, so it follows that constant
     // rather than sitting beside it as a third copy.

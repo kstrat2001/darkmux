@@ -977,6 +977,77 @@
         assert_eq!(failed["models"], serde_json::json!([]), "{failed}");
     }
 
+    /// (#3428) The daemon's residents read is shared and kept for
+    /// [`SERVED_RESIDENTS_TTL`]: `/machine/status`, `/machine/specs` and the
+    /// machine card (every peer's fleet view reads it about every 5s) cost
+    /// one `lms ps` between them, not one each. `generated_at_ms` is when that
+    /// read happened, so a cached answer says how old it is.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_machine_routes_and_the_card_share_one_residents_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let calls = tmp.path().join("ps-calls");
+        let bin = tmp.path().join("lms");
+        fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = ps ] || exit 1\necho x >> '{}'\necho '[{{\"identifier\":\"darkmux:m\",\"modelKey\":\"m\",\"status\":\"idle\",\"sizeBytes\":1000000000,\"contextLength\":4096}}]'\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        let prev = std::env::var_os("DARKMUX_LMS_BIN");
+        // SAFETY: #[serial]; restored below.
+        unsafe { std::env::set_var("DARKMUX_LMS_BIN", &bin) };
+        let get = |uri: &'static str| async move {
+            let response = build_router_local(PathBuf::new())
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        let status = get("/machine/status").await;
+        let specs = get("/machine/specs").await;
+        let card = tokio::task::spawn_blocking(crate::machine_card::gather_local_card).await.unwrap();
+        let again = get("/machine/status").await;
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
+                None => std::env::remove_var("DARKMUX_LMS_BIN"),
+            }
+        }
+        let ps_calls = fs::read_to_string(&calls).map(|s| s.lines().count()).unwrap_or(0);
+        assert_eq!(ps_calls, 1, "one `lms ps` for every read inside the TTL");
+        assert_eq!(status["models"][0]["identifier"], "darkmux:m", "{status}");
+        assert_eq!(specs["loaded_models"][0]["identifier"], "darkmux:m", "{specs}");
+        assert_eq!(card.specs.loaded_models.len(), 1);
+        assert_eq!(again["generated_at_ms"], status["generated_at_ms"], "a cached answer keeps its read time");
+    }
+
+    /// (#3428 review) The spec sheet's AI headroom is computed with the
+    /// residents it lists, at the same read, and says when that was. Headroom
+    /// is `reclaimable + resident − margin`: a cached residents list beside a
+    /// live reclaimable reading counted a just-unloaded model twice (+40 GiB,
+    /// measured by the review).
+    #[test]
+    fn the_spec_sheet_takes_its_headroom_and_time_from_one_residents_read() {
+        let read = ResidentsRead {
+            residents: EngineResidents {
+                engine: wire::MachineEngine { name: "lmstudio".into(), reports_residency: true, usable: true },
+                models: Vec::new(),
+                unknown: None,
+            },
+            ram_free_for_ai_bytes: Some(12_345),
+            read_at_ms: 42,
+        };
+        let specs = gather_specs_from(read);
+        assert_eq!(specs.ram_free_for_ai_bytes, Some(12_345), "the read's headroom, not a fresh one");
+        assert_eq!(specs.generated_at_ms, 42, "when the read happened");
+    }
+
     /// (#316 stage 3.2) The spec sheet's `loaded_models` is what `lms ps`
     /// reports, and an `lms` that cannot run is `lms_unreachable`.
     #[test]
@@ -1122,7 +1193,9 @@
             json["messages"].as_array().is_some_and(|w| !w.is_empty()),
             "missing-lms probes must surface as messages: {json}"
         );
-        assert_eq!(json["cache_ttl_ms"].as_u64(), Some(2_000));
+        // (#3428) At least the viewer's 3s poll, so an open drawer costs one
+        // gather per 10s rather than one per poll.
+        assert_eq!(json["cache_ttl_ms"].as_u64(), Some(10_000));
     }
 
     /// (#316 stage 3.6) GET /machine/resources is the local engine's ledger:
@@ -1480,6 +1553,75 @@
         assert_eq!(m1["machines"], serde_json::json!(["laptop", "studio"]));
         // Newest activity first: m2's last dispatch (09:05) is newer than m1's (09:01).
         assert_eq!(missions[0]["mission_id"], "m2");
+    }
+
+    /// (#3428) The missions catalog re-reads only the day files that changed
+    /// since its last scan: the viewer polls it, and every poll used to
+    /// re-parse every day file on the machine (159 files, 441 MB measured).
+    /// What it answers is unchanged: an appended record shows on the next scan.
+    #[test]
+    #[serial_test::serial]
+    fn a_repeated_missions_scan_rereads_only_the_day_files_that_changed() {
+        use std::io::Write;
+        let reads = || super::MISSION_DAY_FILE_READS.load(std::sync::atomic::Ordering::Relaxed);
+        let tmp = TempDir::new().unwrap();
+        let rec = |mission: &str, exec: &str, ts: &str| {
+            format!("{{\"action\":\"dispatch.start\",\"execution_id\":\"{exec}\",\"mission_id\":\"{mission}\",\"machine_id\":\"laptop\",\"ts\":\"{ts}\"}}\n")
+        };
+        fs::write(tmp.path().join("2026-05-12.jsonl"), rec("m1", "exec-00000001-0000-0001", "2026-05-12T10:00:00Z")).unwrap();
+        fs::write(tmp.path().join("2026-05-14.jsonl"), rec("m1", "exec-00000002-0000-0001", "2026-05-14T09:00:00Z")).unwrap();
+        let before = reads();
+        let first = super::scan_flow_missions(tmp.path(), &[]);
+        assert_eq!(reads() - before, 2);
+        let before = reads();
+        let second = super::scan_flow_missions(tmp.path(), &[]);
+        assert_eq!(reads() - before, 0, "nothing changed, nothing re-read");
+        assert_eq!(serde_json::to_value(&first).unwrap(), serde_json::to_value(&second).unwrap());
+
+        let mut today = fs::OpenOptions::new().append(true).open(tmp.path().join("2026-05-14.jsonl")).unwrap();
+        today.write_all(rec("m2", "exec-00000003-0000-0001", "2026-05-14T09:05:00Z").as_bytes()).unwrap();
+        drop(today);
+        let before = reads();
+        let third = super::scan_flow_missions(tmp.path(), &[]);
+        assert_eq!(reads() - before, 1, "only the day that grew");
+        assert_eq!(third.len(), 2, "the appended mission shows");
+        let m1 = third.iter().find(|m| m.mission_id == "m1").unwrap();
+        assert_eq!((m1.records, m1.dispatches, m1.first_date.as_str()), (2, 2, "2026-05-12"));
+
+        // A write the clock didn't see (a coarse-mtime filesystem): the length
+        // alone says the file changed.
+        let path = tmp.path().join("2026-05-14.jsonl");
+        let stamped = fs::metadata(&path).unwrap().modified().unwrap();
+        let mut today = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        today.write_all(rec("m3", "exec-00000004-0000-0001", "2026-05-14T09:06:00Z").as_bytes()).unwrap();
+        today.set_modified(stamped).unwrap();
+        drop(today);
+        let fourth = super::scan_flow_missions(tmp.path(), &[]);
+        assert_eq!(fourth.len(), 3, "a grown file is re-read though its mtime did not move");
+    }
+
+    /// (#3435 review) A day file that could not be read is never kept as
+    /// read: a past day's file never changes, so a kept failure (a transient
+    /// `EMFILE` or `EIO`, here an unreadable mode) would erase its missions
+    /// from the catalog until the daemon restarted.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn a_day_file_that_could_not_be_read_is_read_again() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("2026-05-12.jsonl");
+        fs::write(&path, "{\"action\":\"dispatch.start\",\"execution_id\":\"exec-00000001-0000-0001\",\"mission_id\":\"m1\",\"ts\":\"2026-05-12T10:00:00Z\"}\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        let during = super::scan_flow_missions(tmp.path(), &[]);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        if fs::File::open(&path).is_ok() && !during.is_empty() {
+            eprintln!("skipping: running with permission to read a 0o000 file");
+            return;
+        }
+        let after = super::scan_flow_missions(tmp.path(), &[]);
+        assert!(during.is_empty());
+        assert_eq!(after.len(), 1, "readable again: its mission shows");
     }
 
     /// #1705: a mission that ran on a PEER reaches the missions lens even
@@ -5139,6 +5281,143 @@
                 assert_eq!(values(&next), fresh(&redis.url, FleetScope::Work));
             }
 
+            /// (#3431) A day served from the window is what a fresh day read
+            /// of the hub returns: the same records in the same order, the
+            /// samples merged in, the other day's records left out, and the
+            /// same cut, bounded or not. The fixture straddles a midnight at a
+            /// fixed time; nothing here reads the clock but the cache's `at`.
+            #[test]
+            #[serial]
+            fn a_day_from_the_window_equals_a_fresh_day_read_of_the_hub() {
+                if !redis_server_available() {
+                    eprintln!("skipping: redis-server not on PATH");
+                    return;
+                }
+                let redis = spawn_redis();
+                // 2026-10-28T00:05:00Z: forty records 15s apart span 23:55 to 00:05.
+                let base = 1_793_145_900;
+                let work = fleet_fixture::realistic_records(40, base);
+                let sample = |i: u64| serde_json::json!({ "ts": fleet_fixture::iso(base - 600 + i * 60), "action": "machine.telemetry", "machine_uid": "UID-STUDIO", "payload": { "cpu_pct": i } });
+                // Hub ids at each record's own time, so the cut is decided by
+                // the fixture, not by when the test runs.
+                let id_of = |r: &serde_json::Value, seq: usize| {
+                    let ts = r["ts"].as_str().unwrap();
+                    let secs = darkmux_flow::parse_ts_utc(ts).unwrap();
+                    format!("{}-{seq}", secs * 1000)
+                };
+                // A stream id only grows, so a record stamped earlier than the
+                // one before it takes that one's millisecond.
+                let mut last_ms = 0u64;
+                for (i, r) in work.iter().enumerate() {
+                    let ms: u64 = id_of(r, 0).trim_end_matches("-0").parse().unwrap();
+                    last_ms = last_ms.max(ms);
+                    xadd_with_id(&redis.url, WORK_STREAM, &format!("{last_ms}-{i}"), r);
+                }
+                for i in 0..10 {
+                    let s = sample(i);
+                    xadd_with_id(&redis.url, TELEMETRY_STREAM, &id_of(&s, 0), &s);
+                }
+                let caches = FleetCaches::default();
+                let t0 = SystemTime::now();
+                let both = read_at(&caches, &redis.url, FleetScope::WithSamples, t0);
+                let work_only = read_at(&caches, &redis.url, FleetScope::Work, t0);
+                for maxlen in ["0", "5"] {
+                    unsafe { std::env::set_var("DARKMUX_REDIS_MAXLEN", maxlen) };
+                    for date in ["2026-10-27", "2026-10-28", "2026-10-29"] {
+                        let want = super::super::read_flow_records_from_redis(&redis.url, Some(date), FleetScope::WithSamples)
+                            .expect("fresh day read");
+                        let got = super::super::fleet_day_records(date, &both.records, &work_only.records);
+                        assert_eq!(got.records, want.records, "{date}, maxlen {maxlen}");
+                        assert_eq!(got.cut, want.cut, "{date}, maxlen {maxlen}");
+                    }
+                }
+                unsafe { std::env::remove_var("DARKMUX_REDIS_MAXLEN") };
+                // Under the 5-entry bound the stream starts inside 10-27, so
+                // 10-27 may be cut and 10-28 (which it holds from midnight) is not.
+                unsafe { std::env::set_var("DARKMUX_REDIS_MAXLEN", "5") };
+                let cut = |date| super::super::fleet_day_records(date, &both.records, &work_only.records).cut;
+                assert_eq!((cut("2026-10-27"), cut("2026-10-28")), (true, false));
+                unsafe { std::env::remove_var("DARKMUX_REDIS_MAXLEN") };
+                let day = super::super::fleet_day_records("2026-10-28", &both.records, &work_only.records);
+                assert!(day.records.iter().any(|r| r["action"] == "machine.telemetry"), "the day's samples are in it");
+                assert!(day.records.len() < 50, "the other day's records are not");
+            }
+
+            /// (#3431) `GET /flow/<date>` reads the hub through the shared
+            /// window: a second request inside the cache window asks the hub
+            /// for nothing, where each request used to `XREVRANGE` the whole
+            /// of both streams (~20 MB a call on the operator's hub).
+            #[tokio::test]
+            #[serial]
+            async fn a_repeated_day_request_does_not_read_the_hubs_window_again() {
+                if !redis_server_available() {
+                    eprintln!("skipping: redis-server not on PATH");
+                    return;
+                }
+                let redis = spawn_redis();
+                let now = now_secs();
+                xadd_all(&redis.url, WORK_STREAM, &fleet_fixture::realistic_records(20, now));
+                let xrevranges = || -> u64 {
+                    let info: String = redis::cmd("INFO").arg("commandstats").query(&mut conn(&redis.url)).unwrap();
+                    info.lines()
+                        .find_map(|l| l.strip_prefix("cmdstat_xrevrange:calls="))
+                        .and_then(|rest| rest.split(',').next())
+                        .and_then(|n| n.parse().ok())
+                        .unwrap_or(0)
+                };
+                let date = &fleet_fixture::iso(now)[..10];
+                unsafe { std::env::set_var("DARKMUX_REDIS_URL", &redis.url) };
+                let tmp = TempDir::new().unwrap();
+                let get = || async {
+                    let response = build_router_local(tmp.path().to_path_buf())
+                        .oneshot(Request::builder().uri(format!("/flow/{date}")).body(Body::empty()).unwrap())
+                        .await
+                        .unwrap();
+                    let bytes = to_bytes(response.into_body(), 16 * 1024 * 1024).await.unwrap();
+                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+                };
+                let first = get().await;
+                let before = xrevranges();
+                let second = get().await;
+                let after = xrevranges();
+                unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
+                assert_eq!(after - before, 0, "the second request asked the hub for its whole window");
+                assert_eq!(first["meta"]["coverage"], second["meta"]["coverage"]);
+                assert_eq!(first["records"], second["records"]);
+                assert!(first["count"].as_u64().is_some_and(|n| n > 0), "{first}");
+            }
+
+            /// (#3431 review) A day whose window has nothing to serve (never
+            /// read, or a cold read still going past another request's wait)
+            /// is read from the hub directly, as before, so a request made
+            /// beside another on a cold window is never served local-only. A
+            /// window with records, fresh or stale, never reads the hub.
+            #[test]
+            fn a_day_reads_the_hub_directly_only_when_the_window_has_nothing() {
+                use crate::source_state::SourceState;
+                let day = |records: Vec<serde_json::Value>| super::super::SourceRead { records, cut: false };
+                let window = |state: SourceState| move |_: FleetScope| FleetRead { records: FleetRecords::default(), state: state.clone() };
+                let hub_record = serde_json::json!({ "ts": "2026-10-28T00:00:01Z", "action": "dispatch.start" });
+
+                let unavailable = SourceState::Unavailable { detail: "x" };
+                let (got, state) = super::super::hub_day("2026-10-28", window(unavailable.clone()), || Ok(day(vec![hub_record.clone()])));
+                assert_eq!(got.map(|d| d.records), Some(vec![hub_record.clone()]), "the direct read's records");
+                assert_eq!(state, SourceState::Ok);
+
+                let (got, state) = super::super::hub_day("2026-10-28", window(unavailable.clone()), || Err(anyhow::anyhow!("down")));
+                assert!(got.is_none());
+                assert_eq!(state, unavailable, "both failed: local only, unavailable");
+
+                for state in [SourceState::Ok, SourceState::Stale { age_ms: 5, detail: "x" }] {
+                    let (got, served) = super::super::hub_day("2026-10-28", window(state.clone()), || panic!("read the hub with a window to serve"));
+                    assert!(got.is_some());
+                    assert_eq!(served, state);
+                }
+                let (got, state) = super::super::hub_day("2026-10-28", window(SourceState::Off), || panic!("read the hub with none configured"));
+                assert!(got.is_none());
+                assert_eq!(state, SourceState::Off);
+            }
+
             /// (b) The same for the telemetry stream a dispatch replay reads
             /// beside the work stream, merged in hub order.
             #[test]
@@ -6370,6 +6649,116 @@
     // dedup, ghost synthesis). These are wiring-level tests only: does the
     // route exist, does it read the SAME `AppState` sources every other
     // handler reads, does the envelope shape match `/missions`'s own.
+
+    /// (#3428) `/runs` requests inside [`RUNS_CACHE_TTL`] share one build of
+    /// the run list: it costs seconds on a busy machine (a 14-day fold of the
+    /// flow records, every mission and lab run), and every open viewer polls
+    /// it. `generated_at_ms` is when that build ran, so a served copy says
+    /// how old it is.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn runs_requests_inside_the_ttl_share_one_build() {
+        let _guard = CrewDirGuard::new();
+        let flows = TempDir::new().unwrap();
+        let builds = || super::RUNS_BUILDS.load(std::sync::atomic::Ordering::Relaxed);
+        let get = || async {
+            let response = build_router_full_local(flows.path().to_path_buf(), None)
+                .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        let before = builds();
+        let first = get().await;
+        save_test_mission(&minimal_mission("runs-cache-later", vec![]));
+        let second = get().await;
+        assert_eq!(builds() - before, 1, "one build for both requests");
+        assert_eq!(first["runs"], second["runs"]);
+        assert_eq!(first["generated_at_ms"], second["generated_at_ms"], "the build's own time");
+
+        // A new flow record (a run's terminal, which the replay's catch-up
+        // refetch waits on) changes what a build reads: the next request
+        // builds again inside the TTL.
+        let today = darkmux_flow::ts_utc_at(now_unix() as i64);
+        fs::write(
+            flows.path().join(format!("{}.jsonl", &today[..10])),
+            format!("{{\"action\":\"dispatch.start\",\"session_id\":\"S-new\",\"execution_id\":\"exec-00000001-0000-0001\",\"ts\":\"{today}\"}}\n"),
+        )
+        .unwrap();
+        let third = get().await;
+        assert_eq!(builds() - before, 2, "a new record means a new build");
+        assert_ne!(third["runs"], first["runs"], "{third}");
+
+        // Another flows dir is another build (a test's router, or a
+        // reconfigured daemon), never this one's copy.
+        let other = TempDir::new().unwrap();
+        let response = build_router_full_local(other.path().to_path_buf(), None)
+            .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(builds() - before, 3);
+    }
+
+    /// (#3428) `/runs` reads the fleet view and the live beats only to mark
+    /// running rows not reporting, so a board with no running row never waits
+    /// on either: a gather (every peer's card over the tailnet, 1-3s each time
+    /// its 5s cache lapsed) or a beat read (a bounded hub connect that, on the
+    /// operator's tailnet, often failed after its 500ms cap), both measured on
+    /// the operator's laptop.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_board_with_no_running_row_reads_no_view_and_no_beats() {
+        use std::sync::atomic::Ordering;
+        let _guard = CrewDirGuard::new();
+        let flows = TempDir::new().unwrap();
+        let sources = std::sync::Arc::new(crate::fleet_view::tests::Scripted::default());
+        let get = |sources: std::sync::Arc<crate::fleet_view::tests::Scripted>| {
+            let app = build_router_full(flows.path().to_path_buf(), None, None, crate::fleet_view::FleetContext::with_sources(sources))
+                .layer(from_fn(assume_loopback_peer));
+            async move {
+                let response = app.oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap()).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+        };
+        // A hub that is configured but down: a beat read would cost a bounded
+        // connect attempt on every request.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let hub = format!("redis://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let accepts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = accepts.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                counted.fetch_add(1, Ordering::Relaxed);
+                drop(stream);
+            }
+        });
+        unsafe { std::env::set_var("DARKMUX_REDIS_URL", &hub) };
+        get(sources.clone()).await; // builds (its own hub reads are the build's)
+        let built = accepts.load(Ordering::Relaxed);
+        get(sources.clone()).await; // served from the build
+        unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
+        assert_eq!(sources.local_cards.load(Ordering::Relaxed), 0, "an idle board gathers no view");
+        let beat_reads = accepts.load(Ordering::Relaxed) - built;
+
+        // A dispatch that started a moment ago with no terminal: a running row.
+        let other = TempDir::new().unwrap();
+        let now = darkmux_flow::ts_utc_at(now_unix() as i64);
+        fs::write(
+            other.path().join(format!("{}.jsonl", &now[..10])),
+            format!("{{\"action\":\"dispatch.start\",\"session_id\":\"S-live\",\"execution_id\":\"exec-00000001-0000-0001\",\"ts\":\"{now}\"}}\n"),
+        )
+        .unwrap();
+        let app = build_router_full(other.path().to_path_buf(), None, None, crate::fleet_view::FleetContext::with_sources(sources.clone()))
+            .layer(from_fn(assume_loopback_peer));
+        let response = app.oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap()).await.unwrap();
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json["runs"].as_array().unwrap().iter().any(|r| r["status"] == "running"), "{json}");
+        assert_eq!(sources.local_cards.load(Ordering::Relaxed), 1, "a running row is judged against the view");
+        assert_eq!(beat_reads, 0, "a request served from the build reads no live beats");
+    }
 
     #[tokio::test]
     #[serial_test::serial]

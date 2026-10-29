@@ -7581,10 +7581,14 @@ pub const RAM_SAFETY_MARGIN_GB_FOR_SPECS: u64 = RAM_SAFETY_MARGIN_GB;
 /// `None` when the platform can't read reclaimable memory. One computation for
 /// every caller: `serve`'s /machine/specs and `init`'s utility window (#3020).
 pub fn ai_headroom_bytes() -> Option<u64> {
-    let resident_gb = engine::local().loaded()
-        .ok()
-        .map(|models| models.iter().filter_map(|m| darkmux_types::size::parse_size_gb(&m.size)).sum::<f64>())
-        .unwrap_or(0.0);
+    ai_headroom_bytes_with(&engine::local().loaded().unwrap_or_default())
+}
+
+/// [`ai_headroom_bytes`] for residents the caller already read, so a caller
+/// holding a listing doesn't spawn `lms ps` again (#3428). An unknown listing
+/// is passed as empty, as [`ai_headroom_bytes`] treats one.
+pub fn ai_headroom_bytes_with(resident: &[darkmux_types::LoadedModel]) -> Option<u64> {
+    let resident_gb = resident.iter().filter_map(|m| darkmux_types::size::parse_size_gb(&m.size)).sum::<f64>();
     headroom_bytes_from(read_reclaimable_gb(), resident_gb, RAM_SAFETY_MARGIN_GB)
 }
 
