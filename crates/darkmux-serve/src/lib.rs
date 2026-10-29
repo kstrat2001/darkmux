@@ -1869,6 +1869,119 @@ async fn missions_handler() -> axum::Json<wire::MissionsResponse> {
     axum::Json(wire::MissionsResponse { missions, generated_at_ms: current_millis() })
 }
 
+/// (#3428) How many times this process has built the `/runs` list: the
+/// instrument a test reads to prove requests share a build.
+pub(crate) static RUNS_BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// (#3428) How long one build of the `/runs` list is served while what it
+/// reads is unchanged. A build costs seconds on a busy machine (a 14-day fold
+/// of the flow records, every mission and lab run), and every open viewer
+/// polls the route every 5s. A new flow record, local or from the hub, means
+/// a new build ([`runs_inputs`]); this bound covers the rest (a status that
+/// turns on elapsed time, a mission or lab file written without a record).
+/// `generated_at_ms` is when the build began, so a served copy says how old
+/// its data is. A named constant, not adaptive.
+const RUNS_CACHE_TTL: Duration = Duration::from_secs(10);
+
+/// One build of the `/runs` list, before the per-request not-reporting
+/// marks (which read live presence), and the sources it was built from.
+#[derive(Clone)]
+struct BuiltRuns {
+    sources: (PathBuf, Option<PathBuf>),
+    /// What it read ([`runs_inputs`]).
+    inputs: u64,
+    at: std::time::SystemTime,
+    built_at_ms: u64,
+    rows: Vec<runs::Run>,
+    off_rows: (wire::OffRowUsage, wire::OffRowUsage),
+    fleet_state: source_state::SourceState,
+}
+
+/// The process's last `/runs` build, and when a build last failed. An async
+/// lock held across a build, so requests arriving during one wait for it
+/// instead of starting their own.
+#[derive(Default)]
+struct RunsCache {
+    built: Option<BuiltRuns>,
+    failed: Option<((PathBuf, Option<PathBuf>), std::time::SystemTime)>,
+}
+
+fn runs_cache() -> &'static tokio::sync::Mutex<RunsCache> {
+    static CACHE: std::sync::OnceLock<tokio::sync::Mutex<RunsCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| tokio::sync::Mutex::new(RunsCache::default()))
+}
+
+/// A digest of what a `/runs` build reads that changes when new work is
+/// recorded: the fleet window (its length and newest hub id) and the local
+/// day files (each one's name, length and modification time). Cheap: the
+/// window is shared and cached, and a stat per day file. Blocking.
+fn runs_inputs(flows_dir: &StdPath) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let fleet = fleet_flow_records();
+    fleet.records.len().hash(&mut h);
+    fleet.records.values().last().and_then(|v| v.get("hub_id")).and_then(|v| v.as_str()).hash(&mut h);
+    for (date, path) in flow_day_files(flows_dir) {
+        date.hash(&mut h);
+        let meta = std::fs::metadata(&path).ok();
+        meta.as_ref().map(|m| m.len()).hash(&mut h);
+        meta.and_then(|m| m.modified().ok()).hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Build the `/runs` list from these sources. Stamped when it begins, so its
+/// age counts the build. Blocking.
+fn build_runs_list(flows_dir: PathBuf, lab_dir: Option<PathBuf>, inputs: u64) -> BuiltRuns {
+    let (at, built_at_ms) = (std::time::SystemTime::now(), current_millis());
+    let fleet = fleet_flow_records();
+    RUNS_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let built = runs::build_runs_for_daemon(&flows_dir, lab_dir.as_deref(), &fleet.records);
+    let off = |s: &usage_sum::UsageSplit| wire::OffRowUsage { calls: s.calls, tokens: s.total };
+    BuiltRuns {
+        off_rows: (off(&built.usage.no_run), off(&built.usage.unlisted)),
+        rows: built.runs,
+        fleet_state: fleet.state,
+        sources: (flows_dir, lab_dir),
+        inputs,
+        at,
+        built_at_ms,
+    }
+}
+
+/// The `/runs` list for these sources: the last build while it is younger
+/// than [`RUNS_CACHE_TTL`] and read the same inputs, otherwise a new one.
+/// `None` when a build task failed, and for a TTL after, so a build that
+/// keeps failing is not retried by every waiting request in turn.
+async fn served_runs_list(flows_dir: PathBuf, lab_dir: Option<PathBuf>) -> Option<BuiltRuns> {
+    let mut slot = runs_cache().lock().await;
+    let sources = (flows_dir, lab_dir);
+    let now = std::time::SystemTime::now();
+    if slot.failed.as_ref().is_some_and(|(s, at)| *s == sources && wall_clock_cache_is_fresh(*at, now, RUNS_CACHE_TTL)) {
+        return None;
+    }
+    let dir = sources.0.clone();
+    let inputs = tokio::task::spawn_blocking(move || runs_inputs(&dir)).await.ok()?;
+    if let Some(built) = slot.built.as_ref() {
+        if built.sources == sources && built.inputs == inputs && wall_clock_cache_is_fresh(built.at, now, RUNS_CACHE_TTL) {
+            return Some(built.clone());
+        }
+    }
+    let (flows_dir, lab_dir) = sources.clone();
+    match tokio::task::spawn_blocking(move || build_runs_list(flows_dir, lab_dir, inputs)).await {
+        Ok(built) => {
+            slot.built = Some(built.clone());
+            slot.failed = None;
+            Some(built)
+        }
+        Err(e) => {
+            eprintln!("darkmux serve: GET /runs aggregation task failed ({e}); serving no rows");
+            slot.failed = Some((sources, std::time::SystemTime::now()));
+            None
+        }
+    }
+}
+
 /// GET /runs — the flat, kind-tagged, normalized run view-model (#1508 step
 /// 3): a READ-SIDE UNION over three existing sources — mission records
 /// (`/missions`'s own source), lab-bench runs (`/lab/runs`'s own scan), and
@@ -1877,44 +1990,60 @@ async fn missions_handler() -> axum::Json<wire::MissionsResponse> {
 /// this handler is a thin `spawn_blocking` + envelope wrapper, same shape
 /// as `missions_handler` above.
 ///
-/// Computed fresh per request — NO new persistence (sink-boundary contract
-/// #3 stays honored: this only READS across the lab/flow/crew boundary,
-/// never writes across it). Never a 500: `runs::build_runs` already
-/// degrades each source independently to zero contribution on failure
-/// (mirrors `missions_handler`'s `_ => Vec::new()`); the `unwrap_or_default`
-/// below covers only the outer `spawn_blocking` join itself panicking.
+/// Built at most once per [`RUNS_CACHE_TTL`] and held in memory only (#3428)
+/// — NO new persistence (sink-boundary contract #3 stays honored: this only
+/// READS across the lab/flow/crew boundary, never writes across it). Never a
+/// 500: `runs::build_runs` already degrades each source independently to
+/// zero contribution on failure (mirrors `missions_handler`'s
+/// `_ => Vec::new()`); a build or marking task that itself fails answers an
+/// empty list marked `unavailable`, never one that reads as an idle fleet.
 async fn runs_handler(State(state): State<AppState>) -> axum::Json<wire::RunsResponse> {
-    let flows_dir = state.flows_dir.clone();
-    let lab_dir = state.lab_dir.clone();
-    // (#1705) One blocking task: read the fleet stream, then build every
-    // row against local + fleet together.
-    let view = fleet_view::cached_view(&state).await.ok();
-    let result = tokio::task::spawn_blocking(move || {
-        let fleet = fleet_flow_records();
-        let built = runs::build_runs_for_daemon(&flows_dir, lab_dir.as_deref(), &fleet.records);
-        let off = |s: &usage_sum::UsageSplit| wire::OffRowUsage { calls: s.calls, tokens: s.total };
-        let off_rows = (off(&built.usage.no_run), off(&built.usage.unlisted));
-        let mut rows = built.runs;
-        let live = live_session_ids();
-        log_beat_read_once(live.is_none());
-        apply_not_reporting(&mut rows, view.as_ref(), live.as_ref());
-        (rows, off_rows, fleet.state)
-    })
-    .await;
-    let (runs, (no_run, unlisted), fleet_state) = result.unwrap_or_else(|e| {
-        // A join failure means NOTHING was aggregated — the empty array below
-        // is a total failure, not an idle fleet. Previously this was a bare
-        // `unwrap_or_default()`: silent on stderr and indistinguishable on the
-        // wire from "no runs".
-        eprintln!("darkmux serve: GET /runs aggregation task failed ({e}); serving no rows");
-        (Vec::new(), Default::default(), source_state::SourceState::Unavailable { detail: "the run aggregation failed" })
-    });
+    // (#1705) One build reads the fleet stream, then builds every row against
+    // local + fleet together. (#3428) Shared between requests for a TTL.
+    let built = served_runs_list(state.flows_dir.clone(), state.lab_dir.clone()).await;
+    let Some(built) = built else {
+        return failed_runs_response();
+    };
+    let BuiltRuns { mut rows, off_rows: (no_run, unlisted), fleet_state, built_at_ms, .. } = built;
+    // (#3428) The view and the live beats only mark running rows not
+    // reporting, so a board with none reads neither: a gather is every peer's
+    // card over the tailnet, a beat read a bounded hub connect.
+    let rows = if rows.iter().any(|r| r.status == runs::RunStatus::Running) {
+        let view = fleet_view::cached_view(&state).await.ok();
+        let marked = tokio::task::spawn_blocking(move || {
+            let live = live_session_ids();
+            log_beat_read_once(live.is_none());
+            apply_not_reporting(&mut rows, view.as_ref(), live.as_ref());
+            rows
+        })
+        .await;
+        let Ok(rows) = marked else {
+            eprintln!("darkmux serve: GET /runs not-reporting task failed; serving no rows");
+            return failed_runs_response();
+        };
+        rows
+    } else {
+        rows
+    };
     axum::Json(wire::RunsResponse {
-        runs,
+        runs: rows,
         no_run,
         unlisted,
-        generated_at_ms: current_millis(),
+        generated_at_ms: built_at_ms,
         meta: source_state::coverage_meta(&fleet_state),
+        policy: runs::runs_policy(),
+    })
+}
+
+/// `/runs` when its aggregation failed: NOTHING was aggregated, so the empty
+/// list is a total failure, not an idle fleet, and the coverage says so.
+fn failed_runs_response() -> axum::Json<wire::RunsResponse> {
+    axum::Json(wire::RunsResponse {
+        runs: Vec::new(),
+        no_run: Default::default(),
+        unlisted: Default::default(),
+        generated_at_ms: current_millis(),
+        meta: source_state::coverage_meta(&source_state::SourceState::Unavailable { detail: "the run aggregation failed" }),
         policy: runs::runs_policy(),
     })
 }
@@ -3519,9 +3648,24 @@ pub(crate) fn for_each_flow_record_across_days(
     flows_dir: &std::path::Path,
     mut visit: impl FnMut(&str, &serde_json::Value) -> std::ops::ControlFlow<()>,
 ) {
-    use std::io::BufRead;
+    for (date, path) in flow_day_files(flows_dir) {
+        let mut stop = false;
+        for_each_record_in_day_file(&path, |v| {
+            if !stop && visit(&date, v).is_break() {
+                stop = true;
+            }
+        });
+        if stop {
+            return;
+        }
+    }
+}
+
+/// The `YYYY-MM-DD.jsonl` day files in `flows_dir`, oldest first, so a
+/// visitor sees records in chronological order across days.
+fn flow_day_files(flows_dir: &std::path::Path) -> Vec<(String, std::path::PathBuf)> {
     let Ok(entries) = std::fs::read_dir(flows_dir) else {
-        return;
+        return Vec::new();
     };
     let mut day_files: Vec<(String, std::path::PathBuf)> = Vec::new();
     for entry in entries.flatten() {
@@ -3535,29 +3679,34 @@ pub(crate) fn for_each_flow_record_across_days(
         }
         day_files.push((date.to_string(), entry.path()));
     }
-    // Oldest-first → the visitor sees records in chronological order across days.
     day_files.sort_by(|a, b| a.0.cmp(&b.0));
-    for (date, path) in day_files {
-        let Ok(file) = std::fs::File::open(&path) else {
+    day_files
+}
+
+/// Each flow record in one day file, in order: blank lines, torn lines and the
+/// schema header skipped; an unreadable line ends the file. `false` when the
+/// file could not be opened or a line could not be read, so the records seen
+/// may not be all of it.
+fn for_each_record_in_day_file(path: &std::path::Path, mut visit: impl FnMut(&serde_json::Value)) -> bool {
+    use std::io::BufRead;
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    for line in std::io::BufReader::new(file).lines() {
+        let Ok(line) = line else { return false };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some(v) = darkmux_flow::reader::parse_value(line) else {
             continue;
         };
-        for line in std::io::BufReader::new(file).lines() {
-            let Ok(line) = line else { break };
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let Some(v) = darkmux_flow::reader::parse_value(line) else {
-                continue;
-            };
-            if v.get("_type").and_then(|t| t.as_str()) == Some("schema") {
-                continue;
-            }
-            if visit(&date, &v).is_break() {
-                return;
-            }
+        if v.get("_type").and_then(|t| t.as_str()) == Some("schema") {
+            continue;
         }
+        visit(&v);
     }
+    true
 }
 
 /// Like [`for_each_flow_record_across_days`] but bounded to the day files
@@ -3660,6 +3809,92 @@ async fn flow_missions_handler(State(state): State<AppState>) -> axum::Json<wire
     })
 }
 
+/// (#3428) How many day files the missions catalog has read: the instrument
+/// a test reads to prove a repeated scan re-reads only what changed.
+pub(crate) static MISSION_DAY_FILE_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One record's part in the missions catalog: what [`scan_flow_missions`]
+/// folds, and its identity (computed from the whole record, so the fleet
+/// de-dup still matches). Typed and with its repeated strings shared, since
+/// every mission record on the machine is held (#3428 review: a cut JSON value
+/// cost ~750 bytes a record, ~140 MB for the operator's 186k).
+struct MissionMark {
+    identity: RecordIdentity,
+    mission_id: std::sync::Arc<str>,
+    /// The record's `ts`, empty when it has none.
+    ts: Box<str>,
+    /// The execution a `dispatch.start` names.
+    dispatch: Option<Box<str>>,
+    /// The record's `machine_id`, when it names one.
+    machine: Option<std::sync::Arc<str>>,
+}
+
+/// The strings a day's marks share: each mission id and machine name once.
+#[derive(Default)]
+struct MarkStrings(std::collections::HashMap<String, std::sync::Arc<str>>);
+
+impl MarkStrings {
+    fn get(&mut self, s: &str) -> std::sync::Arc<str> {
+        if let Some(shared) = self.0.get(s) {
+            return shared.clone();
+        }
+        let shared: std::sync::Arc<str> = s.into();
+        self.0.insert(s.to_string(), shared.clone());
+        shared
+    }
+}
+
+impl MissionMark {
+    /// `None` for a record that names no mission.
+    fn of(v: &serde_json::Value, identity: RecordIdentity, strings: &mut MarkStrings) -> Option<Self> {
+        let mission_id = v.get("mission_id").and_then(|m| m.as_str()).filter(|m| !m.is_empty())?;
+        let dispatch = (darkmux_flow::reader::action_of(v) == Some(darkmux_flow::FlowAction::DispatchStart))
+            .then(|| darkmux_flow::reader::execution_id_of(v).map(|id| id.to_string().into_boxed_str()))
+            .flatten();
+        let machine = v.get("machine_id").and_then(|m| m.as_str()).filter(|m| !m.is_empty());
+        Some(Self {
+            identity,
+            mission_id: strings.get(mission_id),
+            ts: v.get("ts").and_then(|t| t.as_str()).unwrap_or("").into(),
+            dispatch,
+            machine: machine.map(|m| strings.get(m)),
+        })
+    }
+}
+
+/// One day file's [`MissionMark`]s, in file order. Kept per file while its
+/// length and modification time are unchanged: a past day's file never
+/// changes, so a scan re-reads only today's (#3428). A read that failed
+/// partway (the file could not be opened, or a line could not be read) is
+/// never kept, so the next scan tries again. Blocking.
+fn day_mission_records(path: &std::path::Path) -> std::sync::Arc<Vec<MissionMark>> {
+    type Marks = std::sync::Arc<Vec<MissionMark>>;
+    type Cache = std::collections::HashMap<std::path::PathBuf, (u64, Option<std::time::SystemTime>, Marks)>;
+    static CACHE: std::sync::Mutex<Option<Cache>> = std::sync::Mutex::new(None);
+    let stamp = std::fs::metadata(path).ok().map(|m| (m.len(), m.modified().ok()));
+    if let Some((len, modified)) = stamp {
+        let cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((l, m, marks)) = cache.as_ref().and_then(|c| c.get(path)) {
+            if (*l, *m) == (len, modified) {
+                return marks.clone();
+            }
+        }
+    }
+    MISSION_DAY_FILE_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut marks = Vec::new();
+    let mut strings = MarkStrings::default();
+    let whole = for_each_record_in_day_file(path, |v| {
+        marks.extend(MissionMark::of(v, RecordIdentity::of(v), &mut strings));
+    });
+    let marks: Marks = std::sync::Arc::new(marks);
+    // Stamped as read before the read, so a write during it reads again next time.
+    if let (true, Some((len, modified))) = (whole, stamp) {
+        let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        cache.get_or_insert_with(Cache::new).insert(path.to_path_buf(), (len, modified, marks.clone()));
+    }
+    marks
+}
+
 /// Roll every flow record up per `mission_id`, across the local day-files
 /// AND the fleet stream (#1705).
 ///
@@ -3692,15 +3927,9 @@ fn scan_flow_missions(
     let mut by_mission: HashMap<String, Agg> = HashMap::new();
 
     // The per-record fold, shared by both sources so they cannot drift.
-    let fold = |by_mission: &mut HashMap<String, Agg>, date: &str, v: &serde_json::Value| {
-        let Some(mid) = v.get("mission_id").and_then(|m| m.as_str()) else {
-            return;
-        };
-        if mid.is_empty() {
-            return;
-        }
-        let ts = v.get("ts").and_then(|t| t.as_str()).unwrap_or("");
-        let e = by_mission.entry(mid.to_string()).or_insert_with(|| Agg {
+    let fold = |by_mission: &mut HashMap<String, Agg>, date: &str, mark: &MissionMark| {
+        let ts = &*mark.ts;
+        let e = by_mission.entry(mark.mission_id.to_string()).or_insert_with(|| Agg {
             records: 0,
             dispatches: BTreeSet::new(),
             machines: BTreeSet::new(),
@@ -3724,19 +3953,14 @@ fn scan_flow_missions(
         if date > e.last_date.as_str() {
             e.last_date = date.to_string();
         }
-        if darkmux_flow::reader::action_of(v) == Some(darkmux_flow::FlowAction::DispatchStart) {
-            e.dispatches.extend(darkmux_flow::reader::execution_id_of(v).map(|id| id.to_string()));
-        }
-        if let Some(mach) = v.get("machine_id").and_then(|m| m.as_str()) {
-            if !mach.is_empty() {
-                e.machines.insert(mach.to_string());
-            }
-        }
+        e.dispatches.extend(mark.dispatch.as_deref().map(str::to_string));
+        e.machines.extend(mark.machine.as_deref().map(str::to_string));
     };
 
     // Fleet first — its records win the de-dup (see this function's doc).
     let mut fleet_seen: std::collections::HashSet<RecordIdentity> =
         std::collections::HashSet::with_capacity(fleet.len());
+    let mut fleet_strings = MarkStrings::default();
     for r in fleet.iter() {
         let v = r.value();
         // A fleet record carries no day-file to name it, so its date comes
@@ -3747,17 +3971,20 @@ fn scan_flow_missions(
             .map(|t| t.chars().take(10).collect::<String>())
             .unwrap_or_default();
         fleet_seen.insert(r.identity());
-        fold(&mut by_mission, &date, v);
+        if let Some(mark) = MissionMark::of(v, r.identity(), &mut fleet_strings) {
+            fold(&mut by_mission, &date, &mark);
+        }
     }
     // Then the local day-files, skipping anything the fleet already
     // supplied — this machine's own records are written to BOTH sinks.
-    for_each_flow_record_across_days(flows_dir, |date, v| {
-        if !fleet_seen.is_empty() && fleet_seen.contains(&RecordIdentity::of(v)) {
-            return std::ops::ControlFlow::Continue(());
-        }
-        fold(&mut by_mission, date, v);
-        std::ops::ControlFlow::Continue(())
-    });
+    // (#3428) Each day's mission records come from `day_mission_records`,
+    // which re-reads only a file that changed since the last scan.
+    for (date, path) in flow_day_files(flows_dir) {
+        day_mission_records(&path)
+            .iter()
+            .filter(|mark| !fleet_seen.contains(&mark.identity))
+            .for_each(|mark| fold(&mut by_mission, &date, mark));
+    }
 
     let mut out: Vec<wire::FlowMissionSummary> = by_mission
         .into_iter()
