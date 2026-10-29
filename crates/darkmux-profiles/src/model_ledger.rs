@@ -1560,6 +1560,53 @@ fn shrink_hint(rows: &[ModelRow], total_bytes: u64, limit: u64, unpriced_models:
 
 // ── gather (the I/O edge; every probe bounded) ──────────────────────────
 
+/// (#3428) How long a gathered `lms ls` catalog is reused. The catalog only
+/// changes when a model is downloaded or deleted, and a resident it doesn't
+/// name forces a fresh read anyway ([`catalog_is_fresh`]), so this bound only
+/// limits how long a deleted model's row lingers in it.
+const CATALOG_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Whether a catalog read at `at` can price this gather's residents: younger
+/// than [`CATALOG_TTL`] (a clock that went backwards reads as stale) and
+/// naming every resident's model key.
+fn catalog_is_fresh(
+    at: std::time::SystemTime,
+    now: std::time::SystemTime,
+    rows: &[serde_json::Value],
+    resident_keys: &[&str],
+) -> bool {
+    let young = now.duration_since(at).is_ok_and(|age| age < CATALOG_TTL);
+    young
+        && resident_keys
+            .iter()
+            .all(|k| rows.iter().any(|r| r.get("modelKey").and_then(|s| s.as_str()) == Some(*k)))
+}
+
+/// The `lms ls --json` rows for one gather: the last read from this `lms_bin`
+/// while [`catalog_is_fresh`] holds, otherwise a new read. Each `lms` call
+/// starts a large Node binary, and a daemon gathers the ledger on every
+/// viewer poll (#3428). A failed read is never cached, so the next gather
+/// tries again. Keyed by binary, so a test's stub never answers for another.
+fn catalog_rows(lms_bin: &str, resident_keys: &[&str], messages: &mut Vec<LedgerMessage>) -> Vec<serde_json::Value> {
+    type Cache = std::collections::HashMap<String, (std::time::SystemTime, Vec<serde_json::Value>)>;
+    static CACHE: std::sync::Mutex<Option<Cache>> = std::sync::Mutex::new(None);
+    let now = std::time::SystemTime::now();
+    let cached = CACHE.lock().ok().and_then(|guard| {
+        let (at, rows) = guard.as_ref()?.get(lms_bin)?;
+        catalog_is_fresh(*at, now, rows, resident_keys).then(|| rows.clone())
+    });
+    if let Some(rows) = cached {
+        return rows;
+    }
+    let Some(rows) = bounded_json_rows(lms_bin, &["ls", "--json"], "ls", messages) else {
+        return Vec::new();
+    };
+    if let Ok(mut guard) = CACHE.lock() {
+        guard.get_or_insert_with(Cache::new).insert(lms_bin.to_string(), (now, rows.clone()));
+    }
+    rows
+}
+
 /// Assemble the live ledger from the `lms` at `lms_bin`: `lms ps/ls --json`,
 /// per-model arch facts and kernel counters, all through bounded child runs
 /// (#1276 mechanics), then the pure [`compute_ledger`] — and stamp the
@@ -1573,11 +1620,11 @@ pub fn gather_with_bin(lms_bin: &str) -> ModelLedger {
     let mut messages = Vec::new();
 
     let ps_rows = bounded_json_rows(lms_bin, &["ps", "--json"], "ps", &mut messages);
-    let ls_rows =
-        bounded_json_rows(lms_bin, &["ls", "--json"], "ls", &mut messages).unwrap_or_default();
-
     let residents: Vec<ResidentInput> =
         ps_rows.iter().flatten().map(resident_from_ps_json).collect();
+    let resident_keys: Vec<&str> = residents.iter().map(|r| r.model_key.as_str()).collect();
+    let ls_rows = catalog_rows(lms_bin, &resident_keys, &mut messages);
+
     let catalog: Vec<CatalogFact> = ls_rows
         .iter()
         .filter_map(|v| {
@@ -3394,6 +3441,67 @@ mod tests {
         assert_eq!(v["models"][0]["owner"], "darkmux");
         let back: ModelLedger = serde_json::from_value(v).expect("round-trips");
         assert_eq!(back, ledger);
+    }
+
+    /// (#3428) The catalog (`lms ls`) only changes when a model is downloaded,
+    /// so a daemon polling the ledger reuses it: a second gather runs `ps`
+    /// again but not `ls`. A resident the cached catalog doesn't name (a model
+    /// downloaded and loaded since) makes the next gather read `ls` again, so
+    /// a cached catalog never leaves a resident unpriced.
+    #[cfg(unix)]
+    #[test]
+    fn the_catalog_is_reused_until_a_resident_is_missing_from_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let resident = tmp.path().join("resident");
+        let ls_calls = tmp.path().join("ls-calls");
+        std::fs::write(&resident, "m").unwrap();
+        let bin = tmp.path().join("lms");
+        std::fs::write(
+            &bin,
+            format!(
+                r#"#!/bin/sh
+key=$(cat '{resident}')
+case "$1" in
+  ps) echo "[{{\"identifier\":\"darkmux:$key\",\"modelKey\":\"$key\",\"status\":\"idle\",\"sizeBytes\":1000000000,\"contextLength\":4096}}]" ;;
+  ls) echo x >> '{ls_calls}'; echo "[{{\"modelKey\":\"$key\",\"sizeBytes\":1000000000,\"type\":\"llm\"}}]" ;;
+  *) exit 1 ;;
+esac
+"#,
+                resident = resident.display(),
+                ls_calls = ls_calls.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bin = bin.to_string_lossy().into_owned();
+        let ls_count = || std::fs::read_to_string(&ls_calls).map(|s| s.lines().count()).unwrap_or(0);
+
+        let first = gather_with_bin(&bin);
+        let second = gather_with_bin(&bin);
+        assert_eq!(ls_count(), 1, "the second gather reuses the catalog");
+        assert_eq!(second.models.len(), 1);
+        assert_eq!(first.models, second.models, "the reused catalog prices the resident the same");
+
+        std::fs::write(&resident, "n").unwrap();
+        let third = gather_with_bin(&bin);
+        assert_eq!(ls_count(), 2, "a resident missing from the catalog reads `ls` again");
+        assert_eq!(third.models[0].model_key, "n");
+    }
+
+    /// (#3428) The catalog's age bound: a catalog naming every resident is
+    /// reused only within [`CATALOG_TTL`], and never across a clock that went
+    /// backwards.
+    #[test]
+    fn a_catalog_is_fresh_only_within_its_ttl() {
+        let at = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let rows = vec![serde_json::json!({"modelKey": "m"})];
+        let fresh = |now, keys: &[&str]| catalog_is_fresh(at, now, &rows, keys);
+        assert!(fresh(at + CATALOG_TTL - std::time::Duration::from_secs(1), &["m"]));
+        assert!(!fresh(at + CATALOG_TTL, &["m"]), "stale at the TTL");
+        assert!(!fresh(at - std::time::Duration::from_secs(1), &["m"]), "a clock that went back is stale");
+        assert!(!fresh(at, &["m", "other"]), "a resident it doesn't name");
+        assert!(fresh(at, &[]), "no residents: any fresh catalog will do");
     }
 
     /// The one gather test: a nonexistent lms binary — every probe degrades

@@ -2823,17 +2823,52 @@ fn tail_lab_events(dir: &StdPath, offset: u64) -> wire::LabRunEventsResponse {
 /// The engine's `loaded()` is sync (subprocess invocation), so it runs on
 /// the blocking pool to keep the axum executor free.
 async fn machine_status_handler() -> axum::Json<wire::MachineStatusResponse> {
-    let result = tokio::task::spawn_blocking(local_engine_residents).await;
-    let r = result.unwrap_or_else(|_| EngineResidents::panicked());
+    let result = tokio::task::spawn_blocking(served_engine_residents).await;
+    let (r, read_at_ms) = result.unwrap_or_else(|_| (EngineResidents::panicked(), current_millis()));
     axum::Json(wire::MachineStatusResponse {
         lms_unreachable: r.unknown.is_some(),
         models: r.models,
         engine: r.engine,
-        generated_at_ms: current_millis(),
+        generated_at_ms: read_at_ms,
     })
 }
 
+/// (#3428) How long the daemon reuses one residents read. Each read spawns
+/// `lms ps` (a large Node binary), and the card that every peer's fleet view
+/// reads about every 5s embeds one, so without this an idle fleet kept every
+/// machine spawning `lms`. A model loaded or unloaded shows within this bound.
+pub(crate) const SERVED_RESIDENTS_TTL: Duration = Duration::from_secs(10);
+
+/// (#3428) This machine's residents as the daemon serves them: one
+/// [`local_engine_residents`] read shared by `/machine/status`,
+/// `/machine/specs` and the machine card, reused for
+/// [`SERVED_RESIDENTS_TTL`], with the time it was read (epoch ms). Keyed by
+/// the engine setting and the `lms` binary, so a changed setting reads
+/// afresh. Single-flight: the lock is held across the read, so a burst on a
+/// stale slot costs one. Blocking. Wall-clock time, so a daemon that slept
+/// does not serve a pre-sleep read as fresh.
+pub(crate) fn served_engine_residents() -> (EngineResidents, u64) {
+    type Slot = Option<(String, std::time::SystemTime, u64, EngineResidents)>;
+    static SLOT: std::sync::Mutex<Slot> = std::sync::Mutex::new(None);
+    let key = format!(
+        "{}\0{}",
+        darkmux_types::config_access::default_engine(),
+        darkmux_types::config_access::lms_bin()
+    );
+    let mut slot = SLOT.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((k, at, read_at_ms, residents)) = slot.as_ref() {
+        if *k == key && wall_clock_cache_is_fresh(*at, std::time::SystemTime::now(), SERVED_RESIDENTS_TTL) {
+            return (residents.clone(), *read_at_ms);
+        }
+    }
+    let residents = local_engine_residents();
+    let read_at_ms = current_millis();
+    *slot = Some((key, std::time::SystemTime::now(), read_at_ms, residents.clone()));
+    (residents, read_at_ms)
+}
+
 /// (#316) This machine's engine and what it holds.
+#[derive(Clone)]
 pub struct EngineResidents {
     pub engine: wire::MachineEngine,
     pub models: Vec<darkmux_types::LoadedModel>,
@@ -2880,8 +2915,10 @@ pub fn local_engine_residents() -> EngineResidents {
 /// (#1286) GET /machine/resources cache TTL. Computed on request with a short
 /// in-process cache so a phone-viewer poll burst costs ONE gather; the TTL
 /// is recorded in the payload (`cache_ttl_ms`) per the observer-effect
-/// constraint — cadence is a visible knob, never adaptive-silent.
-const MACHINE_RESOURCES_CACHE_TTL: Duration = Duration::from_secs(2);
+/// constraint — cadence is a visible knob, never adaptive-silent. (#3428)
+/// 10s, longer than the viewer's 3s poll: each gather spawns `lms ps`, and a
+/// 2s TTL let every poll pay one. The `load` block stays per-request.
+const MACHINE_RESOURCES_CACHE_TTL: Duration = Duration::from_secs(10);
 /// (#2479 audit — not in the original MUST FIX list, found during the audit
 /// enumeration and fixed for the same reason as [`FleetCache`]) `SystemTime`,
 /// deliberately not `Instant`: this cache's freshness gate is the same
@@ -2929,7 +2966,7 @@ fn machine_resources_cached_fresh() -> Option<darkmux_profiles::model_ledger::Mo
 /// (#2107, #1833, #2108) The host sampler's `load` block — `now`/`window` in
 /// host-sample-shape v2, see `host_sampler`'s own doc — is read AFTER the
 /// ledger cache lookup and never cached itself: the ledger gather is the
-/// expensive shelled-out part worth a 2s cache; the ring read underneath
+/// expensive shelled-out part worth a 10s cache; the ring read underneath
 /// `load` is a mutex lock plus arithmetic, cheap enough to be freshest-possible
 /// on every request rather than inheriting the ledger's cache staleness.
 /// Absent (no `load` key at all) when the sampler hasn't produced a sample
@@ -2987,7 +3024,7 @@ async fn machine_resources_handler(
 /// command. (#275 PR-A)
 async fn machine_specs_handler() -> axum::Json<wire::MachineSpecsResponse> {
     // Shell-out probes run off the async runtime.
-    let specs = tokio::task::spawn_blocking(gather_specs)
+    let specs = tokio::task::spawn_blocking(gather_served_specs)
         .await
         .unwrap_or_else(|_| degraded_specs());
     axum::Json(specs)
@@ -3015,14 +3052,24 @@ fn degraded_specs() -> wire::MachineSpecsResponse {
     }
 }
 
-/// The spec sheet `/machine/specs` serves and the machine card embeds: the
-/// ONE gather. Blocking (it shells out); each probe is independent, so one
-/// failure never cascades.
+/// The spec sheet with a fresh residents read. Blocking.
 pub(crate) fn gather_specs() -> wire::MachineSpecsResponse {
-    let residents = local_engine_residents();
+    gather_specs_from(local_engine_residents())
+}
+
+/// The spec sheet as the daemon serves it, on its shared residents read
+/// ([`served_engine_residents`], #3428). Blocking.
+pub(crate) fn gather_served_specs() -> wire::MachineSpecsResponse {
+    gather_specs_from(served_engine_residents().0)
+}
+
+/// The spec sheet `/machine/specs` serves and the machine card embeds: the
+/// ONE gather, around a residents read. Blocking (it shells out); each probe
+/// is independent, so one failure never cascades.
+pub(crate) fn gather_specs_from(residents: EngineResidents) -> wire::MachineSpecsResponse {
     let (engine, loaded_models, lms_unreachable) = (residents.engine, residents.models, residents.unknown.is_some());
     let ram_total = darkmux_hardware::ram_installed_bytes();
-    let ram_free = read_ram_free_for_ai_bytes();
+    let ram_free = darkmux_doctor::ai_headroom_bytes_with(&loaded_models);
     let cpu_brand = darkmux_hardware::cpu_brand().map(str::to_string);
     let machine_id = darkmux_flow::resolve_machine_id();
     // (#2814) The stable HARDWARE identity beside the NAME. `machine_id` is a
@@ -3090,15 +3137,6 @@ pub fn local_utility_model(loaded_models: &[darkmux_types::LoadedModel]) -> Opti
 fn utility_model(id: &str, n_ctx: Option<u32>, loaded_models: &[darkmux_types::LoadedModel]) -> wire::UtilityModel {
     let loaded = loaded_models.iter().any(|m| m.identifier == id || m.model == id);
     wire::UtilityModel { id: id.to_string(), loaded, n_ctx }
-}
-
-/// Read the AI-available RAM ceiling in bytes — the same "real
-/// headroom" doctor reports, expressed in bytes for JSON precision.
-/// Wraps doctor's existing `reclaimable + resident − safety_margin`
-/// computation. Returns `None` on non-macOS (today's doctor is
-/// macOS-shaped).
-fn read_ram_free_for_ai_bytes() -> Option<u64> {
-    darkmux_doctor::ai_headroom_bytes()
 }
 
 /// GET /flow/:date/stream — SSE-tails new flow records for a UTC day.

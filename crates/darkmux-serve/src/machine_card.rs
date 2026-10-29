@@ -574,7 +574,7 @@ pub(crate) fn stated_work_version() -> String {
 /// This machine's card. Blocking: the specs gather shells out.
 pub(crate) fn gather_local_card() -> MachineCard {
     let started = std::time::Instant::now();
-    let specs = crate::gather_specs();
+    let specs = crate::gather_served_specs();
     let (profiles, default_profile, utility, profiles_error) = match darkmux_profiles::profiles::load_registry(None) {
         Ok(loaded) => {
             let profiles = card_profiles(&loaded.registry);

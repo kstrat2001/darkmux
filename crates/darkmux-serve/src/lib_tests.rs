@@ -977,6 +977,56 @@
         assert_eq!(failed["models"], serde_json::json!([]), "{failed}");
     }
 
+    /// (#3428) The daemon's residents read is shared and kept for
+    /// [`SERVED_RESIDENTS_TTL`]: `/machine/status`, `/machine/specs` and the
+    /// machine card (every peer's fleet view reads it about every 5s) cost
+    /// one `lms ps` between them, not one each. `generated_at_ms` is when that
+    /// read happened, so a cached answer says how old it is.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_machine_routes_and_the_card_share_one_residents_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let calls = tmp.path().join("ps-calls");
+        let bin = tmp.path().join("lms");
+        fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = ps ] || exit 1\necho x >> '{}'\necho '[{{\"identifier\":\"darkmux:m\",\"modelKey\":\"m\",\"status\":\"idle\",\"sizeBytes\":1000000000,\"contextLength\":4096}}]'\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        let prev = std::env::var_os("DARKMUX_LMS_BIN");
+        // SAFETY: #[serial]; restored below.
+        unsafe { std::env::set_var("DARKMUX_LMS_BIN", &bin) };
+        let get = |uri: &'static str| async move {
+            let response = build_router_local(PathBuf::new())
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        let status = get("/machine/status").await;
+        let specs = get("/machine/specs").await;
+        let card = tokio::task::spawn_blocking(crate::machine_card::gather_local_card).await.unwrap();
+        let again = get("/machine/status").await;
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
+                None => std::env::remove_var("DARKMUX_LMS_BIN"),
+            }
+        }
+        let ps_calls = fs::read_to_string(&calls).map(|s| s.lines().count()).unwrap_or(0);
+        assert_eq!(ps_calls, 1, "one `lms ps` for every read inside the TTL");
+        assert_eq!(status["models"][0]["identifier"], "darkmux:m", "{status}");
+        assert_eq!(specs["loaded_models"][0]["identifier"], "darkmux:m", "{specs}");
+        assert_eq!(card.specs.loaded_models.len(), 1);
+        assert_eq!(again["generated_at_ms"], status["generated_at_ms"], "a cached answer keeps its read time");
+    }
+
     /// (#316 stage 3.2) The spec sheet's `loaded_models` is what `lms ps`
     /// reports, and an `lms` that cannot run is `lms_unreachable`.
     #[test]
@@ -1122,7 +1172,9 @@
             json["messages"].as_array().is_some_and(|w| !w.is_empty()),
             "missing-lms probes must surface as messages: {json}"
         );
-        assert_eq!(json["cache_ttl_ms"].as_u64(), Some(2_000));
+        // (#3428) At least the viewer's 3s poll, so an open drawer costs one
+        // gather per 10s rather than one per poll.
+        assert_eq!(json["cache_ttl_ms"].as_u64(), Some(10_000));
     }
 
     /// (#316 stage 3.6) GET /machine/resources is the local engine's ledger:
