@@ -7,7 +7,7 @@
 //! A card states facts and never infers them. Each block is read from the
 //! thing that owns the fact:
 //!
-//! - identity, hardware, loaded and utility models: [`crate::gather_specs`],
+//! - identity, hardware, loaded and utility models: [`crate::gather_served_specs`],
 //!   the same gather `/machine/specs` serves (the card embeds its type);
 //! - profiles and their endpoint kind: the profile registry, through
 //!   `ProfileModel::endpoint_kind`, the classification every dispatch,
@@ -574,7 +574,7 @@ pub(crate) fn stated_work_version() -> String {
 /// This machine's card. Blocking: the specs gather shells out.
 pub(crate) fn gather_local_card() -> MachineCard {
     let started = std::time::Instant::now();
-    let specs = crate::gather_specs();
+    let specs = crate::gather_served_specs();
     let (profiles, default_profile, utility, profiles_error) = match darkmux_profiles::profiles::load_registry(None) {
         Ok(loaded) => {
             let profiles = card_profiles(&loaded.registry);
