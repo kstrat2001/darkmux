@@ -3412,6 +3412,89 @@
         assert_eq!(super::stamp_hub_id_line("not json", Some("1-0")), "not json");
     }
 
+    /// The SSE tail's parse of one `XREAD` reply: every entry advances the
+    /// cursor, a record of another day and an entry with no record field
+    /// included; only the day's records come back, each with its hub id;
+    /// shapes that are not blocks or entries are skipped.
+    #[test]
+    fn an_xread_reply_parses_to_the_days_lines_and_the_next_cursor() {
+        use redis::Value::{Array, BulkString, Int, Nil, SimpleString};
+        let no_record = Array(vec![BulkString(b"3000-0".to_vec()), Int(7)]);
+        let block = Array(vec![
+            BulkString(b"darkmux:flow".to_vec()),
+            Array(vec![
+                xentry(1000, "2026-05-14T09:00:00Z"),
+                Int(1),
+                Array(vec![BulkString(b"lonely".to_vec())]),
+                xentry(2000, "2026-05-13T23:59:59Z"),
+                no_record,
+            ]),
+        ]);
+        let reply = Array(vec![Int(0), Array(vec![BulkString(b"short".to_vec())]), block]);
+        let (lines, cursor) = super::parse_xread_reply(reply, "500-0", "2026-05-14").unwrap();
+        assert_eq!(cursor, "3000-0");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let v: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(v["hub_id"], "1000-0");
+
+        // A BLOCK timeout: nothing new, the cursor stays.
+        let (lines, cursor) = super::parse_xread_reply(Nil, "500-0", "2026-05-14").unwrap();
+        assert!(lines.is_empty());
+        assert_eq!(cursor, "500-0");
+        assert!(super::parse_xread_reply(SimpleString("OK".into()), "500-0", "2026-05-14").is_err());
+    }
+
+    fn runs_sources(dir: &str) -> (std::path::PathBuf, Option<std::path::PathBuf>) {
+        (std::path::PathBuf::from(dir), None)
+    }
+
+    fn built_runs(sources: &(std::path::PathBuf, Option<std::path::PathBuf>), inputs: u64, at: std::time::SystemTime) -> super::BuiltRuns {
+        super::BuiltRuns {
+            sources: sources.clone(),
+            inputs,
+            at,
+            built_at_ms: 0,
+            rows: Vec::new(),
+            off_rows: Default::default(),
+            fleet_state: super::source_state::SourceState::Ok,
+        }
+    }
+
+    /// (#3428) A `/runs` build is served again only for the same sources and
+    /// inputs, and only inside [`RUNS_CACHE_TTL`] of when it was built.
+    #[test]
+    fn a_runs_build_is_reused_only_for_its_sources_and_inputs_inside_the_ttl() {
+        let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let (a, b) = (runs_sources("/a"), runs_sources("/b"));
+        let mut cache = super::RunsCache::default();
+        assert!(cache.fresh(&a, 1, at).is_none(), "nothing built yet");
+        cache.record(a.clone(), Ok(built_runs(&a, 1, at)), at);
+        let just_inside = at + super::RUNS_CACHE_TTL - Duration::from_millis(1);
+        assert!(cache.fresh(&a, 1, just_inside).is_some());
+        assert!(cache.fresh(&a, 2, at).is_none(), "new inputs");
+        assert!(cache.fresh(&b, 1, at).is_none(), "other sources");
+        assert!(cache.fresh(&a, 1, at + super::RUNS_CACHE_TTL).is_none(), "past the TTL");
+    }
+
+    /// (#3428) A failed `/runs` build is not retried by every waiting request:
+    /// those for the same sources back off for [`RUNS_CACHE_TTL`] from when it
+    /// failed, and a later good build ends the backoff.
+    #[test]
+    fn a_failed_runs_build_backs_off_its_sources_for_the_ttl() {
+        let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let (a, b) = (runs_sources("/a"), runs_sources("/b"));
+        let mut cache = super::RunsCache::default();
+        assert!(!cache.backing_off(&a, at));
+        assert!(cache.record(a.clone(), Err("a panicked build".into()), at).is_none());
+        assert!(cache.backing_off(&a, at + super::RUNS_CACHE_TTL - Duration::from_millis(1)));
+        assert!(!cache.backing_off(&a, at + super::RUNS_CACHE_TTL), "past the TTL");
+        assert!(!cache.backing_off(&b, at), "other sources");
+        let later = at + Duration::from_millis(1);
+        assert!(cache.record(a.clone(), Ok(built_runs(&a, 1, later)), later).is_some());
+        assert!(!cache.backing_off(&a, later), "a good build ends the backoff");
+        assert!(cache.fresh(&a, 1, later).is_some());
+    }
+
     fn xentry(ms: u64, ts: &str) -> redis::Value {
         redis::Value::Array(vec![
             redis::Value::BulkString(format!("{ms}-0").into_bytes()),
