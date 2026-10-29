@@ -5023,6 +5023,112 @@
                 assert_eq!(values(&next), fresh(&redis.url, FleetScope::Work));
             }
 
+            /// (#3431) A day served from the window is what a fresh day read
+            /// of the hub returns: the same records in the same order, the
+            /// samples merged in, the other day's records left out, and the
+            /// same cut, bounded or not. The fixture straddles a midnight at a
+            /// fixed time; nothing here reads the clock but the cache's `at`.
+            #[test]
+            #[serial]
+            fn a_day_from_the_window_equals_a_fresh_day_read_of_the_hub() {
+                if !redis_server_available() {
+                    eprintln!("skipping: redis-server not on PATH");
+                    return;
+                }
+                let redis = spawn_redis();
+                // 2026-10-28T00:05:00Z: forty records 15s apart span 23:55 to 00:05.
+                let base = 1_793_145_900;
+                let work = fleet_fixture::realistic_records(40, base);
+                let sample = |i: u64| serde_json::json!({ "ts": fleet_fixture::iso(base - 600 + i * 60), "action": "machine.telemetry", "machine_uid": "UID-STUDIO", "payload": { "cpu_pct": i } });
+                // Hub ids at each record's own time, so the cut is decided by
+                // the fixture, not by when the test runs.
+                let id_of = |r: &serde_json::Value, seq: usize| {
+                    let ts = r["ts"].as_str().unwrap();
+                    let secs = darkmux_flow::parse_ts_utc(ts).unwrap();
+                    format!("{}-{seq}", secs * 1000)
+                };
+                // A stream id only grows, so a record stamped earlier than the
+                // one before it takes that one's millisecond.
+                let mut last_ms = 0u64;
+                for (i, r) in work.iter().enumerate() {
+                    let ms: u64 = id_of(r, 0).trim_end_matches("-0").parse().unwrap();
+                    last_ms = last_ms.max(ms);
+                    xadd_with_id(&redis.url, WORK_STREAM, &format!("{last_ms}-{i}"), r);
+                }
+                for i in 0..10 {
+                    let s = sample(i);
+                    xadd_with_id(&redis.url, TELEMETRY_STREAM, &id_of(&s, 0), &s);
+                }
+                let caches = FleetCaches::default();
+                let t0 = SystemTime::now();
+                let both = read_at(&caches, &redis.url, FleetScope::WithSamples, t0);
+                let work_only = read_at(&caches, &redis.url, FleetScope::Work, t0);
+                for maxlen in ["0", "5"] {
+                    unsafe { std::env::set_var("DARKMUX_REDIS_MAXLEN", maxlen) };
+                    for date in ["2026-10-27", "2026-10-28", "2026-10-29"] {
+                        let want = super::super::read_flow_records_from_redis(&redis.url, Some(date), FleetScope::WithSamples)
+                            .expect("fresh day read");
+                        let got = super::super::fleet_day_records(date, &both.records, &work_only.records);
+                        assert_eq!(got.records, want.records, "{date}, maxlen {maxlen}");
+                        assert_eq!(got.cut, want.cut, "{date}, maxlen {maxlen}");
+                    }
+                }
+                unsafe { std::env::remove_var("DARKMUX_REDIS_MAXLEN") };
+                // Under the 5-entry bound the stream starts inside 10-27, so
+                // 10-27 may be cut and 10-28 (which it holds from midnight) is not.
+                unsafe { std::env::set_var("DARKMUX_REDIS_MAXLEN", "5") };
+                let cut = |date| super::super::fleet_day_records(date, &both.records, &work_only.records).cut;
+                assert_eq!((cut("2026-10-27"), cut("2026-10-28")), (true, false));
+                unsafe { std::env::remove_var("DARKMUX_REDIS_MAXLEN") };
+                let day = super::super::fleet_day_records("2026-10-28", &both.records, &work_only.records);
+                assert!(day.records.iter().any(|r| r["action"] == "machine.telemetry"), "the day's samples are in it");
+                assert!(day.records.len() < 50, "the other day's records are not");
+            }
+
+            /// (#3431) `GET /flow/<date>` reads the hub through the shared
+            /// window: a second request inside the cache window asks the hub
+            /// for nothing, where each request used to `XREVRANGE` the whole
+            /// of both streams (~20 MB a call on the operator's hub).
+            #[tokio::test]
+            #[serial]
+            async fn a_repeated_day_request_does_not_read_the_hubs_window_again() {
+                if !redis_server_available() {
+                    eprintln!("skipping: redis-server not on PATH");
+                    return;
+                }
+                let redis = spawn_redis();
+                let now = now_secs();
+                xadd_all(&redis.url, WORK_STREAM, &fleet_fixture::realistic_records(20, now));
+                let xrevranges = || -> u64 {
+                    let info: String = redis::cmd("INFO").arg("commandstats").query(&mut conn(&redis.url)).unwrap();
+                    info.lines()
+                        .find_map(|l| l.strip_prefix("cmdstat_xrevrange:calls="))
+                        .and_then(|rest| rest.split(',').next())
+                        .and_then(|n| n.parse().ok())
+                        .unwrap_or(0)
+                };
+                let date = &fleet_fixture::iso(now)[..10];
+                unsafe { std::env::set_var("DARKMUX_REDIS_URL", &redis.url) };
+                let tmp = TempDir::new().unwrap();
+                let get = || async {
+                    let response = build_router_local(tmp.path().to_path_buf())
+                        .oneshot(Request::builder().uri(format!("/flow/{date}")).body(Body::empty()).unwrap())
+                        .await
+                        .unwrap();
+                    let bytes = to_bytes(response.into_body(), 16 * 1024 * 1024).await.unwrap();
+                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+                };
+                let first = get().await;
+                let before = xrevranges();
+                let second = get().await;
+                let after = xrevranges();
+                unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
+                assert_eq!(after - before, 0, "the second request asked the hub for its whole window");
+                assert_eq!(first["meta"]["coverage"], second["meta"]["coverage"]);
+                assert_eq!(first["records"], second["records"]);
+                assert!(first["count"].as_u64().is_some_and(|n| n > 0), "{first}");
+            }
+
             /// (b) The same for the telemetry stream a dispatch replay reads
             /// beside the work stream, merged in hub order.
             #[test]
