@@ -1869,6 +1869,77 @@ async fn missions_handler() -> axum::Json<wire::MissionsResponse> {
     axum::Json(wire::MissionsResponse { missions, generated_at_ms: current_millis() })
 }
 
+/// (#3428) How many times this process has built the `/runs` list: the
+/// instrument a test reads to prove requests share a build.
+pub(crate) static RUNS_BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// (#3428) How long one build of the `/runs` list is served. A build costs
+/// seconds on a busy machine (a 14-day fold of the flow records, every
+/// mission and lab run), and every open viewer polls the route every 5s, so
+/// one viewer or many cost one build per TTL. A new run, or a run's change
+/// of status, shows within this bound; `generated_at_ms` is the build's own
+/// time, so a served copy says how old it is. A named constant, not adaptive.
+const RUNS_CACHE_TTL: Duration = Duration::from_secs(10);
+
+/// One build of the `/runs` list, before the per-request not-reporting
+/// marks (which read live presence), and the sources it was built from.
+#[derive(Clone)]
+struct BuiltRuns {
+    sources: (PathBuf, Option<PathBuf>),
+    at: std::time::SystemTime,
+    built_at_ms: u64,
+    rows: Vec<runs::Run>,
+    off_rows: (wire::OffRowUsage, wire::OffRowUsage),
+    fleet_state: source_state::SourceState,
+}
+
+/// The process's last `/runs` build. An async lock held across a build, so
+/// requests arriving during one wait for it instead of starting their own.
+fn runs_cache() -> &'static tokio::sync::Mutex<Option<BuiltRuns>> {
+    static CACHE: std::sync::OnceLock<tokio::sync::Mutex<Option<BuiltRuns>>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| tokio::sync::Mutex::new(None))
+}
+
+/// Build the `/runs` list from these sources. Blocking.
+fn build_runs_list(flows_dir: PathBuf, lab_dir: Option<PathBuf>) -> BuiltRuns {
+    let fleet = fleet_flow_records();
+    RUNS_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let built = runs::build_runs_for_daemon(&flows_dir, lab_dir.as_deref(), &fleet.records);
+    let off = |s: &usage_sum::UsageSplit| wire::OffRowUsage { calls: s.calls, tokens: s.total };
+    BuiltRuns {
+        off_rows: (off(&built.usage.no_run), off(&built.usage.unlisted)),
+        rows: built.runs,
+        fleet_state: fleet.state,
+        sources: (flows_dir, lab_dir),
+        at: std::time::SystemTime::now(),
+        built_at_ms: current_millis(),
+    }
+}
+
+/// The `/runs` list for these sources: the last build while it is younger
+/// than [`RUNS_CACHE_TTL`], otherwise a new one. `None` when the build task
+/// failed (never kept).
+async fn served_runs_list(flows_dir: PathBuf, lab_dir: Option<PathBuf>) -> Option<BuiltRuns> {
+    let mut slot = runs_cache().lock().await;
+    let sources = (flows_dir, lab_dir);
+    if let Some(built) = slot.as_ref() {
+        if built.sources == sources && wall_clock_cache_is_fresh(built.at, std::time::SystemTime::now(), RUNS_CACHE_TTL) {
+            return Some(built.clone());
+        }
+    }
+    let (flows_dir, lab_dir) = sources;
+    match tokio::task::spawn_blocking(move || build_runs_list(flows_dir, lab_dir)).await {
+        Ok(built) => {
+            *slot = Some(built.clone());
+            Some(built)
+        }
+        Err(e) => {
+            eprintln!("darkmux serve: GET /runs aggregation task failed ({e}); serving no rows");
+            None
+        }
+    }
+}
+
 /// GET /runs — the flat, kind-tagged, normalized run view-model (#1508 step
 /// 3): a READ-SIDE UNION over three existing sources — mission records
 /// (`/missions`'s own source), lab-bench runs (`/lab/runs`'s own scan), and
@@ -1877,44 +1948,52 @@ async fn missions_handler() -> axum::Json<wire::MissionsResponse> {
 /// this handler is a thin `spawn_blocking` + envelope wrapper, same shape
 /// as `missions_handler` above.
 ///
-/// Computed fresh per request — NO new persistence (sink-boundary contract
-/// #3 stays honored: this only READS across the lab/flow/crew boundary,
-/// never writes across it). Never a 500: `runs::build_runs` already
-/// degrades each source independently to zero contribution on failure
-/// (mirrors `missions_handler`'s `_ => Vec::new()`); the `unwrap_or_default`
-/// below covers only the outer `spawn_blocking` join itself panicking.
+/// Built at most once per [`RUNS_CACHE_TTL`] and held in memory only (#3428)
+/// — NO new persistence (sink-boundary contract #3 stays honored: this only
+/// READS across the lab/flow/crew boundary, never writes across it). Never a
+/// 500: `runs::build_runs` already degrades each source independently to
+/// zero contribution on failure (mirrors `missions_handler`'s
+/// `_ => Vec::new()`); a build or marking task that itself fails answers an
+/// empty list marked `unavailable`, never one that reads as an idle fleet.
 async fn runs_handler(State(state): State<AppState>) -> axum::Json<wire::RunsResponse> {
-    let flows_dir = state.flows_dir.clone();
-    let lab_dir = state.lab_dir.clone();
-    // (#1705) One blocking task: read the fleet stream, then build every
-    // row against local + fleet together.
+    // (#1705) One build reads the fleet stream, then builds every row against
+    // local + fleet together. (#3428) Shared between requests for a TTL.
     let view = fleet_view::cached_view(&state).await.ok();
-    let result = tokio::task::spawn_blocking(move || {
-        let fleet = fleet_flow_records();
-        let built = runs::build_runs_for_daemon(&flows_dir, lab_dir.as_deref(), &fleet.records);
-        let off = |s: &usage_sum::UsageSplit| wire::OffRowUsage { calls: s.calls, tokens: s.total };
-        let off_rows = (off(&built.usage.no_run), off(&built.usage.unlisted));
-        let mut rows = built.runs;
+    let built = served_runs_list(state.flows_dir.clone(), state.lab_dir.clone()).await;
+    let Some(built) = built else {
+        return failed_runs_response();
+    };
+    let BuiltRuns { mut rows, off_rows: (no_run, unlisted), fleet_state, built_at_ms, .. } = built;
+    let marked = tokio::task::spawn_blocking(move || {
         let live = live_session_ids();
         log_beat_read_once(live.is_none());
         apply_not_reporting(&mut rows, view.as_ref(), live.as_ref());
-        (rows, off_rows, fleet.state)
+        rows
     })
     .await;
-    let (runs, (no_run, unlisted), fleet_state) = result.unwrap_or_else(|e| {
-        // A join failure means NOTHING was aggregated — the empty array below
-        // is a total failure, not an idle fleet. Previously this was a bare
-        // `unwrap_or_default()`: silent on stderr and indistinguishable on the
-        // wire from "no runs".
-        eprintln!("darkmux serve: GET /runs aggregation task failed ({e}); serving no rows");
-        (Vec::new(), Default::default(), source_state::SourceState::Unavailable { detail: "the run aggregation failed" })
-    });
+    let Ok(rows) = marked else {
+        eprintln!("darkmux serve: GET /runs not-reporting task failed; serving no rows");
+        return failed_runs_response();
+    };
     axum::Json(wire::RunsResponse {
-        runs,
+        runs: rows,
         no_run,
         unlisted,
-        generated_at_ms: current_millis(),
+        generated_at_ms: built_at_ms,
         meta: source_state::coverage_meta(&fleet_state),
+        policy: runs::runs_policy(),
+    })
+}
+
+/// `/runs` when its aggregation failed: NOTHING was aggregated, so the empty
+/// list is a total failure, not an idle fleet, and the coverage says so.
+fn failed_runs_response() -> axum::Json<wire::RunsResponse> {
+    axum::Json(wire::RunsResponse {
+        runs: Vec::new(),
+        no_run: Default::default(),
+        unlisted: Default::default(),
+        generated_at_ms: current_millis(),
+        meta: source_state::coverage_meta(&source_state::SourceState::Unavailable { detail: "the run aggregation failed" }),
         policy: runs::runs_policy(),
     })
 }
@@ -3751,11 +3830,10 @@ fn scan_flow_missions(
     // (#3428) Each day's mission records come from `day_mission_records`,
     // which re-reads only a file that changed since the last scan.
     for (date, path) in flow_day_files(flows_dir) {
-        for (identity, v) in day_mission_records(&path).iter() {
-            if !fleet_seen.contains(identity) {
-                fold(&mut by_mission, &date, v);
-            }
-        }
+        day_mission_records(&path)
+            .iter()
+            .filter(|(identity, _)| !fleet_seen.contains(identity))
+            .for_each(|(_, v)| fold(&mut by_mission, &date, v));
     }
 
     let mut out: Vec<wire::FlowMissionSummary> = by_mission

@@ -6300,6 +6300,44 @@
     // route exist, does it read the SAME `AppState` sources every other
     // handler reads, does the envelope shape match `/missions`'s own.
 
+    /// (#3428) `/runs` requests inside [`RUNS_CACHE_TTL`] share one build of
+    /// the run list: it costs seconds on a busy machine (a 14-day fold of the
+    /// flow records, every mission and lab run), and every open viewer polls
+    /// it. `generated_at_ms` is when that build ran, so a served copy says
+    /// how old it is.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn runs_requests_inside_the_ttl_share_one_build() {
+        let _guard = CrewDirGuard::new();
+        let flows = TempDir::new().unwrap();
+        let builds = || super::RUNS_BUILDS.load(std::sync::atomic::Ordering::Relaxed);
+        let get = || async {
+            let response = build_router_full_local(flows.path().to_path_buf(), None)
+                .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        let before = builds();
+        let first = get().await;
+        save_test_mission(&minimal_mission("runs-cache-later", vec![]));
+        let second = get().await;
+        assert_eq!(builds() - before, 1, "one build for both requests");
+        assert_eq!(first["runs"], second["runs"]);
+        assert_eq!(first["generated_at_ms"], second["generated_at_ms"], "the build's own time");
+
+        // Another flows dir is another build (a test's router, or a
+        // reconfigured daemon), never this one's copy.
+        let other = TempDir::new().unwrap();
+        let response = build_router_full_local(other.path().to_path_buf(), None)
+            .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(builds() - before, 2);
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn runs_handler_lists_a_tracked_mission_run() {
