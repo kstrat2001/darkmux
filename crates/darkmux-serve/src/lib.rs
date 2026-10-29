@@ -5064,6 +5064,12 @@ pub(crate) async fn redis_tail_task(
         // counter surfaces (metrics endpoint, /healthz), promote to
         // shared atomic at that time.
         let mut dropped_records: u64 = 0;
+        // (#3432) The connection this tail reads on, kept across polls: a new
+        // one per 500ms poll, per stream, per open viewer, was most of the
+        // hub's connects. Dropped after any failure and reopened by the next
+        // poll, so a reply a read deadline left on the socket is never read
+        // as the next poll's answer.
+        let mut kept: Option<redis::Connection> = None;
 
         loop {
             // Consumer-disconnect check that does NOT require producing.
@@ -5084,10 +5090,15 @@ pub(crate) async fn redis_tail_task(
             let stream_call = stream_name.clone();
             let last_id_call = last_id.clone();
             let date_filter_call = date_filter.clone();
+            let conn_call = kept.take();
             let result = tokio::task::spawn_blocking(move || {
-                xread_block_once(&url_call, &stream_call, &last_id_call, &date_filter_call)
+                poll_tail(conn_call, &url_call, &stream_call, &last_id_call, &date_filter_call)
             })
-            .await;
+            .await
+            .map(|(conn, read)| {
+                kept = conn;
+                read
+            });
             match result {
                 Ok(Ok((records, new_last_id))) => {
                     last_id = new_last_id;
@@ -5345,31 +5356,57 @@ fn resolve_current_last_id(
     Ok("0-0".to_string())
 }
 
-/// One BLOCK iteration of `XREAD`. Returns `(matching_records,
+/// One poll of a tail on its kept connection, or a new one when it has none
+/// (#3432). The connection comes back only when the read succeeded: after a
+/// failure (a read deadline can leave a reply on the socket) the next poll
+/// opens a new one. Synchronous.
+fn poll_tail(
+    kept: Option<redis::Connection>,
+    url: &str,
+    stream_name: &str,
+    last_id: &str,
+    date_filter: &str,
+) -> (Option<redis::Connection>, Result<(Vec<String>, String), anyhow::Error>) {
+    let mut conn = match kept.map_or_else(|| tail_connection(url, stream_name), Ok) {
+        Ok(conn) => conn,
+        Err(e) => return (None, Err(e)),
+    };
+    let read = xread_block_once(&mut conn, stream_name, last_id, date_filter);
+    (read.is_ok().then_some(conn), read)
+}
+
+/// A connection for a tail to read `stream_name` on (#3432: kept across its
+/// polls by [`redis_tail_task`]). Synchronous.
+fn tail_connection(url: &str, stream_name: &str) -> Result<redis::Connection, anyhow::Error> {
+    use anyhow::Context as _;
+    let client = redis::Client::open(url)
+        .with_context(|| format!("opening Redis for XREAD on {stream_name}"))?;
+    // Bounded by REDIS_CONNECT_TIMEOUT (#278). NOTE: the per-iteration
+    // XREAD BLOCK timeout (500ms) is separate — that's the long-poll budget,
+    // not the connect budget.
+    let conn = client
+        .get_connection_with_timeout(darkmux_flow::REDIS_CONNECT_TIMEOUT)
+        .with_context(|| format!("connecting to Redis for XREAD on {stream_name}"))?;
+    // (#1570) Safe alongside the long-poll: REDIS_RESPONSE_TIMEOUT (1s) sits
+    // deliberately ABOVE the 500ms BLOCK budget, so a healthy long-poll that
+    // legitimately waits its full budget never trips the socket deadline —
+    // only a server that has stopped answering entirely does. Without it a
+    // wedged peer strands this tail thread for the daemon's lifetime.
+    bound_redis_response(&conn);
+    Ok(conn)
+}
+
+/// One BLOCK iteration of `XREAD` on `conn`. Returns `(matching_records,
 /// updated_last_id)`. Synchronous — call site wraps in
 /// `spawn_blocking`. Uses BLOCK=500ms so the unfold loop can poll
 /// without burning CPU but still surfaces new records quickly.
 fn xread_block_once(
-    url: &str,
+    conn: &mut redis::Connection,
     stream_name: &str,
     last_id: &str,
     date_filter: &str,
 ) -> Result<(Vec<String>, String), anyhow::Error> {
     use anyhow::Context as _;
-    let client = redis::Client::open(url)
-        .with_context(|| format!("opening Redis for XREAD on {stream_name}"))?;
-    // Bounded by REDIS_CONNECT_TIMEOUT (#278). NOTE: the per-iteration
-    // XREAD BLOCK timeout below (500ms) is separate — that's the
-    // long-poll budget, not the connect budget.
-    let mut conn = client
-        .get_connection_with_timeout(darkmux_flow::REDIS_CONNECT_TIMEOUT)
-        .with_context(|| format!("connecting to Redis for XREAD on {stream_name}"))?;
-    // (#1570) Safe alongside the long-poll: REDIS_RESPONSE_TIMEOUT (1s) sits
-    // deliberately ABOVE the 500ms BLOCK budget below, so a healthy long-poll
-    // that legitimately waits its full budget never trips the socket deadline —
-    // only a server that has stopped answering entirely does. Without it a
-    // wedged peer strands this tail thread for the daemon's lifetime.
-    bound_redis_response(&conn);
     let raw: redis::Value = redis::cmd("XREAD")
         .arg("BLOCK")
         .arg(500u64)
@@ -5378,7 +5415,7 @@ fn xread_block_once(
         .arg("STREAMS")
         .arg(stream_name)
         .arg(last_id)
-        .query(&mut conn)
+        .query(conn)
         .with_context(|| format!("XREAD BLOCK on {stream_name}"))?;
 
     // XREAD returns:
