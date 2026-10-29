@@ -1779,6 +1779,9 @@ async fn health(
         // Whether THIS process resolved a token, for `darkmux doctor` run from
         // a shell that may not have the one the daemon was started with.
         fleet_token_set: loopback_caller.then(darkmux_flow::serve_token_present),
+        // (#3423) Whether THIS process's PATH finds `docker`, for the same
+        // reason: `darkmux doctor` runs from a shell whose PATH may differ.
+        docker_on_path: loopback_caller.then(|| darkmux_types::on_path("docker")),
         // Whether this daemon can publish to the fleet hub's flow stream
         // (`null` when no hub is configured), for this machine only: an
         // outage's reason is operator detail, not something a peer needs.

@@ -48,6 +48,11 @@ pub struct HealthResponse {
     /// Whether this daemon resolved a fleet token (the serve token) in its own
     /// environment; never the value. This machine only.
     pub fleet_token_set: Option<bool>,
+    /// (#3423) Whether this daemon's own `PATH` finds `docker`, which every
+    /// dispatch it runs or accepts needs; never the path. A brew service once
+    /// ran with launchd's bare PATH and failed every dispatch while the
+    /// operator's shell found docker (#3418). This machine only.
+    pub docker_on_path: Option<bool>,
     /// Whether this daemon can publish to the fleet hub's flow stream, and
     /// since when it could not; `null` when no hub is configured. This machine
     /// only.

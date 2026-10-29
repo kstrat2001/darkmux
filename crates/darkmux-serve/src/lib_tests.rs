@@ -2231,6 +2231,33 @@
         assert!(!set.to_string().contains("not-a-real-token"), "the value never appears");
     }
 
+    /// (#3423) `/health` tells this machine whether the daemon's OWN `PATH`
+    /// finds `docker` (never the path): a brew service once ran with launchd's
+    /// bare PATH and failed every dispatch while the operator's shell found
+    /// docker fine (#3418). A peer, or a proxied request, learns nothing.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn health_reports_whether_the_daemon_finds_docker_to_this_machine_only() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("docker"), "").unwrap();
+        let prev = std::env::var_os("PATH");
+        unsafe { std::env::set_var("PATH", dir.path()) };
+        let found = loopback_health(&[]).await;
+        let proxied = loopback_health(&[("X-Forwarded-For", "100.64.0.7")]).await;
+        unsafe { std::env::set_var("PATH", "/nonexistent-darkmux-test-dir") };
+        let missing = loopback_health(&[]).await;
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        assert_eq!(found["docker_on_path"], true, "{found}");
+        assert!(proxied["docker_on_path"].is_null(), "{proxied}");
+        assert_eq!(missing["docker_on_path"], false, "{missing}");
+        assert!(!found.to_string().contains(&dir.path().display().to_string()), "the path never appears");
+    }
+
     /// `/health` tells this machine whether the daemon can publish to the
     /// fleet hub: unreachable (since when, and why), then connected once the
     /// hub answers. A proxied loopback request, which is a peer, learns nothing.

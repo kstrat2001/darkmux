@@ -51,6 +51,38 @@ pub use endpoint::{
     BudgetPolicy, Hardware, HardwareBasis, ManagedBackend, ModelEndpoint, UsageLimits, UsageWindow, WindowBudget,
 };
 
+/// (#3423) Whether `name` resolves to a file on THIS process's `PATH`: what a
+/// bare `Command::new(name)` would find. `darkmux serve` reports it for
+/// `docker` so `darkmux doctor`, run from a shell with a different `PATH`,
+/// can tell when the daemon can't start a dispatch's runtime container.
+pub fn on_path(name: &str) -> bool {
+    on_path_in(name, std::env::var_os("PATH").as_deref())
+}
+
+fn on_path_in(name: &str, path: Option<&std::ffi::OsStr>) -> bool {
+    path.is_some_and(|p| std::env::split_paths(p).any(|dir| dir.join(name).is_file()))
+}
+
+#[cfg(test)]
+mod on_path_tests {
+    use super::on_path_in;
+
+    #[test]
+    fn a_tool_is_found_only_in_a_directory_on_the_given_path() {
+        let has = tempfile::TempDir::new().unwrap();
+        let lacks = tempfile::TempDir::new().unwrap();
+        std::fs::write(has.path().join("docker"), "").unwrap();
+        let path = std::env::join_paths([lacks.path(), has.path()]).unwrap();
+        assert!(on_path_in("docker", Some(&path)));
+        let without = std::env::join_paths([lacks.path()]).unwrap();
+        assert!(!on_path_in("docker", Some(&without)));
+        assert!(!on_path_in("docker", None));
+        // A directory named like the tool is not the tool.
+        std::fs::create_dir(lacks.path().join("lms")).unwrap();
+        assert!(!on_path_in("lms", Some(&without)));
+    }
+}
+
 /// (#1129) The running build's identifier — single source of truth for the
 /// viewer header, `darkmux doctor`, and anywhere the live build needs naming.
 /// The bare package version can't distinguish a packaged release from a

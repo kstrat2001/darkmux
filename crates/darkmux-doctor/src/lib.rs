@@ -153,6 +153,8 @@ pub fn run() -> DoctorReport {
         check_daemon_reachable(),
         // (#1461) Staleness: what is RUNNING vs what is INSTALLED vs the source.
         check_daemon_freshness(),
+        // (#3423) Can the RUNNING daemon start a dispatch's container?
+        check_daemon_docker(),
         check_binary_vs_source(),
         check_runtime_image_freshness(),
         check_runtime_binary_cache(),
@@ -5496,6 +5498,65 @@ fn check_daemon_freshness() -> Check {
     )
 }
 
+const DAEMON_DOCKER_CHECK_NAME: &str = "daemon docker";
+
+/// (#3423) Whether the RUNNING daemon finds `docker` on its own PATH
+/// (`/health`'s `docker_on_path`). Doctor's own shell is not the daemon's: a
+/// brew service once ran with launchd's bare PATH and failed every dispatch
+/// while every shell found docker (#3418).
+fn check_daemon_docker() -> Check {
+    let addr = darkmux_types::config_access::serve_client_addr();
+    let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or("127.0.0.1").to_string();
+    let daemon = loopback_http_body(&host, darkmux_types::config_access::serve_client_port(), "/health")
+        .as_deref()
+        .and_then(parse_daemon_docker);
+    classify_daemon_docker(daemon, darkmux_types::on_path("docker"))
+}
+
+/// `/health`'s `docker_on_path`; `None` when absent (no daemon, a daemon older
+/// than #3423, or a caller the daemon does not count as this machine).
+fn parse_daemon_docker(health_body: &str) -> Option<bool> {
+    let v: serde_json::Value = serde_json::from_str(health_body).ok()?;
+    v.get("docker_on_path")?.as_bool()
+}
+
+/// Pure classifier: `daemon` is what the running daemon reports, `shell`
+/// whether doctor's own PATH finds `docker`.
+fn classify_daemon_docker(daemon: Option<bool>, shell: bool) -> Check {
+    match (daemon, shell) {
+        (None, _) => not_applicable(
+            DAEMON_DOCKER_CHECK_NAME,
+            "no running darkmux serve daemon reports whether it finds `docker`",
+        ),
+        (Some(true), _) => Check {
+            name: DAEMON_DOCKER_CHECK_NAME.into(),
+            status: Status::Pass,
+            message: "the running darkmux serve daemon finds `docker` on its own PATH".into(),
+            hint: None,
+        },
+        // No docker anywhere: the `docker runtime` row already says so.
+        (Some(false), false) => not_applicable(
+            DAEMON_DOCKER_CHECK_NAME,
+            "neither this shell nor the daemon finds `docker` (see `docker runtime`)",
+        ),
+        (Some(false), true) => Check {
+            name: DAEMON_DOCKER_CHECK_NAME.into(),
+            status: Status::Fail,
+            message: "the running darkmux serve daemon cannot find `docker` on its own PATH \
+                      (this shell can), so every dispatch it runs or accepts from a fleet peer \
+                      fails before its container starts"
+                .into(),
+            hint: Some(
+                "as a brew service: `brew upgrade darkmux && brew services restart darkmux` \
+                 (the formula gives the service a PATH since 5.9.1_1); otherwise restart \
+                 `darkmux serve` from a shell where `command -v docker` works, or add \
+                 docker's directory to the PATH its service manager starts it with"
+                    .into(),
+            ),
+        },
+    }
+}
+
 /// The fix for every stale-daemon verdict. Restart is the operator's to run —
 /// doctor never touches a running process (#44).
 fn restart_daemon_hint() -> Option<String> {
@@ -9503,6 +9564,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parse_daemon_docker_reads_the_health_field() {
+        assert_eq!(parse_daemon_docker(r#"{"build":"5.9.2","docker_on_path":true}"#), Some(true));
+        assert_eq!(parse_daemon_docker(r#"{"build":"5.9.2","docker_on_path":false}"#), Some(false));
+        assert_eq!(parse_daemon_docker(r#"{"build":"5.9.1","docker_on_path":null}"#), None);
+        assert_eq!(parse_daemon_docker(r#"{"build":"5.9.1"}"#), None);
+    }
+
+    /// (#3423) The #3418 shape: the shell finds docker, the daemon does not.
+    /// That fails, naming the restart that fixes a brew service.
+    #[test]
+    fn a_daemon_that_cannot_find_docker_fails_when_the_shell_can() {
+        let c = classify_daemon_docker(Some(false), true);
+        assert!(matches!(c.status, Status::Fail), "{c:?}");
+        assert!(c.message.contains("cannot find `docker`"), "{}", c.message);
+        assert!(c.hint.as_deref().unwrap_or("").contains("brew services restart darkmux"), "{c:?}");
+        let ok = classify_daemon_docker(Some(true), true);
+        assert!(matches!(ok.status, Status::Pass) && !ok.message.contains("not applicable"), "{ok:?}");
+        // No daemon report, or no docker anywhere (the docker runtime row says
+        // that): nothing to add.
+        for (d, sh) in [(None, true), (None, false), (Some(false), false)] {
+            let n = classify_daemon_docker(d, sh);
+            assert!(n.message.contains("not applicable"), "{d:?}/{sh}: {n:?}");
+        }
+    }
+
     /// (#2782 C5) The FRESHNESS check probes too, and it was unpinned:
     /// reverting it to the literal `loopback_http_body("127.0.0.1", 8765,
     /// "/health")` left all 294 tests in this crate green. A surviving
@@ -12359,8 +12446,11 @@ mod tests {
         //
         // (#906) 70: `checks_container::check_lab_tests_placement` joined
         // beside the container-user row.
+        //
+        // (#3423) 71: `check_daemon_docker` joined beside the daemon
+        // freshness row.
         let expected =
-            70 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            71 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
