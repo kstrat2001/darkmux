@@ -6375,6 +6375,45 @@
         assert_eq!(builds() - before, 3);
     }
 
+    /// (#3428) `/runs` reads the fleet view only to mark running rows not
+    /// reporting, so a board with no running row never waits on a gather (a
+    /// tailnet read of every peer's card, 1-3s each time its 5s cache
+    /// lapsed, measured on the operator's laptop).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_board_with_no_running_row_never_gathers_the_fleet_view() {
+        use std::sync::atomic::Ordering;
+        let _guard = CrewDirGuard::new();
+        let flows = TempDir::new().unwrap();
+        let sources = std::sync::Arc::new(crate::fleet_view::tests::Scripted::default());
+        let get = |sources: std::sync::Arc<crate::fleet_view::tests::Scripted>| {
+            let app = build_router_full(flows.path().to_path_buf(), None, None, crate::fleet_view::FleetContext::with_sources(sources))
+                .layer(from_fn(assume_loopback_peer));
+            async move {
+                let response = app.oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap()).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+        };
+        get(sources.clone()).await;
+        assert_eq!(sources.local_cards.load(Ordering::Relaxed), 0, "an idle board gathers no view");
+
+        // A dispatch that started a moment ago with no terminal: a running row.
+        let other = TempDir::new().unwrap();
+        let now = darkmux_flow::ts_utc_at(now_unix() as i64);
+        fs::write(
+            other.path().join(format!("{}.jsonl", &now[..10])),
+            format!("{{\"action\":\"dispatch.start\",\"session_id\":\"S-live\",\"execution_id\":\"exec-00000001-0000-0001\",\"ts\":\"{now}\"}}\n"),
+        )
+        .unwrap();
+        let app = build_router_full(other.path().to_path_buf(), None, None, crate::fleet_view::FleetContext::with_sources(sources.clone()))
+            .layer(from_fn(assume_loopback_peer));
+        let response = app.oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap()).await.unwrap();
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json["runs"].as_array().unwrap().iter().any(|r| r["status"] == "running"), "{json}");
+        assert_eq!(sources.local_cards.load(Ordering::Relaxed), 1, "a running row is judged against the view");
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn runs_handler_lists_a_tracked_mission_run() {

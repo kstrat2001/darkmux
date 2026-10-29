@@ -2000,12 +2000,17 @@ async fn served_runs_list(flows_dir: PathBuf, lab_dir: Option<PathBuf>) -> Optio
 async fn runs_handler(State(state): State<AppState>) -> axum::Json<wire::RunsResponse> {
     // (#1705) One build reads the fleet stream, then builds every row against
     // local + fleet together. (#3428) Shared between requests for a TTL.
-    let view = fleet_view::cached_view(&state).await.ok();
     let built = served_runs_list(state.flows_dir.clone(), state.lab_dir.clone()).await;
     let Some(built) = built else {
         return failed_runs_response();
     };
     let BuiltRuns { mut rows, off_rows: (no_run, unlisted), fleet_state, built_at_ms, .. } = built;
+    // (#3428) The view only marks running rows not reporting, so a board with
+    // none never waits on a gather (every peer's card over the tailnet).
+    let view = match rows.iter().any(|r| r.status == runs::RunStatus::Running) {
+        true => fleet_view::cached_view(&state).await.ok(),
+        false => None,
+    };
     let marked = tokio::task::spawn_blocking(move || {
         let live = live_session_ids();
         log_beat_read_once(live.is_none());
