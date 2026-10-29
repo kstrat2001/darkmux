@@ -6375,13 +6375,15 @@
         assert_eq!(builds() - before, 3);
     }
 
-    /// (#3428) `/runs` reads the fleet view only to mark running rows not
-    /// reporting, so a board with no running row never waits on a gather (a
-    /// tailnet read of every peer's card, 1-3s each time its 5s cache
-    /// lapsed, measured on the operator's laptop).
+    /// (#3428) `/runs` reads the fleet view and the live beats only to mark
+    /// running rows not reporting, so a board with no running row never waits
+    /// on either: a gather (every peer's card over the tailnet, 1-3s each time
+    /// its 5s cache lapsed) or a beat read (a bounded hub connect that, on the
+    /// operator's tailnet, often failed after its 500ms cap), both measured on
+    /// the operator's laptop.
     #[tokio::test]
     #[serial_test::serial]
-    async fn a_board_with_no_running_row_never_gathers_the_fleet_view() {
+    async fn a_board_with_no_running_row_reads_no_view_and_no_beats() {
         use std::sync::atomic::Ordering;
         let _guard = CrewDirGuard::new();
         let flows = TempDir::new().unwrap();
@@ -6394,8 +6396,25 @@
                 assert_eq!(response.status(), StatusCode::OK);
             }
         };
-        get(sources.clone()).await;
+        // A hub that is configured but down: a beat read would cost a bounded
+        // connect attempt on every request.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let hub = format!("redis://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let accepts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = accepts.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                counted.fetch_add(1, Ordering::Relaxed);
+                drop(stream);
+            }
+        });
+        unsafe { std::env::set_var("DARKMUX_REDIS_URL", &hub) };
+        get(sources.clone()).await; // builds (its own hub reads are the build's)
+        let built = accepts.load(Ordering::Relaxed);
+        get(sources.clone()).await; // served from the build
+        unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
         assert_eq!(sources.local_cards.load(Ordering::Relaxed), 0, "an idle board gathers no view");
+        let beat_reads = accepts.load(Ordering::Relaxed) - built;
 
         // A dispatch that started a moment ago with no terminal: a running row.
         let other = TempDir::new().unwrap();
@@ -6412,6 +6431,7 @@
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(json["runs"].as_array().unwrap().iter().any(|r| r["status"] == "running"), "{json}");
         assert_eq!(sources.local_cards.load(Ordering::Relaxed), 1, "a running row is judged against the view");
+        assert_eq!(beat_reads, 0, "a request served from the build reads no live beats");
     }
 
     #[tokio::test]

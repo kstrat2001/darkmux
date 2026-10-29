@@ -2005,22 +2005,25 @@ async fn runs_handler(State(state): State<AppState>) -> axum::Json<wire::RunsRes
         return failed_runs_response();
     };
     let BuiltRuns { mut rows, off_rows: (no_run, unlisted), fleet_state, built_at_ms, .. } = built;
-    // (#3428) The view only marks running rows not reporting, so a board with
-    // none never waits on a gather (every peer's card over the tailnet).
-    let view = match rows.iter().any(|r| r.status == runs::RunStatus::Running) {
-        true => fleet_view::cached_view(&state).await.ok(),
-        false => None,
-    };
-    let marked = tokio::task::spawn_blocking(move || {
-        let live = live_session_ids();
-        log_beat_read_once(live.is_none());
-        apply_not_reporting(&mut rows, view.as_ref(), live.as_ref());
+    // (#3428) The view and the live beats only mark running rows not
+    // reporting, so a board with none reads neither: a gather is every peer's
+    // card over the tailnet, a beat read a bounded hub connect.
+    let rows = if rows.iter().any(|r| r.status == runs::RunStatus::Running) {
+        let view = fleet_view::cached_view(&state).await.ok();
+        let marked = tokio::task::spawn_blocking(move || {
+            let live = live_session_ids();
+            log_beat_read_once(live.is_none());
+            apply_not_reporting(&mut rows, view.as_ref(), live.as_ref());
+            rows
+        })
+        .await;
+        let Ok(rows) = marked else {
+            eprintln!("darkmux serve: GET /runs not-reporting task failed; serving no rows");
+            return failed_runs_response();
+        };
         rows
-    })
-    .await;
-    let Ok(rows) = marked else {
-        eprintln!("darkmux serve: GET /runs not-reporting task failed; serving no rows");
-        return failed_runs_response();
+    } else {
+        rows
     };
     axum::Json(wire::RunsResponse {
         runs: rows,
