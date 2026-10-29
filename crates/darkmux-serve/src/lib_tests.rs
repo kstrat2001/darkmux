@@ -1482,6 +1482,51 @@
         assert_eq!(missions[0]["mission_id"], "m2");
     }
 
+    /// (#3428) The missions catalog re-reads only the day files that changed
+    /// since its last scan: the viewer polls it, and every poll used to
+    /// re-parse every day file on the machine (159 files, 441 MB measured).
+    /// What it answers is unchanged: an appended record shows on the next scan.
+    #[test]
+    #[serial_test::serial]
+    fn a_repeated_missions_scan_rereads_only_the_day_files_that_changed() {
+        use std::io::Write;
+        let reads = || super::MISSION_DAY_FILE_READS.load(std::sync::atomic::Ordering::Relaxed);
+        let tmp = TempDir::new().unwrap();
+        let rec = |mission: &str, exec: &str, ts: &str| {
+            format!("{{\"action\":\"dispatch.start\",\"execution_id\":\"{exec}\",\"mission_id\":\"{mission}\",\"machine_id\":\"laptop\",\"ts\":\"{ts}\"}}\n")
+        };
+        fs::write(tmp.path().join("2026-05-12.jsonl"), rec("m1", "exec-00000001-0000-0001", "2026-05-12T10:00:00Z")).unwrap();
+        fs::write(tmp.path().join("2026-05-14.jsonl"), rec("m1", "exec-00000002-0000-0001", "2026-05-14T09:00:00Z")).unwrap();
+        let before = reads();
+        let first = super::scan_flow_missions(tmp.path(), &[]);
+        assert_eq!(reads() - before, 2);
+        let before = reads();
+        let second = super::scan_flow_missions(tmp.path(), &[]);
+        assert_eq!(reads() - before, 0, "nothing changed, nothing re-read");
+        assert_eq!(serde_json::to_value(&first).unwrap(), serde_json::to_value(&second).unwrap());
+
+        let mut today = fs::OpenOptions::new().append(true).open(tmp.path().join("2026-05-14.jsonl")).unwrap();
+        today.write_all(rec("m2", "exec-00000003-0000-0001", "2026-05-14T09:05:00Z").as_bytes()).unwrap();
+        drop(today);
+        let before = reads();
+        let third = super::scan_flow_missions(tmp.path(), &[]);
+        assert_eq!(reads() - before, 1, "only the day that grew");
+        assert_eq!(third.len(), 2, "the appended mission shows");
+        let m1 = third.iter().find(|m| m.mission_id == "m1").unwrap();
+        assert_eq!((m1.records, m1.dispatches, m1.first_date.as_str()), (2, 2, "2026-05-12"));
+
+        // A write the clock didn't see (a coarse-mtime filesystem): the length
+        // alone says the file changed.
+        let path = tmp.path().join("2026-05-14.jsonl");
+        let stamped = fs::metadata(&path).unwrap().modified().unwrap();
+        let mut today = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        today.write_all(rec("m3", "exec-00000004-0000-0001", "2026-05-14T09:06:00Z").as_bytes()).unwrap();
+        today.set_modified(stamped).unwrap();
+        drop(today);
+        let fourth = super::scan_flow_missions(tmp.path(), &[]);
+        assert_eq!(fourth.len(), 3, "a grown file is re-read though its mtime did not move");
+    }
+
     /// #1705: a mission that ran on a PEER reaches the missions lens even
     /// though nothing about it was ever written to this machine's flows dir.
     #[test]

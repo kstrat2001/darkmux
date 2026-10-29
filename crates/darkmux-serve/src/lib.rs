@@ -3454,9 +3454,24 @@ pub(crate) fn for_each_flow_record_across_days(
     flows_dir: &std::path::Path,
     mut visit: impl FnMut(&str, &serde_json::Value) -> std::ops::ControlFlow<()>,
 ) {
-    use std::io::BufRead;
+    for (date, path) in flow_day_files(flows_dir) {
+        let mut stop = false;
+        for_each_record_in_day_file(&path, |v| {
+            if !stop && visit(&date, v).is_break() {
+                stop = true;
+            }
+        });
+        if stop {
+            return;
+        }
+    }
+}
+
+/// The `YYYY-MM-DD.jsonl` day files in `flows_dir`, oldest first, so a
+/// visitor sees records in chronological order across days.
+fn flow_day_files(flows_dir: &std::path::Path) -> Vec<(String, std::path::PathBuf)> {
     let Ok(entries) = std::fs::read_dir(flows_dir) else {
-        return;
+        return Vec::new();
     };
     let mut day_files: Vec<(String, std::path::PathBuf)> = Vec::new();
     for entry in entries.flatten() {
@@ -3470,28 +3485,30 @@ pub(crate) fn for_each_flow_record_across_days(
         }
         day_files.push((date.to_string(), entry.path()));
     }
-    // Oldest-first → the visitor sees records in chronological order across days.
     day_files.sort_by(|a, b| a.0.cmp(&b.0));
-    for (date, path) in day_files {
-        let Ok(file) = std::fs::File::open(&path) else {
+    day_files
+}
+
+/// Each flow record in one day file, in order: blank lines, torn lines and the
+/// schema header skipped; an unreadable line ends the file.
+fn for_each_record_in_day_file(path: &std::path::Path, mut visit: impl FnMut(&serde_json::Value)) {
+    use std::io::BufRead;
+    let Ok(file) = std::fs::File::open(path) else {
+        return;
+    };
+    for line in std::io::BufReader::new(file).lines() {
+        let Ok(line) = line else { break };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some(v) = darkmux_flow::reader::parse_value(line) else {
             continue;
         };
-        for line in std::io::BufReader::new(file).lines() {
-            let Ok(line) = line else { break };
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let Some(v) = darkmux_flow::reader::parse_value(line) else {
-                continue;
-            };
-            if v.get("_type").and_then(|t| t.as_str()) == Some("schema") {
-                continue;
-            }
-            if visit(&date, &v).is_break() {
-                return;
-            }
+        if v.get("_type").and_then(|t| t.as_str()) == Some("schema") {
+            continue;
         }
+        visit(&v);
     }
 }
 
@@ -3595,6 +3612,51 @@ async fn flow_missions_handler(State(state): State<AppState>) -> axum::Json<wire
     })
 }
 
+/// (#3428) How many day files the missions catalog has read: the instrument
+/// a test reads to prove a repeated scan re-reads only what changed.
+pub(crate) static MISSION_DAY_FILE_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The fields of a record the missions catalog folds ([`scan_flow_missions`]).
+const MISSION_FOLD_FIELDS: &[&str] = &["mission_id", "ts", "action", "execution_id", "machine_id"];
+
+/// One day file's records that name a mission, cut to [`MISSION_FOLD_FIELDS`],
+/// each with its identity (computed from the whole record, so the fleet
+/// de-dup still matches), in file order. Kept per file while its length and
+/// modification time are unchanged: a past day's file never changes, so a
+/// scan re-reads only today's (#3428). Blocking.
+fn day_mission_records(path: &std::path::Path) -> std::sync::Arc<Vec<(RecordIdentity, serde_json::Value)>> {
+    type Marks = std::sync::Arc<Vec<(RecordIdentity, serde_json::Value)>>;
+    type Cache = std::collections::HashMap<std::path::PathBuf, (u64, Option<std::time::SystemTime>, Marks)>;
+    static CACHE: std::sync::Mutex<Option<Cache>> = std::sync::Mutex::new(None);
+    let stamp = std::fs::metadata(path).ok().map(|m| (m.len(), m.modified().ok()));
+    if let Some((len, modified)) = stamp {
+        let cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((l, m, marks)) = cache.as_ref().and_then(|c| c.get(path)) {
+            if (*l, *m) == (len, modified) {
+                return marks.clone();
+            }
+        }
+    }
+    MISSION_DAY_FILE_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut marks = Vec::new();
+    for_each_record_in_day_file(path, |v| {
+        if v.get("mission_id").and_then(|m| m.as_str()).is_some_and(|m| !m.is_empty()) {
+            let cut: serde_json::Map<String, serde_json::Value> = MISSION_FOLD_FIELDS
+                .iter()
+                .filter_map(|k| v.get(*k).map(|x| (k.to_string(), x.clone())))
+                .collect();
+            marks.push((RecordIdentity::of(v), serde_json::Value::Object(cut)));
+        }
+    });
+    let marks: Marks = std::sync::Arc::new(marks);
+    // Stamped as read before the read, so a write during it reads again next time.
+    if let Some((len, modified)) = stamp {
+        let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        cache.get_or_insert_with(Cache::new).insert(path.to_path_buf(), (len, modified, marks.clone()));
+    }
+    marks
+}
+
 /// Roll every flow record up per `mission_id`, across the local day-files
 /// AND the fleet stream (#1705).
 ///
@@ -3686,13 +3748,15 @@ fn scan_flow_missions(
     }
     // Then the local day-files, skipping anything the fleet already
     // supplied — this machine's own records are written to BOTH sinks.
-    for_each_flow_record_across_days(flows_dir, |date, v| {
-        if !fleet_seen.is_empty() && fleet_seen.contains(&RecordIdentity::of(v)) {
-            return std::ops::ControlFlow::Continue(());
+    // (#3428) Each day's mission records come from `day_mission_records`,
+    // which re-reads only a file that changed since the last scan.
+    for (date, path) in flow_day_files(flows_dir) {
+        for (identity, v) in day_mission_records(&path).iter() {
+            if !fleet_seen.contains(identity) {
+                fold(&mut by_mission, &date, v);
+            }
         }
-        fold(&mut by_mission, date, v);
-        std::ops::ControlFlow::Continue(())
-    });
+    }
 
     let mut out: Vec<wire::FlowMissionSummary> = by_mission
         .into_iter()
