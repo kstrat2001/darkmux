@@ -1147,15 +1147,24 @@
         let same = super::machine_resources_cached_fresh().is_some();
         unsafe { std::env::set_var("DARKMUX_LMS_BIN", "/nonexistent/darkmux-serve-test-lms-b") };
         let other = super::machine_resources_cached_fresh().is_some();
+        unsafe { std::env::set_var("DARKMUX_LMS_BIN", "/nonexistent/darkmux-serve-test-lms-a") };
+        let prev_engine = std::env::var("DARKMUX_DEFAULT_ENGINE").ok();
+        unsafe { std::env::set_var("DARKMUX_DEFAULT_ENGINE", "darkmux-serve-test-engine") };
+        let other_engine = super::machine_resources_cached_fresh().is_some();
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
                 None => std::env::remove_var("DARKMUX_LMS_BIN"),
             }
+            match prev_engine {
+                Some(v) => std::env::set_var("DARKMUX_DEFAULT_ENGINE", v),
+                None => std::env::remove_var("DARKMUX_DEFAULT_ENGINE"),
+            }
         }
         *super::MACHINE_RESOURCES_CACHE.lock().unwrap() = None;
         assert!(same, "a fresh ledger of this lms was not served");
         assert!(!other, "another lms's ledger was served");
+        assert!(!other_engine, "another engine's ledger was served");
     }
 
     /// GET /machine/resources returns the memory ledger with the fields the

@@ -2019,8 +2019,10 @@ struct BuiltRuns {
 /// The process's last `/runs` build, and when a build last failed. An async
 /// lock held across a foreground build (new inputs, or a build past
 /// [`RUNS_STALE_BOUND`]), so requests arriving during one wait for it instead
-/// of starting their own; a rebuild of unchanged inputs inside the bound runs
-/// in the background, outside the lock.
+/// of starting their own (a request dropped mid-build, by its client or the
+/// route timeout, releases the lock while its build runs on); a rebuild of
+/// unchanged inputs inside the bound runs in the background, outside the
+/// lock.
 #[derive(Default)]
 struct RunsCache {
     built: Option<BuiltRuns>,
@@ -2039,7 +2041,9 @@ struct RunsCache {
 /// A background `/runs` rebuild's claim: its generation (which decides
 /// whether it installs) and the in-flight mark, cleared when the ticket is
 /// dropped: when the rebuild returns, or when its task is dropped with a
-/// runtime that shut down mid-build, so a lost rebuild never stops the next.
+/// runtime that shut down mid-build (a test's; the daemon's lives as long as
+/// the process), so a lost rebuild never stops the next, though its blocking
+/// build may still be finishing.
 struct RebuildTicket {
     generation: u64,
     in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -2233,8 +2237,9 @@ async fn rebuild_runs_list(ticket: RebuildTicket, sources: (PathBuf, Option<Path
 /// as `missions_handler` above.
 ///
 /// Built at most once per [`RUNS_CACHE_TTL`] while its inputs are unchanged
-/// (then rebuilt in the background, [`served_runs_list`]), with at most one
-/// background rebuild at a time, and held in memory only (#3428)
+/// (then rebuilt in the background, [`served_runs_list`]), with one
+/// background rebuild at a time ([`RebuildTicket`]), and held in memory only
+/// (#3428)
 /// — NO new persistence (sink-boundary contract #3 stays honored: this only
 /// READS across the lab/flow/crew boundary, never writes across it). Never a
 /// 500: `runs::build_runs` already degrades each source independently to
