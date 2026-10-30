@@ -2003,12 +2003,18 @@ struct BuiltRuns {
 }
 
 /// The process's last `/runs` build, and when a build last failed. An async
-/// lock held across a build, so requests arriving during one wait for it
-/// instead of starting their own.
+/// lock held across a build of new inputs, so requests arriving during one
+/// wait for it instead of starting their own; a rebuild of unchanged inputs
+/// runs in the background, outside the lock.
 #[derive(Default)]
 struct RunsCache {
     built: Option<BuiltRuns>,
     failed: Option<((PathBuf, Option<PathBuf>), std::time::SystemTime)>,
+    /// When a background rebuild of the last build began. One that has not
+    /// ended inside [`RUNS_CACHE_TTL`] is presumed gone (its runtime shut
+    /// down mid-build) and another may start: a second build of the same
+    /// inputs costs time, a mark that never clears would freeze the list.
+    rebuilding: Option<std::time::SystemTime>,
 }
 
 impl RunsCache {
@@ -2024,6 +2030,40 @@ impl RunsCache {
             .as_ref()
             .filter(|b| b.sources == *sources && b.inputs == inputs && wall_clock_cache_is_fresh(b.at, now, RUNS_CACHE_TTL))
             .cloned()
+    }
+
+    /// The last build past [`RUNS_CACHE_TTL`], while it read these sources and
+    /// `inputs`: nothing new was recorded, so it is served at once rather
+    /// than making the request wait on a rebuild. `true` beside it when this
+    /// request, at `now`, starts that rebuild (one at a time).
+    fn stale(
+        &mut self,
+        sources: &(PathBuf, Option<PathBuf>),
+        inputs: u64,
+        now: std::time::SystemTime,
+    ) -> Option<(BuiltRuns, bool)> {
+        let built = self.built.as_ref().filter(|b| b.sources == *sources && b.inputs == inputs)?.clone();
+        let start = !self.rebuilding.is_some_and(|at| wall_clock_cache_is_fresh(at, now, RUNS_CACHE_TTL));
+        if start {
+            self.rebuilding = Some(now);
+        }
+        Some((built, start))
+    }
+
+    /// Keep a background rebuild of `sources` and `inputs`, unless a build of
+    /// newer inputs (or other sources) replaced the one it refreshes while
+    /// it ran. Either way it has ended.
+    fn install_rebuild(
+        &mut self,
+        sources: (PathBuf, Option<PathBuf>),
+        inputs: u64,
+        built: Result<BuiltRuns, String>,
+        now: std::time::SystemTime,
+    ) {
+        self.rebuilding = None;
+        if self.built.as_ref().is_some_and(|b| b.sources == sources && b.inputs == inputs) {
+            self.record(sources, built, now);
+        }
     }
 
     /// Keep what a build of `sources` produced: the build, or the failure
@@ -2094,8 +2134,12 @@ fn build_runs_list(flows_dir: PathBuf, lab_dir: Option<PathBuf>, inputs: u64) ->
 
 /// The `/runs` list for these sources: the last build while it is younger
 /// than [`RUNS_CACHE_TTL`] and read the same inputs, otherwise a new one.
-/// `None` when a build task failed, and for a TTL after, so a build that
-/// keeps failing is not retried by every waiting request in turn.
+/// Past the TTL with the same inputs (nothing new recorded), the last build
+/// is served at once and rebuilt in the background, so a poll never waits a
+/// build out for a status that only turns on elapsed time; new inputs wait
+/// for their build. `None` when a build task failed, and for a TTL after, so
+/// a build that keeps failing is not retried by every waiting request in
+/// turn.
 async fn served_runs_list(flows_dir: PathBuf, lab_dir: Option<PathBuf>) -> Option<BuiltRuns> {
     let mut slot = runs_cache().lock().await;
     let sources = (flows_dir, lab_dir);
@@ -2107,9 +2151,26 @@ async fn served_runs_list(flows_dir: PathBuf, lab_dir: Option<PathBuf>) -> Optio
     if let Some(built) = slot.fresh(&sources, inputs, std::time::SystemTime::now()) {
         return Some(built);
     }
+    if let Some((built, start)) = slot.stale(&sources, inputs, std::time::SystemTime::now()) {
+        if start {
+            tokio::spawn(rebuild_runs_list(sources, inputs));
+        }
+        return Some(built);
+    }
     let (flows_dir, lab_dir) = sources.clone();
     let built = tokio::task::spawn_blocking(move || build_runs_list(flows_dir, lab_dir, inputs)).await;
     slot.record(sources, built.map_err(|e| e.to_string()), std::time::SystemTime::now())
+}
+
+/// Rebuild the `/runs` list of unchanged inputs in the background and keep
+/// it ([`RunsCache::install_rebuild`]).
+async fn rebuild_runs_list(sources: (PathBuf, Option<PathBuf>), inputs: u64) {
+    let (flows_dir, lab_dir) = sources.clone();
+    let built = tokio::task::spawn_blocking(move || build_runs_list(flows_dir, lab_dir, inputs)).await;
+    runs_cache()
+        .lock()
+        .await
+        .install_rebuild(sources, inputs, built.map_err(|e| e.to_string()), std::time::SystemTime::now());
 }
 
 /// GET /runs — the flat, kind-tagged, normalized run view-model (#1508 step
