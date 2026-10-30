@@ -1982,11 +1982,19 @@ pub(crate) static RUNS_BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic:
 /// reads is unchanged. A build costs seconds on a busy machine (a 14-day fold
 /// of the flow records, every mission and lab run), and every open viewer
 /// polls the route every 5s. A new flow record, local or from the hub, means
-/// a new build ([`runs_inputs`]); this bound covers the rest (a status that
-/// turns on elapsed time, a mission or lab file written without a record).
-/// `generated_at_ms` is when the build began, so a served copy says how old
-/// its data is. A named constant, not adaptive.
+/// a new build ([`runs_inputs`]); past this TTL a build is rebuilt for the
+/// rest (a status that turns on elapsed time, a mission or lab file written
+/// without a record), in the background while it is younger than
+/// [`RUNS_STALE_BOUND`]. `generated_at_ms` is when the build began, so a
+/// served copy says how old its data is. A named constant, not adaptive.
 const RUNS_CACHE_TTL: Duration = Duration::from_secs(10);
+
+/// (#3428) The oldest a `/runs` build of unchanged inputs is served while it
+/// rebuilds in the background: one more TTL, so a viewer polling every 5s
+/// never waits a rebuild out, while a build past it (the first poll after an
+/// idle stretch, or a rebuild slower than a TTL) waits for a new one, as
+/// every build did before. What the fingerprint misses is at most this old.
+const RUNS_STALE_BOUND: Duration = Duration::from_secs(2 * RUNS_CACHE_TTL.as_secs());
 
 /// One build of the `/runs` list, before the per-request not-reporting
 /// marks (which read live presence), and the sources it was built from.
@@ -2010,11 +2018,13 @@ struct BuiltRuns {
 struct RunsCache {
     built: Option<BuiltRuns>,
     failed: Option<((PathBuf, Option<PathBuf>), std::time::SystemTime)>,
-    /// When a background rebuild of the last build began. One that has not
-    /// ended inside [`RUNS_CACHE_TTL`] is presumed gone (its runtime shut
-    /// down mid-build) and another may start: a second build of the same
-    /// inputs costs time, a mark that never clears would freeze the list.
-    rebuilding: Option<std::time::SystemTime>,
+    /// The background rebuild of the last build that is current, by
+    /// generation. A foreground build ends it, so a rebuild it superseded
+    /// (or one that never landed, its runtime shut down mid-build) is
+    /// dropped and never stops a later one.
+    rebuilding: Option<u64>,
+    /// The last rebuild generation handed out.
+    generation: u64,
 }
 
 impl RunsCache {
@@ -2032,48 +2042,56 @@ impl RunsCache {
             .cloned()
     }
 
-    /// The last build past [`RUNS_CACHE_TTL`], while it read these sources and
-    /// `inputs`: nothing new was recorded, so it is served at once rather
-    /// than making the request wait on a rebuild. `true` beside it when this
-    /// request, at `now`, starts that rebuild (one at a time).
+    /// The last build, while it read these sources and `inputs` and is
+    /// younger than [`RUNS_STALE_BOUND`] at `now`: nothing new was recorded,
+    /// so it is served at once rather than making the request wait on a
+    /// rebuild. Beside it, the generation of the rebuild this request starts,
+    /// when none is running.
     fn stale(
         &mut self,
         sources: &(PathBuf, Option<PathBuf>),
         inputs: u64,
         now: std::time::SystemTime,
-    ) -> Option<(BuiltRuns, bool)> {
-        let built = self.built.as_ref().filter(|b| b.sources == *sources && b.inputs == inputs)?.clone();
-        let start = !self.rebuilding.is_some_and(|at| wall_clock_cache_is_fresh(at, now, RUNS_CACHE_TTL));
-        if start {
-            self.rebuilding = Some(now);
+    ) -> Option<(BuiltRuns, Option<u64>)> {
+        let built = self
+            .built
+            .as_ref()
+            .filter(|b| b.sources == *sources && b.inputs == inputs && wall_clock_cache_is_fresh(b.at, now, RUNS_STALE_BOUND))?
+            .clone();
+        if self.rebuilding.is_some() {
+            return Some((built, None));
         }
-        Some((built, start))
+        self.generation += 1;
+        self.rebuilding = Some(self.generation);
+        Some((built, Some(self.generation)))
     }
 
-    /// Keep a background rebuild of `sources` and `inputs`, unless a build of
-    /// newer inputs (or other sources) replaced the one it refreshes while
-    /// it ran. Either way it has ended.
+    /// Keep background rebuild `generation` of `sources`, while it is still
+    /// the current rebuild (it then refreshes the build it was started from:
+    /// any newer build would have ended it); one a foreground build
+    /// superseded is dropped.
     fn install_rebuild(
         &mut self,
+        generation: u64,
         sources: (PathBuf, Option<PathBuf>),
-        inputs: u64,
         built: Result<BuiltRuns, String>,
         now: std::time::SystemTime,
     ) {
-        self.rebuilding = None;
-        if self.built.as_ref().is_some_and(|b| b.sources == sources && b.inputs == inputs) {
+        if self.rebuilding == Some(generation) {
             self.record(sources, built, now);
         }
     }
 
     /// Keep what a build of `sources` produced: the build, or the failure
-    /// (at `now`) that the next requests back off from.
+    /// (at `now`) that the next requests back off from. It ends any
+    /// background rebuild: this is now the newest build.
     fn record(
         &mut self,
         sources: (PathBuf, Option<PathBuf>),
         built: Result<BuiltRuns, String>,
         now: std::time::SystemTime,
     ) -> Option<BuiltRuns> {
+        self.rebuilding = None;
         match built {
             Ok(built) => {
                 self.built = Some(built.clone());
@@ -2152,8 +2170,8 @@ async fn served_runs_list(flows_dir: PathBuf, lab_dir: Option<PathBuf>) -> Optio
         return Some(built);
     }
     if let Some((built, start)) = slot.stale(&sources, inputs, std::time::SystemTime::now()) {
-        if start {
-            tokio::spawn(rebuild_runs_list(sources, inputs));
+        if let Some(generation) = start {
+            tokio::spawn(rebuild_runs_list(generation, sources, inputs));
         }
         return Some(built);
     }
@@ -2162,15 +2180,15 @@ async fn served_runs_list(flows_dir: PathBuf, lab_dir: Option<PathBuf>) -> Optio
     slot.record(sources, built.map_err(|e| e.to_string()), std::time::SystemTime::now())
 }
 
-/// Rebuild the `/runs` list of unchanged inputs in the background and keep
-/// it ([`RunsCache::install_rebuild`]).
-async fn rebuild_runs_list(sources: (PathBuf, Option<PathBuf>), inputs: u64) {
+/// Rebuild the `/runs` list of unchanged inputs in the background, as
+/// rebuild `generation`, and keep it ([`RunsCache::install_rebuild`]).
+async fn rebuild_runs_list(generation: u64, sources: (PathBuf, Option<PathBuf>), inputs: u64) {
     let (flows_dir, lab_dir) = sources.clone();
     let built = tokio::task::spawn_blocking(move || build_runs_list(flows_dir, lab_dir, inputs)).await;
     runs_cache()
         .lock()
         .await
-        .install_rebuild(sources, inputs, built.map_err(|e| e.to_string()), std::time::SystemTime::now());
+        .install_rebuild(generation, sources, built.map_err(|e| e.to_string()), std::time::SystemTime::now());
 }
 
 /// GET /runs — the flat, kind-tagged, normalized run view-model (#1508 step
@@ -2181,7 +2199,9 @@ async fn rebuild_runs_list(sources: (PathBuf, Option<PathBuf>), inputs: u64) {
 /// this handler is a thin `spawn_blocking` + envelope wrapper, same shape
 /// as `missions_handler` above.
 ///
-/// Built at most once per [`RUNS_CACHE_TTL`] and held in memory only (#3428)
+/// Built at most once per [`RUNS_CACHE_TTL`] while its inputs are unchanged
+/// (then rebuilt in the background, [`served_runs_list`]), with at most one
+/// background rebuild at a time, and held in memory only (#3428)
 /// — NO new persistence (sink-boundary contract #3 stays honored: this only
 /// READS across the lab/flow/crew boundary, never writes across it). Never a
 /// 500: `runs::build_runs` already degrades each source independently to

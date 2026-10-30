@@ -3496,50 +3496,92 @@
     }
 
     /// (#3428) A build past [`RUNS_CACHE_TTL`] whose inputs are unchanged is
-    /// served at once instead of making the request wait on a rebuild, and
-    /// only the first such request starts the rebuild. New inputs, or other
-    /// sources, still wait for a build.
+    /// served at once instead of making the request wait on a rebuild, while
+    /// it is younger than [`RUNS_STALE_BOUND`], and only the first such
+    /// request starts the rebuild. New inputs, other sources, or a build past
+    /// the bound (the first poll after an idle hour) still wait for a build:
+    /// the fingerprint misses missions, lab runs and elapsed-time statuses.
     #[test]
-    fn an_unchanged_runs_build_past_the_ttl_is_served_while_one_rebuild_runs() {
+    fn an_unchanged_runs_build_is_served_while_one_rebuild_runs_inside_the_bound() {
         let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let past_ttl = at + super::RUNS_CACHE_TTL;
         let (a, b) = (runs_sources("/a"), runs_sources("/b"));
         let mut cache = super::RunsCache::default();
-        assert!(cache.stale(&a, 1, at).is_none(), "nothing built yet");
+        assert!(cache.stale(&a, 1, past_ttl).is_none(), "nothing built yet");
         cache.record(a.clone(), Ok(built_runs(&a, 1, at)), at);
-        let (built, start) = cache.stale(&a, 1, at).expect("an unchanged build is served");
+        let (built, start) = cache.stale(&a, 1, past_ttl).expect("an unchanged build is served");
         assert_eq!(built.inputs, 1);
-        assert!(start, "the first request starts the rebuild");
-        let (_, start) = cache.stale(&a, 1, at).expect("served while it rebuilds");
-        assert!(!start, "a second rebuild started while one runs");
-        assert!(cache.stale(&a, 2, at).is_none(), "new inputs were served an old build");
-        assert!(cache.stale(&b, 1, at).is_none(), "other sources were served this build");
-        // A rebuild that never ended (its runtime shut down mid-build) holds
-        // the mark one TTL, not forever.
-        let just_inside = at + super::RUNS_CACHE_TTL - Duration::from_millis(1);
-        assert!(!cache.stale(&a, 1, just_inside).expect("served").1);
-        assert!(cache.stale(&a, 1, at + super::RUNS_CACHE_TTL).expect("served").1, "a lost rebuild froze the list");
+        assert!(start.is_some(), "the first request starts the rebuild");
+        let (_, start) = cache.stale(&a, 1, past_ttl).expect("served while it rebuilds");
+        assert!(start.is_none(), "a second rebuild started while one runs");
+        assert!(cache.stale(&a, 2, past_ttl).is_none(), "new inputs were served an old build");
+        assert!(cache.stale(&b, 1, past_ttl).is_none(), "other sources were served this build");
+        let just_inside = at + super::RUNS_STALE_BOUND - Duration::from_millis(1);
+        assert!(cache.stale(&a, 1, just_inside).is_some());
+        assert!(
+            cache.stale(&a, 1, at + super::RUNS_STALE_BOUND).is_none(),
+            "a build past the bound was served instead of waiting for a new one"
+        );
     }
 
-    /// (#3428) A background rebuild is kept unless a newer build replaced the
-    /// one it refreshes, and either way it ends, so the next may start.
+    /// (#3428) A background rebuild is kept only while it is the current one:
+    /// a foreground build (new inputs, or past the bound) supersedes it, its
+    /// result is dropped, and it can neither clear a later rebuild's mark nor
+    /// overlap one.
     #[test]
-    fn a_background_runs_rebuild_is_dropped_when_a_newer_build_replaced_it() {
+    fn a_background_runs_rebuild_is_kept_only_while_it_is_the_current_one() {
         let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let a = runs_sources("/a");
+        let past_ttl = at + super::RUNS_CACHE_TTL;
         let mut cache = super::RunsCache::default();
         cache.record(a.clone(), Ok(built_runs(&a, 1, at)), at);
-        assert!(cache.stale(&a, 1, at).expect("served").1);
-        let later = at + 2 * super::RUNS_CACHE_TTL;
-        cache.install_rebuild(a.clone(), 1, Ok(built_runs(&a, 1, later)), later);
-        assert!(cache.fresh(&a, 1, later).is_some(), "the rebuild was not kept");
-        assert!(cache.stale(&a, 1, at).expect("served").1, "the rebuild never ended");
+        let first = cache.stale(&a, 1, past_ttl).expect("served").1.expect("starts");
+        cache.install_rebuild(first, a.clone(), Ok(built_runs(&a, 1, past_ttl)), past_ttl);
+        assert!(cache.fresh(&a, 1, past_ttl).is_some(), "the rebuild was not kept");
 
-        // A request with new inputs built while that rebuild ran.
-        cache.record(a.clone(), Ok(built_runs(&a, 2, later)), later);
-        let after = later + Duration::from_millis(1);
-        cache.install_rebuild(a.clone(), 1, Ok(built_runs(&a, 1, after)), after);
-        assert!(cache.fresh(&a, 2, after).is_some(), "a superseded rebuild replaced a newer build");
-        assert!(cache.stale(&a, 2, at).expect("served").1, "the superseded rebuild never ended");
+        // A rebuild runs; a foreground build supersedes it; the next rebuild
+        // starts; the superseded one lands.
+        let later = past_ttl + super::RUNS_CACHE_TTL;
+        let r1 = cache.stale(&a, 1, later).expect("served").1.expect("starts");
+        cache.record(a.clone(), Ok(built_runs(&a, 1, later)), later);
+        let r2_at = later + super::RUNS_CACHE_TTL;
+        let r2 = cache.stale(&a, 1, r2_at).expect("served").1.expect("the foreground build ended r1's mark");
+        let landed = r2_at + Duration::from_secs(1);
+        cache.install_rebuild(r1, a.clone(), Ok(built_runs(&a, 1, landed)), landed);
+        assert!(cache.fresh(&a, 1, landed).is_none(), "a superseded rebuild was kept");
+        assert!(cache.stale(&a, 1, landed).expect("served").1.is_none(), "a third rebuild overlapped r2");
+        cache.install_rebuild(r2, a.clone(), Ok(built_runs(&a, 1, landed)), landed);
+        assert!(cache.fresh(&a, 1, landed).is_some(), "the current rebuild was not kept");
+    }
+
+    /// (#3428) A background rebuild that lands after a newer build failed
+    /// does not end that failure's backoff.
+    #[test]
+    fn a_background_runs_rebuild_does_not_end_a_newer_failures_backoff() {
+        let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let a = runs_sources("/a");
+        let past_ttl = at + super::RUNS_CACHE_TTL;
+        let mut cache = super::RunsCache::default();
+        cache.record(a.clone(), Ok(built_runs(&a, 1, at)), at);
+        let rebuild = cache.stale(&a, 1, past_ttl).expect("served").1.expect("starts");
+        assert!(cache.record(a.clone(), Err("a panicked build of new inputs".into()), past_ttl).is_none());
+        cache.install_rebuild(rebuild, a.clone(), Ok(built_runs(&a, 1, past_ttl)), past_ttl);
+        assert!(cache.backing_off(&a, past_ttl), "the newer failure's backoff was ended");
+    }
+
+    /// (#3428) A rebuild that never lands (its runtime shut down mid-build,
+    /// as a test's does) holds its mark only until the next foreground build,
+    /// of any sources, so it cannot stop later rebuilds.
+    #[test]
+    fn a_lost_runs_rebuild_does_not_stop_later_rebuilds() {
+        let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let (a, b) = (runs_sources("/a"), runs_sources("/b"));
+        let past_ttl = at + super::RUNS_CACHE_TTL;
+        let mut cache = super::RunsCache::default();
+        cache.record(a.clone(), Ok(built_runs(&a, 1, at)), at);
+        cache.stale(&a, 1, past_ttl).expect("served").1.expect("starts, then is lost");
+        cache.record(b.clone(), Ok(built_runs(&b, 1, at)), at);
+        assert!(cache.stale(&b, 1, past_ttl).expect("served").1.is_some(), "a lost rebuild stopped b's");
     }
 
     fn xentry(ms: u64, ts: &str) -> redis::Value {
@@ -6897,11 +6939,12 @@
         let before = builds();
         get().await;
         assert_eq!(builds() - before, 1);
-        // Age the build past the TTL, marked so a served copy is recognized.
+        // Age the build past the TTL (inside the stale bound), marked so a
+            // served copy is recognized.
         {
             let mut slot = super::runs_cache().lock().await;
             let built = slot.built.as_mut().expect("the first request's build");
-            built.at -= 2 * super::RUNS_CACHE_TTL;
+            built.at -= super::RUNS_CACHE_TTL + Duration::from_secs(1);
             built.built_at_ms = 1;
         }
         let served = get().await;
@@ -6921,6 +6964,31 @@
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert_eq!(builds() - before, 2, "one rebuild, kept, and served inside the TTL");
+    }
+
+    /// (#3428) The first `/runs` poll after an idle stretch waits for a new
+    /// build rather than being served the old one: the build's fingerprint
+    /// misses a mission recorded without a flow record, and only the bound
+    /// on a served build's age keeps it from hiding that mission.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_first_runs_poll_after_an_idle_hour_waits_for_a_new_build() {
+        let _guard = CrewDirGuard::new();
+        let flows = TempDir::new().unwrap();
+        let get = || async {
+            let response = build_router_full_local(flows.path().to_path_buf(), None)
+                .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        get().await;
+        save_test_mission(&minimal_mission("runs-idle-hour", vec![]));
+        super::runs_cache().lock().await.built.as_mut().expect("the first request's build").at -=
+            Duration::from_secs(3_600);
+        let after = get().await;
+        assert!(after.to_string().contains("runs-idle-hour"), "an hour-old build was served: {after}");
     }
 
     /// (#3428) `/runs` reads the fleet view and the live beats only to mark
