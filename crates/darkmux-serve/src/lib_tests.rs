@@ -1132,6 +1132,32 @@
 
     // ─── #1286: /machine/resources endpoint (the memory-ledger lens feed) ───
 
+    /// (#3428) A cached `/machine/resources` ledger is served only for the
+    /// engine and `lms` binary it was gathered with, like the residents read
+    /// beside it: in one process (release-verify's `cargo test`) a test that
+    /// points `lms` elsewhere was served an earlier test's ledger.
+    #[test]
+    #[serial_test::serial]
+    fn a_cached_machine_ledger_is_served_only_for_its_engine_and_lms() {
+        let prev = std::env::var("DARKMUX_LMS_BIN").ok();
+        unsafe { std::env::set_var("DARKMUX_LMS_BIN", "/nonexistent/darkmux-serve-test-lms-a") };
+        let ledger = darkmux_profiles::engine::local().ledger();
+        *super::MACHINE_RESOURCES_CACHE.lock().unwrap() =
+            Some((super::machine_resources_key(), std::time::SystemTime::now(), ledger));
+        let same = super::machine_resources_cached_fresh().is_some();
+        unsafe { std::env::set_var("DARKMUX_LMS_BIN", "/nonexistent/darkmux-serve-test-lms-b") };
+        let other = super::machine_resources_cached_fresh().is_some();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
+                None => std::env::remove_var("DARKMUX_LMS_BIN"),
+            }
+        }
+        *super::MACHINE_RESOURCES_CACHE.lock().unwrap() = None;
+        assert!(same, "a fresh ledger of this lms was not served");
+        assert!(!other, "another lms's ledger was served");
+    }
+
     /// GET /machine/resources returns the memory ledger with the fields the
     /// machine lens reads, plus the recorded cadence knob (`cache_ttl_ms`)
     /// and the observer-cost stamp (`gather_ms`) — the #1286 observer-effect
@@ -3509,11 +3535,11 @@
         let mut cache = super::RunsCache::default();
         assert!(cache.stale(&a, 1, past_ttl).is_none(), "nothing built yet");
         cache.record(a.clone(), Ok(built_runs(&a, 1, at)), at);
-        let (built, start) = cache.stale(&a, 1, past_ttl).expect("an unchanged build is served");
+        let (built, ticket) = cache.stale(&a, 1, past_ttl).expect("an unchanged build is served");
         assert_eq!(built.inputs, 1);
-        assert!(start.is_some(), "the first request starts the rebuild");
-        let (_, start) = cache.stale(&a, 1, past_ttl).expect("served while it rebuilds");
-        assert!(start.is_none(), "a second rebuild started while one runs");
+        assert!(ticket.is_some(), "the first request starts the rebuild");
+        let (_, second) = cache.stale(&a, 1, past_ttl).expect("served while it rebuilds");
+        assert!(second.is_none(), "a second rebuild started while one runs");
         assert!(cache.stale(&a, 2, past_ttl).is_none(), "new inputs were served an old build");
         assert!(cache.stale(&b, 1, past_ttl).is_none(), "other sources were served this build");
         let just_inside = at + super::RUNS_STALE_BOUND - Duration::from_millis(1);
@@ -3525,9 +3551,9 @@
     }
 
     /// (#3428) A background rebuild is kept only while it is the current one:
-    /// a foreground build (new inputs, or past the bound) supersedes it, its
-    /// result is dropped, and it can neither clear a later rebuild's mark nor
-    /// overlap one.
+    /// a foreground build (new inputs, or past the bound) supersedes it and
+    /// its result is dropped. A superseded rebuild still running holds off
+    /// the next until it returns, so at most one runs at a time.
     #[test]
     fn a_background_runs_rebuild_is_kept_only_while_it_is_the_current_one() {
         let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
@@ -3536,22 +3562,26 @@
         let mut cache = super::RunsCache::default();
         cache.record(a.clone(), Ok(built_runs(&a, 1, at)), at);
         let first = cache.stale(&a, 1, past_ttl).expect("served").1.expect("starts");
-        cache.install_rebuild(first, a.clone(), Ok(built_runs(&a, 1, past_ttl)), past_ttl);
+        cache.install_rebuild(&first, a.clone(), Ok(built_runs(&a, 1, past_ttl)), past_ttl);
+        drop(first);
         assert!(cache.fresh(&a, 1, past_ttl).is_some(), "the rebuild was not kept");
 
-        // A rebuild runs; a foreground build supersedes it; the next rebuild
-        // starts; the superseded one lands.
+        // A rebuild runs; a foreground build supersedes it.
         let later = past_ttl + super::RUNS_CACHE_TTL;
         let r1 = cache.stale(&a, 1, later).expect("served").1.expect("starts");
         cache.record(a.clone(), Ok(built_runs(&a, 1, later)), later);
         let r2_at = later + super::RUNS_CACHE_TTL;
-        let r2 = cache.stale(&a, 1, r2_at).expect("served").1.expect("the foreground build ended r1's mark");
-        let landed = r2_at + Duration::from_secs(1);
-        cache.install_rebuild(r1, a.clone(), Ok(built_runs(&a, 1, landed)), landed);
-        assert!(cache.fresh(&a, 1, landed).is_none(), "a superseded rebuild was kept");
-        assert!(cache.stale(&a, 1, landed).expect("served").1.is_none(), "a third rebuild overlapped r2");
-        cache.install_rebuild(r2, a.clone(), Ok(built_runs(&a, 1, landed)), landed);
-        assert!(cache.fresh(&a, 1, landed).is_some(), "the current rebuild was not kept");
+        assert!(
+            cache.stale(&a, 1, r2_at).expect("served").1.is_none(),
+            "a rebuild started beside a superseded one still running"
+        );
+        cache.install_rebuild(&r1, a.clone(), Ok(built_runs(&a, 1, r2_at)), r2_at);
+        drop(r1);
+        assert!(cache.fresh(&a, 1, later).is_some(), "a superseded rebuild replaced the foreground build");
+        assert!(cache.fresh(&a, 1, r2_at).is_none(), "a superseded rebuild was kept");
+        let r2 = cache.stale(&a, 1, r2_at).expect("served").1.expect("r1 returned, so r2 starts");
+        cache.install_rebuild(&r2, a.clone(), Ok(built_runs(&a, 1, r2_at)), r2_at);
+        assert!(cache.fresh(&a, 1, r2_at).is_some(), "the current rebuild was not kept");
     }
 
     /// (#3428) A background rebuild that lands after a newer build failed
@@ -3565,13 +3595,13 @@
         cache.record(a.clone(), Ok(built_runs(&a, 1, at)), at);
         let rebuild = cache.stale(&a, 1, past_ttl).expect("served").1.expect("starts");
         assert!(cache.record(a.clone(), Err("a panicked build of new inputs".into()), past_ttl).is_none());
-        cache.install_rebuild(rebuild, a.clone(), Ok(built_runs(&a, 1, past_ttl)), past_ttl);
+        cache.install_rebuild(&rebuild, a.clone(), Ok(built_runs(&a, 1, past_ttl)), past_ttl);
         assert!(cache.backing_off(&a, past_ttl), "the newer failure's backoff was ended");
     }
 
-    /// (#3428) A rebuild that never lands (its runtime shut down mid-build,
-    /// as a test's does) holds its mark only until the next foreground build,
-    /// of any sources, so it cannot stop later rebuilds.
+    /// (#3428) A rebuild that never lands (its task dropped with a runtime
+    /// that shut down mid-build, as a test's does) cannot stop later
+    /// rebuilds: dropping its ticket ends its claim.
     #[test]
     fn a_lost_runs_rebuild_does_not_stop_later_rebuilds() {
         let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
@@ -3579,7 +3609,8 @@
         let past_ttl = at + super::RUNS_CACHE_TTL;
         let mut cache = super::RunsCache::default();
         cache.record(a.clone(), Ok(built_runs(&a, 1, at)), at);
-        cache.stale(&a, 1, past_ttl).expect("served").1.expect("starts, then is lost");
+        drop(cache.stale(&a, 1, past_ttl).expect("served").1.expect("starts, then is lost"));
+        assert!(cache.stale(&a, 1, past_ttl).expect("served").1.is_some(), "a lost rebuild stopped a's");
         cache.record(b.clone(), Ok(built_runs(&b, 1, at)), at);
         assert!(cache.stale(&b, 1, past_ttl).expect("served").1.is_some(), "a lost rebuild stopped b's");
     }
@@ -6940,7 +6971,7 @@
         get().await;
         assert_eq!(builds() - before, 1);
         // Age the build past the TTL (inside the stale bound), marked so a
-            // served copy is recognized.
+        // served copy is recognized.
         {
             let mut slot = super::runs_cache().lock().await;
             let built = slot.built.as_mut().expect("the first request's build");
@@ -6964,6 +6995,66 @@
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert_eq!(builds() - before, 2, "one rebuild, kept, and served inside the TTL");
+    }
+
+    /// (#3428) The live rebuild path keeps a background rebuild only while
+    /// it is current: new work arriving while it runs (a foreground build)
+    /// supersedes it, so when it lands the foreground build stays, and while
+    /// it still runs no other rebuild starts beside it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_live_runs_rebuild_superseded_by_new_work_is_dropped_and_runs_alone() {
+        let _guard = CrewDirGuard::new();
+        let flows = TempDir::new().unwrap();
+        let builds = || super::RUNS_BUILDS.load(std::sync::atomic::Ordering::Relaxed);
+        let get = || async {
+            let response = build_router_full_local(flows.path().to_path_buf(), None)
+                .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        let age = || async {
+            super::runs_cache().lock().await.built.as_mut().expect("a build").at -=
+                super::RUNS_CACHE_TTL + Duration::from_secs(1);
+        };
+        let deadline = || std::time::Instant::now() + Duration::from_secs(10);
+        get().await;
+        age().await;
+        let before = builds();
+        // The background rebuild this poll starts takes 1.5s.
+        super::RUNS_BUILD_DELAY_MS.store(1_500, std::sync::atomic::Ordering::SeqCst);
+        get().await;
+        let until = deadline();
+        while super::RUNS_BUILD_DELAY_MS.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            assert!(std::time::Instant::now() < until, "the background rebuild never began");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // New work arrives while it runs: the next poll builds in the foreground.
+        let today = darkmux_flow::ts_utc_at(now_unix() as i64);
+        fs::write(
+            flows.path().join(format!("{}.jsonl", &today[..10])),
+            format!("{{\"action\":\"dispatch.start\",\"session_id\":\"S-new\",\"execution_id\":\"exec-00000001-0000-0001\",\"ts\":\"{today}\"}}\n"),
+        )
+        .unwrap();
+        get().await;
+        // Past the TTL again while the superseded rebuild still runs: served,
+        // and no second rebuild starts beside it.
+        age().await;
+        let kept = super::runs_cache().lock().await.built.as_ref().expect("the foreground build").at;
+        get().await;
+        let until = deadline();
+        while super::runs_cache().lock().await.rebuild_in_flight.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < until, "the background rebuild never returned");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(builds() - before, 2, "a rebuild ran beside the superseded one");
+        assert_eq!(
+            super::runs_cache().lock().await.built.as_ref().expect("a build").at,
+            kept,
+            "the superseded rebuild replaced the foreground build"
+        );
     }
 
     /// (#3428) The first `/runs` poll after an idle stretch waits for a new
