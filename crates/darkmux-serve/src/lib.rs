@@ -1978,15 +1978,29 @@ async fn missions_handler() -> axum::Json<wire::MissionsResponse> {
 /// instrument a test reads to prove requests share a build.
 pub(crate) static RUNS_BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// (#3428) How long the next `/runs` build sleeps before it counts itself in
+/// [`RUNS_BUILDS`], once: a test's slow build, to hold a background rebuild
+/// in flight while it drives the requests around it.
+#[cfg(test)]
+pub(crate) static RUNS_BUILD_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// (#3428) How long one build of the `/runs` list is served while what it
 /// reads is unchanged. A build costs seconds on a busy machine (a 14-day fold
 /// of the flow records, every mission and lab run), and every open viewer
 /// polls the route every 5s. A new flow record, local or from the hub, means
-/// a new build ([`runs_inputs`]); this bound covers the rest (a status that
-/// turns on elapsed time, a mission or lab file written without a record).
-/// `generated_at_ms` is when the build began, so a served copy says how old
-/// its data is. A named constant, not adaptive.
+/// a new build ([`runs_inputs`]); past this TTL a build is rebuilt for the
+/// rest (a status that turns on elapsed time, a mission or lab file written
+/// without a record), in the background while it is younger than
+/// [`RUNS_STALE_BOUND`]. `generated_at_ms` is when the build began, so a
+/// served copy says how old its data is. A named constant, not adaptive.
 const RUNS_CACHE_TTL: Duration = Duration::from_secs(10);
+
+/// (#3428) The oldest a `/runs` build of unchanged inputs is served while it
+/// rebuilds in the background: one more TTL, so a viewer polling every 5s
+/// never waits a rebuild out, while a build past it (the first poll after an
+/// idle stretch, or a rebuild slower than a TTL) waits for a new one, as
+/// every build did before. What the fingerprint misses is at most this old.
+const RUNS_STALE_BOUND: Duration = Duration::from_secs(2 * RUNS_CACHE_TTL.as_secs());
 
 /// One build of the `/runs` list, before the per-request not-reporting
 /// marks (which read live presence), and the sources it was built from.
@@ -2003,12 +2017,42 @@ struct BuiltRuns {
 }
 
 /// The process's last `/runs` build, and when a build last failed. An async
-/// lock held across a build, so requests arriving during one wait for it
-/// instead of starting their own.
+/// lock held across a foreground build (new inputs, or a build past
+/// [`RUNS_STALE_BOUND`]), so requests arriving during one wait for it instead
+/// of starting their own (a request dropped mid-build, by its client or the
+/// route timeout, releases the lock while its build runs on); a rebuild of
+/// unchanged inputs inside the bound runs in the background, outside the
+/// lock.
 #[derive(Default)]
 struct RunsCache {
     built: Option<BuiltRuns>,
     failed: Option<((PathBuf, Option<PathBuf>), std::time::SystemTime)>,
+    /// The background rebuild allowed to install its result, by generation.
+    /// A foreground build ends it, so a rebuild it superseded is dropped.
+    rebuilding: Option<u64>,
+    /// The last rebuild generation handed out.
+    generation: u64,
+    /// A background rebuild is running, superseded or not: its
+    /// [`RebuildTicket`] clears it when the rebuild returns, so at most one
+    /// runs at a time.
+    rebuild_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A background `/runs` rebuild's claim: its generation (which decides
+/// whether it installs) and the in-flight mark, cleared when the ticket is
+/// dropped: when the rebuild returns, or when its task is dropped with a
+/// runtime that shut down mid-build (a test's; the daemon's lives as long as
+/// the process), so a lost rebuild never stops the next, though its blocking
+/// build may still be finishing.
+struct RebuildTicket {
+    generation: u64,
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for RebuildTicket {
+    fn drop(&mut self) {
+        self.in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl RunsCache {
@@ -2026,14 +2070,61 @@ impl RunsCache {
             .cloned()
     }
 
+    /// The last build, while it read these sources and `inputs` and is
+    /// younger than [`RUNS_STALE_BOUND`] at `now`: nothing new was recorded,
+    /// so it is served at once rather than making the request wait on a
+    /// rebuild. Beside it, the ticket of the rebuild this request starts,
+    /// when none is running.
+    fn stale(
+        &mut self,
+        sources: &(PathBuf, Option<PathBuf>),
+        inputs: u64,
+        now: std::time::SystemTime,
+    ) -> Option<(BuiltRuns, Option<RebuildTicket>)> {
+        let built = self
+            .built
+            .as_ref()
+            .filter(|b| b.sources == *sources && b.inputs == inputs && wall_clock_cache_is_fresh(b.at, now, RUNS_STALE_BOUND))?
+            .clone();
+        if self.rebuild_in_flight.load(std::sync::atomic::Ordering::SeqCst) {
+            return Some((built, None));
+        }
+        self.generation += 1;
+        self.rebuilding = Some(self.generation);
+        self.rebuild_in_flight.store(true, std::sync::atomic::Ordering::SeqCst);
+        let ticket = RebuildTicket {
+            generation: self.generation,
+            in_flight: std::sync::Arc::clone(&self.rebuild_in_flight),
+        };
+        Some((built, Some(ticket)))
+    }
+
+    /// Keep the background rebuild of `ticket` of `sources`, while it is
+    /// still the current rebuild (it then refreshes the build it was started
+    /// from: any newer build would have ended it); one a foreground build
+    /// superseded is dropped.
+    fn install_rebuild(
+        &mut self,
+        ticket: &RebuildTicket,
+        sources: (PathBuf, Option<PathBuf>),
+        built: Result<BuiltRuns, String>,
+        now: std::time::SystemTime,
+    ) {
+        if self.rebuilding == Some(ticket.generation) {
+            self.record(sources, built, now);
+        }
+    }
+
     /// Keep what a build of `sources` produced: the build, or the failure
-    /// (at `now`) that the next requests back off from.
+    /// (at `now`) that the next requests back off from. It ends any
+    /// background rebuild: this is now the newest build.
     fn record(
         &mut self,
         sources: (PathBuf, Option<PathBuf>),
         built: Result<BuiltRuns, String>,
         now: std::time::SystemTime,
     ) -> Option<BuiltRuns> {
+        self.rebuilding = None;
         match built {
             Ok(built) => {
                 self.built = Some(built.clone());
@@ -2078,6 +2169,8 @@ fn runs_inputs(flows_dir: &StdPath) -> u64 {
 fn build_runs_list(flows_dir: PathBuf, lab_dir: Option<PathBuf>, inputs: u64) -> BuiltRuns {
     let (at, built_at_ms) = (std::time::SystemTime::now(), current_millis());
     let fleet = fleet_flow_records();
+    #[cfg(test)]
+    std::thread::sleep(Duration::from_millis(RUNS_BUILD_DELAY_MS.swap(0, std::sync::atomic::Ordering::SeqCst)));
     RUNS_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let built = runs::build_runs_for_daemon(&flows_dir, lab_dir.as_deref(), &fleet.records);
     let off = |s: &usage_sum::UsageSplit| wire::OffRowUsage { calls: s.calls, tokens: s.total };
@@ -2094,8 +2187,13 @@ fn build_runs_list(flows_dir: PathBuf, lab_dir: Option<PathBuf>, inputs: u64) ->
 
 /// The `/runs` list for these sources: the last build while it is younger
 /// than [`RUNS_CACHE_TTL`] and read the same inputs, otherwise a new one.
-/// `None` when a build task failed, and for a TTL after, so a build that
-/// keeps failing is not retried by every waiting request in turn.
+/// Past the TTL with the same inputs (nothing new recorded), while the last
+/// build is younger than [`RUNS_STALE_BOUND`], it is served at once and
+/// rebuilt in the background, so a poll never waits a build out for a status
+/// that only turns on elapsed time; new inputs, or a build past the bound,
+/// wait for their build. `None` when a build task failed, and for a TTL after, so
+/// a build that keeps failing is not retried by every waiting request in
+/// turn.
 async fn served_runs_list(flows_dir: PathBuf, lab_dir: Option<PathBuf>) -> Option<BuiltRuns> {
     let mut slot = runs_cache().lock().await;
     let sources = (flows_dir, lab_dir);
@@ -2107,9 +2205,27 @@ async fn served_runs_list(flows_dir: PathBuf, lab_dir: Option<PathBuf>) -> Optio
     if let Some(built) = slot.fresh(&sources, inputs, std::time::SystemTime::now()) {
         return Some(built);
     }
+    if let Some((built, start)) = slot.stale(&sources, inputs, std::time::SystemTime::now()) {
+        if let Some(ticket) = start {
+            tokio::spawn(rebuild_runs_list(ticket, sources, inputs));
+        }
+        return Some(built);
+    }
     let (flows_dir, lab_dir) = sources.clone();
     let built = tokio::task::spawn_blocking(move || build_runs_list(flows_dir, lab_dir, inputs)).await;
     slot.record(sources, built.map_err(|e| e.to_string()), std::time::SystemTime::now())
+}
+
+/// Rebuild the `/runs` list of unchanged inputs in the background under
+/// `ticket`, and keep it while it is current ([`RunsCache::install_rebuild`]).
+/// The ticket is dropped when the rebuild returns, ending its in-flight mark.
+async fn rebuild_runs_list(ticket: RebuildTicket, sources: (PathBuf, Option<PathBuf>), inputs: u64) {
+    let (flows_dir, lab_dir) = sources.clone();
+    let built = tokio::task::spawn_blocking(move || build_runs_list(flows_dir, lab_dir, inputs)).await;
+    runs_cache()
+        .lock()
+        .await
+        .install_rebuild(&ticket, sources, built.map_err(|e| e.to_string()), std::time::SystemTime::now());
 }
 
 /// GET /runs — the flat, kind-tagged, normalized run view-model (#1508 step
@@ -2120,7 +2236,10 @@ async fn served_runs_list(flows_dir: PathBuf, lab_dir: Option<PathBuf>) -> Optio
 /// this handler is a thin `spawn_blocking` + envelope wrapper, same shape
 /// as `missions_handler` above.
 ///
-/// Built at most once per [`RUNS_CACHE_TTL`] and held in memory only (#3428)
+/// Built at most once per [`RUNS_CACHE_TTL`] while its inputs are unchanged
+/// (then rebuilt in the background, [`served_runs_list`]), with one
+/// background rebuild at a time ([`RebuildTicket`]), and held in memory only
+/// (#3428)
 /// — NO new persistence (sink-boundary contract #3 stays honored: this only
 /// READS across the lab/flow/crew boundary, never writes across it). Never a
 /// 500: `runs::build_runs` already degrades each source independently to
@@ -3211,8 +3330,23 @@ const MACHINE_RESOURCES_CACHE_TTL: Duration = Duration::from_secs(10);
 /// staleness marker (this payload has no `age_ms` field at all — see
 /// [`machine_resources_handler`]'s `cache_ttl_ms` insert — so the failure
 /// here is silent, not even mislabeled).
-static MACHINE_RESOURCES_CACHE: std::sync::Mutex<Option<(std::time::SystemTime, darkmux_profiles::model_ledger::ModelLedger)>> =
+///
+/// (#3428) Keyed like [`served_engine_residents`], by the engine setting and
+/// the `lms` binary ([`machine_resources_key`]), so a ledger gathered with
+/// one is never served for another.
+#[allow(clippy::type_complexity)]
+static MACHINE_RESOURCES_CACHE: std::sync::Mutex<Option<(String, std::time::SystemTime, darkmux_profiles::model_ledger::ModelLedger)>> =
     std::sync::Mutex::new(None);
+
+/// What a machine-resources ledger is gathered with: the engine setting and
+/// the `lms` binary.
+fn machine_resources_key() -> String {
+    format!(
+        "{}\0{}",
+        darkmux_types::config_access::default_engine(),
+        darkmux_types::config_access::lms_bin()
+    )
+}
 
 /// Single-flight gate for the machine-resources gather (#1286): concurrent
 /// cold-cache requests serialize on this async lock so a phone-viewer poll
@@ -3227,9 +3361,10 @@ fn machine_resources_gather_lock() -> &'static tokio::sync::Mutex<()> {
 /// Fresh cached machine-resources payload, or `None` when absent/stale. The std
 /// mutex is held only for the clone — never across an `.await`.
 fn machine_resources_cached_fresh() -> Option<darkmux_profiles::model_ledger::ModelLedger> {
+    let key = machine_resources_key();
     let guard = MACHINE_RESOURCES_CACHE.lock().ok()?;
-    let (at, v) = guard.as_ref()?;
-    wall_clock_cache_is_fresh(*at, std::time::SystemTime::now(), MACHINE_RESOURCES_CACHE_TTL).then(|| v.clone())
+    let (k, at, v) = guard.as_ref()?;
+    (*k == key && wall_clock_cache_is_fresh(*at, std::time::SystemTime::now(), MACHINE_RESOURCES_CACHE_TTL)).then(|| v.clone())
 }
 
 /// GET /machine/resources (#1286) — the live machine-scope memory ledger:
@@ -3284,11 +3419,12 @@ async fn machine_resources_handler(
     if let Some(ledger) = machine_resources_cached_fresh() {
         return Ok(axum::Json(machine_resources_body(ledger)));
     }
+    let key = machine_resources_key();
     let ledger = tokio::task::spawn_blocking(|| darkmux_profiles::engine::local().ledger())
         .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "darkmux serve: memory-ledger gather panicked\n"))?;
     if let Ok(mut guard) = MACHINE_RESOURCES_CACHE.lock() {
-        *guard = Some((std::time::SystemTime::now(), ledger.clone()));
+        *guard = Some((key, std::time::SystemTime::now(), ledger.clone()));
     }
     Ok(axum::Json(machine_resources_body(ledger)))
 }
