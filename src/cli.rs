@@ -272,6 +272,8 @@ pub(crate) enum Cmd {
         /// output (e.g. a many-finding review) would truncate, or when a
         /// reasoning model spends the cap thinking: a reply that stops at the
         /// cap with no answer fails the dispatch, naming the cap.
+        /// Local dispatch only: ignored on a `--profile <p>@<machine>`
+        /// dispatch, which does not carry the value to the other machine.
         /// No effect on container-path dispatches (local or agentic-remote).
         #[arg(long, value_name = "N")]
         max_completion_tokens: Option<u32>,

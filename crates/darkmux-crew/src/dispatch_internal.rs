@@ -4428,12 +4428,13 @@ pub(crate) fn single_call_complete(tokens: &crate::dispatch_envelope::DirectToke
 /// That is a failed dispatch, never a clean one whose result is empty: the
 /// terminal is `dispatch.error`, keeping the call's counts, wall time and
 /// endpoint (the tokens were spent), and the error, which names the cap and
-/// both ways to raise it, is returned. `record` builds the path's record.
+/// how to raise it (`raise`), is returned. `record` builds the path's record.
 ///
 /// `fails_at_cap` is false for a lab dispatch (`DispatchOpts::lab_inputs`):
 /// a lab run records the reply as it came, so its grading reads the empty
 /// answer and the `length` finish, and the run keeps its manifest (a lab
-/// dispatch that errors writes none).
+/// dispatch that errors writes none). It is false too for radio's answering
+/// seat (`dispatch_local_single_shot`), which refuses an empty answer itself.
 fn close_answered_call<S: darkmux_flow::BookendSink + ?Sized>(
     session_emitter: &mut Option<darkmux_flow::session_presence::SessionEmitter>,
     bookend: &mut darkmux_flow::BookendGuard<'_, S>,
@@ -4442,13 +4443,10 @@ fn close_answered_call<S: darkmux_flow::BookendSink + ?Sized>(
     complete: DispatchEndPayload,
     cap: u32,
     fails_at_cap: bool,
+    raise: &str,
 ) -> Result<()> {
     if fails_at_cap && reply.hit_cap_with_no_answer() {
-        let e = cap_hit_error(
-            cap,
-            complete.completion_tokens,
-            "set `max_completion_tokens` in the mission step's config, or pass `darkmux dispatch --max-completion-tokens <n>`",
-        );
+        let e = cap_hit_error(cap, complete.completion_tokens, raise);
         let failed = DispatchEndPayload {
             result_class: Some(ResultClass::Error),
             exit_code: None,
@@ -4467,9 +4465,24 @@ fn close_answered_call<S: darkmux_flow::BookendSink + ?Sized>(
 pub(crate) fn cap_hit_error(cap: u32, completion_tokens: Option<u64>, raise: &str) -> anyhow::Error {
     let spent = completion_tokens.map(|n| format!(" after {n} completion tokens")).unwrap_or_default();
     anyhow!(
-        "the model stopped at its output cap of {cap} tokens{spent} without writing an answer (finish_reason: length); \
+        "the model stopped at its output cap of {cap} tokens{spent} without writing an answer; \
          a reasoning model can spend the whole cap thinking. Raise the cap: {raise}"
     )
+}
+
+/// (#3445) How a hosted single-shot dispatch's cap is raised. A dispatch run
+/// here for another machine got the default: a cross-machine job carries no
+/// cap (`WorkJob` has no field for it), so the flag cannot help there.
+fn hosted_cap_remedy(opts: &DispatchOpts) -> &'static str {
+    match opts.remote_origin {
+        Some(_) => {
+            "a dispatch sent from another machine runs at the default cap, which the job does not carry; \
+             run it on the machine that serves this endpoint with `darkmux dispatch --max-completion-tokens <n>`"
+        }
+        None => {
+            "set `max_completion_tokens` in the mission step's config, or pass `darkmux dispatch --max-completion-tokens <n>`"
+        }
+    }
 }
 
 /// The hosted single-shot dispatch (#1177). Precondition: `target` is an
@@ -4480,6 +4493,7 @@ fn dispatch_unmanaged(
     system_prompt: &str,
     provenance: &crate::role_inputs::PromptProvenance,
     target: &crate::target::Target,
+    fails_at_cap: bool,
 ) -> Result<DispatchResult> {
     let ep = &target.endpoint;
     let pm = &target.model;
@@ -4694,7 +4708,8 @@ fn dispatch_unmanaged(
         &reply,
         complete_payload,
         single_shot_cap(opts.max_completion_tokens, ep.reasoning_effort.as_deref()),
-        opts.lab_inputs.is_none(),
+        fails_at_cap,
+        hosted_cap_remedy(opts),
     );
 
     let stdout = if opts.json {
@@ -4875,7 +4890,8 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
                 opts.role_id
             );
         }
-        return dispatch_unmanaged(&opts, execution, &system_prompt, &provenance, &pm);
+        // (#3445) `false`: see the empty-answer note at this function's end.
+        return dispatch_unmanaged(&opts, execution, &system_prompt, &provenance, &pm, false);
     }
 
     let (system_prompt, provenance) = local_single_shot_system_prompt(&opts, &resolved)?;
@@ -5061,17 +5077,24 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
     );
 
     // (#2344) See the error arm above — stop the beat before the terminal.
-    // (#3445) As in `dispatch_unmanaged`: an empty answer at the cap fails.
-    close_answered_call(
+    // (#3445) Unlike `dispatch_unmanaged`, an empty answer at the cap
+    // completes here: this path's one caller is radio's answering seat (on
+    // this machine, or a peer's `single_shot` job), which refuses an empty
+    // answer itself, naming the setting that raises its cap.
+    finish_single_call(
         &mut session_emitter,
         &mut bookend,
-        |payload| build_unmanaged_record(&opts.role_id, session, execution, &model_id, phase, payload),
-        &reply,
-        complete_payload,
-        req.max_tokens,
-        opts.lab_inputs.is_none(),
-    )
-    .map(|()| DispatchResult {
+        build_unmanaged_record(
+            &opts.role_id,
+            session,
+            execution,
+            &model_id,
+            phase,
+            darkmux_flow::Payload::DispatchComplete(complete_payload),
+        ),
+    );
+
+    Ok(DispatchResult {
         exit_code: 0,
         stdout: reply.content,
         stderr: String::new(),
@@ -6447,7 +6470,8 @@ fn route_hosted_or_container(
                 // still covers this guard.
                 bail!(resume_from_bare_hosted_refusal(&opts.role_id));
             }
-            return dispatch_unmanaged(opts, execution, &system_prompt, &provenance, &pm).map(ControlFlow::Break);
+            return dispatch_unmanaged(opts, execution, &system_prompt, &provenance, &pm, opts.lab_inputs.is_none())
+                .map(ControlFlow::Break);
         }
     }
     Ok(ControlFlow::Continue(ContainerBrain { agentic_pm, managed_pm }))
