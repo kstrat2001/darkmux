@@ -4421,6 +4421,57 @@ pub(crate) fn single_call_complete(tokens: &crate::dispatch_envelope::DirectToke
     }
 }
 
+/// The terminal of a single-shot dispatch whose call answered: `complete` as
+/// `dispatch.complete`, unless (#3445) the call stopped at its output `cap`
+/// with no answer
+/// ([`SingleShotReply::hit_cap_with_no_answer`](crate::single_shot::SingleShotReply::hit_cap_with_no_answer)).
+/// That is a failed dispatch, never a clean one whose result is empty: the
+/// terminal is `dispatch.error`, keeping the call's counts, wall time and
+/// endpoint (the tokens were spent), and the error, which names the cap and
+/// both ways to raise it, is returned. `record` builds the path's record.
+///
+/// `fails_at_cap` is false for a lab dispatch (`DispatchOpts::lab_inputs`):
+/// a lab run records the reply as it came, so its grading reads the empty
+/// answer and the `length` finish, and the run keeps its manifest (a lab
+/// dispatch that errors writes none).
+fn close_answered_call<S: darkmux_flow::BookendSink + ?Sized>(
+    session_emitter: &mut Option<darkmux_flow::session_presence::SessionEmitter>,
+    bookend: &mut darkmux_flow::BookendGuard<'_, S>,
+    record: impl Fn(darkmux_flow::Payload) -> darkmux_flow::FlowRecord,
+    reply: &crate::single_shot::SingleShotReply,
+    complete: DispatchEndPayload,
+    cap: u32,
+    fails_at_cap: bool,
+) -> Result<()> {
+    if fails_at_cap && reply.hit_cap_with_no_answer() {
+        let e = cap_hit_error(
+            cap,
+            complete.completion_tokens,
+            "set `max_completion_tokens` in the mission step's config, or pass `darkmux dispatch --max-completion-tokens <n>`",
+        );
+        let failed = DispatchEndPayload {
+            result_class: Some(ResultClass::Error),
+            exit_code: None,
+            error: Some(e.to_string()),
+            ..complete
+        };
+        finish_single_call(session_emitter, bookend, record(darkmux_flow::Payload::DispatchError(failed)));
+        return Err(e);
+    }
+    finish_single_call(session_emitter, bookend, record(darkmux_flow::Payload::DispatchComplete(complete)));
+    Ok(())
+}
+
+/// (#3445) The error of a direct model call that stopped at its output cap of
+/// `cap` with no answer; `raise` is how this caller's cap is raised.
+pub(crate) fn cap_hit_error(cap: u32, completion_tokens: Option<u64>, raise: &str) -> anyhow::Error {
+    let spent = completion_tokens.map(|n| format!(" after {n} completion tokens")).unwrap_or_default();
+    anyhow!(
+        "the model stopped at its output cap of {cap} tokens{spent} without writing an answer (finish_reason: length); \
+         a reasoning model can spend the whole cap thinking. Raise the cap: {raise}"
+    )
+}
+
 /// The hosted single-shot dispatch (#1177). Precondition: `target` is an
 /// unmanaged endpoint (`try_resolve_unmanaged_target`).
 fn dispatch_unmanaged(
@@ -4625,7 +4676,6 @@ fn dispatch_unmanaged(
         &budget_caller,
     );
 
-
     // (#1444) The counts and the one-turn shape are owned by `single_call_complete`,
     // so this producer, the local one and the step kinds cannot drift apart.
     let complete_payload = DispatchEndPayload {
@@ -4634,18 +4684,17 @@ fn dispatch_unmanaged(
     };
 
     // (#2344) See the error arm above — the call is done, so the session is
-    // no longer running; stop the beat before the terminal record.
-    finish_single_call(
+    // no longer running; stop the beat before the terminal record. (#3445)
+    // An empty answer at the cap ends it in `dispatch.error`, after the usage
+    // record and the budget settle above: the call was made, its tokens spent.
+    let answered = close_answered_call(
         &mut session_emitter,
         &mut bookend,
-        build_unmanaged_record(
-            &opts.role_id,
-            session,
-            execution,
-            &pm.id,
-            phase,
-            darkmux_flow::Payload::DispatchComplete(complete_payload),
-        ),
+        |payload| build_unmanaged_record(&opts.role_id, session, execution, &pm.id, phase, payload),
+        &reply,
+        complete_payload,
+        single_shot_cap(opts.max_completion_tokens, ep.reasoning_effort.as_deref()),
+        opts.lab_inputs.is_none(),
     );
 
     let stdout = if opts.json {
@@ -4674,7 +4723,7 @@ fn dispatch_unmanaged(
         reply.content
     };
 
-    Ok(DispatchResult {
+    answered.map(|()| DispatchResult {
         exit_code: 0,
         stdout,
         stderr: String::new(),
@@ -5012,20 +5061,17 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
     );
 
     // (#2344) See the error arm above — stop the beat before the terminal.
-    finish_single_call(
+    // (#3445) As in `dispatch_unmanaged`: an empty answer at the cap fails.
+    close_answered_call(
         &mut session_emitter,
         &mut bookend,
-        build_unmanaged_record(
-            &opts.role_id,
-            session,
-            execution,
-            &model_id,
-            phase,
-            darkmux_flow::Payload::DispatchComplete(complete_payload),
-        ),
-    );
-
-    Ok(DispatchResult {
+        |payload| build_unmanaged_record(&opts.role_id, session, execution, &model_id, phase, payload),
+        &reply,
+        complete_payload,
+        req.max_tokens,
+        opts.lab_inputs.is_none(),
+    )
+    .map(|()| DispatchResult {
         exit_code: 0,
         stdout: reply.content,
         stderr: String::new(),

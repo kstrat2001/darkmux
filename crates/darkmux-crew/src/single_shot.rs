@@ -61,9 +61,20 @@ pub struct SingleShotReply {
     /// one field from another, in either direction.
     pub counts: darkmux_trajectory::UsageCounts,
     pub model: Option<String>,
+    /// The reply's `choices[0].finish_reason` as sent (a Messages reply's
+    /// `stop_reason` arrives already mapped, `max_tokens` as `length`).
+    pub finish_reason: Option<String>,
 }
 
 impl SingleShotReply {
+    /// (#3445) The model stopped at the output cap before writing any answer:
+    /// `finish_reason: "length"` with empty content, which is what a reasoning
+    /// model that spent the whole cap thinking returns. A reply cut off with
+    /// some answer in it is not this.
+    pub fn hit_cap_with_no_answer(&self) -> bool {
+        self.finish_reason.as_deref() == Some("length") && self.content.trim().is_empty()
+    }
+
     /// (#2902 step 1a) The shared reply seam's usage record: this call's
     /// canonical `telemetry.tokens` payload, through the one writer
     /// ([`crate::usage::usage_payload`]). `reported_model` is this reply's
@@ -349,7 +360,11 @@ pub(crate) fn extract_reply(resp: &serde_json::Value) -> SingleShotReply {
         .get("model")
         .and_then(|m| m.as_str())
         .map(str::to_string);
-    SingleShotReply { content, counts, model }
+    let finish_reason = resp
+        .pointer("/choices/0/finish_reason")
+        .and_then(|f| f.as_str())
+        .map(str::to_string);
+    SingleShotReply { content, counts, model, finish_reason }
 }
 
 #[cfg(test)]
@@ -693,6 +708,30 @@ mod tests {
         assert_eq!(reply.counts.prompt, Some(30));
         assert_eq!(reply.counts.completion, Some(12));
         assert_eq!(reply.model.as_deref(), Some("darkmux:qwen3.6-35b-a3b"));
+    }
+
+    /// (#3445) A cap hit with no answer is `length` plus no content: empty,
+    /// whitespace, or the field left out (some reasoning servers omit it).
+    /// Content at the cap, or an empty answer the model chose, is not one.
+    #[test]
+    fn hit_cap_with_no_answer_is_length_with_no_content() {
+        let reply = |body: &str| extract_reply(&serde_json::from_str(body).unwrap());
+        for body in [
+            r#"{"choices":[{"message":{"content":""},"finish_reason":"length"}]}"#,
+            r#"{"choices":[{"message":{"content":" \n "},"finish_reason":"length"}]}"#,
+            r#"{"choices":[{"message":{"reasoning":"..."},"finish_reason":"length"}]}"#,
+        ] {
+            let r = reply(body);
+            assert_eq!(r.finish_reason.as_deref(), Some("length"), "{body}");
+            assert!(r.hit_cap_with_no_answer(), "{body}");
+        }
+        for body in [
+            r#"{"choices":[{"message":{"content":"partial"},"finish_reason":"length"}]}"#,
+            r#"{"choices":[{"message":{"content":""},"finish_reason":"stop"}]}"#,
+            r#"{"choices":[{"message":{"content":""}}]}"#,
+        ] {
+            assert!(!reply(body).hit_cap_with_no_answer(), "{body}");
+        }
     }
 
     #[test]

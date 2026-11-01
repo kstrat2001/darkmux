@@ -20219,6 +20219,133 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         assert_eq!(p["endpoint"], start["payload"]["endpoint"], "the terminal names the endpoint the start named");
     }
 
+    /// One single-shot dispatch against a mock that answers `body`: hosted
+    /// (`dispatch_unmanaged`) or local (`dispatch_local_single_shot`), with
+    /// `cap` as the caller's `max_completion_tokens` and `lab` as its
+    /// `lab_inputs`. Returns the result and the session's flow records.
+    fn single_shot_against(
+        body: &'static str,
+        local: bool,
+        cap: Option<u32>,
+        lab: Option<crate::dispatch::LabInputs>,
+    ) -> (Result<DispatchResult>, Vec<serde_json::Value>) {
+        let (base_url, _rx) = one_shot_http_mock(body);
+        let home = TempDir::new().unwrap();
+        let flows_dir = TempDir::new().unwrap();
+        let keys = ["DARKMUX_HOME", "DARKMUX_FLOWS_DIR", "DARKMUX_REDIS_URL"];
+        let prev: Vec<Option<String>> = keys.iter().map(|k| std::env::var(k).ok()).collect();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", home.path());
+            std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
+            std::env::remove_var("DARKMUX_REDIS_URL");
+        }
+        let session = format!("single-shot-cap-{local}-{}", std::process::id());
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.role_id = "pr-reviewer".to_string();
+        opts.session = crate::test_session(&session);
+        opts.phase_id = None;
+        opts.max_completion_tokens = cap;
+        opts.lab_inputs = lab;
+        let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
+        let result = if local {
+            let pf = home.path().join("profiles.json");
+            std::fs::write(
+                &pf,
+                r#"{"profiles":{"local":{"models":[{"id":"m","n_ctx":8192,"endpoint":"lms"}]}},
+                    "endpoints":{"lms":{"managed":"lmstudio"}},
+                    "default_profile":"local"}"#,
+            )
+            .unwrap();
+            opts.config_path = Some(pf.to_str().unwrap().to_string());
+            opts.model_base_url_override = Some(base_url);
+            crate::budget::with_test_env(env, || dispatch_local_single_shot(opts))
+        } else {
+            let pm = darkmux_types::ProfileModel::hosted_for_test("gpt-remote", None, serde_json::json!({"url": base_url}));
+            crate::budget::with_test_env(env, || {
+                dispatch_unmanaged(
+                    &opts,
+                    &darkmux_types::execution_id::ExecutionId::mint(),
+                    "system prompt",
+                    &Default::default(),
+                    &crate::target::target_for("p".into(), Default::default(), pm).unwrap(),
+                )
+            })
+        };
+        let records = drain_flow_records_for_session(flows_dir.path(), &crate::test_session(&session));
+        unsafe {
+            for (k, v) in keys.iter().zip(prev) {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        (result, records)
+    }
+
+    const CAP_HIT_EMPTY: &str = r#"{"choices":[{"message":{"content":"","reasoning":"thinking..."},"finish_reason":"length"}],"usage":{"prompt_tokens":900,"completion_tokens":4096,"total_tokens":4996}}"#;
+
+    /// (#3445) A single-shot reply that stopped at the output cap with no
+    /// answer is a failed dispatch, on both paths: one `dispatch.error` (no
+    /// `dispatch.complete`), an error naming the cap it hit and both ways to
+    /// raise it, and still the call's usage record, since the tokens were spent.
+    #[test]
+    #[serial]
+    fn a_single_shot_that_hits_its_cap_with_no_answer_fails_naming_the_cap() {
+        for (local, cap, cap_text) in [(false, None, "4096"), (true, None, "4096"), (false, Some(2000), "2000"), (true, Some(2000), "2000")] {
+            let (result, records) = single_shot_against(CAP_HIT_EMPTY, local, cap, None);
+            let what = format!("local={local} cap={cap:?}");
+            let err = result.expect_err(&format!("{what}: an empty answer at the cap fails the dispatch"));
+            let msg = err.to_string();
+            assert!(msg.contains(cap_text), "{what}: names the cap it hit: {msg}");
+            assert!(msg.contains("max_completion_tokens") && msg.contains("--max-completion-tokens"), "{what}: names both remedies: {msg}");
+            let actions: Vec<&str> = records.iter().filter_map(|r| r["action"].as_str()).collect();
+            assert!(!actions.contains(&"dispatch.complete"), "{what}: {actions:?}");
+            let terminals: Vec<&serde_json::Value> = records.iter().filter(|r| r["action"] == "dispatch.error").collect();
+            assert_eq!(terminals.len(), 1, "{what}: exactly one error terminal: {actions:?}");
+            assert_eq!(terminals[0]["payload"]["error"], msg, "{what}: the terminal carries the error the caller got");
+            let rec = crate::usage::assert_one_usage_record(&records, crate::usage::CallKind::SingleShot, &what);
+            assert_eq!(rec["payload"]["completion_tokens"], 4096, "{what}: {rec}");
+        }
+    }
+
+    /// (#3445, the inverted case) A reply cut off at the cap that still
+    /// carries an answer, and an empty answer the model ended on its own, are
+    /// both left as they were: completed dispatches.
+    #[test]
+    #[serial]
+    fn a_single_shot_cut_off_with_an_answer_or_empty_by_choice_still_completes() {
+        const CUT_OFF: &str = r#"{"choices":[{"message":{"content":"partial answer"},"finish_reason":"length"}],"usage":{"total_tokens":10}}"#;
+        const EMPTY_STOP: &str = r#"{"choices":[{"message":{"content":""},"finish_reason":"stop"}],"usage":{"total_tokens":10}}"#;
+        for body in [CUT_OFF, EMPTY_STOP] {
+            for local in [false, true] {
+                let (result, records) = single_shot_against(body, local, None, None);
+                result.unwrap_or_else(|e| panic!("local={local} {body}: {e}"));
+                assert!(records.iter().any(|r| r["action"] == "dispatch.complete"), "local={local} {body}");
+                assert!(!records.iter().any(|r| r["action"] == "dispatch.error"), "local={local} {body}");
+            }
+        }
+    }
+
+    /// (#3445) A lab dispatch keeps the reply as it came: an empty answer at
+    /// the cap completes, its envelope carrying the `length` finish and the
+    /// empty answer for the lab's grading, since a lab dispatch that errors
+    /// writes no run manifest at all.
+    #[test]
+    #[serial]
+    fn a_lab_single_shot_that_hits_its_cap_still_completes_for_grading() {
+        for local in [false, true] {
+            let (result, records) = single_shot_against(CAP_HIT_EMPTY, local, None, Some(crate::dispatch::LabInputs::Builtin));
+            let out = result.unwrap_or_else(|e| panic!("local={local}: {e}"));
+            assert!(records.iter().any(|r| r["action"] == "dispatch.complete"), "local={local}");
+            assert!(!records.iter().any(|r| r["action"] == "dispatch.error"), "local={local}");
+            if !local {
+                let env: serde_json::Value = serde_json::from_str(&out.stdout).expect("the hosted envelope");
+                assert_eq!((env["metrics"]["finish_reason"].as_str(), env["final_assistant"].as_str()), (Some("length"), Some("")), "{env}");
+            }
+        }
+    }
+
     /// A reply with no prompt count has an unknown spend: the step settles
     /// the granted cap plus the prompt it sent, and the usage record carries
     /// no total.
