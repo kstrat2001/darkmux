@@ -4428,12 +4428,13 @@ pub(crate) fn single_call_complete(tokens: &crate::dispatch_envelope::DirectToke
 /// That is a failed dispatch, never a clean one whose result is empty: the
 /// terminal is `dispatch.error`, keeping the call's counts, wall time and
 /// endpoint (the tokens were spent), and the error, which names the cap and
-/// how to raise it (`raise`), is returned. `record` builds the path's record.
+/// how to raise it (the `fails_at_cap` remedy), is returned. `record` builds
+/// the path's record.
 ///
-/// `fails_at_cap` is false for a lab dispatch (`DispatchOpts::lab_inputs`):
+/// `fails_at_cap` is `None` for a lab dispatch (`DispatchOpts::lab_inputs`):
 /// a lab run records the reply as it came, so its grading reads the empty
 /// answer and the `length` finish, and the run keeps its manifest (a lab
-/// dispatch that errors writes none). It is false too for radio's answering
+/// dispatch that errors writes none). It is `None` too for radio's answering
 /// seat (`dispatch_local_single_shot`), which refuses an empty answer itself.
 fn close_answered_call<S: darkmux_flow::BookendSink + ?Sized>(
     session_emitter: &mut Option<darkmux_flow::session_presence::SessionEmitter>,
@@ -4442,10 +4443,9 @@ fn close_answered_call<S: darkmux_flow::BookendSink + ?Sized>(
     reply: &crate::single_shot::SingleShotReply,
     complete: DispatchEndPayload,
     cap: u32,
-    fails_at_cap: bool,
-    raise: &str,
+    fails_at_cap: Option<&str>,
 ) -> Result<()> {
-    if fails_at_cap && reply.hit_cap_with_no_answer() {
+    if let Some(raise) = fails_at_cap.filter(|_| reply.hit_cap_with_no_answer()) {
         let e = cap_hit_error(cap, complete.completion_tokens, raise);
         let failed = DispatchEndPayload {
             result_class: Some(ResultClass::Error),
@@ -4708,8 +4708,7 @@ fn dispatch_unmanaged(
         &reply,
         complete_payload,
         single_shot_cap(opts.max_completion_tokens, ep.reasoning_effort.as_deref()),
-        fails_at_cap,
-        hosted_cap_remedy(opts),
+        fails_at_cap.then(|| hosted_cap_remedy(opts)),
     );
 
     let stdout = if opts.json {
