@@ -1552,13 +1552,41 @@ async fn preview_start_handler(
     tokio::task::spawn_blocking(move || {
         let dir = match workspace_dir(&st, &name) {
             Ok(d) => d,
-            Err(r) => return r,
+            Err(r) => {
+                eprintln!("{}", preview_log_line(&name, "start", "no such workspace"));
+                return r;
+            }
         };
+        let status_of = |v: &serde_json::Value| v["status"].as_str().unwrap_or("?").to_string();
         match st.previews.start(&name, &dir) {
-            Ok((v, true)) => Json(v).into_response(),
-            Ok((v, false)) => (StatusCode::ACCEPTED, Json(v)).into_response(),
-            Err(e) if e.contains("no .darkmux/preview.json") => err(StatusCode::NOT_FOUND, e),
-            Err(e) => err(StatusCode::UNPROCESSABLE_ENTITY, e),
+            Ok((v, true)) => {
+                eprintln!(
+                    "{}",
+                    preview_log_line(&name, "start", &format!("already {} (200)", status_of(&v)))
+                );
+                Json(v).into_response()
+            }
+            Ok((v, false)) => {
+                eprintln!(
+                    "{}",
+                    preview_log_line(&name, "start", &format!("{} (202)", status_of(&v)))
+                );
+                (StatusCode::ACCEPTED, Json(v)).into_response()
+            }
+            Err(e) if e.contains("no .darkmux/preview.json") => {
+                eprintln!(
+                    "{}",
+                    preview_log_line(&name, "start", "no preview recipe (404)")
+                );
+                err(StatusCode::NOT_FOUND, e)
+            }
+            Err(e) => {
+                eprintln!(
+                    "{}",
+                    preview_log_line(&name, "start", &format!("refused (422): {e}"))
+                );
+                err(StatusCode::UNPROCESSABLE_ENTITY, e)
+            }
         }
     })
     .await
@@ -1573,11 +1601,44 @@ async fn preview_status_handler(
     if let Err(r) = authenticate(&state, &headers) {
         return r;
     }
-    match state.previews.status(&name) {
+    let status = state.previews.status(&name);
+    let now = status
+        .as_ref()
+        .map(|v| v["status"].as_str().unwrap_or("?").to_string())
+        .unwrap_or_else(|| "none running (404)".to_string());
+    // The app polls every second: log a status only when it changes.
+    if PREVIEW_LOG_SEEN.changed(&name, &now) {
+        eprintln!("{}", preview_log_line(&name, "status", &now));
+    }
+    match status {
         Some(v) => Json(v).into_response(),
         None => err(StatusCode::NOT_FOUND, format!("no preview for {name}")),
     }
 }
+
+/// One stderr line per preview request worth seeing in the serve log.
+fn preview_log_line(workspace: &str, request: &str, outcome: &str) -> String {
+    format!("darkmux client serve: preview {workspace}: {request} → {outcome}")
+}
+
+/// The last preview status logged per workspace.
+#[derive(Default)]
+struct PreviewLogSeen(Mutex<HashMap<String, String>>);
+
+impl PreviewLogSeen {
+    /// True when `status` differs from the last one seen for `workspace`.
+    fn changed(&self, workspace: &str, status: &str) -> bool {
+        let mut seen = self.0.lock().unwrap();
+        if seen.get(workspace).map(String::as_str) == Some(status) {
+            return false;
+        }
+        seen.insert(workspace.to_string(), status.to_string());
+        true
+    }
+}
+
+static PREVIEW_LOG_SEEN: std::sync::LazyLock<PreviewLogSeen> =
+    std::sync::LazyLock::new(PreviewLogSeen::default);
 
 async fn preview_stop_handler(
     State(state): State<ClientServerState>,
