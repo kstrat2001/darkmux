@@ -289,6 +289,29 @@ pub fn find_worktree_of(base: &Path, common: &Path, bot: &str) -> Option<String>
     })
 }
 
+/// The remote default branch to start new work from, as a ref that
+/// exists in the checkout: `origin/HEAD`, else `origin/main`, else
+/// `origin/master`; `None` when the checkout has no remote branches.
+pub fn remote_default(dir: &Path) -> Option<String> {
+    if let Some(r) = git_out(dir, &["rev-parse", "--abbrev-ref", "origin/HEAD"]) {
+        if r.starts_with("origin/") && r != "origin/HEAD" {
+            return Some(r);
+        }
+    }
+    ["origin/main", "origin/master"].into_iter().find_map(|r| {
+        git_out(
+            dir,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/remotes/{r}"),
+            ],
+        )
+        .map(|_| r.to_string())
+    })
+}
+
 /// `git worktree add -b <branch> <dest> <commit>` from `source`, with the
 /// repo's hooks off (an app asked for this, not the owner at a terminal).
 pub fn add_worktree(source: &Path, branch: &str, dest: &Path, commit: &str) -> Result<(), String> {
