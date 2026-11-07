@@ -230,7 +230,7 @@ fn bearer(token: &str) -> String {
 /// (it is ignored).
 fn pair_body() -> Value {
     serde_json::json!({
-        "device_name": "Kain's iPhone",
+        "device_name": "Sam's iPhone",
         "code": "4F7-K2Q",
         "pair_secret": SECRET,
         "scopes": {"profiles": ["fast"], "workspace": false},
@@ -273,7 +273,7 @@ async fn pairing_happy_path_delivers_a_token_that_whoami_accepts() {
 
     let pending = list_pending(&h.store, (h.state.now)()).unwrap();
     assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].device_name, "Kain's iPhone");
+    assert_eq!(pending[0].device_name, "Sam's iPhone");
     assert_eq!(pending[0].code, "4F7-K2Q");
 
     let name = approve(&h.store, &id, (h.state.now)()).unwrap();
@@ -693,8 +693,8 @@ fn an_absent_store_reads_as_empty() {
 
 #[test]
 fn client_names_are_slugs_and_unique() {
-    let taken = vec!["kain-s-iphone".to_string()];
-    assert_eq!(client_name_for("Kain's iPhone", &taken), "kain-s-iphone-2");
+    let taken = vec!["sam-s-iphone".to_string()];
+    assert_eq!(client_name_for("Sam's iPhone", &taken), "sam-s-iphone-2");
     assert_eq!(client_name_for("!!!", &[]), "client");
 }
 
