@@ -1366,14 +1366,29 @@ fn worktree_workspace(
     };
     let branch = format!("mux/{bot}-{short}");
     let dest = base.join(&name);
-    if let Err(e) = ws::add_worktree(&source, &branch, &dest, git_ref.unwrap_or("HEAD")) {
+    // Start from the remote's default branch as it is now, not from wherever
+    // the owner's checkout happens to be. The fetch moves remote-tracking
+    // refs only; the owner's branch, index and files are never touched.
+    let fetch_error = (state.fetch_repo)(&source).err();
+    let start = git_ref
+        .map(str::to_string)
+        .or_else(|| ws::remote_default(&source))
+        .unwrap_or_else(|| "HEAD".to_string());
+    if let Err(e) = ws::add_worktree(&source, &branch, &dest, &start) {
         return err(
             StatusCode::UNPROCESSABLE_ENTITY,
             format!("adding a worktree of {}: {e}", source.display()),
         );
     }
     match workspace_dir(state, &name) {
-        Ok(dir) => (StatusCode::CREATED, Json(workspace_json(&name, &dir, true))).into_response(),
+        Ok(dir) => {
+            let mut v = workspace_json(&name, &dir, true);
+            v["from"] = start.into();
+            if let Some(e) = fetch_error {
+                v["fetch_error"] = e.into();
+            }
+            (StatusCode::CREATED, Json(v)).into_response()
+        }
         Err(r) => r,
     }
 }

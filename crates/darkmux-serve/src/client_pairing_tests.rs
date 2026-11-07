@@ -130,8 +130,29 @@ fn harness() -> Harness {
             run_git(Some(dest), &["remote", "set-url", "origin", url]);
             Ok(())
         }),
+        // Records every fetch; a checkout whose origin is a local path (a
+        // test fixture) is really fetched, so refs move as they would.
         fetch_repo: Arc::new(move |d| {
             fe.lock().unwrap().push(d.to_path_buf());
+            let origin = std::process::Command::new("git")
+                .arg("-C")
+                .arg(d)
+                .args(["remote", "get-url", "origin"])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+            if origin.starts_with('/') {
+                let ok = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(d)
+                    .args(["fetch", "--quiet", "origin"])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if !ok {
+                    return Err("fetch failed".into());
+                }
+            }
             Ok(())
         }),
         workspace_lock: Arc::new(Mutex::new(())),
@@ -2171,4 +2192,68 @@ async fn a_source_path_must_be_the_top_of_a_real_checkout_outside_the_base() {
         .map(|e| e.file_name())
         .collect();
     assert_eq!(names.len(), 2, "only wt1 and inside: {names:?}");
+}
+
+#[tokio::test]
+async fn a_local_checkout_worktree_starts_from_the_freshly_fetched_default_branch() {
+    let h = harness();
+    let token = paired(&h).await;
+    // The owner's checkout: cloned from "upstream", now on a feature branch
+    // with an extra commit and an uncommitted edit.
+    let upstream = h.dir.path().join("upstream");
+    fixture_repo(&upstream);
+    let mine = h.dir.path().join("site");
+    run_git(
+        None,
+        &[
+            "clone",
+            "--quiet",
+            upstream.to_str().unwrap(),
+            mine.to_str().unwrap(),
+        ],
+    );
+    run_git(Some(&mine), &["checkout", "--quiet", "-b", "feature"]);
+    std::fs::write(mine.join("feature.txt"), "wip\n").unwrap();
+    run_git(Some(&mine), &["add", "."]);
+    run_git(Some(&mine), &["commit", "--quiet", "-m", "feature work"]);
+    std::fs::write(mine.join("README.md"), "uncommitted\n").unwrap();
+    // Meanwhile a PR merges upstream.
+    std::fs::write(upstream.join("merged.txt"), "from the PR\n").unwrap();
+    run_git(Some(&upstream), &["add", "."]);
+    run_git(Some(&upstream), &["commit", "--quiet", "-m", "merge #9"]);
+
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"source_path": mine.to_str(), "bot": "hcr"}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 201, "{v}");
+    let ws = h.base.join(v["workspace"].as_str().unwrap());
+    assert!(
+        ws.join("merged.txt").exists(),
+        "starts from the fetched default branch"
+    );
+    assert!(
+        !ws.join("feature.txt").exists(),
+        "not from the checkout's feature branch"
+    );
+    // The owner's checkout is untouched: branch, files, uncommitted edit.
+    assert_eq!(
+        run_git(Some(&mine), &["branch", "--show-current"]),
+        "feature"
+    );
+    assert_eq!(
+        std::fs::read_to_string(mine.join("README.md")).unwrap(),
+        "uncommitted\n"
+    );
+    assert!(!mine.join("merged.txt").exists());
+    assert_eq!(
+        h.fetched.lock().unwrap().len(),
+        1,
+        "the checkout was fetched (refs only)"
+    );
 }
