@@ -498,6 +498,8 @@ pub struct ClientServerState {
     pub fetch_repo: Arc<dyn Fn(&Path) -> Result<(), String> + Send + Sync>,
     /// One workspace creation at a time, so two requests never race for a name.
     pub workspace_lock: Arc<Mutex<()>>,
+    /// Workspaces' live previews (dev servers from `.darkmux/preview.json`).
+    pub previews: Arc<crate::client_preview::Previews>,
 }
 
 impl ClientServerState {
@@ -545,6 +547,7 @@ impl ClientServerState {
             clone_repo: Arc::new(crate::client_workspace::clone_with_git),
             fetch_repo: Arc::new(crate::client_workspace::fetch_with_git),
             workspace_lock: Arc::new(Mutex::new(())),
+            previews: Arc::new(crate::client_preview::Previews::production()),
         })
     }
 }
@@ -634,6 +637,12 @@ pub fn router(state: ClientServerState) -> Router {
         .route("/client/recipe", get(recipe_handler))
         .route("/client/workspaces", post(workspace_create_handler))
         .route("/client/workspaces/:name", get(workspace_status_handler))
+        .route(
+            "/client/workspaces/:name/preview",
+            post(preview_start_handler)
+                .get(preview_status_handler)
+                .delete(preview_stop_handler),
+        )
         .fallback(|| async { err(StatusCode::NOT_FOUND, "no such route") })
         .method_not_allowed_fallback(|| async {
             err(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
@@ -1423,6 +1432,67 @@ fn worktree_workspace(
             (StatusCode::CREATED, Json(v)).into_response()
         }
         Err(r) => r,
+    }
+}
+
+/// `POST /client/workspaces/{name}/preview`: runs the workspace's dev
+/// server from its `.darkmux/preview.json` on free ports. 202 while it
+/// starts, 200 when it was already running; poll GET for `ready` and `url`.
+async fn preview_start_handler(
+    State(state): State<ClientServerState>,
+    UrlPath(name): UrlPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = authenticate(&state, &headers) {
+        return r;
+    }
+    let st = state.clone();
+    tokio::task::spawn_blocking(move || {
+        let dir = match workspace_dir(&st, &name) {
+            Ok(d) => d,
+            Err(r) => return r,
+        };
+        match st.previews.start(&name, &dir) {
+            Ok((v, true)) => Json(v).into_response(),
+            Ok((v, false)) => (StatusCode::ACCEPTED, Json(v)).into_response(),
+            Err(e) if e.contains("no .darkmux/preview.json") => err(StatusCode::NOT_FOUND, e),
+            Err(e) => err(StatusCode::UNPROCESSABLE_ENTITY, e),
+        }
+    })
+    .await
+    .unwrap_or_else(|e| internal(anyhow!("preview start panicked: {e}")))
+}
+
+async fn preview_status_handler(
+    State(state): State<ClientServerState>,
+    UrlPath(name): UrlPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = authenticate(&state, &headers) {
+        return r;
+    }
+    match state.previews.status(&name) {
+        Some(v) => Json(v).into_response(),
+        None => err(StatusCode::NOT_FOUND, format!("no preview for {name}")),
+    }
+}
+
+async fn preview_stop_handler(
+    State(state): State<ClientServerState>,
+    UrlPath(name): UrlPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = authenticate(&state, &headers) {
+        return r;
+    }
+    let st = state.clone();
+    let stopped = tokio::task::spawn_blocking(move || st.previews.stop(&name))
+        .await
+        .unwrap_or(false);
+    if stopped {
+        Json(serde_json::json!({"status": "stopped"})).into_response()
+    } else {
+        not_found()
     }
 }
 
