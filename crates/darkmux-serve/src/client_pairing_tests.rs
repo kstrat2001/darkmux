@@ -3095,3 +3095,25 @@ async fn changes_needs_a_token_and_a_workspace_with_a_remote_default() {
     .await;
     assert_eq!(code, 409, "{v}");
 }
+
+// ---- preview request logging -------------------------------------------
+
+#[test]
+fn preview_log_names_the_workspace_and_outcome() {
+    assert_eq!(
+        preview_log_line("hcr", "start", "starting (202)"),
+        "darkmux client serve: preview hcr: start → starting (202)"
+    );
+}
+
+#[test]
+fn preview_status_is_logged_only_when_it_changes() {
+    let seen = PreviewLogSeen::default();
+    assert!(seen.changed("hcr-a", "starting"));
+    assert!(
+        !seen.changed("hcr-a", "starting"),
+        "a poll that changed nothing stays quiet"
+    );
+    assert!(seen.changed("hcr-a", "ready"));
+    assert!(seen.changed("hcr-b", "starting"), "per workspace");
+}
