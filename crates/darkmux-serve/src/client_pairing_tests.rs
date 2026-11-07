@@ -2294,15 +2294,22 @@ fn git_workspace(h: &Harness, name: &str) -> PathBuf {
 }
 
 async fn run_in(h: &Harness, token: &str, workspace: &str, message: &str) -> String {
-    let (code, v) = call(
-        h,
-        post(
-            "/client/work",
-            Some(token),
-            serde_json::json!({"role": "coder", "message": message, "workspace": workspace}),
-        ),
-    )
-    .await;
+    run_after(h, token, workspace, message, None).await
+}
+
+/// A run that continues `continues` (a Tweak) when given.
+async fn run_after(
+    h: &Harness,
+    token: &str,
+    workspace: &str,
+    message: &str,
+    continues: Option<&str>,
+) -> String {
+    let mut body = serde_json::json!({"role": "coder", "message": message, "workspace": workspace});
+    if let Some(c) = continues {
+        body["continues"] = c.into();
+    }
+    let (code, v) = call(h, post("/client/work", Some(token), body)).await;
     assert_eq!(code, 202, "{v}");
     let id = v["work_id"].as_str().unwrap().to_string();
     let _ = wait_done(h, token, &id).await;
@@ -2371,7 +2378,7 @@ async fn discard_puts_back_what_the_run_changed_and_nothing_else() {
     let wt = git_workspace(&h, "site");
     std::fs::write(wt.join("README.md"), "the owner's uncommitted readme\n").unwrap();
     let id = run_in(&h, &token, "site", "edit-readme").await;
-    let id2 = run_in(&h, &token, "site", "edit").await;
+    let id2 = run_after(&h, &token, "site", "edit", Some(&id)).await;
     let (code, v) = call(
         &h,
         post(
@@ -2417,8 +2424,8 @@ async fn a_tweak_keeps_everything_since_the_first_run() {
     let h = harness();
     let token = paired(&h).await;
     let wt = git_workspace(&h, "site");
-    let _first = run_in(&h, &token, "site", "edit-readme").await;
-    let second = run_in(&h, &token, "site", "edit-other").await;
+    let first = run_in(&h, &token, "site", "edit-readme").await;
+    let second = run_after(&h, &token, "site", "edit-other", Some(&first)).await;
     let (_, done) = call(
         &h,
         get(
@@ -2895,4 +2902,129 @@ async fn a_preview_ends_when_darkmux_does() {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     assert!(gone, "the preview outlived darkmux");
+}
+
+#[tokio::test]
+async fn a_new_run_is_refused_while_the_work_copy_has_undecided_changes() {
+    let h = harness();
+    let token = paired(&h).await;
+    git_workspace(&h, "site");
+    let first = run_in(&h, &token, "site", "edit-readme").await;
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/work",
+            Some(&token),
+            serde_json::json!({"role": "coder", "message": "edit-other", "workspace": "site"}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 409, "{v}");
+    assert!(
+        v["error"].as_str().unwrap().contains(&first),
+        "names the waiting run: {v}"
+    );
+    let (code, v) = call(
+        &h,
+        post(
+            &format!("/client/work/{first}/discard"),
+            Some(&token),
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 200, "{v}");
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/work",
+            Some(&token),
+            serde_json::json!({"role": "coder", "message": "edit-other", "workspace": "site"}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 202, "{v}");
+}
+
+#[tokio::test]
+async fn a_new_run_after_a_no_change_run_starts_fresh_and_folds_nothing() {
+    let h = harness();
+    let token = paired(&h).await;
+    git_workspace(&h, "site");
+    let quiet = run_in(&h, &token, "site", "hello").await;
+    let next = run_in(&h, &token, "site", "edit-readme").await;
+    let (_, done) = call(
+        &h,
+        get(
+            &format!("/client/work/{next}"),
+            &[("authorization", &bearer(&token))],
+        ),
+    )
+    .await;
+    let paths: Vec<&str> = done["changes"]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, vec!["README.md"]);
+    let (code, v) = call(
+        &h,
+        post(
+            &format!("/client/work/{quiet}/discard"),
+            Some(&token),
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 200, "the quiet run wasn't folded: {v}");
+}
+
+#[tokio::test]
+async fn continues_must_name_this_clients_undecided_run_in_the_same_work_copy() {
+    let h = harness();
+    let token = paired(&h).await;
+    git_workspace(&h, "site");
+    let first = run_in(&h, &token, "site", "edit-readme").await;
+    for (ws, cont) in [("site", "w-nope"), ("wt1", first.as_str())] {
+        let (code, v) = call(&h, post("/client/work", Some(&token), serde_json::json!({"role": "coder", "message": "edit", "workspace": ws, "continues": cont}))).await;
+        assert_eq!(code, 409, "{ws} {cont}: {v}");
+    }
+}
+
+#[tokio::test]
+async fn a_second_run_cant_start_while_one_is_working_in_the_same_copy() {
+    let h = harness();
+    let token = paired(&h).await;
+    git_workspace(&h, "site");
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/work",
+            Some(&token),
+            serde_json::json!({"role": "coder", "message": "wait", "workspace": "site"}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 202, "{v}");
+    let busy = v["work_id"].as_str().unwrap().to_string();
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/work",
+            Some(&token),
+            serde_json::json!({"role": "coder", "message": "hello", "workspace": "site"}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 409, "{v}");
+    call(
+        &h,
+        post(
+            &format!("/client/work/{busy}/cancel"),
+            Some(&token),
+            serde_json::json!({}),
+        ),
+    )
+    .await;
 }

@@ -462,6 +462,8 @@ pub struct WorkEntry {
     pub baseline: Option<String>,
     /// Kept, discarded, or folded into a later run: decided once.
     pub decided: Option<String>,
+    /// The run this one continues (a Tweak), whose baseline it takes over.
+    pub continues: Option<String>,
 }
 
 /// (url, ref, dest) -> cloned, or why not.
@@ -892,6 +894,10 @@ struct WorkBody {
     /// A workspace name (`POST /client/workspaces`), in place of `workdir`.
     #[serde(default)]
     workspace: Option<String>,
+    /// A Tweak: the id of this client's finished, undecided run in the same
+    /// work copy that this run continues (its changes stay together).
+    #[serde(default)]
+    continues: Option<String>,
 }
 
 async fn work_handler(
@@ -938,22 +944,18 @@ async fn work_handler(
         // never reported as the run's change. A run in the same work copy
         // as this client's undecided finished run continues it (a tweak):
         // it inherits that run's baseline, and that run is folded into this.
-        let inherited = workdir.as_ref().and_then(|w| {
+        // A Tweak continues the run it names: it takes over that run's
+        // baseline (so its changes are cumulative) and that run is folded in.
+        // Any other run starts from the work copy as it is.
+        let inherited = {
             let mut works = works.lock().unwrap();
-            let me = works.get(&id).map(|e| e.client_name.clone())?;
-            let prior = works
-                .iter_mut()
-                .filter(|(k, e)| {
-                    **k != id
-                        && e.client_name == me
-                        && e.workdir.as_ref() == Some(w)
-                        && e.decided.is_none()
-                        && matches!(e.status, WorkStatus::Done { .. })
-                })
-                .max_by_key(|(_, e)| e.created)?;
-            prior.1.decided = Some(format!("folded into {id}"));
-            prior.1.baseline.clone()
-        });
+            let continues = works.get(&id).and_then(|e| e.continues.clone());
+            continues.and_then(|c| {
+                let prior = works.get_mut(&c)?;
+                prior.decided = Some(format!("folded into {id}"));
+                prior.baseline.clone()
+            })
+        };
         let baseline = inherited.or_else(|| workdir.as_deref().and_then(snapshot_tree));
         if let Some(e) = works.lock().unwrap().get_mut(&id) {
             e.baseline = baseline.clone();
@@ -1070,6 +1072,61 @@ fn admit(
             ),
         ));
     }
+    // One run at a time per work copy, and never two runs' uncommitted
+    // changes mixed: a new run waits until the last run's changes are kept
+    // or discarded; a Tweak names the run it continues.
+    if let Some(w) = &workdir {
+        if let Some((id, _)) = works
+            .iter()
+            .find(|(_, e)| e.workdir.as_ref() == Some(w) && matches!(e.status, WorkStatus::Running))
+        {
+            return Err(err(
+                StatusCode::CONFLICT,
+                format!("run {id} is already working in this work copy"),
+            ));
+        }
+        match &req.continues {
+            Some(c) => {
+                let ok = works.get(c).is_some_and(|e| {
+                    e.client_name == client.name
+                        && e.workdir.as_ref() == Some(w)
+                        && e.decided.is_none()
+                        && matches!(e.status, WorkStatus::Done { .. })
+                });
+                if !ok {
+                    return Err(err(
+                        StatusCode::CONFLICT,
+                        format!(
+                            "run {c} isn't a finished, undecided run of yours in this work copy"
+                        ),
+                    ));
+                }
+            }
+            None => {
+                let has_changes = |e: &WorkEntry| match &e.status {
+                    WorkStatus::Done {
+                        changes: Some(c), ..
+                    } => c["files"].as_array().is_some_and(|f| !f.is_empty()),
+                    _ => false,
+                };
+                if let Some((id, _)) = works.iter().find(|(_, e)| {
+                    e.workdir.as_ref() == Some(w) && e.decided.is_none() && has_changes(e)
+                }) {
+                    return Err(err(
+                        StatusCode::CONFLICT,
+                        format!(
+                            "run {id}'s changes in this work copy are still waiting: keep or discard them first, or continue that run"
+                        ),
+                    ));
+                }
+            }
+        }
+    } else if req.continues.is_some() {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "only a run in a work copy can continue another",
+        ));
+    }
     works.insert(
         work_id.clone(),
         WorkEntry {
@@ -1080,6 +1137,7 @@ fn admit(
             workdir: workdir.clone(),
             baseline: None,
             decided: None,
+            continues: req.continues.clone(),
         },
     );
     Ok(WorkSpec {
