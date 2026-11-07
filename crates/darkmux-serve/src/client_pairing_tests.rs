@@ -34,7 +34,9 @@ fn harness() -> Harness {
         now: Arc::new(move || c.load(Ordering::SeqCst)),
         role_known: Arc::new(|role| Ok(role == "coder" || role == "radio-host")),
         resolve_profile: Arc::new(|_role, profile| {
-            if profile == "fast" || profile == "deep" {
+            // `fast@studio` "resolves" here on purpose, so the `@` guard in
+            // `admit` is the only thing refusing it.
+            if profile == "fast" || profile == "deep" || profile == "fast@studio" {
                 Ok(())
             } else {
                 Err(format!("profile {profile} is not defined on this machine"))
@@ -175,6 +177,18 @@ async fn the_token_and_pair_secret_are_stored_only_as_hashes() {
     let text = std::fs::read_to_string(h.store.path()).unwrap();
     assert!(!text.contains(&token), "the token never reaches disk");
     assert!(!text.contains(SECRET), "the pair secret never reaches disk");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_store_that_existed_world_readable_is_tightened_to_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("clients.json");
+    std::fs::write(&path, "").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    ClientStore::at(path.clone()).read().unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
 }
 
 #[cfg(unix)]
