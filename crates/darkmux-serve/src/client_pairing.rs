@@ -457,6 +457,9 @@ pub struct WorkEntry {
     pub cancel: Arc<CancelFlag>,
 }
 
+/// (url, ref, dest) -> cloned, or why not.
+pub type CloneRepo = dyn Fn(&str, Option<&str>, &Path) -> Result<(), String> + Send + Sync;
+
 /// Everything the listener needs, injectable so tests drive the real router
 /// with a fake clock and a fake executor.
 #[derive(Clone)]
@@ -480,6 +483,14 @@ pub struct ClientServerState {
     /// It watches the [`CancelFlag`] and stops the run when it is raised.
     pub execute: Arc<dyn Fn(WorkSpec, Arc<CancelFlag>) -> Result<Value, RunError> + Send + Sync>,
     pub works: Arc<Mutex<HashMap<String, WorkEntry>>>,
+    /// The canonical worktrees base workspaces live under.
+    pub worktrees_base: Arc<dyn Fn() -> Result<PathBuf, String> + Send + Sync>,
+    /// (url, ref, dest): clones a repo into `dest`, which must not exist.
+    pub clone_repo: Arc<CloneRepo>,
+    /// Updates a workspace's remote-tracking refs; never its branch or files.
+    pub fetch_repo: Arc<dyn Fn(&Path) -> Result<(), String> + Send + Sync>,
+    /// One workspace creation at a time, so two requests never race for a name.
+    pub workspace_lock: Arc<Mutex<()>>,
 }
 
 impl ClientServerState {
@@ -518,6 +529,15 @@ impl ClientServerState {
                 run_dispatch_child(&exe, &spec, &cancel, CANCEL_GRACE, &ProductionTeardown)
             }),
             works: Arc::new(Mutex::new(HashMap::new())),
+            worktrees_base: Arc::new(|| {
+                let base = darkmux_types::workdir::worktrees_base_dir();
+                std::fs::create_dir_all(&base).map_err(|e| format!("{}: {e}", base.display()))?;
+                base.canonicalize()
+                    .map_err(|e| format!("{}: {e}", base.display()))
+            }),
+            clone_repo: Arc::new(crate::client_workspace::clone_with_git),
+            fetch_repo: Arc::new(crate::client_workspace::fetch_with_git),
+            workspace_lock: Arc::new(Mutex::new(())),
         })
     }
 }
@@ -603,6 +623,8 @@ pub fn router(state: ClientServerState) -> Router {
         .route("/client/work/:work_id", get(work_status_handler))
         .route("/client/work/:work_id/cancel", post(cancel_handler))
         .route("/client/recipe", get(recipe_handler))
+        .route("/client/workspaces", post(workspace_create_handler))
+        .route("/client/workspaces/:name", get(workspace_status_handler))
         .fallback(|| async { err(StatusCode::NOT_FOUND, "no such route") })
         .method_not_allowed_fallback(|| async {
             err(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
@@ -849,6 +871,9 @@ struct WorkBody {
     profile: Option<String>,
     #[serde(default)]
     workdir: Option<String>,
+    /// A workspace name (`POST /client/workspaces`), in place of `workdir`.
+    #[serde(default)]
+    workspace: Option<String>,
 }
 
 async fn work_handler(
@@ -941,9 +966,16 @@ fn admit(
         }
         Err(e) => return Err(internal(anyhow!(e))),
     }
-    let workdir = match &req.workdir {
-        None => None,
-        Some(w) => Some(checked_workdir(state, w)?),
+    let workdir = match (&req.workdir, &req.workspace) {
+        (Some(_), Some(_)) => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "send `workdir` or `workspace`, not both",
+            ))
+        }
+        (Some(w), None) => Some(checked_workdir(state, w)?),
+        (None, Some(name)) => Some(workspace_dir(state, name)?),
+        (None, None) => None,
     };
     let policy = policy_or_503(state)?;
     let forbidden = |e: String| err(StatusCode::FORBIDDEN, e);
@@ -1022,7 +1054,10 @@ pub const MAX_RECIPE_BYTES: u64 = 16 * 1024;
 
 #[derive(Deserialize)]
 struct RecipeQuery {
-    workdir: String,
+    #[serde(default)]
+    workdir: Option<String>,
+    #[serde(default)]
+    workspace: Option<String>,
 }
 
 async fn recipe_handler(
@@ -1033,26 +1068,35 @@ async fn recipe_handler(
     if let Err(r) = authenticate(&state, &headers) {
         return r;
     }
-    let Ok(axum::extract::Query(q)) = query else {
-        return err(
-            StatusCode::BAD_REQUEST,
-            "`workdir` query parameter is required",
-        );
+    let q = match query {
+        Ok(axum::extract::Query(q)) if q.workdir.is_some() != q.workspace.is_some() => q,
+        _ => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "one of the `workdir` or `workspace` query parameters is required",
+            )
+        }
     };
     let st = state.clone();
-    tokio::task::spawn_blocking(move || read_recipe(&st, &q.workdir))
-        .await
-        .unwrap_or_else(|e| internal(anyhow!("recipe read panicked: {e}")))
+    tokio::task::spawn_blocking(move || {
+        let wd = match (&q.workdir, &q.workspace) {
+            (Some(w), _) => checked_workdir(&st, w),
+            (_, Some(n)) => workspace_dir(&st, n),
+            _ => unreachable!("checked above"),
+        };
+        match wd {
+            Ok(wd) => read_recipe(&wd),
+            Err(r) => r,
+        }
+    })
+    .await
+    .unwrap_or_else(|e| internal(anyhow!("recipe read panicked: {e}")))
 }
 
 /// `<workdir>/.darkmux/preview.json` under the same containment as work. A
 /// symlinked `.darkmux` or `preview.json` is refused, and the file itself is
 /// opened without following a link.
-fn read_recipe(state: &ClientServerState, workdir: &str) -> Response {
-    let wd = match checked_workdir(state, workdir) {
-        Ok(p) => p,
-        Err(r) => return r,
-    };
+fn read_recipe(wd: &Path) -> Response {
     let dir = wd.join(".darkmux");
     let file = dir.join("preview.json");
     for p in [&dir, &file] {
@@ -1107,6 +1151,249 @@ fn read_recipe(state: &ClientServerState, workdir: &str) -> Response {
             "preview.json is not a JSON object",
         ),
     }
+}
+
+// ─── Workspaces ──────────────────────────────────────────────────────────
+
+/// A workspace name resolved to its canonical directory under the worktrees
+/// base: 400 for a name that isn't one plain segment, 404 when there is no
+/// such workspace, 403 when it fails containment (a symlink out, say).
+fn workspace_dir(state: &ClientServerState, name: &str) -> Result<PathBuf, Response> {
+    use crate::client_workspace::valid_name;
+    if !valid_name(name) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!("{name:?} is not a workspace name"),
+        ));
+    }
+    let base = (state.worktrees_base)().map_err(|e| internal(anyhow!(e)))?;
+    let dir = base.join(name);
+    if std::fs::symlink_metadata(&dir).is_err() {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            format!("no workspace named {name}"),
+        ));
+    }
+    (state.check_workdir)(&dir).map_err(|e| err(StatusCode::FORBIDDEN, e))
+}
+
+fn workspace_json(name: &str, dir: &Path, created: bool) -> Value {
+    let (branch, head) = crate::client_workspace::status_of(dir).unwrap_or_default();
+    serde_json::json!({
+        "workspace": name,
+        "branch": branch,
+        "head": head,
+        "repo": crate::client_workspace::origin_of(dir),
+        "created": created,
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceBody {
+    /// Clone (or reuse a checkout of) this repo.
+    #[serde(default)]
+    repo_url: Option<String>,
+    /// Or start from this local checkout, as a git worktree on a new branch.
+    #[serde(default)]
+    source_path: Option<String>,
+    #[serde(default, rename = "ref")]
+    git_ref: Option<String>,
+    /// The asking bot's name, for the workspace and branch names.
+    #[serde(default)]
+    bot: Option<String>,
+}
+
+/// `POST /client/workspaces`: `{repo_url}` reuses the workspace whose origin
+/// is that repo (fetching it) or clones it; `{source_path}` reuses this bot's
+/// worktree of that checkout or adds one on a new `mux/<bot>-<id>` branch, so
+/// the owner's own working tree is never touched. 201 when created, 200 when
+/// reused.
+async fn workspace_create_handler(
+    State(state): State<ClientServerState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    use crate::client_workspace as ws;
+    if let Err(r) = authenticate(&state, &headers) {
+        return r;
+    }
+    let req: WorkspaceBody = match json_body(body).await {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+    if let Some(r) = &req.git_ref {
+        if !ws::valid_ref(r) {
+            return err(
+                StatusCode::BAD_REQUEST,
+                format!("{r:?} is not a branch name"),
+            );
+        }
+    }
+    let bot = ws::slug(req.bot.as_deref().unwrap_or("app"));
+    let bot = if bot.is_empty() {
+        "app".to_string()
+    } else {
+        bot
+    };
+    let st = state.clone();
+    let made = match (req.repo_url, req.source_path) {
+        (Some(url), None) => {
+            let Some(normalized) = ws::normalize_repo_url(&url) else {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    "repo_url must be https://host/owner/repo or git@host:owner/repo",
+                );
+            };
+            tokio::task::spawn_blocking(move || {
+                clone_workspace(&st, &url, &normalized, req.git_ref.as_deref())
+            })
+            .await
+        }
+        (None, Some(path)) => {
+            tokio::task::spawn_blocking(move || {
+                worktree_workspace(&st, Path::new(&path), req.git_ref.as_deref(), &bot)
+            })
+            .await
+        }
+        _ => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "send `repo_url` or `source_path`, not both or neither",
+            )
+        }
+    };
+    made.unwrap_or_else(|e| internal(anyhow!("workspace setup panicked: {e}")))
+}
+
+fn clone_workspace(
+    state: &ClientServerState,
+    url: &str,
+    normalized: &str,
+    git_ref: Option<&str>,
+) -> Response {
+    use crate::client_workspace as ws;
+    let base = match (state.worktrees_base)() {
+        Ok(b) => b,
+        Err(e) => return internal(anyhow!(e)),
+    };
+    let _one_at_a_time = state.workspace_lock.lock().unwrap();
+    if let Some(name) = ws::find_by_origin(&base, normalized) {
+        let dir = match workspace_dir(state, &name) {
+            Ok(d) => d,
+            Err(r) => return r,
+        };
+        let mut v = workspace_json(&name, &dir, false);
+        if let Err(e) = (state.fetch_repo)(&dir) {
+            v["fetch_error"] = e.into();
+        }
+        return Json(v).into_response();
+    }
+    let taken = |n: &str| {
+        std::fs::symlink_metadata(base.join(n)).is_ok()
+            || std::fs::symlink_metadata(base.join(format!(".{n}.partial"))).is_ok()
+    };
+    let Some(name) = ws::name_for(normalized, taken) else {
+        return err(StatusCode::CONFLICT, "no free workspace name for this repo");
+    };
+    // Clone beside the final name, then rename: a failed clone never leaves a
+    // half workspace behind under a real name.
+    let partial = base.join(format!(".{name}.partial"));
+    if let Err(e) = (state.clone_repo)(url, git_ref, &partial) {
+        let _ = std::fs::remove_dir_all(&partial);
+        return err(
+            StatusCode::BAD_GATEWAY,
+            format!("cloning {normalized}: {e}"),
+        );
+    }
+    if let Err(e) = std::fs::rename(&partial, base.join(&name)) {
+        let _ = std::fs::remove_dir_all(&partial);
+        return internal(anyhow!("placing workspace {name}: {e}"));
+    }
+    match workspace_dir(state, &name) {
+        Ok(dir) => (StatusCode::CREATED, Json(workspace_json(&name, &dir, true))).into_response(),
+        Err(r) => r,
+    }
+}
+
+fn worktree_workspace(
+    state: &ClientServerState,
+    source: &Path,
+    git_ref: Option<&str>,
+    bot: &str,
+) -> Response {
+    use crate::client_workspace as ws;
+    let base = match (state.worktrees_base)() {
+        Ok(b) => b,
+        Err(e) => return internal(anyhow!(e)),
+    };
+    let source = match ws::check_source(source, &base) {
+        Ok(s) => s,
+        Err(e) => return err(StatusCode::FORBIDDEN, e),
+    };
+    let Some(common) = ws::common_dir(&source) else {
+        return err(
+            StatusCode::FORBIDDEN,
+            format!("{} is not a git repository", source.display()),
+        );
+    };
+    let _one_at_a_time = state.workspace_lock.lock().unwrap();
+    if let Some(name) = ws::find_worktree_of(&base, &common, bot) {
+        return match workspace_dir(state, &name) {
+            Ok(dir) => Json(workspace_json(&name, &dir, false)).into_response(),
+            Err(r) => r,
+        };
+    }
+    let repo = ws::slug(
+        &source
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default(),
+    );
+    let stem = format!("{}-{bot}", if repo.is_empty() { "repo" } else { &repo });
+    let Some(name) = std::iter::once(stem.clone())
+        .chain((2..100).map(|n| format!("{stem}-{n}")))
+        .find(|n| ws::valid_name(n) && std::fs::symlink_metadata(base.join(n)).is_err())
+    else {
+        return err(
+            StatusCode::CONFLICT,
+            "no free workspace name for this checkout",
+        );
+    };
+    let short = match random_hex(3) {
+        Ok(h) => h,
+        Err(e) => return internal(e),
+    };
+    let branch = format!("mux/{bot}-{short}");
+    let dest = base.join(&name);
+    if let Err(e) = ws::add_worktree(&source, &branch, &dest, git_ref.unwrap_or("HEAD")) {
+        return err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("adding a worktree of {}: {e}", source.display()),
+        );
+    }
+    match workspace_dir(state, &name) {
+        Ok(dir) => (StatusCode::CREATED, Json(workspace_json(&name, &dir, true))).into_response(),
+        Err(r) => r,
+    }
+}
+
+/// `GET /client/workspaces/{name}`: branch, head and repo of one workspace.
+async fn workspace_status_handler(
+    State(state): State<ClientServerState>,
+    UrlPath(name): UrlPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = authenticate(&state, &headers) {
+        return r;
+    }
+    let st = state.clone();
+    tokio::task::spawn_blocking(move || match workspace_dir(&st, &name) {
+        Ok(dir) => Json(workspace_json(&name, &dir, false)).into_response(),
+        Err(r) => r,
+    })
+    .await
+    .unwrap_or_else(|e| internal(anyhow!("workspace status panicked: {e}")))
 }
 
 async fn work_status_handler(

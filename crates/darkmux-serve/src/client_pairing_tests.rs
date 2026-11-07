@@ -22,6 +22,11 @@ struct Harness {
     ran: Arc<Mutex<Vec<WorkSpec>>>,
     /// What `clients.profiles` reads as right now (default: unset).
     policy: Arc<Mutex<Policy>>,
+    /// URLs the injected clone was asked for, and dirs it fetched.
+    cloned: Arc<Mutex<Vec<String>>>,
+    fetched: Arc<Mutex<Vec<PathBuf>>>,
+    /// A git repo with one commit, standing in for every remote.
+    fixture: PathBuf,
     state: ClientServerState,
 }
 
@@ -44,6 +49,16 @@ fn harness() -> Harness {
     let ran = Arc::new(Mutex::new(Vec::new()));
     let policy: Arc<Mutex<Policy>> = Arc::new(Mutex::new(Ok(None)));
     let (c, r, pol) = (clock.clone(), ran.clone(), policy.clone());
+    let fixture = dir.path().join("fixture");
+    fixture_repo(&fixture);
+    let cloned = Arc::new(Mutex::new(Vec::new()));
+    let fetched = Arc::new(Mutex::new(Vec::new()));
+    let (fx, cl, fe, wb) = (
+        fixture.clone(),
+        cloned.clone(),
+        fetched.clone(),
+        canon_base.clone(),
+    );
     let state = ClientServerState {
         store: store.clone(),
         now: Arc::new(move || c.load(Ordering::SeqCst)),
@@ -94,8 +109,37 @@ fn harness() -> Harness {
             )
         }),
         works: Arc::new(Mutex::new(HashMap::new())),
+        worktrees_base: Arc::new(move || Ok(wb.clone())),
+        // Every "remote" is the fixture; origin is then set to the URL asked
+        // for, as a real clone would leave it. A URL naming "fail" fails
+        // after leaving a partial directory behind, as an interrupted clone can.
+        clone_repo: Arc::new(move |url, git_ref, dest| {
+            cl.lock().unwrap().push(url.to_string());
+            if url.contains("fail") {
+                std::fs::create_dir_all(dest.join("half")).unwrap();
+                return Err("authentication failed".into());
+            }
+            let mut args = vec!["clone", "--quiet"];
+            if let Some(r) = git_ref {
+                args.extend(["--branch", r]);
+            }
+            let fx = fx.to_str().unwrap().to_string();
+            let d = dest.to_str().unwrap().to_string();
+            args.extend([fx.as_str(), d.as_str()]);
+            run_git(None, &args);
+            run_git(Some(dest), &["remote", "set-url", "origin", url]);
+            Ok(())
+        }),
+        fetch_repo: Arc::new(move |d| {
+            fe.lock().unwrap().push(d.to_path_buf());
+            Ok(())
+        }),
+        workspace_lock: Arc::new(Mutex::new(())),
     };
     Harness {
+        cloned,
+        fetched,
+        fixture,
         base,
         dir,
         store,
@@ -1594,4 +1638,537 @@ fn exit_reasons_are_short_and_machine_readable() {
         "no output",
         "a clean exit without an envelope"
     );
+}
+
+// ─── Workspaces ──────────────────────────────────────────────────────────
+
+fn run_git(dir: Option<&Path>, args: &[&str]) -> String {
+    let mut cmd = std::process::Command::new("git");
+    if let Some(d) = dir {
+        cmd.arg("-C").arg(d);
+    }
+    let out = cmd
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "init.defaultBranch=main",
+        ])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A repo with one commit on `main` and a `dev` branch.
+fn fixture_repo(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    run_git(Some(dir), &["init", "--quiet", "-b", "main"]);
+    std::fs::write(dir.join("README.md"), "hi\n").unwrap();
+    run_git(Some(dir), &["add", "."]);
+    run_git(Some(dir), &["commit", "--quiet", "-m", "first"]);
+    run_git(Some(dir), &["branch", "dev"]);
+}
+
+const HCR: &str = "https://github.com/kstrat2001/hcr";
+
+fn ws_body(v: Value) -> Value {
+    v
+}
+
+#[tokio::test]
+async fn workspaces_need_a_token() {
+    let h = harness();
+    let (code, _) = call(
+        &h,
+        post(
+            "/client/workspaces",
+            None,
+            serde_json::json!({"repo_url": HCR}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 401);
+    let (code, _) = call(&h, get("/client/workspaces/hcr", &[])).await;
+    assert_eq!(code, 401);
+    assert!(h.cloned.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_repo_url_is_cloned_into_a_named_workspace() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/workspaces",
+            Some(&token),
+            ws_body(serde_json::json!({"repo_url": HCR})),
+        ),
+    )
+    .await;
+    assert_eq!(code, 201, "{v}");
+    assert_eq!(v["workspace"], "hcr");
+    assert_eq!(v["branch"], "main");
+    assert_eq!(v["repo"], "github.com/kstrat2001/hcr");
+    assert!(!v["head"].as_str().unwrap().is_empty());
+    assert!(h.base.join("hcr/README.md").exists());
+    assert!(!h.base.join(".hcr.partial").exists());
+    // Asked again (in its ssh spelling), it's reused and fetched, not cloned.
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"repo_url": "git@github.com:kstrat2001/hcr.git"}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["workspace"], "hcr");
+    assert_eq!(v["created"], false);
+    assert_eq!(h.cloned.lock().unwrap().len(), 1);
+    assert_eq!(h.fetched.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_ref_is_cloned_on_that_branch() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"repo_url": HCR, "ref": "dev"}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 201, "{v}");
+    assert_eq!(v["branch"], "dev");
+}
+
+#[tokio::test]
+async fn an_existing_checkout_of_the_repo_is_reused_whatever_its_name() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = h.base.join("hcr-preview");
+    run_git(
+        None,
+        &[
+            "clone",
+            "--quiet",
+            h.fixture.to_str().unwrap(),
+            wt.to_str().unwrap(),
+        ],
+    );
+    run_git(
+        Some(&wt),
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "git@github.com:kstrat2001/hcr.git",
+        ],
+    );
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"repo_url": HCR}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["workspace"], "hcr-preview");
+    assert!(h.cloned.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_name_taken_by_another_folder_falls_back_to_owner_repo() {
+    let h = harness();
+    let token = paired(&h).await;
+    std::fs::create_dir_all(h.base.join("hcr")).unwrap();
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"repo_url": HCR}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 201, "{v}");
+    assert_eq!(v["workspace"], "kstrat2001-hcr");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_symlinked_checkout_is_never_reused_or_clobbered() {
+    let h = harness();
+    let token = paired(&h).await;
+    // A checkout of the same repo OUTSIDE the base, linked in under the repo's name.
+    let outside = h.dir.path().join("outside-hcr");
+    run_git(
+        None,
+        &[
+            "clone",
+            "--quiet",
+            h.fixture.to_str().unwrap(),
+            outside.to_str().unwrap(),
+        ],
+    );
+    run_git(Some(&outside), &["remote", "set-url", "origin", HCR]);
+    std::os::unix::fs::symlink(&outside, h.base.join("hcr")).unwrap();
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"repo_url": HCR}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 201, "{v}");
+    assert_eq!(
+        v["workspace"], "kstrat2001-hcr",
+        "the link is neither reused nor overwritten"
+    );
+    assert!(std::fs::symlink_metadata(h.base.join("hcr"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    // And it can't be worked in or reported by name.
+    let (code, _) = call(
+        &h,
+        get(
+            "/client/workspaces/hcr",
+            &[("authorization", &bearer(&token))],
+        ),
+    )
+    .await;
+    assert_eq!(code, 403);
+    let (code, _) = call(
+        &h,
+        post(
+            "/client/work",
+            Some(&token),
+            serde_json::json!({"role": "coder", "message": "hello", "workspace": "hcr"}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 403);
+    assert!(h.ran.lock().unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_dangling_link_still_takes_its_name() {
+    let h = harness();
+    let token = paired(&h).await;
+    std::os::unix::fs::symlink(h.dir.path().join("gone"), h.base.join("hcr")).unwrap();
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"repo_url": HCR}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 201, "{v}");
+    assert_eq!(v["workspace"], "kstrat2001-hcr");
+}
+
+#[tokio::test]
+async fn only_plain_https_or_ssh_repo_urls_and_safe_refs_are_cloned() {
+    let h = harness();
+    let token = paired(&h).await;
+    for body in [
+        serde_json::json!({"repo_url": "file:///etc"}),
+        serde_json::json!({"repo_url": "ext::sh -c id"}),
+        serde_json::json!({"repo_url": "https://github.com/a/b/../../c"}),
+        serde_json::json!({"repo_url": "--upload-pack=touch /tmp/x"}),
+        serde_json::json!({"repo_url": HCR, "ref": "--upload-pack=x"}),
+        serde_json::json!({"repo_url": HCR, "ref": "a..b"}),
+        serde_json::json!({}),
+        serde_json::json!({"repo_url": HCR, "source_path": "/tmp"}),
+        serde_json::json!({"repo_url": HCR, "extra": 1}),
+    ] {
+        let (code, v) = call(&h, post("/client/workspaces", Some(&token), body.clone())).await;
+        assert_eq!(code, 400, "{body} -> {v}");
+    }
+    assert!(h.cloned.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_clone_leaves_nothing_behind() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"repo_url": "https://github.com/someone/fail"}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 502, "{v}");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap()
+            .contains("authentication failed"),
+        "{v}"
+    );
+    let left: Vec<_> = std::fs::read_dir(&h.base)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name())
+        .collect();
+    assert_eq!(
+        left,
+        vec![std::ffi::OsString::from("wt1")],
+        "only what was there before"
+    );
+}
+
+#[tokio::test]
+async fn workspace_status_reports_branch_head_and_repo() {
+    let h = harness();
+    let token = paired(&h).await;
+    call(
+        &h,
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"repo_url": HCR}),
+        ),
+    )
+    .await;
+    let auth = bearer(&token);
+    let (code, v) = call(
+        &h,
+        get("/client/workspaces/hcr", &[("authorization", &auth)]),
+    )
+    .await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["branch"], "main");
+    assert_eq!(v["repo"], "github.com/kstrat2001/hcr");
+    let (code, _) = call(
+        &h,
+        get("/client/workspaces/nope", &[("authorization", &auth)]),
+    )
+    .await;
+    assert_eq!(code, 404);
+    let (code, _) = call(
+        &h,
+        get("/client/workspaces/..x", &[("authorization", &auth)]),
+    )
+    .await;
+    assert_eq!(code, 400);
+}
+
+#[tokio::test]
+async fn work_can_name_a_workspace_instead_of_a_path() {
+    let h = harness();
+    let token = paired(&h).await;
+    call(
+        &h,
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"repo_url": HCR}),
+        ),
+    )
+    .await;
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/work",
+            Some(&token),
+            serde_json::json!({"role": "coder", "message": "hello", "workspace": "hcr"}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 202, "{v}");
+    let _ = wait_done(&h, &token, v["work_id"].as_str().unwrap()).await;
+    assert_eq!(
+        h.ran.lock().unwrap()[0].workdir.as_deref(),
+        Some(h.base.join("hcr").canonicalize().unwrap().as_path())
+    );
+}
+
+#[tokio::test]
+async fn work_refuses_bad_unknown_or_doubled_workspaces() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt1 = h.base.join("wt1");
+    for (body, want) in [
+        (
+            serde_json::json!({"role": "coder", "message": "hi", "workspace": "../wt1"}),
+            400,
+        ),
+        (
+            serde_json::json!({"role": "coder", "message": "hi", "workspace": ".."}),
+            400,
+        ),
+        (
+            serde_json::json!({"role": "coder", "message": "hi", "workspace": "nope"}),
+            404,
+        ),
+        (
+            serde_json::json!({"role": "coder", "message": "hi", "workspace": "wt1", "workdir": wt1.to_str()}),
+            400,
+        ),
+    ] {
+        let (code, v) = call(&h, post("/client/work", Some(&token), body.clone())).await;
+        assert_eq!(code, want, "{body} -> {v}");
+    }
+    assert!(h.ran.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn the_recipe_can_be_read_by_workspace() {
+    let h = harness();
+    let token = paired(&h).await;
+    write_recipe(&h.base.join("wt1"), r#"{"command": "npm run dev"}"#);
+    let auth = bearer(&token);
+    let (code, v) = call(
+        &h,
+        get("/client/recipe?workspace=wt1", &[("authorization", &auth)]),
+    )
+    .await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["recipe"]["command"], "npm run dev");
+    let (code, _) = call(&h, get("/client/recipe", &[("authorization", &auth)])).await;
+    assert_eq!(code, 400);
+}
+
+// A local checkout becomes a worktree on a new branch; the owner's own
+// working tree, branch and uncommitted files are untouched.
+
+#[tokio::test]
+async fn a_local_checkout_becomes_a_worktree_on_a_new_branch() {
+    let h = harness();
+    let token = paired(&h).await;
+    let mine = h.dir.path().join("my-site");
+    fixture_repo(&mine);
+    run_git(Some(&mine), &["remote", "add", "origin", HCR]);
+    std::fs::write(mine.join("README.md"), "my uncommitted edit\n").unwrap();
+    // The checkout's own hooks never run for an app's request.
+    let hooked = h.dir.path().join("hook-ran");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let hook = mine.join(".git/hooks/post-checkout");
+        std::fs::write(&hook, format!("#!/bin/sh\ntouch {}\n", hooked.display())).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let body = serde_json::json!({"source_path": mine.to_str(), "bot": "Human Code Reader"});
+    let (code, v) = call(&h, post("/client/workspaces", Some(&token), body.clone())).await;
+    assert_eq!(code, 201, "{v}");
+    assert_eq!(v["workspace"], "my-site-human-code-reader");
+    let branch = v["branch"].as_str().unwrap();
+    assert!(branch.starts_with("mux/human-code-reader-"), "{branch}");
+    assert_eq!(v["repo"], "github.com/kstrat2001/hcr");
+    assert!(!hooked.exists(), "post-checkout hook ran");
+    let ws = h.base.join("my-site-human-code-reader");
+    assert_eq!(
+        std::fs::read_to_string(ws.join("README.md")).unwrap(),
+        "hi\n",
+        "from the commit, not my edit"
+    );
+    // My checkout: same branch, my edit still there, and it now knows the branch.
+    assert_eq!(run_git(Some(&mine), &["branch", "--show-current"]), "main");
+    assert_eq!(
+        std::fs::read_to_string(mine.join("README.md")).unwrap(),
+        "my uncommitted edit\n"
+    );
+    assert!(run_git(Some(&mine), &["branch", "--list", branch]).contains(branch));
+    // Asked again by the same bot: the same workspace.
+    let (code, v) = call(&h, post("/client/workspaces", Some(&token), body)).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["workspace"], "my-site-human-code-reader");
+    // Another bot gets its own.
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"source_path": mine.to_str(), "bot": "other"}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 201, "{v}");
+    assert_eq!(v["workspace"], "my-site-other");
+}
+
+#[tokio::test]
+async fn a_source_path_must_be_the_top_of_a_real_checkout_outside_the_base() {
+    let h = harness();
+    let token = paired(&h).await;
+    let plain = h.dir.path().join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    let repo = h.dir.path().join("repo");
+    fixture_repo(&repo);
+    std::fs::create_dir_all(repo.join("sub")).unwrap();
+    let inside = h.base.join("inside");
+    fixture_repo(&inside);
+    for (path, why) in [
+        ("relative/path".to_string(), "absolute"),
+        (plain.to_str().unwrap().to_string(), "not a git repository"),
+        (repo.join("sub").to_str().unwrap().to_string(), "top folder"),
+        (
+            h.dir.path().join("missing").to_str().unwrap().to_string(),
+            "does not exist",
+        ),
+        (
+            inside.to_str().unwrap().to_string(),
+            "inside the worktrees base",
+        ),
+    ] {
+        let (code, v) = call(
+            &h,
+            post(
+                "/client/workspaces",
+                Some(&token),
+                serde_json::json!({"source_path": path}),
+            ),
+        )
+        .await;
+        assert_eq!(code, 403, "{path} -> {v}");
+        assert!(v["error"].as_str().unwrap().contains(why), "{path}: {v}");
+    }
+    #[cfg(unix)]
+    {
+        let link = h.dir.path().join("link-to-repo");
+        std::os::unix::fs::symlink(&repo, &link).unwrap();
+        let (code, v) = call(
+            &h,
+            post(
+                "/client/workspaces",
+                Some(&token),
+                serde_json::json!({"source_path": link.to_str()}),
+            ),
+        )
+        .await;
+        assert_eq!(code, 403, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("symlink"), "{v}");
+    }
+    let names: Vec<_> = std::fs::read_dir(&h.base)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name())
+        .collect();
+    assert_eq!(names.len(), 2, "only wt1 and inside: {names:?}");
 }
