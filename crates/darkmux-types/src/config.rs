@@ -425,7 +425,11 @@ use std::path::Path;
 //           suites, which run model-written tests, run on the host as the
 //           user instead of in a locked-down container. An older binary
 //           refuses a config carrying it.
-pub const CONFIG_SCHEMA_VERSION: &str = "2.6";
+//   2.7 (client pairing, local prototype): additive `clients.profiles`
+//           (string list; `DARKMUX_CLIENTS_PROFILES`, comma-separated): the
+//           profiles a paired client app may run on. Absent = the role's own
+//           resolved profile only. An older binary refuses a config carrying it.
+pub const CONFIG_SCHEMA_VERSION: &str = "2.7";
 
 /// A `config.json` key an older darkmux read (and `init` may have written)
 /// that this one does not. The unknown-key gate (`user_files`) names it with
@@ -834,6 +838,9 @@ pub struct DarkmuxConfig {
     /// [`ServeConfig`]'s own doc.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serve: Option<ServeConfig>,
+    /// Paired client apps (`darkmux client serve`) — see [`ClientsConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clients: Option<ClientsConfig>,
 
     /// (#1475 packet 1) The machine-local **role → profile** map — the binding
     /// that welds an abstract role id (e.g. `judge`, `probe-high`) to a
@@ -1822,6 +1829,21 @@ pub struct RadioConfig {
 /// EMPTY `allowed` list — darkmux ships no opinion about which verbs
 /// exist; the operator's own configs name their own verbs, and the
 /// operator opts each one in by listing it here. Fails closed on both
+/// (CONFIG 2.7) What a paired client app (`darkmux client serve`) may run on
+/// this machine. A pairing records identity only; this block is the policy,
+/// read on every work request, so `darkmux config set clients.profiles ...`
+/// takes effect without a restart or a re-pair.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ClientsConfig {
+    /// The profile names a paired app's work may run on. Absent: only the
+    /// profile darkmux itself resolves for the requested role
+    /// (`role_profiles.<role>`, else `default_profile`), exactly as a bare
+    /// `darkmux dispatch <role>` would. An empty list allows none.
+    /// `darkmux config set clients.profiles <comma-separated-list>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub profiles: Option<Vec<String>>,
+    #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
 /// counts: `enabled: false` blocks every verb regardless of `allowed`, and
 /// a verb absent from `allowed` is blocked even with `enabled: true`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
@@ -2410,6 +2432,10 @@ impl DarkmuxConfig {
                 read_auth: Some(false),
                 extras: Default::default(),
             }),
+            // Deliberately NOT written: absent `clients.profiles` is a real
+            // behavior (a paired app runs only on the role's own resolved
+            // profile), not a value to default.
+            clients: None,
             extras: Default::default(),
         }
     }

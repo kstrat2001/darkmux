@@ -1702,15 +1702,16 @@ pub enum ClientCmd {
         #[arg(long, default_value_t = darkmux_serve::client_pairing::DEFAULT_PORT)]
         port: u16,
     },
-    /// List pending pairing requests (device, code, scopes, age) and ask, per
-    /// request, whether to approve it. `--code` approves the one request
-    /// showing that code, after confirmation.
+    /// List pending pairing requests (device, code, age) and ask, per
+    /// request: y approves, d denies, Enter leaves it pending. `--code`
+    /// approves the one request showing that code, after confirmation. What
+    /// a paired app may run is this machine's `clients.profiles` setting.
     Approve {
         /// The code the app shows (e.g. 4F7-K2Q).
         #[arg(long)]
         code: Option<String>,
     },
-    /// List paired clients and their scopes.
+    /// List paired clients and what apps may run here (`clients.profiles`).
     List,
     /// Remove a paired client; its token stops working at once.
     Revoke {

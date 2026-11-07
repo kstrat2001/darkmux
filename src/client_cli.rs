@@ -59,26 +59,25 @@ fn age(now: u64, then: u64) -> String {
     }
 }
 
-fn scopes_line(s: &cp::Scopes) -> String {
-    let profiles = if s.profiles.is_empty() {
-        "(none)".to_string()
-    } else {
-        s.profiles.join(", ")
-    };
+fn describe(p: &PendingRequest, now: u64) -> String {
     format!(
-        "profiles: {profiles}; workspace: {}",
-        if s.workspace { "yes" } else { "no" }
+        "  device: {}\n  code:   {}\n  age:    {}",
+        p.device_name,
+        p.code,
+        age(now, p.created)
     )
 }
 
-fn describe(p: &PendingRequest, now: u64) -> String {
-    format!(
-        "  device: {}\n  code:   {}\n  scopes: {}\n  age:    {}",
-        p.device_name,
-        p.code,
-        scopes_line(&p.scopes),
-        age(now, p.created)
-    )
+/// What every paired app may run here: `clients.profiles`, else the role's
+/// own resolved profile.
+fn policy_line() -> String {
+    match darkmux_types::config_access::clients_profiles() {
+        Some(list) if list.is_empty() => {
+            "apps may run on: nothing (clients.profiles is empty)".to_string()
+        }
+        Some(list) => format!("apps may run on: {} (clients.profiles)", list.join(", ")),
+        None => "apps may run on: each role's own profile (clients.profiles unset)".to_string(),
+    }
 }
 
 fn ask(input: &mut dyn BufRead, out: &mut dyn Write, prompt: &str) -> Result<String> {
@@ -147,13 +146,9 @@ fn list(store: &ClientStore, now: u64) -> Result<i32> {
         println!("no paired clients");
     }
     for c in clients {
-        println!(
-            "{}  (paired {})  {}",
-            c.name,
-            age(now, c.created),
-            scopes_line(&c.scopes)
-        );
+        println!("{}  (paired {})", c.name, age(now, c.created));
     }
+    println!("{}", policy_line());
     if waiting > 0 {
         println!("{waiting} pairing request(s) waiting: darkmux client approve");
     }
@@ -181,10 +176,6 @@ mod tests {
                         device_name: format!("phone {i}"),
                         code: code.to_string(),
                         pair_secret_hash: "00".repeat(32),
-                        scopes: cp::Scopes {
-                            profiles: vec!["fast".into()],
-                            workspace: false,
-                        },
                         created: 100 + i as u64,
                         status: cp::PendingStatus::Pending,
                         client_name: None,
@@ -217,7 +208,7 @@ mod tests {
         assert_eq!(statuses(&store), [Approved, Denied, Pending]);
         let shown = String::from_utf8(out).unwrap();
         assert!(
-            shown.contains("phone 0") && shown.contains("AAA") && shown.contains("profiles: fast"),
+            shown.contains("phone 0") && shown.contains("AAA") && !shown.contains("profiles"),
             "{shown}"
         );
     }
