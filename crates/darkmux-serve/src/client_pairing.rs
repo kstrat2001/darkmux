@@ -455,6 +455,13 @@ pub struct WorkEntry {
     pub created: u64,
     pub status: WorkStatus,
     pub cancel: Arc<CancelFlag>,
+    /// The canonical work copy, when the run has one.
+    pub workdir: Option<PathBuf>,
+    /// The work copy as a tree before the run (or before the first run of a
+    /// chain of tweaks): what Keep commits against and Discard restores to.
+    pub baseline: Option<String>,
+    /// Kept, discarded, or folded into a later run: decided once.
+    pub decided: Option<String>,
 }
 
 /// (url, ref, dest) -> cloned, or why not.
@@ -622,6 +629,8 @@ pub fn router(state: ClientServerState) -> Router {
         .route("/client/work", post(work_handler))
         .route("/client/work/:work_id", get(work_status_handler))
         .route("/client/work/:work_id/cancel", post(cancel_handler))
+        .route("/client/work/:work_id/keep", post(keep_handler))
+        .route("/client/work/:work_id/discard", post(discard_handler))
         .route("/client/recipe", get(recipe_handler))
         .route("/client/workspaces", post(workspace_create_handler))
         .route("/client/workspaces/:name", get(workspace_status_handler))
@@ -917,8 +926,29 @@ async fn work_handler(
         let id = spec.work_id.clone();
         let workdir = spec.workdir.clone();
         // The work copy as it is before the run, so what it held already is
-        // never reported as the run's change.
-        let baseline = workdir.as_deref().and_then(snapshot_tree);
+        // never reported as the run's change. A run in the same work copy
+        // as this client's undecided finished run continues it (a tweak):
+        // it inherits that run's baseline, and that run is folded into this.
+        let inherited = workdir.as_ref().and_then(|w| {
+            let mut works = works.lock().unwrap();
+            let me = works.get(&id).map(|e| e.client_name.clone())?;
+            let prior = works
+                .iter_mut()
+                .filter(|(k, e)| {
+                    **k != id
+                        && e.client_name == me
+                        && e.workdir.as_ref() == Some(w)
+                        && e.decided.is_none()
+                        && matches!(e.status, WorkStatus::Done { .. })
+                })
+                .max_by_key(|(_, e)| e.created)?;
+            prior.1.decided = Some(format!("folded into {id}"));
+            prior.1.baseline.clone()
+        });
+        let baseline = inherited.or_else(|| workdir.as_deref().and_then(snapshot_tree));
+        if let Some(e) = works.lock().unwrap().get_mut(&id) {
+            e.baseline = baseline.clone();
+        }
         let flag = cancel.clone();
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| execute(spec, flag)));
         // A cancelled run ends as cancelled, however its child reported.
@@ -1038,6 +1068,9 @@ fn admit(
             created: now,
             status: WorkStatus::Running,
             cancel: Arc::new(CancelFlag::default()),
+            workdir: workdir.clone(),
+            baseline: None,
+            decided: None,
         },
     );
     Ok(WorkSpec {
@@ -1473,6 +1506,203 @@ async fn cancel_handler(
         },
         _ => not_found(),
     }
+}
+
+// ─── Keep and Discard ────────────────────────────────────────────────────
+
+/// A finished, undecided run of this client's with a git work copy, for
+/// Keep or Discard: (workdir, baseline, paths the run changed). Refusals
+/// are responses: 404 for anyone else's or an unknown id, 409 otherwise.
+fn decidable(
+    state: &ClientServerState,
+    headers: &HeaderMap,
+    work_id: &str,
+) -> Result<(PathBuf, String, Vec<String>), Response> {
+    let client = authenticate(state, headers)?;
+    let entry = state.works.lock().unwrap().get(work_id).cloned();
+    let Some(w) = entry.filter(|w| w.client_name == client.name) else {
+        return Err(not_found());
+    };
+    if let Some(d) = &w.decided {
+        return Err(err(StatusCode::CONFLICT, format!("already decided: {d}")));
+    }
+    if !matches!(w.status, WorkStatus::Done { .. }) {
+        return Err(err(StatusCode::CONFLICT, "the run hasn't finished"));
+    }
+    let (Some(wd), Some(base)) = (w.workdir, w.baseline) else {
+        return Err(err(StatusCode::CONFLICT, "the run has no git work copy"));
+    };
+    let now = snapshot_tree(&wd).ok_or_else(|| {
+        err(
+            StatusCode::CONFLICT,
+            "the work copy is no longer a git repository",
+        )
+    })?;
+    let out = git(
+        &wd,
+        None,
+        &["diff", "--no-renames", "--name-only", "-z", &base, &now],
+    )
+    .ok_or_else(|| internal(anyhow!("diffing the work copy failed")))?;
+    let paths: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect();
+    Ok((wd, base, paths))
+}
+
+fn mark_decided(state: &ClientServerState, work_id: &str, how: &str) {
+    if let Some(w) = state.works.lock().unwrap().get_mut(work_id) {
+        w.decided = Some(how.to_string());
+    }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct KeepBody {
+    #[serde(default)]
+    message: Option<String>,
+}
+
+/// `POST /client/work/{id}/keep {message?}`: commits exactly the files the
+/// run (and its tweaks) changed to the work copy's branch, with the repo's
+/// hooks off. Anything else in the work copy, staged or not, stays as it
+/// was. 200 {commit, branch, files}.
+async fn keep_handler(
+    State(state): State<ClientServerState>,
+    UrlPath(work_id): UrlPath<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let req: KeepBody = match json_body(body).await {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+    let st = state.clone();
+    tokio::task::spawn_blocking(move || {
+        let (wd, _base, paths) = match decidable(&st, &headers, &work_id) {
+            Ok(d) => d,
+            Err(r) => return r,
+        };
+        if paths.is_empty() {
+            return err(
+                StatusCode::CONFLICT,
+                "the run changed nothing; there is nothing to keep",
+            );
+        }
+        let branch = git(&wd, None, &["branch", "--show-current"])
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        if branch.is_empty() {
+            return err(
+                StatusCode::CONFLICT,
+                "the work copy isn't on a branch; nothing to commit to",
+            );
+        }
+        let message = req
+            .message
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| "Changes made by a darkmux run".to_string());
+        let mut add = vec!["add", "-A", "--"];
+        add.extend(paths.iter().map(String::as_str));
+        let mut commit = vec![
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "--quiet",
+            "-m",
+            message.as_str(),
+            "--",
+        ];
+        commit.extend(paths.iter().map(String::as_str));
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&wd)
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .output()
+        };
+        for args in [&add[..], &commit[..]] {
+            match run(args) {
+                Ok(o) if o.status.success() => {}
+                Ok(o) => {
+                    let why = String::from_utf8_lossy(&o.stderr);
+                    return internal(anyhow!(
+                        "git {}: {}",
+                        args[0],
+                        why.lines().last().unwrap_or("").trim()
+                    ));
+                }
+                Err(e) => return internal(anyhow!("running git: {e}")),
+            }
+        }
+        let sha = git(&wd, None, &["rev-parse", "--short", "HEAD"])
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        mark_decided(&st, &work_id, "kept");
+        Json(serde_json::json!({"commit": sha, "branch": branch, "files": paths})).into_response()
+    })
+    .await
+    .unwrap_or_else(|e| internal(anyhow!("keep panicked: {e}")))
+}
+
+/// `POST /client/work/{id}/discard`: puts every file the run (and its
+/// tweaks) changed back as it was before the first run, and removes files
+/// it added. Nothing else is touched. 200 {restored, removed}.
+async fn discard_handler(
+    State(state): State<ClientServerState>,
+    UrlPath(work_id): UrlPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    let st = state.clone();
+    tokio::task::spawn_blocking(move || {
+        let (wd, base, paths) = match decidable(&st, &headers, &work_id) {
+            Ok(d) => d,
+            Err(r) => return r,
+        };
+        let (mut restored, mut removed) = (Vec::new(), Vec::new());
+        for path in &paths {
+            let in_base = git(&wd, None, &["cat-file", "-e", &format!("{base}:{path}")]).is_some();
+            if in_base {
+                if git(
+                    &wd,
+                    None,
+                    &[
+                        "restore",
+                        &format!("--source={base}"),
+                        "--worktree",
+                        "--",
+                        path,
+                    ],
+                )
+                .is_none()
+                {
+                    return internal(anyhow!("restoring {path} failed"));
+                }
+                restored.push(path.clone());
+            } else {
+                let file = wd.join(path);
+                // git reports paths inside the work tree; never follow one out.
+                let inside = file
+                    .parent()
+                    .and_then(|p| p.canonicalize().ok())
+                    .is_some_and(|p| p.starts_with(&wd));
+                if inside && std::fs::symlink_metadata(&file).is_ok() {
+                    if let Err(e) = std::fs::remove_file(&file) {
+                        return internal(anyhow!("removing {path}: {e}"));
+                    }
+                }
+                removed.push(path.clone());
+            }
+        }
+        mark_decided(&st, &work_id, "discarded");
+        Json(serde_json::json!({"restored": restored, "removed": removed})).into_response()
+    })
+    .await
+    .unwrap_or_else(|e| internal(anyhow!("discard panicked: {e}")))
 }
 
 // ─── The production executor ─────────────────────────────────────────────
