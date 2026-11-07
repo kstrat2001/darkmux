@@ -86,8 +86,14 @@ fn harness() -> Harness {
             if spec.message == "slow" {
                 std::thread::sleep(std::time::Duration::from_millis(400));
             }
+            // "edit-wait" changes the work copy, then runs on like "wait".
+            if spec.message == "edit-wait" {
+                if let Some(w) = &spec.workdir {
+                    std::fs::write(w.join("in-progress.txt"), "half done\n").unwrap();
+                }
+            }
             // A "wait" message runs until it is cancelled, as a dispatch child would.
-            if spec.message == "wait" {
+            if spec.message == "wait" || spec.message == "edit-wait" {
                 for _ in 0..500 {
                     if cancel.requested() {
                         return Err(RunError {
@@ -102,6 +108,17 @@ fn harness() -> Harness {
             if spec.message == "edit" {
                 if let Some(w) = &spec.workdir {
                     std::fs::write(w.join("made-by-run.txt"), "one\ntwo\n").unwrap();
+                }
+            }
+            // "edit-readme" changes a tracked file; "edit-other" adds another.
+            if spec.message == "edit-readme" {
+                if let Some(w) = &spec.workdir {
+                    std::fs::write(w.join("README.md"), "changed by the run\n").unwrap();
+                }
+            }
+            if spec.message == "edit-other" {
+                if let Some(w) = &spec.workdir {
+                    std::fs::write(w.join("other.txt"), "tweak\n").unwrap();
                 }
             }
             Ok(
@@ -2256,4 +2273,305 @@ async fn a_local_checkout_worktree_starts_from_the_freshly_fetched_default_branc
         1,
         "the checkout was fetched (refs only)"
     );
+}
+
+// ─── Keep and Discard ────────────────────────────────────────────────────
+
+/// A git workspace under the base with an uncommitted edit of the owner's
+/// own (`notes.txt`), which Keep and Discard must never touch.
+fn git_workspace(h: &Harness, name: &str) -> PathBuf {
+    let wt = h.base.join(name);
+    fixture_repo(&wt);
+    run_git(Some(&wt), &["config", "user.name", "Owner"]);
+    run_git(Some(&wt), &["config", "user.email", "owner@example.com"]);
+    run_git(Some(&wt), &["checkout", "--quiet", "-b", "mux/test-abc123"]);
+    std::fs::write(wt.join("notes.txt"), "mine, uncommitted\n").unwrap();
+    wt
+}
+
+async fn run_in(h: &Harness, token: &str, workspace: &str, message: &str) -> String {
+    let (code, v) = call(
+        h,
+        post(
+            "/client/work",
+            Some(token),
+            serde_json::json!({"role": "coder", "message": message, "workspace": workspace}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 202, "{v}");
+    let id = v["work_id"].as_str().unwrap().to_string();
+    let _ = wait_done(h, token, &id).await;
+    id
+}
+
+#[tokio::test]
+async fn keep_commits_only_the_runs_changes_to_its_branch() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = git_workspace(&h, "site");
+    let id = run_in(&h, &token, "site", "edit-readme").await;
+    let (code, v) = call(
+        &h,
+        post(
+            &format!("/client/work/{id}/keep"),
+            Some(&token),
+            serde_json::json!({"message": "Restore side padding"}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["branch"], "mux/test-abc123");
+    assert_eq!(v["files"], serde_json::json!(["README.md"]));
+    let commit = v["commit"].as_str().unwrap();
+    assert_eq!(
+        run_git(Some(&wt), &["log", "-1", "--format=%h %s"]),
+        format!("{commit} Restore side padding")
+    );
+    assert_eq!(
+        run_git(Some(&wt), &["show", "--name-only", "--format=", "HEAD"]),
+        "README.md"
+    );
+    // The owner's own edit is still there, uncommitted.
+    assert_eq!(
+        run_git(Some(&wt), &["status", "--porcelain"]),
+        "?? notes.txt"
+    );
+    // Decided once.
+    let (code, _) = call(
+        &h,
+        post(
+            &format!("/client/work/{id}/keep"),
+            Some(&token),
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 409);
+    let (code, _) = call(
+        &h,
+        post(
+            &format!("/client/work/{id}/discard"),
+            Some(&token),
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 409);
+}
+
+#[tokio::test]
+async fn discard_puts_back_what_the_run_changed_and_nothing_else() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = git_workspace(&h, "site");
+    std::fs::write(wt.join("README.md"), "the owner's uncommitted readme\n").unwrap();
+    let id = run_in(&h, &token, "site", "edit-readme").await;
+    let id2 = run_in(&h, &token, "site", "edit").await;
+    let (code, v) = call(
+        &h,
+        post(
+            &format!("/client/work/{id2}/discard"),
+            Some(&token),
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["restored"], serde_json::json!(["README.md"]));
+    assert_eq!(v["removed"], serde_json::json!(["made-by-run.txt"]));
+    // Back to exactly what was there before the first run, owner's edits included.
+    assert_eq!(
+        std::fs::read_to_string(wt.join("README.md")).unwrap(),
+        "the owner's uncommitted readme\n"
+    );
+    assert!(!wt.join("made-by-run.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(wt.join("notes.txt")).unwrap(),
+        "mine, uncommitted\n"
+    );
+    assert_eq!(
+        run_git(Some(&wt), &["log", "--oneline"]).lines().count(),
+        1,
+        "nothing committed"
+    );
+    // The first run was folded into the second: it can't be decided on its own.
+    let (code, v) = call(
+        &h,
+        post(
+            &format!("/client/work/{id}/keep"),
+            Some(&token),
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 409, "{v}");
+}
+
+#[tokio::test]
+async fn a_tweak_keeps_everything_since_the_first_run() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = git_workspace(&h, "site");
+    let _first = run_in(&h, &token, "site", "edit-readme").await;
+    let second = run_in(&h, &token, "site", "edit-other").await;
+    let (_, done) = call(
+        &h,
+        get(
+            &format!("/client/work/{second}"),
+            &[("authorization", &bearer(&token))],
+        ),
+    )
+    .await;
+    let paths: Vec<&str> = done["changes"]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        paths,
+        vec!["README.md", "other.txt"],
+        "the diff is cumulative"
+    );
+    let (code, v) = call(
+        &h,
+        post(
+            &format!("/client/work/{second}/keep"),
+            Some(&token),
+            serde_json::json!({"message": "Both"}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["files"], serde_json::json!(["README.md", "other.txt"]));
+    assert_eq!(
+        run_git(Some(&wt), &["status", "--porcelain"]),
+        "?? notes.txt"
+    );
+}
+
+#[tokio::test]
+async fn keep_and_discard_refuse_what_they_cant_do() {
+    let h = harness();
+    let token = paired(&h).await;
+    let other = {
+        let id = request_pairing(&h).await;
+        let _ = id;
+        paired(&h).await
+    };
+    git_workspace(&h, "site");
+    // Nothing changed.
+    let quiet = run_in(&h, &token, "site", "hello").await;
+    let (code, v) = call(
+        &h,
+        post(
+            &format!("/client/work/{quiet}/keep"),
+            Some(&token),
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 409, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("nothing"), "{v}");
+    let id = run_in(&h, &token, "site", "edit-readme").await;
+    // Not yours, not authenticated, unknown.
+    let (code, _) = call(
+        &h,
+        post(
+            &format!("/client/work/{id}/keep"),
+            Some(&other),
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 404);
+    let (code, _) = call(
+        &h,
+        post(
+            &format!("/client/work/{id}/keep"),
+            None,
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 401);
+    let (code, _) = call(
+        &h,
+        post(
+            "/client/work/w-nope/discard",
+            Some(&token),
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 404);
+    // Detached HEAD: no branch to commit to.
+    let wt = h.base.join("site");
+    run_git(Some(&wt), &["checkout", "--quiet", "--detach"]);
+    let (code, v) = call(
+        &h,
+        post(
+            &format!("/client/work/{id}/keep"),
+            Some(&token),
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 409, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("branch"), "{v}");
+}
+
+#[tokio::test]
+async fn keep_and_discard_wait_for_the_run_to_finish() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = git_workspace(&h, "site");
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/work",
+            Some(&token),
+            serde_json::json!({"role": "coder", "message": "edit-wait", "workspace": "site"}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 202, "{v}");
+    let id = v["work_id"].as_str().unwrap().to_string();
+    // The run has changed something and is still going.
+    for _ in 0..300 {
+        if wt.join("in-progress.txt").exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let (code, _) = call(
+        &h,
+        post(
+            &format!("/client/work/{id}/keep"),
+            Some(&token),
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 409);
+    let (code, _) = call(
+        &h,
+        post(
+            &format!("/client/work/{id}/discard"),
+            Some(&token),
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 409);
+    call(
+        &h,
+        post(
+            &format!("/client/work/{id}/cancel"),
+            Some(&token),
+            serde_json::json!({}),
+        ),
+    )
+    .await;
 }
