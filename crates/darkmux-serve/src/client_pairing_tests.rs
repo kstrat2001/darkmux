@@ -2403,7 +2403,7 @@ async fn undo_reverts_that_runs_commit_and_nothing_else() {
         std::fs::read_to_string(wt.join("notes.txt")).unwrap(),
         "mine, uncommitted\n"
     );
-    let (code, _) = call(
+    let (code, v) = call(
         &h,
         post(
             &format!("/client/work/{id}/undo"),
@@ -2413,6 +2413,7 @@ async fn undo_reverts_that_runs_commit_and_nothing_else() {
     )
     .await;
     assert_eq!(code, 409, "undone once");
+    assert!(v["error"].as_str().unwrap().contains("already undone"), "{v}");
 }
 
 #[tokio::test]
