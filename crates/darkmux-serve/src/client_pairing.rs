@@ -415,10 +415,25 @@ pub struct WorkSpec {
 #[derive(Debug, Clone)]
 pub enum WorkStatus {
     Running,
-    Done(Value),
-    Error(String),
-    /// Its owner cancelled it and it has ended.
-    Cancelled,
+    /// The dispatch's `--json` envelope, and what the run changed in its
+    /// workdir (`None`: no workdir, or not a git work copy).
+    Done {
+        result: Value,
+        changes: Option<Value>,
+    },
+    Error(RunError),
+    /// Its owner cancelled it and it has ended; how its child ended, if it
+    /// reported an error.
+    Cancelled(Option<RunError>),
+}
+
+/// How a run failed: a short machine `reason` (`exit 143/SIGTERM`, `exit 2`,
+/// `signal 9/SIGKILL`, `no output`, `spawn failed`) and the raw `error` text
+/// (the child's stderr tail).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunError {
+    pub reason: String,
+    pub error: String,
 }
 
 /// A request to stop one running work item, read by its executor.
@@ -463,7 +478,7 @@ pub struct ClientServerState {
     pub check_workdir: Arc<dyn Fn(&Path) -> Result<PathBuf, String> + Send + Sync>,
     /// Runs one role execution, blocking; `Ok` is the dispatch's `--json` envelope.
     /// It watches the [`CancelFlag`] and stops the run when it is raised.
-    pub execute: Arc<dyn Fn(WorkSpec, Arc<CancelFlag>) -> Result<Value, String> + Send + Sync>,
+    pub execute: Arc<dyn Fn(WorkSpec, Arc<CancelFlag>) -> Result<Value, RunError> + Send + Sync>,
     pub works: Arc<Mutex<HashMap<String, WorkEntry>>>,
 }
 
@@ -875,14 +890,28 @@ async fn work_handler(
     };
     tokio::task::spawn_blocking(move || {
         let id = spec.work_id.clone();
+        let workdir = spec.workdir.clone();
+        // The work copy as it is before the run, so what it held already is
+        // never reported as the run's change.
+        let baseline = workdir.as_deref().and_then(snapshot_tree);
         let flag = cancel.clone();
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| execute(spec, flag)));
         // A cancelled run ends as cancelled, however its child reported.
         let status = match ran {
-            _ if cancel.requested() => WorkStatus::Cancelled,
-            Ok(Ok(v)) => WorkStatus::Done(v),
+            Ok(r) if cancel.requested() => WorkStatus::Cancelled(r.err()),
+            Err(_) if cancel.requested() => WorkStatus::Cancelled(None),
+            Ok(Ok(result)) => {
+                let changes = match (&workdir, &baseline) {
+                    (Some(w), Some(before)) => changes_since(w, before),
+                    _ => None,
+                };
+                WorkStatus::Done { result, changes }
+            }
             Ok(Err(e)) => WorkStatus::Error(e),
-            Err(_) => WorkStatus::Error("the dispatch runner panicked".to_string()),
+            Err(_) => WorkStatus::Error(RunError {
+                reason: "panic".to_string(),
+                error: "the dispatch runner panicked".to_string(),
+            }),
         };
         if let Some(w) = works.lock().unwrap().get_mut(&id) {
             w.status = status;
@@ -1096,15 +1125,20 @@ async fn work_status_handler(
                 Json(serde_json::json!({"status": "cancelling"})).into_response()
             }
             WorkStatus::Running => Json(serde_json::json!({"status": "running"})).into_response(),
-            WorkStatus::Done(v) => {
-                Json(serde_json::json!({"status": "done", "result": v})).into_response()
+            WorkStatus::Done { result, changes } => {
+                Json(serde_json::json!({"status": "done", "result": result, "changes": changes}))
+                    .into_response()
             }
             WorkStatus::Error(e) => {
-                Json(serde_json::json!({"status": "error", "error": e})).into_response()
+                Json(serde_json::json!({"status": "error", "error": e.error, "reason": e.reason}))
+                    .into_response()
             }
-            WorkStatus::Cancelled => {
-                Json(serde_json::json!({"status": "cancelled"})).into_response()
-            }
+            WorkStatus::Cancelled(e) => Json(serde_json::json!({
+                "status": "cancelled",
+                "reason": "cancelled",
+                "error": e.map(|e| e.error),
+            }))
+            .into_response(),
         },
         _ => not_found(),
     }
@@ -1185,8 +1219,12 @@ pub(crate) fn run_dispatch_child(
     cancel: &CancelFlag,
     grace: std::time::Duration,
     teardown: &dyn HardKillTeardown,
-) -> Result<Value, String> {
+) -> Result<Value, RunError> {
     use darkmux_types::child_registry::{kill_pid, SIGKILL, SIGTERM};
+    let failed = |reason: &str, error: String| RunError {
+        reason: reason.to_string(),
+        error,
+    };
     use std::process::{Command, Stdio};
     let mut child = Command::new(exe)
         .args(dispatch_args(spec))
@@ -1194,12 +1232,19 @@ pub(crate) fn run_dispatch_child(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("could not start {}: {e}", exe.display()))?;
+        .map_err(|e| {
+            failed(
+                "spawn failed",
+                format!("could not start {}: {e}", exe.display()),
+            )
+        })?;
     let pid = child.id();
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or("no stdin for the dispatch child")?;
+    let mut stdin = child.stdin.take().ok_or_else(|| {
+        failed(
+            "spawn failed",
+            "no stdin for the dispatch child".to_string(),
+        )
+    })?;
     let message = spec.message.clone();
     // A child that exits before reading is reported by its status below.
     let feeder = std::thread::spawn(move || {
@@ -1232,7 +1277,12 @@ pub(crate) fn run_dispatch_child(
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {}
-            Err(e) => return Err(format!("waiting for the dispatch child: {e}")),
+            Err(e) => {
+                return Err(failed(
+                    "wait failed",
+                    format!("waiting for the dispatch child: {e}"),
+                ))
+            }
         }
         if cancel.requested() {
             match termed_at {
@@ -1260,16 +1310,136 @@ pub(crate) fn run_dispatch_child(
         return Ok(v);
     }
     let stderr = String::from_utf8_lossy(&stderr_bytes);
-    let tail: String = {
-        let chars: Vec<char> = stderr.trim().chars().collect();
-        chars[chars.len().saturating_sub(2000)..].iter().collect()
+    let chars: Vec<char> = stderr.trim().chars().collect();
+    let tail: String = chars[chars.len().saturating_sub(STDERR_TAIL_CHARS)..]
+        .iter()
+        .collect();
+    #[cfg(unix)]
+    let signal = std::os::unix::process::ExitStatusExt::signal(&status);
+    #[cfg(not(unix))]
+    let signal: Option<i32> = None;
+    Err(failed(&exit_reason(status.code(), signal), tail))
+}
+
+/// The most of a failed child's stderr a status keeps.
+const STDERR_TAIL_CHARS: usize = 4000;
+
+/// A short machine reason for a child that ended without a `--json`
+/// envelope: `exit 143/SIGTERM` (dispatch's own exit on a caught signal is
+/// 128 + its number), `exit <n>`, `signal 9/SIGKILL` (killed outright), or
+/// `no output` (a clean exit that printed no envelope).
+pub(crate) fn exit_reason(code: Option<i32>, signal: Option<i32>) -> String {
+    let name = |n: i32| match n {
+        1 => Some("SIGHUP"),
+        2 => Some("SIGINT"),
+        9 => Some("SIGKILL"),
+        15 => Some("SIGTERM"),
+        _ => None,
     };
-    Err(format!(
-        "dispatch exited {} with no JSON envelope: {tail}",
-        status
-            .code()
-            .map_or("by signal".to_string(), |c| c.to_string())
-    ))
+    match (code, signal) {
+        (Some(0), _) => "no output".to_string(),
+        (Some(c), _) if c > 128 => match name(c - 128) {
+            Some(n) => format!("exit {c}/{n}"),
+            None => format!("exit {c}"),
+        },
+        (Some(c), _) => format!("exit {c}"),
+        (None, Some(sig)) => match name(sig) {
+            Some(n) => format!("signal {sig}/{n}"),
+            None => format!("signal {sig}"),
+        },
+        (None, None) => "no exit status".to_string(),
+    }
+}
+
+// ─── What a run changed ──────────────────────────────────────────────────
+
+/// The most of a run's unified diff a status carries.
+pub const MAX_DIFF_BYTES: usize = 32 * 1024;
+/// Appended to a diff cut at [`MAX_DIFF_BYTES`].
+pub const DIFF_TRUNCATED_MARKER: &str = "\n[diff truncated at 32 KiB]\n";
+
+fn git(wd: &Path, index: Option<&Path>, args: &[&str]) -> Option<std::process::Output> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C")
+        .arg(wd)
+        .args(args)
+        .stdin(std::process::Stdio::null());
+    if let Some(i) = index {
+        cmd.env("GIT_INDEX_FILE", i);
+    }
+    let out = cmd.output().ok()?;
+    out.status.success().then_some(out)
+}
+
+/// The whole work copy as a git tree id: tracked AND untracked files (not
+/// ignored ones), staged or not, written through a throwaway index so the
+/// work copy's own index, branch and files are never touched (only blob and
+/// tree objects are added to its object store). `None` when `wd` is not in
+/// a git work copy.
+pub(crate) fn snapshot_tree(wd: &Path) -> Option<String> {
+    // Outside a git work copy `git add` fails, which is the `None`.
+    let scratch = tempfile::tempdir().ok()?;
+    let index = scratch.path().join("index");
+    git(wd, Some(&index), &["add", "-A"])?;
+    let tree = git(wd, Some(&index), &["write-tree"])?;
+    Some(String::from_utf8_lossy(&tree.stdout).trim().to_string())
+}
+
+/// What changed in `wd` since the tree `before` ([`snapshot_tree`]):
+/// `{"files": [{"path","added","removed"}], "diff": "<unified diff>"}`, the
+/// diff capped at [`MAX_DIFF_BYTES`]. `added`/`removed` are null for a
+/// binary file. `None` when the work copy can no longer be read.
+pub(crate) fn changes_since(wd: &Path, before: &str) -> Option<Value> {
+    let after = snapshot_tree(wd)?;
+    let numstat = git(
+        wd,
+        None,
+        &[
+            "diff",
+            "--no-renames",
+            "--no-ext-diff",
+            "--numstat",
+            "-z",
+            before,
+            &after,
+        ],
+    )?;
+    let files: Vec<Value> = String::from_utf8_lossy(&numstat.stdout)
+        .split('\0')
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| {
+            let mut parts = l.splitn(3, '\t');
+            let (added, removed, path) = (parts.next()?, parts.next()?, parts.next()?);
+            let n = |s: &str| s.parse::<u64>().ok();
+            Some(serde_json::json!({"path": path, "added": n(added), "removed": n(removed)}))
+        })
+        .collect();
+    let patch = git(
+        wd,
+        None,
+        &[
+            "diff",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-color",
+            before,
+            &after,
+        ],
+    )?;
+    Some(
+        serde_json::json!({"files": files, "diff": capped_diff(&String::from_utf8_lossy(&patch.stdout))}),
+    )
+}
+
+fn capped_diff(diff: &str) -> String {
+    if diff.len() <= MAX_DIFF_BYTES {
+        return diff.to_string();
+    }
+    let mut cut = MAX_DIFF_BYTES;
+    while !diff.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}{DIFF_TRUNCATED_MARKER}", &diff[..cut])
 }
 
 // ─── Teardown after a hard kill ──────────────────────────────────────────

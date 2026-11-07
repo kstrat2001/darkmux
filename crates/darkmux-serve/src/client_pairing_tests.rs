@@ -75,9 +75,18 @@ fn harness() -> Harness {
             if spec.message == "wait" {
                 for _ in 0..500 {
                     if cancel.requested() {
-                        return Err("dispatch exited 143".to_string());
+                        return Err(RunError {
+                            reason: "exit 143/SIGTERM".into(),
+                            error: "stopped".into(),
+                        });
                     }
                     std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            // An "edit" message changes the work copy, as a coder would.
+            if spec.message == "edit" {
+                if let Some(w) = &spec.workdir {
+                    std::fs::write(w.join("made-by-run.txt"), "one\ntwo\n").unwrap();
                 }
             }
             Ok(
@@ -884,13 +893,18 @@ async fn a_client_runs_at_most_two_items_at_once() {
 #[tokio::test]
 async fn a_failed_execution_reports_its_error() {
     let mut h = harness();
-    h.state.execute = Arc::new(|_, _| Err("dispatch exited 1".to_string()));
+    h.state.execute = Arc::new(|_, _| {
+        Err(RunError {
+            reason: "exit 1".into(),
+            error: "boom on stderr".into(),
+        })
+    });
     let token = paired(&h).await;
     let (_, v) = call(&h, post("/client/work", Some(&token), work_for("coder"))).await;
     let done = wait_done(&h, &token, v["work_id"].as_str().unwrap()).await;
     assert_eq!(
         done,
-        serde_json::json!({"status": "error", "error": "dispatch exited 1"})
+        serde_json::json!({"status": "error", "error": "boom on stderr", "reason": "exit 1"})
     );
 }
 
@@ -1119,7 +1133,8 @@ fn the_child_runner_parses_the_json_envelope_and_reports_failures() {
         &FakeTeardown::default(),
     )
     .unwrap_err();
-    assert!(e.contains("exited") && e.contains("boom"), "{e}");
+    assert_eq!(e.reason, "exit 3");
+    assert_eq!(e.error, "boom", "the raw stderr");
 }
 
 // ─── Cancel ──────────────────────────────────────────────────────────────
@@ -1147,7 +1162,10 @@ async fn cancelling_a_running_item_ends_it_as_cancelled() {
         (202, serde_json::json!({"status": "cancelling"}))
     );
     let done = wait_done(&h, &token, &id).await;
-    assert_eq!(done, serde_json::json!({"status": "cancelled"}));
+    assert_eq!(
+        done,
+        serde_json::json!({"status": "cancelled", "reason": "cancelled", "error": "stopped"})
+    );
 }
 
 #[tokio::test]
@@ -1448,5 +1466,132 @@ fn the_container_stop_judges_only_the_killed_childs_containers_gone() {
         names,
         ["darkmux-dispatch-ours"],
         "another run's container is never stopped"
+    );
+}
+
+// ─── Changes and reasons ─────────────────────────────────────────────────
+
+fn git_repo(dir: &Path) {
+    let ok = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "git init");
+}
+
+#[test]
+fn changes_exclude_what_the_work_copy_held_before_the_run() {
+    let dir = tempfile::tempdir().unwrap();
+    git_repo(dir.path());
+    std::fs::write(dir.path().join("pre.txt"), "already here\n").unwrap();
+    std::fs::write(dir.path().join("untouched.txt"), "left alone\n").unwrap();
+    let before = snapshot_tree(dir.path()).expect("a git work copy snapshots");
+    std::fs::write(
+        dir.path().join("pre.txt"),
+        "already here\nadded by the run\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("new.txt"), "a\nb\n").unwrap();
+    let c = changes_since(dir.path(), &before).unwrap();
+    assert_eq!(
+        c["files"],
+        serde_json::json!([{"path": "new.txt", "added": 2, "removed": 0}, {"path": "pre.txt", "added": 1, "removed": 0}])
+    );
+    let diff = c["diff"].as_str().unwrap();
+    assert!(diff.contains("+added by the run"), "{diff}");
+    assert!(
+        !diff.contains("+already here"),
+        "pre-existing uncommitted content is not the run's: {diff}"
+    );
+    assert!(!diff.contains("untouched"), "{diff}");
+    assert!(
+        !dir.path().join(".git/index").exists(),
+        "the work copy's own index is never written"
+    );
+}
+
+#[test]
+fn an_unchanged_work_copy_reports_no_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    git_repo(dir.path());
+    std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+    let before = snapshot_tree(dir.path()).unwrap();
+    assert_eq!(
+        changes_since(dir.path(), &before).unwrap(),
+        serde_json::json!({"files": [], "diff": ""})
+    );
+}
+
+#[test]
+fn a_large_diff_is_capped_with_a_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    git_repo(dir.path());
+    let before = snapshot_tree(dir.path()).unwrap();
+    let big: String = (0..5000)
+        .map(|i| format!("line number {i} of a long file\n"))
+        .collect();
+    std::fs::write(dir.path().join("big.txt"), &big).unwrap();
+    let c = changes_since(dir.path(), &before).unwrap();
+    let diff = c["diff"].as_str().unwrap();
+    assert!(
+        diff.len() <= MAX_DIFF_BYTES + DIFF_TRUNCATED_MARKER.len(),
+        "{}",
+        diff.len()
+    );
+    assert!(diff.ends_with(DIFF_TRUNCATED_MARKER));
+    assert_eq!(
+        c["files"],
+        serde_json::json!([{"path": "big.txt", "added": 5000, "removed": 0}]),
+        "the file list is not cut"
+    );
+}
+
+#[test]
+fn a_workdir_that_is_not_a_git_repo_has_no_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+    assert_eq!(snapshot_tree(dir.path()), None);
+}
+
+#[tokio::test]
+async fn a_done_run_reports_its_changes_and_null_outside_git() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = h.base.join("wt1");
+    let mut body = work_body(None, wt.to_str());
+    body["message"] = "edit".into();
+    let (_, v) = call(&h, post("/client/work", Some(&token), body.clone())).await;
+    let done = wait_done(&h, &token, v["work_id"].as_str().unwrap()).await;
+    assert_eq!(done["status"], "done");
+    assert_eq!(done["changes"], Value::Null, "not a git repo");
+
+    git_repo(&wt);
+    std::fs::remove_file(wt.join("made-by-run.txt")).unwrap();
+    std::fs::write(wt.join("mine.txt"), "uncommitted, the user's\n").unwrap();
+    let (_, v) = call(&h, post("/client/work", Some(&token), body)).await;
+    let done = wait_done(&h, &token, v["work_id"].as_str().unwrap()).await;
+    assert_eq!(
+        done["changes"]["files"],
+        serde_json::json!([{"path": "made-by-run.txt", "added": 2, "removed": 0}])
+    );
+
+    let (_, v) = call(&h, post("/client/work", Some(&token), work_for("coder"))).await;
+    let done = wait_done(&h, &token, v["work_id"].as_str().unwrap()).await;
+    assert_eq!(done["changes"], Value::Null, "no workdir, nothing to diff");
+}
+
+#[test]
+fn exit_reasons_are_short_and_machine_readable() {
+    assert_eq!(exit_reason(Some(143), None), "exit 143/SIGTERM");
+    assert_eq!(exit_reason(Some(130), None), "exit 130/SIGINT");
+    assert_eq!(exit_reason(Some(2), None), "exit 2");
+    assert_eq!(exit_reason(None, Some(9)), "signal 9/SIGKILL");
+    assert_eq!(exit_reason(None, Some(15)), "signal 15/SIGTERM");
+    assert_eq!(
+        exit_reason(Some(0), None),
+        "no output",
+        "a clean exit without an envelope"
     );
 }
