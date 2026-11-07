@@ -2413,7 +2413,10 @@ async fn undo_reverts_that_runs_commit_and_nothing_else() {
     )
     .await;
     assert_eq!(code, 409, "undone once");
-    assert!(v["error"].as_str().unwrap().contains("already undone"), "{v}");
+    assert!(
+        v["error"].as_str().unwrap().contains("already undone"),
+        "{v}"
+    );
 }
 
 #[tokio::test]
@@ -2999,4 +3002,96 @@ async fn a_second_run_cant_start_while_one_is_working_in_the_same_copy() {
         ),
     )
     .await;
+}
+
+// ─── Changes for an app-opened PR ────────────────────────────────────────
+
+#[tokio::test]
+async fn changes_lists_the_branchs_commits_against_origins_default_branch() {
+    let h = harness();
+    let token = paired(&h).await;
+    let upstream = h.dir.path().join("upstream");
+    fixture_repo(&upstream);
+    std::fs::write(upstream.join("gone.txt"), "to delete\n").unwrap();
+    run_git(Some(&upstream), &["add", "."]);
+    run_git(Some(&upstream), &["commit", "--quiet", "-m", "add gone"]);
+    let wt = h.base.join("site");
+    run_git(
+        None,
+        &[
+            "clone",
+            "--quiet",
+            upstream.to_str().unwrap(),
+            wt.to_str().unwrap(),
+        ],
+    );
+    run_git(Some(&wt), &["config", "user.name", "Owner"]);
+    run_git(Some(&wt), &["config", "user.email", "owner@example.com"]);
+    run_git(Some(&wt), &["checkout", "--quiet", "-b", "mux/site-abc123"]);
+    let base = run_git(Some(&wt), &["rev-parse", "origin/main"]);
+    std::fs::write(wt.join("README.md"), "changed\n").unwrap();
+    std::fs::create_dir_all(wt.join("img")).unwrap();
+    std::fs::write(wt.join("img/dot.bin"), [0u8, 159, 146, 150]).unwrap();
+    std::fs::remove_file(wt.join("gone.txt")).unwrap();
+    run_git(Some(&wt), &["add", "-A"]);
+    run_git(Some(&wt), &["commit", "--quiet", "-m", "run"]);
+    std::fs::write(wt.join("notes.txt"), "uncommitted, not in the PR\n").unwrap();
+    std::fs::write(wt.join("README.md"), "an uncommitted edit after the run\n").unwrap();
+
+    let (code, v) = call(
+        &h,
+        get(
+            "/client/workspaces/site/changes",
+            &[("authorization", &bearer(&token))],
+        ),
+    )
+    .await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["base"], base.as_str());
+    assert_eq!(v["branch"], "mux/site-abc123");
+    assert_eq!(v["base_branch"], "main");
+    let files = v["files"].as_array().unwrap();
+    let by = |p: &str| {
+        files
+            .iter()
+            .find(|f| f["path"] == p)
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let decode = |v: &Value| crate::client_workspace::base64_decode(v.as_str().unwrap()).unwrap();
+    assert_eq!(decode(&by("README.md")["content"]), b"changed\n");
+    assert_eq!(
+        decode(&by("img/dot.bin")["content"]),
+        vec![0u8, 159, 146, 150]
+    );
+    assert_eq!(by("gone.txt")["deleted"], true);
+    assert_eq!(by("notes.txt"), Value::Null, "only committed changes");
+    assert_eq!(files.len(), 3);
+}
+
+#[tokio::test]
+async fn changes_needs_a_token_and_a_workspace_with_a_remote_default() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (code, _) = call(&h, get("/client/workspaces/site/changes", &[])).await;
+    assert_eq!(code, 401);
+    let (code, _) = call(
+        &h,
+        get(
+            "/client/workspaces/nope/changes",
+            &[("authorization", &bearer(&token))],
+        ),
+    )
+    .await;
+    assert_eq!(code, 404);
+    // wt1 isn't a git checkout with an origin.
+    let (code, v) = call(
+        &h,
+        get(
+            "/client/workspaces/wt1/changes",
+            &[("authorization", &bearer(&token))],
+        ),
+    )
+    .await;
+    assert_eq!(code, 409, "{v}");
 }
