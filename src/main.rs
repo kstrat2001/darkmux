@@ -106,6 +106,8 @@ mod radio_busy;
 mod radio_index;
 mod card_status;
 mod role_cli;
+// `darkmux client` (local prototype): pairing an app and its scoped work.
+mod client_cli;
 // #515 — serve daemon extracted (final crate; deps doctor/eureka/fleet/crew/
 // flow/profiles all crates). Re-export keeps crate::serve::* resolving for
 // main + phase_review.
@@ -288,6 +290,7 @@ fn run(cmd: Cmd) -> Result<i32> {
         Cmd::Acp => acp::run(),
         // (#1698 Packet A) — see src/radio.rs / src/radio_cli.rs module docs.
         Cmd::Radio { text, dry_run } => radio_cli::run(&text, dry_run),
+        Cmd::Client { sub } => client_cli::run(sub),
     }
 }
 
