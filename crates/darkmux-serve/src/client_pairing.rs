@@ -6,9 +6,10 @@
 //! ([`bind_addr`]): never `0.0.0.0`, never the tailnet address.
 //!
 //! **Pairing.** The app `POST`s `/client/pair` with a device name, a code it
-//! shows its user, a random `pair_secret`, and the scopes it asks for. The
-//! operator runs `darkmux client approve` here, sees the device, code, scopes
-//! and age, and approves (or denies). The app polls `/client/pair/{id}` with
+//! shows its user and a random `pair_secret` (a `scopes` field is accepted
+//! and ignored: what an app may run is machine policy, not the app's ask). The
+//! operator runs `darkmux client approve` here, sees the device, code and age,
+//! and approves (or denies). A pairing records identity only. The app polls `/client/pair/{id}` with
 //! `X-Pair-Secret`; on the first poll after approval this listener mints the
 //! token (32 random bytes, hex), stores ONLY its BLAKE3 hash as an approved
 //! client, deletes the pending record and returns the token. A later poll is
@@ -21,11 +22,16 @@
 //! as `darkmux dispatch <role> --profile <p> [--workdir <w>] --json --name
 //! <work_id>` with the message on stdin ([`dispatch_args`]), so every dispatch
 //! contract (the user-file preflight, liveness bookends, residency, the
-//! crew-of-one run) holds unchanged. The profile must be one the client was
-//! granted, must not route to another machine (`<p>@<machine>`), and must be
-//! defined here (dispatch would otherwise fall back to `default_profile`). A
-//! `workdir` needs the `workspace` grant and must lie under the worktrees base
-//! (`validate_remote_workdir`).
+//! crew-of-one run) holds unchanged. The profile is optional: absent, it
+//! resolves exactly as `darkmux dispatch <role>` would (`role_profiles`, else
+//! `default_profile`), and the resolved name is passed to the child explicitly
+//! so what runs is what was checked. It must be defined here, must not route
+//! to another machine (`<p>@<machine>`), and must be allowed by the machine's
+//! `clients.profiles` setting, read fresh from `config.json` on every request
+//! (unset: only the role's own resolved profile). A `workdir` must lie under
+//! the worktrees base (`validate_remote_workdir`).
+//! `GET /client/recipe?workdir=` reads `<workdir>/.darkmux/preview.json`
+//! under the same containment, for an app that cannot read the disk itself.
 //!
 //! **State.** `~/.darkmux/clients.json` (0600), every read-modify-write under
 //! an exclusive `flock` on the file itself, so `client approve` in one process
@@ -69,18 +75,13 @@ const MAX_RUNNING_PER_CLIENT: usize = 2;
 /// Finished work is remembered this long for polls.
 const KEEP_WORK_SECS: u64 = 3600;
 /// The `schema_version` this binary writes and reads.
-pub const CLIENTS_SCHEMA_VERSION: &str = "1.0";
+///
+/// 1.1: records hold identity only; the per-record `scopes` of 1.0 is
+/// dropped when a 1.0 store is read (what a client may run is the machine's
+/// `clients.profiles` setting).
+pub const CLIENTS_SCHEMA_VERSION: &str = "1.1";
 
 // ─── Store ───────────────────────────────────────────────────────────────
-
-/// What a client may do: run on these profiles, and name a workdir.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct Scopes {
-    #[serde(default)]
-    pub profiles: Vec<String>,
-    #[serde(default)]
-    pub workspace: bool,
-}
 
 /// Where a pairing request stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -100,7 +101,6 @@ pub struct PendingRequest {
     pub code: String,
     /// BLAKE3 of the app's `pair_secret`, hex. The secret itself is never stored.
     pub pair_secret_hash: String,
-    pub scopes: Scopes,
     /// Unix seconds.
     pub created: u64,
     pub status: PendingStatus,
@@ -125,7 +125,6 @@ pub struct ApprovedClient {
     pub name: String,
     /// Unix seconds.
     pub created: u64,
-    pub scopes: Scopes,
     /// BLAKE3 of the bearer token, hex. The token itself is never stored.
     pub token_hash: String,
 }
@@ -217,11 +216,12 @@ fn parse_clients(path: &Path, text: &str) -> Result<ClientsFile> {
             darkmux_types::user_files::MAX_USER_FILE_BYTES
         );
     }
-    let doc: Value = serde_json::from_str(text)
+    let mut doc: Value = serde_json::from_str(text)
         .with_context(|| format!("{} is not valid JSON", path.display()))?;
     if let Some(v) = darkmux_types::data_version::newer(&doc, CLIENTS_SCHEMA_VERSION) {
         bail!("{} was written by a newer darkmux (schema_version {v}; this one reads {CLIENTS_SCHEMA_VERSION}). Upgrade darkmux.", path.display());
     }
+    migrate_1_0(&mut doc);
     let issues = darkmux_types::user_files::key_issues::<ClientsFile>(
         &doc,
         &darkmux_types::user_files::no_retired,
@@ -231,6 +231,21 @@ fn parse_clients(path: &Path, text: &str) -> Result<ClientsFile> {
         bail!("client store {}: {}", path.display(), lines.join("; "));
     }
     serde_json::from_value(doc).with_context(|| format!("reading {}", path.display()))
+}
+
+/// A 1.0 store carried `scopes` on every record; 1.1 holds identity only.
+fn migrate_1_0(doc: &mut Value) {
+    if doc.get("schema_version").and_then(Value::as_str) != Some("1.0") {
+        return;
+    }
+    for list in ["pending", "clients"] {
+        if let Some(items) = doc.get_mut(list).and_then(Value::as_array_mut) {
+            for item in items.iter_mut().filter_map(Value::as_object_mut) {
+                item.remove("scopes");
+            }
+        }
+    }
+    doc["schema_version"] = Value::from(CLIENTS_SCHEMA_VERSION);
 }
 
 /// Keep the store owner-only, also when it existed with a wider mode.
@@ -420,9 +435,14 @@ pub struct ClientServerState {
     pub now: Arc<dyn Fn() -> u64 + Send + Sync>,
     /// Whether a role is defined on this machine.
     pub role_known: Arc<dyn Fn(&str) -> Result<bool, String> + Send + Sync>,
-    /// (role, profile): `Ok` when the profile is defined here and runnable
-    /// for the role.
-    pub resolve_profile: Arc<dyn Fn(&str, &str) -> Result<(), String> + Send + Sync>,
+    /// (role, requested profile) -> the profile that would run, resolved as
+    /// `darkmux dispatch <role> [--profile <p>]` resolves it; `Err` when
+    /// nothing runnable resolves (a requested name never falls back).
+    pub resolve_profile: Arc<dyn Fn(&str, Option<&str>) -> Result<String, String> + Send + Sync>,
+    /// This machine's `clients.profiles`, read per request: `Ok(None)` when
+    /// unset (only the role's own resolved profile), `Err` when it cannot be
+    /// read (work is then refused, never run on a guessed policy).
+    pub profiles_policy: Arc<dyn Fn() -> Result<Option<Vec<String>>, String> + Send + Sync>,
     /// The workdir containment check; returns the canonical path.
     pub check_workdir: Arc<dyn Fn(&Path) -> Result<PathBuf, String> + Send + Sync>,
     /// Runs one role execution, blocking; `Ok` is the dispatch's `--json` envelope.
@@ -443,22 +463,22 @@ impl ClientServerState {
                     .map(|rs| rs.iter().any(|r| r.id == role))
                     .map_err(|e| format!("{e:#}"))
             }),
-            resolve_profile: Arc::new(|role, profile| {
-                match darkmux_fleet::resolve_work_profile(role, Some(profile), "this machine") {
-                    darkmux_fleet::ProfileResolution::Work {
-                        profile: resolved, ..
-                    } if resolved == profile => Ok(()),
-                    darkmux_fleet::ProfileResolution::Work {
-                        profile: resolved, ..
-                    } => Err(format!(
-                        "profile {profile} resolves to {resolved} here; refusing"
-                    )),
-                    darkmux_fleet::ProfileResolution::UtilityOnly(p) => Err(format!(
+            resolve_profile: Arc::new(|role, requested| {
+                use darkmux_fleet::ProfileResolution as R;
+                match darkmux_fleet::resolve_work_profile(role, requested, "this machine") {
+                    R::Work { profile, .. } => match requested {
+                        Some(asked) if asked != profile => Err(format!(
+                            "profile {asked} resolves to {profile} here; refusing"
+                        )),
+                        _ => Ok(profile),
+                    },
+                    R::UtilityOnly(p) => Err(format!(
                         "profile {p} holds only the utility model; work never runs on it"
                     )),
-                    darkmux_fleet::ProfileResolution::Unresolved(why) => Err(why),
+                    R::Unresolved(why) => Err(why),
                 }
             }),
+            profiles_policy: Arc::new(read_profiles_policy),
             check_workdir: Arc::new(|p| {
                 darkmux_types::workdir::validate_remote_workdir(p).map_err(|e| format!("{e:#}"))
             }),
@@ -466,6 +486,32 @@ impl ClientServerState {
             works: Arc::new(Mutex::new(HashMap::new())),
         })
     }
+}
+
+/// `clients.profiles` from `config.json` as it is NOW (the process-wide
+/// config tier is read once, and `config set` must take effect without a
+/// restart), env first. A missing file is "unset"; one that cannot be read or
+/// parsed refuses rather than falling back to a policy nobody wrote.
+fn read_profiles_policy() -> Result<Option<Vec<String>>, String> {
+    let path = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config;
+    let cfg = match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            serde_json::from_str::<darkmux_types::config::DarkmuxConfig>(&text).map_err(|e| {
+                format!(
+                    "{} does not parse ({e}); refusing client work",
+                    path.display()
+                )
+            })?
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Default::default(),
+        Err(e) => {
+            return Err(format!(
+                "{} could not be read ({e}); refusing client work",
+                path.display()
+            ))
+        }
+    };
+    Ok(darkmux_types::config_access::clients_profiles_in(&cfg))
 }
 
 fn unix_now() -> u64 {
@@ -521,6 +567,7 @@ pub fn router(state: ClientServerState) -> Router {
         .route("/client/whoami", get(whoami_handler))
         .route("/client/work", post(work_handler))
         .route("/client/work/:work_id", get(work_status_handler))
+        .route("/client/recipe", get(recipe_handler))
         .fallback(|| async { err(StatusCode::NOT_FOUND, "no such route") })
         .method_not_allowed_fallback(|| async {
             err(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
@@ -575,7 +622,11 @@ struct PairBody {
     device_name: String,
     code: String,
     pair_secret: String,
-    scopes: Scopes,
+    /// Accepted for apps built against the first contract, and ignored: what
+    /// a paired app may run is this machine's `clients.profiles`.
+    #[serde(default)]
+    #[allow(dead_code)]
+    scopes: Option<serde::de::IgnoredAny>,
 }
 
 async fn pair_handler(State(state): State<ClientServerState>, body: Body) -> Response {
@@ -591,14 +642,6 @@ async fn pair_handler(State(state): State<ClientServerState>, body: Body) -> Res
     if let Some(Err(r)) = checks.into_iter().find(Result::is_err) {
         return r;
     }
-    if req.scopes.profiles.len() > 32 {
-        return err(StatusCode::BAD_REQUEST, "at most 32 profiles");
-    }
-    for p in &req.scopes.profiles {
-        if let Err(r) = clean_text(p, "scopes.profiles[]", 1, 128) {
-            return r;
-        }
-    }
     let now = (state.now)();
     let request_id = match random_hex(16) {
         Ok(h) => format!("r-{h}"),
@@ -609,7 +652,6 @@ async fn pair_handler(State(state): State<ClientServerState>, body: Body) -> Res
         device_name: req.device_name,
         code: req.code,
         pair_secret_hash: hash_hex(&req.pair_secret),
-        scopes: req.scopes,
         created: now,
         status: PendingStatus::Pending,
         client_name: None,
@@ -640,11 +682,20 @@ async fn pair_handler(State(state): State<ClientServerState>, body: Body) -> Res
 enum PollOutcome {
     NotFound,
     Status(&'static str),
-    Approved {
-        client_name: String,
-        token: String,
-        scopes: Scopes,
-    },
+    Approved { client_name: String, token: String },
+}
+
+/// What a paired client may run, as it reads it: `{"profiles": [..] | null,
+/// "workspace": true}`. `profiles` is this machine's `clients.profiles`;
+/// `null` means unset, so each role runs on its own resolved profile.
+/// `workspace` is always true: a `workdir` under the worktrees base is
+/// allowed to every paired client.
+fn scopes_json(policy: &Option<Vec<String>>) -> Value {
+    serde_json::json!({"profiles": policy, "workspace": true})
+}
+
+fn policy_or_503(state: &ClientServerState) -> Result<Option<Vec<String>>, Response> {
+    (state.profiles_policy)().map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, e))
 }
 
 async fn poll_handler(
@@ -654,6 +705,12 @@ async fn poll_handler(
 ) -> Response {
     let Some(secret) = headers.get("x-pair-secret").and_then(|v| v.to_str().ok()) else {
         return not_found();
+    };
+    // Read before anything is consumed, so a policy that cannot be read
+    // never costs the app its one token delivery.
+    let policy = match policy_or_503(&state) {
+        Ok(p) => p,
+        Err(r) => return r,
     };
     let now = (state.now)();
     let outcome = state.store.update(|f| {
@@ -684,25 +741,16 @@ async fn poll_handler(
         f.clients.push(ApprovedClient {
             name: client_name.clone(),
             created: now,
-            scopes: p.scopes.clone(),
             token_hash: hash_hex(&token),
         });
         f.pending.remove(i);
-        Ok(PollOutcome::Approved {
-            client_name,
-            token,
-            scopes: p.scopes,
-        })
+        Ok(PollOutcome::Approved { client_name, token })
     });
     match outcome {
         Ok(PollOutcome::NotFound) => not_found(),
         Ok(PollOutcome::Status(s)) => Json(serde_json::json!({"status": s})).into_response(),
-        Ok(PollOutcome::Approved {
-            client_name,
-            token,
-            scopes,
-        }) => Json(serde_json::json!({
-            "status": "approved", "client_name": client_name, "token": token, "scopes": scopes,
+        Ok(PollOutcome::Approved { client_name, token }) => Json(serde_json::json!({
+            "status": "approved", "client_name": client_name, "token": token, "scopes": scopes_json(&policy),
         }))
         .into_response(),
         Err(e) => internal(e),
@@ -736,12 +784,24 @@ fn authenticate(
 }
 
 async fn whoami_handler(State(state): State<ClientServerState>, headers: HeaderMap) -> Response {
-    match authenticate(&state, &headers) {
-        Ok(c) => {
-            Json(serde_json::json!({"client_name": c.name, "scopes": c.scopes})).into_response()
+    let client = match authenticate(&state, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    match policy_or_503(&state) {
+        Ok(policy) => {
+            Json(serde_json::json!({"client_name": client.name, "scopes": scopes_json(&policy)}))
+                .into_response()
         }
         Err(r) => r,
     }
+}
+
+/// A client-named workdir under the worktrees base
+/// ([`ClientServerState::check_workdir`], which canonicalizes, so a relative
+/// path is judged by where it really lands); the canonical path, or a 403.
+fn checked_workdir(state: &ClientServerState, w: &str) -> Result<PathBuf, Response> {
+    (state.check_workdir)(Path::new(w)).map_err(|e| err(StatusCode::FORBIDDEN, e))
 }
 
 #[derive(Deserialize)]
@@ -749,7 +809,9 @@ async fn whoami_handler(State(state): State<ClientServerState>, headers: HeaderM
 struct WorkBody {
     role: String,
     message: String,
-    profile: String,
+    /// Absent or null: resolved as `darkmux dispatch <role>` would.
+    #[serde(default)]
+    profile: Option<String>,
     #[serde(default)]
     workdir: Option<String>,
 }
@@ -770,8 +832,8 @@ async fn work_handler(
     if req.message.trim().is_empty() {
         return err(StatusCode::BAD_REQUEST, "`message` is empty");
     }
-    // The checks below read the role library, the registry and the disk:
-    // off the async workers.
+    // The checks below read the role library, the registry, config.json and
+    // the disk: off the async workers.
     let st = state.clone();
     let checked = tokio::task::spawn_blocking(move || admit(&st, &client, req)).await;
     let spec = match checked {
@@ -780,6 +842,7 @@ async fn work_handler(
         Err(e) => return internal(anyhow!("work admission panicked: {e}")),
     };
     let work_id = spec.work_id.clone();
+    let profile = spec.profile.clone();
     let execute = state.execute.clone();
     let works = state.works.clone();
     tokio::task::spawn_blocking(move || {
@@ -796,13 +859,13 @@ async fn work_handler(
     });
     (
         StatusCode::ACCEPTED,
-        Json(serde_json::json!({"work_id": work_id})),
+        Json(serde_json::json!({"work_id": work_id, "profile": profile})),
     )
         .into_response()
 }
 
 /// Every refusal a work request can meet, in order; on success the work is
-/// registered as running and its spec returned.
+/// registered as running and its spec (with the RESOLVED profile) returned.
 fn admit(
     state: &ClientServerState,
     client: &ApprovedClient,
@@ -818,40 +881,45 @@ fn admit(
         }
         Err(e) => return Err(internal(anyhow!(e))),
     }
-    if !client.scopes.profiles.iter().any(|p| p == &req.profile) {
-        return Err(err(
-            StatusCode::FORBIDDEN,
-            format!(
-                "profile {} is not in client {}'s scopes",
-                req.profile, client.name
-            ),
-        ));
-    }
-    if req.profile.contains('@') {
-        return Err(err(
-            StatusCode::FORBIDDEN,
-            format!(
-                "profile {} names another machine; client work runs here only",
-                req.profile
-            ),
-        ));
-    }
     let workdir = match &req.workdir {
         None => None,
-        Some(_) if !client.scopes.workspace => {
-            return Err(err(
-                StatusCode::FORBIDDEN,
-                format!(
-                    "client {} was not granted workspace access; omit `workdir`",
-                    client.name
-                ),
-            ));
-        }
-        Some(w) => {
-            Some((state.check_workdir)(Path::new(w)).map_err(|e| err(StatusCode::FORBIDDEN, e))?)
-        }
+        Some(w) => Some(checked_workdir(state, w)?),
     };
-    (state.resolve_profile)(&req.role, &req.profile).map_err(|e| err(StatusCode::FORBIDDEN, e))?;
+    let policy = policy_or_503(state)?;
+    let forbidden = |e: String| err(StatusCode::FORBIDDEN, e);
+    let profile = (state.resolve_profile)(&req.role, req.profile.as_deref()).map_err(forbidden)?;
+    if profile.contains('@') {
+        return Err(forbidden(format!(
+            "profile {profile} names another machine; client work runs here only"
+        )));
+    }
+    match &policy {
+        Some(allowed) => {
+            if !allowed.iter().any(|p| p == &profile) {
+                return Err(forbidden(format!(
+                    "profile {profile} is not in this machine's clients.profiles ({})",
+                    if allowed.is_empty() {
+                        "empty".to_string()
+                    } else {
+                        allowed.join(", ")
+                    }
+                )));
+            }
+        }
+        // Unset: only what darkmux itself resolves for the role. An omitted
+        // profile IS that; a named one must equal it.
+        None if req.profile.is_some() => {
+            let own = (state.resolve_profile)(&req.role, None).map_err(forbidden)?;
+            if own != profile {
+                return Err(forbidden(format!(
+                    "profile {profile} is not available to apps: with clients.profiles unset, role {} runs only on \
+                     its own profile ({own}); `darkmux config set clients.profiles <list>` widens it",
+                    req.role
+                )));
+            }
+        }
+        None => {}
+    }
     let work_id = format!("w-{}", random_hex(8).map_err(internal)?);
     let now = (state.now)();
     let mut works = state.works.lock().unwrap();
@@ -882,10 +950,102 @@ fn admit(
     Ok(WorkSpec {
         work_id,
         role: req.role,
-        profile: req.profile,
+        profile,
         workdir,
         message: req.message,
     })
+}
+
+/// The largest `preview.json` `/client/recipe` reads.
+pub const MAX_RECIPE_BYTES: u64 = 16 * 1024;
+
+#[derive(Deserialize)]
+struct RecipeQuery {
+    workdir: String,
+}
+
+async fn recipe_handler(
+    State(state): State<ClientServerState>,
+    headers: HeaderMap,
+    query: Result<axum::extract::Query<RecipeQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    if let Err(r) = authenticate(&state, &headers) {
+        return r;
+    }
+    let Ok(axum::extract::Query(q)) = query else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "`workdir` query parameter is required",
+        );
+    };
+    let st = state.clone();
+    tokio::task::spawn_blocking(move || read_recipe(&st, &q.workdir))
+        .await
+        .unwrap_or_else(|e| internal(anyhow!("recipe read panicked: {e}")))
+}
+
+/// `<workdir>/.darkmux/preview.json` under the same containment as work. A
+/// symlinked `.darkmux` or `preview.json` is refused, and the file itself is
+/// opened without following a link.
+fn read_recipe(state: &ClientServerState, workdir: &str) -> Response {
+    let wd = match checked_workdir(state, workdir) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let dir = wd.join(".darkmux");
+    let file = dir.join("preview.json");
+    for p in [&dir, &file] {
+        match std::fs::symlink_metadata(p) {
+            Ok(m) if m.file_type().is_symlink() => {
+                return err(
+                    StatusCode::FORBIDDEN,
+                    format!("{} is a symlink; refusing", p.display()),
+                )
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return err(StatusCode::NOT_FOUND, "no recipe")
+            }
+            Err(e) => return internal(anyhow!("reading {}: {e}", p.display())),
+        }
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut text = String::new();
+    let read = opts.open(&file).and_then(|f| {
+        if !f.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "not a file",
+            ));
+        }
+        f.take(MAX_RECIPE_BYTES + 1).read_to_string(&mut text)
+    });
+    match read {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return err(StatusCode::NOT_FOUND, "no recipe")
+        }
+        Err(e) => return internal(anyhow!("reading {}: {e}", file.display())),
+    }
+    if text.len() as u64 > MAX_RECIPE_BYTES {
+        return err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("preview.json is larger than {MAX_RECIPE_BYTES} bytes"),
+        );
+    }
+    match serde_json::from_str::<Value>(&text) {
+        Ok(v @ Value::Object(_)) => Json(serde_json::json!({"recipe": v})).into_response(),
+        _ => err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "preview.json is not a JSON object",
+        ),
+    }
 }
 
 async fn work_status_handler(

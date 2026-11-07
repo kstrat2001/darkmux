@@ -227,6 +227,8 @@ const KEYS: &[(&str, Ty)] = &[
     // (#1685) The `gh`-verb allowlist gate — see `CmdConfig`'s own doc.
     ("cmd.enabled", Ty::Bool),
     ("cmd.allowed", Ty::StrList),
+    // The profiles a paired client app may run on — see `ClientsConfig`.
+    ("clients.profiles", Ty::StrList),
     // (#2093) The flow-record hook sink — see `HooksConfig`'s own doc.
     // `hooks.rules` is deliberately NOT a per-field-settable structure (a
     // rule is an object, not a scalar) — it's settable only as a whole,

@@ -193,6 +193,7 @@ pub const CONFIG_SHOWN: &[&str] = &[
     "radio.humor",
     "cmd.enabled",
     "cmd.allowed",
+    "clients.profiles",
     "hooks.enabled",
     "hooks.max_outbox_mb",
     "hooks.jq_timeout_ms",
