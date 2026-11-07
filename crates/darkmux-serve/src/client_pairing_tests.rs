@@ -65,11 +65,20 @@ fn harness() -> Harness {
             darkmux_types::workdir::validate_remote_workdir_in(p, &canon_base)
                 .map_err(|e| format!("{e:#}"))
         }),
-        execute: Arc::new(move |spec: WorkSpec| {
+        execute: Arc::new(move |spec: WorkSpec, cancel: Arc<CancelFlag>| {
             r.lock().unwrap().push(spec.clone());
             // A "slow" message holds its seat a while, so a test can fill the cap.
             if spec.message == "slow" {
                 std::thread::sleep(std::time::Duration::from_millis(400));
+            }
+            // A "wait" message runs until it is cancelled, as a dispatch child would.
+            if spec.message == "wait" {
+                for _ in 0..500 {
+                    if cancel.requested() {
+                        return Err("dispatch exited 143".to_string());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
             }
             Ok(
                 serde_json::json!({"result": "stop", "final_assistant": format!("ran {}", spec.role)}),
@@ -615,7 +624,7 @@ async fn wait_done(h: &Harness, token: &str, id: &str) -> Value {
         )
         .await;
         assert_eq!(code, 200, "{v}");
-        if v["status"] != "running" {
+        if v["status"] != "running" && v["status"] != "cancelling" {
             return v;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -875,7 +884,7 @@ async fn a_client_runs_at_most_two_items_at_once() {
 #[tokio::test]
 async fn a_failed_execution_reports_its_error() {
     let mut h = harness();
-    h.state.execute = Arc::new(|_| Err("dispatch exited 1".to_string()));
+    h.state.execute = Arc::new(|_, _| Err("dispatch exited 1".to_string()));
     let token = paired(&h).await;
     let (_, v) = call(&h, post("/client/work", Some(&token), work_for("coder"))).await;
     let done = wait_done(&h, &token, v["work_id"].as_str().unwrap()).await;
@@ -1089,12 +1098,355 @@ fn the_child_runner_parses_the_json_envelope_and_reports_failures() {
         workdir: None,
         message: "hi".into(),
     };
-    let v = run_dispatch_child(&ok, &spec).unwrap();
+    let v = run_dispatch_child(
+        &ok,
+        &spec,
+        &CancelFlag::default(),
+        GRACE,
+        &FakeTeardown::default(),
+    )
+    .unwrap();
     assert_eq!(v["final_assistant"], "coder hi");
 
     let bad = dir.path().join("bad");
     std::fs::write(&bad, "#!/bin/sh\ncat >/dev/null\necho 'boom' >&2\nexit 3\n").unwrap();
     std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let e = run_dispatch_child(&bad, &spec).unwrap_err();
+    let e = run_dispatch_child(
+        &bad,
+        &spec,
+        &CancelFlag::default(),
+        GRACE,
+        &FakeTeardown::default(),
+    )
+    .unwrap_err();
     assert!(e.contains("exited") && e.contains("boom"), "{e}");
+}
+
+// ─── Cancel ──────────────────────────────────────────────────────────────
+
+fn waiting_work() -> Value {
+    serde_json::json!({"role": "coder", "message": "wait"})
+}
+
+async fn cancel(h: &Harness, token: Option<&str>, id: &str) -> (u16, Value) {
+    call(
+        h,
+        post(&format!("/client/work/{id}/cancel"), token, Value::Null),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn cancelling_a_running_item_ends_it_as_cancelled() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (_, v) = call(&h, post("/client/work", Some(&token), waiting_work())).await;
+    let id = v["work_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        cancel(&h, Some(&token), &id).await,
+        (202, serde_json::json!({"status": "cancelling"}))
+    );
+    let done = wait_done(&h, &token, &id).await;
+    assert_eq!(done, serde_json::json!({"status": "cancelled"}));
+}
+
+#[tokio::test]
+async fn only_the_client_that_started_a_run_may_cancel_it() {
+    let h = harness();
+    let a = paired(&h).await;
+    let b = paired(&h).await;
+    let (_, v) = call(&h, post("/client/work", Some(&a), waiting_work())).await;
+    let id = v["work_id"].as_str().unwrap().to_string();
+    let (code, v) = cancel(&h, Some(&b), &id).await;
+    assert_eq!(code, 404, "another client's id is not found: {v}");
+    let (code, _) = cancel(&h, None, &id).await;
+    assert_eq!(code, 401);
+    let (code, _) = cancel(&h, Some(&"0".repeat(64)), &id).await;
+    assert_eq!(code, 401);
+    let (code, _) = cancel(&h, Some(&a), "w-nope").await;
+    assert_eq!(code, 404);
+    // Nothing above stopped it: it is still running until its owner cancels.
+    let (_, s) = call(
+        &h,
+        get(
+            &format!("/client/work/{id}"),
+            &[("authorization", &bearer(&a))],
+        ),
+    )
+    .await;
+    assert_eq!(s["status"], "running");
+    assert_eq!(cancel(&h, Some(&a), &id).await.0, 202);
+}
+
+#[tokio::test]
+async fn cancelling_a_finished_run_is_409() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (_, v) = call(&h, post("/client/work", Some(&token), work_for("coder"))).await;
+    let id = v["work_id"].as_str().unwrap().to_string();
+    let _ = wait_done(&h, &token, &id).await;
+    assert_eq!(
+        cancel(&h, Some(&token), &id).await,
+        (409, serde_json::json!({"error": "not running"}))
+    );
+}
+
+/// What the production teardown would have done, recorded.
+#[derive(Default)]
+struct FakeTeardown {
+    start: Option<StartedRun>,
+    terminal_exists: bool,
+    stopped_for: Mutex<Vec<u32>>,
+    emitted: Mutex<Vec<StartedRun>>,
+}
+
+impl HardKillTeardown for FakeTeardown {
+    fn stop_containers(&self, host_pid: u32) {
+        self.stopped_for.lock().unwrap().push(host_pid);
+    }
+    fn find_start(&self, _spec: &WorkSpec) -> Option<StartedRun> {
+        self.start.clone()
+    }
+    fn has_terminal(&self, _run: &StartedRun) -> bool {
+        self.terminal_exists
+    }
+    fn emit_cancelled(&self, run: &StartedRun) {
+        self.emitted.lock().unwrap().push(run.clone());
+    }
+}
+
+const GRACE: std::time::Duration = std::time::Duration::from_millis(300);
+
+fn started() -> StartedRun {
+    StartedRun {
+        session: darkmux_types::session_id::SessionId::adhoc(
+            darkmux_types::session_id::RunId::mission("dispatch-coder-1-a-0").unwrap(),
+            "coder",
+            "w-1",
+        )
+        .wire(),
+        execution: "exec-1".into(),
+        role: "coder".into(),
+        model: Some("darkmux:qwen".into()),
+    }
+}
+
+#[cfg(unix)]
+fn fake_child(dir: &Path, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let p = dir.join(name);
+    std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
+    p
+}
+
+fn spec_w1() -> WorkSpec {
+    WorkSpec {
+        work_id: "w-1".into(),
+        role: "coder".into(),
+        profile: "fast".into(),
+        workdir: None,
+        message: "hi".into(),
+    }
+}
+
+/// Request a cancel once the fake child says it is ready (its signal
+/// disposition set), so TERM never races its `trap`.
+fn cancel_when_ready(child: &Path) -> Arc<CancelFlag> {
+    let flag = Arc::new(CancelFlag::default());
+    let (f, ready) = (
+        flag.clone(),
+        PathBuf::from(format!("{}.ready", child.display())),
+    );
+    std::thread::spawn(move || {
+        for _ in 0..500 {
+            if ready.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        f.request();
+    });
+    flag
+}
+
+#[cfg(unix)]
+#[test]
+fn a_child_that_exits_on_term_is_left_to_dispatchs_own_teardown() {
+    let dir = tempfile::tempdir().unwrap();
+    let child = fake_child(
+        dir.path(),
+        "polite",
+        "cat >/dev/null\n: > \"$0.ready\"\nexec sleep 30",
+    );
+    let teardown = FakeTeardown {
+        start: Some(started()),
+        ..Default::default()
+    };
+    let t0 = std::time::Instant::now();
+    let r = run_dispatch_child(
+        &child,
+        &spec_w1(),
+        &cancel_when_ready(&child),
+        std::time::Duration::from_secs(20),
+        &teardown,
+    );
+    assert!(r.is_err());
+    assert!(
+        t0.elapsed() < std::time::Duration::from_secs(5),
+        "SIGTERM ended it, no wait for the grace"
+    );
+    assert!(
+        teardown.stopped_for.lock().unwrap().is_empty(),
+        "dispatch kills its own container on TERM"
+    );
+    assert!(
+        teardown.emitted.lock().unwrap().is_empty(),
+        "and writes its own terminal"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_child_that_ignores_term_is_killed_after_the_grace_and_torn_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let child = fake_child(
+        dir.path(),
+        "stubborn",
+        "trap '' TERM\ncat >/dev/null\n: > \"$0.ready\"\nexec sleep 30",
+    );
+    let teardown = FakeTeardown {
+        start: Some(started()),
+        ..Default::default()
+    };
+    let t0 = std::time::Instant::now();
+    let r = run_dispatch_child(
+        &child,
+        &spec_w1(),
+        &cancel_when_ready(&child),
+        GRACE,
+        &teardown,
+    );
+    let took = t0.elapsed();
+    assert!(r.is_err());
+    assert!(took >= GRACE, "TERM first, then the grace: {took:?}");
+    assert!(
+        took < std::time::Duration::from_secs(10),
+        "then KILL, not the child's own 30 s: {took:?}"
+    );
+    let stopped = teardown.stopped_for.lock().unwrap().clone();
+    assert_eq!(
+        stopped.len(),
+        1,
+        "the dead child's containers are stopped once"
+    );
+    assert!(stopped[0] > 0);
+    assert_eq!(
+        teardown.emitted.lock().unwrap().as_slice(),
+        &[started()],
+        "one terminal, for its execution"
+    );
+}
+
+#[test]
+fn after_a_hard_kill_the_terminal_is_written_only_when_none_exists() {
+    let already = FakeTeardown {
+        start: Some(started()),
+        terminal_exists: true,
+        ..Default::default()
+    };
+    after_hard_kill(&already, &spec_w1(), 42);
+    assert!(
+        already.emitted.lock().unwrap().is_empty(),
+        "the child wrote its terminal before the KILL"
+    );
+    assert_eq!(already.stopped_for.lock().unwrap().as_slice(), &[42]);
+
+    let never_started = FakeTeardown::default();
+    after_hard_kill(&never_started, &spec_w1(), 42);
+    assert!(
+        never_started.emitted.lock().unwrap().is_empty(),
+        "no dispatch.start, no execution to end"
+    );
+    assert_eq!(
+        never_started.stopped_for.lock().unwrap().as_slice(),
+        &[42],
+        "containers are stopped regardless"
+    );
+}
+
+#[test]
+fn the_cancelled_terminal_is_a_dispatch_error_naming_the_stop() {
+    let rec = cancelled_record(&started()).unwrap();
+    assert_eq!(rec.action, darkmux_flow::FlowAction::DispatchError);
+    assert_eq!(
+        rec.execution_id.as_ref().map(|e| e.as_str()),
+        Some("exec-1")
+    );
+    let v = serde_json::to_value(&rec).unwrap();
+    assert_eq!(v["payload"]["stop_reason"], "cancelled", "{v}");
+}
+
+#[test]
+fn the_start_is_found_by_its_work_id_in_the_flow_day_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let line = |action: &str, session: &str, exec: &str| {
+        serde_json::json!({"action": action, "session_id": session, "execution_id": exec, "model": "darkmux:q"}).to_string()
+    };
+    let text = [
+        line(
+            "dispatch.start",
+            "dispatch-coder-1-a-0.adhoc.coder.w-other",
+            "exec-a",
+        ),
+        line(
+            "dispatch.start",
+            "dispatch-coder-1-b-0.adhoc.coder.w-1",
+            "exec-b",
+        ),
+        line(
+            "dispatch.error",
+            "dispatch-coder-1-c-0.adhoc.coder.w-9",
+            "exec-c",
+        ),
+    ]
+    .join("\n");
+    std::fs::write(dir.path().join("2026-11-07.jsonl"), text).unwrap();
+    let run = find_start_in(dir.path(), &spec_w1()).unwrap();
+    assert_eq!(
+        (run.execution.as_str(), run.session.as_str()),
+        ("exec-b", "dispatch-coder-1-b-0.adhoc.coder.w-1")
+    );
+    assert!(terminal_in(dir.path(), "exec-c"));
+    assert!(
+        !terminal_in(dir.path(), "exec-b"),
+        "a start is not a terminal"
+    );
+}
+
+#[test]
+fn the_container_stop_judges_only_the_killed_childs_containers_gone() {
+    use darkmux_crew::orphan_reaper::{orphaned_dispatch_containers, ListedContainer, LocalHost};
+    let local = LocalHost {
+        machine: "m".into(),
+        pid_ns: "ns".into(),
+    };
+    let c = |name: &str, pid: u32| ListedContainer {
+        name: name.into(),
+        host_pid: Some(pid),
+        host_start: Some(7),
+        host_machine: Some("m".into()),
+        host_pid_ns: Some("ns".into()),
+    };
+    let listed = [
+        c("darkmux-dispatch-ours", 42),
+        c("darkmux-dispatch-another-run", 43),
+    ];
+    let orphans = orphaned_dispatch_containers(&listed, Some(&local), only_this_host_is_gone(42));
+    let names: Vec<&str> = orphans.iter().map(|o| o.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["darkmux-dispatch-ours"],
+        "another run's container is never stopped"
+    );
 }
