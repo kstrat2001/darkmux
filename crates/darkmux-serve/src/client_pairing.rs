@@ -417,6 +417,21 @@ pub enum WorkStatus {
     Running,
     Done(Value),
     Error(String),
+    /// Its owner cancelled it and it has ended.
+    Cancelled,
+}
+
+/// A request to stop one running work item, read by its executor.
+#[derive(Debug, Default)]
+pub struct CancelFlag(std::sync::atomic::AtomicBool);
+
+impl CancelFlag {
+    pub fn request(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    pub fn requested(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -424,6 +439,7 @@ pub struct WorkEntry {
     pub client_name: String,
     pub created: u64,
     pub status: WorkStatus,
+    pub cancel: Arc<CancelFlag>,
 }
 
 /// Everything the listener needs, injectable so tests drive the real router
@@ -446,7 +462,8 @@ pub struct ClientServerState {
     /// The workdir containment check; returns the canonical path.
     pub check_workdir: Arc<dyn Fn(&Path) -> Result<PathBuf, String> + Send + Sync>,
     /// Runs one role execution, blocking; `Ok` is the dispatch's `--json` envelope.
-    pub execute: Arc<dyn Fn(WorkSpec) -> Result<Value, String> + Send + Sync>,
+    /// It watches the [`CancelFlag`] and stops the run when it is raised.
+    pub execute: Arc<dyn Fn(WorkSpec, Arc<CancelFlag>) -> Result<Value, String> + Send + Sync>,
     pub works: Arc<Mutex<HashMap<String, WorkEntry>>>,
 }
 
@@ -482,7 +499,9 @@ impl ClientServerState {
             check_workdir: Arc::new(|p| {
                 darkmux_types::workdir::validate_remote_workdir(p).map_err(|e| format!("{e:#}"))
             }),
-            execute: Arc::new(move |spec| run_dispatch_child(&exe, &spec)),
+            execute: Arc::new(move |spec, cancel| {
+                run_dispatch_child(&exe, &spec, &cancel, CANCEL_GRACE, &ProductionTeardown)
+            }),
             works: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -567,6 +586,7 @@ pub fn router(state: ClientServerState) -> Router {
         .route("/client/whoami", get(whoami_handler))
         .route("/client/work", post(work_handler))
         .route("/client/work/:work_id", get(work_status_handler))
+        .route("/client/work/:work_id/cancel", post(cancel_handler))
         .route("/client/recipe", get(recipe_handler))
         .fallback(|| async { err(StatusCode::NOT_FOUND, "no such route") })
         .method_not_allowed_fallback(|| async {
@@ -845,10 +865,21 @@ async fn work_handler(
     let profile = spec.profile.clone();
     let execute = state.execute.clone();
     let works = state.works.clone();
+    let Some(cancel) = works
+        .lock()
+        .unwrap()
+        .get(&work_id)
+        .map(|w| w.cancel.clone())
+    else {
+        return internal(anyhow!("work {work_id} was admitted but is not registered"));
+    };
     tokio::task::spawn_blocking(move || {
         let id = spec.work_id.clone();
-        let status = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| execute(spec)))
-        {
+        let flag = cancel.clone();
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| execute(spec, flag)));
+        // A cancelled run ends as cancelled, however its child reported.
+        let status = match ran {
+            _ if cancel.requested() => WorkStatus::Cancelled,
             Ok(Ok(v)) => WorkStatus::Done(v),
             Ok(Err(e)) => WorkStatus::Error(e),
             Err(_) => WorkStatus::Error("the dispatch runner panicked".to_string()),
@@ -945,6 +976,7 @@ fn admit(
             client_name: client.name.clone(),
             created: now,
             status: WorkStatus::Running,
+            cancel: Arc::new(CancelFlag::default()),
         },
     );
     Ok(WorkSpec {
@@ -1060,6 +1092,9 @@ async fn work_status_handler(
     let entry = state.works.lock().unwrap().get(&work_id).cloned();
     match entry {
         Some(w) if w.client_name == client.name => match w.status {
+            WorkStatus::Running if w.cancel.requested() => {
+                Json(serde_json::json!({"status": "cancelling"})).into_response()
+            }
             WorkStatus::Running => Json(serde_json::json!({"status": "running"})).into_response(),
             WorkStatus::Done(v) => {
                 Json(serde_json::json!({"status": "done", "result": v})).into_response()
@@ -1067,6 +1102,38 @@ async fn work_status_handler(
             WorkStatus::Error(e) => {
                 Json(serde_json::json!({"status": "error", "error": e})).into_response()
             }
+            WorkStatus::Cancelled => {
+                Json(serde_json::json!({"status": "cancelled"})).into_response()
+            }
+        },
+        _ => not_found(),
+    }
+}
+
+/// `POST /client/work/{id}/cancel`: only the client that started the run may
+/// stop it (anyone else's id reads as unknown). The stop itself is the
+/// executor's: SIGTERM, then SIGKILL after [`CANCEL_GRACE`].
+async fn cancel_handler(
+    State(state): State<ClientServerState>,
+    UrlPath(work_id): UrlPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    let client = match authenticate(&state, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let works = state.works.lock().unwrap();
+    match works.get(&work_id) {
+        Some(w) if w.client_name == client.name => match w.status {
+            WorkStatus::Running => {
+                w.cancel.request();
+                (
+                    StatusCode::ACCEPTED,
+                    Json(serde_json::json!({"status": "cancelling"})),
+                )
+                    .into_response()
+            }
+            _ => err(StatusCode::CONFLICT, "not running"),
         },
         _ => not_found(),
     }
@@ -1096,11 +1163,30 @@ pub(crate) fn dispatch_args(spec: &WorkSpec) -> Vec<std::ffi::OsString> {
     args
 }
 
+/// How long a cancelled dispatch child gets after SIGTERM before SIGKILL.
+/// `darkmux dispatch` handles TERM itself (its interrupt flag stops the run,
+/// `docker kill`s its container by name and writes its own `dispatch.error`
+/// with `stop_reason: "SIGTERM"`), which takes well under a second; the grace
+/// is for a child stuck somewhere that does not poll the flag.
+pub const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Run `exe dispatch ...` with the message on stdin and return its `--json`
 /// envelope. An envelope is returned whatever the exit code (its `result`
 /// says how the dispatch ended); no envelope is an error carrying the exit
 /// status and the tail of stderr.
-pub(crate) fn run_dispatch_child(exe: &Path, spec: &WorkSpec) -> Result<Value, String> {
+///
+/// **Cancel.** When `cancel` is raised the child gets SIGTERM; one still
+/// alive `grace` later gets SIGKILL, and since a killed child runs none of
+/// its own teardown, [`after_hard_kill`] does it: stop its containers, and
+/// end its execution with the terminal it could not write.
+pub(crate) fn run_dispatch_child(
+    exe: &Path,
+    spec: &WorkSpec,
+    cancel: &CancelFlag,
+    grace: std::time::Duration,
+    teardown: &dyn HardKillTeardown,
+) -> Result<Value, String> {
+    use darkmux_types::child_registry::{kill_pid, SIGKILL, SIGTERM};
     use std::process::{Command, Stdio};
     let mut child = Command::new(exe)
         .args(dispatch_args(spec))
@@ -1109,31 +1195,235 @@ pub(crate) fn run_dispatch_child(exe: &Path, spec: &WorkSpec) -> Result<Value, S
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("could not start {}: {e}", exe.display()))?;
-    {
-        let mut stdin = child
-            .stdin
+    let pid = child.id();
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or("no stdin for the dispatch child")?;
+    let message = spec.message.clone();
+    // A child that exits before reading is reported by its status below.
+    let feeder = std::thread::spawn(move || {
+        let _ = stdin.write_all(message.as_bytes());
+    });
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let out_reader = drain(
+        child
+            .stdout
             .take()
-            .ok_or("no stdin for the dispatch child")?;
-        // A child that exits before reading is reported by its status below.
-        let _ = stdin.write_all(spec.message.as_bytes());
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let err_reader = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let mut termed_at: Option<std::time::Instant> = None;
+    let mut killed = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(e) => return Err(format!("waiting for the dispatch child: {e}")),
+        }
+        if cancel.requested() {
+            match termed_at {
+                None => {
+                    let _ = kill_pid(pid, SIGTERM);
+                    termed_at = Some(std::time::Instant::now());
+                }
+                Some(t) if !killed && t.elapsed() >= grace => {
+                    let _ = kill_pid(pid, SIGKILL);
+                    killed = true;
+                }
+                Some(_) => {}
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+    let _ = feeder.join();
+    if killed {
+        after_hard_kill(teardown, spec, pid);
     }
-    let out = child
-        .wait_with_output()
-        .map_err(|e| format!("waiting for the dispatch child: {e}"))?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stdout_bytes = out_reader.join().unwrap_or_default();
+    let stderr_bytes = err_reader.join().unwrap_or_default();
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
     if let Ok(v @ Value::Object(_)) = serde_json::from_str::<Value>(stdout.trim()) {
         return Ok(v);
     }
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stderr = String::from_utf8_lossy(&stderr_bytes);
     let tail: String = {
         let chars: Vec<char> = stderr.trim().chars().collect();
         chars[chars.len().saturating_sub(2000)..].iter().collect()
     };
     Err(format!(
         "dispatch exited {} with no JSON envelope: {tail}",
-        out.status
+        status
             .code()
             .map_or("by signal".to_string(), |c| c.to_string())
+    ))
+}
+
+// ─── Teardown after a hard kill ──────────────────────────────────────────
+
+/// A dispatch child's role execution, as its `dispatch.start` names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartedRun {
+    pub session: String,
+    pub execution: String,
+    pub role: String,
+    pub model: Option<String>,
+}
+
+/// What [`after_hard_kill`] needs from the outside world, injectable so a
+/// test needs no Docker and no flow directory.
+pub trait HardKillTeardown: Send + Sync {
+    /// Stop the dispatch containers whose host was `host_pid`.
+    fn stop_containers(&self, host_pid: u32);
+    /// The execution the child started, from its `dispatch.start`.
+    fn find_start(&self, spec: &WorkSpec) -> Option<StartedRun>;
+    /// Whether that execution already has its terminal record.
+    fn has_terminal(&self, run: &StartedRun) -> bool;
+    /// Write the execution's `dispatch.error` naming the cancel.
+    fn emit_cancelled(&self, run: &StartedRun);
+}
+
+/// Do for a SIGKILLed dispatch child what its own TERM handling would have
+/// done: stop its containers, then end its execution, once. A child killed
+/// before its `dispatch.start` has no execution to end; one that wrote its
+/// terminal before the KILL landed is not given a second.
+pub(crate) fn after_hard_kill(teardown: &dyn HardKillTeardown, spec: &WorkSpec, host_pid: u32) {
+    teardown.stop_containers(host_pid);
+    if let Some(run) = teardown.find_start(spec) {
+        if !teardown.has_terminal(&run) {
+            teardown.emit_cancelled(&run);
+        }
+    }
+}
+
+/// The real world: the orphan reaper's Docker path and the flow stream.
+pub struct ProductionTeardown;
+
+impl HardKillTeardown for ProductionTeardown {
+    fn stop_containers(&self, host_pid: u32) {
+        // The serve daemon's reaper path (#3200): every dispatch container is
+        // labeled with its host's pid, start, machine and pid namespace. Only
+        // `host_pid` is judged gone; every other host reads as alive with an
+        // unknown start, which the rule keeps, so no other run is touched.
+        let local = darkmux_crew::orphan_reaper::LocalHost::this_host();
+        let _ = darkmux_crew::orphan_reaper::reap_tick(
+            local.as_ref(),
+            only_this_host_is_gone(host_pid),
+        );
+    }
+    fn find_start(&self, spec: &WorkSpec) -> Option<StartedRun> {
+        find_start_in(&darkmux_flow::flows_dir(), spec)
+    }
+    fn has_terminal(&self, run: &StartedRun) -> bool {
+        terminal_in(&darkmux_flow::flows_dir(), &run.execution)
+    }
+    fn emit_cancelled(&self, run: &StartedRun) {
+        match cancelled_record(run) {
+            Ok(rec) => {
+                if let Err(e) = darkmux_flow::record(rec) {
+                    eprintln!(
+                        "darkmux client serve: writing the cancelled terminal for {}: {e:#}",
+                        run.execution
+                    );
+                }
+            }
+            Err(e) => eprintln!("darkmux client serve: {e}"),
+        }
+    }
+}
+
+/// The reaper's liveness answer scoped to one killed child: `host_pid` is
+/// gone, every other host is alive with an unknown start, which the reaper's
+/// rule always keeps.
+pub(crate) fn only_this_host_is_gone(
+    host_pid: u32,
+) -> impl Fn(u32) -> darkmux_crew::orphan_reaper::HostLiveness {
+    use darkmux_crew::orphan_reaper::HostLiveness;
+    move |pid| {
+        if pid == host_pid {
+            HostLiveness::Gone
+        } else {
+            HostLiveness::Running { start: None }
+        }
+    }
+}
+
+/// The day files a just-killed run's records can be in: today's and
+/// yesterday's (a run that started before midnight).
+const START_SEARCH_DAYS: usize = 2;
+
+fn records_in(dir: &Path) -> impl Iterator<Item = Value> {
+    darkmux_flow::reader::recent_day_files(dir, START_SEARCH_DAYS)
+        .into_iter()
+        .flat_map(|p| darkmux_flow::reader::day_file_records(&p))
+}
+
+/// The `dispatch.start` of the crew-of-one run `darkmux dispatch <role> --name
+/// <work_id>` made: its session ends `.adhoc.<role>.<work_id>`.
+pub(crate) fn find_start_in(dir: &Path, spec: &WorkSpec) -> Option<StartedRun> {
+    let suffix = format!(".adhoc.{}.{}", spec.role, spec.work_id);
+    records_in(dir).find_map(|r| {
+        if darkmux_flow::reader::action_of(&r) != Some(darkmux_flow::FlowAction::DispatchStart) {
+            return None;
+        }
+        let session = r.get("session_id")?.as_str()?;
+        if !session.ends_with(&suffix) {
+            return None;
+        }
+        Some(StartedRun {
+            session: session.to_string(),
+            execution: r.get("execution_id")?.as_str()?.to_string(),
+            role: spec.role.clone(),
+            model: r.get("model").and_then(Value::as_str).map(str::to_string),
+        })
+    })
+}
+
+/// Whether `execution` has a `dispatch.complete` or `dispatch.error`.
+pub(crate) fn terminal_in(dir: &Path, execution: &str) -> bool {
+    use darkmux_flow::FlowAction;
+    records_in(dir).any(|r| {
+        r.get("execution_id").and_then(Value::as_str) == Some(execution)
+            && matches!(
+                darkmux_flow::reader::action_of(&r),
+                Some(FlowAction::DispatchComplete | FlowAction::DispatchError)
+            )
+    })
+}
+
+/// The execution's terminal: a `dispatch.error` (its action comes from the
+/// payload variant) at `Error`, `stop_reason: "cancelled"`, built through the
+/// same `build_dispatch_record` dispatch's own bookends use.
+pub(crate) fn cancelled_record(run: &StartedRun) -> Result<darkmux_flow::FlowRecord, String> {
+    let session =
+        darkmux_types::session_id::SessionId::parse(&run.session).map_err(|e| e.to_string())?;
+    let execution = darkmux_types::execution_id::ExecutionId::parse(&run.execution)
+        .map_err(|e| e.to_string())?;
+    let mut payload = darkmux_flow::payload::DispatchEndPayload::aborted(None);
+    payload.error =
+        Some("cancelled by the client that started it (SIGKILL after the grace)".to_string());
+    payload.stop_reason = Some("cancelled".to_string());
+    Ok(darkmux_crew::dispatch::build_dispatch_record(
+        darkmux_flow::Level::Error,
+        &run.role,
+        &session,
+        &execution,
+        run.model.as_deref(),
+        None,
+        darkmux_flow::Payload::DispatchError(payload),
     ))
 }
 
