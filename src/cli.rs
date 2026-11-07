@@ -440,6 +440,14 @@ pub(crate) enum Cmd {
         #[arg(long = "lab-dir")]
         lab_dir: Option<std::path::PathBuf>,
     },
+    /// Pair an app on this machine and let it run scoped work (local
+    /// prototype). `client serve` listens on 127.0.0.1 only; `client approve`
+    /// approves a pending pairing; `client list` / `client revoke` manage
+    /// paired clients. State: `~/.darkmux/clients.json` (0600).
+    Client {
+        #[command(subcommand)]
+        sub: ClientCmd,
+    },
     /// Serve darkmux as an ACP (Agent Client Protocol) agent over stdio, for
     /// editors like Zed. The agent panel gets one slash command, `/mission`
     /// (`list`, `launch <config>`, `show <id>`); free text goes through
@@ -1686,5 +1694,32 @@ pub(crate) enum SubmitCmd {
         /// The site whose token to forget.
         #[arg(long, default_value = darkmux_lab::lab::submit::DEFAULT_SITE)]
         site: String,
+    },
+}
+
+/// `darkmux client` subcommands.
+#[derive(Subcommand)]
+pub enum ClientCmd {
+    /// Listen for pairing and work requests on 127.0.0.1 (never any other
+    /// address). Runs until Ctrl-C.
+    Serve {
+        /// Port on 127.0.0.1.
+        #[arg(long, default_value_t = darkmux_serve::client_pairing::DEFAULT_PORT)]
+        port: u16,
+    },
+    /// List pending pairing requests (device, code, scopes, age) and ask, per
+    /// request, whether to approve it. `--code` approves the one request
+    /// showing that code, after confirmation.
+    Approve {
+        /// The code the app shows (e.g. 4F7-K2Q).
+        #[arg(long)]
+        code: Option<String>,
+    },
+    /// List paired clients and their scopes.
+    List,
+    /// Remove a paired client; its token stops working at once.
+    Revoke {
+        /// The client's name (from `client list`).
+        name: String,
     },
 }
