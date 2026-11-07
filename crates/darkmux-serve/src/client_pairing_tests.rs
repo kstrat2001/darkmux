@@ -173,6 +173,10 @@ fn harness() -> Harness {
             Ok(())
         }),
         workspace_lock: Arc::new(Mutex::new(())),
+        previews: Arc::new(crate::client_preview::Previews::new(
+            dir.path().join("previews"),
+            std::process::id(),
+        )),
     };
     Harness {
         cloned,
@@ -2574,4 +2578,321 @@ async fn keep_and_discard_wait_for_the_run_to_finish() {
         ),
     )
     .await;
+}
+
+// ─── Previews ────────────────────────────────────────────────────────────
+
+const SERVE: &str = "exec python3 -m http.server \"$PORT\" --bind 127.0.0.1";
+
+fn recipe(wt: &Path, json: Value) {
+    std::fs::create_dir_all(wt.join(".darkmux")).unwrap();
+    std::fs::write(wt.join(".darkmux/preview.json"), json.to_string()).unwrap();
+}
+
+async fn preview_until(h: &Harness, token: &str, name: &str, done: &[&str]) -> Value {
+    let auth = bearer(token);
+    for _ in 0..600 {
+        let (code, v) = call(
+            h,
+            get(
+                &format!("/client/workspaces/{name}/preview"),
+                &[("authorization", &auth)],
+            ),
+        )
+        .await;
+        assert_eq!(code, 200, "{v}");
+        if done.contains(&v["status"].as_str().unwrap()) {
+            return v;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("preview {name} never reached {done:?}");
+}
+
+fn answers(port: u64) -> bool {
+    std::net::TcpStream::connect(("127.0.0.1", port as u16)).is_ok()
+}
+
+#[tokio::test]
+async fn a_preview_runs_from_the_recipe_and_stops() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = h.base.join("wt1");
+    std::fs::write(wt.join("index.html"), "hello preview").unwrap();
+    recipe(
+        &wt,
+        serde_json::json!({"command": SERVE, "env": {"PORT": "{port}"}, "ready": {"http": "/"}}),
+    );
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/workspaces/wt1/preview",
+            Some(&token),
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 202, "{v}");
+    let ready = preview_until(&h, &token, "wt1", &["ready", "failed"]).await;
+    assert_eq!(ready["status"], "ready", "{ready}");
+    let port = ready["port"].as_u64().unwrap();
+    assert_eq!(ready["url"], format!("http://127.0.0.1:{port}/"));
+    assert_ne!(ready["port"], ready["hmr_port"]);
+    assert!(answers(port));
+    // Asking again returns the same one.
+    let (code, again) = call(
+        &h,
+        post(
+            "/client/workspaces/wt1/preview",
+            Some(&token),
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 200);
+    assert_eq!(again["port"], ready["port"]);
+    // Stop: the server is gone.
+    let req = Request::builder()
+        .method("DELETE")
+        .uri("/client/workspaces/wt1/preview")
+        .header("authorization", bearer(&token))
+        .body(Body::empty())
+        .unwrap();
+    let asked = std::time::Instant::now();
+    let (code, _) = call(&h, req).await;
+    assert_eq!(code, 200);
+    assert!(
+        asked.elapsed() < std::time::Duration::from_secs(3),
+        "a polite stop, not the KILL fallback"
+    );
+    for _ in 0..100 {
+        if !answers(port) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(!answers(port), "stopped");
+}
+
+#[tokio::test]
+async fn install_runs_only_when_its_marker_is_missing() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = h.base.join("wt1");
+    recipe(
+        &wt,
+        serde_json::json!({
+            "command": SERVE, "env": {"PORT": "{port}"},
+            "install": {"command": "mkdir deps && echo ran >> installs.txt", "unless_exists": "deps"}
+        }),
+    );
+    call(
+        &h,
+        post(
+            "/client/workspaces/wt1/preview",
+            Some(&token),
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        preview_until(&h, &token, "wt1", &["ready", "failed"]).await["status"],
+        "ready"
+    );
+    h.state.previews.stop("wt1");
+    call(
+        &h,
+        post(
+            "/client/workspaces/wt1/preview",
+            Some(&token),
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        preview_until(&h, &token, "wt1", &["ready", "failed"]).await["status"],
+        "ready"
+    );
+    h.state.previews.stop("wt1");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("installs.txt")).unwrap(),
+        "ran\n",
+        "installed once"
+    );
+}
+
+#[tokio::test]
+async fn a_worktree_preview_gets_env_files_from_its_checkout_without_overwriting() {
+    let h = harness();
+    let token = paired(&h).await;
+    let mine = h.dir.path().join("site");
+    fixture_repo(&mine);
+    std::fs::write(mine.join(".env"), "SECRET=from-source\n").unwrap();
+    std::fs::write(mine.join(".env.local"), "LOCAL=from-source\n").unwrap();
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"source_path": mine.to_str(), "bot": "b"}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 201, "{v}");
+    let name = v["workspace"].as_str().unwrap().to_string();
+    let ws = h.base.join(&name);
+    std::fs::write(ws.join(".env.local"), "LOCAL=already-here\n").unwrap();
+    recipe(
+        &ws,
+        serde_json::json!({"command": SERVE, "env": {"PORT": "{port}"}, "env_from_source": [".env", ".env.local"]}),
+    );
+    call(
+        &h,
+        post(
+            &format!("/client/workspaces/{name}/preview"),
+            Some(&token),
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        preview_until(&h, &token, &name, &["ready", "failed"]).await["status"],
+        "ready"
+    );
+    h.state.previews.stop(&name);
+    assert_eq!(
+        std::fs::read_to_string(ws.join(".env")).unwrap(),
+        "SECRET=from-source\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws.join(".env.local")).unwrap(),
+        "LOCAL=already-here\n",
+        "never overwritten"
+    );
+}
+
+#[tokio::test]
+async fn a_failing_dev_server_says_why() {
+    let h = harness();
+    let token = paired(&h).await;
+    recipe(
+        &h.base.join("wt1"),
+        serde_json::json!({"command": "echo boom-from-the-server; exit 3"}),
+    );
+    call(
+        &h,
+        post(
+            "/client/workspaces/wt1/preview",
+            Some(&token),
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    let v = preview_until(&h, &token, "wt1", &["ready", "failed"]).await;
+    assert_eq!(v["status"], "failed", "{v}");
+    assert!(v["error"].as_str().unwrap().contains("exited"), "{v}");
+    assert!(
+        v["log_tail"]
+            .as_str()
+            .unwrap()
+            .contains("boom-from-the-server"),
+        "{v}"
+    );
+}
+
+#[tokio::test]
+async fn previews_refuse_what_they_cant_run() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (code, _) = call(
+        &h,
+        post(
+            "/client/workspaces/wt1/preview",
+            None,
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 401);
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/workspaces/wt1/preview",
+            Some(&token),
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 404, "no recipe: {v}");
+    let (code, _) = call(
+        &h,
+        post(
+            "/client/workspaces/nope/preview",
+            Some(&token),
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 404);
+    recipe(
+        &h.base.join("wt1"),
+        serde_json::json!({"command": SERVE, "env_from_source": ["../../etc/passwd"]}),
+    );
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/workspaces/wt1/preview",
+            Some(&token),
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 422, "{v}");
+    let (code, _) = call(
+        &h,
+        get(
+            "/client/workspaces/wt1/preview",
+            &[("authorization", &bearer(&token))],
+        ),
+    )
+    .await;
+    assert_eq!(code, 404, "nothing started");
+}
+
+#[tokio::test]
+async fn a_preview_ends_when_darkmux_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let wt = dir.path().join("w");
+    std::fs::create_dir_all(&wt).unwrap();
+    recipe(
+        &wt,
+        serde_json::json!({"command": SERVE, "env": {"PORT": "{port}"}}),
+    );
+    // "darkmux" here is a short-lived process; when it exits, so does the preview.
+    let mut stand_in = std::process::Command::new("sleep")
+        .arg("3")
+        .spawn()
+        .unwrap();
+    let previews = crate::client_preview::Previews::new(dir.path().join("p"), stand_in.id());
+    let (v, _) = previews.start("w", &wt).unwrap();
+    let port = v["port"].as_u64().unwrap();
+    let mut up = false;
+    for _ in 0..100 {
+        if answers(port) {
+            up = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(up, "started");
+    stand_in.wait().unwrap();
+    let mut gone = false;
+    for _ in 0..100 {
+        if !answers(port) {
+            gone = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(gone, "the preview outlived darkmux");
 }
