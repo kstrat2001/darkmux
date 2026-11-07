@@ -650,6 +650,10 @@ pub fn router(state: ClientServerState) -> Router {
         .route("/client/workspaces", post(workspace_create_handler))
         .route("/client/workspaces/:name", get(workspace_status_handler))
         .route(
+            "/client/workspaces/:name/changes",
+            get(workspace_changes_handler),
+        )
+        .route(
             "/client/workspaces/:name/preview",
             post(preview_start_handler)
                 .get(preview_status_handler)
@@ -1592,6 +1596,80 @@ async fn preview_stop_handler(
     } else {
         not_found()
     }
+}
+
+/// The most file content `/changes` returns in one reply.
+pub const MAX_CHANGES_BYTES: usize = 25 * 1024 * 1024;
+
+/// `GET /client/workspaces/{name}/changes` (read-only): what the work
+/// copy's branch holds that origin's default branch doesn't, for an app to
+/// open a PR with its own GitHub sign-in (darkmux doesn't author PRs). Only
+/// committed changes: {base, base_branch, head, branch, files: [{path,
+/// content (base64), mode} | {path, deleted: true}]}.
+async fn workspace_changes_handler(
+    State(state): State<ClientServerState>,
+    UrlPath(name): UrlPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = authenticate(&state, &headers) {
+        return r;
+    }
+    let st = state.clone();
+    tokio::task::spawn_blocking(move || {
+        use crate::client_workspace as ws;
+        let dir = match workspace_dir(&st, &name) {
+            Ok(d) => d,
+            Err(r) => return r,
+        };
+        let Some(default) = ws::remote_default(&dir) else {
+            return err(StatusCode::CONFLICT, "this work copy has no origin default branch to compare with");
+        };
+        let branch = git_line(&dir, &["branch", "--show-current"]).unwrap_or_default();
+        if branch.is_empty() {
+            return err(StatusCode::CONFLICT, "the work copy isn't on a branch");
+        }
+        let (Some(base), Some(head)) = (git_line(&dir, &["merge-base", "HEAD", &default]), git_line(&dir, &["rev-parse", "HEAD"])) else {
+            return err(StatusCode::CONFLICT, "couldn't find where this branch left the default branch");
+        };
+        let Some(listing) = git(&dir, None, &["diff", "--no-renames", "--name-status", "-z", &base, &head]) else {
+            return internal(anyhow!("listing the branch's changes failed"));
+        };
+        let fields: Vec<String> = String::from_utf8_lossy(&listing.stdout)
+            .split('\0')
+            .filter(|f| !f.is_empty())
+            .map(str::to_string)
+            .collect();
+        let mut files = Vec::new();
+        let mut total = 0usize;
+        for pair in fields.chunks(2) {
+            let [status, path] = pair else { continue };
+            if status.starts_with('D') {
+                files.push(serde_json::json!({"path": path, "deleted": true}));
+                continue;
+            }
+            let Some(blob) = git(&dir, None, &["show", &format!("{head}:{path}")]) else {
+                return internal(anyhow!("reading {path} failed"));
+            };
+            total += blob.stdout.len();
+            if total > MAX_CHANGES_BYTES {
+                return err(StatusCode::PAYLOAD_TOO_LARGE, "the branch's changes are too large to send");
+            }
+            let mode = git_line(&dir, &["ls-tree", &head, "--", path])
+                .and_then(|l| l.split_whitespace().next().map(str::to_string))
+                .unwrap_or_else(|| "100644".to_string());
+            files.push(serde_json::json!({"path": path, "mode": mode, "content": ws::base64_encode(&blob.stdout)}));
+        }
+        Json(serde_json::json!({
+            "base": base,
+            "base_branch": default.trim_start_matches("origin/"),
+            "head": head,
+            "branch": branch,
+            "files": files,
+        }))
+        .into_response()
+    })
+    .await
+    .unwrap_or_else(|e| internal(anyhow!("changes panicked: {e}")))
 }
 
 /// `GET /client/workspaces/{name}`: branch, head and repo of one workspace.
