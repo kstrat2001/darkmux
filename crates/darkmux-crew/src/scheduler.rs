@@ -5436,6 +5436,7 @@ mod tests {
                     content: format!("mocked reply for {}", call.user),
                     model: Some("served-by-mock".to_string()),
                     counts: darkmux_trajectory::UsageCounts { total: Some(7), ..Default::default() },
+                    finish_reason: None,
                 })
             });
 

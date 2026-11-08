@@ -519,7 +519,7 @@ fn the_hosted_start_record_carries_the_prompt_hash_and_the_role() {
     };
     let pm = darkmux_types::ProfileModel::hosted_for_test("gpt-remote", None, serde_json::json!({"url": base_url}));
     let target = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
-    dispatch_unmanaged(&o, &darkmux_types::execution_id::ExecutionId::mint(), "the system prompt", &prov, &target)
+    dispatch_unmanaged(&o, &darkmux_types::execution_id::ExecutionId::mint(), "the system prompt", &prov, &target, true)
         .expect("the mock answers");
     let records = drain_flow_records_for_session(flows.path(), &session);
     let start = records.iter().find(|r| r["action"] == "dispatch.start").expect("a start bookend");
