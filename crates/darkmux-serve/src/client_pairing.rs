@@ -495,6 +495,10 @@ pub struct ClientServerState {
     /// unset (only the role's own resolved profile), `Err` when it cannot be
     /// read (work is then refused, never run on a guessed policy).
     pub profiles_policy: Arc<dyn Fn() -> Result<Option<Vec<String>>, String> + Send + Sync>,
+    /// A profile's name, description, default model, endpoint kind, and
+    /// whether it answers now (`GET /client/profiles`); `Err` when the
+    /// registry doesn't have it.
+    pub profile_info: Arc<dyn Fn(&str) -> Result<ClientProfileInfo, String> + Send + Sync>,
     /// The workdir containment check; returns the canonical path.
     pub check_workdir: Arc<dyn Fn(&Path) -> Result<PathBuf, String> + Send + Sync>,
     /// Runs one role execution, blocking; `Ok` is the dispatch's `--json` envelope.
@@ -542,6 +546,7 @@ impl ClientServerState {
                 }
             }),
             profiles_policy: Arc::new(read_profiles_policy),
+            profile_info: Arc::new(describe_profile),
             check_workdir: Arc::new(|p| {
                 darkmux_types::workdir::validate_remote_workdir(p).map_err(|e| format!("{e:#}"))
             }),
@@ -640,6 +645,7 @@ pub fn router(state: ClientServerState) -> Router {
         .route("/client/pair", post(pair_handler))
         .route("/client/pair/:request_id", get(poll_handler))
         .route("/client/whoami", get(whoami_handler))
+        .route("/client/profiles", get(profiles_handler))
         .route("/client/work", post(work_handler))
         .route("/client/work/:work_id", get(work_status_handler))
         .route("/client/work/:work_id/cancel", post(cancel_handler))
@@ -872,6 +878,140 @@ fn authenticate(
         }
     });
     found.ok_or_else(unauthorized)
+}
+
+/// One profile an app may run on this machine, as `GET /client/profiles`
+/// reports it. Read-only: what the registry declares and whether its server
+/// answers right now.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ClientProfileInfo {
+    pub name: String,
+    pub description: Option<String>,
+    /// The profile's default model id.
+    pub model: Option<String>,
+    /// `url` (an unmanaged server darkmux only sends to) or `lmstudio`.
+    pub endpoint: String,
+    /// Its server answered just now.
+    pub reachable: bool,
+    /// The model is loaded and serving (`None`: couldn't tell).
+    pub loaded: Option<bool>,
+    /// Why it couldn't be described (e.g. not in the registry).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ProfilesQuery {
+    role: Option<String>,
+}
+
+/// `GET /client/profiles[?role=coder]`: the profiles this app may run work
+/// on here, in the order `clients.profiles` grants them (unset: only the
+/// role's own), each with its model and whether it answers now. Read-only;
+/// an app picks among these per run.
+async fn profiles_handler(
+    State(state): State<ClientServerState>,
+    query: axum::extract::Query<ProfilesQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = authenticate(&state, &headers) {
+        return r;
+    }
+    let role = query.role.clone().unwrap_or_else(|| "coder".to_string());
+    match (state.role_known)(&role) {
+        Ok(true) => {}
+        Ok(false) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                format!("no role {role} on this machine"),
+            )
+        }
+        Err(e) => return internal(anyhow!(e)),
+    }
+    let policy = match policy_or_503(&state) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let names = match policy {
+        Some(list) => list,
+        None => match (state.resolve_profile)(&role, None) {
+            Ok(own) => vec![own],
+            Err(e) => return err(StatusCode::FORBIDDEN, e),
+        },
+    };
+    let st = state.clone();
+    let profiles = tokio::task::spawn_blocking(move || {
+        names
+            .iter()
+            .map(|name| {
+                (st.profile_info)(name).unwrap_or_else(|e| ClientProfileInfo {
+                    name: name.clone(),
+                    description: None,
+                    model: None,
+                    endpoint: "unknown".into(),
+                    reachable: false,
+                    loaded: None,
+                    error: Some(e),
+                })
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    Json(serde_json::json!({ "role": role, "profiles": profiles })).into_response()
+}
+
+/// The production [`ClientServerState::profile_info`]: the registry's entry,
+/// and a quick look at whether its server answers (about 1 s for a URL
+/// endpoint; LM Studio's own listing for a managed one).
+fn describe_profile(name: &str) -> Result<ClientProfileInfo, String> {
+    let loaded =
+        darkmux_profiles::profiles::load_registry_quiet(None).map_err(|e| format!("{e:#}"))?;
+    let profile = loaded
+        .registry
+        .profiles
+        .get(name)
+        .ok_or_else(|| format!("profile {name} is not in this machine's profiles.json"))?;
+    let model_id = profile.default_model_id().map(str::to_string);
+    let model = model_id
+        .as_deref()
+        .and_then(|id| profile.models.iter().find(|m| m.id == id));
+    let url = model
+        .and_then(|m| m.endpoint.as_ref())
+        .and_then(|e| e.url.clone());
+    let (endpoint, reachable, is_loaded) = match url {
+        Some(url) => {
+            // Any HTTP answer (401 included: it wants its key) means it's up.
+            let probe = format!("{}/models", url.trim_end_matches('/'));
+            let up = match ureq::get(&probe)
+                .timeout(std::time::Duration::from_secs(1))
+                .call()
+            {
+                Ok(_) | Err(ureq::Error::Status(..)) => true,
+                Err(_) => false,
+            };
+            ("url", up, Some(up))
+        }
+        None => match darkmux_profiles::engine::lmstudio().loaded() {
+            Ok(models) => {
+                let want = model_id.as_deref().unwrap_or_default();
+                let here = models
+                    .iter()
+                    .any(|m| m.model == want || m.identifier.ends_with(want));
+                ("lmstudio", true, Some(here))
+            }
+            Err(_) => ("lmstudio", false, None),
+        },
+    };
+    Ok(ClientProfileInfo {
+        name: name.to_string(),
+        description: profile.description.clone(),
+        model: model_id,
+        endpoint: endpoint.into(),
+        reachable,
+        loaded: is_loaded,
+        error: None,
+    })
 }
 
 async fn whoami_handler(State(state): State<ClientServerState>, headers: HeaderMap) -> Response {
