@@ -28,7 +28,8 @@
 //! so what runs is what was checked. It must be defined here, must not route
 //! to another machine (`<p>@<machine>`), and must be allowed by the machine's
 //! `clients.profiles` setting, read fresh from `config.json` on every request
-//! (unset: only the role's own resolved profile). A `workdir` must lie under
+//! (unset: any local profile, one that runs on this machine; a hosted one
+//! must be granted by name). A `workdir` must lie under
 //! the worktrees base (`validate_remote_workdir`).
 //! `GET /client/recipe?workdir=` reads `<workdir>/.darkmux/preview.json`
 //! under the same containment, for an app that cannot read the disk itself.
@@ -492,13 +493,19 @@ pub struct ClientServerState {
     /// nothing runnable resolves (a requested name never falls back).
     pub resolve_profile: Arc<dyn Fn(&str, Option<&str>) -> Result<String, String> + Send + Sync>,
     /// This machine's `clients.profiles`, read per request: `Ok(None)` when
-    /// unset (only the role's own resolved profile), `Err` when it cannot be
+    /// unset (any local profile), `Err` when it cannot be
     /// read (work is then refused, never run on a guessed policy).
     pub profiles_policy: Arc<dyn Fn() -> Result<Option<Vec<String>>, String> + Send + Sync>,
     /// A profile's name, description, default model, endpoint kind, and
     /// whether it answers now (`GET /client/profiles`); `Err` when the
     /// registry doesn't have it.
     pub profile_info: Arc<dyn Fn(&str) -> Result<ClientProfileInfo, String> + Send + Sync>,
+    /// Whether a profile runs on this machine: every model LM Studio-managed
+    /// or served from a loopback URL. With `clients.profiles` unset, an app
+    /// may use any local profile; a hosted one only when granted.
+    pub profile_is_local: Arc<dyn Fn(&str) -> Result<bool, String> + Send + Sync>,
+    /// Every profile name in this machine's registry.
+    pub registry_profiles: Arc<dyn Fn() -> Result<Vec<String>, String> + Send + Sync>,
     /// The workdir containment check; returns the canonical path.
     pub check_workdir: Arc<dyn Fn(&Path) -> Result<PathBuf, String> + Send + Sync>,
     /// Runs one role execution, blocking; `Ok` is the dispatch's `--json` envelope.
@@ -547,6 +554,12 @@ impl ClientServerState {
             }),
             profiles_policy: Arc::new(read_profiles_policy),
             profile_info: Arc::new(describe_profile),
+            profile_is_local: Arc::new(profile_runs_here),
+            registry_profiles: Arc::new(|| {
+                darkmux_profiles::profiles::load_registry_quiet(None)
+                    .map(|l| l.registry.profiles.keys().cloned().collect())
+                    .map_err(|e| format!("{e:#}"))
+            }),
             check_workdir: Arc::new(|p| {
                 darkmux_types::workdir::validate_remote_workdir(p).map_err(|e| format!("{e:#}"))
             }),
@@ -787,8 +800,13 @@ enum PollOutcome {
 /// `null` means unset, so each role runs on its own resolved profile.
 /// `workspace` is always true: a `workdir` under the worktrees base is
 /// allowed to every paired client.
+/// What a paired app may run: the granted list, or `"local"` (any profile
+/// that runs on this machine) when `clients.profiles` is unset.
 fn scopes_json(policy: &Option<Vec<String>>) -> Value {
-    serde_json::json!({"profiles": policy, "workspace": true})
+    match policy {
+        Some(list) => serde_json::json!({"profiles": list, "workspace": true}),
+        None => serde_json::json!({"profiles": "local", "workspace": true}),
+    }
 }
 
 fn policy_or_503(state: &ClientServerState) -> Result<Option<Vec<String>>, Response> {
@@ -906,8 +924,9 @@ struct ProfilesQuery {
 }
 
 /// `GET /client/profiles[?role=coder]`: the profiles this app may run work
-/// on here, in the order `clients.profiles` grants them (unset: only the
-/// role's own), each with its model and whether it answers now. Read-only;
+/// on here, in the order `clients.profiles` grants them (unset: the
+/// role's own first, then every other local one), each with its model and
+/// whether it answers now. Read-only;
 /// an app picks among these per run.
 async fn profiles_handler(
     State(state): State<ClientServerState>,
@@ -934,10 +953,26 @@ async fn profiles_handler(
     };
     let names = match policy {
         Some(list) => list,
-        None => match (state.resolve_profile)(&role, None) {
-            Ok(own) => vec![own],
-            Err(e) => return err(StatusCode::FORBIDDEN, e),
-        },
+        // Unset: the role's own first, then every other local profile work
+        // can run on.
+        None => {
+            let own = match (state.resolve_profile)(&role, None) {
+                Ok(own) => own,
+                Err(e) => return err(StatusCode::FORBIDDEN, e),
+            };
+            let all = match (state.registry_profiles)() {
+                Ok(all) => all,
+                Err(e) => return internal(anyhow!(e)),
+            };
+            let mut names = vec![own.clone()];
+            names.extend(all.into_iter().filter(|n| {
+                n != &own
+                    && !n.contains('@')
+                    && matches!((state.profile_is_local)(n), Ok(true))
+                    && (state.resolve_profile)(&role, Some(n)).is_ok()
+            }));
+            names
+        }
     };
     let st = state.clone();
     let profiles = tokio::task::spawn_blocking(move || {
@@ -959,6 +994,32 @@ async fn profiles_handler(
     .await
     .unwrap_or_default();
     Json(serde_json::json!({ "role": role, "profiles": profiles })).into_response()
+}
+
+/// The production [`ClientServerState::profile_is_local`]: every model of the
+/// profile is LM Studio-managed or served from this machine (a loopback URL).
+fn profile_runs_here(name: &str) -> Result<bool, String> {
+    let loaded =
+        darkmux_profiles::profiles::load_registry_quiet(None).map_err(|e| format!("{e:#}"))?;
+    let profile = loaded
+        .registry
+        .profiles
+        .get(name)
+        .ok_or_else(|| format!("profile {name} is not in this machine's profiles.json"))?;
+    Ok(profile.models.iter().all(
+        |m| match m.endpoint.as_ref().and_then(|e| e.url.as_deref()) {
+            None => true,
+            Some(url) => {
+                let host = url.split("://").nth(1).unwrap_or(url);
+                let host = if let Some(rest) = host.strip_prefix('[') {
+                    rest.split(']').next().unwrap_or("")
+                } else {
+                    host.split(['/', ':']).next().unwrap_or("")
+                };
+                matches!(host, "127.0.0.1" | "localhost" | "::1")
+            }
+        },
+    ))
 }
 
 /// The production [`ClientServerState::profile_info`]: the registry's entry,
@@ -1223,18 +1284,18 @@ fn admit(
                 )));
             }
         }
-        // Unset: only what darkmux itself resolves for the role. An omitted
-        // profile IS that; a named one must equal it.
-        None if req.profile.is_some() => {
-            let own = (state.resolve_profile)(&req.role, None).map_err(forbidden)?;
-            if own != profile {
+        // Unset: any profile that runs on this machine (an omitted one is
+        // the role's own). A hosted one needs to be granted by name.
+        None if req.profile.is_some() => match (state.profile_is_local)(&profile) {
+            Ok(true) => {}
+            Ok(false) => {
                 return Err(forbidden(format!(
-                    "profile {profile} is not available to apps: with clients.profiles unset, role {} runs only on \
-                     its own profile ({own}); `darkmux config set clients.profiles <list>` widens it",
-                    req.role
-                )));
+                    "profile {profile} isn't local (it sends work off this machine); \
+                     `darkmux config set clients.profiles <list>` can grant it"
+                )))
             }
-        }
+            Err(e) => return Err(forbidden(e)),
+        },
         None => {}
     }
     let work_id = format!("w-{}", random_hex(8).map_err(internal)?);

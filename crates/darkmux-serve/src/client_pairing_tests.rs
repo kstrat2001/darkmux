@@ -69,13 +69,31 @@ fn harness() -> Harness {
         // `deep`. `fast@studio` "resolves" on purpose, so the `@` guard in
         // `admit` is the only thing refusing it.
         resolve_profile: Arc::new(|role, profile| match profile {
-            Some(p) if ["fast", "deep", "fast@studio"].contains(&p) => Ok(p.to_string()),
+            Some(p) if ["fast", "deep", "hosted", "fast@studio"].contains(&p) => Ok(p.to_string()),
+            Some("utility") => Err(
+                "profile utility holds only the utility model; work never runs on it".to_string(),
+            ),
             Some(p) => Err(format!("profile {p} is not defined on this machine")),
             None if role == "coder" => Ok("fast".to_string()),
             None if role == "radio-host" => Ok("deep".to_string()),
             None => Err("no profile resolves".to_string()),
         }),
         profiles_policy: Arc::new(move || pol.lock().unwrap().clone()),
+        // `fast` and `deep` run on this machine; `hosted` sends work to a
+        // hosted API, so it isn't local.
+        profile_is_local: Arc::new(|name| match name {
+            "fast" | "deep" => Ok(true),
+            "hosted" => Ok(false),
+            other => Err(format!("profile {other} is not in the registry")),
+        }),
+        registry_profiles: Arc::new(|| {
+            Ok(vec![
+                "deep".into(),
+                "fast".into(),
+                "hosted".into(),
+                "utility".into(),
+            ])
+        }),
         // `fast` is served and loaded; `deep` is declared but its server is
         // down; anything else isn't in the registry.
         profile_info: Arc::new(|name| match name {
@@ -311,8 +329,8 @@ async fn pairing_happy_path_delivers_a_token_that_whoami_accepts() {
     assert_eq!(v["client_name"], name);
     assert_eq!(
         v["scopes"],
-        serde_json::json!({"profiles": null, "workspace": true}),
-        "unset policy reads as null"
+        serde_json::json!({"profiles": "local", "workspace": true}),
+        "unset policy: any profile that runs on this machine"
     );
     let token = v["token"].as_str().unwrap();
     assert_eq!(token.len(), 64, "32 random bytes, hex");
@@ -326,7 +344,7 @@ async fn pairing_happy_path_delivers_a_token_that_whoami_accepts() {
     assert_eq!(code, 200, "{who}");
     assert_eq!(
         who,
-        serde_json::json!({"client_name": name, "scopes": {"profiles": null, "workspace": true}})
+        serde_json::json!({"client_name": name, "scopes": {"profiles": "local", "workspace": true}})
     );
 }
 
@@ -814,7 +832,7 @@ async fn an_omitted_profile_resolves_through_the_role_binding_and_the_reply_name
 }
 
 #[tokio::test]
-async fn with_the_setting_unset_a_named_profile_other_than_the_roles_own_is_403() {
+async fn with_the_setting_unset_any_local_profile_runs() {
     let h = harness();
     let token = paired(&h).await;
     let (code, v) = call(
@@ -822,10 +840,52 @@ async fn with_the_setting_unset_a_named_profile_other_than_the_roles_own_is_403(
         post("/client/work", Some(&token), work_body(Some("deep"), None)),
     )
     .await;
-    assert_eq!(code, 403, "coder's own profile is fast: {v}");
+    assert_eq!(
+        code, 202,
+        "deep runs on this machine, though coder's own is fast: {v}"
+    );
+    assert_eq!(v["profile"], "deep");
+}
+
+#[tokio::test]
+async fn with_the_setting_unset_a_hosted_profile_is_403() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/work",
+            Some(&token),
+            work_body(Some("hosted"), None),
+        ),
+    )
+    .await;
+    assert_eq!(code, 403, "{v}");
+    let e = v["error"].as_str().unwrap();
     assert!(
-        v["error"].as_str().unwrap().contains("clients.profiles"),
-        "names the setting: {v}"
+        e.contains("isn't local") && e.contains("clients.profiles"),
+        "says why and names the setting: {v}"
+    );
+    assert!(h.ran.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_utility_only_profile_is_403() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/work",
+            Some(&token),
+            work_body(Some("utility"), None),
+        ),
+    )
+    .await;
+    assert_eq!(code, 403, "{v}");
+    assert!(
+        v["error"].as_str().unwrap().contains("utility model"),
+        "{v}"
     );
     assert!(h.ran.lock().unwrap().is_empty());
 }
@@ -3151,7 +3211,7 @@ async fn profiles_need_a_token() {
 }
 
 #[tokio::test]
-async fn profiles_unset_policy_lists_the_roles_own() {
+async fn profiles_unset_policy_lists_every_local_one_the_roles_own_first() {
     let h = harness();
     let t = paired(&h).await;
     let (code, v) = call(
@@ -3162,8 +3222,12 @@ async fn profiles_unset_policy_lists_the_roles_own() {
     assert_eq!(code, 200, "{v}");
     assert_eq!(v["role"], "coder");
     let ps = v["profiles"].as_array().unwrap();
-    assert_eq!(ps.len(), 1, "{v}");
-    assert_eq!(ps[0]["name"], "fast");
+    let names: Vec<&str> = ps.iter().map(|p| p["name"].as_str().unwrap()).collect();
+    assert_eq!(
+        names,
+        ["fast", "deep"],
+        "own first, then the other local ones; not hosted, not utility: {v}"
+    );
     assert_eq!(ps[0]["model"], "m-fast");
     assert_eq!(ps[0]["endpoint"], "url");
     assert_eq!(ps[0]["reachable"], true);
@@ -3315,4 +3379,33 @@ fn describe_profile_reads_the_registry_and_probes_its_server() {
     assert!(missing
         .unwrap_err()
         .contains("not in this machine's profiles.json"));
+}
+
+#[test]
+#[serial_test::serial]
+fn a_profile_is_local_when_every_model_runs_on_this_machine() {
+    let tmp = tempfile::tempdir().unwrap();
+    let registry = tmp.path().join("profiles.json");
+    std::fs::write(
+        &registry,
+        r#"{"profiles":{
+            "managed":{"models":[{"id":"q","n_ctx":32000}]},
+            "loop4":{"models":[{"id":"f","n_ctx":32000,"endpoint":"l4"}]},
+            "loop6":{"models":[{"id":"f","n_ctx":32000,"endpoint":"l6"}]},
+            "named":{"models":[{"id":"f","n_ctx":32000,"endpoint":"ln"}]},
+            "hosted":{"models":[{"id":"c","n_ctx":32000,"endpoint":"api"}]},
+            "mixed":{"models":[{"id":"q","n_ctx":32000},{"id":"c","n_ctx":32000,"endpoint":"api"}]}
+        },"endpoints":{
+            "l4":{"url":"http://127.0.0.1:11500/v1"},
+            "l6":{"url":"http://[::1]:8090/v1"},
+            "ln":{"url":"http://localhost:8000/v1"},
+            "api":{"url":"https://api.example.com/v1"}
+        }}"#,
+    )
+    .unwrap();
+    let got = with_env_vars(&[("DARKMUX_PROFILES", registry.as_os_str())], || {
+        ["managed", "loop4", "loop6", "named", "hosted", "mixed"]
+            .map(|n| profile_runs_here(n).unwrap())
+    });
+    assert_eq!(got, [true, true, true, true, false, false]);
 }
