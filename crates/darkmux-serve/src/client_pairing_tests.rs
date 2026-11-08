@@ -76,6 +76,29 @@ fn harness() -> Harness {
             None => Err("no profile resolves".to_string()),
         }),
         profiles_policy: Arc::new(move || pol.lock().unwrap().clone()),
+        // `fast` is served and loaded; `deep` is declared but its server is
+        // down; anything else isn't in the registry.
+        profile_info: Arc::new(|name| match name {
+            "fast" => Ok(ClientProfileInfo {
+                name: "fast".into(),
+                description: Some("Fast coder".into()),
+                model: Some("m-fast".into()),
+                endpoint: "url".into(),
+                reachable: true,
+                loaded: Some(true),
+                error: None,
+            }),
+            "deep" => Ok(ClientProfileInfo {
+                name: "deep".into(),
+                description: None,
+                model: Some("m-deep".into()),
+                endpoint: "lmstudio".into(),
+                reachable: false,
+                loaded: Some(false),
+                error: None,
+            }),
+            other => Err(format!("profile {other} is not in the registry")),
+        }),
         check_workdir: Arc::new(move |p| {
             darkmux_types::workdir::validate_remote_workdir_in(p, &canon_base)
                 .map_err(|e| format!("{e:#}"))
@@ -3116,4 +3139,180 @@ fn preview_status_is_logged_only_when_it_changes() {
     );
     assert!(seen.changed("hcr-a", "ready"));
     assert!(seen.changed("hcr-b", "starting"), "per workspace");
+}
+
+// ---- GET /client/profiles: what an app may run here, and what's up ---------
+
+#[tokio::test]
+async fn profiles_need_a_token() {
+    let h = harness();
+    let (code, _) = call(&h, get("/client/profiles", &[])).await;
+    assert_eq!(code, 401);
+}
+
+#[tokio::test]
+async fn profiles_unset_policy_lists_the_roles_own() {
+    let h = harness();
+    let t = paired(&h).await;
+    let (code, v) = call(
+        &h,
+        get("/client/profiles", &[("authorization", &bearer(&t))]),
+    )
+    .await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["role"], "coder");
+    let ps = v["profiles"].as_array().unwrap();
+    assert_eq!(ps.len(), 1, "{v}");
+    assert_eq!(ps[0]["name"], "fast");
+    assert_eq!(ps[0]["model"], "m-fast");
+    assert_eq!(ps[0]["endpoint"], "url");
+    assert_eq!(ps[0]["reachable"], true);
+    assert_eq!(ps[0]["loaded"], true);
+}
+
+#[tokio::test]
+async fn profiles_follow_the_grant_in_its_order() {
+    let h = harness();
+    let t = paired(&h).await;
+    *h.policy.lock().unwrap() = Ok(Some(vec!["deep".into(), "fast".into(), "gone".into()]));
+    let (code, v) = call(
+        &h,
+        get("/client/profiles", &[("authorization", &bearer(&t))]),
+    )
+    .await;
+    assert_eq!(code, 200, "{v}");
+    let names: Vec<&str> = v["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["deep", "fast", "gone"]);
+    assert_eq!(v["profiles"][0]["reachable"], false);
+    // A granted name the registry doesn't have is listed, unreachable, with why.
+    assert_eq!(v["profiles"][2]["reachable"], false);
+    assert!(
+        v["profiles"][2]["error"]
+            .as_str()
+            .unwrap()
+            .contains("not in the registry"),
+        "{v}"
+    );
+}
+
+#[tokio::test]
+async fn profiles_for_another_role() {
+    let h = harness();
+    let t = paired(&h).await;
+    let (code, v) = call(
+        &h,
+        get(
+            "/client/profiles?role=radio-host",
+            &[("authorization", &bearer(&t))],
+        ),
+    )
+    .await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["role"], "radio-host");
+    assert_eq!(v["profiles"][0]["name"], "deep");
+}
+
+#[tokio::test]
+async fn profiles_refuse_an_unknown_role() {
+    let h = harness();
+    let t = paired(&h).await;
+    let (code, _) = call(
+        &h,
+        get(
+            "/client/profiles?role=nope",
+            &[("authorization", &bearer(&t))],
+        ),
+    )
+    .await;
+    assert_eq!(code, 400);
+}
+
+// ---- describe_profile, the production profile_info ------------------------
+
+/// Sets env vars for one closure, restoring them after (serial tests only).
+fn with_env_vars<T>(vars: &[(&str, &std::ffi::OsStr)], f: impl FnOnce() -> T) -> T {
+    let saved: Vec<_> = vars
+        .iter()
+        .map(|(k, _)| (*k, std::env::var_os(k)))
+        .collect();
+    for (k, v) in vars {
+        unsafe { std::env::set_var(k, v) };
+    }
+    let out = f();
+    for (k, v) in saved {
+        match v {
+            Some(v) => unsafe { std::env::set_var(k, v) },
+            None => unsafe { std::env::remove_var(k) },
+        }
+    }
+    out
+}
+
+/// A server that answers every request with 401, as a key-guarded model
+/// server does: reachable.
+fn answering_401() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(1) {
+            use std::io::{Read, Write};
+            let mut s = stream.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = s.read(&mut buf);
+            let _ = s.write_all(
+                b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            );
+        }
+    });
+    port
+}
+
+#[test]
+#[serial_test::serial]
+fn describe_profile_reads_the_registry_and_probes_its_server() {
+    let tmp = tempfile::tempdir().unwrap();
+    let up = answering_401();
+    // A port nothing listens on: bind, note it, drop it.
+    let down = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let registry = tmp.path().join("profiles.json");
+    std::fs::write(
+        &registry,
+        format!(
+            r#"{{"profiles":{{
+                "quick":{{"description":"Quick coder","models":[{{"id":"flint","n_ctx":32000,"endpoint":"up"}}]}},
+                "gone":{{"models":[{{"id":"big","n_ctx":32000,"endpoint":"down"}}]}}
+            }},"endpoints":{{
+                "up":{{"url":"http://127.0.0.1:{up}/v1"}},
+                "down":{{"url":"http://127.0.0.1:{down}/v1"}}
+            }}}}"#
+        ),
+    )
+    .unwrap();
+    let (quick, gone, missing) =
+        with_env_vars(&[("DARKMUX_PROFILES", registry.as_os_str())], || {
+            (
+                describe_profile("quick"),
+                describe_profile("gone"),
+                describe_profile("nope"),
+            )
+        });
+    let quick = quick.unwrap();
+    assert_eq!(quick.description.as_deref(), Some("Quick coder"));
+    assert_eq!(quick.model.as_deref(), Some("flint"));
+    assert_eq!(quick.endpoint, "url");
+    assert!(quick.reachable, "a 401 means the server is up: {quick:?}");
+    let gone = gone.unwrap();
+    assert!(!gone.reachable, "nothing listens there: {gone:?}");
+    assert!(missing
+        .unwrap_err()
+        .contains("not in this machine's profiles.json"));
 }
