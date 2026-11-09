@@ -174,13 +174,15 @@ pub fn status_of(wc: &crate::client_git::WorkCopy) -> Option<(String, String)> {
 /// cover: a setting that names no program and that this list misses
 /// (a fetch only moves remote-tracking refs, so the worst it can do is fetch
 /// the wrong objects).
-fn git_bounded(args: &[&std::ffi::OsStr], timeout: Duration) -> Result<(), String> {
-    git_bounded_with(&[], args, timeout)
-}
-
-/// [`git_bounded`] with `extra` settings after the transport rules (tests
-/// allow a local `file://` remote this way).
-fn git_bounded_with(extra: &[&str], args: &[&std::ffi::OsStr], timeout: Duration) -> Result<(), String> {
+///
+/// `extra` settings go after the transport rules (tests allow a local
+/// `file://` remote this way).
+fn git_bounded_with(
+    config_dir: &Path,
+    extra: &[&str],
+    args: &[&std::ffi::OsStr],
+    timeout: Duration,
+) -> Result<(), String> {
     let child = std::process::Command::new("git")
         .args([
             "-c",
@@ -190,7 +192,7 @@ fn git_bounded_with(extra: &[&str], args: &[&std::ffi::OsStr], timeout: Duration
             "-c",
             "protocol.ssh.allow=always",
         ])
-        .args(global_network_config())
+        .args(global_network_config(config_dir))
         .args(extra)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -207,11 +209,12 @@ fn git_bounded_with(extra: &[&str], args: &[&std::ffi::OsStr], timeout: Duration
 const GLOBAL_ONLY_KEYS: [&str; 5] =
     ["credential.helper", "core.sshcommand", "core.askpass", "core.hookspath", "core.fsmonitor"];
 
-/// `-c` settings for a network operation: hooks and fsmonitor off, and the
-/// credential helper, ssh command and askpass program the operator's GLOBAL
-/// config names (`ssh` and none when it names none). An empty
-/// `credential.helper` first resets the list a checkout's config built.
-fn global_network_config() -> Vec<String> {
+/// `-c` settings for a network operation run for `dir` (where its config
+/// is read; `/` before a clone exists): hooks and fsmonitor off, the
+/// operator's own credential helpers ([`operator_credential_helpers`]), and
+/// the ssh command and askpass program the operator's GLOBAL config names
+/// (`ssh` and none when it names none).
+fn global_network_config(dir: &Path) -> Vec<String> {
     let global = |key: &str| -> Vec<String> {
         darkmux_types::host_git::HostGit::trusted("/")
             .stdout(&["config", "--global", "--get-all", key])
@@ -222,10 +225,49 @@ fn global_network_config() -> Vec<String> {
         .iter()
         .map(|s| s.to_string())
         .collect();
-    c.extend(global("credential.helper").into_iter().map(|h| format!("credential.helper={h}")));
+    c.extend(operator_credential_helpers(dir));
     c.push(format!("core.sshCommand={}", global("core.sshCommand").pop().unwrap_or_else(|| "ssh".to_string())));
     c.push(format!("core.askPass={}", global("core.askPass").pop().unwrap_or_default()));
     c.into_iter().flat_map(|s| ["-c".to_string(), s]).collect()
+}
+
+/// The config scopes whose credential helpers a network operation keeps:
+/// the system config, the global one, and the one Apple's git reads from
+/// Xcode (`unknown` scope), which holds `osxkeychain`. Never `local` or
+/// `worktree` (the checkout's own config, which a run may have written) or
+/// `command`.
+const OPERATOR_SCOPES: [&str; 3] = ["system", "global", "unknown"];
+
+/// The credential helpers the operator's own git would run, as `key=value`
+/// settings for after the empty `credential.helper` that resets the list a
+/// checkout's own config built. Generic and per-URL entries (`gh auth
+/// setup-git` writes an empty reset and its own helper for its host) come
+/// in the order git read them, so git's own URL matching builds, for any
+/// URL, the list the operator's git would, minus the checkout's entries.
+/// Read in `dir`, so a global `includeIf "gitdir:..."` applies as it does
+/// for the operator; with the system config on, which other host git calls
+/// leave off. An entry whose key holds `=` cannot be given as `-c`, and is
+/// left out.
+fn operator_credential_helpers(dir: &Path) -> Vec<String> {
+    let out = darkmux_types::host_git::HostGit::trusted(dir)
+        .command(&["config", "-z", "--show-scope", "--get-regexp", r"^credential\.(.+\.)?helper$"])
+        .env_remove("GIT_CONFIG_NOSYSTEM")
+        .stdin(std::process::Stdio::null())
+        .output();
+    let Some(out) = out.ok().filter(|o| o.status.success()) else {
+        return Vec::new();
+    };
+    out.stdout
+        .split(|b| *b == 0)
+        .collect::<Vec<_>>()
+        .chunks_exact(2)
+        .filter(|p| OPERATOR_SCOPES.iter().any(|s| p[0] == s.as_bytes()))
+        .filter_map(|p| {
+            let entry = String::from_utf8_lossy(p[1]);
+            let (key, value) = entry.split_once('\n').unwrap_or((&entry, ""));
+            (!key.contains('=')).then(|| format!("{key}={value}"))
+        })
+        .collect()
 }
 
 /// The keys the repository at `dir` sets in its OWN config (local or
@@ -249,21 +291,25 @@ fn repo_local_keys(dir: &Path) -> Vec<String> {
 /// Of `keys`, the network settings no override can switch off, so a fetch
 /// refuses them: a proxy or any other `http.*` setting (TLS verification,
 /// CA file, extra headers), a URL rewrite, a per-URL credential helper, a
-/// transport allowed or a remote helper named, a proxy command.
+/// transport allowed or a remote helper named, a proxy command, the command
+/// a remote runs to serve the fetch (over ssh, possibly this machine), and
+/// the command a fetch runs to list an alternate object store's refs.
 fn refused_network_keys(keys: &[String]) -> Vec<String> {
     keys.iter().filter(|k| is_refused_network_key(k)).cloned().collect()
 }
 
 /// (section prefix, key suffix) pairs [`refused_network_keys`] refuses; an
 /// empty suffix is the whole section.
-const REFUSED_NETWORK_KEYS: [(&str, &str); 7] = [
+const REFUSED_NETWORK_KEYS: [(&str, &str); 9] = [
     ("http.", ""),
     ("protocol.", ""),
     ("url.", ".insteadof"),
     ("url.", ".pushinsteadof"),
     ("remote.", ".proxy"),
     ("remote.", ".vcs"),
+    ("remote.", ".uploadpack"),
     ("core.gitproxy", ""),
+    ("core.alternaterefscommand", ""),
 ];
 
 fn is_refused_network_key(key: &str) -> bool {
@@ -336,7 +382,7 @@ fn clone_at(url: &str, git_ref: Option<&str>, dest: &Path, git_dir: &Path, extra
     args.push("--".as_ref());
     args.push(url.as_ref());
     args.push(dest.as_os_str());
-    git_bounded_with(extra, &args, Duration::from_secs(600))?;
+    git_bounded_with(Path::new("/"), extra, &args, Duration::from_secs(600))?;
     let Some(sha) = sha else { return Ok(()) };
     fn in_dest<'a>(dest: &'a Path, rest: &[&'a str]) -> Vec<&'a std::ffi::OsStr> {
         let mut a: Vec<&std::ffi::OsStr> = vec!["-C".as_ref(), dest.as_os_str()];
@@ -345,10 +391,11 @@ fn clone_at(url: &str, git_ref: Option<&str>, dest: &Path, git_dir: &Path, extra
     }
     let object = format!("{sha}^{{commit}}");
     // A commit off every branch the clone fetched: ask the remote for it.
-    if git_bounded_with(extra, &in_dest(dest, &["cat-file", "-e", &object]), Duration::from_secs(30)).is_err() {
-        git_bounded_with(extra, &in_dest(dest, &["fetch", "--quiet", "origin", sha]), Duration::from_secs(600))?;
+    if git_bounded_with(dest, extra, &in_dest(dest, &["cat-file", "-e", &object]), Duration::from_secs(30)).is_err() {
+        let fetch = ["fetch", "--quiet", "--no-recurse-submodules", "origin", sha];
+        git_bounded_with(dest, extra, &in_dest(dest, &fetch), Duration::from_secs(600))?;
     }
-    git_bounded_with(extra, &in_dest(dest, &["checkout", "--quiet", "--detach", sha]), Duration::from_secs(120))
+    git_bounded_with(dest, extra, &in_dest(dest, &["checkout", "--quiet", "--detach", sha]), Duration::from_secs(120))
 }
 
 /// A full object name (SHA-1 or SHA-256, lowercase hex): a ref that names
@@ -382,10 +429,18 @@ impl std::fmt::Display for Coded {
 }
 
 /// Production fetch: updates remote-tracking refs only; the checkout's
-/// branch and files are never touched. A network key the checkout's own
+/// branch and files are never touched, and its submodules are never
+/// fetched (a child fetch there would read the submodule's own config,
+/// which the key check below never sees). A network key the checkout's own
 /// config sets is refused (`network_key_in_repo_config`); any other failure
 /// is `fetch_failed`.
 pub fn fetch_with_git(dir: &Path) -> Result<(), Coded> {
+    fetch_at(dir, &[])
+}
+
+/// [`fetch_with_git`] with `extra` settings after the transport rules (tests
+/// allow a local `file://` remote this way).
+fn fetch_at(dir: &Path, extra: &[&str]) -> Result<(), Coded> {
     let local = repo_local_keys(dir);
     let mut refused = refused_network_keys(&local);
     refused.dedup();
@@ -402,9 +457,10 @@ pub fn fetch_with_git(dir: &Path) -> Result<(), Coded> {
         dir.as_os_str(),
         "fetch".as_ref(),
         "--quiet".as_ref(),
+        "--no-recurse-submodules".as_ref(),
         "origin".as_ref(),
     ];
-    git_bounded(&args, Duration::from_secs(120)).map_err(|e| {
+    git_bounded_with(dir, extra, &args, Duration::from_secs(120)).map_err(|e| {
         Coded::new(
             ClientCode::FetchFailed,
             match ignored.is_empty() {
@@ -560,7 +616,7 @@ fn remote_default_with(git: impl Fn(&[&str]) -> Option<String>) -> Option<String
 /// `git worktree add -b <branch> <dest> <commit>` from `source`, with the
 /// repo's hooks off (an app asked for this, not the owner at a terminal),
 /// through `HostGit`'s trusted mode (#3457): no network, so it needs none of
-/// the credentials [`git_bounded`] keeps, and the checkout's own config
+/// the credentials [`git_bounded_with`] keeps, and the checkout's own config
 /// cannot run a program while git checks the files out.
 pub fn add_worktree(source: &Path, branch: &str, dest: &Path, commit: &str) -> Result<(), Coded> {
     // (#3457) A filter the checkout's own config defines never runs here,
@@ -912,7 +968,7 @@ mod tests {
         let missing = dir.path().join("missing");
         let args: Vec<&std::ffi::OsStr> =
             vec!["-C".as_ref(), missing.as_os_str(), "status".as_ref()];
-        let err = git_bounded(&args, Duration::from_secs(30)).unwrap_err();
+        let err = git_bounded_with(Path::new("/"), &[], &args, Duration::from_secs(30)).unwrap_err();
         assert!(err.starts_with("git exited with "), "{err}");
         assert!(err.contains("cannot change to"), "{err}");
     }
@@ -1002,6 +1058,7 @@ mod tests {
             ("url.ext::sh.insteadOf", "ssh://"),
             ("credential.https://example.com.helper", "!touch x"),
             ("protocol.ext.allow", "always"),
+            ("remote.origin.uploadpack", "touch x; git-upload-pack"),
         ] {
             let tmp = tempfile::tempdir().unwrap();
             let (_root, src, marker) = checkout_for_test(&tmp);
@@ -1016,6 +1073,170 @@ mod tests {
             assert!(err.contains("includeIf"), "{key}: names the per-repo fix: {err}");
             assert!(!marker.exists(), "{key}: git ran");
         }
+    }
+
+    /// A new commit in `repo`, so the next fetch has something to fetch.
+    fn bump(repo: &Path, what: &str) {
+        let fx = darkmux_types::host_git::fixture::git;
+        std::fs::write(repo.join("page.txt"), what).unwrap();
+        fx(repo, &["commit", "-qam", what]);
+    }
+
+    /// Plain git's fetch, to prove a fixture arms.
+    fn plain_fetch(dir: &Path) {
+        let out = std::process::Command::new("git")
+            .args(["-c", "protocol.file.allow=always", "-C"])
+            .arg(dir)
+            .args(["fetch", "-q", "origin"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// A checkout that borrows objects from an alternate runs its
+    /// `core.alternateRefsCommand` while a fetch negotiates. One the
+    /// checkout's own config names is refused, and never runs.
+    #[test]
+    fn fetch_runs_no_alternate_refs_command_the_checkout_config_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let fx = darkmux_types::host_git::fixture::git;
+        let (remote, other, src) = (root.join("remote"), root.join("other"), root.join("src"));
+        two_commit_repo(&remote);
+        two_commit_repo(&other);
+        fx(&root, &["clone", "-q", remote.to_str().unwrap(), src.to_str().unwrap()]);
+        let alternates = src.join(".git").join("objects").join("info").join("alternates");
+        std::fs::write(&alternates, format!("{}\n", other.join(".git").join("objects").display())).unwrap();
+        let marker = root.join("alternate-refs-ran");
+        fx(&src, &["config", "core.alternateRefsCommand", &format!("touch '{}'; true", marker.display())]);
+        bump(&remote, "third");
+        plain_fetch(&src);
+        assert!(marker.exists(), "the fixture must arm: plain git's fetch runs the command");
+        std::fs::remove_file(&marker).unwrap();
+        bump(&remote, "fourth");
+
+        let out = fetch_at(&src, ALLOW_FILE);
+        assert!(!marker.exists(), "the checkout's own core.alternateRefsCommand ran");
+        let coded = out.unwrap_err();
+        assert_eq!(coded.code, ClientCode::NetworkKeyInRepoConfig);
+        assert!(coded.message.contains("core.alternaterefscommand"), "{}", coded.message);
+    }
+
+    /// A fetch never recurses into the checkout's submodules: the child
+    /// fetch git starts there reads the submodule's own repository, whose
+    /// config the checkout's own key checks never see.
+    #[test]
+    fn fetch_never_recurses_into_a_submodule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let fx = darkmux_types::host_git::fixture::git;
+        let (sub_src, remote, src) = (root.join("subsrc"), root.join("remote"), root.join("src"));
+        two_commit_repo(&sub_src);
+        two_commit_repo(&remote);
+        fx(&remote, &["submodule", "add", "-q", sub_src.to_str().unwrap(), "lib"]);
+        fx(&remote, &["commit", "-qm", "with lib"]);
+        fx(&root, &["clone", "-q", "--recurse-submodules", remote.to_str().unwrap(), src.to_str().unwrap()]);
+        // The submodule's repository borrows objects and names a command.
+        let sub_git = src.join(".git").join("modules").join("lib");
+        let alternates = sub_git.join("objects").join("info").join("alternates");
+        std::fs::write(&alternates, format!("{}\n", sub_src.join(".git").join("objects").display())).unwrap();
+        let marker = root.join("submodule-alternate-refs-ran");
+        fx(&sub_git, &["config", "core.alternateRefsCommand", &format!("touch '{}'; true", marker.display())]);
+        let move_lib = |what: &str| {
+            bump(&sub_src, what);
+            fx(&remote.join("lib"), &["pull", "-q"]);
+            fx(&remote, &["commit", "-qam", what]);
+        };
+        move_lib("third");
+        plain_fetch(&src);
+        assert!(marker.exists(), "the fixture must arm: plain git's fetch recurses and runs the command");
+        std::fs::remove_file(&marker).unwrap();
+        move_lib("fourth");
+
+        fetch_at(&src, ALLOW_FILE).expect("the fetch itself succeeds");
+        assert!(!marker.exists(), "the fetch recursed into the submodule and ran its config");
+    }
+
+    /// Sets `vars` (`None` removes one) for the duration of `f`, then puts
+    /// back what was there. Callers are `#[serial]`.
+    fn with_env<T>(vars: &[(&str, Option<&std::ffi::OsStr>)], f: impl FnOnce() -> T) -> T {
+        let prev: Vec<(&str, Option<std::ffi::OsString>)> = vars.iter().map(|(k, _)| (*k, std::env::var_os(k))).collect();
+        for (k, v) in vars {
+            // SAFETY: #[serial] callers; restored below.
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+        let out = f();
+        for (k, v) in prev {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+        out
+    }
+
+    /// The credential helpers a network operation runs are the ones the
+    /// operator's own git would run for that URL, from the system config
+    /// (where Xcode's git keeps `osxkeychain`) and the global one, per-URL
+    /// entries included (`gh auth setup-git` writes an empty reset and then
+    /// its own helper for its host); a helper the checkout's own config
+    /// names is never among them.
+    #[test]
+    #[serial_test::serial]
+    fn the_credential_helpers_are_the_operators_own_never_the_checkouts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, src, _marker) = checkout_for_test(&tmp);
+        let log = root.join("helpers-ran");
+        let helper = |name: &str| format!("!f() {{ echo {name} >> '{}'; }}; f", log.display());
+        // Quoted in a config file, where `;` would start a comment.
+        let quoted = |name: &str| format!("\"{}\"", helper(name));
+        let system = root.join("system-config");
+        std::fs::write(&system, format!("[credential]\n\thelper = {}\n", quoted("system"))).unwrap();
+        let global = root.join("global-config");
+        std::fs::write(
+            &global,
+            format!(
+                "[credential]\n\thelper = {}\n[credential \"https://forge.example.invalid\"]\n\thelper =\n\thelper = {}\n\
+                 [credential \"https://other.invalid\"]\n\thelper = {}\n",
+                quoted("global"),
+                quoted("gh"),
+                quoted("other-host")
+            ),
+        )
+        .unwrap();
+        darkmux_types::host_git::fixture::git(&src, &["config", "credential.helper", &helper("checkout")]);
+        let fill = |args: &[String], host: &str| -> Vec<String> {
+            use std::io::Write;
+            let _ = std::fs::remove_file(&log);
+            let mut child = std::process::Command::new("git")
+                .args(args)
+                .arg("-C")
+                .arg(&src)
+                .args(["credential", "fill"])
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(format!("protocol=https\nhost={host}\n\n").as_bytes()).unwrap();
+            child.wait().unwrap();
+            std::fs::read_to_string(&log).unwrap_or_default().lines().map(str::to_string).collect()
+        };
+        let env = [
+            ("GIT_CONFIG_GLOBAL", Some(global.as_os_str())),
+            ("GIT_CONFIG_SYSTEM", Some(system.as_os_str())),
+            ("GIT_CONFIG_NOSYSTEM", None),
+        ];
+        let (plain, gh) = with_env(&env, || {
+            let args = global_network_config(&src);
+            (fill(&args, "plain.invalid"), fill(&args, "forge.example.invalid"))
+        });
+        assert_eq!(plain, ["system", "global"], "the system and global helpers, never the checkout's");
+        assert_eq!(gh, ["gh"], "a per-URL reset and helper apply to their host as they do for the operator");
     }
 
     /// The operator's GLOBAL `core.sshCommand` is the one a fetch runs.
@@ -1048,7 +1269,7 @@ mod tests {
         let args: Vec<&std::ffi::OsStr> =
             vec!["-c".as_ref(), "alias.nap=!sleep 5".as_ref(), "nap".as_ref()];
         let started = Instant::now();
-        let err = git_bounded(&args, Duration::from_secs(1)).unwrap_err();
+        let err = git_bounded_with(Path::new("/"), &[], &args, Duration::from_secs(1)).unwrap_err();
         assert_eq!(err, "git took longer than 1s");
         assert!(
             started.elapsed() < Duration::from_secs(4),
