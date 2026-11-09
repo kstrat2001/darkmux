@@ -1089,18 +1089,14 @@ fn profile_runs_here(name: &str) -> Result<bool, String> {
     Ok(profile.models.iter().all(
         |m| match m.endpoint.as_ref().and_then(|e| e.url.as_deref()) {
             None => true,
-            Some(url) => {
-                let host = url.split("://").nth(1).unwrap_or(url);
-                let host = if let Some(rest) = host.strip_prefix('[') {
-                    rest.split(']').next().unwrap_or("")
-                } else {
-                    host.split(['/', ':']).next().unwrap_or("")
-                };
-                matches!(host, "127.0.0.1" | "localhost" | "::1")
-            }
+            Some(url) => darkmux_types::endpoint::url_names_this_machine(url),
         },
     ))
 }
+
+/// The `endpoint` a listed profile reports when LM Studio serves its model
+/// (the wire label the app shows; `"url"` otherwise).
+const MANAGED_LABEL: &str = "lmstudio";
 
 /// A listed profile before its server is looked at: name, description,
 /// default model, and that model's URL when it has one.
@@ -1167,9 +1163,9 @@ fn describe_profiles(names: &[String]) -> Vec<Result<ClientProfileInfo, String>>
                         let here = models
                             .iter()
                             .any(|m| m.model == want || m.identifier.ends_with(want));
-                        ("lmstudio", true, Some(here))
+                        (MANAGED_LABEL, true, Some(here))
                     }
-                    None => ("lmstudio", false, None),
+                    None => (MANAGED_LABEL, false, None),
                 },
             };
             Ok(ClientProfileInfo {

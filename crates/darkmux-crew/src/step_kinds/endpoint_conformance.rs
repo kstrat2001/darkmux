@@ -104,6 +104,9 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     ("crates/darkmux-doctor/src/lib.rs", "default_model_id()", 2, "which profile the LOADED residents match (profile match / active profile), not a model choice"),
     ("crates/darkmux-lab/src/lab/profile_check.rs", "default_model_id()", 1, "a lab envelope warning about whether the profile's default model is loaded, not a model choice"),
     ("src/main.rs", "default_model_id()", 1, "`profile list`'s `default` marker (display)"),
+    ("crates/darkmux-serve/src/client_pairing.rs", "default_model_id()", 1, "the client profile listing's `model` (display, like `profile list`); a run's model is chosen by the resolver"),
+    ("crates/darkmux-serve/src/client_pairing.rs", "\"lmstudio\"", 1, "the client profile listing's `endpoint` wire label for an LM Studio-served profile, a name not a test"),
+    ("crates/darkmux-serve/src/client_workspace.rs", "strip_prefix(\"https://\")", 1, "parses a git remote URL (`https://` or `git@`) for a client workspace, not a model endpoint"),
     ("src/mission_config_cli.rs", "default_model_id()", 1, "`show`'s fallback for a role this binary does not know (it cannot select without the role)"),
 ];
 
