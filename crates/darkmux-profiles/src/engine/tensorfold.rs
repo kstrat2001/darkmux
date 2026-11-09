@@ -78,34 +78,41 @@ impl ServeFlags {
     /// list it declares for that flag. A token that is not a flag is the
     /// value of the flag before it. Never echoes a value (it may be a secret).
     pub fn check(&self, args: &[String]) -> std::result::Result<(), String> {
-        let mut pending: Option<(&str, &[String])> = None;
+        // The flag whose value list the next token must be on, if any.
+        let mut pending: Option<(String, &[String])> = None;
         for arg in args {
-            if let Some(stripped) = arg.strip_prefix("--") {
-                let (flag, inline) = match stripped.split_once('=') {
-                    Some((f, v)) => (f, Some(v)),
-                    None => (stripped, None),
-                };
-                let flag = format!("--{flag}");
-                let Some(values) = self.0.get(&flag) else {
-                    return Err(format!("`{flag}` is not a flag `tensorfold-native serve` accepts"));
-                };
-                pending = None;
-                match (values, inline) {
-                    (Some(allowed), Some(v)) if !allowed.iter().any(|a| a == v) => {
-                        return Err(format!("`{flag}` takes one of {}", allowed.join(", ")));
-                    }
-                    (Some(allowed), None) => {
-                        pending = self.0.get_key_value(&flag).map(|(k, _)| (k.as_str(), allowed.as_slice()));
-                    }
-                    _ => {}
+            let Some(stripped) = arg.strip_prefix("--") else {
+                if let Some((flag, allowed)) = pending.take() {
+                    one_of(&flag, allowed, arg)?;
                 }
-            } else if let Some((flag, allowed)) = pending.take() {
-                if !allowed.iter().any(|a| a == arg) {
-                    return Err(format!("`{flag}` takes one of {}", allowed.join(", ")));
+                continue;
+            };
+            let (flag, inline) = match stripped.split_once('=') {
+                Some((f, v)) => (format!("--{f}"), Some(v)),
+                None => (format!("--{stripped}"), None),
+            };
+            let Some(values) = self.0.get(&flag) else {
+                return Err(format!("`{flag}` is not a flag `tensorfold-native serve` accepts"));
+            };
+            pending = None;
+            if let Some(allowed) = values {
+                match inline {
+                    Some(v) => one_of(&flag, allowed, v)?,
+                    None => pending = Some((flag, allowed.as_slice())),
                 }
             }
         }
         Ok(())
+    }
+}
+
+/// `value` is one of the values `flag` lists, or the refusal naming them
+/// (never the value, which may be a secret).
+fn one_of(flag: &str, allowed: &[String], value: &str) -> std::result::Result<(), String> {
+    if allowed.iter().any(|a| a == value) {
+        Ok(())
+    } else {
+        Err(format!("`{flag}` takes one of {}", allowed.join(", ")))
     }
 }
 

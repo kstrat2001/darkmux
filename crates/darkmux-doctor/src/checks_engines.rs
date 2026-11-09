@@ -43,20 +43,29 @@ pub(crate) fn check_tensorfold_engine() -> Check {
     }
 }
 
+/// A profile model on a Tensorfold endpoint, with where it is declared.
+type TfModel<'a> = (String, usize, &'a darkmux_types::ProfileModel);
+
+fn is_tf(kind: Result<EndpointKind, darkmux_types::EndpointError>) -> bool {
+    matches!(kind, Ok(EndpointKind::Managed(ManagedBackend::Tensorfold)))
+}
+
+fn pass(message: String) -> Check {
+    Check { name: NAME.into(), status: Status::Pass, message, hint: None }
+}
+
+fn fail(message: String, hint: String) -> Check {
+    Check { name: NAME.into(), status: Status::Fail, message, hint: Some(hint) }
+}
+
 /// The row, from the registry and (only when it declares a Tensorfold
 /// endpoint) what the binary says.
 pub(crate) fn tensorfold_engine_status(registry: &ProfileRegistry, probe: impl FnOnce() -> TensorfoldFacts) -> Check {
-    let is_tf = |kind: Result<EndpointKind, _>| matches!(kind, Ok(EndpointKind::Managed(ManagedBackend::Tensorfold)));
     let endpoints = registry.endpoints.values().filter(|ep| is_tf(ep.kind())).count();
     if endpoints == 0 {
-        return Check {
-            name: NAME.into(),
-            status: Status::Pass,
-            message: "not checked: no endpoint declares `\"managed\": \"tensorfold\"`".into(),
-            hint: None,
-        };
+        return pass("not checked: no endpoint declares `\"managed\": \"tensorfold\"`".into());
     }
-    let models: Vec<(String, usize, &darkmux_types::ProfileModel)> = registry
+    let models: Vec<TfModel> = registry
         .profiles
         .iter()
         .flat_map(|(p, prof)| prof.models.iter().enumerate().map(move |(i, m)| (p.clone(), i, m)))
@@ -68,48 +77,11 @@ pub(crate) fn tensorfold_engine_status(registry: &ProfileRegistry, probe: impl F
         Source::Config => " (via config.engines.tensorfold.bin)",
         Source::BuiltIn => "",
     };
-    let fail = |message: String, hint: String| Check { name: NAME.into(), status: Status::Fail, message, hint: Some(hint) };
-    let version = match facts.version {
-        Err(e) => {
-            return fail(
-                format!("`{}`{via} did not answer: {e}", facts.bin),
-                "install Tensorfold, then `darkmux config set engines.tensorfold.bin <path to tensorfold-native>` \
-                 if it is not on PATH; DARKMUX_TENSORFOLD_BIN overrides it for one shell"
-                    .into(),
-            )
-        }
-        Ok(v) if !v.is_verified() => {
-            return fail(
-                format!("`{}`{via} is Tensorfold {v}; this darkmux supports {VERIFIED_RELEASES}", facts.bin),
-                format!("install a Tensorfold {VERIFIED_RELEASES} release, or a darkmux that supports {v}"),
-            )
-        }
+    let version = match verified(&facts, via) {
         Ok(v) => v,
+        Err(row) => return row,
     };
-    let mut problems = Vec::new();
-    match &facts.models {
-        Ok(have) => {
-            for (p, i, m) in &models {
-                if !have.iter().any(|r| r == &m.id) {
-                    problems.push(format!(
-                        "profiles.{p}.models[{i}] names `{}`, which `tensorfold-native models` does not list",
-                        m.id
-                    ));
-                }
-            }
-        }
-        Err(e) => problems.push(format!("could not list its models: {e}")),
-    }
-    match &facts.flags {
-        Ok(flags) => {
-            for (p, i, m) in models.iter().filter(|(_, _, m)| !m.engine_args.is_empty()) {
-                if let Err(why) = flags.check(&m.engine_args) {
-                    problems.push(format!("profiles.{p}.models[{i}].engine_args: {why}"));
-                }
-            }
-        }
-        Err(e) => problems.push(format!("could not read its serve flags: {e}")),
-    }
+    let problems = model_problems(&models, &facts);
     if !problems.is_empty() {
         return fail(
             format!("Tensorfold {version} (`{}`{via}): {}", facts.bin, problems.join("; ")),
@@ -118,17 +90,49 @@ pub(crate) fn tensorfold_engine_status(registry: &ProfileRegistry, probe: impl F
                 .into(),
         );
     }
-    Check {
-        name: NAME.into(),
-        status: Status::Pass,
-        message: format!(
-            "Tensorfold {version} (`{}`{via}): {} model(s) on {endpoints} endpoint(s), each one the engine has, every \
-             `engine_args` flag accepted. darkmux does not start its servers yet, so dispatch refuses them (#3448)",
-            facts.bin,
-            models.len()
-        ),
-        hint: None,
+    pass(format!(
+        "Tensorfold {version} (`{}`{via}): {} model(s) on {endpoints} endpoint(s), each one the engine has, every \
+         `engine_args` flag accepted. darkmux does not start its servers yet, so dispatch refuses them (#3448)",
+        facts.bin,
+        models.len()
+    ))
+}
+
+/// The installed version when darkmux was verified against it, else the
+/// failing row.
+fn verified(facts: &TensorfoldFacts, via: &str) -> Result<Version, Check> {
+    match &facts.version {
+        Err(e) => Err(fail(
+            format!("`{}`{via} did not answer: {e}", facts.bin),
+            "install Tensorfold, then `darkmux config set engines.tensorfold.bin <path to tensorfold-native>` \
+             if it is not on PATH; DARKMUX_TENSORFOLD_BIN overrides it for one shell"
+                .into(),
+        )),
+        Ok(v) if !v.is_verified() => Err(fail(
+            format!("`{}`{via} is Tensorfold {v}; this darkmux supports {VERIFIED_RELEASES}", facts.bin),
+            format!("install a Tensorfold {VERIFIED_RELEASES} release, or a darkmux that supports {v}"),
+        )),
+        Ok(v) => Ok(*v),
     }
+}
+
+/// Every Tensorfold model the engine does not have, and every `engine_args`
+/// it does not accept.
+fn model_problems(models: &[TfModel], facts: &TensorfoldFacts) -> Vec<String> {
+    let mut problems = Vec::new();
+    match &facts.models {
+        Ok(have) => problems.extend(models.iter().filter(|(_, _, m)| !have.iter().any(|r| r == &m.id)).map(|(p, i, m)| {
+            format!("profiles.{p}.models[{i}] names `{}`, which `tensorfold-native models` does not list", m.id)
+        })),
+        Err(e) => problems.push(format!("could not list its models: {e}")),
+    }
+    match &facts.flags {
+        Ok(flags) => problems.extend(models.iter().filter(|(_, _, m)| !m.engine_args.is_empty()).filter_map(|(p, i, m)| {
+            flags.check(&m.engine_args).err().map(|why| format!("profiles.{p}.models[{i}].engine_args: {why}"))
+        })),
+        Err(e) => problems.push(format!("could not read its serve flags: {e}")),
+    }
+    problems
 }
 
 #[cfg(test)]
