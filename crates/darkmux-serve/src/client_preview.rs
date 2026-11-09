@@ -594,6 +594,9 @@ pub struct Previews {
     ports: Arc<dyn Fn() -> Result<u16, String> + Send + Sync>,
     /// Set once `client serve` begins to stop: no preview starts after it.
     stopping: std::sync::atomic::AtomicBool,
+    /// How long a started dev server may take to answer ([`READY_WITHIN`];
+    /// a test's shorter one).
+    ready_within: Duration,
 }
 
 /// A relative path inside the work copy, spelled plainly: no absolute
@@ -1019,6 +1022,7 @@ impl Previews {
             clock: Arc::new(unix_seconds),
             ports: Arc::new(free_port),
             stopping: std::sync::atomic::AtomicBool::new(false),
+            ready_within: READY_WITHIN,
         }
     }
 
@@ -1034,6 +1038,13 @@ impl Previews {
     /// Whether [`Previews::begin_shutdown`] ran.
     pub fn stopping(&self) -> bool {
         self.stopping.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The same previews giving a dev server `within` to answer.
+    #[cfg(test)]
+    pub(crate) fn with_ready_within(mut self, within: Duration) -> Self {
+        self.ready_within = within;
+        self
     }
 
     /// The same previews picking ports with `ports` (a test's fixed ones).
@@ -1131,6 +1142,7 @@ impl Previews {
             log,
             port,
             hmr_port,
+            ready_within: self.ready_within,
         };
         let containers = self.containers.clone();
         std::thread::spawn(move || run(entry, recipe, at, &*containers));
@@ -1348,6 +1360,8 @@ struct RunIn {
     log: PathBuf,
     port: u16,
     hmr_port: u16,
+    /// How long the dev server may take to answer once it starts.
+    ready_within: Duration,
 }
 
 fn run(entry: Arc<Mutex<Entry>>, recipe: Recipe, at: RunIn, containers: &dyn PreviewContainers) {
@@ -1791,13 +1805,7 @@ fn wait_ready(
     let path = ready_path(recipe);
     let mut serving_since = None;
     loop {
-        if let Ok(Some(status)) = child.try_wait() {
-            return Err(Halt::Failed(exit_reason(recipe, &at.log, Ok(status))));
-        }
-        if entry.lock().unwrap().status == Status::Stopped {
-            let _ = child.wait();
-            return Err(Halt::Stopped);
-        }
+        ended_or_stopped(entry, child, recipe, at)?;
         if serving_since.is_none() && log_has(&at.log, SERVING_LINE) {
             serving_since = Some(Instant::now());
             now_serving(entry, at, installed)?;
@@ -1806,7 +1814,7 @@ fn wait_ready(
             set(entry, Status::Ready);
             return Ok(());
         }
-        if serving_since.is_some_and(|t| t.elapsed() > READY_WITHIN) {
+        if serving_since.is_some_and(|t| t.elapsed() > at.ready_within) {
             let listening = containers.listeners(name);
             return Err(Halt::Failed(not_ready_reason(
                 at.port,
@@ -1815,6 +1823,24 @@ fn wait_ready(
         }
         std::thread::sleep(Duration::from_millis(300));
     }
+}
+
+/// Why [`wait_ready`] stops waiting before the server answers: the
+/// container exited, or the preview was stopped.
+fn ended_or_stopped(
+    entry: &Arc<Mutex<Entry>>,
+    child: &mut std::process::Child,
+    recipe: &Recipe,
+    at: &RunIn,
+) -> Result<(), Halt> {
+    if let Ok(Some(status)) = child.try_wait() {
+        return Err(Halt::Failed(exit_reason(recipe, &at.log, Ok(status))));
+    }
+    if entry.lock().unwrap().status == Status::Stopped {
+        let _ = child.wait();
+        return Err(Halt::Stopped);
+    }
+    Ok(())
 }
 
 /// The dev server line appeared: the install, when one ran, succeeded
@@ -2100,9 +2126,102 @@ mod tests {
             log: PathBuf::from("/tmp/p/site.log"),
             port: 4100,
             hmr_port: 4200,
+            ready_within: READY_WITHIN,
         };
         let labels = vec!["darkmux.dispatch.host-pid=7".to_string()];
         spec_for(recipe, &at, true, ("sha256:runtime".into(), user), labels)
+    }
+
+    /// A dev server that starts but never answers on its port fails once
+    /// its time is up, saying how it must listen.
+    #[test]
+    fn a_dev_server_that_never_answers_fails_naming_how_to_listen() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = a_workspace(dir.path(), "sleep 30");
+        let (previews, emu) = emulated(dir.path());
+        let previews = previews.with_ready_within(Duration::from_millis(400));
+        previews.start("w", &wt, &RecipeSource::Checkout(wt.clone())).unwrap();
+        let v = until_failed(&previews, "w");
+        assert_eq!(v["status"], "failed", "{v}");
+        assert!(v["error"].as_str().unwrap().contains("must listen on 0.0.0.0"), "{v}");
+        previews.stop("w");
+        drop(emu);
+    }
+
+    /// Runs `f` with a fake `docker` first on `PATH`: it appends each call's
+    /// arguments to `calls` and answers as a daemon would: `create` fails
+    /// for a container named `*fail*`, `exec` prints listeners (none for
+    /// `*quiet*`), `start -a` prints a line, `version` reports the daemon
+    /// down. Callers are `#[serial]`.
+    #[cfg(unix)]
+    fn with_fake_docker<T>(f: impl FnOnce(&Path) -> T) -> T {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let calls = dir.path().join("calls");
+        let script = format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\ncase \"$1\" in\n\
+             create) case \"$*\" in *fail*) echo 'no such image' >&2; exit 1;; esac;;\n\
+             exec) case \"$2\" in *quiet*) exit 0;; esac; echo '0: 00000000:1004 00000000:0000 0A';;\n\
+             start) echo \"attached to $3\";;\n\
+             version) echo 'Cannot connect to the Docker daemon' >&2; exit 1;;\n\
+             esac\n",
+            calls.display()
+        );
+        std::fs::write(dir.path().join("docker"), script).unwrap();
+        std::fs::set_permissions(dir.path().join("docker"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let prev = std::env::var_os("PATH").unwrap_or_default();
+        let mut path = std::ffi::OsString::from(dir.path());
+        path.push(":");
+        path.push(&prev);
+        // SAFETY: #[serial] callers; restored below.
+        unsafe { std::env::set_var("PATH", &path) };
+        let out = f(&calls);
+        unsafe { std::env::set_var("PATH", &prev) };
+        out
+    }
+
+    /// The `docker` CLI behind previews: `create` passes the spec's
+    /// arguments and names docker's error; `listeners` reads the
+    /// container's socket tables (none when it prints nothing); `start`
+    /// attaches, its output going to the log.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn the_docker_cli_is_driven_as_previews_need() {
+        let recipe = a_recipe(serde_json::json!({"schema_version": "1.0", "command": "npm run dev"}));
+        let mut spec = a_spec(&recipe, None);
+        let docker = Docker { image: Some("sha256:pinned".into()) };
+        let log = tempfile::NamedTempFile::new().unwrap();
+        with_fake_docker(|calls| {
+            docker.create(&spec).expect("created");
+            spec.name = "darkmux-preview-fail".into();
+            let err = docker.create(&spec).unwrap_err();
+            assert!(err.contains("docker create") && err.contains("no such image"), "{err}");
+            assert_eq!(docker.listeners("darkmux-preview-site").as_deref(), Some("0: 00000000:1004 00000000:0000 0A\n"));
+            assert_eq!(docker.listeners("darkmux-preview-quiet"), None, "nothing printed");
+            docker.start("darkmux-preview-site", log.path()).unwrap().wait().unwrap();
+            assert!(std::fs::read_to_string(log.path()).unwrap().contains("attached to darkmux-preview-site"));
+            let said = std::fs::read_to_string(calls).unwrap();
+            let expected = docker_create_args(&a_spec(&recipe, None)).join(" ");
+            assert!(said.starts_with(&expected), "create gets the spec's arguments: {said}");
+            assert!(said.contains("start -a darkmux-preview-site"), "{said}");
+        });
+    }
+
+    /// A pinned image is used as is; with none, the runtime image is
+    /// resolved as a dispatch resolves it, and a Docker that will not answer
+    /// says so. The user is the dispatch container's.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn the_preview_image_is_the_pinned_one_or_the_resolved_runtime_image() {
+        let user = darkmux_crew::dispatch_internal::runtime_container_user().unwrap();
+        with_fake_docker(|_| {
+            let pinned = Docker { image: Some("sha256:pinned".into()) }.image_and_user().unwrap();
+            assert_eq!(pinned, ("sha256:pinned".to_string(), user.clone()));
+            let err = Docker { image: None }.image_and_user().unwrap_err();
+            assert!(err.contains("docker version"), "{err}");
+        });
     }
 
     /// The values `docker run` is given for `flag` (`-v`, `-p`, `-e`, ...).

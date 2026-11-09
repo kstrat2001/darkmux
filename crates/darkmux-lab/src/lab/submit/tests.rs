@@ -1258,3 +1258,14 @@ fn a_provider_run_sends_its_served_model_and_effort_beside_a_local_run() {
     assert_eq!((here["hardware"].as_str(), here["servedModel"].as_str()), (Some("submitting-machine"), Some("m1")), "the namespace is darkmux's");
     assert!(here.get("effort").is_some_and(Value::is_null), "{here}");
 }
+
+/// The name git reads for a directory: the repository's own `user.name`
+/// when it sets one (beside whatever the machine's global config says).
+#[test]
+fn the_git_user_name_is_the_one_git_reads_there() {
+    let dir = tempfile::tempdir().unwrap();
+    darkmux_types::host_git::fixture::git(dir.path(), &["init", "-q"]);
+    darkmux_types::host_git::fixture::git(dir.path(), &["config", "user.name", "Repo Owner"]);
+    assert_eq!(git_user_name_in(dir.path()), Some("Repo Owner".to_string()));
+    assert_eq!(git_user_name_in(&dir.path().join("missing")), None, "git cannot run there");
+}

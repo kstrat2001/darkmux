@@ -308,3 +308,16 @@ fn an_inherited_git_config_does_not_hide_a_repo_filter() {
     assert!(status.is_some_and(|s| s.contains("a.txt")), "status runs");
     assert!(!f.clean_ran(), "the repository's clean filter ran: GIT_CONFIG hid it from the driver read");
 }
+
+/// `dir` names the directory each mode's command runs in.
+#[test]
+fn dir_is_where_each_mode_runs() {
+    for (host, want) in [
+        (HostGit::trusted("/repo"), "/repo"),
+        (HostGit::run_written("/repo/.git/worktrees/p1", "/wt/p1"), "/wt/p1"),
+        (HostGit::held_git_dir("/held.git"), "/held.git"),
+    ] {
+        assert_eq!(host.dir(), Path::new(want));
+        assert_eq!(host.command(&["status"]).get_current_dir(), Some(Path::new(want)));
+    }
+}

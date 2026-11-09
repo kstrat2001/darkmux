@@ -1324,7 +1324,10 @@ mod tests {
         fx(&src, &["remote", "add", "origin", DEAD_SSH_ORIGIN]);
         let global_marker = root.join("global-ssh-ran");
         let global = root.join("gitconfig");
-        std::fs::write(&global, format!("[core]\n\tsshCommand = touch '{}'; false\n", global_marker.display())).unwrap();
+        // Quoted: in a config file an unquoted `;` starts a comment, which
+        // left `touch '<marker>'` with git's ssh arguments after it, and GNU
+        // touch reads the `-p` among them as an option and touches nothing.
+        std::fs::write(&global, format!("[core]\n\tsshCommand = \"touch '{}'; false\"\n", global_marker.display())).unwrap();
         let prev = std::env::var_os("GIT_CONFIG_GLOBAL");
         // SAFETY: #[serial]; restored below.
         unsafe { std::env::set_var("GIT_CONFIG_GLOBAL", &global) };

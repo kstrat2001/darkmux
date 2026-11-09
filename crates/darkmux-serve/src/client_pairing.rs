@@ -300,13 +300,17 @@ impl ClientStore {
 
 /// Replaces the locked file's contents with `doc`, synced.
 fn rewrite(file: &mut std::fs::File, doc: &ClientsFile) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(doc)?;
+    let mut bytes = serde_json::to_vec_pretty(doc)?;
+    bytes.push(b'\n');
+    Ok(replace_contents(file, &bytes)?)
+}
+
+/// `file` holds exactly `bytes`, synced to disk.
+fn replace_contents(file: &mut std::fs::File, bytes: &[u8]) -> std::io::Result<()> {
     file.set_len(0)?;
     file.rewind()?;
-    file.write_all(&bytes)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    Ok(())
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 /// Parse the store's text: empty is an empty store; an unknown key, a wrong
@@ -2562,11 +2566,7 @@ fn clone_workspace(state: &ClientServerState, url: &str, normalized: &str, made:
         Ok(None) => {}
         Err(r) => return *r,
     }
-    let taken = |n: &str| {
-        std::fs::symlink_metadata(base.join(n)).is_ok()
-            || std::fs::symlink_metadata(base.join(format!(".{n}.partial"))).is_ok()
-    };
-    let Some(name) = ws::name_for(normalized, taken) else {
+    let Some(name) = ws::name_for(normalized, |n| name_taken(&base, n)) else {
         return err(StatusCode::CONFLICT, ClientCode::Conflict, "no free workspace name for this repo");
     };
     if let Err(r) = place_clone(state, url, normalized, made, &base, &name) {
@@ -2632,13 +2632,16 @@ fn template_workspace(
 /// clone's name counts as taken).
 fn free_project_name(base: &Path, bot: &str) -> Option<String> {
     use crate::client_workspace as ws;
-    let taken = |n: &str| {
-        std::fs::symlink_metadata(base.join(n)).is_ok()
-            || std::fs::symlink_metadata(base.join(format!(".{n}.partial"))).is_ok()
-    };
     std::iter::once(bot.to_string())
         .chain((2..100).map(|n| format!("{bot}-{n}")))
-        .find(|n| ws::valid_name(n) && !taken(n))
+        .find(|n| ws::valid_name(n) && !name_taken(base, n))
+}
+
+/// Whether workspace name `n` is taken under `base`: by a folder, or by a
+/// clone still in progress (its `.partial`).
+fn name_taken(base: &Path, n: &str) -> bool {
+    std::fs::symlink_metadata(base.join(n)).is_ok()
+        || std::fs::symlink_metadata(base.join(format!(".{n}.partial"))).is_ok()
 }
 
 /// The branch a project made from a template starts on.
@@ -2670,15 +2673,20 @@ fn start_fresh(base: &Path, name: &str, message: &str) -> Result<String, String>
     first_commit(dir, message)
 }
 
-/// Commits everything in the fresh project as its first commit; returns
-/// its SHA.
-fn first_commit(dir: &WorkCopy, message: &str) -> Result<String, String> {
-    // A Mac with no git identity yet can still commit here: this project
-    // gets its own, and the owner's takes over once there is one.
+/// A Mac with no git identity yet can still commit in a fresh project: it
+/// gets its own, and the owner's takes over once there is one.
+fn ensure_identity(dir: &WorkCopy) -> Result<(), String> {
     if git_line(dir, &["config", "user.email"]).unwrap_or_default().is_empty() {
         git_quiet(dir, &["config", "user.name", "darkmux"])?;
         git_quiet(dir, &["config", "user.email", "darkmux@localhost"])?;
     }
+    Ok(())
+}
+
+/// Commits everything in the fresh project as its first commit; returns
+/// its SHA.
+fn first_commit(dir: &WorkCopy, message: &str) -> Result<String, String> {
+    ensure_identity(dir)?;
     git_quiet(dir, &["add", "-A"])?;
     // (#3460 review) The recipe a preview of this project trusts is read
     // from this commit, so it goes in even when an ignore rule (the
@@ -4123,16 +4131,8 @@ impl HardKillTeardown for ProductionTeardown {
         terminal_in(&darkmux_flow::flows_dir(), &run.execution)
     }
     fn emit_cancelled(&self, run: &StartedRun) {
-        match cancelled_record(run) {
-            Ok(rec) => {
-                if let Err(e) = darkmux_flow::record(rec) {
-                    eprintln!(
-                        "darkmux client serve: writing the cancelled terminal for {}: {e:#}",
-                        run.execution
-                    );
-                }
-            }
-            Err(e) => eprintln!("darkmux client serve: {e}"),
+        if let Err(e) = write_cancelled(run, darkmux_flow::record) {
+            eprintln!("darkmux client serve: {e}");
         }
     }
     fn dispatch_error_code(&self, spec: &WorkSpec) -> Option<String> {
@@ -4201,6 +4201,16 @@ pub(crate) fn terminal_in(dir: &Path, execution: &str) -> bool {
 /// The execution's terminal: a `dispatch.error` (its action comes from the
 /// payload variant) at `Error`, `stop_reason: "cancelled"`, built through the
 /// same `build_dispatch_record` dispatch's own bookends use.
+/// Builds `run`'s cancelled terminal and hands it to `sink` (the flow
+/// stream, in production); why it could not, otherwise.
+pub(crate) fn write_cancelled(
+    run: &StartedRun,
+    sink: impl FnOnce(darkmux_flow::FlowRecord) -> anyhow::Result<()>,
+) -> Result<(), String> {
+    let rec = cancelled_record(run)?;
+    sink(rec).map_err(|e| format!("writing the cancelled terminal for {}: {e:#}", run.execution))
+}
+
 pub(crate) fn cancelled_record(run: &StartedRun) -> Result<darkmux_flow::FlowRecord, String> {
     let session =
         darkmux_types::session_id::SessionId::parse(&run.session).map_err(|e| e.to_string())?;
