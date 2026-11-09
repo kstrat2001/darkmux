@@ -429,8 +429,10 @@ impl Tensorfold {
     /// `port`, the model's `n_ctx` as `--context`, its `darkmux:` name,
     /// `host.docker.internal` allowed as a Host so a dispatch container can
     /// reach it, no update check), so darkmux's win wherever the engine takes
-    /// the last of a repeated flag. The `engine_args` darkmux sets are
-    /// refused before this is reached (`ProfileModel::engine_args_problem`).
+    /// the last of a repeated flag. Only the `engine_args` entries
+    /// `ProfileModel::engine_args_problem` names are refused before this is
+    /// reached; any other flag darkmux sets here may also appear among them,
+    /// ahead of darkmux's own.
     pub fn serve_argv(&self, port: u16, model: &darkmux_types::ProfileModel) -> Result<(Vec<String>, String)> {
         let n_ctx = model.require_n_ctx()?;
         let served_name = crate::ownership::namespaced_identifier(model);

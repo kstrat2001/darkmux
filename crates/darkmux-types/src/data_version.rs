@@ -59,8 +59,14 @@ pub const PREVIEW_RECIPE_SCHEMA_VERSION: &str = "1.0";
 pub const MISSION_SCHEMA_VERSION: &str = "1.0";
 /// A phase JSON.
 pub const PHASE_SCHEMA_VERSION: &str = "1.0";
-/// A task JSON.
-pub const TASK_SCHEMA_VERSION: &str = "1.0";
+/// A task JSON. 1.1 adds `branch` and `repo_root` (#3457): the branch and
+/// main repository a coder phase's worktree was made from, which `mission
+/// finalize` and `abort` tear it down by. Every save writes this marker, so a
+/// darkmux reading 1.0 (5.0 through 5.9) cannot read any task this one
+/// saved. Its callers skip a task they cannot read without saying so: it
+/// shows such a mission with no tasks, and its `mission abort` leaves the
+/// coder worktree and its branch for the operator to remove by hand.
+pub const TASK_SCHEMA_VERSION: &str = "1.1";
 /// A step JSON.
 pub const STEP_SCHEMA_VERSION: &str = "1.0";
 /// The `resume_origin` sidecar a resumed run writes.
@@ -257,10 +263,20 @@ pub const WORKSPACE_SPEC_SCHEMA_VERSION: &str = "1.0";
 /// 3.x document naming either now fails its gate, and `darkmux doctor` notes
 /// a user-tier config whose schema major is older than this build's.
 ///
+/// Bumped to **"4.1"** (#3461), additive: a `dispatch.internal` step's
+/// `config` gained `workdir_git_writable` (mount a `workdir` checkout's
+/// `.git` read-write; it is read-only by default). Since 4.0 a step's
+/// `config` is part of the shape the gate checks, so a key added there is a
+/// field of this document: a reader of 4.0 refuses a 4.1 document as written
+/// by a newer darkmux instead of naming the key a typo. The `mods.gate`
+/// step's `gate_image` and `gate_on_host` (#3177, darkmux 5.1) were added
+/// under 4.0 without a bump; 4.1 names them too. A 4.0 document means what it
+/// always did.
+///
 /// Bump discipline (see `CLAUDE.md`'s "Versioning" — same rule, different
 /// data shape): additive field/section → minor; rename/retype/removed
 /// field/new-required-field → major.
-pub const MISSION_CONFIG_SCHEMA: &str = "4.0";
+pub const MISSION_CONFIG_SCHEMA: &str = "4.1";
 
 /// The numeric components of a version written as `"2.1"`, `"1"` or the
 /// JSON number `1`; `None` for anything else.

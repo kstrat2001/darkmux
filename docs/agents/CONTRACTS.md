@@ -55,6 +55,18 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    actions (`OwnedTarget`). When user state blocks a need, darkmux surfaces a reason naming
    the blocking instance and suggests; it never touches. This supersedes the #408-derived
    preflight behavior of reusing/unloading foreign residents.
+
+   **Engine servers darkmux starts (#3448, #3453) own by record, not only by name.** A
+   Tensorfold server darkmux starts serves its model as `darkmux:<id>` (`--name`), as an LM
+   Studio load does. rec's Flint has no `--name`: every Flint server answers `flint`, so on
+   that one engine the wire name is `flint`, not `darkmux:<id>`, and the name proves nothing.
+   For both engines ownership is the server record darkmux writes when it starts one
+   (`~/.darkmux/run/engines/`: pid, process start stamp, command line, port): a server is
+   darkmux's only while that record matches the live process (a reused pid reads as stale),
+   and only such a server is evicted or stopped. Reusing one also needs it to run the
+   profile's exact command, answer under the served name and be what listens on the port. A
+   server darkmux did not start (rec's own, say) is user state: a dispatch is refused naming it
+   (`engine_in_use`, `port_in_use`), never stopped or adopted.
 5. **Schema versioning** — flow/rules/config/profiles data shapes change only through their
    documented semver rules. Flow-archive readers are lenient-on-read; user files follow
    contract 7.

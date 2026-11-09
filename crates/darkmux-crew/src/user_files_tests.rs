@@ -202,6 +202,23 @@ fn every_shipped_document_declares_its_schema_version() {
     check(UserFileKind::Rule, crate::rules::EMBEDDED_RULES);
 }
 
+/// A mission config that sets a `dispatch.internal` step's
+/// `workdir_git_writable` (#3461) declares the schema that names the key, and
+/// the gate passes it. A darkmux that reads an older schema refuses the
+/// document as written by a newer one, not over a typo.
+#[test]
+#[serial_test::serial]
+fn a_mission_config_declaring_the_schema_that_names_workdir_git_writable_passes() {
+    let state = IsolatedState::new();
+    let step = json!({"id": "s", "kind": "dispatch.internal",
+                      "config": {"role_id": "coder", "message": "m", "workdir_git_writable": true}});
+    let doc = json!({"id": "probe", "name": "Commit in place", "schema_version": "4.1",
+                     "phases": [{"id": "p", "tasks": [{"id": "t", "steps": [step]}]}]});
+    write(&state, "mission-configs", &doc);
+    assert_eq!(problems(UserFileKind::MissionConfig, Reach::Every), vec![]);
+    assert!(darkmux_types::data_version::newer(&doc, "4.0").is_some(), "a 4.0 reader refuses it as newer");
+}
+
 #[test]
 fn no_crew_file_object_accepts_keys_it_does_not_name() {
     assert_eq!(open_objects::<Role>(), Vec::<String>::new());
