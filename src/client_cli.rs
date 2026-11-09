@@ -68,15 +68,15 @@ fn describe(p: &PendingRequest, now: u64) -> String {
     )
 }
 
-/// What every paired app may run here: `clients.profiles`, else the role's
-/// own resolved profile.
+/// What every paired app may run here: `clients.profiles`, else any local
+/// profile.
 fn policy_line() -> String {
     match darkmux_types::config_access::clients_profiles() {
         Some(list) if list.is_empty() => {
             "apps may run on: nothing (clients.profiles is empty)".to_string()
         }
         Some(list) => format!("apps may run on: {} (clients.profiles)", list.join(", ")),
-        None => "apps may run on: each role's own profile (clients.profiles unset)".to_string(),
+        None => "apps may run on: any local profile, one whose work stays on this machine (clients.profiles unset)".to_string(),
     }
 }
 

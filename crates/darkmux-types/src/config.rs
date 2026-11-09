@@ -427,8 +427,10 @@ use std::path::Path;
 //           refuses a config carrying it.
 //   2.7 (client pairing, local prototype): additive `clients.profiles`
 //           (string list; `DARKMUX_CLIENTS_PROFILES`, comma-separated): the
-//           profiles a paired client app may run on. Absent = the role's own
-//           resolved profile only. An older binary refuses a config carrying it.
+//           profiles a paired client app may run on. Absent = any local
+//           profile (one whose work stays on this machine, as dispatch judges
+//           it); a hosted one only when listed. An older binary refuses a
+//           config carrying it.
 pub const CONFIG_SCHEMA_VERSION: &str = "2.7";
 
 /// A `config.json` key an older darkmux read (and `init` may have written)
@@ -1796,6 +1798,22 @@ pub struct RadioConfig {
     #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
+/// (CONFIG 2.7) What a paired client app (`darkmux client serve`) may run on
+/// this machine. A pairing records identity only; this block is the policy,
+/// read on every work request, so `darkmux config set clients.profiles ...`
+/// takes effect without a restart or a re-pair.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ClientsConfig {
+    /// The profile names a paired app's work may run on. Absent: any local
+    /// profile, one whose work stays on this machine as dispatch judges it
+    /// (LM Studio, or the `default_engine` on loopback); an omitted profile
+    /// is the role's own (`role_profiles.<role>`, else `default_profile`),
+    /// judged the same way. A hosted profile runs only when listed. An empty
+    /// list allows none. `darkmux config set clients.profiles <comma-separated-list>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub profiles: Option<Vec<String>>,
+    #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
 /// (#1685) The operator's own `gh` CLI credential gate — a **feature block
 /// gated by `enabled`**, same pattern as `RedisConfig`/`AuditConfig`.
 /// The allowlist a mission config's `cmd` field is checked against before
@@ -1829,21 +1847,6 @@ pub struct RadioConfig {
 /// EMPTY `allowed` list — darkmux ships no opinion about which verbs
 /// exist; the operator's own configs name their own verbs, and the
 /// operator opts each one in by listing it here. Fails closed on both
-/// (CONFIG 2.7) What a paired client app (`darkmux client serve`) may run on
-/// this machine. A pairing records identity only; this block is the policy,
-/// read on every work request, so `darkmux config set clients.profiles ...`
-/// takes effect without a restart or a re-pair.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct ClientsConfig {
-    /// The profile names a paired app's work may run on. Absent: only the
-    /// profile darkmux itself resolves for the requested role
-    /// (`role_profiles.<role>`, else `default_profile`), exactly as a bare
-    /// `darkmux dispatch <role>` would. An empty list allows none.
-    /// `darkmux config set clients.profiles <comma-separated-list>`.
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub profiles: Option<Vec<String>>,
-    #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
-}
-
 /// counts: `enabled: false` blocks every verb regardless of `allowed`, and
 /// a verb absent from `allowed` is blocked even with `enabled: true`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
@@ -2433,8 +2436,8 @@ impl DarkmuxConfig {
                 extras: Default::default(),
             }),
             // Deliberately NOT written: absent `clients.profiles` is a real
-            // behavior (a paired app runs only on the role's own resolved
-            // profile), not a value to default.
+            // behavior (a paired app may run on any local profile), not a
+            // value to default.
             clients: None,
             extras: Default::default(),
         }

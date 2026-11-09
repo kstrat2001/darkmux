@@ -768,6 +768,51 @@ fn tokens_are_32_random_bytes_hex() {
     assert_ne!(a, b);
 }
 
+// ─── The config gate ─────────────────────────────────────────────────────
+
+/// (review) `client serve` runs the config gate before it listens, like
+/// `darkmux serve`: a misspelled `clients.profile` refuses the start instead
+/// of reading as unset (which would allow every local profile).
+#[test]
+#[serial_test::serial]
+fn client_serve_refuses_to_start_on_a_misspelled_clients_setting() {
+    let cfg: darkmux_types::config::DarkmuxConfig =
+        serde_json::from_str(r#"{"clients": {"profile": ["fast"]}}"#).unwrap();
+    let guard = darkmux_types::config_access::set_config_for_test(cfg);
+    let e = preflight().expect_err("refused").to_string();
+    assert!(
+        e.contains("unknown key `clients.profile`") && e.contains("did you mean `clients.profiles`?"),
+        "{e}"
+    );
+    drop(guard);
+    let clean: darkmux_types::config::DarkmuxConfig =
+        serde_json::from_str(r#"{"clients": {"profiles": ["fast"]}}"#).unwrap();
+    let _guard = darkmux_types::config_access::set_config_for_test(clean);
+    assert!(preflight().is_ok());
+}
+
+/// The policy is read fresh on every request, through the same gate: a
+/// misspelling written while serving refuses work, never reads as unset.
+#[test]
+#[serial_test::serial]
+fn a_misspelled_policy_written_while_serving_refuses_work() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.json");
+    let read = |text: &str| {
+        std::fs::write(&path, text).unwrap();
+        with_env_vars(&[], || {
+            unsafe { std::env::remove_var("DARKMUX_CLIENTS_PROFILES") };
+            read_profiles_policy_at(&path)
+        })
+    };
+    let e = read(r#"{"clients": {"profile": ["fast"]}}"#).unwrap_err();
+    assert!(e.contains("clients.profile") && e.contains("refusing client work"), "{e}");
+    assert_eq!(read(r#"{"clients": {"profiles": ["fast"]}}"#), Ok(Some(vec!["fast".to_string()])));
+    assert_eq!(read(r#"{}"#), Ok(None));
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(read_profiles_policy_at(&path), Ok(None), "no file is unset");
+}
+
 // ─── Bind ────────────────────────────────────────────────────────────────
 
 #[test]

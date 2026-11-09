@@ -13017,6 +13017,9 @@ fn every_enum_setting_is_refused_by_every_cli_entry_point_that_consumes_it() {
                 // `fleet.identity.provider`) are covered in-process by
                 // darkmux-types' `the_serve_preflight_refuses_a_bad_fleet_listener_enum`.
                 Scope::Serve => continue,
+                // `client serve` binds a port too; no enum setting is
+                // scoped to it (its gate is the config.json key walk).
+                Scope::ClientServe => continue,
             };
             for args in cases {
                 let mut cmd = darkmux_std_cmd();

@@ -692,7 +692,8 @@ pub fn cmd_allowed(verb: &str) -> bool {
 /// The profiles a paired client app may run on, against `cfg`:
 /// `env(DARKMUX_CLIENTS_PROFILES)` (comma-separated, trimmed, empty entries
 /// dropped) > `cfg.clients.profiles` > `None`. `None` means no list: the
-/// listener allows only the profile darkmux resolves for the role. The `_in`
+/// listener allows any local profile (one whose work stays on this machine);
+/// a hosted one only when listed. The `_in`
 /// form exists because the listener reads `config.json` FRESH on every work
 /// request (the process-wide [`config`] tier is read once), the same way the
 /// fleet listener reads its allow-list.

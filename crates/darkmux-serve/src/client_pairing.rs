@@ -610,14 +610,34 @@ impl ClientServerState {
     }
 }
 
+/// The config gate `client serve` runs before it listens, the same one
+/// `darkmux serve` runs (`config_enum::preflight`, which walks `config.json`
+/// with the user-file key gate): a misspelled or wrong-typed key refuses the
+/// start, naming the key and the closest valid one.
+pub fn preflight() -> Result<()> {
+    darkmux_types::config_enum::preflight(darkmux_types::config_enum::Scope::ClientServe)
+        .map_err(|e| anyhow!("{e}"))
+}
+
 /// `clients.profiles` from `config.json` as it is NOW (the process-wide
 /// config tier is read once, and `config set` must take effect without a
 /// restart), env first. A missing file is "unset"; one that cannot be read or
 /// parsed refuses rather than falling back to a policy nobody wrote.
 fn read_profiles_policy() -> Result<Option<Vec<String>>, String> {
-    let path = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config;
-    let cfg = match std::fs::read_to_string(&path) {
+    read_profiles_policy_at(
+        &darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config,
+    )
+}
+
+/// [`read_profiles_policy`] against the config at `path`.
+pub(crate) fn read_profiles_policy_at(path: &Path) -> Result<Option<Vec<String>>, String> {
+    let cfg = match std::fs::read_to_string(path) {
         Ok(text) => {
+            // The same gate as the start's: a key written while serving is
+            // checked too, so a misspelling refuses instead of reading as unset.
+            if let Some(problem) = darkmux_types::user_files::config_check_text(path, &text).refusal {
+                return Err(format!("{problem}; refusing client work"));
+            }
             serde_json::from_str::<darkmux_types::config::DarkmuxConfig>(&text).map_err(|e| {
                 format!(
                     "{} does not parse ({e}); refusing client work",
@@ -655,6 +675,7 @@ pub async fn bind_listener(port: u16) -> std::io::Result<tokio::net::TcpListener
 
 /// Serve until Ctrl-C (blocking; builds its own runtime).
 pub fn run(port: u16) -> Result<()> {
+    preflight()?;
     let state = ClientServerState::production()?;
     // Refuse a store this binary cannot read before listening.
     state.store.read()?;
@@ -890,13 +911,12 @@ enum PollOutcome {
     Approved { client_name: String, token: String },
 }
 
-/// What a paired client may run, as it reads it: `{"profiles": [..] | null,
-/// "workspace": true}`. `profiles` is this machine's `clients.profiles`;
-/// `null` means unset, so each role runs on its own resolved profile.
+/// What a paired client may run, as it reads it: `{"profiles": [..] |
+/// "local", "workspace": true}`. `profiles` is this machine's
+/// `clients.profiles`, or `"local"` when it is unset: any profile whose work
+/// stays on this machine (the role's own included, judged the same way).
 /// `workspace` is always true: a `workdir` under the worktrees base is
 /// allowed to every paired client.
-/// What a paired app may run: the granted list, or `"local"` (any profile
-/// that runs on this machine) when `clients.profiles` is unset.
 fn scopes_json(policy: &Option<Vec<String>>) -> Value {
     match policy {
         Some(list) => serde_json::json!({"profiles": list, "workspace": true}),

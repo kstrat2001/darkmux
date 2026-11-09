@@ -151,11 +151,22 @@ pub enum Scope {
     /// its read posture and its fleet listener, so it refuses one that fails
     /// the schema before it binds anything.
     Serve,
+    /// `darkmux client serve`: the paired-app listener reads `config.json`
+    /// for `clients.profiles` (what an app may run), so it refuses one that
+    /// fails the schema (a misspelled `clients.profile` would otherwise read
+    /// as unset) before it listens.
+    ClientServe,
 }
 
 impl Scope {
-    pub const ALL: [Scope; 5] =
-        [Scope::Dispatch, Scope::MissionLaunch, Scope::LabRun, Scope::FleetSubmission, Scope::Serve];
+    pub const ALL: [Scope; 6] = [
+        Scope::Dispatch,
+        Scope::MissionLaunch,
+        Scope::LabRun,
+        Scope::FleetSubmission,
+        Scope::Serve,
+        Scope::ClientServe,
+    ];
 
     /// How the refusal names the entry point.
     pub fn label(self) -> &'static str {
@@ -165,6 +176,7 @@ impl Scope {
             Scope::LabRun => "lab run",
             Scope::FleetSubmission => "fleet work submission",
             Scope::Serve => "serve",
+            Scope::ClientServe => "client serve",
         }
     }
 }
