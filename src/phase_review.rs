@@ -16,8 +16,7 @@ use darkmux_flow::payload::{PhaseReviewVerdictPayload, ReviewVerdict};
 use darkmux_types::session_id::SessionId;
 use serde::Serialize;
 use serde_json::Value;
-use std::path::Path;
-use std::process::Command;
+use darkmux_types::host_git::HostGit;
 
 /// Build a `FlowRecord` for phase review verbs.
 #[allow(clippy::too_many_arguments)]
@@ -252,11 +251,8 @@ pub fn parse_signoff(input: &str) -> SignoffParse {
 /// --name-only <base>`. Returns 0 on any error (treated as "no files
 /// changed" — the empty-diff path short-circuits before this is called
 /// in practice, so the 0 fallback is only hit if `git` itself is missing).
-fn count_files_changed(path: &Path, base: &str) -> usize {
-    Command::new("git")
-        .args(["diff", "--name-only", base])
-        .current_dir(path)
-        .output()
+fn count_files_changed(git: &HostGit, base: &str) -> usize {
+    git.output(&["diff", "--name-only", base])
         .ok()
         .filter(|o| o.status.success())
         .map(|o| {
@@ -369,23 +365,26 @@ fn review_dispatch_opts(prompt: String, session_id: &SessionId) -> crate::crew::
     }
 }
 
-/// The code-review core (#1463): run the `code-reviewer` role against `path`'s
+/// The code-review core (#1463): run the `code-reviewer` role against `git`'s
 /// diff vs `base` and return the structured [`PhaseReviewOutput`] (verdict +
 /// findings). Does NOT print or map an exit code — callers decide how to
 /// surface it. The coder-phase pipeline's `MissionVerifyStepKind`
 /// (`src/coder_phase.rs`) consumes the struct directly for a colorized
 /// at-the-gate summary; there is no CLI verb over it (the `phase review` verb
 /// retired — the funnel, `mission launch review`, is the standalone review path).
+///
+/// (#3457) `git` names the tree: for the coder phase's worktree, which a run
+/// had mounted read-write, the git dir the main repository holds for it
+/// (`coder_phase::worktree_host_git`), so nothing the run left in the tree's
+/// `.git` is read.
 pub(crate) fn phase_review_output_at(
-    path: &Path,
+    git: &HostGit,
     base: Option<&str>,
     phase_id: Option<&str>,
 ) -> Result<PhaseReviewOutput> {
     // Capture branch name.
-    let branch = Command::new("git")
-        .args(["branch", "--show-current"])
-        .current_dir(path)
-        .output()
+    let branch = git
+        .output(&["branch", "--show-current"])
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| {
@@ -439,11 +438,7 @@ pub(crate) fn phase_review_output_at(
     // (the whole point of `phase review` is to review work before it ships,
     // which is by definition uncommitted at the moment of review).
     let base_ref = base.unwrap_or("main");
-    let diff_output = Command::new("git")
-        .args(["diff", base_ref])
-        .current_dir(path)
-        .output()
-        .context("running git diff")?;
+    let diff_output = git.output(&["diff", base_ref]).context("running git diff")?;
 
     let diff = String::from_utf8_lossy(&diff_output.stdout).to_string();
 
@@ -473,7 +468,7 @@ pub(crate) fn phase_review_output_at(
     }
 
     // Count changed files from diff stat.
-    let files_changed = count_files_changed(path, base_ref);
+    let files_changed = count_files_changed(git, base_ref);
 
     // Build reviewer prompt. `MAX_CHARS` is a byte budget (line.len() returns
     // bytes); for typical Rust + JSON diffs this is effectively chars, but
@@ -750,6 +745,25 @@ mod tests {
         }
     }
 
+    /// (#3457) The review reads the coder's worktree after a run had it
+    /// mounted read-write; the run replaced the `.git` pointer with a
+    /// directory whose config runs commands and whose HEAD names
+    /// `keep-me`. The review reads the real branch and runs none of them.
+    /// (`TouchOnly`: the diff stays empty, so no reviewer is dispatched.)
+    #[serial_test::serial]
+    #[test]
+    fn phase_review_reads_no_git_dir_the_run_planted() {
+        let _guard = FlowsDirGuard::new();
+        let f = darkmux_types::host_git::fixture::PlantedWorktree::new();
+        f.plant(darkmux_types::host_git::fixture::TreeChange::TouchOnly);
+        let git = HostGit::run_written(&f.admin, &f.wt);
+        let out = crate::phase_review::phase_review_output_at(&git, Some("main"), Some("66")).unwrap();
+        assert_eq!(out.diff_files_changed, 0);
+        assert_eq!(out.branch, "phase", "the branch came from the planted HEAD");
+        assert!(!f.fsmonitor_ran(), "the planted fsmonitor ran on the host");
+        assert!(!f.clean_ran(), "the planted clean filter ran on the host");
+    }
+
     #[serial_test::serial]
     #[test]
     fn review_start_record_has_review_category_and_frontier_tier() {
@@ -763,7 +777,7 @@ mod tests {
             .output()
             .ok();
 
-        crate::phase_review::phase_review_output_at(repo.path(), None, Some("66")).unwrap();
+        crate::phase_review::phase_review_output_at(&HostGit::run_written(repo.path().join(".git"), repo.path()), None, Some("66")).unwrap();
 
         // Read all jsonl files; expect 2 records (start + verdict).
         let files: Vec<_> = std::fs::read_dir(guard.path())
@@ -808,7 +822,7 @@ mod tests {
             .output()
             .ok();
 
-        crate::phase_review::phase_review_output_at(repo.path(), None, Some("66")).unwrap();
+        crate::phase_review::phase_review_output_at(&HostGit::run_written(repo.path().join(".git"), repo.path()), None, Some("66")).unwrap();
 
         let records = collect_records(guard.path());
         let verdict = records
@@ -882,7 +896,7 @@ mod tests {
             std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
         }
 
-        let result = crate::phase_review::phase_review_output_at(repo.path(), None, Some("66"));
+        let result = crate::phase_review::phase_review_output_at(&HostGit::run_written(repo.path().join(".git"), repo.path()), None, Some("66"));
 
         unsafe {
             match prev {
@@ -983,7 +997,7 @@ mod tests {
             .output()
             .ok();
 
-        crate::phase_review::phase_review_output_at(repo.path(), None, Some("66")).unwrap();
+        crate::phase_review::phase_review_output_at(&HostGit::run_written(repo.path().join(".git"), repo.path()), None, Some("66")).unwrap();
 
         let records = collect_records(guard.path());
         assert_eq!(records.len(), 2, "expected begin + verdict records only");

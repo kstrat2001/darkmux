@@ -3126,6 +3126,14 @@ fn build_launch_params(
         // renamed task in a copied config still receives its overrides.
         let coder_task = task_id_declaring_step_kind(config, "mission.coder");
         let verify_task = task_id_declaring_step_kind(config, "mission.verify");
+        // (#3457) The worktree task records the branch it creates, so
+        // finalize/abort delete that name and never read it back from the
+        // worktree's HEAD, which the run could repoint.
+        let worktree_task = task_id_declaring_step_kind(config, "mission.worktree");
+        let branch = collected.get("branch").and_then(|v| v.as_str()).map(String::from);
+        if let (Some(task), Some(branch)) = (worktree_task, branch) {
+            task_overrides.insert(task, TaskOverride { branch: Some(branch), ..Default::default() });
+        }
         if let Some(coder_task) = coder_task {
             if let Some(role) = role {
                 task_overrides.insert(
@@ -4942,6 +4950,7 @@ mod tests {
 
     fn staffed_task(id: &str, role_id: Option<&str>, profile_name: Option<&str>, step_ids: &[&str]) -> crew::types::Task {
         crew::types::Task {
+            branch: None,
             run_on: darkmux_crew::types::default_run_on(),
             id: id.into(),
             phase_id: "m-1-p".into(),
@@ -5213,6 +5222,7 @@ mod tests {
         .unwrap();
         let real_phase_ids: BTreeMap<String, String> = [("p".to_string(), "m-1-p".to_string())].into();
         let task = crew::types::Task {
+            branch: None,
             run_on: darkmux_crew::types::default_run_on(),
             id: "m-1-t".into(),
             phase_id: "m-1-p".into(),
@@ -5279,6 +5289,7 @@ mod tests {
         let cfg: mission_config::MissionConfig = serde_json::from_value(cfg_json).unwrap();
         let real_phase_ids: BTreeMap<String, String> = [("p".to_string(), "m-1-p".to_string())].into();
         let mk_task = |id: &str, step_id: &str| crew::types::Task {
+            branch: None,
             run_on: darkmux_crew::types::default_run_on(),
             id: id.into(),
             phase_id: "m-1-p".into(),
@@ -5368,6 +5379,7 @@ mod tests {
         // Only "live-task" was actually minted — "disabled-task" was pruned
         // before this point, matching real mint behavior (`prune.rs`).
         let tasks = vec![crew::types::Task {
+            branch: None,
             run_on: darkmux_crew::types::default_run_on(),
             id: "live-task".into(),
             phase_id: "m-1-p".into(),
@@ -7748,6 +7760,13 @@ mod tests {
             .expect("the task declaring `mission.verify` must receive the workdir override");
         assert_eq!(verify.workdir.as_deref(), Some(std::path::Path::new("/tmp/some-other-tree")));
 
+        // (#3457) The worktree task records the launch branch: the one name
+        // finalize/abort may force-delete.
+        collected.insert("branch".to_string(), serde_json::json!("feature/x"));
+        let params = build_launch_params(&cfg, &BTreeMap::new(), &collected);
+        let wt = params.task_overrides.get("wt").expect("the task declaring `mission.worktree` records the branch");
+        assert_eq!(wt.branch.as_deref(), Some("feature/x"));
+
         // And a graph with none of the coder-phase kinds still gets nothing.
         let plain = config_with_kind("something", "dispatch.internal");
         assert!(build_launch_params(&plain, &BTreeMap::new(), &collected).task_overrides.is_empty());
@@ -8214,6 +8233,7 @@ mod tests {
     /// [`build_envelope`] read.
     fn task_with_step(phase_real_id: &str, step_id: &str) -> crew::types::Task {
         crew::types::Task {
+            branch: None,
             run_on: darkmux_crew::types::default_run_on(),
             id: format!("{phase_real_id}-task"),
             phase_id: phase_real_id.to_string(),
@@ -9636,6 +9656,7 @@ mod tests {
         registry.register(Arc::new(coder_phase::MissionWorktreeStepKind)).unwrap();
 
         let task = crew::types::Task {
+            branch: None,
             run_on: darkmux_crew::types::default_run_on(),
             id: "t1".to_string(),
             phase_id: "p-test".to_string(),
@@ -10071,6 +10092,7 @@ mod tests {
         tasks_by_id.insert(
             "plan-task".to_string(),
             crew::types::Task {
+                branch: None,
                 id: "plan-task".to_string(),
                 phase_id: "plan-phase".to_string(),
                 description: String::new(),

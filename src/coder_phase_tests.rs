@@ -1,5 +1,6 @@
     use super::*;
     use crew::types::{NodeStatus, Phase, PhaseStatus, Task};
+    use std::process::Command;
 
     /// (#1402) `darkmux-serve`'s `mission_graph::mission_step_kind_display_name`
     /// is a STATIC literal table (that crate can't depend on this root
@@ -1168,6 +1169,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
     /// `mission.worktree`/`mission.coder`/`mission.verify` kinds).
     fn test_task(id: &str) -> Task {
         Task {
+            branch: None,
             run_on: darkmux_crew::types::default_run_on(),
             id: id.to_string(),
             phase_id: "s1".to_string(),
@@ -2321,18 +2323,63 @@ edit loop detected on src/widget.rs in an earlier dispatch
         std::fs::write(rp.join("f.txt"), "one").unwrap();
         git(rp, &["add", "."]);
         git(rp, &["commit", "-q", "-m", "work"]);
-        assert!(worktree_has_unsaved_work(rp), "committed but unpushed → unsaved");
+        assert!(worktree_has_unsaved_work(&darkmux_types::host_git::HostGit::run_written(rp.join(".git"), rp)), "committed but unpushed → unsaved");
 
         // 2. Push to a bare remote → nothing unpushed, clean tree → saved.
         let remote = tempfile::TempDir::new().unwrap();
         git(remote.path(), &["init", "-q", "--bare"]);
         git(rp, &["remote", "add", "origin", &remote.path().to_string_lossy()]);
         git(rp, &["push", "-q", "origin", "HEAD"]);
-        assert!(!worktree_has_unsaved_work(rp), "clean tree, everything pushed → saved");
+        assert!(!worktree_has_unsaved_work(&darkmux_types::host_git::HostGit::run_written(rp.join(".git"), rp)), "clean tree, everything pushed → saved");
 
         // 3. Uncommitted change → unsaved (dirty tree), even when pushed.
         std::fs::write(rp.join("f.txt"), "two").unwrap();
-        assert!(worktree_has_unsaved_work(rp), "uncommitted changes → unsaved");
+        assert!(worktree_has_unsaved_work(&darkmux_types::host_git::HostGit::run_written(rp.join(".git"), rp)), "uncommitted changes → unsaved");
+    }
+
+    // ── (#3457) host git never reads a git dir the run could write ──────────
+
+    use darkmux_types::host_git::fixture::{PlantedWorktree, TreeChange};
+
+    /// The coder's worktree was mounted read-write: the run replaced its
+    /// `.git` pointer with a directory whose config runs commands. finalize's
+    /// unsaved-work check still sees the real change, and runs none of them.
+    #[test]
+    fn unsaved_work_check_runs_nothing_a_run_planted() {
+        let f = PlantedWorktree::new();
+        f.plant(TreeChange::Content);
+        let git = worktree_host_git(&f.repo, &f.wt).expect("the main repo holds the worktree's git dir");
+        assert_eq!(git, darkmux_types::host_git::HostGit::run_written(&f.admin, &f.wt));
+        assert!(worktree_has_unsaved_work(&git), "a.txt changed: unsaved");
+        assert!(!f.fsmonitor_ran(), "the planted fsmonitor ran on the host");
+        assert!(!f.clean_ran(), "the planted clean filter ran on the host");
+    }
+
+    /// The run's `.git` names `keep-me` as HEAD. abort force-deletes the
+    /// branch darkmux recorded at launch (`phase`), never the one the
+    /// planted HEAD names, and runs nothing the run planted.
+    #[test]
+    #[serial_test::serial]
+    fn abort_deletes_the_recorded_branch_not_the_one_a_planted_head_names() {
+        let _g = CrewEnvGuard::new();
+        let f = PlantedWorktree::new();
+        let mid = "planted-head";
+        seed_finalize_mission(mid, &[("p1", PhaseStatus::Running)]);
+        let mut t = test_task("p1-worktree");
+        t.phase_id = "p1".to_string();
+        t.workdir = Some(f.wt.clone());
+        t.branch = Some("phase".to_string());
+        crew::lifecycle::save_task(mid, &t).unwrap();
+        f.plant(TreeChange::Content);
+
+        let m = crew::loader::load_missions().unwrap().into_iter().find(|m| m.id == mid).unwrap();
+        let p = phase("p1", mid, PhaseStatus::Running);
+        teardown_and_terminate_phase(Some(&f.repo), &m, &p, None, MissionTerminal::Abort);
+
+        assert!(f.branch_exists("keep-me"), "the planted HEAD chose the branch abort deleted");
+        assert!(!f.branch_exists("phase"), "the recorded branch is the one to delete");
+        assert!(!f.wt.exists(), "the worktree is torn down");
+        assert!(!f.anything_ran(), "a planted command ran on the host");
     }
 
     /// (#2869) The workspace is model-writable: a caution's file that the

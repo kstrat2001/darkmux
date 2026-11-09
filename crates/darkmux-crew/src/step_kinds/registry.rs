@@ -264,6 +264,7 @@ mod tests {
                 stop_reason: None,
             };
             let task = Task {
+                branch: None,
                 run_on: crate::types::default_run_on(),
                 id: "t1".to_string(),
                 phase_id: "p1".to_string(),

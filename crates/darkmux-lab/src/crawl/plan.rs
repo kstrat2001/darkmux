@@ -4091,6 +4091,7 @@ line two
             stop_reason: None,
         };
         let task = darkmux_crew::types::Task {
+            branch: None,
             id: "deliver".into(),
             phase_id: PHASE.into(),
             description: String::new(),

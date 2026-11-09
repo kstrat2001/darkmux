@@ -1726,6 +1726,7 @@ impl<T> WithContextStep<T> for Result<T> {
 /// Task-assignment-agnostic callers, not a production shape).
 fn synthetic_task(step: &Step) -> Task {
     Task {
+        branch: None,
         run_on: crate::types::default_run_on(),
         id: step.task_id.clone(),
         phase_id: String::new(),
@@ -1991,6 +1992,7 @@ mod tests {
     fn task_and_step(id: &str, deps: &[&str]) -> (Task, Step) {
         let step_id = format!("{id}-step");
         let task = Task {
+            branch: None,
             run_on: crate::types::default_run_on(),
             id: id.to_string(),
             phase_id: "p1".to_string(),
@@ -2484,6 +2486,7 @@ mod tests {
         // A two-step Task: step-0 -> step-1, positional order, no
         // `Task.depends_on` involved at all for the intra-task edge.
         let task = Task {
+            branch: None,
             run_on: crate::types::default_run_on(),
             id: "multi".to_string(),
             phase_id: "p1".to_string(),
@@ -2695,6 +2698,7 @@ mod tests {
     #[test]
     fn gather_inputs_later_step_keys_by_previous_same_task_step_id() {
         let task = Task {
+            branch: None,
             run_on: crate::types::default_run_on(),
             id: "multi".to_string(),
             phase_id: "p1".to_string(),
@@ -2753,6 +2757,7 @@ mod tests {
         step_a.output = Some("a's output".to_string());
 
         let task = Task {
+            branch: None,
             run_on: crate::types::default_run_on(),
             id: "multi".to_string(),
             phase_id: "p1".to_string(),

@@ -4386,6 +4386,7 @@ mod tests {
         running_phase.task_ids = vec!["t-crash".to_string()];
         crew::lifecycle::save_phase(&running_phase).unwrap();
         let task = crew::types::Task {
+            branch: None,
             run_on: crew::types::default_run_on(),
             id: "t-crash".to_string(),
             phase_id: "p-crash".to_string(),

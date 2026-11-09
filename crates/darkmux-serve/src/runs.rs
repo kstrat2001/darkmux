@@ -3571,6 +3571,7 @@ mod tests {
 
     fn minimal_task(id: &str, phase_id: &str, step_ids: Vec<String>, role_id: Option<&str>) -> Task {
         Task {
+            branch: None,
             run_on: darkmux_crew::types::default_run_on(),
             id: id.to_string(),
             phase_id: phase_id.to_string(),

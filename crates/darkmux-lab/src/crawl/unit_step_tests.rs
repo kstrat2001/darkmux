@@ -147,6 +147,7 @@ fn unit_session(rule: &str, unit: &str) -> String {
 
 fn unit_task() -> Task {
     Task {
+        branch: None,
         run_on: darkmux_crew::types::default_run_on(),
         id: "unit-task".into(),
         phase_id: PHASE.into(),
@@ -2272,6 +2273,7 @@ fn the_summary_names_the_rule_whose_plan_sites_step_errored() {
 
 fn graph_task(id: &str, step_id: &str, depends_on: &[&str]) -> Task {
     Task {
+        branch: None,
         run_on: darkmux_crew::types::default_run_on(),
         id: id.into(),
         phase_id: PHASE.into(),

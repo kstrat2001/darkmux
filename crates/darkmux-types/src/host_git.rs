@@ -206,6 +206,12 @@ fn prefixed(flag: &str, path: &Path) -> OsString {
     s
 }
 
+/// (#3457) The run's side, for host-git tests in every crate: a worktree
+/// whose `.git` was replaced by a directory that runs marker commands.
+#[cfg(any(test, feature = "test-support"))]
+#[path = "host_git_fixture.rs"]
+pub mod fixture;
+
 #[cfg(test)]
 #[path = "host_git_tests.rs"]
 mod tests;

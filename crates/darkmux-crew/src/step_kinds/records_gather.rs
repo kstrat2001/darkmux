@@ -735,6 +735,7 @@ mod tests {
 
     fn task() -> Task {
         Task {
+            branch: None,
             id: "deliver".into(),
             phase_id: PHASE.into(),
             description: String::new(),

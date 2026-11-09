@@ -104,6 +104,7 @@ fn step_with(config: Value) -> Step {
 
 fn empty_task() -> Task {
     Task {
+        branch: None,
         run_on: darkmux_crew::types::default_run_on(),
         id: "task-graph-001".to_string(),
         phase_id: "phase-graph".to_string(),

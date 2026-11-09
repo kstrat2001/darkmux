@@ -31,8 +31,8 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
+use darkmux_types::host_git::HostGit;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::crew;
 use crate::fleet;
@@ -108,9 +108,9 @@ pub(crate) fn emit_step_result(
 // (#1284 Packet 4a) `pub(crate)` — `mission_launch.rs`'s coder-phase
 // execution path resolves the SAME repo root the teardown verbs do.
 pub(crate) fn repo_root() -> Result<PathBuf> {
-    let out = Command::new("git")
-        .args(["worktree", "list", "--porcelain"])
-        .output()
+    let here = std::env::current_dir().context("reading the current directory")?;
+    let out = HostGit::trusted(here)
+        .output(&["worktree", "list", "--porcelain"])
         .context("running `git worktree list --porcelain`")?;
     if !out.status.success() {
         bail!(
@@ -356,17 +356,8 @@ fn add_worktree(repo_root: &Path, wt_path: &Path, branch: &str, base: &str) -> R
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating worktree parent dir {}", parent.display()))?;
     }
-    let out = Command::new("git")
-        .current_dir(repo_root)
-        .args([
-            "worktree",
-            "add",
-            "-b",
-            branch,
-            &wt_path.to_string_lossy(),
-            base,
-        ])
-        .output()
+    let out = HostGit::trusted(repo_root)
+        .output(&["worktree", "add", "-b", branch, &wt_path.to_string_lossy(), base])
         .context("running `git worktree add`")?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1072,7 +1063,12 @@ impl StepKind for MissionVerifyStepKind {
             style::header("▶ local QA: dispatching `code-reviewer` against the worktree diff…")
         );
 
-        match crate::phase_review::phase_review_output_at(&ctx.wt_path, Some(&ctx.base), Some(&ctx.phase_id)) {
+        // (#3457) The coder's run had the worktree mounted read-write, so git
+        // reads it only through the git dir the main repository holds.
+        let review = worktree_host_git(&ctx.repo_root, &ctx.wt_path).and_then(|git| {
+            crate::phase_review::phase_review_output_at(&git, Some(&ctx.base), Some(&ctx.phase_id))
+        });
+        match review {
             Ok(review) => {
                 print_review_summary(&review);
                 let verdict = review.verdict.to_string();
@@ -1136,6 +1132,85 @@ fn resolve_run_workdir(mission_id: &str, phase_id: &str, root: &Path) -> PathBuf
         .flatten()
         .find_map(|t| t.workdir)
         .unwrap_or_else(|| worktree_path(root, phase_id))
+}
+
+/// (#3457) The branch `mission launch coder-phase` created the phase's
+/// worktree on, as persisted on its worktree task (`Task.branch`). `None`
+/// for task records written before the field existed.
+fn resolve_run_branch(mission_id: &str, phase_id: &str) -> Option<String> {
+    crew::lifecycle::load_tasks_for_phase(mission_id, phase_id)
+        .ok()
+        .into_iter()
+        .flatten()
+        .find_map(|t| t.branch)
+}
+
+/// (#3457) The git directory of the linked worktree at `wt_path`, found from
+/// the MAIN repository: the `<common dir>/worktrees/<name>` entry whose
+/// `gitdir` back-link names `<wt_path>/.git`. Never read from the worktree's
+/// own `.git`: a dispatch had the worktree mounted read-write, and a run can
+/// replace that pointer file with a directory whose config runs commands or
+/// whose HEAD names another branch. The main working tree itself
+/// (`wt_path` = `repo_root`) is its common dir.
+pub(crate) fn worktree_admin_dir(repo_root: &Path, wt_path: &Path) -> Result<PathBuf> {
+    let common = HostGit::trusted(repo_root)
+        .stdout(&["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("`git rev-parse --git-common-dir` failed in {}", repo_root.display()))?;
+    let wt = wt_path.canonicalize().with_context(|| format!("resolving {}", wt_path.display()))?;
+    if repo_root.canonicalize().ok().as_deref() == Some(wt.as_path()) {
+        return Ok(common);
+    }
+    let want = wt.join(".git");
+    let entries = std::fs::read_dir(common.join("worktrees")).into_iter().flatten().flatten();
+    for admin in entries.map(|e| e.path()) {
+        if back_link(&admin).as_deref() == Some(want.as_path()) {
+            return Ok(admin);
+        }
+    }
+    bail!(
+        "{} has no worktree registered at {}, so darkmux will not run git there: its `.git` \
+         is whatever the run left in it",
+        repo_root.display(),
+        wt.display()
+    )
+}
+
+/// The `<admin>/gitdir` back-link of a worktree admin dir, as an absolute
+/// path with its directory part resolved and its last component (`.git`)
+/// NOT followed: a run may have replaced `.git` with a symlink.
+fn back_link(admin: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(admin.join("gitdir")).ok()?;
+    let link = PathBuf::from(text.trim_end_matches(['\n', '\r']));
+    // git 2.48's `worktree.useRelativePaths` writes it relative to `admin`.
+    let link = if link.is_relative() { admin.join(link) } else { link };
+    Some(link.parent()?.canonicalize().ok()?.join(link.file_name()?))
+}
+
+/// (#3457) The coder phase's worktree, for host git: the git dir the main
+/// repository holds for it plus the work tree, so git discovers nothing from
+/// what the run wrote. See [`worktree_admin_dir`].
+pub(crate) fn worktree_host_git(repo_root: &Path, wt_path: &Path) -> Result<HostGit> {
+    Ok(HostGit::run_written(worktree_admin_dir(repo_root, wt_path)?, wt_path))
+}
+
+/// (#3457) Rewrite `<wt_path>/.git` as the pointer file to `admin` that
+/// `git worktree add` wrote, replacing whatever a run left there (a
+/// directory, a symlink, a pointer elsewhere), so `git worktree remove`
+/// validates and tears the worktree down. Only called right before that
+/// removal. `remove_dir_all` does not follow symlinks.
+fn restore_worktree_pointer(wt_path: &Path, admin: &Path) -> std::io::Result<()> {
+    let dot_git = wt_path.join(".git");
+    let pointer = format!("gitdir: {}\n", admin.display());
+    match std::fs::symlink_metadata(&dot_git) {
+        Ok(m) if m.is_file() && std::fs::read_to_string(&dot_git).is_ok_and(|t| t == pointer) => return Ok(()),
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(&dot_git)?,
+        Ok(_) => std::fs::remove_file(&dot_git)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    std::fs::write(&dot_git, pointer)
 }
 
 /// (#1426 ship-4 / #1433) After the narrow single-phase `abort --phase` drives
@@ -1272,13 +1347,19 @@ fn teardown_and_terminate_phase(
         // the worktree is already gone or a task didn't record one.
         let wt_path = resolve_run_workdir(mission_id, &phase.id, root);
         let wt_exists = wt_path.exists();
-        // `Some` here means the branch came from a LIVE worktree — a REAL ref.
-        // The conventions fallback is only a DERIVED guess for a phase whose
-        // worktree is already gone (or was never launched at all).
-        let live_branch = worktree_branch(&wt_path);
-        let b = live_branch
+        // (#3457) `Some` here means the branch is the one darkmux recorded
+        // when it created the worktree — a REAL ref. Never read from the
+        // worktree's HEAD: the run had the worktree mounted read-write and
+        // could point its `.git` at a HEAD naming any branch in the repo.
+        // The conventions fallback is only a DERIVED guess, for a phase
+        // whose task records predate the field or that never launched.
+        let recorded_branch = resolve_run_branch(mission_id, &phase.id);
+        let b = recorded_branch
             .clone()
             .unwrap_or_else(|| conventions_branch(phase, mission, conv));
+        // The worktree's git dir, from the main repository (never from the
+        // worktree's own `.git`).
+        let admin = wt_exists.then(|| worktree_admin_dir(root, &wt_path));
 
         // (#1463) SUCCESS-path data-loss guard. `mission finalize` runs AFTER
         // the frontier orchestrator has committed + pushed the work by hand —
@@ -1290,8 +1371,17 @@ fn teardown_and_terminate_phase(
         // (surface-don't-block, #44). Only finalize (the SUCCESS terminal) is
         // guarded; `abort` is destroy-by-intent and tears down regardless.
         let unsaved = kind == MissionTerminal::Finalize
-            && wt_exists
-            && worktree_has_unsaved_work(&wt_path);
+            && match &admin {
+                Some(Ok(admin)) => worktree_has_unsaved_work(&HostGit::run_written(admin, &wt_path)),
+                // The repository has no record of this worktree, so darkmux
+                // cannot check it without reading what the run left there:
+                // treat it as unsaved and leave it in place.
+                Some(Err(e)) => {
+                    eprintln!("{}", style::warn(&format!("cannot check {} for unsaved work: {e:#}", wt_path.display())));
+                    true
+                }
+                None => false,
+            };
 
         if unsaved {
             eprintln!(
@@ -1312,11 +1402,14 @@ fn teardown_and_terminate_phase(
             // guard above already spared any UNSAVED tree). Best-effort: a
             // missing worktree is reported, never fatal.
             if wt_exists {
-                match Command::new("git")
-                    .current_dir(root)
-                    .args(["worktree", "remove", "--force", &wt_path.to_string_lossy()])
-                    .output()
-                {
+                // (#3457) `worktree remove` validates the `.git` pointer file;
+                // a run that replaced it would leave the worktree stuck.
+                if let Some(Ok(admin)) = &admin {
+                    if let Err(e) = restore_worktree_pointer(&wt_path, admin) {
+                        eprintln!("{}", style::warn(&format!("could not restore {}/.git: {e}", wt_path.display())));
+                    }
+                }
+                match HostGit::trusted(root).output(&["worktree", "remove", "--force", &wt_path.to_string_lossy()]) {
                     Ok(o) if o.status.success() => {
                         println!("{}", style::success(&format!("✓ removed worktree {}", wt_path.display())));
                     }
@@ -1335,17 +1428,13 @@ fn teardown_and_terminate_phase(
                 println!("{}", style::dim(&format!("worktree {} already gone", wt_path.display())));
             }
 
-            // (#1463) Only force-delete a branch we KNOW is real — one a live
-            // worktree reported, or one whose worktree still exists. A
+            // (#1463) Only force-delete a branch we KNOW is real — one darkmux
+            // recorded at launch, or one whose worktree still exists. A
             // never-launched Planned phase has only a DERIVED conventions name;
             // force-deleting that could blow away an unrelated branch that
             // merely matches the template, so it's left untouched.
-            if should_force_delete_branch(live_branch.is_some(), wt_exists) {
-                match Command::new("git")
-                    .current_dir(root)
-                    .args(["branch", "-D", &b])
-                    .output()
-                {
+            if should_force_delete_branch(recorded_branch.is_some(), wt_exists) {
+                match HostGit::trusted(root).output(&["branch", "-D", &b]) {
                     Ok(o) if o.status.success() => {
                         println!("{}", style::success(&format!("✓ deleted branch {b}")));
                     }
@@ -2847,13 +2936,13 @@ pub(crate) fn print_unverified_banner(failed: &[FailedExec]) {
 }
 
 /// (#1463) Whether a whole-mission teardown may force-delete a phase's branch.
-/// YES only when the name is backed by a real worktree — one a live worktree
-/// reported (`live_branch_present`), or one whose worktree still exists on disk
-/// (`wt_exists`). A never-launched Planned phase has only a DERIVED conventions
+/// YES only when the name is backed by a real worktree — one darkmux recorded
+/// when it created the worktree (`recorded_branch_present`, #3457), or one
+/// whose worktree still exists on disk (`wt_exists`). A never-launched Planned phase has only a DERIVED conventions
 /// name; force-deleting that could blow away an unrelated branch that merely
 /// matches the template, so the caller leaves it untouched. Pure, for testing.
-fn should_force_delete_branch(live_branch_present: bool, wt_exists: bool) -> bool {
-    live_branch_present || wt_exists
+fn should_force_delete_branch(recorded_branch_present: bool, wt_exists: bool) -> bool {
+    recorded_branch_present || wt_exists
 }
 
 /// (#1463) True when a worktree holds work the operator has not saved yet:
@@ -2865,16 +2954,14 @@ fn should_force_delete_branch(live_branch_present: bool, wt_exists: bool) -> boo
 /// Best-effort: any git error falls through to `false` (proceed with teardown),
 /// since the reliable signal (`status --porcelain`) rarely fails on a live
 /// worktree; the guard errs toward acting only on a POSITIVE unsaved reading.
-fn worktree_has_unsaved_work(wt_path: &Path) -> bool {
-    let git = |args: &[&str]| -> Option<String> {
-        Command::new("git")
-            .current_dir(wt_path)
-            .args(args)
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-    };
+///
+/// (#3457) `worktree` is [`worktree_host_git`]'s: the git dir the main repo
+/// holds, never the worktree's own `.git`. Uncommitted work inside a
+/// SUBMODULE of the worktree is not counted (`host_git::HARDENING_CONFIG`'s
+/// `diff.ignoreSubmodules=dirty`: checking it would run a child git in a
+/// directory the run wrote); a submodule whose recorded commit moved is.
+fn worktree_has_unsaved_work(worktree: &HostGit) -> bool {
+    let git = |args: &[&str]| worktree.stdout(args);
     // Uncommitted changes (staged, unstaged, or untracked).
     if let Some(out) = git(&["status", "--porcelain"]) {
         if !out.is_empty() {
@@ -2889,22 +2976,6 @@ fn worktree_has_unsaved_work(wt_path: &Path) -> bool {
         }
     }
     false
-}
-
-/// (#816) The branch a worktree is actually on (`git rev-parse
-/// --abbrev-ref HEAD`). None when the worktree is missing/unreadable or
-/// detached — callers fall back to the conventions-computed name.
-fn worktree_branch(wt_path: &Path) -> Option<String> {
-    let out = Command::new("git")
-        .current_dir(wt_path)
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let b = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if b.is_empty() || b == "HEAD" { None } else { Some(b) }
 }
 
 /// The coder's tokens: the dispatch's own fold of its trajectory, the one

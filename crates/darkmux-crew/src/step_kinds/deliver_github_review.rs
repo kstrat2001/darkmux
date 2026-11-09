@@ -2513,6 +2513,7 @@ mod tests {
             stop_reason: None,
         };
         let task = Task {
+            branch: None,
             run_on: crate::types::default_run_on(),
             id: "deliver-task".into(),
             phase_id: "p".into(),
@@ -2559,6 +2560,7 @@ mod tests {
             stop_reason: None,
         };
         let task = Task {
+            branch: None,
             run_on: crate::types::default_run_on(),
             id: "deliver-task".into(),
             phase_id: "p".into(),
@@ -3178,6 +3180,7 @@ mod tests {
             stop_reason: None,
         };
         let task = Task {
+            branch: None,
             run_on: crate::types::default_run_on(),
             id: "deliver-task".into(),
             phase_id: "p".into(),
@@ -3240,6 +3243,7 @@ mod tests {
             "emit": out_path.to_string_lossy(),
         });
         let task = Task {
+            branch: None,
             run_on: crate::types::default_run_on(),
             id: "deliver-task".into(),
             phase_id: "p".into(),
@@ -4076,6 +4080,7 @@ mod tests {
             stop_reason: None,
         };
         let task = Task {
+            branch: None,
             run_on: crate::types::default_run_on(),
             id: "deliver-task".into(),
             phase_id: "p".into(),

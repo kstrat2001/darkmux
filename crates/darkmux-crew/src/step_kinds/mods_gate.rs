@@ -974,6 +974,7 @@ mod tests {
 
     fn task() -> Task {
         Task {
+            branch: None,
             id: "create-mod-1".into(),
             phase_id: "p".into(),
             description: String::new(),
