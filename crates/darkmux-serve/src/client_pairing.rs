@@ -2017,10 +2017,32 @@ fn worktree_workspace(
     match add_bot_worktree(state, &source, git_ref, bot, &base.join(&name)) {
         Ok(added) => match record_worktree(&base, &name, &source, &common) {
             Ok(()) => created_worktree(state, &name, added.0, added.1),
-            Err(e) => internal(anyhow!(e)),
+            Err(e) => {
+                remove_worktree(&source, &base.join(&name), &added.2);
+                internal(anyhow!(e))
+            }
         },
         Err(r) => *r,
     }
+}
+
+/// Takes back a worktree darkmux added but could not record: the worktree
+/// (from the user's checkout, with its admin dir) and its `mux/` branch, so
+/// a retry never leaves an orphan behind.
+fn remove_worktree(source: &Path, dest: &Path, branch: &str) {
+    let in_checkout = |args: &[&str]| {
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(source)
+            .args(["-c", "core.hooksPath=/dev/null"])
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output();
+    };
+    in_checkout(&["worktree", "remove", "--force", &dest.to_string_lossy()]);
+    let _ = std::fs::remove_dir_all(dest);
+    in_checkout(&["worktree", "prune"]);
+    in_checkout(&["branch", "-D", branch]);
 }
 
 /// Records a new worktree workspace: the user's checkout it was made from,
@@ -2048,14 +2070,14 @@ fn reused_worktree(state: &ClientServerState, base: &Path, name: &str, source: &
 /// the remote's default branch as it is now, not from wherever the owner's
 /// checkout happens to be: the fetch moves remote-tracking refs only; the
 /// owner's branch, index and files are never touched. Returns where it
-/// started and the fetch's error, if any.
+/// started, the fetch's error if any, and the new branch.
 fn add_bot_worktree(
     state: &ClientServerState,
     source: &Path,
     git_ref: Option<&str>,
     bot: &str,
     dest: &Path,
-) -> Result<(String, Option<String>), Refused> {
+) -> Result<(String, Option<String>, String), Refused> {
     use crate::client_workspace as ws;
     let short = random_hex(3).map_err(|e| Box::new(internal(e)))?;
     let branch = format!("mux/{bot}-{short}");
@@ -2070,7 +2092,7 @@ fn add_bot_worktree(
             format!("adding a worktree of {}: {e}", source.display()),
         )
     })?;
-    Ok((start, fetch_error))
+    Ok((start, fetch_error, branch))
 }
 
 fn created_worktree(state: &ClientServerState, name: &str, start: String, fetch_error: Option<String>) -> Response {

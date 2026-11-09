@@ -129,7 +129,10 @@ pub fn worktree_admin_dir(work_tree: &Path, common: &Path) -> Result<PathBuf, St
         .strip_prefix("gitdir:")
         .ok_or("the new worktree's .git is not a gitdir pointer")?
         .trim();
-    let dir = PathBuf::from(pointer)
+    // A relative pointer (`worktree.useRelativePaths`) is relative to the
+    // worktree's own folder, never to this process's working directory.
+    let dir = work_tree
+        .join(pointer)
         .canonicalize()
         .map_err(|e| format!("resolving the new worktree's repository: {e}"))?;
     if !dir.starts_with(common.join("worktrees")) {
@@ -180,7 +183,11 @@ pub fn line(wc: &WorkCopy, args: &[&str]) -> Option<String> {
 
 /// [`command`] run to completion; its output, or git's error (every stderr
 /// line, so a failure names the file it failed on).
-pub fn run_or_why(wc: &WorkCopy, index: Option<&Path>, args: &[&str]) -> Result<std::process::Output, String> {
+pub fn run_or_why(
+    wc: &WorkCopy,
+    index: Option<&Path>,
+    args: &[&str],
+) -> Result<std::process::Output, String> {
     let out = command(wc, index)
         .args(args)
         .output()
@@ -189,8 +196,16 @@ pub fn run_or_why(wc: &WorkCopy, index: Option<&Path>, args: &[&str]) -> Result<
         return Ok(out);
     }
     let err = String::from_utf8_lossy(&out.stderr);
-    let lines: Vec<&str> = err.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-    Err(if lines.is_empty() { format!("git {} failed", args.join(" ")) } else { lines.join("; ") })
+    let lines: Vec<&str> = err
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    Err(if lines.is_empty() {
+        format!("git {} failed", args.join(" "))
+    } else {
+        lines.join("; ")
+    })
 }
 
 /// [`command`] for its effect; the last stderr line on failure.
@@ -228,4 +243,136 @@ pub fn common_of(git_dir: &Path) -> Option<PathBuf> {
     PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
         .canonicalize()
         .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    /// A checkout with one commit, and a worktree of it at `wt` made with
+    /// `extra` config.
+    fn checkout_with_worktree(extra: &[&str]) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        git(&src, &["init", "--quiet", "-b", "main"]);
+        std::fs::write(src.join("a"), "a").unwrap();
+        git(&src, &["add", "a"]);
+        git(&src, &["commit", "--quiet", "-m", "a"]);
+        let wt = tmp.path().join("ws");
+        let mut args: Vec<&str> = extra.to_vec();
+        let wt_s = wt.to_str().unwrap().to_string();
+        args.extend(["worktree", "add", "--quiet", "-b", "mux/t-1", &wt_s]);
+        git(&src, &args);
+        (tmp, src.join(".git").canonicalize().unwrap(), wt)
+    }
+
+    /// (review) A relative `gitdir:` pointer (`worktree.useRelativePaths`,
+    /// git 2.48+) is resolved against the worktree's own folder, not this
+    /// process's working directory.
+    #[test]
+    fn a_relative_worktree_pointer_resolves_against_the_worktree() {
+        let (_tmp, common, wt) = checkout_with_worktree(&["-c", "worktree.useRelativePaths=true"]);
+        let text = std::fs::read_to_string(wt.join(".git")).unwrap();
+        let pointer = text
+            .trim()
+            .strip_prefix("gitdir:")
+            .unwrap()
+            .trim()
+            .to_string();
+        // Older git writes an absolute pointer even when asked; write the
+        // relative one by hand then.
+        if Path::new(&pointer).is_absolute() {
+            let rel = format!(
+                "gitdir: ../src/.git/worktrees/{}\n",
+                wt.file_name().unwrap().to_str().unwrap()
+            );
+            std::fs::write(wt.join(".git"), rel).unwrap();
+        }
+        assert_eq!(
+            worktree_admin_dir(&wt, &common),
+            Ok(common.join("worktrees").join("ws"))
+        );
+    }
+
+    /// (review) The admin dir must be under the checkout's own
+    /// `<common>/worktrees`: a pointer anywhere else is refused.
+    #[test]
+    fn a_worktree_pointer_outside_the_checkouts_worktrees_is_refused() {
+        let (tmp, common, wt) = checkout_with_worktree(&[]);
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", elsewhere.display()),
+        )
+        .unwrap();
+        let e = worktree_admin_dir(&wt, &common).unwrap_err();
+        assert!(e.contains("is not under"), "{e}");
+    }
+
+    /// (review) A recorded repository inside the work tree (where a run can
+    /// write) is no repository for host git.
+    #[test]
+    fn a_recorded_repository_inside_the_work_tree_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, tree) = (tmp.path().join("base"), tmp.path().join("base/ws"));
+        std::fs::create_dir_all(tree.join(".git")).unwrap();
+        let outside = tmp.path().join("held");
+        std::fs::create_dir_all(&outside).unwrap();
+        record_git_dir(&base, "ws", &tree.join(".git")).unwrap();
+        assert_eq!(
+            work_copy_of(&base, "ws", &tree),
+            None,
+            "inside the work tree"
+        );
+        record_git_dir(&base, "ws", &outside).unwrap();
+        assert!(work_copy_of(&base, "ws", &tree).is_some(), "outside it");
+    }
+
+    /// (review) Every host git command turns `core.fsmonitor` off, so even a
+    /// setting darkmux did not expect to find (the operator's own) runs
+    /// nothing. Read off the built command, since the structural fix leaves
+    /// no repository a run controls for a test to plant one in.
+    #[test]
+    fn every_host_git_command_turns_off_the_program_running_settings() {
+        let wc = WorkCopy {
+            work_tree: PathBuf::from("/w"),
+            git_dir: PathBuf::from("/g"),
+        };
+        let cmd = command(&wc, None);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        for setting in [
+            "core.fsmonitor=false",
+            "core.hooksPath=/dev/null",
+            "commit.gpgsign=false",
+            "credential.helper=",
+        ] {
+            let at = args
+                .iter()
+                .position(|a| a == setting)
+                .unwrap_or_else(|| panic!("{setting} missing: {args:?}"));
+            assert_eq!(args[at - 1], "-c", "{args:?}");
+        }
+        assert_eq!(&args[..4], ["--git-dir", "/g", "--work-tree", "/w"]);
+        let nosystem = cmd
+            .get_envs()
+            .any(|(k, v)| k == "GIT_CONFIG_NOSYSTEM" && v == Some(std::ffi::OsStr::new("1")));
+        assert!(nosystem);
+    }
 }

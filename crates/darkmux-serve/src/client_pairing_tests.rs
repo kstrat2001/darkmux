@@ -2852,6 +2852,31 @@ async fn a_failed_snapshot_is_reported_never_read_as_no_changes() {
     assert!(e.contains("locked.txt"), "{v}");
 }
 
+/// (review) When the workspace cannot be recorded after `git worktree add`
+/// ran, the worktree and its `mux/` branch are taken back out: a retry
+/// never leaves an orphan behind.
+#[tokio::test]
+async fn a_worktree_that_cannot_be_recorded_is_removed_again() {
+    let h = harness();
+    let token = paired(&h).await;
+    let mine = h.dir.path().join("site");
+    fixture_repo(&mine);
+    // The record cannot be written: its name is taken by a folder.
+    let base = h.base.canonicalize().unwrap();
+    std::fs::create_dir_all(base.join(".site-b.gitdir")).unwrap();
+    let (code, v) = call(
+        &h,
+        post("/client/workspaces", Some(&token), serde_json::json!({"source_path": mine.to_str(), "bot": "b"})),
+    )
+    .await;
+    assert_eq!(code, 500, "{v}");
+    assert!(!base.join("site-b").exists(), "the worktree folder is gone");
+    let branches = run_git(Some(&mine), &["branch", "--list", "mux/*"]);
+    assert_eq!(branches, "", "no orphan branch");
+    let worktrees = run_git(Some(&mine), &["worktree", "list", "--porcelain"]);
+    assert_eq!(worktrees.matches("worktree ").count(), 1, "only the checkout itself: {worktrees}");
+}
+
 #[tokio::test]
 async fn a_finished_run_commits_exactly_its_files_to_the_branch() {
     let h = harness();
