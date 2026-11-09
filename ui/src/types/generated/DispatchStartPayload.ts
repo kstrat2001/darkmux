@@ -4,6 +4,7 @@ import type { DispatchRoleInputs } from "./DispatchRoleInputs";
 import type { PromptAdditions } from "./PromptAdditions";
 import type { RecordContext } from "./RecordContext";
 import type { RuntimeBounds } from "./RuntimeBounds";
+import type { WorkdirGitMount } from "./WorkdirGitMount";
 
 /**
  * A role execution began: the payload of `dispatch.start`. One type for every producer of the
@@ -107,4 +108,12 @@ prompt_additions?: PromptAdditions,
  * (#3363, flow 2.6.0) A lab dispatch's role and the hashes of what it
  * loaded. Absent on every other dispatch.
  */
-role?: DispatchRoleInputs, };
+role?: DispatchRoleInputs, 
+/**
+ * (#3461, flow 2.7.0) How the `--workdir` checkout's own `.git`
+ * directory was mounted. Absent when the workdir has none (no
+ * `--workdir`, a plain folder, a worktree's pointer file) or the whole
+ * workspace is read-only, and on every record before 2.7.0 (when such a
+ * `.git` was always read-write).
+ */
+workdir_git?: WorkdirGitMount, };

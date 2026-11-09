@@ -426,6 +426,7 @@ fn step_config(opts: &DispatchOpts) -> serde_json::Value {
         resume_from,
         timeout_override_seconds,
         workspace_read_only,
+        workdir_git_writable,
         // Carried on the Task, not the step config.
         role_id: _,
         profile_name: _,
@@ -503,6 +504,10 @@ fn step_config(opts: &DispatchOpts) -> serde_json::Value {
     // reads a missing key as the read-write default every other caller has.
     if *workspace_read_only {
         config["workspace_read_only"] = serde_json::Value::Bool(true);
+    }
+    // (#3461) `--workdir-git-writable`, the same way.
+    if *workdir_git_writable {
+        config["workdir_git_writable"] = serde_json::Value::Bool(true);
     }
     config
 }
@@ -601,6 +606,7 @@ mod tests {
 
     fn test_opts(role: &str, message: &str) -> DispatchOpts {
         DispatchOpts {
+            workdir_git_writable: false,
             finding_sites: None,
             // (#2914) Work never runs on the utility model.
             allow_utility_model: false,
@@ -1032,6 +1038,22 @@ mod tests {
             rebuilt_opts(&task, &step).workspace_read_only,
             "the flag must reach the DispatchOpts the step kind dispatches with"
         );
+    }
+
+    /// (#3461) `--workdir-git-writable` survives the crew-of-one hop the
+    /// same way.
+    #[serial_test::serial]
+    #[test]
+    fn build_graph_carries_workdir_git_writable_to_the_step_kind() {
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
+        let mut opts = test_opts("coder", "hi");
+        let (_, _, task, step) = build_graph(&opts, "dispatch-coder-1-abc");
+        let off = rebuilt_opts(&task, &step).workdir_git_writable;
+        assert!(!off, "off by default");
+        opts.workdir_git_writable = true;
+        let (_, _, task, step) = build_graph(&opts, "dispatch-coder-1-abc");
+        let on = rebuilt_opts(&task, &step).workdir_git_writable;
+        assert!(on, "the opt-in reaches the step kind");
     }
 
     #[serial_test::serial]

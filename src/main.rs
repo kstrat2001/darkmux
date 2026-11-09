@@ -204,6 +204,7 @@ fn run(cmd: Cmd) -> Result<i32> {
             timeout,
             workdir,
             workspace_read_only,
+            workdir_git_writable,
             skip_preflight,
             json,
             no_wait,
@@ -221,6 +222,7 @@ fn run(cmd: Cmd) -> Result<i32> {
             timeout,
             workdir,
             workspace_read_only,
+            workdir_git_writable,
             skip_preflight,
             json,
             no_wait,
@@ -984,6 +986,7 @@ struct DispatchInvocation {
     timeout: Option<u32>,
     workdir: Option<std::path::PathBuf>,
     workspace_read_only: bool,
+    workdir_git_writable: bool,
     skip_preflight: bool,
     json: bool,
     no_wait: bool,
@@ -1155,6 +1158,7 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         timeout,
         workdir,
         workspace_read_only,
+        workdir_git_writable,
         skip_preflight,
         json,
         no_wait,
@@ -1177,6 +1181,9 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
     let message = resolve_dispatch_message(&role, message, message_from_file, resume_from.is_some())?;
     let brief_refs = checked_brief_refs(&finding, &mod_key, machine.as_deref())?;
     let opts = crew::dispatch::DispatchOpts {
+        // (#3461) `--workdir-git-writable`: a `--workdir` checkout's own
+        // `.git` is read-only unless asked.
+        workdir_git_writable,
         finding_sites: None,
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,

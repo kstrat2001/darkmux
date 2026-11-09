@@ -829,6 +829,7 @@ impl StepKind for MissionCoderStepKind {
         let image = cfg.image;
 
         let opts = crew::dispatch::DispatchOpts {
+            workdir_git_writable: false,
             finding_sites: None,
             // (#2914) Work never runs on the utility model.
             allow_utility_model: false,

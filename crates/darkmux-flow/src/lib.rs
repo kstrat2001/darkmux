@@ -4081,7 +4081,8 @@ mod tests {
         //            (`source`: eval | builtin | legacy_root).
         //   2.7.0 — (#3448) additive: `dispatch.model.start` / `.loading` /
         //            `.ready` (`DispatchModelPayload`) and `dispatch.error`'s
-        //            `payload.code`.
+        //            `payload.code`, and (#3461) `dispatch.start`'s
+        //            `workdir_git`.
         //   2.0.0 — (4.0) MAJOR: one wire spelling per action, dotted on
         //            write; a retired spelling reads as an unknown action
         //            (5.0, #3036). Also drops

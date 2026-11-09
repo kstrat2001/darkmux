@@ -640,6 +640,7 @@ fn dispatch_opts(
     lab_inputs: darkmux_crew::dispatch::LabInputs,
 ) -> darkmux_crew::dispatch::DispatchOpts {
     darkmux_crew::dispatch::DispatchOpts {
+        workdir_git_writable: false,
         finding_sites: None,
         // (#2914) The lab benchmarks candidate utility models.
         allow_utility_model: true,

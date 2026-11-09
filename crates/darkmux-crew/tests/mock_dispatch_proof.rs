@@ -262,6 +262,7 @@ fn run_mock_dispatch(
     let session = darkmux_types::session_id::SessionId::adhoc(darkmux_types::session_id::RunId::standalone("test").unwrap(), "coder", format!("mock-model-proof-{}-{}", std::process::id(), port));
     let session_id = session.wire();
     let opts = DispatchOpts {
+        workdir_git_writable: false,
         finding_sites: None,
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,
@@ -519,6 +520,7 @@ fn real_container_dispatch_ends_alone_on_a_phase_stop_and_refuses_a_live_resume(
     );
     let session_id = session.wire();
     let opts = |session: darkmux_types::session_id::SessionId, resume: Option<PathBuf>, host_out: Option<PathBuf>| DispatchOpts {
+        workdir_git_writable: false,
         finding_sites: None,
         allow_utility_model: false,
         remote_origin: None,
@@ -964,6 +966,7 @@ fn run_mock_dispatch_with_timeout_override(
     );
     let session_id = session.wire();
     let opts = DispatchOpts {
+        workdir_git_writable: false,
         finding_sites: None,
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,

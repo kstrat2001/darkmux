@@ -73,6 +73,9 @@ pub struct DispatchInternalConfig {
     pub timeout_override_seconds: Option<Count>,
     /// Mount `/workspace` read-only (#3074).
     pub workspace_read_only: Option<Flag>,
+    /// (#3461) Mount a `workdir` checkout's own `.git` directory read-write
+    /// (it is read-only by default). For a role meant to commit in place.
+    pub workdir_git_writable: Option<Flag>,
 }
 
 impl ConfigRules for DispatchInternalConfig {

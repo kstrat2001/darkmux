@@ -110,6 +110,7 @@ fn load_owned(eval: &TempDir, role: &str) -> anyhow::Result<LabInputs> {
 /// A local dispatch with every optional input off.
 fn probe_opts() -> DispatchOpts {
     DispatchOpts {
+        workdir_git_writable: false,
         finding_sites: None,
         allow_utility_model: false,
         remote_origin: None,

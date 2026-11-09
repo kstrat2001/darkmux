@@ -28,9 +28,16 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.7.0";
 //           runs on; and `payload.code` on `dispatch.error` (`busy`,
 //           `wont_fit`, `model_start_failed`, `port_in_use`,
 //           `engine_unavailable`, and `engine_in_use` from #3453, unreleased
-//           with it). ADDITIVE: a reader that does not know
-//           the actions keeps them as unknown records, and `code` is absent
-//           on every record before 2.7.0.
+//           with it). Also `payload.workdir_git` on `dispatch.start`
+//           (`"read_only"` | `"read_write"`, from #3461, unreleased with
+//           it): how a `--workdir` checkout's own `.git` directory was
+//           mounted, read-only unless `--workdir-git-writable` (or a step's
+//           `workdir_git_writable`); absent when the workdir has no `.git`
+//           directory or the workspace is read-only. ADDITIVE: a reader that does not know
+//           the actions keeps them as unknown records, and `code` and
+//           `workdir_git` are absent on every record before 2.7.0 (when such
+//           a `.git` was always read-write); an unknown `workdir_git` value
+//           reads as absent.
 //   2.6.0 (#3363): `dispatch.start` gains `payload.system_sha256` (SHA-256 of
 //           the assembled system prompt, taken where `system_chars` is) and
 //           `payload.prompt_additions` (`{identity, workspace_notes,

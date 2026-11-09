@@ -406,6 +406,7 @@ fn session() -> SessionId {
 
 fn opts_with(profiles: &Path) -> DispatchOpts {
     DispatchOpts {
+        workdir_git_writable: false,
         finding_sites: None,
         allow_utility_model: false,
         remote_origin: None,

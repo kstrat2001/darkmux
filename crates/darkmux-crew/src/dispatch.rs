@@ -209,6 +209,17 @@ pub struct DispatchOpts {
     /// (`dispatch_internal::dispatch`) checks the value against the
     /// checkpoint's origin in exactly one place.
     pub workspace_read_only: bool,
+    /// (#3461) Mount a `--workdir` checkout's own `.git` directory
+    /// read-write. By default it is mounted read-only over the writable
+    /// workspace, so a run can change the work tree but not the repository's
+    /// config and hooks, which git run on the host afterwards would honor.
+    /// A role meant to commit in a plain checkout needs this. A worktree's
+    /// `.git` pointer file (the coder phase's shape) is unaffected, as is a
+    /// read-only workspace. `darkmux dispatch --workdir-git-writable`, or a
+    /// `dispatch.internal` step's `workdir_git_writable`. Recorded in
+    /// `dispatch.start` (`workdir_git`), and a resume may not grant it when
+    /// the run that wrote the checkpoint lacked it.
+    pub workdir_git_writable: bool,
     /// (#1959 flow-record vocabulary retirement) Provenance the runtime
     /// itself has no concept of — merged under `payload.context` on EVERY
     /// record this dispatch's flow-record surface emits: the `dispatch

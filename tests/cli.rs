@@ -3605,7 +3605,68 @@ fn dispatch_host_side_unset_compactor_disclosure_fires_on_the_local_path() {
         );
 }
 
-/// (#3207) A utility binding on an UNMANAGED endpoint compacts there: the
+/// (#3461) Through the real binary, a `--workdir` checkout whose `.git` is a
+/// real directory gets that `.git` bound read-only over the writable
+/// workspace, and `dispatch.start` says so; `--workdir-git-writable` binds
+/// none and says `read_write`. The fake `docker` records the argv.
+#[test]
+fn a_workdir_checkouts_git_dir_is_mounted_read_only_unless_opted_in() {
+    for writable in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let profiles_path = tmp.path().join("profiles.json");
+        fs::write(
+            &profiles_path,
+            r#"{"profiles":{"fast":{"models":[{"id":"model-a","n_ctx":32000}]}},"default_profile":"fast"}"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("lms-ps.json"),
+            r#"[{"identifier":"darkmux:model-a","modelKey":"model-a","status":"loaded","sizeBytes":1000000000,"contextLength":32000}]"#,
+        )
+        .unwrap();
+        let checkout = tmp.path().join("checkout");
+        fs::create_dir_all(checkout.join(".git")).unwrap();
+        let checkout = checkout.canonicalize().unwrap();
+        let flows = tmp.path().join("flows");
+        let (fake_bin, docker_log) =
+            fake_docker_for_runtime_image(tmp.path(), &[("darkmux-runtime:latest", env!("CARGO_PKG_VERSION"))]);
+        let real_path = std::env::var("PATH").unwrap_or_default();
+        let workdir = checkout.to_str().unwrap();
+        let mut args = vec!["dispatch", "coder", "--skip-preflight", "--workdir", workdir];
+        if writable {
+            args.push("--workdir-git-writable");
+        }
+        args.push("smoke");
+        darkmux_cmd()
+            .env("DARKMUX_PROFILES", &profiles_path)
+            .env("DARKMUX_LMS_BIN", fake_bin.join("lms"))
+            .env("DARKMUX_FLOWS_DIR", &flows)
+            .env("DARKMUX_REDIS_URL", "")
+            .env("FAKE_DOCKER_STATE_DIR", tmp.path())
+            .env("PATH", format!("{}:{}:{real_path}", fake_bin.display(), docker_shim_dir().display()))
+            .args(&args)
+            .output()
+            .expect("darkmux runs");
+        let log = fs::read_to_string(&docker_log).unwrap_or_default();
+        let run = &log[log.find("run --rm").unwrap_or_else(|| panic!("no `docker run` in {log}"))..];
+        let bind = format!("{}/.git:/workspace/.git:ro", checkout.display());
+        assert_eq!(run.contains(&bind), !writable, "writable={writable}: {run}");
+        let mut start = None;
+        for entry in fs::read_dir(&flows).unwrap() {
+            for line in fs::read_to_string(entry.unwrap().path()).unwrap_or_default().lines() {
+                let Ok(rec) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+                if rec["action"] == "dispatch.start" {
+                    start = Some(rec);
+                }
+            }
+        }
+        let start = start.expect("a `dispatch.start` record");
+        let want = if writable { "read_write" } else { "read_only" };
+        assert_eq!(start["payload"]["workdir_git"], want, "{start}");
+    }
+}
+
+/// (#3207) A utility binding on an UNMANAGED endpoint compacts there: the/// (#3207) A utility binding on an UNMANAGED endpoint compacts there: the
 /// container's compactor gets the bare id, the endpoint's chat URL (as the
 /// container reaches this machine) and its dialect, and darkmux never asks
 /// `lms` about the utility model (no load, no `ps` match, no eject). The work

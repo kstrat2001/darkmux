@@ -1356,6 +1356,7 @@ impl StepKind for DispatchUnitStepKind {
             };
             let started = std::time::Instant::now();
             let opts = DispatchOpts {
+                workdir_git_writable: false,
                 // (#2265, 5.0) The unit's planned spans go to the tailer for
                 // the FINDINGS only. In `record_context` they would ride
                 // every flow record of the dispatch.
