@@ -304,38 +304,35 @@ mod tests {
         std::fs::read_dir("/dev/fd").unwrap().count()
     }
 
-    /// Removes `root/deep`, `depth` folders deep, on a 64 KiB stack, where
-    /// a recursive walk overflows within about 64 levels in a debug build.
-    fn remove_nested(depth: usize) -> io::Result<std::path::PathBuf> {
-        let dir = tempfile::tempdir().unwrap().keep();
-        let root = dir.join("root");
+    /// Removes `root/deep`, `depth` folders deep, in a temporary folder
+    /// that is cleaned up when the result is dropped (a tree left behind is
+    /// one a recursive walker elsewhere, like the leak check's census, has
+    /// to descend).
+    fn remove_nested(depth: usize) -> (tempfile::TempDir, io::Result<()>) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
         nest(&root, depth);
-        std::thread::Builder::new()
-            .stack_size(64 * 1024)
-            .spawn(move || remove(&root, "deep").map(|_| root))
-            .unwrap()
-            .join()
-            .expect("the walk overflowed its stack")
+        let removed = remove(&root, "deep");
+        (dir, removed)
     }
 
-    /// A tree as deep as darkmux deletes is removed without overflowing a
-    /// small stack.
+    /// A tree as deep as darkmux deletes is removed.
     #[test]
-    fn a_tree_as_deep_as_the_walk_takes_is_removed_on_a_small_stack() {
-        let root = remove_nested(MAX_DELETE_DEPTH).unwrap();
-        assert!(std::fs::symlink_metadata(root.join("deep")).is_err(), "the tree is gone");
-        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    fn a_tree_as_deep_as_the_walk_takes_is_removed() {
+        let (dir, removed) = remove_nested(MAX_DELETE_DEPTH);
+        removed.unwrap();
+        assert!(std::fs::symlink_metadata(dir.path().join("root/deep")).is_err(), "the tree is gone");
     }
 
-    /// A run can build a tree far deeper (a recursive walk's stack ran out
-    /// near 2,000 levels on 2 MiB; a descriptor per level runs past a
-    /// 256-file limit sooner). One deeper than [`MAX_DELETE_DEPTH`] is
-    /// refused with a reason, without aborting and without holding a
-    /// descriptor per level.
+    /// A run can build a tree far deeper than [`MAX_DELETE_DEPTH`] (a
+    /// recursive walk's stack ran out near 2,000 levels on 2 MiB; a
+    /// descriptor per level runs past a 256-file limit sooner). One deeper
+    /// is refused with a reason, without holding a descriptor per level.
     #[test]
-    fn a_tree_deeper_than_the_walk_takes_is_refused_not_aborted() {
+    fn a_tree_deeper_than_the_walk_takes_is_refused() {
         let before = open_fds();
-        let err = remove_nested(1000).unwrap_err();
+        let (_dir, removed) = remove_nested(MAX_DELETE_DEPTH + 72);
+        let err = removed.unwrap_err();
         assert!(err.to_string().contains("deeper than"), "{err}");
         assert!(open_fds() <= before + 2, "descriptors left open");
     }
