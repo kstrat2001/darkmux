@@ -308,7 +308,11 @@ fn wait_ready(spec: &ServerSpec, dirs: &Dirs, rec: &EngineRecord, bounds: Bounds
             return Ok(());
         }
         if began.elapsed() >= bounds.start {
-            return Err(format!("it did not answer within {} s", bounds.start.as_secs()));
+            return Err(format!(
+                "it did not answer within {} s{}",
+                bounds.start.as_secs(),
+                log_tail(&dirs.log_for(&spec.endpoint))
+            ));
         }
         if last_beat.elapsed() >= Duration::from_secs(10) {
             last_beat = Instant::now();
