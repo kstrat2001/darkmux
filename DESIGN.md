@@ -687,6 +687,8 @@ darkmux dispatch <role> "<message>" --profile <profile> [--json]
 darkmux dispatch <role> "<message>" --profile <profile>@<machine>   # on another fleet machine
 ```
 
+**The CLI is the app interface (operator, 2026-11-09).** An app runs `darkmux` on its own machine and reads `--json`; for a profile on another machine it uses `@<machine>`, so the fleet token stays in darkmux's Keychain item and never reaches the app. Calling `POST /fleet/work` directly would put that shared token in the app; it waits for a need and a per-client token.
+
 Missions name profiles the same way. An app never starts, stops or addresses an engine server, and never sends to the server's port itself: darkmux owns that port and may stop or restart the server between dispatches.
 
 ### What the operator declares once
