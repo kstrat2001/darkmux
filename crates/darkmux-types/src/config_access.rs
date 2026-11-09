@@ -734,6 +734,26 @@ pub fn clients_preview_enabled_in(cfg: &DarkmuxConfig) -> bool {
     }
     cfg.clients.as_ref().and_then(|c| c.preview.as_ref()).and_then(|p| p.enabled).unwrap_or(false)
 }
+/// The built-in `clients.preview.idle_minutes`.
+pub const CLIENTS_PREVIEW_IDLE_MINUTES_DEFAULT: u64 = 15;
+/// (#3459) How many minutes a live preview may go without an app asking
+/// about it (a start or a status) before `client serve` stops it, against
+/// `cfg`: `env(DARKMUX_CLIENTS_PREVIEW_IDLE_MINUTES)` >
+/// `cfg.clients.preview.idle_minutes` > 15. `0` means never. Read fresh by
+/// each idle check, so `darkmux config set` applies without a restart.
+pub fn clients_preview_idle_minutes_in(cfg: &DarkmuxConfig) -> u64 {
+    let written = cfg
+        .clients
+        .as_ref()
+        .and_then(|c| c.preview.as_ref())
+        .and_then(|p| p.idle_minutes);
+    pick_parsed(
+        "DARKMUX_CLIENTS_PREVIEW_IDLE_MINUTES",
+        written,
+        Some(CLIENTS_PREVIEW_IDLE_MINUTES_DEFAULT),
+    )
+    .unwrap_or(CLIENTS_PREVIEW_IDLE_MINUTES_DEFAULT)
+}
 /// [`clients_profiles_in`] against this process's config tier.
 pub fn clients_profiles() -> Option<Vec<String>> {
     clients_profiles_in(config())
@@ -4290,6 +4310,43 @@ mod tests {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_CMD_ALLOWED", v),
                 None => std::env::remove_var("DARKMUX_CMD_ALLOWED"),
+            }
+        }
+    }
+
+    /// (#3459) How long a preview nobody asks about runs:
+    /// `env(DARKMUX_CLIENTS_PREVIEW_IDLE_MINUTES)` > config > 15, and `0`
+    /// is kept as written (never), not read as unset.
+    #[serial_test::serial]
+    #[test]
+    fn clients_preview_idle_minutes_is_env_then_config_then_15() {
+        let key = "DARKMUX_CLIENTS_PREVIEW_IDLE_MINUTES";
+        let prev = std::env::var(key).ok();
+        let with = |m: u64| crate::config::DarkmuxConfig {
+            clients: Some(crate::config::ClientsConfig {
+                preview: Some(crate::config::ClientsPreviewConfig {
+                    idle_minutes: Some(m),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        unsafe {
+            std::env::remove_var(key);
+        }
+        let read = |cfg: &crate::config::DarkmuxConfig| clients_preview_idle_minutes_in(cfg);
+        assert_eq!(read(&Default::default()), 15, "built-in default");
+        assert_eq!(read(&with(40)), 40, "config tier");
+        assert_eq!(read(&with(0)), 0, "0 is never, as written");
+        unsafe {
+            std::env::set_var(key, "5");
+        }
+        assert_eq!(read(&with(40)), 5, "env wins");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
             }
         }
     }

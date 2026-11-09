@@ -542,6 +542,8 @@ pub type PathSource = Arc<dyn Fn() -> Result<PathBuf, String> + Send + Sync>;
 pub type PathAction = Arc<dyn Fn(&Path) -> Result<(), String> + Send + Sync>;
 /// `clients.preview.enabled`, read per request.
 pub type PreviewSwitch = Arc<dyn Fn() -> Result<bool, String> + Send + Sync>;
+/// `clients.preview.idle_minutes`, read per idle check.
+pub type PreviewMinutes = Arc<dyn Fn() -> Result<u64, String> + Send + Sync>;
 /// Runs one role execution, blocking.
 pub type Execute = Arc<dyn Fn(WorkSpec, Arc<CancelFlag>) -> Result<Value, RunError> + Send + Sync>;
 
@@ -600,6 +602,9 @@ pub struct ClientServerState {
     /// This machine's `clients.preview.enabled`, read per request (`Err`:
     /// unreadable, so previews are refused).
     pub preview_enabled: PreviewSwitch,
+    /// This machine's `clients.preview.idle_minutes`, read at every idle
+    /// check (`Err`: unreadable, so that check stops nothing).
+    pub preview_idle_minutes: PreviewMinutes,
 }
 
 impl ClientServerState {
@@ -658,6 +663,7 @@ impl ClientServerState {
             previews: Arc::new(crate::client_preview::Previews::production()),
             bound: None,
             preview_enabled: Arc::new(read_preview_enabled),
+            preview_idle_minutes: Arc::new(read_preview_idle_minutes),
         })
     }
 }
@@ -697,6 +703,20 @@ fn read_preview_enabled() -> Result<bool, String> {
 /// [`read_preview_enabled`] against the config at `path`.
 pub(crate) fn read_preview_enabled_at(path: &Path) -> Result<bool, String> {
     read_config_at(path).map(|cfg| darkmux_types::config_access::clients_preview_enabled_in(&cfg))
+}
+
+/// `clients.preview.idle_minutes` from `config.json` as it is now, env
+/// first; absent is 15.
+fn read_preview_idle_minutes() -> Result<u64, String> {
+    read_preview_idle_minutes_at(
+        &darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config,
+    )
+}
+
+/// [`read_preview_idle_minutes`] against the config at `path`.
+pub(crate) fn read_preview_idle_minutes_at(path: &Path) -> Result<u64, String> {
+    read_config_at(path)
+        .map(|cfg| darkmux_types::config_access::clients_preview_idle_minutes_in(&cfg))
 }
 
 /// `config.json` at `path`, read now through the config gate (a missing file
@@ -767,15 +787,24 @@ pub fn run(port: u16) -> Result<()> {
         );
         let mut state = state;
         state.bound = Some(listener.local_addr()?);
-        axum::serve(
+        // (#3459) Previews no app asks about any more are stopped.
+        let idle_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _idle_check = spawn_preview_idle_check(
+            state.clone(),
+            PREVIEW_IDLE_CHECK_INTERVAL,
+            idle_stop.clone(),
+        );
+        let served = axum::serve(
             listener,
             router(state).into_make_service_with_connect_info::<SocketAddr>(),
         )
-            .with_graceful_shutdown(async {
-                let _ = tokio::signal::ctrl_c().await;
-            })
-            .await
-            .context("serving")
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await
+        .context("serving");
+        idle_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        served
     })
 }
 
@@ -2284,6 +2313,72 @@ impl PreviewLogSeen {
 
 static PREVIEW_LOG_SEEN: std::sync::LazyLock<PreviewLogSeen> =
     std::sync::LazyLock::new(PreviewLogSeen::default);
+
+/// How often `client serve` looks for previews no app has asked about.
+pub(crate) const PREVIEW_IDLE_CHECK_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
+/// (#3459) One idle check: reads `clients.preview.idle_minutes` now (so a
+/// `darkmux config set` applies at the next check) and stops every preview
+/// no app has asked about for that long. Returns the serve-log lines.
+/// `skipped` carries the last "could not read the setting" reason between
+/// checks, so an unreadable config is said once, not every minute; while
+/// it is unreadable nothing is stopped on a guessed value.
+pub fn preview_idle_tick(state: &ClientServerState, skipped: &mut Option<String>) -> Vec<String> {
+    let minutes = match (state.preview_idle_minutes)() {
+        Ok(m) => m,
+        Err(e) => {
+            if skipped.as_deref() == Some(e.as_str()) {
+                return Vec::new();
+            }
+            let line = format!(
+                "darkmux client serve: preview idle check skipped, stopping nothing: clients.preview.idle_minutes \
+                 could not be read ({e})"
+            );
+            *skipped = Some(e);
+            return vec![line];
+        }
+    };
+    *skipped = None;
+    state
+        .previews
+        .stop_idle(minutes)
+        .into_iter()
+        .map(|name| {
+            preview_log_line(
+                &name,
+                "idle",
+                &format!("stopped: no app asked about it for {minutes} minutes (clients.preview.idle_minutes)"),
+            )
+        })
+        .collect()
+}
+
+/// Starts the idle check's thread: every `interval` until `stop` is set.
+pub(crate) fn spawn_preview_idle_check(
+    state: ClientServerState,
+    interval: std::time::Duration,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    use std::sync::atomic::Ordering;
+    std::thread::spawn(move || {
+        let mut skipped = None;
+        let poll = interval.min(std::time::Duration::from_millis(200));
+        loop {
+            let mut slept = std::time::Duration::ZERO;
+            while slept < interval {
+                if stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(poll);
+                slept += poll;
+            }
+            for line in preview_idle_tick(&state, &mut skipped) {
+                eprintln!("{line}");
+            }
+        }
+    })
+}
 
 pub(crate) async fn preview_stop_handler(
     State(state): State<ClientServerState>,

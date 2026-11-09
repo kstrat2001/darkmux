@@ -59,6 +59,12 @@ darkmux release.
   `TERM`, the recipe's `env` and its ports), and `env_from_source` never copies through a
   symlink. Known gap: a file a running preview writes in the workspace during a run can be
   committed as the run's.
+- A preview no app asks about stops on its own (#3459). An app that quit or crashed never stopped
+  its preview, so its dev server ran until `client serve` did. Once a minute `client serve` stops
+  every preview no app has asked about (a start or a status) for `clients.preview.idle_minutes`
+  (CONFIG 2.8, `DARKMUX_CLIENTS_PREVIEW_IDLE_MINUTES`; default `15`, `0` = never), the way a stop
+  does, and says so in its log. The setting is read at each check, so `darkmux config set` applies
+  without a restart.
 - Previews trust only your own checkout: a workspace's dev-server recipe, `.darkmux/preview.json`
   (`schema_version` `1.0`, unknown keys refused), is read only from the checkout the workspace was
   made from, never from the workspace a run edits. A workspace cloned from a URL gets no preview;
