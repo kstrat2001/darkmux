@@ -19,10 +19,13 @@ use crate::client_pairing::ClientMachine;
 use crate::client_preview::Recipe;
 use crate::client_profiles::ClientProfileInfo;
 
-/// Every refusal: `{"error": "..."}`, with the status code saying which.
+/// Every refusal: `{"error": "...", "code": "..."}`. The status says the
+/// class, `code` which refusal it is (#3468): an app branches on `code`,
+/// never on `error`'s wording, which is for a person.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ClientError {
     pub error: String,
+    pub code: darkmux_types::client_code::ClientCode,
 }
 
 /// `POST /client/pair`, 202: the request to poll.
@@ -123,7 +126,17 @@ pub struct RunChanges {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum WorkState {
-    Running,
+    Running {
+        /// (#3467) `starting_model` while the run's dispatch is starting its
+        /// model (an engine server, a load), as the run lifecycle decides it
+        /// (the same `activity` `GET /runs` and `run list --json` carry).
+        /// Absent otherwise.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        activity: Option<crate::runs::RunActivity>,
+        /// With `activity`: how long the start has taken so far, ms.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        activity_elapsed_ms: Option<u64>,
+    },
     Cancelling,
     Done {
         /// The dispatch's own `--json` envelope (that verb's contract).
@@ -142,6 +155,10 @@ pub enum WorkState {
     Error {
         error: String,
         reason: String,
+        /// (#3468) Why it failed, for an app: the code its run's
+        /// `dispatch.error` named (`busy`, `wont_fit`, ...), else
+        /// `dispatch_failed`.
+        code: darkmux_types::client_code::ClientCode,
     },
     Cancelled {
         /// Always `cancelled`.
@@ -206,6 +223,10 @@ pub struct WorkspaceInfo {
     /// Why the fetch of a reused (or source) checkout failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fetch_error: Option<String>,
+    /// (#3468) With `fetch_error`: its code (`network_key_in_repo_config`,
+    /// `fetch_failed`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fetch_error_code: Option<darkmux_types::client_code::ClientCode>,
 }
 
 /// One file on the workspace's branch that origin's default branch lacks:

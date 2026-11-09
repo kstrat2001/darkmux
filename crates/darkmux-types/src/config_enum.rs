@@ -1217,6 +1217,7 @@ mod tests {
             ("TreeChange", "how a host-git test fixture leaves a file (`host_git::fixture`, test-support only), never a setting"),
             ("AttrPlace", "where a host-git test fixture plants attributes (`host_git::fixture`, test-support only), never a setting"),
             ("ServerState", "what an engine server's record says about its process now (`engine_record`, #3448), never a setting"),
+            ("ClientCode", "why the client API refused a request or a work item failed (`client_code`, #3468), a wire value, never a setting"),
             ("Takes", "what one of rec's `rec-mlx serve flint` flags takes (`engine_args`, #3453), a fact about rec, never a setting"),
             ("SessionKind", "a session's kind within its run (`session_id`), never a setting"),
             ("SessionScope", "what a step kind declares about its sessions (`session_id`), never a setting"),

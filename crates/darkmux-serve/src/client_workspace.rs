@@ -12,6 +12,7 @@
 //! that can't be read as an option, and workspace names that are one plain
 //! path segment.
 
+use darkmux_types::client_code::ClientCode;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -357,17 +358,41 @@ pub fn is_commit_sha(r: &str) -> bool {
     matches!(r.len(), 40 | 64) && r.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
 }
 
+/// (#3468) A refusal, with the code an app branches on beside the sentence
+/// for a person. Shown as its sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Coded {
+    pub code: ClientCode,
+    pub message: String,
+}
+
+impl Coded {
+    pub fn new(code: ClientCode, message: impl Into<String>) -> Self {
+        Coded { code, message: message.into() }
+    }
+    pub fn code(&self) -> ClientCode {
+        self.code
+    }
+}
+
+impl std::fmt::Display for Coded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 /// Production fetch: updates remote-tracking refs only; the checkout's
-/// branch and files are never touched.
-pub fn fetch_with_git(dir: &Path) -> Result<(), String> {
+/// branch and files are never touched. A network key the checkout's own
+/// config sets is refused (`network_key_in_repo_config`); any other failure
+/// is `fetch_failed`.
+pub fn fetch_with_git(dir: &Path) -> Result<(), Coded> {
     let local = repo_local_keys(dir);
     let mut refused = refused_network_keys(&local);
     refused.dedup();
     if !refused.is_empty() {
-        return Err(format!(
-            "not fetched: {}'s own git config sets {}. {NETWORK_FIX}.",
-            dir.display(),
-            refused.join(", ")
+        return Err(Coded::new(
+            ClientCode::NetworkKeyInRepoConfig,
+            format!("not fetched: {}'s own git config sets {}. {NETWORK_FIX}.", dir.display(), refused.join(", ")),
         ));
     }
     let mut ignored: Vec<&str> = GLOBAL_ONLY_KEYS.iter().copied().filter(|k| local.iter().any(|l| l == k)).collect();
@@ -379,13 +404,18 @@ pub fn fetch_with_git(dir: &Path) -> Result<(), String> {
         "--quiet".as_ref(),
         "origin".as_ref(),
     ];
-    git_bounded(&args, Duration::from_secs(120)).map_err(|e| match ignored.is_empty() {
-        true => e,
-        false => format!(
-            "{e} (darkmux ignored {} from {}'s own git config: {NETWORK_FIX})",
-            ignored.iter().map(|k| spelled(k)).collect::<Vec<_>>().join(", "),
-            dir.display()
-        ),
+    git_bounded(&args, Duration::from_secs(120)).map_err(|e| {
+        Coded::new(
+            ClientCode::FetchFailed,
+            match ignored.is_empty() {
+                true => e,
+                false => format!(
+                    "{e} (darkmux ignored {} from {}'s own git config: {NETWORK_FIX})",
+                    ignored.iter().map(|k| spelled(k)).collect::<Vec<_>>().join(", "),
+                    dir.display()
+                ),
+            },
+        )
     })
 }
 
@@ -532,13 +562,21 @@ fn remote_default_with(git: impl Fn(&[&str]) -> Option<String>) -> Option<String
 /// through `HostGit`'s trusted mode (#3457): no network, so it needs none of
 /// the credentials [`git_bounded`] keeps, and the checkout's own config
 /// cannot run a program while git checks the files out.
-pub fn add_worktree(source: &Path, branch: &str, dest: &Path, commit: &str) -> Result<(), String> {
+pub fn add_worktree(source: &Path, branch: &str, dest: &Path, commit: &str) -> Result<(), Coded> {
     // (#3457) A filter the checkout's own config defines never runs here,
     // so a worktree would hold its filtered form: refused instead.
     let drivers = darkmux_types::host_git::HostGit::trusted(source).repo_filter_drivers();
     if !drivers.is_empty() {
-        return Err(crate::client_git::repo_filter_refusal(&drivers, "adding a worktree"));
+        return Err(Coded::new(
+            ClientCode::FilterInRepoConfig,
+            crate::client_git::repo_filter_refusal(&drivers, "adding a worktree"),
+        ));
     }
+    add_worktree_unfiltered(source, branch, dest, commit).map_err(|e| Coded::new(ClientCode::Unprocessable, e))
+}
+
+/// [`add_worktree`] once the checkout's filters are known to be none.
+fn add_worktree_unfiltered(source: &Path, branch: &str, dest: &Path, commit: &str) -> Result<(), String> {
     let dest = dest.to_string_lossy();
     let child = darkmux_types::host_git::HostGit::trusted(source)
         .command(&["worktree", "add", "--quiet", "-b", branch, &dest, commit])
@@ -575,10 +613,11 @@ pub fn record_source(base: &Path, name: &str, checkout: &Path) -> Result<(), Str
         .map_err(|e| format!("recording {}'s checkout: {e}", path.display()))
 }
 
-/// Forget workspace `name`'s checkout (a new workspace under a name an old
-/// one had).
+/// Forget workspace `name`'s checkout, and that it was a template project
+/// (a new workspace under a name an old one had).
 pub fn forget_source(base: &Path, name: &str) {
     let _ = std::fs::remove_file(source_record(base, name));
+    let _ = std::fs::remove_file(template_record(base, name));
 }
 
 /// (#3460) Where darkmux records the first commit of a project it made from
@@ -640,26 +679,26 @@ fn recorded_source(base: &Path, name: &str) -> Option<PathBuf> {
 /// user's ([`check_source`]), and still the repository the workspace is a
 /// worktree of. `Err` says why not, and what to do. This is the only place
 /// a preview recipe is read from: never the workspace, which a run writes.
-pub fn own_checkout_of(base: &Path, name: &str, dir: &Path) -> Result<PathBuf, String> {
+pub fn own_checkout_of(base: &Path, name: &str, dir: &Path) -> Result<PathBuf, Coded> {
     let held = crate::client_git::work_copy_of(base, name, dir);
     let repo = held.as_ref().and_then(origin_of).unwrap_or_else(|| "this repo".to_string());
+    let gone = |message: String| Coded::new(ClientCode::NoSourceCheckout, message);
     let Some(source) = recorded_source(base, name) else {
-        return Err(format!(
+        return Err(gone(format!(
             "workspace {name} was not made from a checkout of yours (it was cloned), so it has no \
              preview: a preview runs only from .darkmux/preview.json in your own checkout. Make the \
              workspace from your checkout (`source_path`), and add .darkmux/preview.json to your own \
              checkout of {repo}"
-        ));
+        )));
     };
-    let source = check_source(&source, base).map_err(|e| {
-        format!("workspace {name}'s checkout {}: {e}; refusing its preview", source.display())
-    })?;
+    let source = check_source(&source, base)
+        .map_err(|e| gone(format!("workspace {name}'s checkout {}: {e}; refusing its preview", source.display())))?;
     let held_common = held.and_then(|wc| crate::client_git::common_of(&wc.git_dir));
     if held_common.is_none() || held_common != common_dir(&source) {
-        return Err(format!(
+        return Err(gone(format!(
             "workspace {name} is no longer a worktree of your checkout {}; refusing its preview",
             source.display()
-        ));
+        )));
     }
     Ok(source)
 }
@@ -881,7 +920,9 @@ mod tests {
         let fx = darkmux_types::host_git::fixture::git;
         fx(&src, &["config", "filter.x.smudge", &format!("touch '{}'; cat", marker.display())]);
 
-        let err = add_worktree(&src, "mux/t", &root.join("wt"), "HEAD").unwrap_err();
+        let coded = add_worktree(&src, "mux/t", &root.join("wt"), "HEAD").unwrap_err();
+        assert_eq!(coded.code, ClientCode::FilterInRepoConfig, "(#3468) its code");
+        let err = coded.message;
         assert!(err.contains("filter.x"), "names the driver: {err}");
         assert!(err.contains("--global"), "names the fix: {err}");
         assert!(!root.join("wt").exists(), "nothing is made");
@@ -903,7 +944,9 @@ mod tests {
         fx(&src, &["remote", "add", "origin", DEAD_SSH_ORIGIN]);
         fx(&src, &["config", "core.sshCommand", &format!("touch '{}'; false", marker.display())]);
 
-        let err = fetch_with_git(&src).unwrap_err();
+        let coded = fetch_with_git(&src).unwrap_err();
+        assert_eq!(coded.code, ClientCode::FetchFailed, "(#3468) an ignored key leaves a plain failure");
+        let err = coded.message;
         assert!(!marker.exists(), "the checkout's own core.sshCommand ran");
         assert!(err.contains("core.sshCommand") && err.contains("global"), "{err}");
     }
@@ -925,7 +968,9 @@ mod tests {
             fx(&src, &["remote", "add", "origin", DEAD_SSH_ORIGIN]);
             fx(&src, &["config", key, value]);
             fx(&src, &["config", "core.sshCommand", &format!("touch '{}'; false", marker.display())]);
-            let err = fetch_with_git(&src).unwrap_err();
+            let coded = fetch_with_git(&src).unwrap_err();
+            assert_eq!(coded.code, ClientCode::NetworkKeyInRepoConfig, "(#3468) {key}: its code");
+            let err = coded.message;
             assert!(err.to_lowercase().contains(&key.to_lowercase()), "{key}: {err}");
             assert!(err.contains("includeIf"), "{key}: names the per-repo fix: {err}");
             assert!(!marker.exists(), "{key}: git ran");

@@ -43,6 +43,9 @@ struct Harness {
     fetched: Arc<Mutex<Vec<PathBuf>>>,
     /// A git repo with one commit, standing in for every remote.
     fixture: PathBuf,
+    /// What the run lifecycle says each running work item is doing
+    /// (default: nothing besides its turns).
+    activity: Arc<Mutex<(Option<crate::runs::RunActivity>, Option<u64>)>>,
     state: ClientServerState,
 }
 
@@ -71,6 +74,8 @@ fn harness() -> Harness {
     let pc = clock.clone();
     let containers = Arc::new(crate::client_preview::HostEmulator::default());
     let emu: Arc<dyn crate::client_preview::PreviewContainers> = containers.clone();
+    let activity = Arc::new(Mutex::new((None, None)));
+    let act = activity.clone();
     let (c, r, pol) = (clock.clone(), ran.clone(), policy.clone());
     let fixture = dir.path().join("fixture");
     fixture_repo(&fixture);
@@ -144,6 +149,10 @@ fn harness() -> Harness {
                     std::fs::write(w.join("in-progress.txt"), "half done\n").unwrap();
                 }
             }
+            // "refused-busy" fails as a dispatch whose `dispatch.error` said `busy`.
+            if spec.message == "refused-busy" {
+                return Err(RunError { reason: "exit 1".into(), error: "memory is held".into(), code: Some("busy".into()) });
+            }
             // A "wait" message runs until it is cancelled, as a dispatch child would.
             if spec.message == "wait" || spec.message == "edit-wait" {
                 for _ in 0..500 {
@@ -151,6 +160,7 @@ fn harness() -> Harness {
                         return Err(RunError {
                             reason: "exit 143/SIGTERM".into(),
                             error: "stopped".into(),
+                            code: None,
                         });
                     }
                     std::thread::sleep(std::time::Duration::from_millis(10));
@@ -210,6 +220,7 @@ fn harness() -> Harness {
             )
         }),
         works: Arc::new(Mutex::new(HashMap::new())),
+        work_activity: Arc::new(move |_role, _work_id| *act.lock().unwrap()),
         worktrees_base: Arc::new(move || Ok(wb.clone())),
         // Every "remote" is the fixture; origin is then set to the URL asked
         // for, as a real clone would leave it. A URL naming "fail" fails
@@ -252,7 +263,10 @@ fn harness() -> Harness {
                     .map(|s| s.success())
                     .unwrap_or(false);
                 if !ok {
-                    return Err("fetch failed".into());
+                    return Err(crate::client_workspace::Coded::new(
+                        darkmux_types::client_code::ClientCode::FetchFailed,
+                        "fetch failed",
+                    ));
                 }
             }
             Ok(())
@@ -270,6 +284,7 @@ fn harness() -> Harness {
         preview_idle_minutes: Arc::new(move || pi.lock().unwrap().clone()),
     };
     Harness {
+        activity,
         preview_on,
         preview_idle,
         containers,
@@ -1381,6 +1396,7 @@ async fn a_failed_execution_reports_its_error() {
         Err(RunError {
             reason: "exit 1".into(),
             error: "boom on stderr".into(),
+            code: None,
         })
     });
     let token = paired(&h).await;
@@ -1388,7 +1404,7 @@ async fn a_failed_execution_reports_its_error() {
     let done = wait_done(&h, &token, v["work_id"].as_str().unwrap()).await;
     assert_eq!(
         done,
-        serde_json::json!({"status": "error", "error": "boom on stderr", "reason": "exit 1"})
+        serde_json::json!({"status": "error", "error": "boom on stderr", "reason": "exit 1", "code": "dispatch_failed"})
     );
 }
 
@@ -1493,6 +1509,7 @@ async fn no_recipe_is_404_and_says_where_to_put_one() {
     )
     .await;
     assert_eq!(code, 404, "{v}");
+    assert_eq!(v["code"], "no_source_checkout", "{v}");
     assert!(v["error"].as_str().unwrap().contains("your own checkout"), "{v}");
     let (_mine, name, ws) = checkout_workspace(&h, &token).await;
     write_recipe(&ws, A_RECIPE);
@@ -1502,6 +1519,7 @@ async fn no_recipe_is_404_and_says_where_to_put_one() {
     )
     .await;
     assert_eq!(code, 404, "{v}");
+    assert_eq!(v["code"], "no_recipe", "{v}");
     let e = v["error"].as_str().unwrap();
     assert!(
         e.contains("add .darkmux/preview.json to your own checkout") && e.contains("never read"),
@@ -1585,6 +1603,7 @@ async fn an_oversized_unknown_keyed_or_non_object_recipe_is_refused() {
     write_recipe(&mine, r#"{"schema_version": "1.0", "command": "x", "port": 5173}"#);
     let (code, v) = call(&h, get(&url, &[("authorization", &auth)])).await;
     assert_eq!(code, 422, "{v}");
+    assert_eq!(v["code"], "recipe_invalid", "{v}");
     assert!(v["error"].as_str().unwrap().contains("unknown key `port`"), "{v}");
 }
 
@@ -1662,6 +1681,12 @@ fn the_child_runner_parses_the_json_envelope_and_reports_failures() {
     .unwrap_err();
     assert_eq!(e.reason, "exit 3");
     assert_eq!(e.error, "boom", "the raw stderr");
+    assert_eq!(e.code, None, "no dispatch.error code recorded");
+
+    // (#3468) A child that failed carries the code its `dispatch.error` named.
+    let refused = FakeTeardown { code: Some("wont_fit".into()), ..FakeTeardown::default() };
+    let e = run_dispatch_child(&bad, &spec, &CancelFlag::default(), GRACE, &refused).unwrap_err();
+    assert_eq!(e.code.as_deref(), Some("wont_fit"));
 }
 
 // ─── Cancel ──────────────────────────────────────────────────────────────
@@ -1723,6 +1748,72 @@ async fn only_the_client_that_started_a_run_may_cancel_it() {
     assert_eq!(cancel(&h, Some(&a), &id).await.0, 202);
 }
 
+/// (#3467) A running work item whose dispatch is starting its model says
+/// so, with the elapsed time, as the run lifecycle decides it; once the
+/// model is ready it reads plain `running` again (no extra keys).
+#[tokio::test]
+async fn running_work_says_when_it_is_starting_its_model() {
+    let h = harness();
+    let t = paired(&h).await;
+    let (_, v) = call(&h, post("/client/work", Some(&t), waiting_work())).await;
+    let id = v["work_id"].as_str().unwrap().to_string();
+    let status = || async { call(&h, get(&format!("/client/work/{id}"), &[("authorization", &bearer(&t))])).await.1 };
+    *h.activity.lock().unwrap() = (Some(crate::runs::RunActivity::StartingModel), Some(20_000));
+    assert_eq!(status().await, serde_json::json!({"status": "running", "activity": "starting_model", "activity_elapsed_ms": 20_000}));
+    *h.activity.lock().unwrap() = (None, None);
+    assert_eq!(status().await, serde_json::json!({"status": "running"}));
+    assert_eq!(cancel(&h, Some(&t), &id).await.0, 202);
+}
+
+/// (#3467) The production reader: the work's dispatch session
+/// (`.adhoc.<role>.<work_id>`) read from the flow day files through the run
+/// lifecycle, incrementally (a later read sees what was appended). Another
+/// session's model start is not this work's.
+#[test]
+fn the_work_activity_reader_follows_the_dispatchs_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let day = darkmux_flow::day_utc_now();
+    let path = dir.path().join(format!("{day}.jsonl"));
+    let append = |recs: &[serde_json::Value]| {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).unwrap();
+        for r in recs {
+            writeln!(f, "{r}").unwrap();
+        }
+    };
+    let rec = |session: &str, action: &str, payload: serde_json::Value| {
+        serde_json::json!({"ts": darkmux_flow::ts_utc_now(), "action": action, "session_id": session,
+            "execution_id": format!("exec-{session}"), "payload": payload})
+    };
+    let model = |ms: u64| serde_json::json!({"engine": "tensorfold", "endpoint": "tf", "model": "TF/m", "elapsed_ms": ms});
+    let ours = "run-x.adhoc.coder.w-1";
+    let store = crate::flow_window::FlowRecordStore::new(crate::client_pairing::feeds_work_activity);
+    let read = || crate::client_pairing::work_activity_in(&store, dir.path(), "coder", "w-1");
+    let theirs = "run-y.adhoc.coder.w-2";
+    append(&[
+        rec(ours, "dispatch.start", serde_json::json!({})),
+        rec(theirs, "dispatch.start", serde_json::json!({})),
+        rec(theirs, "dispatch.model.start", model(0)),
+    ]);
+    assert_eq!(read(), (None, None), "another work's start is not this one's");
+    append(&[rec(ours, "dispatch.model.start", model(0)), rec(ours, "dispatch.model.loading", model(30_000))]);
+    assert_eq!(read(), (Some(crate::runs::RunActivity::StartingModel), Some(30_000)));
+    append(&[rec(ours, "dispatch.model.ready", model(31_000))]);
+    assert_eq!(read(), (None, None), "ready: running as usual");
+
+    // (#3467 review) A role id outside `[A-Za-z0-9-]` is escaped on the
+    // wire; its work is still found.
+    let escaped = darkmux_types::session_id::SessionId::adhoc(
+        darkmux_types::session_id::RunId::mission("dispatch-code-1-a-0").unwrap(),
+        "code_writer",
+        "w-7",
+    )
+    .wire();
+    append(&[rec(&escaped, "dispatch.start", serde_json::json!({})), rec(&escaped, "dispatch.model.start", model(0))]);
+    let got = crate::client_pairing::work_activity_in(&store, dir.path(), "code_writer", "w-7");
+    assert_eq!(got, (Some(crate::runs::RunActivity::StartingModel), Some(0)));
+}
+
 #[tokio::test]
 async fn cancelling_a_finished_run_is_409() {
     let h = harness();
@@ -1732,7 +1823,7 @@ async fn cancelling_a_finished_run_is_409() {
     let _ = wait_done(&h, &token, &id).await;
     assert_eq!(
         cancel(&h, Some(&token), &id).await,
-        (409, serde_json::json!({"error": "not running"}))
+        (409, serde_json::json!({"error": "not running", "code": "conflict"}))
     );
 }
 
@@ -1741,6 +1832,8 @@ async fn cancelling_a_finished_run_is_409() {
 struct FakeTeardown {
     start: Option<StartedRun>,
     terminal_exists: bool,
+    /// The `code` the run's `dispatch.error` named, as the flow would say.
+    code: Option<String>,
     stopped_for: Mutex<Vec<u32>>,
     emitted: Mutex<Vec<StartedRun>>,
 }
@@ -1757,6 +1850,9 @@ impl HardKillTeardown for FakeTeardown {
     }
     fn emit_cancelled(&self, run: &StartedRun) {
         self.emitted.lock().unwrap().push(run.clone());
+    }
+    fn dispatch_error_code(&self, _spec: &WorkSpec) -> Option<String> {
+        self.code.clone()
     }
 }
 
@@ -1967,6 +2063,20 @@ fn the_start_is_found_by_its_work_id_in_the_flow_day_files() {
         !terminal_in(dir.path(), "exec-b"),
         "a start is not a terminal"
     );
+
+    // (#3467 review) A role id outside `[A-Za-z0-9-]` is escaped in the
+    // session id (`code_writer` is `code_5Fwriter` on the wire): found all
+    // the same.
+    let escaped = darkmux_types::session_id::SessionId::adhoc(
+        darkmux_types::session_id::RunId::mission("dispatch-code-1-a-0").unwrap(),
+        "code_writer",
+        "w-1",
+    )
+    .wire();
+    assert!(!escaped.contains("code_writer"), "the wire escapes it: {escaped}");
+    std::fs::write(dir.path().join("2026-11-08.jsonl"), line("dispatch.start", &escaped, "exec-u")).unwrap();
+    let spec = WorkSpec { role: "code_writer".into(), ..spec_w1() };
+    assert_eq!(find_start_in(dir.path(), &spec).map(|r| r.execution).as_deref(), Some("exec-u"));
 }
 
 #[test]
@@ -2528,6 +2638,7 @@ async fn a_failed_clone_leaves_nothing_behind() {
     )
     .await;
     assert_eq!(code, 502, "{v}");
+    assert_eq!(v["code"], "clone_failed", "{v}");
     assert!(
         v["error"]
             .as_str()
@@ -3489,6 +3600,7 @@ async fn a_cloned_workspace_gets_no_preview() {
     recipe(&ws, serde_json::json!({"command": format!("touch pwned; {}", serve())}));
     let (code, v) = start_preview(&h, &token, "hcr").await;
     assert_eq!(code, 404, "{v}");
+    assert_eq!(v["code"], "no_source_checkout", "{v}");
     let e = v["error"].as_str().unwrap();
     assert!(e.contains("not made from a checkout of yours") && e.contains("github.com/kstrat2001/hcr"), "{v}");
     assert!(!ws.join("pwned").exists());
@@ -3518,6 +3630,7 @@ async fn a_preview_needs_the_workspace_to_still_be_a_worktree_of_the_checkout() 
     }
     let (code, v) = start_preview(&h, &token, &name).await;
     assert_eq!(code, 404, "{v}");
+    assert_eq!(v["code"], "no_source_checkout", "{v}");
     assert!(v["error"].as_str().unwrap().contains("no longer a worktree"), "{v}");
     // A stale record under the name a clone then takes.
     let base = h.base.canonicalize().unwrap();
@@ -3703,6 +3816,7 @@ async fn previews_are_refused_while_clients_preview_enabled_is_off() {
     *h.preview_on.lock().unwrap() = false;
     let (code, v) = start_preview(&h, &token, &name).await;
     assert_eq!(code, 403, "{v}");
+    assert_eq!(v["code"], "preview_disabled", "{v}");
     let e = v["error"].as_str().unwrap();
     assert!(
         e.contains("darkmux config set clients.preview.enabled true")
@@ -5016,4 +5130,152 @@ async fn a_failed_template_clone_leaves_nothing_behind() {
     .await;
     assert_eq!(code, 502, "{v}");
     assert!(!h.base.join("bakery").exists() && !h.base.join(".bakery.partial").exists());
+}
+
+// ---- refusal codes (#3468) -------------------------------------------------
+
+/// (#3468) Every refusal body carries a `code` beside its sentence: the
+/// generic refusals of the request itself each have theirs.
+#[tokio::test]
+async fn every_refusal_names_its_code() {
+    let h = harness();
+    let token = paired(&h).await;
+    let code_of = |v: &Value| v["code"].as_str().map(str::to_string);
+    let (_, v) = call(&h, get("/client/nope", &[])).await;
+    assert_eq!(code_of(&v).as_deref(), Some("not_found"), "{v}");
+    let (status, v) = call(&h, get("/client/whoami", &[])).await;
+    assert_eq!((status, code_of(&v).as_deref()), (401, Some("unauthorized")), "{v}");
+    let (status, v) = call(&h, get("/client/whoami", &[("authorization", &bearer(&token)), ("origin", "https://evil.example")])).await;
+    assert_eq!((status, code_of(&v).as_deref()), (403, Some("not_local")), "{v}");
+    let (status, v) = call(&h, post("/client/work", Some(&token), serde_json::json!({"role": "coder", "message": ""}))).await;
+    assert_eq!((status, code_of(&v).as_deref()), (400, Some("bad_request")), "{v}");
+    let (status, v) = call(&h, get("/client/work/w-nope", &[("authorization", &bearer(&token))])).await;
+    assert_eq!((status, code_of(&v).as_deref()), (404, Some("not_found")), "{v}");
+}
+
+/// (#3468) A failed work item carries its code: the one its run's
+/// `dispatch.error` named (`busy` here), else `dispatch_failed`.
+#[tokio::test]
+async fn a_failed_work_item_carries_its_dispatch_code() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (_, v) = call(&h, post("/client/work", Some(&token), serde_json::json!({"role": "coder", "message": "refused-busy"}))).await;
+    let id = v["work_id"].as_str().unwrap().to_string();
+    let v = wait_done(&h, &token, &id).await;
+    assert_eq!((v["status"].as_str(), v["code"].as_str()), (Some("error"), Some("busy")), "{v}");
+}
+
+/// (#3468) A template project previews from its first commit's recipe
+/// (#3460); when that commit has none, the refusal is `template_no_recipe`,
+/// told apart from a checkout with none (`no_recipe`).
+#[tokio::test]
+async fn a_template_whose_first_commit_has_no_recipe_is_template_no_recipe() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (code, v) = call(
+        &h,
+        post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR, "template": true, "bot": "Bakery"})),
+    )
+    .await;
+    assert_eq!(code, 201, "{v}");
+    let (code, v) = start_preview(&h, &token, "bakery").await;
+    assert_eq!((code, v["code"].as_str()), (404, Some("template_no_recipe")), "{v}");
+}
+
+/// (#3468) A checkout whose own git config defines a filter driver is
+/// refused as a workspace with `filter_in_repo_config` (#3457).
+#[tokio::test]
+async fn a_checkout_with_a_repo_filter_is_refused_with_its_code() {
+    let h = harness();
+    let token = paired(&h).await;
+    let mine = h.dir.path().join("crypt");
+    fixture_repo(&mine);
+    run_git(Some(&mine), &["config", "filter.crypt.clean", "cat"]);
+    let (code, v) = call(&h, post("/client/workspaces", Some(&token), serde_json::json!({"source_path": mine.to_str(), "bot": "c"}))).await;
+    assert_eq!((code, v["code"].as_str()), (422, Some("filter_in_repo_config")), "{v}");
+}
+
+/// (#3468) The production reader of a failed run's code: its dispatch
+/// session's `dispatch.error` `code`, read from the flow day files; another
+/// work's is not this one's, and a terminal with none names none.
+#[test]
+fn the_failed_run_code_reader_reads_the_dispatch_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let day = darkmux_flow::day_utc_now();
+    let rec = |session: &str, action: &str, payload: Value| {
+        serde_json::json!({"ts": darkmux_flow::ts_utc_now(), "action": action, "session_id": session,
+            "execution_id": format!("exec-{session}"), "payload": payload})
+    };
+    let lines = [
+        rec("run-x.adhoc.coder.w-1", "dispatch.start", serde_json::json!({})),
+        rec("run-x.adhoc.coder.w-1", "dispatch.error", serde_json::json!({"error": "no fit", "code": "wont_fit"})),
+        // Only a `dispatch.error` names the failure, whatever else a record carries.
+        rec("run-x.adhoc.coder.w-1", "dispatch.model.loading", serde_json::json!({"engine": "e", "endpoint": "p", "model": "m", "code": "not_a_failure"})),
+        rec("run-y.adhoc.coder.w-2", "dispatch.error", serde_json::json!({"error": "held", "code": "busy"})),
+        rec("run-z.adhoc.coder.w-3", "dispatch.error", serde_json::json!({"error": "crashed"})),
+    ];
+    std::fs::write(dir.path().join(format!("{day}.jsonl")), lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+    let store = crate::flow_window::FlowRecordStore::new(crate::client_pairing::feeds_work_activity);
+    let read = |id: &str| crate::client_pairing::dispatch_error_code_in(&store, dir.path(), "coder", id);
+    assert_eq!(read("w-1").as_deref(), Some("wont_fit"));
+    // (#3468 review) A role id escaped on the wire is found too.
+    let escaped = darkmux_types::session_id::SessionId::adhoc(
+        darkmux_types::session_id::RunId::mission("dispatch-code-1-a-0").unwrap(),
+        "code_writer",
+        "w-5",
+    )
+    .wire();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.path().join(format!("{day}.jsonl")))
+        .and_then(|mut f| {
+            use std::io::Write;
+            writeln!(f, "{}", rec(&escaped, "dispatch.error", serde_json::json!({"error": "held", "code": "busy"})))
+        })
+        .unwrap();
+    assert_eq!(
+        crate::client_pairing::dispatch_error_code_in(&store, dir.path(), "code_writer", "w-5").as_deref(),
+        Some("busy")
+    );
+    assert_eq!(read("w-3"), None, "a terminal with no code names none");
+    assert_eq!(read("w-9"), None, "no record");
+}
+
+/// (#3468 review) A path segment the router cannot read (not UTF-8) is
+/// refused as JSON with a code, like every other refusal, never axum's
+/// plain-text rejection.
+#[tokio::test]
+async fn an_unreadable_path_segment_is_a_coded_json_refusal() {
+    let h = harness();
+    let token = paired(&h).await;
+    for req in [
+        get("/client/work/%FF", &[("authorization", &bearer(&token))]),
+        get("/client/pair/%FF", &[("x-pair-secret", SECRET)]),
+        post("/client/workspaces/%FF/preview", Some(&token), serde_json::json!({})),
+    ] {
+        let (code, v) = call(&h, req).await;
+        assert_eq!((code, v["code"].as_str()), (400, Some("bad_request")), "{v}");
+        assert!(v["error"].is_string(), "{v}");
+    }
+}
+
+/// (#3468 review) A handler that panics outside `spawn_blocking` answers a
+/// coded 500 instead of dropping the connection.
+#[tokio::test]
+async fn a_panicking_handler_is_a_coded_500() {
+    let mut h = harness();
+    let token = paired(&h).await;
+    h.state.profiles_policy = Arc::new(|| panic!("the policy read panicked"));
+    let (code, v) = call(&h, get("/client/whoami", &[("authorization", &bearer(&token))])).await;
+    assert_eq!((code, v["code"].as_str()), (500, Some("internal")), "{v}");
+}
+
+/// (#3468 review) Every client route takes its path parameters through
+/// `ClientPath`, so none answers axum's plain-text rejection.
+#[test]
+fn every_client_route_reads_its_path_through_client_path() {
+    let src = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/client_pairing.rs")).unwrap();
+    let bare: Vec<&str> = src.lines().filter(|l| l.contains(": UrlPath<") || l.contains("): UrlPath<")).collect();
+    assert!(bare.is_empty(), "a handler takes a bare `UrlPath`: {bare:?}");
+    assert!(src.matches(": ClientPath<").count() >= 10, "the routes were found");
 }
