@@ -106,6 +106,8 @@ mod radio_busy;
 mod radio_index;
 mod card_status;
 mod role_cli;
+// `darkmux client` (local prototype): pairing an app and its scoped work.
+mod client_cli;
 // #515 — serve daemon extracted (final crate; deps doctor/eureka/fleet/crew/
 // flow/profiles all crates). Re-export keeps crate::serve::* resolving for
 // main + phase_review.
@@ -259,36 +261,46 @@ fn run(cmd: Cmd) -> Result<i32> {
             bind,
             flows_dir,
             lab_dir,
-        } => {
-            // (#2765) `--port`/`--bind` still win outright; unset now falls
-            // through to `env(DARKMUX_SERVE_*) > config.serve.* > built-in`
-            // — the SAME resolution every client-side daemon probe reads, so
-            // the two halves cannot land on different ports the way they
-            // could when the port lived only in this command line.
-            let (port, bind) = serve::resolve_listen_addr(port, bind);
-            let flows_dir = flows_dir.unwrap_or_else(crate::flow::flows_dir);
-            // (#1585) `--lab-dir` > `DARKMUX_LAB_DIR` > `config.dirs.lab` >
-            // `~/.darkmux/lab`. The flag still wins; the tiers beneath it are
-            // new, and `Some(...)` is now unconditional.
-            //
-            // This REPLACES #1247's opt-in ("no config tier and no built-in
-            // default — the lab lens only ever reads a directory the operator
-            // explicitly named"). That was right while lab was a separate
-            // side-lens: unset meant "not using it." #1508 made lab one of the
-            // three sources feeding `/runs`, at which point unset stopped
-            // meaning that and started meaning "a source of your primary run
-            // view is silently missing" — measured: 247 lab runs on disk, zero
-            // visible anywhere. Optionality is part of a subsystem's contract,
-            // and promoting it into a shared read-model changes that contract.
-            let lab_dir = Some(lab_dir.unwrap_or_else(darkmux_types::config_access::lab_dir));
-            serve::run(port, bind, flows_dir, lab_dir)?;
-            Ok(0)
-        }
+        } => cmd_serve(port, bind, flows_dir, lab_dir),
         // SPIKE (#1388) — see src/acp.rs module docs.
         Cmd::Acp => acp::run(),
         // (#1698 Packet A) — see src/radio.rs / src/radio_cli.rs module docs.
         Cmd::Radio { text, dry_run } => radio_cli::run(&text, dry_run),
+        Cmd::Client { sub } => client_cli::run(sub),
     }
+}
+
+/// `darkmux serve`: resolves the listen address and the run sources, then
+/// runs the daemon.
+fn cmd_serve(
+    port: Option<u16>,
+    bind: Option<String>,
+    flows_dir: Option<std::path::PathBuf>,
+    lab_dir: Option<std::path::PathBuf>,
+) -> Result<i32> {
+    // (#2765) `--port`/`--bind` still win outright; unset now falls
+    // through to `env(DARKMUX_SERVE_*) > config.serve.* > built-in`
+    // — the SAME resolution every client-side daemon probe reads, so
+    // the two halves cannot land on different ports the way they
+    // could when the port lived only in this command line.
+    let (port, bind) = serve::resolve_listen_addr(port, bind);
+    let flows_dir = flows_dir.unwrap_or_else(crate::flow::flows_dir);
+    // (#1585) `--lab-dir` > `DARKMUX_LAB_DIR` > `config.dirs.lab` >
+    // `~/.darkmux/lab`. The flag still wins; the tiers beneath it are
+    // new, and `Some(...)` is now unconditional.
+    //
+    // This REPLACES #1247's opt-in ("no config tier and no built-in
+    // default — the lab lens only ever reads a directory the operator
+    // explicitly named"). That was right while lab was a separate
+    // side-lens: unset meant "not using it." #1508 made lab one of the
+    // three sources feeding `/runs`, at which point unset stopped
+    // meaning that and started meaning "a source of your primary run
+    // view is silently missing" — measured: 247 lab runs on disk, zero
+    // visible anywhere. Optionality is part of a subsystem's contract,
+    // and promoting it into a shared read-model changes that contract.
+    let lab_dir = Some(lab_dir.unwrap_or_else(darkmux_types::config_access::lab_dir));
+    serve::run(port, bind, flows_dir, lab_dir)?;
+    Ok(0)
 }
 
 fn cmd_lessons(sub: LessonCmd) -> Result<i32> {

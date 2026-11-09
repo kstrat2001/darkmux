@@ -708,6 +708,37 @@ pub fn cmd_allowed(verb: &str) -> bool {
     cmd_enabled() && cmd_allowed_verbs().iter().any(|v| v == verb)
 }
 
+// ── Paired client apps (`darkmux client serve`, CONFIG 2.7) ──
+/// The profiles a paired client app may run on, against `cfg`:
+/// `env(DARKMUX_CLIENTS_PROFILES)` (comma-separated, trimmed, empty entries
+/// dropped) > `cfg.clients.profiles` > `None`. `None` means no list: the
+/// listener allows any local profile (one whose work stays on this machine);
+/// a hosted one only when listed. The `_in`
+/// form exists because the listener reads `config.json` FRESH on every work
+/// request (the process-wide [`config`] tier is read once), the same way the
+/// fleet listener reads its allow-list.
+pub fn clients_profiles_in(cfg: &DarkmuxConfig) -> Option<Vec<String>> {
+    if let Some(s) = env_str("DARKMUX_CLIENTS_PROFILES") {
+        return Some(s.split(',').map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).collect());
+    }
+    cfg.clients.as_ref().and_then(|c| c.profiles.clone())
+}
+/// Whether a paired app may start a live preview, against `cfg`:
+/// `env(DARKMUX_CLIENTS_PREVIEW_ENABLED)` > `cfg.clients.preview.enabled` >
+/// `false`. Fail closed: an unrecognized env token leaves previews off. A
+/// preview runs the workspace's own code on this machine, outside the
+/// sandbox, which is why it is off by default.
+pub fn clients_preview_enabled_in(cfg: &DarkmuxConfig) -> bool {
+    if let Some(s) = env_str("DARKMUX_CLIENTS_PREVIEW_ENABLED") {
+        return parse_bool_token(&s).unwrap_or(false);
+    }
+    cfg.clients.as_ref().and_then(|c| c.preview.as_ref()).and_then(|p| p.enabled).unwrap_or(false)
+}
+/// [`clients_profiles_in`] against this process's config tier.
+pub fn clients_profiles() -> Option<Vec<String>> {
+    clients_profiles_in(config())
+}
+
 // ── (#2093) Hooks — flow-record hook sink (match → HTTP POST) ──
 /// The hooks feature gate: `env(DARKMUX_HOOKS_ENABLED)` truthy
 /// (`1`/`true`/`yes`/`on`, case-insensitive) > `config.hooks.enabled` >
@@ -2629,6 +2660,8 @@ mod location_guard {
         ("redis_stream", "a stream name"),
         ("redis_telemetry_stream", "a stream name"),
         ("cmd_allowed_verbs", "CLI verb names"),
+        ("clients_profiles", "profile names a paired client app may run on"),
+        ("clients_profiles_in", "profile names a paired client app may run on, against a given config"),
         ("hooks_enabled_provenance", "which tier set a switch"),
         ("check_retired_env", "the same leftovers as `retired_env_leftovers`, split by policy"),
         ("role_profiles", "role and profile names"),
@@ -4257,6 +4290,31 @@ mod tests {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_CMD_ALLOWED", v),
                 None => std::env::remove_var("DARKMUX_CMD_ALLOWED"),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn clients_profiles_is_env_then_config_then_unset() {
+        let prev = std::env::var("DARKMUX_CLIENTS_PROFILES").ok();
+        let cfg = crate::config::DarkmuxConfig {
+            clients: Some(crate::config::ClientsConfig { profiles: Some(vec!["deep".into()]), ..Default::default() }),
+            ..Default::default()
+        };
+        unsafe { std::env::remove_var("DARKMUX_CLIENTS_PROFILES"); }
+        assert_eq!(clients_profiles_in(&crate::config::DarkmuxConfig::default()), None, "unset: no list");
+        assert_eq!(clients_profiles_in(&cfg), Some(vec!["deep".to_string()]), "config tier");
+        unsafe { std::env::set_var("DARKMUX_CLIENTS_PROFILES", " fast, ,tiny "); }
+        assert_eq!(clients_profiles_in(&cfg), Some(vec!["fast".to_string(), "tiny".to_string()]), "env wins, trimmed");
+        {
+            let _guard = set_config_for_test(cfg.clone());
+            assert_eq!(clients_profiles(), Some(vec!["fast".to_string(), "tiny".to_string()]));
+        }
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_CLIENTS_PROFILES", v),
+                None => std::env::remove_var("DARKMUX_CLIENTS_PROFILES"),
             }
         }
     }

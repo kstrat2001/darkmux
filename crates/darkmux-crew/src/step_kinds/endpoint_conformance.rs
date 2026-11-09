@@ -97,6 +97,7 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     ("crates/darkmux-lab/src/lab/submit/upload.rs", ".keychain", 6, "the evals upload token's own secret store (#3400: a Keychain trait object behind the per-origin token); it holds no endpoint credential and never decides an endpoint"),
     ("crates/darkmux-doctor/src/lib.rs", ".keychain", 3, "the probe's dedup key (two credentials to one deployment both probe) and two messages naming the field"),
     ("crates/darkmux-flow/src/hooks.rs", "strip_prefix(\"http://\")", 2, "the hooks destination URL policy, not a model endpoint"),
+    ("crates/darkmux-serve/src/client_workspace.rs", "strip_prefix(\"https://\")", 1, "a git repo URL a paired app may ask darkmux to clone (`https://host/owner/repo`), not a model endpoint"),
     ("crates/darkmux-serve/src/runs.rs", ".endpoint.is_some()", 1, "a run aggregate's recorded `endpoint` label (from flow records), not a profile endpoint"),
     ("crates/darkmux-serve/src/runs.rs", ".endpoint.is_none()", 1, "a run aggregate's recorded `endpoint` label (from flow records), not a profile endpoint"),
     ("crates/darkmux-crew/src/dispatch.rs", "default_model_id()", 1, "profile_default_window: the role-less window, documented as never a dispatch's own"),

@@ -1540,7 +1540,11 @@ mod tests {
 
     /// A route registered anywhere but the route table escapes the layer. The
     /// daemon's router is built from `routes::table()`; the fleet listener's
-    /// own router is the token-gated execution surface, not a read.
+    /// own router is the token-gated execution surface, not a read. `darkmux
+    /// client serve`'s router is built in routes.rs too, from
+    /// `routes::client_table()` (its own listener, 127.0.0.1 only and behind
+    /// its own gate, so never mounted on the daemon), so no other file may
+    /// register a route.
     #[test]
     fn every_route_is_registered_through_the_route_table() {
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");

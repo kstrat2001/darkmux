@@ -1,0 +1,250 @@
+//! The response bodies of `darkmux client serve`: one named type per JSON
+//! reply, the way `wire.rs` names the viewer daemon's.
+//!
+//! The client listener's routes and these shapes are a contract (DESIGN.md,
+//! "Public surfaces"): `routes::client_table()` names each route's response
+//! type through its `client_json!` macro (which fails to compile if the type
+//! does not exist), and `route-table.golden` pins every route and every
+//! field below, read from the type's JSON schema. A handler builds no `json!`
+//! object by hand. The viewer imports none of these, so no TypeScript twin is
+//! generated for them; the golden is their only record.
+//!
+//! Fields the producer could not read are `null`; an optional field marked
+//! `skip_serializing_if` is absent instead.
+
+use schemars::JsonSchema;
+use serde::Serialize;
+
+use crate::client_pairing::ClientMachine;
+use crate::client_preview::Recipe;
+use crate::client_profiles::ClientProfileInfo;
+
+/// Every refusal: `{"error": "..."}`, with the status code saying which.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ClientError {
+    pub error: String,
+}
+
+/// `POST /client/pair`, 202: the request to poll.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct PairAccepted {
+    pub request_id: String,
+}
+
+/// What a paired app may run: `profiles` is this machine's
+/// `clients.profiles`, or the word `"local"` when it is unset (any profile
+/// whose work stays on this machine). `workspace` is always true.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ClientScopes {
+    pub profiles: ProfilesGrant,
+    pub workspace: bool,
+}
+
+/// The granted list, or `"local"`.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum ProfilesGrant {
+    Listed(Vec<String>),
+    /// Always the word `local`.
+    Local(String),
+}
+
+impl ClientScopes {
+    pub fn of(policy: &Option<Vec<String>>) -> Self {
+        ClientScopes {
+            profiles: match policy {
+                Some(list) => ProfilesGrant::Listed(list.clone()),
+                None => ProfilesGrant::Local("local".to_string()),
+            },
+            workspace: true,
+        }
+    }
+}
+
+/// `GET /client/pair/{id}`: `pending`, `denied` or `expired`, or, once,
+/// `approved` with the token.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum PairPoll {
+    Pending,
+    Denied,
+    Expired,
+    Approved {
+        client_name: String,
+        token: String,
+        scopes: ClientScopes,
+    },
+}
+
+/// `GET /client/whoami`.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct Whoami {
+    pub client_name: String,
+    pub scopes: ClientScopes,
+    pub machine: ClientMachine,
+}
+
+/// `GET /client/profiles`.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ClientProfiles {
+    pub role: String,
+    pub profiles: Vec<ClientProfileInfo>,
+    pub machine: ClientMachine,
+}
+
+/// `POST /client/work`, 202: the run and the profile it resolved to.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct WorkAccepted {
+    pub work_id: String,
+    pub profile: String,
+}
+
+/// One file a run changed: lines added and removed (`null` for a binary
+/// file).
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq)]
+pub struct FileChange {
+    pub path: String,
+    pub added: Option<u64>,
+    pub removed: Option<u64>,
+}
+
+/// What a run changed in its work copy, against its baseline: the files and
+/// the unified diff (capped).
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq)]
+pub struct RunChanges {
+    pub files: Vec<FileChange>,
+    pub diff: String,
+    /// Repositories the run made inside the work copy (`git init sub`),
+    /// left out of the snapshot and so of the run's changes and commit.
+    pub skipped: Vec<String>,
+}
+
+/// `GET /client/work/{id}`: where a run stands.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum WorkState {
+    Running,
+    Cancelling,
+    Done {
+        /// The dispatch's own `--json` envelope (that verb's contract).
+        result: serde_json::Value,
+        /// `null` without a git work copy.
+        changes: Option<RunChanges>,
+        /// The run's commit (short id), `null` when nothing was committed.
+        commit: Option<String>,
+        branch: Option<String>,
+        commit_error: Option<String>,
+        /// Why the run's changes could not be read (`changes` is then
+        /// `null` and nothing was committed): never "no changes".
+        changes_error: Option<String>,
+        undone: bool,
+    },
+    Error {
+        error: String,
+        reason: String,
+    },
+    Cancelled {
+        /// Always `cancelled`.
+        reason: String,
+        error: Option<String>,
+    },
+}
+
+/// `POST /client/work/{id}/cancel` (202) and `DELETE
+/// /client/workspaces/{name}/preview`: what is happening now (`cancelling`,
+/// `stopped`).
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct StatusWord {
+    pub status: String,
+}
+
+/// `POST /client/work/{id}/undo`: the revert commit (short id) and the files
+/// it put back.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct UndoReply {
+    pub revert: String,
+    pub files: Vec<String>,
+}
+
+/// `POST /client/work/{id}/keep` (older apps): the run's commit.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct KeepReply {
+    pub commit: Option<String>,
+    pub branch: Option<String>,
+    pub files: Vec<String>,
+}
+
+/// `POST /client/work/{id}/discard` (older apps): an Undo, reported as the
+/// files restored (`removed` is always empty: an Undo is a revert commit).
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct DiscardReply {
+    pub restored: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+/// `GET /client/recipe`: the workspace's preview recipe, as read from the
+/// user's own checkout.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RecipeReply {
+    pub recipe: Recipe,
+}
+
+/// `POST /client/workspaces` and `GET /client/workspaces/{name}`.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct WorkspaceInfo {
+    pub workspace: String,
+    /// Empty when detached.
+    pub branch: String,
+    pub head: String,
+    /// The normalized origin (`host/owner/repo`), `null` with none.
+    pub repo: Option<String>,
+    pub created: bool,
+    /// Where a new workspace started (a ref, or `<repo>@<ref>` for a
+    /// template).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// Why the fetch of a reused (or source) checkout failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fetch_error: Option<String>,
+}
+
+/// One file on the workspace's branch that origin's default branch lacks:
+/// its content (base64) and mode, or `deleted: true`.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct BranchFile {
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+}
+
+/// `GET /client/workspaces/{name}/changes`: the branch's committed changes
+/// against origin's default branch, for an app to open a PR itself.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct BranchChanges {
+    pub base: String,
+    pub base_branch: String,
+    pub head: String,
+    pub branch: String,
+    pub files: Vec<BranchFile>,
+}
+
+/// `POST` / `GET /client/workspaces/{name}/preview`: a preview's state.
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq)]
+pub struct PreviewState {
+    pub workspace: String,
+    /// `installing`, `starting`, `ready`, `failed` or `stopped`.
+    pub status: String,
+    pub url: String,
+    pub port: u16,
+    pub hmr_port: u16,
+    /// Why it failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// The end of its log, when it failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_tail: Option<String>,
+}

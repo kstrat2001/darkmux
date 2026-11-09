@@ -429,7 +429,16 @@ use std::path::Path;
 //           where the Tensorfold server binary is installed. Absent =
 //           `tensorfold-native` on `PATH`. An older binary refuses a config
 //           carrying it.
-pub const CONFIG_SCHEMA_VERSION: &str = "2.7";
+//   2.8 (client pairing, local prototype, #3447): additive `clients` block:
+//           `clients.profiles` (string list; `DARKMUX_CLIENTS_PROFILES`,
+//           comma-separated), the profiles a paired client app may run on
+//           (absent = any local profile, one whose work stays on this machine
+//           as dispatch judges it; a hosted one only when listed), and
+//           `clients.preview.enabled` (bool, default false), whether a paired
+//           app may start a workspace's live preview (it runs the workspace's
+//           own code on this machine, outside the sandbox). An older binary
+//           refuses a config carrying either.
+pub const CONFIG_SCHEMA_VERSION: &str = "2.8";
 
 /// A `config.json` key an older darkmux read (and `init` may have written)
 /// that this one does not. The unknown-key gate (`user_files`) names it with
@@ -842,6 +851,9 @@ pub struct DarkmuxConfig {
     /// [`ServeConfig`]'s own doc.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serve: Option<ServeConfig>,
+    /// Paired client apps (`darkmux client serve`) — see [`ClientsConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clients: Option<ClientsConfig>,
 
     /// (#1475 packet 1) The machine-local **role → profile** map — the binding
     /// that welds an abstract role id (e.g. `judge`, `probe-high`) to a
@@ -1817,6 +1829,36 @@ pub struct RadioConfig {
     #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
+/// (CONFIG 2.7) What a paired client app (`darkmux client serve`) may run on
+/// this machine. A pairing records identity only; this block is the policy,
+/// read on every work request, so `darkmux config set clients.profiles ...`
+/// takes effect without a restart or a re-pair.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ClientsConfig {
+    /// The profile names a paired app's work may run on. Absent: any local
+    /// profile, one whose work stays on this machine as dispatch judges it
+    /// (LM Studio, or the `default_engine` on loopback); an omitted profile
+    /// is the role's own (`role_profiles.<role>`, else `default_profile`),
+    /// judged the same way. A hosted profile runs only when listed. An empty
+    /// list allows none. `darkmux config set clients.profiles <comma-separated-list>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub profiles: Option<Vec<String>>,
+    /// Live previews of a workspace's dev server — see [`ClientsPreviewConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub preview: Option<ClientsPreviewConfig>,
+    #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+/// (CONFIG 2.8) Whether a paired app may start a workspace's live preview.
+/// A preview runs the workspace's own code (its `package.json` scripts and
+/// whatever they call, which a model may have written) on this machine as
+/// you, outside the dispatch sandbox, so it is OFF unless turned on here:
+/// `darkmux config set clients.preview.enabled true`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ClientsPreviewConfig {
+    /// `true` allows previews; absent or `false` refuses every preview start.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub enabled: Option<bool>,
+    #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
 /// (#1685) The operator's own `gh` CLI credential gate — a **feature block
 /// gated by `enabled`**, same pattern as `RedisConfig`/`AuditConfig`.
 /// The allowlist a mission config's `cmd` field is checked against before
@@ -2440,6 +2482,10 @@ impl DarkmuxConfig {
                 read_auth: Some(false),
                 extras: Default::default(),
             }),
+            // Deliberately NOT written: absent `clients.profiles` is a real
+            // behavior (a paired app may run on any local profile), not a
+            // value to default.
+            clients: None,
             extras: Default::default(),
         }
     }

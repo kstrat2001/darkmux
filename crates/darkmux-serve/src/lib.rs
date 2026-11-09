@@ -46,6 +46,14 @@ pub mod mission_graph;
 /// rendering needs it too, not just the wire response.
 /// (#2107, #1833) The daemon-side continuous host sampler feeding the
 /// machine stats drawer's live `load` block — see the module's own doc.
+/// Client pairing: a loopback-only listener that pairs an app and runs its
+/// scoped work through `darkmux dispatch` (local prototype).
+pub mod client_git;
+pub mod client_pairing;
+pub mod client_preview;
+pub mod client_profiles;
+pub mod client_wire;
+pub mod client_workspace;
 mod fleet_listener;
 /// The fleet view: one row per roster machine, each with its own card.
 pub mod fleet_view;

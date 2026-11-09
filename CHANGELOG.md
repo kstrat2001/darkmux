@@ -26,6 +26,32 @@ darkmux release.
   every dispatching preflight refuses a Tensorfold endpoint, naming the `url` form that works
   today. `PROFILES_SCHEMA_VERSION` 2.2 -> 2.3 and `CONFIG_SCHEMA_VERSION` 2.6 -> 2.7, both
   additive; an older binary refuses the new keys and value.
+- `darkmux client serve` (local prototype, #3447): a loopback-only endpoint an app on this machine
+  pairs with (`darkmux client approve`), then runs work through. It answers only this machine's
+  apps: a loopback connection naming the listener, through no proxy, with no `Origin` header (a web
+  page cannot drive it), and JSON request bodies. With `clients.profiles` unset an app may run on
+  any profile whose work stays on this machine, judged as dispatch judges it (LM Studio, or the
+  `default_engine` on loopback); the role's own profile is checked the same way. Its 17 routes
+  and their response types are in `route-table.golden` (a new contract surface; nothing changes
+  for the viewer daemon's routes).
+- Host git never reads git config a run can write: a client workspace's repository is held by
+  darkmux outside the work tree the run is given (a clone's `--separate-git-dir`, a worktree's own
+  admin directory in your checkout), and every host git call in a workspace names it, with
+  `core.fsmonitor`, hooks, signing, `core.sshCommand`, `credential.helper` and external diffs off
+  and no system config. A run that rewrites its workspace's `.git` changes nothing on the host. A
+  run inside a client workspace's container no longer has a usable `.git` there.
+- Previews are off by default (`clients.preview.enabled`, CONFIG 2.8, default `false`). Even
+  with its recipe read only from your own checkout, a preview runs the workspace's code (its
+  `package.json` scripts and whatever they load, which a model may have written) on this machine
+  as you, outside the dispatch sandbox. `darkmux config set clients.preview.enabled true` turns
+  it on. A running preview gets a stripped environment (`PATH`, `HOME`, `USER`, `LANG`, `TMPDIR`,
+  `TERM`, the recipe's `env` and its ports), and `env_from_source` never copies through a
+  symlink. Known gap: a file a running preview writes in the workspace during a run can be
+  committed as the run's.
+- Previews trust only your own checkout: a workspace's dev-server recipe, `.darkmux/preview.json`
+  (`schema_version` `1.0`, unknown keys refused), is read only from the checkout the workspace was
+  made from, never from the workspace a run edits. A workspace cloned from a URL gets no preview;
+  add `.darkmux/preview.json` to your own checkout of the repo and make the workspace from it.
 
 ## [5.9.3] - 2026-10-29
 
