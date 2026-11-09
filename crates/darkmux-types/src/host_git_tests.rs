@@ -85,6 +85,20 @@ fn run_written_command_names_the_held_git_dir_and_work_tree() {
     }
 }
 
+/// (#3460 review) No mode honors replace refs: a `refs/replace/<oid>`
+/// planted in a repository would change what every object read returns.
+#[test]
+fn every_mode_ignores_replace_refs() {
+    for cmd in [
+        HostGit::trusted("/r").command(&["show", "HEAD"]),
+        HostGit::run_written("/g", "/w").command(&["show", "HEAD"]),
+        HostGit::held_git_dir("/g").command(&["cat-file", "blob", "HEAD"]),
+    ] {
+        let set = env_of(&cmd, "GIT_NO_REPLACE_OBJECTS");
+        assert_eq!(set, Some(Some("1".to_string())), "{cmd:?}");
+    }
+}
+
 #[test]
 fn a_held_git_dir_names_only_the_git_dir_and_extra_config_follows_the_hardening() {
     let cmd = HostGit::held_git_dir("/g").with_config(&["tag.gpgsign=false"]).command(&["rev-parse", "HEAD"]);

@@ -4576,6 +4576,180 @@ async fn a_template_becomes_a_fresh_local_project_named_for_the_bot() {
     assert!(!h.base.join(".bakery.partial").exists());
 }
 
+/// A project made from the fixture as a template, after committing `with`
+/// (a recipe, and a page to serve) to the fixture; its name and directory.
+async fn template_project(h: &Harness, token: &str, with: Option<Value>) -> (String, PathBuf) {
+    if let Some(json) = with {
+        recipe(&h.fixture, json);
+        std::fs::write(h.fixture.join("index.html"), "from the template").unwrap();
+        run_git(Some(&h.fixture), &["add", "-A"]);
+        run_git(Some(&h.fixture), &["commit", "--quiet", "-m", "recipe"]);
+    }
+    let body = serde_json::json!({"repo_url": HCR, "template": true, "bot": "Bakery"});
+    let (code, v) = call(h, post("/client/workspaces", Some(token), body)).await;
+    assert_eq!(code, 201, "{v}");
+    let name = v["workspace"].as_str().unwrap().to_string();
+    let dir = h.base.join(&name);
+    (name, dir)
+}
+
+/// (#3460) A project made from a template previews from the recipe in its
+/// first commit, darkmux's own, recorded beside the workspace: `GET
+/// /client/recipe` and a start both use it, and an edit to the recipe in
+/// the workspace (uncommitted, then committed by a run) changes nothing.
+#[tokio::test]
+async fn a_template_project_previews_from_its_first_commits_recipe() {
+    let h = harness();
+    let token = paired(&h).await;
+    let json = serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}});
+    let (name, ws) = template_project(&h, &token, Some(json)).await;
+    let base = h.base.canonicalize().unwrap();
+    let recorded = std::fs::read_to_string(base.join(format!(".{name}.template"))).unwrap();
+    assert_eq!(
+        recorded.trim(),
+        run_git(Some(&ws), &["rev-parse", "HEAD"]),
+        "the first commit, beside the workspace"
+    );
+    let auth = bearer(&token);
+    let (code, v) = call(
+        &h,
+        get(
+            &format!("/client/recipe?workspace={name}"),
+            &[("authorization", &auth)],
+        ),
+    )
+    .await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["recipe"]["command"], serve());
+    let hostile = serde_json::json!({"command": format!("touch pwned; {}", serve()), "env": {"PORT": "{port}"}});
+    for commit in [false, true] {
+        recipe(&ws, hostile.clone());
+        if commit {
+            run_git(
+                Some(&ws),
+                &["commit", "--quiet", "-am", "a run edits the recipe"],
+            );
+        }
+        let (code, v) = start_preview(&h, &token, &name).await;
+        assert_eq!(code, 202, "{v}");
+        let ready = preview_until(&h, &token, &name, &["ready", "failed"]).await;
+        assert_eq!(ready["status"], "ready", "{ready}");
+        h.state.previews.stop(&name);
+        let script = h
+            .containers
+            .specs
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .script
+            .clone();
+        assert!(
+            !script.contains("pwned") && script.contains(&serve()),
+            "committed={commit}: {script}"
+        );
+        let (_, v) = call(
+            &h,
+            get(
+                &format!("/client/recipe?workspace={name}"),
+                &[("authorization", &auth)],
+            ),
+        )
+        .await;
+        assert_eq!(v["recipe"]["command"], serve(), "committed={commit}");
+    }
+    assert!(!ws.join("pwned").exists(), "the workspace's recipe ran");
+}
+
+/// (#3460 review) A template whose `.gitignore` (or the user's global
+/// excludes) ignores `.darkmux/` still has its recipe in the project's first
+/// commit, so it still previews.
+#[tokio::test]
+async fn an_ignored_recipe_still_reaches_the_first_commit() {
+    let h = harness();
+    let token = paired(&h).await;
+    recipe(
+        &h.fixture,
+        serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}),
+    );
+    std::fs::write(h.fixture.join(".gitignore"), ".darkmux/\n").unwrap();
+    run_git(
+        Some(&h.fixture),
+        &["add", "-f", ".gitignore", ".darkmux/preview.json"],
+    );
+    run_git(
+        Some(&h.fixture),
+        &["commit", "--quiet", "-m", "ignored recipe"],
+    );
+    let (name, ws) = template_project(&h, &token, None).await;
+    let listed = run_git(Some(&ws), &["ls-tree", "--name-only", "-r", "HEAD"]);
+    assert!(
+        listed.lines().any(|l| l == ".darkmux/preview.json"),
+        "{listed}"
+    );
+    let (code, v) = start_preview(&h, &token, &name).await;
+    assert_eq!(code, 202, "{v}");
+    h.state.previews.stop(&name);
+}
+
+/// (#3460) A template recipe that lists `env_from_source` files is refused
+/// naming the key (a template project has no checkout of the user's to
+/// copy them from), and one without a recipe says why. A clone that takes
+/// the name of an old template project inherits nothing.
+#[tokio::test]
+async fn template_projects_without_a_usable_recipe_say_why() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (bare, _) = template_project(&h, &token, None).await;
+    let (code, v) = start_preview(&h, &token, &bare).await;
+    assert_eq!(code, 404, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("first commit"), "{v}");
+    let json = serde_json::json!({"command": serve(), "env_from_source": [".env"]});
+    let (name, _) = template_project(&h, &token, Some(json)).await;
+    let (code, v) = start_preview(&h, &token, &name).await;
+    assert_eq!(code, 422, "{v}");
+    assert!(
+        v["error"].as_str().unwrap().contains("`env_from_source`"),
+        "{v}"
+    );
+    let (code, v) = call(
+        &h,
+        get(
+            &format!("/client/recipe?workspace={name}"),
+            &[("authorization", &bearer(&token))],
+        ),
+    )
+    .await;
+    assert_eq!(code, 422, "{v}");
+    // A stale template record under the name a clone then takes.
+    let base = h.base.canonicalize().unwrap();
+    let first = std::fs::read_to_string(base.join(format!(".{name}.template"))).unwrap();
+    std::fs::write(base.join(".hcr.template"), first).unwrap();
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"repo_url": HCR}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 201, "{v}");
+    assert!(
+        !base.join(".hcr.template").exists(),
+        "the clone forgot the old record"
+    );
+    let (code, v) = start_preview(&h, &token, "hcr").await;
+    assert_eq!(code, 404, "{v}");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap()
+            .contains("not made from a checkout of yours"),
+        "{v}"
+    );
+}
+
 #[tokio::test]
 async fn a_template_is_never_reused() {
     let h = harness();

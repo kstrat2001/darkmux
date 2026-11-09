@@ -52,11 +52,12 @@
 //! (`.darkmux/preview.json`) is a command darkmux runs, so it is read only
 //! from the checkout the workspace's worktree was made from (`source_path`),
 //! as darkmux recorded it when it made the workspace, and never from the
-//! workspace, where a Coder run writes. A workspace cloned from a URL (or
-//! made from a template) gets no preview, and neither does one whose checkout
-//! has no recipe; the refusal names why and says to add
-//! `.darkmux/preview.json` to your own checkout of the repo
-//! ([`crate::client_preview`]).
+//! workspace, where a Coder run writes. A project made from a template
+//! (#3460) trusts the recipe in its first commit, the one darkmux made,
+//! read from the repository darkmux holds. A workspace cloned from a URL
+//! gets no preview, and neither does one whose checkout has no recipe; the
+//! refusal names why and says to add `.darkmux/preview.json` to your own
+//! checkout of the repo ([`crate::client_preview`]).
 //!
 //! **Host git never reads what a run can write.** A workspace is mounted
 //! read-write into the run's container, so its `.git` and config are the
@@ -1706,8 +1707,8 @@ pub(crate) async fn recipe_handler(
             (_, Some(n)) => Ok(n.clone()),
             _ => unreachable!("checked above"),
         };
-        match name.and_then(|n| workspace_and_checkout(&st, &n)) {
-            Ok((dir, checkout)) => read_recipe(&dir, &checkout),
+        match name.and_then(|n| workspace_and_recipe_source(&st, &n)) {
+            Ok((_dir, source)) => read_recipe(&source),
             Err(r) => *r,
         }
     })
@@ -1729,11 +1730,11 @@ fn workspace_of_workdir(state: &ClientServerState, w: &str) -> Result<String, Re
     }
 }
 
-/// The recipe in the user's `checkout`, checked, as `{"recipe": {..}}`.
-fn read_recipe(dir: &Path, checkout: &Path) -> Response {
-    match crate::client_preview::load_recipe(checkout) {
+/// The recipe from its trusted `source`, checked, as `{"recipe": {..}}`.
+fn read_recipe(source: &crate::client_preview::RecipeSource) -> Response {
+    match source.load() {
         Ok(recipe) => Json(RecipeReply { recipe }).into_response(),
-        Err(e) => recipe_refusal(&no_recipe_in(checkout, dir, e)),
+        Err(e) => recipe_refusal(&no_recipe_in(source, e)),
     }
 }
 
@@ -1945,10 +1946,15 @@ fn template_workspace(
         Some(r) => format!("{normalized}@{r}"),
         None => normalized.to_string(),
     };
-    if let Err(e) = start_fresh(&base, &name, &format!("Start from {from}")) {
+    // (#3460) The first commit is darkmux's own: its recipe is the one a
+    // preview of this project trusts, recorded beside the workspace.
+    let started = start_fresh(&base, &name, &format!("Start from {from}"))
+        .and_then(|commit| crate::client_workspace::record_template_commit(&base, &name, &commit));
+    if let Err(e) = started {
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(crate::client_git::clone_git_dir(&base, &name));
         crate::client_git::forget_git_dir(&base, &name);
+        crate::client_workspace::forget_template_commit(&base, &name);
         return internal(anyhow!("starting {name} from the template: {e}"));
     }
     match workspace_dir(state, &name) {
@@ -1976,8 +1982,8 @@ fn free_project_name(base: &Path, bot: &str) -> Option<String> {
 
 /// Drops the clone's history and remote and makes it a new repo on `main`
 /// with everything in one commit, its repository again held by darkmux
-/// outside the work tree.
-fn start_fresh(base: &Path, name: &str, message: &str) -> Result<(), String> {
+/// outside the work tree. Returns that commit's SHA.
+fn start_fresh(base: &Path, name: &str, message: &str) -> Result<String, String> {
     let dir = base.join(name);
     let git_dir = crate::client_git::clone_git_dir(base, name);
     std::fs::remove_dir_all(&git_dir).map_err(|e| format!("removing the template's history: {e}"))?;
@@ -1996,6 +2002,12 @@ fn start_fresh(base: &Path, name: &str, message: &str) -> Result<(), String> {
         work_tree: canon(&dir)?,
         git_dir: canon(&git_dir)?,
     };
+    first_commit(dir, message)
+}
+
+/// Commits everything in the fresh project as its first commit; returns
+/// its SHA.
+fn first_commit(dir: &WorkCopy, message: &str) -> Result<String, String> {
     // A Mac with no git identity yet can still commit here: this project
     // gets its own, and the owner's takes over once there is one.
     if git_line(dir, &["config", "user.email"]).unwrap_or_default().is_empty() {
@@ -2003,7 +2015,15 @@ fn start_fresh(base: &Path, name: &str, message: &str) -> Result<(), String> {
         git_quiet(dir, &["config", "user.email", "darkmux@localhost"])?;
     }
     git_quiet(dir, &["add", "-A"])?;
-    git_quiet(dir, &["commit", "--quiet", "-m", message])
+    // (#3460 review) The recipe a preview of this project trusts is read
+    // from this commit, so it goes in even when an ignore rule (the
+    // template's `.gitignore`, the user's global excludes) leaves it out.
+    let recipe = crate::client_preview::RECIPE_PATH;
+    if std::fs::symlink_metadata(dir.work_tree.join(recipe)).is_ok() {
+        git_quiet(dir, &["add", "-f", "--", recipe])?;
+    }
+    git_quiet(dir, &["commit", "--quiet", "-m", message])?;
+    git_line(dir, &["rev-parse", "HEAD"]).ok_or_else(|| "reading the first commit".to_string())
 }
 
 /// The repo's workspace already here, its remote-tracking refs fetched.
@@ -2052,6 +2072,7 @@ fn place_clone(
     // no source record, whatever an earlier workspace of this name had. Its
     // repository is the one darkmux cloned it into, outside the work tree.
     crate::client_workspace::forget_source(base, name);
+    crate::client_workspace::forget_template_commit(base, name);
     cg::record_git_dir(base, name, &git_dir).map_err(|e| Box::new(internal(anyhow!(e))))
 }
 
@@ -2214,26 +2235,41 @@ fn recipe_refusal(r: &crate::client_preview::RecipeRefusal) -> Response {
     err(code, r.message())
 }
 
-/// Workspace `name`'s directory and the user's own checkout it was made
-/// from (where its recipe is read); a 404 naming why there is none.
-fn workspace_and_checkout(state: &ClientServerState, name: &str) -> Result<(PathBuf, PathBuf), Refused> {
+/// Workspace `name`'s directory and where its recipe is trusted from: the
+/// first commit of a project darkmux made from a template (#3460), else the
+/// user's own checkout it was made from; a 404 naming why there is neither.
+fn workspace_and_recipe_source(
+    state: &ClientServerState,
+    name: &str,
+) -> Result<(PathBuf, crate::client_preview::RecipeSource), Refused> {
+    use crate::client_preview::RecipeSource;
     let dir = workspace_dir(state, name)?;
     let base = (state.worktrees_base)().map_err(|e| Box::new(internal(anyhow!(e))))?;
+    if let Some(commit) = crate::client_workspace::template_commit_of(&base, name) {
+        let held = crate::client_git::work_copy_of(&base, name, &dir).ok_or_else(|| {
+            refuse(
+                StatusCode::NOT_FOUND,
+                format!(
+                    "darkmux holds no repository for template project {name}, so it has no preview"
+                ),
+            )
+        })?;
+        let git_dir = held.git_dir;
+        return Ok((dir, RecipeSource::TemplateCommit { git_dir, commit }));
+    }
     let checkout = crate::client_workspace::own_checkout_of(&base, name, &dir)
         .map_err(|e| refuse(StatusCode::NOT_FOUND, e))?;
-    Ok((dir, checkout))
+    Ok((dir, RecipeSource::Checkout(checkout)))
 }
 
-/// A recipe the user's checkout lacks, said with what to do about it.
+/// A recipe the trusted source lacks, said with what to do about it.
 fn no_recipe_in(
-    checkout: &Path,
-    dir: &Path,
+    source: &crate::client_preview::RecipeSource,
     r: crate::client_preview::RecipeRefusal,
 ) -> crate::client_preview::RecipeRefusal {
-    use crate::client_preview::RecipeRefusal as R;
-    match r {
-        R::NotFound(_) => {
-            let _ = dir;
+    use crate::client_preview::{RecipeRefusal as R, RecipeSource};
+    match (r, source) {
+        (R::NotFound(_), RecipeSource::Checkout(checkout)) => {
             let repo = crate::client_workspace::checkout_origin(checkout).unwrap_or_else(|| "this repo".to_string());
             R::NotFound(format!(
                 "no .darkmux/preview.json in your checkout {}: add .darkmux/preview.json to your own \
@@ -2241,7 +2277,11 @@ fn no_recipe_in(
                 checkout.display()
             ))
         }
-        other => other,
+        (R::NotFound(_), RecipeSource::TemplateCommit { commit, .. }) => R::NotFound(format!(
+            "the template this project was made from had no .darkmux/preview.json in its first commit \
+             {commit}, so it has no preview (a recipe added in the workspace is never read)"
+        )),
+        (other, _) => other,
     }
 }
 
@@ -2291,19 +2331,19 @@ fn previews_allowed(state: &ClientServerState) -> Result<(), Refused> {
     }
 }
 
-/// Starts workspace `name`'s preview from the recipe in its checkout.
+/// Starts workspace `name`'s preview from its trusted recipe.
 fn start_preview(state: &ClientServerState, name: &str) -> Response {
     if let Err(r) = previews_allowed(state) {
         return *r;
     }
-    let (dir, checkout) = match workspace_and_checkout(state, name) {
+    let (dir, source) = match workspace_and_recipe_source(state, name) {
         Ok(found) => found,
         Err(r) => return *r,
     };
-    match state.previews.start(name, &dir, &checkout) {
+    match state.previews.start(name, &dir, &source) {
         Ok((v, true)) => Json(v).into_response(),
         Ok((v, false)) => (StatusCode::ACCEPTED, Json(v)).into_response(),
-        Err(e) => recipe_refusal(&no_recipe_in(&checkout, &dir, e)),
+        Err(e) => recipe_refusal(&no_recipe_in(&source, e)),
     }
 }
 

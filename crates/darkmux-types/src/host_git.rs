@@ -21,8 +21,9 @@
 //!   `--git-dir` and `--work-tree`, so nothing is discovered from the tree:
 //!   a planted `.git` there is never read, its config never applies.
 //!
-//! Both modes add [`HARDENING_CONFIG`], `GIT_CONFIG_NOSYSTEM=1` and the
-//! [`CLEARED_ENV`] removals, and the subcommand gets [`DIFF_SAFETY`] and
+//! Every mode adds [`HARDENING_CONFIG`], `GIT_CONFIG_NOSYSTEM=1`,
+//! `GIT_NO_REPLACE_OBJECTS=1` (a planted `refs/replace/` never changes what
+//! an object read returns) and the [`CLEARED_ENV`] removals, and the subcommand gets [`DIFF_SAFETY`] and
 //! [`IGNORE_SUBMODULES`] where it takes them.
 //!
 //! **Limits, stated.** A filter driver defined in the user's GLOBAL config
@@ -225,6 +226,9 @@ impl HostGit {
     fn base(&self) -> Command {
         let mut cmd = Command::new("git");
         cmd.env("GIT_CONFIG_NOSYSTEM", "1");
+        // (#3460 review) A `refs/replace/<oid>` planted in a repository would
+        // change what every object read returns.
+        cmd.env("GIT_NO_REPLACE_OBJECTS", "1");
         for var in CLEARED_ENV {
             cmd.env_remove(var);
         }

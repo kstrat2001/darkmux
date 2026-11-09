@@ -101,6 +101,17 @@ darkmux release.
   (CONFIG 2.8, `DARKMUX_CLIENTS_PREVIEW_IDLE_MINUTES`; default `15`, `0` = never), the way a stop
   does, and says so in its log. The setting is read at each check, so `darkmux config set` applies
   without a restart.
+- A project made from a template gets a preview (#3460). darkmux records the project's first
+  commit, the one it made itself, beside the workspace, and reads the template's
+  `.darkmux/preview.json` as it was there, with host git from the repository darkmux holds, never
+  from the work tree: an edit to the recipe in the workspace, committed or not, changes nothing.
+  Every object on the recipe's path is checked against its id and replace refs are ignored, so a
+  forged object or a planted replace ref in that repository changes nothing, and the recipe goes
+  into the first commit even when the template's `.gitignore` or your global excludes leave
+  `.darkmux` out. The recipe must be a regular file within the size cap and is parsed as strictly as a checkout's
+  (the recipe keeps darkmux's own shape; an app keeps its template keys in a file of its own). A
+  template recipe that lists `env_from_source` files is refused, naming the key. `GET
+  /client/recipe` and a preview start both use it; a plain URL clone still gets none.
 - Previews trust only your own checkout: a workspace's dev-server recipe, `.darkmux/preview.json`
   (`schema_version` `1.0`, unknown keys refused), is read only from the checkout the workspace was
   made from, never from the workspace a run edits. A workspace cloned from a URL gets no preview;
