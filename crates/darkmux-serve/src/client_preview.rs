@@ -31,7 +31,10 @@
 //! is missing there. `env_from_source` copies untracked files (like `.env`)
 //! from that same checkout into the workspace, never overwriting. The dev
 //! server runs in its own process group with a watchdog: it stops when
-//! darkmux stops, when it is stopped, or when it exits on its own.
+//! darkmux stops, when it is stopped, or when it exits on its own. It and
+//! its install step get a stripped environment ([`PREVIEW_ENV_KEPT`] plus
+//! the recipe's `env` and the ports), so nothing else `client serve` was
+//! started with (an exported API key) reaches the workspace's code.
 
 use crate::client_wire::PreviewState;
 use darkmux_types::data_version::PREVIEW_RECIPE_SCHEMA_VERSION;
@@ -454,12 +457,25 @@ fn set(entry: &Arc<Mutex<Entry>>, status: Status) -> bool {
     true
 }
 
+/// The only variables of `client serve`'s own environment a preview's
+/// processes get: what a dev server needs to find its tools and a home.
+/// Everything else (an API key exported where `client serve` started, a
+/// token) stays out of code the workspace holds, which a run may have
+/// written. The recipe's own `env` and the port variables are added on top.
+pub const PREVIEW_ENV_KEPT: &[&str] = &["PATH", "HOME", "USER", "LANG", "TMPDIR", "TERM"];
+
 fn sh(command: &str, workdir: &Path, log: &Path) -> std::process::Command {
     let out = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
         .open(log);
     let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.env_clear();
+    for key in PREVIEW_ENV_KEPT {
+        if let Some(v) = std::env::var_os(key) {
+            cmd.env(key, v);
+        }
+    }
     cmd.arg("-c")
         .arg(command)
         .current_dir(workdir)
@@ -708,6 +724,54 @@ mod tests {
     fn ports_are_substituted() {
         assert_eq!(substitute("{port}:{hmrPort}", 4100, 4200), "4100:4200");
         assert_eq!(substitute("127.0.0.1", 1, 2), "127.0.0.1");
+    }
+
+    /// Waits for the preview to fail and returns its state.
+    fn until_failed(previews: &Previews, name: &str) -> serde_json::Value {
+        let mut v = serde_json::Value::Null;
+        for _ in 0..200 {
+            v = serde_json::to_value(previews.status(name).unwrap()).unwrap();
+            if v["status"] == "failed" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        v
+    }
+
+    /// (review) The dev server and its install step get a stripped
+    /// environment: the few variables a dev server needs, the recipe's own
+    /// `env` and the ports, and nothing else `client serve` was started
+    /// with, so an API key exported there never reaches code a run wrote.
+    #[test]
+    #[serial_test::serial]
+    fn a_preview_gets_only_a_minimal_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().join("w");
+        std::fs::create_dir_all(&wt).unwrap();
+        let recipe = serde_json::json!({
+            "schema_version": "1.0",
+            "command": "env > server-env.txt; exit 3",
+            "env": {"FROM_RECIPE": "yes {port}"},
+            "install": {"command": "env > install-env.txt", "unless_exists": "deps"}
+        });
+        std::fs::create_dir_all(wt.join(".darkmux")).unwrap();
+        std::fs::write(wt.join(".darkmux/preview.json"), recipe.to_string()).unwrap();
+        unsafe { std::env::set_var("SOME_PROVIDER_API_KEY", "must-not-leak") };
+        let previews = Previews::new(dir.path().join("p"), std::process::id());
+        let (state, _) = previews.start("w", &wt, &wt).unwrap();
+        let v = until_failed(&previews, "w");
+        unsafe { std::env::remove_var("SOME_PROVIDER_API_KEY") };
+        assert_eq!(v["status"], "failed", "{v}");
+        for file in ["server-env.txt", "install-env.txt"] {
+            let env = std::fs::read_to_string(wt.join(file)).unwrap();
+            assert!(!env.contains("must-not-leak") && !env.contains("SOME_PROVIDER_API_KEY"), "{file}: {env}");
+            assert!(env.lines().any(|l| l.starts_with("PATH=")), "{file} keeps PATH: {env}");
+            assert!(env.lines().any(|l| l.starts_with("HOME=")), "{file} keeps HOME: {env}");
+        }
+        let server = std::fs::read_to_string(wt.join("server-env.txt")).unwrap();
+        assert!(server.contains(&format!("FROM_RECIPE=yes {}", state.port)), "{server}");
+        assert!(server.contains(&format!("DARKMUX_PREVIEW_PORT={}", state.port)), "{server}");
     }
 
     #[test]
