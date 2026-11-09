@@ -178,6 +178,21 @@ pub fn line(wc: &WorkCopy, args: &[&str]) -> Option<String> {
     run(wc, None, args).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
+/// [`command`] run to completion; its output, or git's error (every stderr
+/// line, so a failure names the file it failed on).
+pub fn run_or_why(wc: &WorkCopy, index: Option<&Path>, args: &[&str]) -> Result<std::process::Output, String> {
+    let out = command(wc, index)
+        .args(args)
+        .output()
+        .map_err(|e| format!("running git: {e}"))?;
+    if out.status.success() {
+        return Ok(out);
+    }
+    let err = String::from_utf8_lossy(&out.stderr);
+    let lines: Vec<&str> = err.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    Err(if lines.is_empty() { format!("git {} failed", args.join(" ")) } else { lines.join("; ") })
+}
+
 /// [`command`] for its effect; the last stderr line on failure.
 pub fn quiet(wc: &WorkCopy, args: &[&str]) -> Result<(), String> {
     let out = command(wc, None)

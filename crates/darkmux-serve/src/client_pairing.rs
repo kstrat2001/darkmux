@@ -453,6 +453,9 @@ pub enum WorkStatus {
     Done {
         result: Value,
         changes: Option<RunChanges>,
+        /// Why the changes could not be read (then `changes` is `None` and
+        /// nothing is committed): never read as "no changes".
+        changes_error: Option<String>,
     },
     Error(RunError),
     /// Its owner cancelled it and it has ended; how its child ended, if it
@@ -1298,9 +1301,9 @@ fn run_work(
     // never reported as the run's change. A run in the same work copy
     // as this client's undecided finished run continues it (a tweak):
     // it inherits that run's baseline, and that run is folded into this.
-    let baseline = git.as_ref().and_then(snapshot_tree);
+    let baseline = git.as_ref().map(snapshot_tree);
     if let Some(e) = works.lock().unwrap().get_mut(&id) {
-        e.baseline = baseline.clone();
+        e.baseline = baseline.as_ref().and_then(|b| b.as_ref().ok()).map(|b| b.tree.clone());
     }
     let flag = cancel.clone();
     let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| execute(spec, flag)));
@@ -1336,23 +1339,40 @@ fn run_work(
     }
 }
 
+/// What a finished run changed, or why that could not be read. No work
+/// copy (or none darkmux holds) is neither.
+fn run_changes(
+    git: Option<&WorkCopy>,
+    baseline: Option<&Result<Snapshot, String>>,
+) -> (Option<RunChanges>, Option<String>) {
+    match (git, baseline) {
+        (Some(w), Some(Ok(before))) => match changes_since(w, &before.tree) {
+            Ok(c) => (Some(c), None),
+            Err(e) => (None, Some(format!("reading the run's changes failed: {e}"))),
+        },
+        (Some(_), Some(Err(e))) => (None, Some(format!("reading the work copy before the run failed: {e}"))),
+        _ => (None, None),
+    }
+}
+
 /// How a run ended. A cancelled run ends as cancelled, however its child
 /// reported.
 fn run_status(
     ran: std::thread::Result<Result<Value, RunError>>,
     cancel: &CancelFlag,
     git: Option<&WorkCopy>,
-    baseline: Option<&String>,
+    baseline: Option<&Result<Snapshot, String>>,
 ) -> WorkStatus {
     match ran {
         Ok(r) if cancel.requested() => WorkStatus::Cancelled(r.err()),
         Err(_) if cancel.requested() => WorkStatus::Cancelled(None),
         Ok(Ok(result)) => {
-            let changes = match (git, baseline) {
-                (Some(w), Some(before)) => changes_since(w, before),
-                _ => None,
-            };
-            WorkStatus::Done { result, changes }
+            let (changes, changes_error) = run_changes(git, baseline);
+            WorkStatus::Done {
+                result,
+                changes,
+                changes_error,
+            }
         }
         Ok(Err(e)) => WorkStatus::Error(e),
         Err(_) => WorkStatus::Error(RunError {
@@ -2396,7 +2416,12 @@ fn work_status_json(w: WorkEntry) -> WorkState {
     match w.status {
         WorkStatus::Running if w.cancel.requested() => WorkState::Cancelling,
         WorkStatus::Running => WorkState::Running,
-        WorkStatus::Done { result, changes } => WorkState::Done {
+        WorkStatus::Done {
+            result,
+            changes,
+            changes_error,
+        } => WorkState::Done {
+            changes_error,
             result,
             changes,
             commit: w.commit.as_deref().map(short),
@@ -2857,34 +2882,54 @@ fn git(wd: &WorkCopy, index: Option<&Path>, args: &[&str]) -> Option<std::proces
 /// work copy's own index, branch and files are never touched (only blob and
 /// tree objects are added to its object store). `None` when `wd` is not in
 /// a git work copy.
-pub(crate) fn snapshot_tree(wd: &WorkCopy) -> Option<String> {
-    // Outside a git work copy `git add` fails, which is the `None`.
-    let scratch = tempfile::tempdir().ok()?;
+pub(crate) fn snapshot_tree(wd: &WorkCopy) -> Result<Snapshot, String> {
+    let scratch = tempfile::tempdir().map_err(|e| format!("a scratch index: {e}"))?;
     let index = scratch.path().join("index");
-    git(wd, Some(&index), &["add", "-A"])?;
-    let tree = git(wd, Some(&index), &["write-tree"])?;
-    Some(String::from_utf8_lossy(&tree.stdout).trim().to_string())
+    let skipped = nested_repositories(wd)?;
+    // A repository inside the work copy (an empty `git init sub` makes
+    // `git add` fail outright; one with commits would be added as a link)
+    // is left out, by name, literally.
+    let excludes: Vec<String> = skipped.iter().map(|p| format!(":(exclude,literal){p}")).collect();
+    let mut add = vec!["add", "-A", "--", "."];
+    add.extend(excludes.iter().map(String::as_str));
+    crate::client_git::run_or_why(wd, Some(&index), &add)?;
+    let tree = crate::client_git::run_or_why(wd, Some(&index), &["write-tree"])?;
+    Ok(Snapshot {
+        tree: String::from_utf8_lossy(&tree.stdout).trim().to_string(),
+        skipped,
+    })
 }
 
-/// What changed in `wd` since the tree `before` ([`snapshot_tree`]):
-/// `{"files": [{"path","added","removed"}], "diff": "<unified diff>"}`, the
-/// diff capped at [`MAX_DIFF_BYTES`]. `added`/`removed` are null for a
-/// binary file. `None` when the work copy can no longer be read.
-pub(crate) fn changes_since(wd: &WorkCopy, before: &str) -> Option<RunChanges> {
+/// A work copy as one tree, and the repositories inside it the tree leaves
+/// out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Snapshot {
+    pub tree: String,
+    pub skipped: Vec<String>,
+}
+
+/// The untracked repositories inside the work copy: git lists each as one
+/// `path/` entry and does not descend into it.
+fn nested_repositories(wd: &WorkCopy) -> Result<Vec<String>, String> {
+    let out = crate::client_git::run_or_why(wd, None, &["ls-files", "-z", "--others", "--exclude-standard"])?;
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .split('\0')
+        .filter_map(|e| e.strip_suffix('/'))
+        .filter(|p| std::fs::symlink_metadata(wd.work_tree.join(p).join(".git")).is_ok())
+        .map(str::to_string)
+        .collect())
+}
+
+/// What changed in `wd` since the tree `before` ([`snapshot_tree`]): the
+/// files (lines added and removed, `null` for a binary file), the unified
+/// diff capped at [`MAX_DIFF_BYTES`], and the nested repositories left out.
+/// `Err` says why the work copy could not be read: never "no changes".
+pub(crate) fn changes_since(wd: &WorkCopy, before: &str) -> Result<RunChanges, String> {
     let after = snapshot_tree(wd)?;
-    let numstat = git(
+    let numstat = crate::client_git::run_or_why(
         wd,
         None,
-        &[
-            "diff",
-            "--no-renames",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--numstat",
-            "-z",
-            before,
-            &after,
-        ],
+        &["diff", "--no-renames", "--no-ext-diff", "--no-textconv", "--numstat", "-z", before, &after.tree],
     )?;
     let files: Vec<FileChange> = String::from_utf8_lossy(&numstat.stdout)
         .split('\0')
@@ -2900,22 +2945,15 @@ pub(crate) fn changes_since(wd: &WorkCopy, before: &str) -> Option<RunChanges> {
             })
         })
         .collect();
-    let patch = git(
+    let patch = crate::client_git::run_or_why(
         wd,
         None,
-        &[
-            "diff",
-            "--no-renames",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-color",
-            before,
-            &after,
-        ],
+        &["diff", "--no-renames", "--no-ext-diff", "--no-textconv", "--no-color", before, &after.tree],
     )?;
-    Some(RunChanges {
+    Ok(RunChanges {
         files,
         diff: capped_diff(&String::from_utf8_lossy(&patch.stdout)),
+        skipped: after.skipped,
     })
 }
 

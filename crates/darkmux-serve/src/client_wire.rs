@@ -114,6 +114,9 @@ pub struct FileChange {
 pub struct RunChanges {
     pub files: Vec<FileChange>,
     pub diff: String,
+    /// Repositories the run made inside the work copy (`git init sub`),
+    /// left out of the snapshot and so of the run's changes and commit.
+    pub skipped: Vec<String>,
 }
 
 /// `GET /client/work/{id}`: where a run stands.
@@ -131,6 +134,9 @@ pub enum WorkState {
         commit: Option<String>,
         branch: Option<String>,
         commit_error: Option<String>,
+        /// Why the run's changes could not be read (`changes` is then
+        /// `null` and nothing was committed): never "no changes".
+        changes_error: Option<String>,
         undone: bool,
     },
     Error {

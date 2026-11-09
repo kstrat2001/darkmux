@@ -169,6 +169,24 @@ fn harness() -> Harness {
                     std::fs::write(w.join("other.txt"), "tweak\n").unwrap();
                 }
             }
+            // "nested-init" makes an empty repository in `sub/` (as `git
+            // init` in a subfolder does) and edits a tracked file.
+            if spec.message == "nested-init" {
+                if let Some(w) = &spec.workdir {
+                    std::fs::create_dir_all(w.join("sub")).unwrap();
+                    assert!(std::process::Command::new("git").args(["init", "--quiet"]).arg(w.join("sub")).status().unwrap().success());
+                    std::fs::write(w.join("README.md"), "changed by the run\n").unwrap();
+                }
+            }
+            // "unreadable" leaves a file nobody can read, beside an edit.
+            if spec.message == "unreadable" {
+                if let Some(w) = &spec.workdir {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::write(w.join("locked.txt"), "secret\n").unwrap();
+                    std::fs::set_permissions(w.join("locked.txt"), std::fs::Permissions::from_mode(0o000)).unwrap();
+                    std::fs::write(w.join("README.md"), "changed by the run\n").unwrap();
+                }
+            }
             // A hostile run: it plants git config the host would obey (an
             // fsmonitor hook, or a clean filter its .gitattributes selects)
             // in a fresh `.git` where the work copy's was, then edits a file.
@@ -1934,7 +1952,7 @@ fn changes_exclude_what_the_work_copy_held_before_the_run() {
     )
     .unwrap();
     std::fs::write(dir.path().join("new.txt"), "a\nb\n").unwrap();
-    let c = serde_json::to_value(changes_since(&wc(dir.path()), &before).unwrap()).unwrap();
+    let c = serde_json::to_value(changes_since(&wc(dir.path()), &before.tree).unwrap()).unwrap();
     assert_eq!(
         c["files"],
         serde_json::json!([{"path": "new.txt", "added": 2, "removed": 0}, {"path": "pre.txt", "added": 1, "removed": 0}])
@@ -1959,8 +1977,8 @@ fn an_unchanged_work_copy_reports_no_changes() {
     std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
     let before = snapshot_tree(&wc(dir.path())).unwrap();
     assert_eq!(
-        serde_json::to_value(changes_since(&wc(dir.path()), &before).unwrap()).unwrap(),
-        serde_json::json!({"files": [], "diff": ""})
+        serde_json::to_value(changes_since(&wc(dir.path()), &before.tree).unwrap()).unwrap(),
+        serde_json::json!({"files": [], "diff": "", "skipped": []})
     );
 }
 
@@ -1973,7 +1991,7 @@ fn a_large_diff_is_capped_with_a_marker() {
         .map(|i| format!("line number {i} of a long file\n"))
         .collect();
     std::fs::write(dir.path().join("big.txt"), &big).unwrap();
-    let c = serde_json::to_value(changes_since(&wc(dir.path()), &before).unwrap()).unwrap();
+    let c = serde_json::to_value(changes_since(&wc(dir.path()), &before.tree).unwrap()).unwrap();
     let diff = c["diff"].as_str().unwrap();
     assert!(
         diff.len() <= MAX_DIFF_BYTES + DIFF_TRUNCATED_MARKER.len(),
@@ -1992,7 +2010,7 @@ fn a_large_diff_is_capped_with_a_marker() {
 fn a_workdir_that_is_not_a_git_repo_has_no_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
-    assert_eq!(snapshot_tree(&wc(dir.path())), None);
+    assert!(snapshot_tree(&wc(dir.path())).is_err());
 }
 
 #[tokio::test]
@@ -2790,6 +2808,48 @@ async fn host_git_never_runs_config_a_run_planted() {
         assert_eq!(code, 200, "{u}");
         assert!(!marker.exists());
     }
+}
+
+/// (review) A repository a run makes inside the work copy (`git init sub`)
+/// does not break the snapshot: it is left out and named, the run's own
+/// edit is reported and committed, and later runs still see their changes.
+#[tokio::test]
+async fn a_nested_repository_is_left_out_of_the_snapshot_and_named() {
+    let h = harness();
+    let token = paired(&h).await;
+    let _wt = git_workspace(&h, "nest");
+    let id = run_in(&h, &token, "nest", "nested-init").await;
+    let v = status(&h, &token, &id).await;
+    assert_eq!(v["changes_error"], Value::Null, "{v}");
+    let files: Vec<&str> = v["changes"]["files"].as_array().unwrap().iter().map(|f| f["path"].as_str().unwrap()).collect();
+    assert_eq!(files, ["README.md"], "{v}");
+    assert_eq!(v["changes"]["skipped"], serde_json::json!(["sub"]), "{v}");
+    assert!(v["commit"].is_string(), "{v}");
+    let id = run_in(&h, &token, "nest", "edit-other").await;
+    let v = status(&h, &token, &id).await;
+    let files: Vec<&str> = v["changes"]["files"].as_array().unwrap().iter().map(|f| f["path"].as_str().unwrap()).collect();
+    assert_eq!(files, ["other.txt"], "a later run still sees its change: {v}");
+}
+
+/// (review) A snapshot that fails is never "no changes": the run says the
+/// snapshot failed and why, and nothing is committed on a guess.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failed_snapshot_is_reported_never_read_as_no_changes() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = git_workspace(&h, "locked");
+    let id = run_in(&h, &token, "locked", "unreadable").await;
+    let v = status(&h, &token, &id).await;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(wt.join("locked.txt"), std::fs::Permissions::from_mode(0o600));
+    }
+    assert_eq!(v["status"], "done", "{v}");
+    assert_eq!(v["changes"], Value::Null, "{v}");
+    assert_eq!(v["commit"], Value::Null, "{v}");
+    let e = v["changes_error"].as_str().unwrap_or_else(|| panic!("the failure is named: {v}"));
+    assert!(e.contains("locked.txt"), "{v}");
 }
 
 #[tokio::test]

@@ -104,6 +104,7 @@ Recipe.schema_version: string
 RecipeReply.recipe: Recipe
 RunChanges.diff: string
 RunChanges.files: Array<FileChange>
+RunChanges.skipped: Array<string>
 StatusWord.status: string
 UndoReply.files: Array<string>
 UndoReply.revert: string
@@ -112,7 +113,7 @@ Whoami.machine: ClientMachine
 Whoami.scopes: ClientScopes
 WorkAccepted.profile: string
 WorkAccepted.work_id: string
-WorkState = { status: "running" } | { status: "cancelling" } | { result: any, changes?: RunChanges | null, commit?: string | null, branch?: string | null, commit_error?: string | null, undone: boolean, status: "done" } | { error: string, reason: string, status: "error" } | { reason: string, error?: string | null, status: "cancelled" }
+WorkState = { status: "running" } | { status: "cancelling" } | { result: any, changes?: RunChanges | null, commit?: string | null, branch?: string | null, commit_error?: string | null, changes_error?: string | null, undone: boolean, status: "done" } | { error: string, reason: string, status: "error" } | { reason: string, error?: string | null, status: "cancelled" }
 WorkspaceInfo.branch: string
 WorkspaceInfo.created: boolean
 WorkspaceInfo.fetch_error?: string | null
