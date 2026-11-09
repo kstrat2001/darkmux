@@ -496,10 +496,12 @@ pub struct ClientServerState {
     /// unset (any local profile), `Err` when it cannot be
     /// read (work is then refused, never run on a guessed policy).
     pub profiles_policy: Arc<dyn Fn() -> Result<Option<Vec<String>>, String> + Send + Sync>,
-    /// A profile's name, description, default model, endpoint kind, and
-    /// whether it answers now (`GET /client/profiles`); `Err` when the
-    /// registry doesn't have it.
-    pub profile_info: Arc<dyn Fn(&str) -> Result<ClientProfileInfo, String> + Send + Sync>,
+    /// Each named profile's description, default model, endpoint kind, and
+    /// whether it answers now (`GET /client/profiles`), in order; `Err` for
+    /// a name the registry doesn't have. One call per request, so the
+    /// registry and each server are looked at once, not once per profile.
+    pub profile_info:
+        Arc<dyn Fn(&[String]) -> Vec<Result<ClientProfileInfo, String>> + Send + Sync>,
     /// Whether a profile runs on this machine: every model LM Studio-managed
     /// or served from a loopback URL. With `clients.profiles` unset, an app
     /// may use any local profile; a hosted one only when granted.
@@ -556,7 +558,7 @@ impl ClientServerState {
                 }
             }),
             profiles_policy: Arc::new(read_profiles_policy),
-            profile_info: Arc::new(describe_profile),
+            profile_info: Arc::new(describe_profiles),
             profile_is_local: Arc::new(profile_runs_here),
             registry_profiles: Arc::new(|| {
                 darkmux_profiles::profiles::load_registry_quiet(None)
@@ -1011,10 +1013,12 @@ async fn profiles_handler(
     };
     let st = state.clone();
     let profiles = tokio::task::spawn_blocking(move || {
+        let infos = (st.profile_info)(&names);
         names
             .iter()
-            .map(|name| {
-                (st.profile_info)(name).unwrap_or_else(|e| ClientProfileInfo {
+            .zip(infos)
+            .map(|(name, info)| {
+                info.unwrap_or_else(|e| ClientProfileInfo {
                     name: name.clone(),
                     description: None,
                     model: None,
@@ -1058,57 +1062,105 @@ fn profile_runs_here(name: &str) -> Result<bool, String> {
     ))
 }
 
-/// The production [`ClientServerState::profile_info`]: the registry's entry,
-/// and a quick look at whether its server answers (about 1 s for a URL
-/// endpoint; LM Studio's own listing for a managed one).
-fn describe_profile(name: &str) -> Result<ClientProfileInfo, String> {
-    let loaded =
-        darkmux_profiles::profiles::load_registry_quiet(None).map_err(|e| format!("{e:#}"))?;
-    let profile = loaded
-        .registry
-        .profiles
-        .get(name)
-        .ok_or_else(|| format!("profile {name} is not in this machine's profiles.json"))?;
-    let model_id = profile.default_model_id().map(str::to_string);
-    let model = model_id
-        .as_deref()
-        .and_then(|id| profile.models.iter().find(|m| m.id == id));
-    let url = model
-        .and_then(|m| m.endpoint.as_ref())
-        .and_then(|e| e.url.clone());
-    let (endpoint, reachable, is_loaded) = match url {
-        Some(url) => {
-            // Any HTTP answer (401 included: it wants its key) means it's up.
-            let probe = format!("{}/models", url.trim_end_matches('/'));
-            let up = match ureq::get(&probe)
-                .timeout(std::time::Duration::from_secs(1))
-                .call()
-            {
-                Ok(_) | Err(ureq::Error::Status(..)) => true,
-                Err(_) => false,
-            };
-            ("url", up, Some(up))
+/// A listed profile before its server is looked at: name, description,
+/// default model, and that model's URL when it has one.
+type Entry = (String, Option<String>, Option<String>, Option<String>);
+
+/// The production [`ClientServerState::profile_info`]: the registry read
+/// once, each distinct server probed once and all at the same time (about
+/// 1 s at most), and LM Studio's listing asked for once. Looked at per
+/// profile, 30-odd local profiles took longer than an app waits.
+fn describe_profiles(names: &[String]) -> Vec<Result<ClientProfileInfo, String>> {
+    let loaded = match darkmux_profiles::profiles::load_registry_quiet(None) {
+        Ok(l) => l,
+        Err(e) => {
+            let e = format!("{e:#}");
+            return names.iter().map(|_| Err(e.clone())).collect();
         }
-        None => match darkmux_profiles::engine::lmstudio().loaded() {
-            Ok(models) => {
-                let want = model_id.as_deref().unwrap_or_default();
-                let here = models
-                    .iter()
-                    .any(|m| m.model == want || m.identifier.ends_with(want));
-                ("lmstudio", true, Some(here))
-            }
-            Err(_) => ("lmstudio", false, None),
-        },
     };
-    Ok(ClientProfileInfo {
-        name: name.to_string(),
-        description: profile.description.clone(),
-        model: model_id,
-        endpoint: endpoint.into(),
-        reachable,
-        loaded: is_loaded,
-        error: None,
-    })
+    let entries: Vec<Result<Entry, String>> =
+        names
+            .iter()
+            .map(|name| {
+                let profile = loaded.registry.profiles.get(name).ok_or_else(|| {
+                    format!("profile {name} is not in this machine's profiles.json")
+                })?;
+                let model_id = profile.default_model_id().map(str::to_string);
+                let url = model_id
+                    .as_deref()
+                    .and_then(|id| profile.models.iter().find(|m| m.id == id))
+                    .and_then(|m| m.endpoint.as_ref())
+                    .and_then(|e| e.url.clone());
+                Ok((name.clone(), profile.description.clone(), model_id, url))
+            })
+            .collect();
+    let mut urls: Vec<String> = entries
+        .iter()
+        .filter_map(|e| e.as_ref().ok().and_then(|(_, _, _, u)| u.clone()))
+        .collect();
+    urls.sort();
+    urls.dedup();
+    let up: HashMap<String, bool> = std::thread::scope(|s| {
+        let probes: Vec<_> = urls
+            .iter()
+            .map(|url| (url.clone(), s.spawn(move || server_answers(url))))
+            .collect();
+        probes
+            .into_iter()
+            .map(|(url, h)| (url, h.join().unwrap_or(false)))
+            .collect()
+    });
+    let needs_lmstudio = entries.iter().any(|e| matches!(e, Ok((_, _, _, None))));
+    let lmstudio = needs_lmstudio.then(|| darkmux_profiles::engine::lmstudio().loaded().ok());
+    entries
+        .into_iter()
+        .map(|e| {
+            let (name, description, model, url) = e?;
+            let (endpoint, reachable, is_loaded) = match url {
+                Some(url) => {
+                    let up = up.get(&url).copied().unwrap_or(false);
+                    ("url", up, Some(up))
+                }
+                None => match lmstudio.as_ref().and_then(|l| l.as_ref()) {
+                    Some(models) => {
+                        let want = model.as_deref().unwrap_or_default();
+                        let here = models
+                            .iter()
+                            .any(|m| m.model == want || m.identifier.ends_with(want));
+                        ("lmstudio", true, Some(here))
+                    }
+                    None => ("lmstudio", false, None),
+                },
+            };
+            Ok(ClientProfileInfo {
+                name,
+                description,
+                model,
+                endpoint: endpoint.into(),
+                reachable,
+                loaded: is_loaded,
+                error: None,
+            })
+        })
+        .collect()
+}
+
+/// One profile's entry ([`describe_profiles`] for a single name).
+#[cfg(test)]
+fn describe_profile(name: &str) -> Result<ClientProfileInfo, String> {
+    describe_profiles(&[name.to_string()]).remove(0)
+}
+
+/// Whether a model server answers within about a second. Any HTTP answer
+/// (401 included: it wants its key) means it's up.
+fn server_answers(url: &str) -> bool {
+    let probe = format!("{}/models", url.trim_end_matches('/'));
+    matches!(
+        ureq::get(&probe)
+            .timeout(std::time::Duration::from_secs(1))
+            .call(),
+        Ok(_) | Err(ureq::Error::Status(..))
+    )
 }
 
 async fn whoami_handler(State(state): State<ClientServerState>, headers: HeaderMap) -> Response {
