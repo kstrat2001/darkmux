@@ -740,7 +740,10 @@ The dispatch envelope, the flow records and the exit codes are unchanged. The fi
 - something darkmux did not start already holds the endpoint's port;
 - the server fails to start or exits early (the message names its log file);
 - the model does not fit even after darkmux evicts everything it owns;
-- the engine binary is missing, or its version is one darkmux has not verified.
+- the engine binary is missing, or its version is one darkmux has not verified;
+- the memory it needs is held by another darkmux dispatch that is still running, and `fleet.busy_policy` is `refuse` (the default).
+
+**Busy memory follows `fleet.busy_policy` (operator, 2026-11-09).** A local dispatch whose memory is held by a running dispatch gets the answer a fleet job gets for a busy seat: `refuse` says so at once, naming what is running; `queue` waits until the memory frees, bounded by the dispatch's timeout, with a `queued` line every 20 seconds so the wait never looks like a stall. An app that queues work sets `darkmux config set fleet.busy_policy queue` on the machine that runs it. A model held by a running dispatch is never evicted under it (the residency leases), whichever policy is set.
 
 ### What the operator sees
 
@@ -751,7 +754,6 @@ The dispatch envelope, the flow records and the exit codes are unchanged. The fi
 
 ### Still open
 
-- When the memory a dispatch needs is held by another dispatch that is still running, whether darkmux waits for it (bounded by the dispatch's timeout, with live records naming what it waits on) or refuses. The proposal is to wait, so an app can queue work and let darkmux order it.
 - How concurrent dispatches to one server share it.
 - An idle timeout that frees memory for programs other than darkmux.
 - How long a start takes at a 262k context, which sets what an eviction costs.
