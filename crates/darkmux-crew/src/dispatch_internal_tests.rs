@@ -2799,6 +2799,60 @@
         );
     }
 
+    /// (#3457) A read-write workdir whose `.git` is a real directory hands
+    /// the run that repository's config and hooks; `dispatch()` says so at
+    /// the call site, and stays quiet when the mount is read-only.
+    #[test]
+    #[serial]
+    fn dispatch_notes_a_read_write_mount_of_a_checkouts_git_dir() {
+        let tmp = TempDir::new().unwrap();
+        let checkout = tmp.path().join("checkout");
+        std::fs::create_dir(&checkout).unwrap();
+        let init = std::process::Command::new("git").current_dir(&checkout).args(["init", "-q"]).output().unwrap();
+        assert!(init.status.success());
+        let home = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+
+        let run = |read_only: bool| {
+            let mut opts = dispatch_preflight_probe_opts();
+            opts.workdir = Some(checkout.clone());
+            opts.workspace_read_only = read_only;
+            capture_preflight_warnings(|| {
+                let _ = dispatch(opts);
+            })
+        };
+        // Read-only FIRST: the note is printed once per message per process,
+        // so asking second would pass whatever the read-only branch did.
+        let read_only = run(true);
+        let writable = run(false);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        let note = writable
+            .iter()
+            .find(|m| m.contains("mounted read-write"))
+            .unwrap_or_else(|| panic!("dispatch() must note the writable `.git`; got {writable:?}"));
+        assert!(note.contains(&checkout.display().to_string()), "{note}");
+        assert!(!read_only.iter().any(|m| m.contains("mounted read-write")), "{read_only:?}");
+    }
+
+    #[test]
+    fn writable_git_dir_note_only_for_a_real_git_dir_on_a_writable_mount() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(writable_git_dir_note(tmp.path(), false), None, "no .git");
+        std::fs::write(tmp.path().join(".git"), "gitdir: /elsewhere\n").unwrap();
+        assert_eq!(writable_git_dir_note(tmp.path(), false), None, "a worktree's pointer file");
+        std::fs::remove_file(tmp.path().join(".git")).unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        assert_eq!(writable_git_dir_note(tmp.path(), true), None, "read-only mount");
+        assert!(writable_git_dir_note(tmp.path(), false).is_some_and(|m| m.contains("mounted read-write")));
+    }
+
     /// The negative half of the call site: an ordinary directory workdir
     /// must produce NO warning out of `dispatch()`. Without this, a call
     /// site mutated to warn unconditionally would still pass the positive
