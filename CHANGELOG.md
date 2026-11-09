@@ -16,6 +16,18 @@ darkmux release.
 
 ### Added
 
+- **A preview's install is redone when its inputs change, and an app can ask for a clean restart
+  (#3484).** `install.unless_exists: node_modules` skipped the install whenever `node_modules`
+  existed, so an install broken on an older image, or a dependency a run added, stayed broken.
+  After a successful install darkmux records a fingerprint beside the workspace (the runtime image
+  id, the install command, and the lockfiles present, else `package.json`; a symlinked lockfile
+  counts as its link text and is never followed), and skips the install only while it matches. A
+  failed install records nothing, so the next start retries. `POST
+  /client/workspaces/{name}/preview` takes an optional body, `{"clean": true}`: it stops the preview,
+  forgets the record and deletes the `unless_exists` path inside the workspace (a symlink there is
+  unlinked, never followed), then starts with a fresh install. No body, or `clean: false`, is a
+  plain start as before; an unknown key is refused (`bad_request`).
+
 - **Every client API refusal and failed run carries a code (#3468).** `darkmux client serve`'s refusal
   bodies gain `code` beside `error` (`preview_disabled`, `no_source_checkout`, `template_no_recipe` (a template project whose
   first commit has no recipe), `no_recipe`, `recipe_invalid`, `filter_in_repo_config`, `clone_failed`, and a class code for every
