@@ -13,6 +13,11 @@
 //! whose process exited, or was reused by another process, makes the record
 //! stale, and darkmux never signals that pid (contract 4). A record this
 //! darkmux cannot read (another schema, a corrupt file) claims nothing.
+//!
+//! The directory is the user's own, as `config.json` is: a record edited by
+//! hand to name a live process with its real start stamp would read as
+//! darkmux's, since nothing here compares the process's command line. The
+//! trust boundary is the home directory, not this file.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -151,7 +156,11 @@ fn plausible(rec: &EngineRecord) -> Result<(), String> {
 /// Hold `endpoint`'s record lock while a write or a compare-and-remove runs,
 /// so neither sees the other half done.
 fn record_lock(dir: &Path, endpoint: &str) -> std::io::Result<crate::flock::FlockGuard> {
+    real_dir(dir).map_err(invalid)?;
     let lock = checked_path(dir, endpoint)?.with_extension("json.lock");
+    if std::fs::symlink_metadata(&lock).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(invalid(format!("{} is a symlink, which darkmux never follows", lock.display())));
+    }
     crate::flock::lock_exclusive(&lock).map_err(|e| std::io::Error::other(format!("{e:#}")))
 }
 
@@ -485,5 +494,28 @@ mod tests {
         let same_pid_older = rec("tf", 1001, 0);
         assert!(!remove_if_in(dir.path(), &same_pid_older).unwrap(), "same pid, another start: not this server");
         assert!(read_in(dir.path(), "tf").unwrap().is_some());
+    }
+
+    /// (#3455 re-review) The compare-and-remove holds the record lock, so it
+    /// waits for a writer holding it; and a lock file planted as a symlink
+    /// is refused rather than created through.
+    #[test]
+    fn remove_waits_for_the_record_lock_and_a_symlinked_lock_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = rec("tf", 1001, 1);
+        write_in(dir.path(), &r).unwrap();
+        let held = record_lock(dir.path(), "tf").unwrap();
+        let (d, r2) = (dir.path().to_path_buf(), r.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let remover = std::thread::spawn(move || tx.send(remove_if_in(&d, &r2).unwrap()).unwrap());
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(), "removal waits while the lock is held");
+        drop(held);
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), "and removes once it is released");
+        remover.join().unwrap();
+        let planted = tempfile::tempdir().unwrap();
+        let victim = planted.path().join("victim");
+        std::os::unix::fs::symlink(&victim, path_in(planted.path(), "tf").with_extension("json.lock")).unwrap();
+        assert!(write_in(planted.path(), &rec("tf", 1001, 1)).is_err());
+        assert!(!victim.exists(), "nothing is created through a planted lock symlink");
     }
 }
