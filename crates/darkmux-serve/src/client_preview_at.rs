@@ -135,23 +135,15 @@ impl Frame {
 /// (a link is never followed). Iterative, with the open folders on an
 /// explicit stack: a run can build a tree deeper than any thread's stack.
 fn remove_tree_at(dir: RawFd, name: &OsStr) -> io::Result<()> {
-    let Some(st) = lstat_at(dir, name)? else {
+    let Some(first) = remove_or_open(dir, name)? else {
         return Ok(());
     };
-    if !is_dir(&st) {
-        return unlink_at(dir, name, 0);
-    }
-    let mut stack = vec![Frame::open(dir, name)?];
+    let mut stack = vec![first];
     while let Some(top) = stack.last_mut() {
         match top.pending.pop() {
             Some(entry) => {
                 if let Some(sub) = remove_or_open(top.fd.as_raw_fd(), &entry)? {
-                    if stack.len() >= MAX_DELETE_DEPTH {
-                        return Err(io::Error::other(format!(
-                            "the tree is deeper than {MAX_DELETE_DEPTH} folders, more than darkmux deletes; delete it yourself"
-                        )));
-                    }
-                    stack.push(sub);
+                    push_within_depth(&mut stack, sub)?;
                 }
             }
             None => {
@@ -161,6 +153,18 @@ fn remove_tree_at(dir: RawFd, name: &OsStr) -> io::Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// Descends into `sub`, unless that would make the walk deeper than
+/// [`MAX_DELETE_DEPTH`].
+fn push_within_depth(stack: &mut Vec<Frame>, sub: Frame) -> io::Result<()> {
+    if stack.len() >= MAX_DELETE_DEPTH {
+        return Err(io::Error::other(format!(
+            "the tree is deeper than {MAX_DELETE_DEPTH} folders, more than darkmux deletes; delete it yourself"
+        )));
+    }
+    stack.push(sub);
     Ok(())
 }
 
@@ -335,6 +339,39 @@ mod tests {
         let err = removed.unwrap_err();
         assert!(err.to_string().contains("deeper than"), "{err}");
         assert!(open_fds() <= before + 2, "descriptors left open");
+    }
+
+    /// A path that is not plain names, a root that is not there, a NUL in a
+    /// name and a missing folder on the way are each refused, touching
+    /// nothing.
+    #[test]
+    fn paths_the_walk_cannot_take_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("keep"), "x").unwrap();
+        for bad in ["", "../keep", "a/../keep", "/keep", "./keep"] {
+            let err = remove(dir.path(), bad).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{bad:?}: {err}");
+        }
+        assert_eq!(remove(&dir.path().join("missing"), "keep").unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert_eq!(remove(dir.path(), "ke\0ep").unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert!(create_new(dir.path(), "missing/new", 0o600).is_err(), "a missing folder on the way");
+        assert!(dir.path().join("keep").exists());
+    }
+
+    /// A folder whose entries cannot be unlinked (no write permission)
+    /// fails the delete with the OS's reason, rather than reporting it done.
+    #[test]
+    fn a_folder_that_cannot_be_emptied_fails_the_delete() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("deps/locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("f"), "x").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let out = remove(dir.path(), "deps");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(out.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert!(locked.join("f").exists());
     }
 
     /// A FIFO where the file should be is refused at once, never opened in a

@@ -1072,6 +1072,38 @@ fn a_misspelled_policy_written_while_serving_refuses_work() {
     assert_eq!(read_profiles_policy_at(&path), Ok(None), "no file is unset");
 }
 
+/// A config that cannot be read (here a folder where the file should be)
+/// or that is not JSON refuses client work, naming the file; it never
+/// reads as the defaults.
+#[test]
+fn an_unreadable_or_broken_config_refuses_client_work() {
+    let tmp = tempfile::tempdir().unwrap();
+    let e = read_config_at(tmp.path()).unwrap_err();
+    assert!(e.contains("could not be read") && e.contains("refusing client work"), "{e}");
+    let path = tmp.path().join("config.json");
+    for text in ["{not json", r#"{"clients": {"profiles": 5}}"#] {
+        std::fs::write(&path, text).unwrap();
+        let e = read_config_at(&path).unwrap_err();
+        assert!(e.contains("config.json") && e.contains("refusing client work"), "{text}: {e}");
+    }
+}
+
+/// The store's rewrite replaces the whole file; one it cannot write fails
+/// rather than reporting the store saved.
+#[test]
+fn the_store_rewrite_replaces_the_file_or_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("clients.json");
+    std::fs::write(&path, "x".repeat(4096)).unwrap();
+    let doc = ClientsFile::default();
+    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+    rewrite(&mut file, &doc).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(text, format!("{}\n", serde_json::to_string_pretty(&doc).unwrap()), "nothing of the old text is left");
+    let mut read_only = std::fs::File::open(&path).unwrap();
+    assert!(rewrite(&mut read_only, &doc).is_err());
+}
+
 // ─── Bind ────────────────────────────────────────────────────────────────
 
 #[test]
@@ -2265,6 +2297,24 @@ fn after_a_hard_kill_the_terminal_is_written_only_when_none_exists() {
         &[42],
         "containers are stopped regardless"
     );
+}
+
+/// The cancelled terminal goes to the sink; a sink that fails, or a run
+/// whose ids cannot be read, says why instead of passing silently.
+#[test]
+fn the_cancelled_terminal_is_written_or_the_failure_named() {
+    let mut got = None;
+    write_cancelled(&started(), |rec| {
+        got = Some(rec);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(got.map(|r| r.action), Some(darkmux_flow::FlowAction::DispatchError));
+    let err = write_cancelled(&started(), |_| Err(anyhow!("disk full"))).unwrap_err();
+    assert!(err.contains("exec-1") && err.contains("disk full"), "{err}");
+    let mut bad = started();
+    bad.session = "not a session".into();
+    assert!(write_cancelled(&bad, |_| panic!("never written")).is_err());
 }
 
 #[test]
@@ -5881,6 +5931,103 @@ async fn a_template_becomes_a_fresh_local_project_named_for_the_bot() {
     assert!(run_git(Some(&dir), &["remote"]).trim().is_empty());
     assert!(run_git(Some(&dir), &["status", "--porcelain"]).trim().is_empty(), "everything is in the first commit");
     assert!(!h.base.join(".bakery.partial").exists());
+}
+
+/// `req` through the router with `state` in place of the harness's, sent
+/// as this machine's app sends it.
+async fn call_with(state: ClientServerState, mut req: Request<Body>) -> (u16, Value) {
+    req.extensions_mut().insert(axum::extract::ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5555))));
+    req.headers_mut().insert(axum::http::header::HOST, BOUND.parse().unwrap());
+    let resp = router(state).oneshot(req).await.unwrap();
+    let code = resp.status().as_u16();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    (code, serde_json::from_slice(&bytes).unwrap())
+}
+
+/// With no worktrees base to put it in, neither a clone nor a template
+/// project is made: an internal error, and nothing cloned.
+#[tokio::test]
+async fn no_worktrees_base_makes_no_workspace() {
+    let h = harness();
+    let token = paired(&h).await;
+    let state = ClientServerState { worktrees_base: Arc::new(|| Err("no base".to_string())), ..h.state.clone() };
+    for body in [
+        serde_json::json!({"repo_url": HCR}),
+        serde_json::json!({"repo_url": HCR, "template": true, "bot": "Bakery"}),
+    ] {
+        let (code, v) = call_with(state.clone(), post("/client/workspaces", Some(&token), body.clone())).await;
+        assert_eq!((code, v["code"].as_str()), (500, Some("internal")), "{body}: {v}");
+    }
+    assert!(h.cloned.lock().unwrap().is_empty(), "nothing was cloned");
+}
+
+/// A template whose files git cannot read cannot become a project: the
+/// start fails and leaves nothing behind (no folder, no repository, no
+/// records), so the name is free again.
+#[tokio::test]
+async fn a_template_that_cannot_be_committed_leaves_nothing_behind() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = harness();
+    let token = paired(&h).await;
+    let clone = h.state.clone_repo.clone();
+    let state = ClientServerState {
+        clone_repo: Arc::new(move |url, r, dest, gd| {
+            clone(url, r, dest, gd)?;
+            std::fs::set_permissions(dest.join("README.md"), std::fs::Permissions::from_mode(0o000)).unwrap();
+            Ok(())
+        }),
+        ..h.state.clone()
+    };
+    let body = serde_json::json!({"repo_url": HCR, "template": true, "bot": "Bakery"});
+    let (code, v) = call_with(state, post("/client/workspaces", Some(&token), body)).await;
+    assert_eq!((code, v["code"].as_str()), (500, Some("internal")), "{v}");
+    let left: Vec<String> = std::fs::read_dir(&h.base)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("bakery"))
+        .collect();
+    assert!(left.is_empty(), "left behind: {left:?}");
+}
+
+/// Host git touches a workdir only as a workspace directly under the
+/// worktrees base whose repository darkmux recorded: never with no base,
+/// never a folder deeper down, never one with no record.
+#[tokio::test]
+async fn host_git_touches_only_a_recorded_workspace_directly_under_the_base() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (code, v) = call(&h, post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR}))).await;
+    assert_eq!(code, 201, "{v}");
+    let base = h.base.canonicalize().unwrap();
+    let hcr = base.join("hcr");
+    assert_eq!(work_copy_for(&h.state, &hcr).map(|w| w.work_tree), Some(hcr.clone()), "the recorded workspace");
+    std::fs::create_dir_all(hcr.join("deeper")).unwrap();
+    assert!(work_copy_for(&h.state, &hcr.join("deeper")).is_none(), "a folder inside it");
+    std::fs::create_dir_all(base.join("unrecorded")).unwrap();
+    assert!(work_copy_for(&h.state, &base.join("unrecorded")).is_none(), "no record");
+    let no_base = ClientServerState { worktrees_base: Arc::new(|| Err("no base".to_string())), ..h.state.clone() };
+    assert!(work_copy_for(&no_base, &hcr).is_none(), "no base");
+    assert!(work_copy_for(&h.state, Path::new("/")).is_none(), "no name");
+}
+
+/// A fresh project's first commit carries darkmux's own identity when the
+/// machine has none, and everything in the project.
+#[test]
+#[serial_test::serial]
+fn a_first_commit_on_a_machine_with_no_git_identity_is_darkmuxs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let (w, g) = (root.join("w"), root.join(".w.git"));
+    run_git(None, &["init", "-q", "--separate-git-dir", g.to_str().unwrap(), w.to_str().unwrap()]);
+    std::fs::write(w.join("page.txt"), "hi\n").unwrap();
+    let wd = WorkCopy { work_tree: w.clone(), git_dir: g.clone() };
+    let empty = root.join("empty-global");
+    std::fs::write(&empty, "").unwrap();
+    let sha = with_env_vars(&[("GIT_CONFIG_GLOBAL", empty.as_os_str())], || first_commit(&wd, "Start")).unwrap();
+    let gd = format!("--git-dir={}", g.display());
+    assert_eq!(run_git(None, &[&gd, "log", "-1", "--format=%an <%ae>", &sha]), "darkmux <darkmux@localhost>");
+    assert_eq!(run_git(None, &[&gd, "show", "--name-only", "--format=", &sha]), "page.txt");
 }
 
 /// A project made from the fixture as a template, after committing `with`
