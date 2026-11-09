@@ -1739,9 +1739,20 @@ pub enum ClientCmd {
     /// apps may run here (`clients.profiles`).
     List,
     /// Remove a paired client; its token stops working at once. An approval
-    /// its app has not collected yet is taken back too.
+    /// its app has not collected yet is taken back too. Its workspaces stay,
+    /// owned by no one until `client claim` gives them to a client.
     Revoke {
         /// The client's name (from `client list`).
         name: String,
+    },
+    /// Give a workspace darkmux made for a paired app to a paired client:
+    /// one made before workspaces had owners while several apps were paired,
+    /// or one whose client was revoked. `darkmux doctor` lists the
+    /// workspaces no paired client owns.
+    Claim {
+        /// The workspace's name (a folder under the worktrees base).
+        workspace: String,
+        /// The client's name (from `client list`).
+        client: String,
     },
 }

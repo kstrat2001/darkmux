@@ -980,6 +980,10 @@ fn proc_net_tcp_names_the_socket_at_the_peers_end() {
     let peer: std::net::SocketAddr = "127.0.0.1:54321".parse().unwrap();
     assert_eq!(crate::linux::connected_inode(table, peer, local), Some(41233));
     assert_eq!(crate::linux::connected_inode(table, peer, "127.0.0.1:1".parse().unwrap()), None);
+    // `tcp6`: a dual-stack client's socket shows its v4-mapped address.
+    let table6 = "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+   0: 0000000000000000FFFF00000100007F:D431 0000000000000000FFFF00000100007F:223F 01 00000000:00000000 00:00000000 00000000  1000        0 51233 1 0000000000000000 20 4 30 10 -1\n";
+    assert_eq!(crate::linux::connected_inode(table6, peer, local), Some(51233));
 }
 
 /// This host's strategy names the process at the other end of a loopback

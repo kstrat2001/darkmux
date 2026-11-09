@@ -144,7 +144,7 @@ fn held_workspaces(base: &Path) -> Vec<(String, crate::client_git::WorkCopy)> {
 
 /// The workspace under `base` whose origin is `normalized`, among those
 /// darkmux holds a repository for, that paired client `client` may be
-/// handed ([`pick_for`]).
+/// handed ([`pick_for`]): one it owns.
 pub fn find_by_origin(base: &Path, normalized: &str, client: &str) -> Option<String> {
     let names = held_workspaces(base)
         .into_iter()
@@ -716,21 +716,33 @@ fn owner_record(base: &Path, name: &str) -> PathBuf {
     base.join(format!(".{name}.client"))
 }
 
-/// Record that workspace `name` belongs to paired client `client`.
-/// Replaces any earlier record, never through a link.
+/// Record that workspace `name` belongs to the paired client whose id is
+/// `client`. Nothing is written when the record already says so; otherwise
+/// a new record replaces the old in one rename (never through a link), so a
+/// reader meanwhile sees the old owner or the new, never none.
 pub fn record_owner(base: &Path, name: &str, client: &str) -> Result<(), String> {
     use std::io::Write;
     if !valid_name(name) {
         return Err(format!("{name:?} is not a workspace name"));
     }
+    if owner_of(base, name).as_deref() == Some(client) {
+        return Ok(());
+    }
     let path = owner_record(base, name);
-    let _ = std::fs::remove_file(&path);
-    std::fs::OpenOptions::new()
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = base.join(format!(".{name}.client.{}-{n}.tmp", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    let written = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&path)
+        .open(&tmp)
         .and_then(|mut f| writeln!(f, "{client}"))
-        .map_err(|e| format!("recording {}'s app: {e}", path.display()))
+        .and_then(|()| std::fs::rename(&tmp, &path));
+    written.map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("recording {}'s app: {e}", path.display())
+    })
 }
 
 /// Forget which paired client workspace `name` was made for.
@@ -751,13 +763,19 @@ pub fn owner_of(base: &Path, name: &str) -> Option<String> {
     Some(text.trim_end_matches('\n').to_string()).filter(|t| !t.is_empty())
 }
 
-/// The first of `names` that paired client `client` owns, else the first
-/// darkmux made before workspaces had an owner (no record), which it may
-/// then claim. Another client's never.
+/// The first of `names` that paired client `client` owns. Another client's,
+/// or one no client owns, never.
 fn pick_for(base: &Path, names: Vec<String>, client: &str) -> Option<String> {
-    let owner = |n: &String| owner_of(base, n);
-    let owned = names.iter().find(|n| owner(n).as_deref() == Some(client)).cloned();
-    owned.or_else(|| names.into_iter().find(|n| owner(n).is_none()))
+    names.into_iter().find(|n| owner_of(base, n).as_deref() == Some(client))
+}
+
+/// The workspaces under `base` darkmux holds a repository for (made for a
+/// paired app), by name, sorted, with the client id each is recorded for.
+pub fn held_owners(base: &Path) -> Vec<(String, Option<String>)> {
+    held_workspaces(base).into_iter().map(|(n, _)| {
+        let owner = owner_of(base, &n);
+        (n, owner)
+    }).collect()
 }
 
 /// The checkout recorded for workspace `name`, if any (a record that is a

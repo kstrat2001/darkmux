@@ -45,11 +45,14 @@
 //! directly under the worktrees base (#3451 review): never the base itself,
 //! a dot entry beside the workspaces (darkmux's held repositories and
 //! records) or a path inside a workspace. And it must be one darkmux made
-//! for this client: every workspace records the client it was made for
-//! (`.<name>.client` beside it), and every route that names a workspace
-//! refuses another app's, a mission's worktrees, or any folder no app asked
-//! darkmux for ([`owned_workspace`]). One made before workspaces had an
-//! owner is claimed by the first client a workspace request hands it to.
+//! for this client: every workspace records the id of the client it was
+//! made for (`.<name>.client` beside it; an id, never the client's name,
+//! which a later pairing can reuse), and every route that names a workspace
+//! refuses another app's, a revoked client's, a mission's worktrees, or any
+//! folder no app asked darkmux for ([`owned_workspace`]). One made before
+//! workspaces had an owner goes to the paired client when exactly one is
+//! paired ([`adopt_unowned`]); otherwise only `darkmux client claim
+//! <workspace> <client>` gives it to one, and `darkmux doctor` lists it.
 //! `GET /client/recipe?workspace=` returns a workspace's preview recipe, for
 //! an app that cannot read the disk itself.
 //!
@@ -139,7 +142,11 @@ const KEEP_WORK_SECS: u64 = 3600;
 /// 1.1: records hold identity only; the per-record `scopes` of 1.0 is
 /// dropped when a 1.0 store is read (what a client may run is the machine's
 /// `clients.profiles` setting).
-pub const CLIENTS_SCHEMA_VERSION: &str = "1.1";
+///
+/// 1.2: every client has a stable random `id`, minted at approval, which its
+/// workspaces and runs are keyed by (never its display name, which a later
+/// pairing can reuse). A 1.1 store's clients get one when it is read.
+pub const CLIENTS_SCHEMA_VERSION: &str = "1.2";
 
 // ─── Store ───────────────────────────────────────────────────────────────
 
@@ -167,6 +174,9 @@ pub struct PendingRequest {
     /// The name the client will have, set at approval.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_name: Option<String>,
+    /// The id the client will have, minted at approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
 }
 
 impl PendingRequest {
@@ -183,6 +193,10 @@ impl PendingRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ApprovedClient {
     pub name: String,
+    /// Stable and random (`c-` and 16 hex digits), minted at approval: what
+    /// its workspaces and runs belong to. A later client given the same
+    /// name never inherits them.
+    pub id: String,
     /// Unix seconds.
     pub created: u64,
     /// BLAKE3 of the bearer token, hex. The token itself is never stored.
@@ -237,6 +251,17 @@ impl ClientStore {
         self.update(|f| Ok(f.clone()))
     }
 
+    /// The store as it is now, read without its lock and never written (an
+    /// older store is migrated in memory only; an absent one reads as
+    /// empty): for a reader that must change nothing, `darkmux doctor`.
+    pub fn peek(&self) -> Result<ClientsFile> {
+        match std::fs::read_to_string(&self.path) {
+            Ok(text) => Ok(parse_clients(&self.path, &text)?.0),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ClientsFile::default()),
+            Err(e) => Err(e).with_context(|| format!("reading {}", self.path.display())),
+        }
+    }
+
     /// Load, change, save, all under the file's exclusive lock. `f`'s error
     /// saves nothing.
     pub fn update<T>(&self, f: impl FnOnce(&mut ClientsFile) -> Result<T>) -> Result<T> {
@@ -246,10 +271,12 @@ impl ClientStore {
         file.take(darkmux_types::user_files::MAX_USER_FILE_BYTES + 1)
             .read_to_string(&mut text)
             .with_context(|| format!("reading {}", self.path.display()))?;
-        let mut doc = parse_clients(&self.path, &text)?;
+        let (mut doc, migrated) = parse_clients(&self.path, &text)?;
         let before = doc.clone();
         let out = f(&mut doc)?;
-        if doc != before {
+        // A migration mints ids, so it is written at once: they must be the
+        // same at the next read.
+        if migrated || doc != before {
             rewrite(guard.file(), &doc)?;
         }
         owner_only(&self.path)?;
@@ -270,9 +297,10 @@ fn rewrite(file: &mut std::fs::File, doc: &ClientsFile) -> Result<()> {
 
 /// Parse the store's text: empty is an empty store; an unknown key, a wrong
 /// type or a newer `schema_version` refuses, naming the file and the key.
-fn parse_clients(path: &Path, text: &str) -> Result<ClientsFile> {
+/// `true` beside it when an older store was migrated.
+fn parse_clients(path: &Path, text: &str) -> Result<(ClientsFile, bool)> {
     if text.trim().is_empty() {
-        return Ok(ClientsFile::default());
+        return Ok((ClientsFile::default(), false));
     }
     if text.len() as u64 > darkmux_types::user_files::MAX_USER_FILE_BYTES {
         bail!(
@@ -286,7 +314,9 @@ fn parse_clients(path: &Path, text: &str) -> Result<ClientsFile> {
     if let Some(v) = darkmux_types::data_version::newer(&doc, CLIENTS_SCHEMA_VERSION) {
         bail!("{} was written by a newer darkmux (schema_version {v}; this one reads {CLIENTS_SCHEMA_VERSION}). Upgrade darkmux.", path.display());
     }
+    let migrated = doc.get("schema_version").and_then(Value::as_str) != Some(CLIENTS_SCHEMA_VERSION);
     migrate_1_0(&mut doc);
+    migrate_1_1(&mut doc)?;
     let issues = darkmux_types::user_files::key_issues::<ClientsFile>(
         &doc,
         &darkmux_types::user_files::no_retired,
@@ -295,7 +325,8 @@ fn parse_clients(path: &Path, text: &str) -> Result<ClientsFile> {
         let lines: Vec<String> = issues.iter().map(ToString::to_string).collect();
         bail!("client store {}: {}", path.display(), lines.join("; "));
     }
-    serde_json::from_value(doc).with_context(|| format!("reading {}", path.display()))
+    let file = serde_json::from_value(doc).with_context(|| format!("reading {}", path.display()))?;
+    Ok((file, migrated))
 }
 
 /// A 1.0 store carried `scopes` on every record; 1.1 holds identity only.
@@ -310,7 +341,28 @@ fn migrate_1_0(doc: &mut Value) {
             }
         }
     }
+    doc["schema_version"] = Value::from("1.1");
+}
+
+/// A 1.1 store's clients had no id; each gets one now.
+fn migrate_1_1(doc: &mut Value) -> Result<()> {
+    if doc.get("schema_version").and_then(Value::as_str) != Some("1.1") {
+        return Ok(());
+    }
+    if let Some(items) = doc.get_mut("clients").and_then(Value::as_array_mut) {
+        for item in items.iter_mut().filter_map(Value::as_object_mut) {
+            if !item.contains_key("id") {
+                item.insert("id".to_string(), Value::from(new_client_id()?));
+            }
+        }
+    }
     doc["schema_version"] = Value::from(CLIENTS_SCHEMA_VERSION);
+    Ok(())
+}
+
+/// A new client id: `c-` and 16 random hex digits.
+fn new_client_id() -> Result<String> {
+    Ok(format!("c-{}", random_hex(8)?))
 }
 
 /// Keep the store owner-only, also when it existed with a wider mode.
@@ -406,6 +458,7 @@ pub fn approve(store: &ClientStore, request_id: &str, now: u64) -> Result<String
         let name = client_name_for(&p.device_name, &taken);
         p.status = PendingStatus::Approved;
         p.client_name = Some(name.clone());
+        p.client_id = Some(new_client_id()?);
         Ok(name)
     })
 }
@@ -424,6 +477,7 @@ pub fn deny(store: &ClientStore, request_id: &str, now: u64) -> Result<()> {
         }
         p.status = PendingStatus::Denied;
         p.client_name = None;
+        p.client_id = None;
         Ok(())
     })
 }
@@ -458,11 +512,78 @@ pub fn revoke(store: &ClientStore, name: &str) -> Result<bool> {
             if p.client_name.as_deref() == Some(name) {
                 p.status = PendingStatus::Denied;
                 p.client_name = None;
+                p.client_id = None;
                 found = true;
             }
         }
         Ok(found)
     })
+}
+
+/// The one paired client's id, when exactly one is paired.
+fn sole_client(store: &ClientStore) -> Result<Option<String>> {
+    let clients = store.read()?.clients;
+    Ok(match clients.as_slice() {
+        [only] => Some(only.id.clone()),
+        _ => None,
+    })
+}
+
+/// Gives every workspace darkmux made for a paired app (it holds its
+/// repository) that is recorded for no client to the one paired client,
+/// when exactly one is paired: an app that had workspaces before they had
+/// owners keeps them. With none or several paired they stay unowned, and
+/// no app may use them until the operator runs `darkmux client claim`. A
+/// workspace recorded for a client since revoked is not given away either.
+/// Returns the names given.
+pub fn adopt_unowned(store: &ClientStore, base: &Path) -> Result<Vec<String>> {
+    let Some(id) = sole_client(store)? else {
+        return Ok(Vec::new());
+    };
+    let mut given = Vec::new();
+    for (name, owner) in crate::client_workspace::held_owners(base) {
+        if owner.is_none() {
+            crate::client_workspace::record_owner(base, &name, &id).map_err(|e| anyhow!(e))?;
+            given.push(name);
+        }
+    }
+    Ok(given)
+}
+
+/// The workspaces darkmux made for a paired app that no paired client owns
+/// now: never recorded for one, or recorded for a client since revoked. No
+/// app may use them until `darkmux client claim` gives one to a client.
+/// Reads the store without writing it ([`ClientStore::peek`]).
+pub fn unowned_workspaces(store: &ClientStore, base: &Path) -> Result<Vec<String>> {
+    let live: Vec<String> = store.peek()?.clients.into_iter().map(|c| c.id).collect();
+    Ok(crate::client_workspace::held_owners(base)
+        .into_iter()
+        .filter(|(_, owner)| !owner.as_ref().is_some_and(|o| live.contains(o)))
+        .map(|(n, _)| n)
+        .collect())
+}
+
+/// `darkmux client claim <workspace> <client>`: gives a workspace darkmux
+/// made for a paired app to the paired client named `client` (by its
+/// `client list` name), whoever it was recorded for before. Refuses a
+/// folder darkmux did not make for an app (a mission's worktrees, anything
+/// made by hand). Returns the client's id.
+pub fn claim(store: &ClientStore, base: &Path, workspace: &str, client: &str) -> Result<String> {
+    let id = store
+        .read()?
+        .clients
+        .into_iter()
+        .find(|c| c.name == client)
+        .map(|c| c.id)
+        .ok_or_else(|| anyhow!("no paired client named {client} (see `darkmux client list`)"))?;
+    if !crate::client_workspace::held_owners(base).iter().any(|(n, _)| n == workspace) {
+        bail!(
+            "{workspace} is not a workspace darkmux made for a paired app under {}",
+            base.display()
+        );
+    }
+    crate::client_workspace::record_owner(base, workspace, &id).map_err(|e| anyhow!(e))?;
+    Ok(id)
 }
 
 /// A slug of the device name, unique against `taken`.
@@ -548,7 +669,8 @@ impl CancelFlag {
 
 #[derive(Debug, Clone)]
 pub struct WorkEntry {
-    pub client_name: String,
+    /// The client's id (never its name, which a later pairing can reuse).
+    pub client_id: String,
     pub created: u64,
     pub status: WorkStatus,
     pub cancel: Arc<CancelFlag>,
@@ -679,6 +801,10 @@ pub struct ClientServerState {
     pub preview_idle_minutes: PreviewMinutes,
     /// Which process on this machine sent a pairing request.
     pub peer_process: PeerProcess,
+    /// One [`ClientServerState::peer_process`] lookup at a time: a flood of
+    /// pairing requests queues for it instead of fanning out (each asks the
+    /// OS, `lsof` on macOS, about a third of a second).
+    pub pair_lookups: Arc<tokio::sync::Semaphore>,
     /// The process each waiting pairing request came from, by request id,
     /// when it could be told: no process holds more than
     /// [`PAIR_REQUESTS_PER_PROCESS`] of them. In memory only; a restart
@@ -748,6 +874,7 @@ impl ClientServerState {
             preview_idle_minutes: Arc::new(read_preview_idle_minutes),
             peer_process: Arc::new(|peer, bound| darkmux_platform::current().tcp_peer_pid(bound?, peer)),
             pair_peers: Arc::new(Mutex::new(HashMap::new())),
+            pair_lookups: Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }
 }
@@ -1113,20 +1240,11 @@ pub(crate) async fn pair_handler(
         return *r;
     }
     let now = (state.now)();
-    let request_id = match random_hex(16) {
-        Ok(h) => format!("r-{h}"),
+    let (record, from) = match new_request(&state, req, peer, now).await {
+        Ok(made) => made,
         Err(e) => return internal(e),
     };
-    let from = peer_process_of(&state, peer).await;
-    let record = PendingRequest {
-        request_id: request_id.clone(),
-        device_name: req.device_name,
-        code: req.code,
-        pair_secret_hash: hash_hex(&req.pair_secret),
-        created: now,
-        status: PendingStatus::Pending,
-        client_name: None,
-    };
+    let request_id = record.request_id.clone();
     match add_pending(&state, record, from, now) {
         Ok(true) => (
             StatusCode::ACCEPTED,
@@ -1141,12 +1259,59 @@ pub(crate) async fn pair_handler(
     }
 }
 
+/// A new pending request for `req`, and the process it came from when that
+/// is asked ([`request_process`]).
+async fn new_request(
+    state: &ClientServerState,
+    req: PairBody,
+    peer: Option<axum::extract::ConnectInfo<SocketAddr>>,
+    now: u64,
+) -> Result<(PendingRequest, Option<u32>)> {
+    let request_id = format!("r-{}", random_hex(16)?);
+    let from = request_process(state, peer, now).await?;
+    let record = PendingRequest {
+        request_id,
+        device_name: req.device_name,
+        code: req.code,
+        pair_secret_hash: hash_hex(&req.pair_secret),
+        created: now,
+        status: PendingStatus::Pending,
+        client_name: None,
+        client_id: None,
+    };
+    Ok((record, from))
+}
+
+/// The process on this machine a new pairing request came from, asked only
+/// when another request is waiting already: to one alone in the queue the
+/// per-process bound has nothing to say, so a lone app's pairing asks the
+/// OS nothing.
+async fn request_process(
+    state: &ClientServerState,
+    peer: Option<axum::extract::ConnectInfo<SocketAddr>>,
+    now: u64,
+) -> Result<Option<u32>> {
+    let others_waiting = state.store.read()?.pending.iter().any(|p| p.live(now));
+    Ok(match others_waiting {
+        true => peer_process_of(state, peer).await,
+        false => None,
+    })
+}
+
 /// The process on this machine a pairing request came from, when that can
-/// be told (off the async workers: it may ask the OS).
+/// be told. One lookup runs at a time ([`ClientServerState::pair_lookups`]),
+/// off the async workers; a request whose sender went away while it queued
+/// is dropped before its lookup starts.
 async fn peer_process_of(state: &ClientServerState, peer: Option<axum::extract::ConnectInfo<SocketAddr>>) -> Option<u32> {
     let axum::extract::ConnectInfo(p) = peer?;
+    let permit = state.pair_lookups.clone().acquire_owned().await.ok()?;
     let st = state.clone();
-    tokio::task::spawn_blocking(move || (st.peer_process)(p, st.bound)).await.unwrap_or(None)
+    tokio::task::spawn_blocking(move || {
+        let _one_at_a_time = permit;
+        (st.peer_process)(p, st.bound)
+    })
+    .await
+    .unwrap_or(None)
 }
 
 /// Stores a new pairing request from process `from` under the bounds
@@ -1217,8 +1382,13 @@ fn poll_pending(f: &mut ClientsFile, request_id: &str, secret: &str, now: u64) -
         let taken: Vec<String> = f.clients.iter().map(|c| c.name.clone()).collect();
         client_name_for(&p.device_name, &taken)
     });
+    let id = match p.client_id.clone() {
+        Some(id) => id,
+        None => new_client_id()?,
+    };
     f.clients.push(ApprovedClient {
         name: client_name.clone(),
+        id,
         created: now,
         token_hash: hash_hex(&token),
     });
@@ -1657,7 +1827,7 @@ fn admit(
     works.insert(
         work_id.clone(),
         WorkEntry {
-            client_name: client.name.clone(),
+            client_id: client.id.clone(),
             created: now,
             status: WorkStatus::Running,
             cancel: Arc::new(CancelFlag::default()),
@@ -1790,11 +1960,11 @@ fn check_capacity(
     now: u64,
 ) -> Result<(), Refused> {
     works.retain(|_, w| {
-        matches!(w.status, WorkStatus::Running) || now.saturating_sub(w.created) <= KEEP_WORK_SECS
+        matches!(w.status, WorkStatus::Running) || w.undoing || now.saturating_sub(w.created) <= KEEP_WORK_SECS
     });
     let running = works
         .values()
-        .filter(|w| w.client_name == client.name && matches!(w.status, WorkStatus::Running))
+        .filter(|w| w.client_id == client.id && matches!(w.status, WorkStatus::Running))
         .count();
     if running >= MAX_RUNNING_PER_CLIENT {
         return Err(refuse(
@@ -1832,7 +2002,7 @@ fn check_work_copy(
     }
     if let Some(c) = continues {
         let ok = works.get(c).is_some_and(|e| {
-            e.client_name == client.name
+            e.client_id == client.id
                 && e.workdir.as_ref() == Some(w)
                 && matches!(e.status, WorkStatus::Done { .. })
         });
@@ -2002,13 +2172,21 @@ fn workspace_dir(state: &ClientServerState, name: &str) -> Result<PathBuf, Refus
 }
 
 /// [`workspace_dir`], and only when darkmux made that workspace for
-/// `client` (its owner record, written when the workspace was made or first
-/// handed to it): a 403 for another app's workspace, a mission's worktrees
-/// or any folder no app asked darkmux for.
+/// `client` (its owner record, by client id, written when the workspace was
+/// made, by [`adopt_unowned`] or by `client claim`): a 403 for another app's
+/// workspace, a revoked client's, a mission's worktrees or any folder no app
+/// asked darkmux for.
 fn owned_workspace(state: &ClientServerState, client: &ApprovedClient, name: &str) -> Result<PathBuf, Refused> {
     let dir = workspace_dir(state, name)?;
     let base = (state.worktrees_base)().map_err(|e| internal(anyhow!(e)))?;
-    if crate::client_workspace::owner_of(&base, name).as_deref() != Some(client.name.as_str()) {
+    let owner = match crate::client_workspace::owner_of(&base, name) {
+        None => {
+            adopt_unowned(&state.store, &base).map_err(internal)?;
+            crate::client_workspace::owner_of(&base, name)
+        }
+        recorded => recorded,
+    };
+    if owner.as_deref() != Some(client.id.as_str()) {
         return Err(forbidden(format!(
             "workspace {name} was not made for this app: an app works only in a workspace darkmux \
              made for it (POST /client/workspaces)"
@@ -2101,7 +2279,7 @@ pub(crate) async fn workspace_create_handler(
 ) -> Response {
     use crate::client_workspace as ws;
     let client = match authenticate(&state, &headers) {
-        Ok(c) => c.name,
+        Ok(c) => c.id,
         Err(r) => return *r,
     };
     let req: WorkspaceBody = match json_body(body).await {
@@ -2137,6 +2315,13 @@ fn bot_slug(bot: Option<&str>) -> String {
     }
 }
 
+/// The client's own workspace `find` names, if any, after
+/// [`adopt_unowned`] has given out what it may.
+fn reusable(state: &ClientServerState, base: &Path, find: impl FnOnce() -> Option<String>) -> Result<Option<String>, Refused> {
+    adopt_unowned(&state.store, base).map_err(|e| Box::new(internal(e)))?;
+    Ok(find())
+}
+
 /// Makes (or hands back) a workspace for paired client `client`: every
 /// workspace darkmux makes records the client it was made for, and only
 /// that client may use it ([`owned_workspace`]).
@@ -2163,11 +2348,10 @@ fn clone_workspace(state: &ClientServerState, url: &str, normalized: &str, made:
         Err(e) => return internal(anyhow!(e)),
     };
     let _one_at_a_time = state.workspace_lock.lock().unwrap();
-    if let Some(name) = ws::find_by_origin(&base, normalized, made.client) {
-        if let Err(e) = ws::record_owner(&base, &name, made.client) {
-            return internal(anyhow!(e));
-        }
-        return existing_clone(state, &name);
+    match reusable(state, &base, || ws::find_by_origin(&base, normalized, made.client)) {
+        Ok(Some(name)) => return existing_clone(state, &name),
+        Ok(None) => {}
+        Err(r) => return *r,
     }
     let taken = |n: &str| {
         std::fs::symlink_metadata(base.join(n)).is_ok()
@@ -2364,20 +2548,27 @@ fn worktree_workspace(state: &ClientServerState, source: &Path, made: &Made, bot
         Err(r) => return *r,
     };
     let _one_at_a_time = state.workspace_lock.lock().unwrap();
-    if let Some(name) = ws::find_worktree_of(&base, &common, bot, made.client) {
-        return reused_worktree(state, &base, &name, &source, made.client);
+    match reusable(state, &base, || ws::find_worktree_of(&base, &common, bot, made.client)) {
+        Ok(Some(name)) => reused_worktree(state, &base, &name, &source),
+        Ok(None) => new_worktree(state, &base, (&source, &common), made, bot),
+        Err(r) => *r,
     }
-    let Some(name) = free_worktree_name(&base, &source, bot) else {
+}
+
+/// A new worktree workspace of `source` (its git common dir beside it) for
+/// `made`'s client, recorded; taken back again if it cannot be recorded.
+fn new_worktree(state: &ClientServerState, base: &Path, (source, common): (&Path, &Path), made: &Made, bot: &str) -> Response {
+    let Some(name) = free_worktree_name(base, source, bot) else {
         return err(
             StatusCode::CONFLICT, ClientCode::Conflict,
             "no free workspace name for this checkout",
         );
     };
-    match add_bot_worktree(state, &source, made.git_ref, bot, &base.join(&name)) {
-        Ok(added) => match record_worktree(&base, &name, &source, &common, made.client) {
+    match add_bot_worktree(state, source, made.git_ref, bot, &base.join(&name)) {
+        Ok(added) => match record_worktree(base, &name, source, common, made.client) {
             Ok(()) => created_worktree(state, &name, added.0, added.1),
             Err(e) => {
-                remove_worktree(&source, &base.join(&name), &added.2);
+                remove_worktree(source, &base.join(&name), &added.2);
                 internal(anyhow!(e))
             }
         },
@@ -2412,12 +2603,10 @@ fn record_worktree(base: &Path, name: &str, source: &Path, common: &Path, client
     crate::client_workspace::record_owner(base, name, client)
 }
 
-/// This bot's existing worktree of the checkout, its checkout recorded again
-/// (the one previews read their recipe from), and this client's.
-fn reused_worktree(state: &ClientServerState, base: &Path, name: &str, source: &Path, client: &str) -> Response {
-    let recorded = crate::client_workspace::record_source(base, name, source)
-        .and_then(|()| crate::client_workspace::record_owner(base, name, client));
-    if let Err(e) = recorded {
+/// This bot's existing worktree of the checkout (one of this client's), its
+/// checkout recorded again (the one previews read their recipe from).
+fn reused_worktree(state: &ClientServerState, base: &Path, name: &str, source: &Path) -> Response {
+    if let Err(e) = crate::client_workspace::record_source(base, name, source) {
         return internal(anyhow!(e));
     }
     match workspace_dir(state, name) {
@@ -2952,7 +3141,7 @@ pub(crate) async fn work_status_handler(
     };
     let entry = state.works.lock().unwrap().get(&work_id).cloned();
     match entry {
-        Some(w) if w.client_name == client.name => {
+        Some(w) if w.client_id == client.id => {
             let st = state.clone();
             tokio::task::spawn_blocking(move || Json(work_status_json(&st, &work_id, w)).into_response())
                 .await
@@ -3094,7 +3283,7 @@ pub(crate) async fn cancel_handler(
     };
     let works = state.works.lock().unwrap();
     match works.get(&work_id) {
-        Some(w) if w.client_name == client.name => match w.status {
+        Some(w) if w.client_id == client.id => match w.status {
             WorkStatus::Running => {
                 w.cancel.request();
                 (
@@ -3161,7 +3350,7 @@ fn committed_run(
 ) -> Result<WorkEntry, Refused> {
     let client = authenticate(state, headers)?;
     let entry = state.works.lock().unwrap().get(work_id).cloned();
-    let Some(w) = entry.filter(|w| w.client_name == client.name) else {
+    let Some(w) = entry.filter(|w| w.client_id == client.id) else {
         return Err(Box::new(not_found()));
     };
     if matches!(w.status, WorkStatus::Running) {

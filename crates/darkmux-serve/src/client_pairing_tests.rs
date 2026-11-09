@@ -64,8 +64,6 @@ fn harness() -> Harness {
     let clock = Arc::new(AtomicU64::new(1_000_000));
     let base = dir.path().join("worktrees");
     std::fs::create_dir_all(base.join("wt1")).unwrap();
-    // `wt1` is a workspace darkmux made for the first client a test pairs.
-    std::fs::write(base.join(".wt1.client"), format!("{FIRST_CLIENT}\n")).unwrap();
     let canon_base = base.canonicalize().unwrap();
     let ran = Arc::new(Mutex::new(Vec::new()));
     let policy: Arc<Mutex<Policy>> = Arc::new(Mutex::new(Ok(None)));
@@ -307,6 +305,7 @@ fn harness() -> Harness {
             _ => Some(100),
         }),
         pair_peers: Arc::new(Mutex::new(HashMap::new())),
+        pair_lookups: Arc::new(tokio::sync::Semaphore::new(1)),
     };
     Harness {
         activity,
@@ -407,13 +406,22 @@ async fn poll(h: &Harness, id: &str, secret: &str) -> (u16, Value) {
     .await
 }
 
-/// Pair, approve through the CLI-side verb, collect the token.
+/// Pair, approve through the CLI-side verb, collect the token. `wt1` is a
+/// workspace darkmux made for the first client a test pairs.
 async fn paired(h: &Harness) -> String {
     let id = request_pairing(h).await;
     approve(&h.store, &id, (h.state.now)()).unwrap();
     let (code, v) = poll(h, &id, SECRET).await;
     assert_eq!(code, 200, "{v}");
+    if let [only] = h.store.read().unwrap().clients.as_slice() {
+        own(h, "wt1", &only.id);
+    }
     v["token"].as_str().unwrap().to_string()
+}
+
+/// The id of the paired client named `name`.
+fn client_id(h: &Harness, name: &str) -> String {
+    h.store.read().unwrap().clients.into_iter().find(|c| c.name == name).unwrap().id
 }
 
 // ─── Only this machine ───────────────────────────────────────────────────
@@ -717,6 +725,38 @@ async fn an_unreadable_policy_does_not_consume_the_token_delivery() {
     assert!(v["token"].is_string());
 }
 
+/// The process a pairing request came from is asked only when another
+/// request is already waiting (a lone app's pairing asks the OS nothing),
+/// one lookup at a time however many requests arrive at once, and a request
+/// whose sender went away while it queued starts no lookup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_lookups_run_only_when_needed_one_at_a_time() {
+    let mut h = harness();
+    let (calls, inside, most) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+    let (c, n, m) = (calls.clone(), inside.clone(), most.clone());
+    h.state.peer_process = Arc::new(move |_peer, _bound| {
+        c.fetch_add(1, Ordering::SeqCst);
+        m.fetch_max(n.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        n.fetch_sub(1, Ordering::SeqCst);
+        Some(900)
+    });
+    let _ = request_pairing(&h).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "a lone request asks nothing");
+    let flood = (0..12u16).map(|i| call(&h, pair_from(CONTAINER_PEER_PORTS + i, "X")));
+    for (code, v) in futures::future::join_all(flood).await {
+        assert_eq!(code, 202, "{v}");
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 12);
+    assert_eq!(most.load(Ordering::SeqCst), 1, "never two lookups at once");
+    let held = h.state.pair_lookups.clone().acquire_owned().await.unwrap();
+    let gone = tokio::time::timeout(std::time::Duration::from_millis(50), call(&h, pair_from(CONTAINER_PEER_PORTS + 99, "X"))).await;
+    assert!(gone.is_err(), "it queued behind the held lookup");
+    drop(held);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 12, "a request whose sender went away starts no lookup");
+}
+
 /// An approval the app has not collected yet can be taken back: revoking
 /// the client name it will have (or denying the request) leaves a token
 /// nobody can collect, and the app hears `denied`.
@@ -838,7 +878,9 @@ async fn a_container_flooding_pair_requests_never_crowds_out_the_app() {
     }
     let id = request_pairing(&h).await;
     let now = (h.state.now)();
-    assert!(list_pending(&h.store, now).unwrap().len() <= PAIR_REQUESTS_PER_PROCESS + 1);
+    // Docker's first request, made to an empty queue, asked the OS nothing
+    // and counts only toward the cap; its others hold at most the bound.
+    assert!(list_pending(&h.store, now).unwrap().len() <= PAIR_REQUESTS_PER_PROCESS + 2);
     let found = find_by_code(&h.store, "4f7-k2q", now).unwrap();
     assert_eq!(found.request_id, id);
     approve(&h.store, &id, now).unwrap();
@@ -851,17 +893,19 @@ async fn a_container_flooding_pair_requests_never_crowds_out_the_app() {
 }
 
 /// The app's own newest request replaces its oldest past the same bound,
-/// so an app that asks again (a new code) is never refused.
+/// so an app that asks again (a new code) is never refused. Its first, made
+/// to an empty queue, asked the OS nothing, so it counts only toward the
+/// cap and is never replaced.
 #[tokio::test]
 async fn an_app_that_asks_again_replaces_its_oldest_request() {
     let h = harness();
     let mut ids = Vec::new();
-    for _ in 0..PAIR_REQUESTS_PER_PROCESS + 1 {
+    for _ in 0..PAIR_REQUESTS_PER_PROCESS + 2 {
         ids.push(request_pairing(&h).await);
     }
     let live: Vec<String> = list_pending(&h.store, (h.state.now)()).unwrap().into_iter().map(|p| p.request_id).collect();
-    assert_eq!(live, ids[1..], "the oldest went");
-    let (code, _) = poll(&h, &ids[0], SECRET).await;
+    assert_eq!(live, [ids[0].clone(), ids[2].clone(), ids[3].clone()], "the oldest it was asked about went");
+    let (code, _) = poll(&h, &ids[1], SECRET).await;
     assert_eq!(code, 404);
 }
 
@@ -1063,6 +1107,41 @@ fn a_1_0_store_is_read_with_its_scopes_dropped() {
     assert_eq!(f.schema_version, CLIENTS_SCHEMA_VERSION);
     assert_eq!(f.pending.len(), 1);
     assert_eq!(f.clients[0].name, "a");
+}
+
+/// A 1.1 store's clients get an id each when it is read, written at once,
+/// so the next read sees the same ids.
+#[test]
+fn a_1_1_store_gives_each_client_a_stable_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("clients.json");
+    std::fs::write(
+        &path,
+        r#"{"schema_version":"1.1","pending":[],"clients":[{"name":"a","created":1,"token_hash":"00"},{"name":"b","created":2,"token_hash":"00"}]}"#,
+    )
+    .unwrap();
+    let store = ClientStore::at(path.clone());
+    let first: Vec<String> = store.read().unwrap().clients.into_iter().map(|c| c.id).collect();
+    assert!(first.iter().all(|id| id.starts_with("c-") && id.len() == 18), "{first:?}");
+    assert_ne!(first[0], first[1]);
+    let again: Vec<String> = store.read().unwrap().clients.into_iter().map(|c| c.id).collect();
+    assert_eq!(first, again, "stable across reads");
+    assert_eq!(store.peek().unwrap().clients.into_iter().map(|c| c.id).collect::<Vec<_>>(), first);
+    assert!(std::fs::read_to_string(&path).unwrap().contains(r#""schema_version": "1.2""#));
+}
+
+/// `peek` (doctor's read) never writes: an older store stays as it was and
+/// an absent one is not created.
+#[test]
+fn peeking_at_the_store_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("clients.json");
+    assert!(ClientStore::at(path.clone()).peek().unwrap().clients.is_empty());
+    assert!(!path.exists(), "an absent store is not created");
+    let old = r#"{"schema_version":"1.1","pending":[],"clients":[{"name":"a","created":1,"token_hash":"00"}]}"#;
+    std::fs::write(&path, old).unwrap();
+    assert_eq!(ClientStore::at(path.clone()).peek().unwrap().clients.len(), 1);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), old, "not migrated on disk");
 }
 
 #[test]
@@ -2871,9 +2950,10 @@ async fn work_runs_only_in_a_workspace_made_for_this_app() {
     let token = paired(&h).await;
     std::fs::create_dir_all(h.base.join("darkmux-public/phase-1")).unwrap();
     git_workspace(&h, "theirs");
-    own(&h, "theirs", "other-app");
+    own(&h, "theirs", "c-0000000000000000");
     git_workspace(&h, "nobodys");
-    let _ = std::fs::remove_file(h.base.join(".nobodys.client"));
+    // With two apps paired, a workspace from before owners goes to neither.
+    let _second = paired(&h).await;
     let base = h.base.canonicalize().unwrap();
     for name in ["darkmux-public", "theirs", "nobodys"] {
         for body in [
@@ -2929,25 +3009,103 @@ async fn each_app_gets_its_own_workspace_of_a_repo() {
     assert!(h.ran.lock().unwrap().is_empty());
 }
 
-/// A workspace darkmux made before workspaces had an owner is claimed by the
-/// first app that asks for it again through `POST /client/workspaces`, and
-/// is then that app's alone.
+/// A workspace darkmux made before workspaces had an owner goes to the
+/// paired app when exactly one is paired: it keeps working there, with no
+/// set-up again.
 #[tokio::test]
-async fn an_unowned_workspace_is_claimed_by_the_app_that_asks_for_it() {
+async fn a_workspace_from_before_owners_goes_to_the_one_paired_app() {
+    let h = harness();
+    let token = paired(&h).await;
+    git_workspace(&h, "site");
+    assert_eq!(crate::client_workspace::owner_of(&h.base, "site"), None);
+    let id = run_in(&h, &token, "site", "edit-readme").await;
+    assert_eq!(status(&h, &token, &id).await["status"], "done");
+    assert_eq!(crate::client_workspace::owner_of(&h.base, "site"), Some(client_id(&h, FIRST_CLIENT)));
+}
+
+/// With two apps paired, a workspace from before owners goes to neither,
+/// whatever either asks for (its repo URL included); the operator gives it
+/// to one with `client claim`, and doctor's list shows it until then.
+#[tokio::test]
+async fn with_two_apps_paired_only_the_operator_gives_out_an_unowned_workspace() {
     let h = harness();
     let a = paired(&h).await;
-    let b = paired(&h).await;
     let make = |t: &str| post("/client/workspaces", Some(t), serde_json::json!({"repo_url": HCR}));
     let (code, v) = call(&h, make(&a)).await;
-    assert_eq!(code, 201, "{v}");
-    let _ = std::fs::remove_file(h.base.join(".hcr.client"));
+    assert_eq!((code, v["workspace"].as_str()), (201, Some("hcr")), "{v}");
+    std::fs::remove_file(h.base.join(".hcr.client")).unwrap();
+    let b = paired(&h).await;
+    assert_eq!(unowned_workspaces(&h.store, &h.base).unwrap(), ["hcr"]);
     let (code, v) = call(&h, make(&b)).await;
-    assert_eq!((code, v["workspace"].as_str()), (200, Some("hcr")), "{v}");
+    assert_eq!(code, 201, "b gets its own, never the unowned one: {v}");
+    assert_ne!(v["workspace"], "hcr");
     let work = |t: &str| post("/client/work", Some(t), serde_json::json!({"role": "coder", "message": "hi", "workspace": "hcr"}));
+    for t in [&a, &b] {
+        let (code, v) = call(&h, work(t)).await;
+        assert_eq!((code, v["code"].as_str()), (403, Some("forbidden")), "{v}");
+    }
+    assert!(claim(&h.store, &h.base, "hcr", "nobody").is_err(), "an unknown client");
+    std::fs::create_dir_all(h.base.join("darkmux-public/phase-1")).unwrap();
+    assert!(claim(&h.store, &h.base, "darkmux-public", FIRST_CLIENT).is_err(), "a mission's worktrees");
+    claim(&h.store, &h.base, "hcr", FIRST_CLIENT).unwrap();
+    assert!(unowned_workspaces(&h.store, &h.base).unwrap().is_empty());
     let (code, v) = call(&h, work(&a)).await;
-    assert_eq!(code, 403, "{v}");
-    let (code, v) = call(&h, work(&b)).await;
     assert_eq!(code, 202, "{v}");
+    let (code, _) = call(&h, work(&b)).await;
+    assert_eq!(code, 403);
+}
+
+/// A client's workspaces and runs belong to its id, not its name: after it
+/// is revoked, a new pairing given the same name inherits neither. Its
+/// workspaces stay unowned until the operator gives them to someone.
+#[tokio::test]
+async fn a_new_pairing_never_inherits_a_revoked_clients_workspaces_or_runs() {
+    let h = harness();
+    let old = paired(&h).await;
+    let (code, v) = call(&h, post("/client/workspaces", Some(&old), serde_json::json!({"repo_url": HCR}))).await;
+    assert_eq!(code, 201, "{v}");
+    let run = run_in(&h, &old, "hcr", "hello").await;
+    assert!(revoke(&h.store, FIRST_CLIENT).unwrap());
+    let new = paired(&h).await;
+    assert_eq!(list_clients(&h.store).unwrap()[0].name, FIRST_CLIENT, "the name is reused");
+    let (code, v) = call(&h, post("/client/work", Some(&new), serde_json::json!({"role": "coder", "message": "hi", "workspace": "hcr"}))).await;
+    assert_eq!((code, v["code"].as_str()), (403, Some("forbidden")), "{v}");
+    let (code, _) = call(&h, get(&format!("/client/work/{run}"), &[("authorization", &bearer(&new))])).await;
+    assert_eq!(code, 404, "the revoked client's run is not the new one's");
+    let (code, v) = call(&h, post("/client/workspaces", Some(&new), serde_json::json!({"repo_url": HCR}))).await;
+    assert_eq!(code, 201, "a workspace of its own: {v}");
+    assert_ne!(v["workspace"], "hcr");
+    assert_eq!(unowned_workspaces(&h.store, &h.base).unwrap(), ["hcr"]);
+}
+
+/// The owner record is written only when it changes, and replaced in one
+/// rename: a reader never finds a workspace with no owner while it changes.
+#[test]
+fn an_owner_record_is_replaced_atomically_and_only_when_it_changes() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().to_path_buf();
+    let ws = crate::client_workspace::record_owner;
+    ws(&base, "site", "c-a").unwrap();
+    let ino = std::fs::metadata(base.join(".site.client")).unwrap().ino();
+    ws(&base, "site", "c-a").unwrap();
+    assert_eq!(std::fs::metadata(base.join(".site.client")).unwrap().ino(), ino, "no write when it already says so");
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (b2, st) = (base.clone(), stop.clone());
+    let writer = std::thread::spawn(move || {
+        let mut i = 0u64;
+        while !st.load(Ordering::SeqCst) {
+            ws(&b2, "site", if i.is_multiple_of(2) { "c-b" } else { "c-a" }).unwrap();
+            i += 1;
+        }
+    });
+    for _ in 0..20_000 {
+        assert!(crate::client_workspace::owner_of(&base, "site").is_some(), "never unowned mid-change");
+    }
+    stop.store(true, Ordering::SeqCst);
+    writer.join().unwrap();
+    let names: Vec<String> = std::fs::read_dir(&base).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+    assert_eq!(names, [".site.client"], "no temporary file left");
 }
 
 // A local checkout becomes a worktree on a new branch; the owner's own
@@ -3143,13 +3301,13 @@ fn hold(h: &Harness, name: &str) {
     std::fs::rename(wt.join(".git"), &held).unwrap();
     std::fs::write(wt.join(".git"), format!("gitdir: {}\n", held.display())).unwrap();
     crate::client_git::record_git_dir(&h.base, name, &held).unwrap();
-    own(h, name, FIRST_CLIENT);
 }
 
 /// The name the first client a test pairs gets ("Sam's iPhone").
 const FIRST_CLIENT: &str = "sam-s-iphone";
 
-/// Records workspace `name` as made for `client`, as darkmux records it.
+/// Records workspace `name` as made for the client whose id is `client`, as
+/// darkmux records it.
 fn own(h: &Harness, name: &str, client: &str) {
     crate::client_workspace::record_owner(&h.base, name, client).unwrap();
 }
@@ -3575,6 +3733,21 @@ async fn no_run_starts_while_an_undo_reverts_in_the_same_copy() {
     assert_eq!(code, 202, "{v}");
 }
 
+/// An Undo still reverting is remembered however long ago its run was
+/// made, so no run starts in that copy meanwhile.
+#[tokio::test]
+async fn an_undo_in_progress_is_never_forgotten_as_old_work() {
+    let h = harness();
+    let token = paired(&h).await;
+    git_workspace(&h, "site");
+    let first = run_in(&h, &token, "site", "edit-readme").await;
+    h.state.works.lock().unwrap().get_mut(&first).unwrap().undoing = true;
+    h.clock.fetch_add(KEEP_WORK_SECS + 1, Ordering::SeqCst);
+    let body = serde_json::json!({"role": "coder", "message": "edit-other", "workspace": "site"});
+    let (code, v) = call(&h, post("/client/work", Some(&token), body)).await;
+    assert_eq!((code, v["code"].as_str()), (409, Some("conflict")), "{v}");
+}
+
 /// A run that is cancelled after editing the work copy gets its edits as
 /// its own commit, which Undo can revert; they never ride along in the next
 /// run's commit.
@@ -3634,6 +3807,7 @@ async fn undo_refuses_what_it_cant_do() {
     let token = paired(&h).await;
     let other = paired(&h).await;
     git_workspace(&h, "site");
+    own(&h, "site", &client_id(&h, FIRST_CLIENT));
     let quiet = run_in(&h, &token, "site", "hello").await;
     let (code, v) = call(
         &h,

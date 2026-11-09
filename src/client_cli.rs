@@ -32,6 +32,7 @@ pub fn run(sub: ClientCmd) -> Result<i32> {
             let (list, source) = darkmux_types::config_access::clients_profiles_with_source();
             list_to(&ClientStore::production(), now(), &policy_line(list, source), &mut std::io::stdout())
         }
+        ClientCmd::Claim { workspace, client } => claim(&workspace, &client),
         ClientCmd::Revoke { name } => {
             if cp::revoke(&ClientStore::production(), &name)? {
                 println!("revoked client {name}");
@@ -40,6 +41,21 @@ pub fn run(sub: ClientCmd) -> Result<i32> {
                 eprintln!("no paired client named {name} (see `darkmux client list`)");
                 Ok(1)
             }
+        }
+    }
+}
+
+/// `client claim <workspace> <client>`.
+fn claim(workspace: &str, client: &str) -> Result<i32> {
+    let base = darkmux_types::workdir::worktrees_base_dir();
+    match cp::claim(&ClientStore::production(), &base, workspace, client) {
+        Ok(_) => {
+            println!("workspace {workspace} now belongs to client {client}");
+            Ok(0)
+        }
+        Err(e) => {
+            eprintln!("{e:#}");
+            Ok(1)
         }
     }
 }
@@ -212,6 +228,49 @@ fn client_lines(store: &ClientStore, now: u64) -> Result<Vec<String>> {
     Ok(lines)
 }
 
+/// `darkmux doctor`'s row for client workspaces no paired client owns.
+pub(crate) fn doctor_checks() -> Vec<crate::doctor::Check> {
+    let base = darkmux_types::workdir::worktrees_base_dir();
+    let unowned = if base.is_dir() {
+        cp::unowned_workspaces(&ClientStore::production(), &base)
+    } else {
+        Ok(Vec::new())
+    };
+    vec![unowned_row(unowned)]
+}
+
+/// The row for `unowned`: Pass when every client workspace has a paired
+/// owner, Warn naming each one that has none and the command that gives it
+/// to a client.
+fn unowned_row(unowned: Result<Vec<String>>) -> crate::doctor::Check {
+    use crate::doctor::{Check, Status};
+    let name = "client workspaces".to_string();
+    match unowned {
+        Ok(list) if list.is_empty() => Check {
+            name,
+            status: Status::Pass,
+            message: "every workspace darkmux made for a paired app belongs to one".to_string(),
+            hint: None,
+        },
+        Ok(list) => Check {
+            name,
+            status: Status::Warn,
+            message: format!(
+                "no paired app owns {} (made before workspaces had owners while several apps were \
+                 paired, or its app was revoked), so no app can use it",
+                list.join(", ")
+            ),
+            hint: Some("`darkmux client claim <workspace> <client>` gives one to a client (`darkmux client list` names them)".to_string()),
+        },
+        Err(e) => Check {
+            name,
+            status: Status::Warn,
+            message: format!("could not read the client store: {e:#}"),
+            hint: None,
+        },
+    }
+}
+
 /// The command that approves a pairing, as every text names it.
 pub(crate) const APPROVE_COMMAND: &str = "darkmux client approve --code <CODE>";
 
@@ -257,6 +316,7 @@ mod tests {
                         created: 100 + i as u64,
                         status: cp::PendingStatus::Pending,
                         client_name: None,
+                        client_id: None,
                     });
                 }
                 Ok(())
@@ -367,6 +427,23 @@ mod tests {
         assert!(shown.contains("1 pairing request(s) waiting: darkmux client approve --code <CODE>"), "{shown}");
         assert!(cp::revoke(&store, &name).unwrap());
         assert!(!listed(&store, 200, "x").contains(&name), "taken back");
+    }
+
+    /// `client claim <workspace> <client>` parses, and doctor's row names each
+    /// workspace no paired app owns with the command that gives it to one.
+    #[test]
+    fn claim_parses_and_doctor_names_unowned_workspaces() {
+        use clap::Parser;
+        let cli = crate::cli::Cli::try_parse_from(["darkmux", "client", "claim", "hcr", "sam-s-iphone"]).unwrap();
+        let crate::cli::Cmd::Client { sub: ClientCmd::Claim { workspace, client } } = cli.command else {
+            panic!("not `client claim`");
+        };
+        assert_eq!((workspace.as_str(), client.as_str()), ("hcr", "sam-s-iphone"));
+        let row = unowned_row(Ok(vec!["hcr".into(), "site".into()]));
+        assert_eq!(row.status, crate::doctor::Status::Warn);
+        assert!(row.message.contains("hcr, site"), "{}", row.message);
+        assert!(row.hint.unwrap().contains("darkmux client claim <workspace> <client>"));
+        assert_eq!(unowned_row(Ok(Vec::new())).status, crate::doctor::Status::Pass);
     }
 
     /// The policy line credits `clients.profiles` to the tier that set it:
