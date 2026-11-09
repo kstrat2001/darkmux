@@ -436,7 +436,7 @@ use std::path::Path;
 //           as dispatch judges it; a hosted one only when listed), and
 //           `clients.preview.enabled` (bool, default false), whether a paired
 //           app may start a workspace's live preview (it runs the workspace's
-//           own code on this machine, outside the sandbox), and
+//           own code, in a container of its own since #3456), and
 //           `clients.preview.idle_minutes` (non-negative integer, default 15,
 //           `0` = never; `DARKMUX_CLIENTS_PREVIEW_IDLE_MINUTES`, #3459), how
 //           long a preview no app asks about runs before it is stopped. An
@@ -1858,8 +1858,10 @@ pub struct ClientsConfig {
 
 /// (CONFIG 2.8) Whether a paired app may start a workspace's live preview.
 /// A preview runs the workspace's own code (its `package.json` scripts and
-/// whatever they call, which a model may have written) on this machine as
-/// you, outside the dispatch sandbox, so it is OFF unless turned on here:
+/// whatever they call, which a model may have written). Since #3456 it runs
+/// in a container of its own (the workspace its only mount, its ports
+/// published on 127.0.0.1 only, no host environment), but with network
+/// access, so it is still OFF unless turned on here:
 /// `darkmux config set clients.preview.enabled true`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ClientsPreviewConfig {

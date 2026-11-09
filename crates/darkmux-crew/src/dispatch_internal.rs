@@ -63,16 +63,16 @@ pub use crate::runtime_image::RUNTIME_IMAGE;
 // capabilities, forbid privilege escalation, limit PIDs and memory.
 /// Drop ALL Linux capabilities — the runtime needs none for its job
 /// (HTTP calls to LMStudio, file reads/writes via bind mounts).
-pub(crate) const DOCKER_CAP_DROP: &str = "ALL";
+pub const DOCKER_CAP_DROP: &str = "ALL";
 /// Prevent newpriv inside the container — even if a capability is
 /// granted, the kernel blocks setuid/setgid/binary-sUID tricks.
-pub(crate) const DOCKER_SECURITY_OPT: &str = "no-new-privileges";
+pub const DOCKER_SECURITY_OPT: &str = "no-new-privileges";
 /// Per-container PID limit — prevents fork-bomb style resource exhaustion
 /// inside the container. 512 is a sane default for an LLM agent loop.
-pub(crate) const DOCKER_PIDS_LIMIT: u64 = 512;
+pub const DOCKER_PIDS_LIMIT: u64 = 512;
 /// Per-container memory limit — prevents OOM-killing the host. 4g is a
 /// sane default for an LLM agent loop that may compile/test code.
-pub(crate) const DOCKER_MEMORY: &str = "4g";
+pub const DOCKER_MEMORY: &str = "4g";
 /// TODO (#839): Run the container as non-root (`--user 1000:1000`).
 /// This requires verifying that the workspace bind-mount and injected
 /// runtime binary are readable/executable by uid 1000:gid 1000 inside
@@ -13493,7 +13493,27 @@ fn check_docker_preflight(explicit: Option<&str>) -> Result<crate::runtime_image
 /// review) By the content id that was checked, like the dispatch (#2923
 /// review C6), so a tag re-pointed after the check cannot swap the image.
 pub(crate) fn test_runtime_image() -> Result<String> {
+    resolved_runtime_image()
+}
+
+/// The darkmux runtime image as a dispatch resolves it (Docker reachable,
+/// the version-checked local or pinned image, pulled when absent), by the
+/// content id that was checked. For containers darkmux runs beside
+/// dispatch: lab test runs, and client previews (#3456).
+pub fn resolved_runtime_image() -> Result<String> {
     check_docker_preflight(None).map(|image| image.id)
+}
+
+/// The `--user` a darkmux container runs as, as the dispatch container
+/// gets it: the operator's `runtime.container_user`, else the platform's
+/// answer (`None` keeps the image's user). Files written into a bind mount
+/// then belong to whoever owns it.
+pub fn runtime_container_user() -> Result<Option<String>> {
+    let user = resolve_container_user(
+        darkmux_types::config_access::container_user_override().as_deref(),
+        darkmux_platform::current(),
+    )?;
+    Ok(user.docker_user())
 }
 
 /// Map a probe result to the dispatch-time bail (pure — unit-testable

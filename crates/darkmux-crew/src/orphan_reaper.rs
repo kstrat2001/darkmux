@@ -28,6 +28,11 @@
 //!
 //! **What it does to one.** `docker kill`, nothing else: the workspace and
 //! out-dir are bind mounts and survive the container.
+//!
+//! **Client previews (#3456)** carry the same four labels and are judged by
+//! the same rule under their own name prefix ([`PREVIEW_CONTAINER_PREFIX`],
+//! [`reap_tick_named`]); `darkmux client serve` reaps them as it starts.
+//! Each reaper lists only its own prefix, so neither touches the other's.
 
 use crate::bounded_command::{run_bounded, Bounded};
 use std::process::Command;
@@ -37,6 +42,10 @@ use std::time::Duration;
 /// (`dispatch_internal::container_name_for`). Contract 4: the reaper touches
 /// only containers darkmux names this way.
 pub const DISPATCH_CONTAINER_PREFIX: &str = "darkmux-dispatch-";
+/// (#3456) The prefix every client preview container's name carries
+/// (`darkmux-serve`'s `client_preview`). Labeled with its host like a
+/// dispatch container, and reaped by the same rule under this prefix.
+pub const PREVIEW_CONTAINER_PREFIX: &str = "darkmux-preview-";
 
 /// The host darkmux process's pid.
 pub const HOST_PID_LABEL: &str = "darkmux.dispatch.host-pid";
@@ -77,14 +86,18 @@ impl HostIdentity {
 
 /// The `docker run` options that label a container with its host.
 pub fn host_label_args(host: &HostIdentity) -> Vec<String> {
+    host_labels(host)
+        .into_iter()
+        .flat_map(|l| ["--label".to_string(), l])
+        .collect()
+}
+
+/// The four host labels, each `key=value`.
+pub fn host_labels(host: &HostIdentity) -> Vec<String> {
     vec![
-        "--label".to_string(),
         format!("{HOST_PID_LABEL}={}", host.pid),
-        "--label".to_string(),
         format!("{HOST_START_LABEL}={}", host.start),
-        "--label".to_string(),
         format!("{HOST_MACHINE_LABEL}={}", host.machine),
-        "--label".to_string(),
         format!("{HOST_PID_NS_LABEL}={}", host.pid_ns),
     ]
 }
@@ -142,12 +155,23 @@ pub fn orphaned_dispatch_containers(
     local: Option<&LocalHost>,
     liveness: impl Fn(u32) -> HostLiveness,
 ) -> Vec<Orphan> {
+    orphaned_containers_named(listed, DISPATCH_CONTAINER_PREFIX, local, liveness)
+}
+
+/// The containers named `prefix*` whose host is provably dead, by the same
+/// rule (#3456: client previews use [`PREVIEW_CONTAINER_PREFIX`]).
+pub fn orphaned_containers_named(
+    listed: &[ListedContainer],
+    prefix: &str,
+    local: Option<&LocalHost>,
+    liveness: impl Fn(u32) -> HostLiveness,
+) -> Vec<Orphan> {
     let Some(local) = local else {
         return Vec::new();
     };
     listed
         .iter()
-        .filter_map(|c| orphan_of(c, local, &liveness))
+        .filter_map(|c| orphan_of(c, prefix, local, &liveness))
         .collect()
 }
 
@@ -155,20 +179,21 @@ pub fn orphaned_dispatch_containers(
 /// provably gone.
 fn orphan_of(
     c: &ListedContainer,
+    prefix: &str,
     local: &LocalHost,
     liveness: &impl Fn(u32) -> HostLiveness,
 ) -> Option<Orphan> {
-    let (pid, start) = local_host_of(c, local)?;
+    let (pid, start) = local_host_of(c, prefix, local)?;
     host_is_gone(start, liveness(pid)).then(|| Orphan {
         name: c.name.clone(),
         host_pid: pid,
     })
 }
 
-/// The container's host pid and start time, when it is a dispatch
-/// container fully labeled with this reaper's own machine and namespace.
-fn local_host_of(c: &ListedContainer, local: &LocalHost) -> Option<(u32, u64)> {
-    if !c.name.starts_with(DISPATCH_CONTAINER_PREFIX) {
+/// The container's host pid and start time, when it is named `prefix*`
+/// and fully labeled with this reaper's own machine and namespace.
+fn local_host_of(c: &ListedContainer, prefix: &str, local: &LocalHost) -> Option<(u32, u64)> {
+    if !c.name.starts_with(prefix) {
         return None;
     }
     let (pid, start, machine) = (c.host_pid?, c.host_start?, c.host_machine.as_deref()?);
@@ -186,13 +211,14 @@ fn host_is_gone(labeled_start: u64, now: HostLiveness) -> bool {
     }
 }
 
-/// The `docker ps` arguments the reaper lists dispatch containers with: one
-/// line per running container, name then the four labels, tab-separated.
-fn docker_ps_args() -> Vec<String> {
+/// The `docker ps` arguments the reaper lists the containers named
+/// `prefix*` with: one line per running container, name then the four
+/// labels, tab-separated.
+fn docker_ps_args_named(prefix: &str) -> Vec<String> {
     vec![
         "ps".to_string(),
         "--filter".to_string(),
-        format!("name=^{DISPATCH_CONTAINER_PREFIX}"),
+        format!("name=^{prefix}"),
         "--format".to_string(),
         format!(
             "{{{{.Names}}}}\t{{{{.Label \"{HOST_PID_LABEL}\"}}}}\t{{{{.Label \"{HOST_START_LABEL}\"}}}}\t{{{{.Label \"{HOST_MACHINE_LABEL}\"}}}}\t{{{{.Label \"{HOST_PID_NS_LABEL}\"}}}}"
@@ -200,7 +226,7 @@ fn docker_ps_args() -> Vec<String> {
     ]
 }
 
-/// Parse [`docker_ps_args`]'s output. An empty label renders as an empty
+/// Parse [`docker_ps_args_named`]'s output. An empty label renders as an empty
 /// field and reads as absent.
 pub fn parse_docker_ps(stdout: &str) -> Vec<ListedContainer> {
     let field = |s: Option<&str>| {
@@ -256,8 +282,18 @@ pub enum ReapTick {
 
 /// List the dispatch containers, decide, and `docker kill` each orphan.
 pub fn reap_tick(local: Option<&LocalHost>, liveness: impl Fn(u32) -> HostLiveness) -> ReapTick {
+    reap_tick_named(DISPATCH_CONTAINER_PREFIX, local, liveness)
+}
+
+/// [`reap_tick`] over the containers named `prefix*` (#3456: client
+/// previews whose `client serve` died without stopping them).
+pub fn reap_tick_named(
+    prefix: &str,
+    local: Option<&LocalHost>,
+    liveness: impl Fn(u32) -> HostLiveness,
+) -> ReapTick {
     let mut ps = Command::new("docker");
-    ps.args(docker_ps_args());
+    ps.args(docker_ps_args_named(prefix));
     let stdout = match run_bounded(ps, DOCKER_CALL_BOUND) {
         Bounded::Finished {
             success: true,
@@ -267,7 +303,7 @@ pub fn reap_tick(local: Option<&LocalHost>, liveness: impl Fn(u32) -> HostLivene
         _ => return ReapTick::DockerUnavailable,
     };
     let listed = parse_docker_ps(&String::from_utf8_lossy(&stdout));
-    let reaped = orphaned_dispatch_containers(&listed, local, liveness)
+    let reaped = orphaned_containers_named(&listed, prefix, local, liveness)
         .into_iter()
         .map(|orphan| {
             let mut kill = Command::new("docker");

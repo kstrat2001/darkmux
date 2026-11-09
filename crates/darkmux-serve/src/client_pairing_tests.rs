@@ -36,6 +36,8 @@ struct Harness {
     preview_on: Arc<Mutex<bool>>,
     /// What `clients.preview.idle_minutes` reads as right now (default 15).
     preview_idle: Arc<Mutex<Result<u64, String>>>,
+    /// Plays the preview containers' part, without Docker.
+    containers: Arc<crate::client_preview::HostEmulator>,
     /// URLs the injected clone was asked for, and dirs it fetched.
     cloned: Arc<Mutex<Vec<String>>>,
     fetched: Arc<Mutex<Vec<PathBuf>>>,
@@ -67,6 +69,8 @@ fn harness() -> Harness {
     let preview_idle = Arc::new(Mutex::new(Ok(15)));
     let pi = preview_idle.clone();
     let pc = clock.clone();
+    let containers = Arc::new(crate::client_preview::HostEmulator::default());
+    let emu: Arc<dyn crate::client_preview::PreviewContainers> = containers.clone();
     let (c, r, pol) = (clock.clone(), ran.clone(), policy.clone());
     let fixture = dir.path().join("fixture");
     fixture_repo(&fixture);
@@ -256,7 +260,7 @@ fn harness() -> Harness {
         workspace_lock: Arc::new(Mutex::new(())),
         // On the harness's clock, so a test moves idle time by hand.
         previews: Arc::new(
-            crate::client_preview::Previews::new(dir.path().join("previews"), std::process::id())
+            crate::client_preview::Previews::new(dir.path().join("previews"), emu.clone())
                 .with_clock(Arc::new(move || pc.load(Ordering::SeqCst))),
         ),
         bound: Some(BOUND.parse().unwrap()),
@@ -268,6 +272,7 @@ fn harness() -> Harness {
     Harness {
         preview_on,
         preview_idle,
+        containers,
         cloned,
         fetched,
         fixture,
@@ -3702,7 +3707,7 @@ async fn previews_are_refused_while_clients_preview_enabled_is_off() {
     assert!(
         e.contains("darkmux config set clients.preview.enabled true")
             && e.contains("runs the workspace's own code")
-            && e.contains("outside the sandbox"),
+            && e.contains("in a container with network access"),
         "{v}"
     );
     let (code, v) = call(&h, get(&format!("/client/workspaces/{name}/preview"), &[("authorization", &bearer(&token))])).await;
@@ -3945,45 +3950,36 @@ async fn previews_refuse_what_they_cant_run() {
     assert_eq!(code, 404, "nothing started");
 }
 
+/// (#3456) A started preview's container mounts the workspace, never the
+/// user's checkout the recipe came from, and serves from it: the page is
+/// the workspace's. The shape `docker run` gets is asserted in
+/// `client_preview`'s tests.
 #[tokio::test]
-async fn a_preview_ends_when_darkmux_does() {
-    let dir = tempfile::tempdir().unwrap();
-    let wt = dir.path().join("w");
-    std::fs::create_dir_all(&wt).unwrap();
-    std::fs::write(wt.join("index.html"), "up").unwrap();
-    let checkout = dir.path().join("mine");
-    std::fs::create_dir_all(&checkout).unwrap();
+async fn a_preview_container_mounts_the_workspace_not_the_checkout() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (mine, name, ws) = served_workspace(&h, &token).await;
     recipe(
-        &checkout,
+        &mine,
         serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}),
     );
-    // "darkmux" here is a short-lived process; when it exits, so does the preview.
-    let mut stand_in = std::process::Command::new("sleep")
-        .arg("3")
-        .spawn()
-        .unwrap();
-    let previews = crate::client_preview::Previews::new(dir.path().join("p"), stand_in.id());
-    let (v, _) = previews.start("w", &wt, &checkout).unwrap();
-    let port = u64::from(v.port);
-    let mut up = false;
-    for _ in 0..100 {
-        if answers(port) {
-            up = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    assert!(up, "started");
-    stand_in.wait().unwrap();
-    let mut gone = false;
-    for _ in 0..100 {
-        if !answers(port) {
-            gone = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    assert!(gone, "the preview outlived darkmux");
+    start_preview(&h, &token, &name).await;
+    let ready = preview_until(&h, &token, &name, &["ready", "failed"]).await;
+    assert_eq!(ready["status"], "ready", "{ready}");
+    let specs = h.containers.specs.lock().unwrap().clone();
+    assert_eq!(specs.len(), 1);
+    assert_eq!(specs[0].workspace, ws.canonicalize().unwrap());
+    assert_ne!(specs[0].workspace, mine.canonicalize().unwrap());
+    let port = ready["port"].as_u64().unwrap() as u16;
+    assert_eq!(
+        specs[0].ports,
+        [port, ready["hmr_port"].as_u64().unwrap() as u16]
+    );
+    h.state.previews.stop(&name);
+    assert_eq!(
+        *h.containers.removed.lock().unwrap(),
+        std::slice::from_ref(&specs[0].name)
+    );
 }
 
 #[tokio::test]
