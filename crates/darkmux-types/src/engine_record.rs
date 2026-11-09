@@ -90,42 +90,124 @@ pub fn dir() -> PathBuf {
     crate::paths::user_root_guarded().join("run").join("engines")
 }
 
+/// The longest file name a record gets, inside every common filesystem's
+/// 255-byte limit with room for the temp and lock suffixes.
+const MAX_NAME_BYTES: usize = 200;
+
 /// The file an endpoint's record lives in. An endpoint id is the
-/// operator's text, so every byte outside `[A-Za-z0-9._-]`, and a leading
-/// `.`, is written `%XX`: no id can name a path outside `dir` or a hidden
-/// file, and two ids never share a file.
+/// operator's text, so every byte outside `[a-z0-9._-]` (uppercase
+/// included, so a case-insensitive disk never merges two ids), and a
+/// leading `.`, is written `%XX`: no id can name a path outside `dir` or a
+/// hidden file, and two ids never share a file.
 pub fn path_in(dir: &Path, endpoint: &str) -> PathBuf {
+    dir.join(format!("{}.json", file_stem(endpoint)))
+}
+
+fn file_stem(endpoint: &str) -> String {
     let mut name = String::new();
     for (i, b) in endpoint.bytes().enumerate() {
-        let plain = b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || (b == b'.' && i > 0);
+        let plain = b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_' || (b == b'.' && i > 0);
         if plain {
             name.push(b as char);
         } else {
             name.push_str(&format!("%{b:02X}"));
         }
     }
-    dir.join(format!("{name}.json"))
+    name
 }
 
-/// Write `rec` atomically (a temp file renamed over the record), creating
-/// `dir` as needed.
+fn invalid(why: String) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, why)
+}
+
+/// `path_in`, refusing an id no record can be kept for.
+fn checked_path(dir: &Path, endpoint: &str) -> std::io::Result<PathBuf> {
+    if endpoint.is_empty() {
+        return Err(invalid("an endpoint id is empty".into()));
+    }
+    if file_stem(endpoint).len() > MAX_NAME_BYTES {
+        return Err(invalid(format!("endpoint id `{endpoint}` is too long for a record file name")));
+    }
+    Ok(path_in(dir, endpoint))
+}
+
+/// A symlinked records directory is never read or written through.
+fn real_dir(dir: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(m) if m.file_type().is_symlink() => Err(format!("{} is a symlink, which darkmux never follows", dir.display())),
+        _ => Ok(()),
+    }
+}
+
+/// The pid of a process darkmux could have started: never the kernel's (0)
+/// or init's (1).
+fn plausible(rec: &EngineRecord) -> Result<(), String> {
+    if rec.pid < 2 {
+        return Err(format!("records pid {}, which no server darkmux starts can have", rec.pid));
+    }
+    Ok(())
+}
+
+/// Hold `endpoint`'s record lock while a write or a compare-and-remove runs,
+/// so neither sees the other half done.
+fn record_lock(dir: &Path, endpoint: &str) -> std::io::Result<crate::flock::FlockGuard> {
+    let lock = checked_path(dir, endpoint)?.with_extension("json.lock");
+    crate::flock::lock_exclusive(&lock).map_err(|e| std::io::Error::other(format!("{e:#}")))
+}
+
+/// Write `rec` atomically (a temp file of this writer's own, created fresh
+/// so a planted file or symlink is never written through, then renamed over
+/// the record), creating `dir` as needed.
 pub fn write_in(dir: &Path, rec: &EngineRecord) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    plausible(rec).map_err(invalid)?;
+    let path = checked_path(dir, &rec.endpoint)?;
     std::fs::create_dir_all(dir)?;
-    let path = path_in(dir, &rec.endpoint);
-    let tmp = path.with_extension("json.tmp");
+    real_dir(dir).map_err(invalid)?;
+    let _lock = record_lock(dir, &rec.endpoint)?;
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.{}.{seq}.tmp", std::process::id()));
     let bytes = serde_json::to_vec_pretty(rec).map_err(std::io::Error::other)?;
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, &path)
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(&bytes).and_then(|()| f.sync_all()));
+    if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, &path)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// The record for `endpoint`: `Ok(None)` when there is none, `Err` when the
 /// file is there but this darkmux cannot use it.
 pub fn read_in(dir: &Path, endpoint: &str) -> Result<Option<EngineRecord>, UnreadableRecord> {
     let path = path_in(dir, endpoint);
-    match std::fs::read_to_string(&path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(UnreadableRecord { path, why: e.to_string() }),
-        Ok(text) => parse(&text).map(Some).map_err(|why| UnreadableRecord { path, why }),
+    let unreadable = |why: String| UnreadableRecord { path: path.clone(), why };
+    real_dir(dir).map_err(unreadable)?;
+    if !regular_file(&path).map_err(unreadable)? {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| unreadable(e.to_string()))?;
+    let rec = parse(&text).map_err(unreadable)?;
+    if rec.endpoint != endpoint {
+        return Err(unreadable(format!("names endpoint `{}`, not `{endpoint}`", rec.endpoint)));
+    }
+    Ok(Some(rec))
+}
+
+/// Whether a record file is there (`false` for none), refusing a symlink
+/// and an error reading its metadata, which is never "no record".
+fn regular_file(path: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.to_string()),
+        Ok(m) if m.file_type().is_symlink() => Err("a symlink, which darkmux never follows".into()),
+        Ok(_) => Ok(true),
     }
 }
 
@@ -135,13 +217,20 @@ fn parse(text: &str) -> Result<EngineRecord, String> {
         Some(s) if s == u64::from(ENGINE_RECORD_SCHEMA) => {}
         other => return Err(format!("record schema {other:?}; this darkmux reads {ENGINE_RECORD_SCHEMA}")),
     }
-    serde_json::from_value(doc).map_err(|e| e.to_string())
+    let rec: EngineRecord = serde_json::from_value(doc).map_err(|e| e.to_string())?;
+    plausible(&rec)?;
+    Ok(rec)
 }
 
-/// Every record in `dir`, and every file there that could not be used.
-/// A missing `dir` is no records.
+/// Every record in `dir`, and every file there that could not be used: one
+/// this darkmux cannot read, a symlink, or one whose record names another
+/// endpoint than its file is for. A missing `dir` is no records.
 pub fn list_in(dir: &Path) -> (Vec<EngineRecord>, Vec<UnreadableRecord>) {
     let (mut records, mut unreadable) = (Vec::new(), Vec::new());
+    if let Err(why) = real_dir(dir) {
+        unreadable.push(UnreadableRecord { path: dir.to_path_buf(), why });
+        return (records, unreadable);
+    }
     let Ok(entries) = std::fs::read_dir(dir) else { return (records, unreadable) };
     let mut paths: Vec<PathBuf> = entries
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -149,7 +238,7 @@ pub fn list_in(dir: &Path) -> (Vec<EngineRecord>, Vec<UnreadableRecord>) {
         .collect();
     paths.sort();
     for path in paths {
-        match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| parse(&t)) {
+        match list_one(dir, &path) {
             Ok(rec) => records.push(rec),
             Err(why) => unreadable.push(UnreadableRecord { path, why }),
         }
@@ -157,10 +246,24 @@ pub fn list_in(dir: &Path) -> (Vec<EngineRecord>, Vec<UnreadableRecord>) {
     (records, unreadable)
 }
 
+fn list_one(dir: &Path, path: &Path) -> Result<EngineRecord, String> {
+    let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if meta.file_type().is_symlink() {
+        return Err("a symlink, which darkmux never follows".into());
+    }
+    let rec = std::fs::read_to_string(path).map_err(|e| e.to_string()).and_then(|t| parse(&t))?;
+    if path_in(dir, &rec.endpoint) != path {
+        return Err(format!("names endpoint `{}`, whose record is another file", rec.endpoint));
+    }
+    Ok(rec)
+}
+
 /// Remove `rec`'s file only while it still records the same server (pid and
-/// start stamp), so a stop never deletes the record of a server another
-/// darkmux process started on that endpoint since. `Ok(true)` when removed.
+/// start stamp), compared and removed under the record lock, so a stop never
+/// deletes the record of a server another darkmux process started on that
+/// endpoint since. `Ok(true)` when removed.
 pub fn remove_if_in(dir: &Path, rec: &EngineRecord) -> std::io::Result<bool> {
+    let _lock = record_lock(dir, &rec.endpoint)?;
     match read_in(dir, &rec.endpoint) {
         Ok(Some(now)) if now.pid == rec.pid && now.start_stamp == rec.start_stamp => {
             std::fs::remove_file(path_in(dir, &rec.endpoint))?;
@@ -208,9 +311,10 @@ mod tests {
         let r = rec("tf", 100, 5_000);
         write_in(dir.path(), &r).unwrap();
         assert_eq!(read_in(dir.path(), "tf").unwrap(), Some(r.clone()));
-        let names: Vec<String> =
+        let mut names: Vec<String> =
             std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
-        assert_eq!(names, ["tf.json"]);
+        names.sort();
+        assert_eq!(names, ["tf.json", "tf.json.lock"], "the record and its lock, no temp file");
         assert_eq!(read_in(dir.path(), "other").unwrap(), None, "no file is no record");
         assert_eq!(list_in(&dir.path().join("missing")), (vec![], vec![]), "no directory is no records");
     }
@@ -221,6 +325,7 @@ mod tests {
     fn an_endpoint_id_never_escapes_the_directory_or_collides() {
         let d = Path::new("/r");
         assert_eq!(path_in(d, "tensorfold-27b.v2"), PathBuf::from("/r/tensorfold-27b.v2.json"));
+        assert_eq!(path_in(d, "TF"), PathBuf::from("/r/%54%46.json"), "uppercase is escaped");
         assert_eq!(path_in(d, "../x"), PathBuf::from("/r/%2E.%2Fx.json"));
         assert_eq!(path_in(d, ".hidden"), PathBuf::from("/r/%2Ehidden.json"));
         assert_eq!(path_in(d, "a/b"), PathBuf::from("/r/a%2Fb.json"));
@@ -236,8 +341,8 @@ mod tests {
     #[test]
     fn a_record_of_another_schema_or_a_corrupt_file_claims_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        write_in(dir.path(), &rec("good", 1, 1)).unwrap();
-        let mut newer = serde_json::to_value(rec("newer", 2, 2)).unwrap();
+        write_in(dir.path(), &rec("good", 1001, 1)).unwrap();
+        let mut newer = serde_json::to_value(rec("newer", 1002, 2)).unwrap();
         newer["schema"] = serde_json::json!(2);
         std::fs::write(path_in(dir.path(), "newer"), newer.to_string()).unwrap();
         std::fs::write(path_in(dir.path(), "junk"), "not json").unwrap();
@@ -262,5 +367,123 @@ mod tests {
         assert!(remove_if_in(dir.path(), &second).unwrap());
         assert_eq!(read_in(dir.path(), "tf").unwrap(), None);
         assert!(!remove_if_in(dir.path(), &second).unwrap(), "already gone");
+    }
+
+    /// (#3455 review) Two writers of one endpoint never share a temp file, so
+    /// a write that reports `Ok` always leaves a readable record and no write
+    /// fails because another renamed its temp file away.
+    #[test]
+    fn concurrent_writers_of_one_endpoint_never_lose_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_path_buf();
+        for round in 0..200u32 {
+            let (a, b) = (d.clone(), d.clone());
+            let ta = std::thread::spawn(move || write_in(&a, &rec("tf", 1001, u64::from(round))));
+            let tb = std::thread::spawn(move || write_in(&b, &rec("tf", 1002, u64::from(round))));
+            assert!(ta.join().unwrap().is_ok() && tb.join().unwrap().is_ok(), "round {round}: a write failed");
+            let now = read_in(&d, "tf").unwrap().expect("a record survives");
+            assert!(now.pid == 1001 || now.pid == 1002, "round {round}");
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(&d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "no temp file is left behind: {leftovers:?}");
+    }
+
+    /// (#3455 review) A symlinked record file, a symlinked directory, and a
+    /// planted symlink where a temp file would go are never followed.
+    #[test]
+    fn symlinks_are_never_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        write_in(&real, &rec("tf", 1001, 1)).unwrap();
+        let linked_dir = dir.path().join("linked");
+        std::os::unix::fs::symlink(&real, &linked_dir).unwrap();
+        assert!(read_in(&linked_dir, "tf").is_err(), "a symlinked directory is refused");
+        assert!(list_in(&linked_dir).0.is_empty(), "and lists no records");
+        assert!(write_in(&linked_dir, &rec("tf", 1002, 2)).is_err(), "and is never written through");
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::os::unix::fs::symlink(path_in(&real, "tf"), path_in(&other, "tf")).unwrap();
+        let err = read_in(&other, "tf").unwrap_err();
+        assert!(err.why.contains("symlink"), "{err:?}");
+        assert!(list_in(&other).0.is_empty());
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "precious").unwrap();
+        let planted = dir.path().join("planted");
+        std::fs::create_dir_all(&planted).unwrap();
+        for i in 0..64 {
+            let tmp = path_in(&planted, "tf").with_extension(format!("json.{}.{i}.tmp", std::process::id()));
+            let _ = std::os::unix::fs::symlink(&victim, tmp);
+        }
+        let _ = write_in(&planted, &rec("tf", 1003, 3));
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious", "a planted temp symlink is not written through");
+    }
+
+    /// (#3455 review) Ids that differ only in case get different files, so a
+    /// case-insensitive disk (macOS's default) never merges them; and a file
+    /// whose record names another endpoint than its own name is refused.
+    #[test]
+    fn ids_that_differ_in_case_never_share_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write_in(dir.path(), &rec("TF", 1001, 1)).unwrap();
+        assert_eq!(read_in(dir.path(), "tf").unwrap(), None, "`tf` is not `TF`");
+        write_in(dir.path(), &rec("tf", 1002, 2)).unwrap();
+        assert_eq!(read_in(dir.path(), "TF").unwrap().map(|r| r.pid), Some(1001));
+        assert_eq!(read_in(dir.path(), "tf").unwrap().map(|r| r.pid), Some(1002));
+        std::fs::copy(path_in(dir.path(), "tf"), dir.path().join("tf-backup.json")).unwrap();
+        let (records, unreadable) = list_in(dir.path());
+        assert_eq!(records.len(), 2, "the copy is not a third record: {records:?}");
+        std::fs::copy(path_in(dir.path(), "tf"), path_in(dir.path(), "other")).unwrap();
+        let err = read_in(dir.path(), "other").unwrap_err();
+        assert!(err.why.contains("names endpoint `tf`"), "a copied record is not `other`'s: {err:?}");
+        assert!(unreadable.iter().any(|u| u.why.contains("names endpoint")), "{unreadable:?}");
+    }
+
+    /// (#3455 review) A record naming pid 0 or 1 claims nothing, and an empty
+    /// or over-long endpoint id is refused rather than written somewhere no
+    /// listing finds.
+    #[test]
+    fn impossible_records_and_ids_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for pid in [0, 1] {
+            let bad = rec("tf", pid, 5);
+            std::fs::create_dir_all(dir.path()).unwrap();
+            std::fs::write(path_in(dir.path(), "tf"), serde_json::to_vec(&bad).unwrap()).unwrap();
+            assert!(read_in(dir.path(), "tf").is_err(), "pid {pid}");
+            assert!(write_in(dir.path(), &bad).is_err(), "pid {pid} is never written");
+        }
+        assert!(write_in(dir.path(), &rec("", 100, 1)).is_err(), "an empty id");
+        assert!(write_in(dir.path(), &rec(&"é".repeat(60), 100, 1)).is_err(), "an id too long for a file name");
+    }
+
+    /// (#3455 review) An unreadable file is an error, never "no record"; a
+    /// file that is not `.json` is not a record; and a stop compares the
+    /// start stamp, not only the pid.
+    #[test]
+    fn io_errors_other_files_and_stamps_each_decide() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(path_in(dir.path(), "tf")).unwrap();
+        assert!(read_in(dir.path(), "tf").is_err(), "a directory where the record goes is not `None`");
+        // A directory darkmux cannot look into: the record's state is unknown,
+        // never "no record".
+        let locked = tempfile::tempdir().unwrap();
+        let inner = locked.path().join("engines");
+        write_in(&inner, &rec("tf", 1001, 1)).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let state = read_in(&inner, "tf");
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(state.is_err(), "an unreadable directory is not `None`: {state:?}");
+        let dir = tempfile::tempdir().unwrap();
+        write_in(dir.path(), &rec("tf", 1001, 1)).unwrap();
+        std::fs::write(dir.path().join("tf.json.lock"), "").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "{}").unwrap();
+        assert_eq!(list_in(dir.path()), (vec![rec("tf", 1001, 1)], vec![]));
+        let same_pid_older = rec("tf", 1001, 0);
+        assert!(!remove_if_in(dir.path(), &same_pid_older).unwrap(), "same pid, another start: not this server");
+        assert!(read_in(dir.path(), "tf").unwrap().is_some());
     }
 }
