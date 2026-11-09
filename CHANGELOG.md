@@ -16,6 +16,21 @@ darkmux release.
 
 ### Added
 
+- **Every client API refusal and failed run carries a code (#3468).** `darkmux client serve`'s refusal
+  bodies gain `code` beside `error` (`preview_disabled`, `no_source_checkout`, `template_no_recipe` (a template project whose
+  first commit has no recipe), `no_recipe`, `recipe_invalid`, `filter_in_repo_config`, `clone_failed`, and a class code for every
+  other refusal), a failed work item's status gains `code` (read from its run's `dispatch.error`:
+  `busy`, `wont_fit`, `model_start_failed`, `model_stop_failed`, `port_in_use`, `engine_unavailable`,
+  `engine_in_use`, else `dispatch_failed`), and a workspace's `fetch_error` gains `fetch_error_code`
+  (`network_key_in_repo_config`, `fetch_failed`). One enum, one wire spelling each; all additive. An
+  app branches on the code, never on darkmux's wording.
+
+- **A run starting its model says so (#3467).** While a dispatch is between `dispatch.model.start` and
+  `dispatch.model.ready` (a Tensorfold server starting, say), its run reads `activity: "starting_model"`
+  with `activity_elapsed_ms` (from the latest `dispatch.model.loading`) in `GET /runs`, `darkmux run list
+  --json` and the client's `GET /client/work/{id}` while it is `running`. The run lifecycle decides it
+  once (`Attempt::starting_model`); every surface reads it. Both fields are additive and absent otherwise.
+
 - **Listings say whether darkmux can make each model resident (#3466).** `darkmux profile list --json`
   gains an `availability` list (one row per profile model: `profile`, `model`, `endpoint`, `engine`,
   `state`, `reason`), and each profile in `GET /client/profiles` an `availability` object

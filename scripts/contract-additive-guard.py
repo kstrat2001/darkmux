@@ -70,9 +70,14 @@ def line_members(text):
     An indented line is a field of the unindented header above it, and its
     member names that header, so a field moved to another type is a removal
     from the first. A header of the form `Name = A | B` is a union: each
-    variant is its own member, an object variant `{ tag; field; ... }` is
-    keyed by its first field, so adding a variant (or a field to one) is an
-    addition and removing one is not. Any other line is one member.
+    variant is its own member, so adding a variant is an addition and
+    removing one is not. When every object variant names the same tag field
+    (a field whose type is one quoted constant, `status: "running"`), each
+    variant is keyed by its tag and each of its fields is its own member, so
+    adding a field to a variant is an addition and removing, retyping or
+    retagging one is not. Without such a tag, an object variant
+    `{ a; b; ... }` is keyed by its first field, and any other variant
+    (including a `{ a, b }` one) is one member. Any other line is one member.
     """
     out, header = [], ""
     for i, ln in enumerate(text.splitlines(), 1):
@@ -85,13 +90,48 @@ def line_members(text):
         if " = " not in ln:
             out.append((i, norm(ln)))
             continue
-        for variant, _ in split_top(ln.split(" = ", 1)[1], "|"):
-            v = variant.strip()
-            if v.startswith("{") and v.endswith("}") and len(split_top(v, "|")) == 1 and ";" in v:
-                fields = [norm(f) for f, _ in split_top(v[1:-1], ";") if f.strip()]
-                out.extend((i, f"{header} | {fields[0]} :: {f}") for f in fields)
-            else:
-                out.append((i, f"{header} | {norm(v)}"))
+        out.extend((i, m) for m in union_members(header, ln.split(" = ", 1)[1]))
+    return out
+
+
+TAG_FIELD = re.compile(r'^(\w+): "[^"]*"$')
+
+
+def object_fields(v):
+    """The fields of an object variant `{ a; b }` or `{ a, b }`, else None."""
+    if not (v.startswith("{") and v.endswith("}") and len(split_top(v, "|")) == 1):
+        return None
+    inner = v[1:-1]
+    sep = ";" if len(split_top(inner, ";")) > 1 else ","
+    return [norm(f) for f, _ in split_top(inner, sep) if f.strip()]
+
+
+def union_tag(variants):
+    """The field every object variant carries as one quoted constant, if the
+    union has object variants and they all share one such field."""
+    shared = None
+    for fields in variants:
+        if fields is None:
+            continue
+        names = {m.group(1) for f in fields if (m := TAG_FIELD.match(f))}
+        shared = names if shared is None else shared & names
+    return sorted(shared)[0] if shared and len(shared) == 1 else None
+
+
+def union_members(header, rhs):
+    """The members of the union `header = rhs` (see [`line_members`])."""
+    variants = [norm(v) for v, _ in split_top(rhs, "|")]
+    fields = [object_fields(v) for v in variants]
+    tag = union_tag(fields)
+    out = []
+    for v, fs in zip(variants, fields):
+        if fs is not None and tag is not None:
+            key = next(f for f in fs if f.startswith(f"{tag}: "))
+            out.extend(f"{header} | {key} :: {f}" for f in fs)
+        elif fs is not None and ";" in v:
+            out.extend(f"{header} | {fs[0]} :: {f}" for f in fs)
+        else:
+            out.append(f"{header} | {v}")
     return out
 
 
@@ -257,7 +297,11 @@ BASE_FILES = {
         "# verbs\nflow status  FlowStatus\nmachine list  FleetView\n\n# types\n"
         'Mode = "a" | "b"\nTypeA\n  f: string\nTypeB\n  g: string\n'
     ),
-    "crates/darkmux-serve/route-table.golden": "GET /health  json HealthResponse\n\n# response types\nHealthResponse.build: string\n",
+    "crates/darkmux-serve/route-table.golden": (
+        "GET /health  json HealthResponse\n\n# response types\nHealthResponse.build: string\n"
+        'WorkState = { status: "running" } | { error: string, reason: string, status: "error" }\n'
+        'Plain = { a: string, b: number } | "x"\n'
+    ),
     f"{TS_DIR}/HealthResponse.ts": (
         "// generated\nimport type { A } from \"./A\";\n/** doc */\n"
         "export type HealthResponse = { build: string, \n/** why */\nn: number | null, };\n"
@@ -288,6 +332,14 @@ def _repo(tmp, head_files, tag=True):
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(text)
     return root, base
+
+
+RT = "crates/darkmux-serve/route-table.golden"
+
+
+def _rt(work_state, plain='Plain = { a: string, b: number } | "x"\n'):
+    """The base route golden with its two union lines replaced."""
+    return "GET /health  json HealthResponse\n\n# response types\nHealthResponse.build: string\n" + work_state + plain
 
 
 def self_test():
@@ -321,6 +373,31 @@ def self_test():
         ("a removed generated field fails", {ts: BASE_FILES[ts].replace("build: string, ", "")}, [], 1),
         ("a removed union variant fails", {f"{TS_DIR}/Kind.ts": 'export type Kind = { "k": "a", x: number };\n'}, [], 1),
         ("a deleted generated file fails", {ts: None}, [], 1),
+        ("a field added to a tagged route-golden union variant passes", {RT: _rt(
+            'WorkState = { activity?: string | null, status: "running" } '
+            '| { code: ClientCode, error: string, reason: string, status: "error" }\n'
+        )}, [], 0),
+        ("a field removed from a tagged union variant fails", {RT: _rt(
+            'WorkState = { status: "running" } | { error: string, status: "error" }\n'
+        )}, [], 1),
+        ("a field of a tagged union variant retyped fails", {RT: _rt(
+            'WorkState = { status: "running" } | { error: number, reason: string, status: "error" }\n'
+        )}, [], 1),
+        ("a tagged union variant removed fails", {RT: _rt('WorkState = { status: "running" }\n')}, [], 1),
+        ("a tagged union variant's tag changed fails", {RT: _rt(
+            'WorkState = { status: "running" } | { error: string, reason: string, status: "failed" }\n'
+        )}, [], 1),
+        ("a tagged union variant's tag removed fails", {RT: _rt(
+            'WorkState = { status: "running" } | { error: string, reason: string }\n'
+        )}, [], 1),
+        ("a field added to an untagged union variant still fails", {RT: _rt(
+            'WorkState = { status: "running" } | { error: string, reason: string, status: "error" }\n',
+            'Plain = { a: string, b: number, c: boolean } | "x"\n',
+        )}, [], 1),
+        ("a variant added to an untagged union still passes", {RT: _rt(
+            'WorkState = { status: "running" } | { error: string, reason: string, status: "error" }\n',
+            'Plain = { a: string, b: number } | "x" | "y"\n',
+        )}, [], 0),
         ("a removal with the breaking-v6 label passes", {
             "crates/darkmux-serve/route-table.golden": "GET /health  json HealthResponse\n\n# response types\n",
         }, [BREAKING_LABEL], 0),

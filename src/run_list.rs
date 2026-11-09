@@ -1018,6 +1018,8 @@ mod tests {
             relay: None,
             receive_key: updated_ts * 1000 * 1024,
             not_reporting: false,
+            activity: None,
+            activity_elapsed_ms: None,
         }
     }
 

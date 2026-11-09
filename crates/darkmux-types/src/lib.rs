@@ -7,6 +7,7 @@
 
 #[cfg(unix)]
 pub mod child_registry;
+pub mod client_code;
 pub mod config;
 pub mod config_access;
 pub mod config_enum;

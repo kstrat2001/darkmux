@@ -421,6 +421,60 @@ pub struct Run {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     #[cfg_attr(test, ts(as = "Option<bool>", optional))]
     pub not_reporting: bool,
+    /// (#3467) What a running run is doing besides its turns:
+    /// `starting_model` while one of its dispatches starts its model (from
+    /// `dispatch.model.start` until `.ready`). Decided by the run lifecycle
+    /// (`Attempt::starting_model`), read by every surface (`GET /runs`,
+    /// `darkmux run list --json`, the client's work status). Absent when the
+    /// run is not running or is doing nothing else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub activity: Option<RunActivity>,
+    /// (#3467) With `activity`: how long it has taken so far, ms, from the
+    /// latest `dispatch.model.loading` (0 before the first).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional, type = "number"))]
+    pub activity_elapsed_ms: Option<u64>,
+}
+
+/// (#3467) What a running run is doing besides its turns. One wire spelling
+/// per value; a new one is additive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
+#[serde(rename_all = "snake_case")]
+pub enum RunActivity {
+    /// A dispatch is starting its model (an engine server, a load).
+    StartingModel,
+}
+
+/// (#3467) A running session's `activity` from its records alone (the
+/// client's work status): folded by [`fold_session_record`] and settled by
+/// the run lifecycle exactly as `/runs` folds them, its status taken as
+/// running by the caller that knows it is.
+pub(crate) fn running_session_activity(
+    visit: impl FnOnce(&mut dyn FnMut(&serde_json::Value)),
+) -> (Option<RunActivity>, Option<u64>) {
+    let mut idx: HashMap<String, SessionAgg> = HashMap::new();
+    visit(&mut |v| fold_session_record(&mut idx, v));
+    let mut sessions: Vec<SessionAgg> = idx.into_values().collect();
+    sessions.iter_mut().for_each(SessionAgg::settle);
+    activity_of(RunStatus::Running, sessions.iter())
+}
+
+/// (#3467) A run's `activity` and its elapsed time, from its sessions as
+/// the lifecycle settled them: only a running run has one.
+fn activity_of<'a>(
+    status: RunStatus,
+    sessions: impl IntoIterator<Item = &'a SessionAgg>,
+) -> (Option<RunActivity>, Option<u64>) {
+    if status != RunStatus::Running {
+        return (None, None);
+    }
+    match sessions.into_iter().find_map(|s| s.model_starting) {
+        Some(ms) => (Some(RunActivity::StartingModel), Some(ms)),
+        None => (None, None),
+    }
 }
 
 /// A bare running dispatch row, for tests in sibling modules.
@@ -447,6 +501,8 @@ pub(crate) fn tests_support_run(id: &str) -> Run {
         relay: None,
         receive_key: 0,
         not_reporting: false,
+        activity: None,
+        activity_elapsed_ms: None,
     }
 }
 
@@ -1026,7 +1082,8 @@ fn flow_mission_to_run(
         .iter()
         .filter_map(|s| flow_index.get(s.as_str()).map(|a| (s.as_str(), a)))
         .collect();
-    let any_live = mission_status_sessions(mission_id, &sessions).iter().any(|s| session_is_live(s, now_ms));
+    let status_sessions = mission_status_sessions(mission_id, &sessions);
+    let any_live = status_sessions.iter().any(|s| session_is_live(s, now_ms));
     let status = match (&agg.terminal_ts, agg.terminal_was_abort, agg.terminal_status) {
         // #1627 again: abort is teardown, not success.
         (Some(_), true, _) => RunStatus::Abandoned,
@@ -1098,6 +1155,7 @@ fn flow_mission_to_run(
     let session_id = earliest_by_start(&sessions)
         .filter(|(_, agg)| !agg.is_ambiguous())
         .map(|(sid, _)| sid.to_string());
+    let (activity, activity_elapsed_ms) = activity_of(status, status_sessions.iter().map(|s| s.as_ref()));
     Run {
         id: mission_id.to_string(),
         kind: mission_run_kind(agg.config_id.as_deref(), false),
@@ -1129,6 +1187,8 @@ fn flow_mission_to_run(
         relay: None,
         receive_key: agg.last_key.unwrap_or(0),
         not_reporting: false,
+        activity,
+        activity_elapsed_ms,
     }
 }
 
@@ -1474,6 +1534,7 @@ fn mission_to_run(
     let status_sessions = mission_status_sessions(&mission.id, &sessions);
     let sessions_bare: Vec<&SessionAgg> = status_sessions.iter().map(|s| s.as_ref()).collect();
     let status = mission_run_status(mission, &sessions_bare, now_ms);
+    let (activity, activity_elapsed_ms) = activity_of(status, sessions_bare.iter().copied());
     // (#1907) `mission_run_status` has exactly ONE arm that reaches
     // `Abandoned` via a deliberate teardown — `MissionStatus::Aborted =>
     // RunStatus::Abandoned` — every other `Abandoned` result it returns
@@ -1516,6 +1577,8 @@ fn mission_to_run(
         relay: None,
         receive_key: local_receive_key(completed_ts.or(started_ts).unwrap_or(mission.created_ts)),
         not_reporting: false,
+        activity,
+        activity_elapsed_ms,
     }
 }
 
@@ -2046,6 +2109,8 @@ fn lab_summary_to_run(
         relay: None,
         receive_key: local_receive_key(summary.mtime_ms / 1000),
         not_reporting: false,
+        activity: None,
+        activity_elapsed_ms: None,
     }
 }
 
@@ -2588,6 +2653,8 @@ struct SessionAgg {
     wait_until_ms: Option<u64>,
     /// The session's terminal was a `budget.stop` that names why.
     stopped_by_operator: bool,
+    /// (#3467) Its current attempt is starting its model: for how long, ms.
+    model_starting: Option<u64>,
     /// The session's attempts (`run_lifecycle.rs`), whose current one the
     /// attempt-scoped fields above describe once settled.
     lifecycle: crate::run_lifecycle::RunFold,
@@ -2625,6 +2692,7 @@ impl SessionAgg {
         self.terminal_status = ending.map(|e| e.status);
         self.terminal_ts = a.fold.close.as_ref().map(|(ts, _)| ts.clone());
         self.stopped_by_operator = ending.and_then(|e| e.reason) == Some(AbandonReason::Aborted);
+        self.model_starting = a.starting_model();
     }
 
     /// (#1918) `true` when this session's records name more than one
@@ -2990,6 +3058,7 @@ fn ghost_runs(
         } else {
             AbandonReason::NoTerminal
         });
+        let (activity, activity_elapsed_ms) = activity_of(status, [agg]);
         out.push(Run {
             id: session_id.clone(),
             kind: RunKind::Dispatch,
@@ -3032,6 +3101,8 @@ fn ghost_runs(
             relay: run_relay(session_id),
             receive_key: agg.last_key.unwrap_or(0),
             not_reporting: false,
+            activity,
+            activity_elapsed_ms,
         });
     }
     out
@@ -6038,6 +6109,91 @@ mod tests {
         assert_eq!(run_list, (RunStatus::Abandoned, Some(AbandonReason::NoTerminal)));
     }
 
+    /// (#3467) `/runs` and `run list` read a dispatch starting its model as
+    /// running with `activity: starting_model` and the latest `.loading`'s
+    /// elapsed time, decided by the run lifecycle; once `.ready` lands it is
+    /// running as usual. The elapsed time is the record's own, so no clock
+    /// is read: the fixture's timestamps are now only to keep the run live.
+    #[test]
+    #[serial_test::serial]
+    fn a_dispatch_starting_its_model_reads_starting_model_until_ready() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let now = now_unix() as i64;
+        let ts = |back: i64| darkmux_flow::ts_utc_at(now - back);
+        let rec = |action: &str, back: i64, payload: serde_json::Value| {
+            serde_json::json!({
+                "ts": ts(back), "action": action, "session_id": "tf-sess", "execution_id": "exec-tf",
+                "handle": "coder", "model": "TF/m", "payload": payload,
+            })
+        };
+        let model = |elapsed: Option<u64>| {
+            let mut p = serde_json::json!({"engine": "tensorfold", "endpoint": "tf", "model": "TF/m"});
+            if let Some(ms) = elapsed {
+                p["elapsed_ms"] = ms.into();
+            }
+            p
+        };
+        // The same dispatch as a tracked crew-of-one mission (what `darkmux
+        // dispatch`, and so a client's work, makes), and a start left open
+        // three hours ago by a run that stopped reporting.
+        darkmux_crew::lifecycle::save_mission(&minimal_mission(
+            "disp-1",
+            vec![],
+            Some(MissionSpec { config_id: "dispatch".to_string(), inputs_fingerprint: "x".to_string(), origin: None }),
+        ))
+        .unwrap();
+        let in_mission = |action: &str, back: i64, payload: serde_json::Value| {
+            let mut r = rec(action, back, payload);
+            r["session_id"] = "disp-1-sess".into();
+            r["execution_id"] = "exec-disp".into();
+            r["mission_id"] = "disp-1".into();
+            r
+        };
+        let stale = |action: &str, payload: serde_json::Value| {
+            let mut r = rec(action, 3 * 3_600, payload);
+            r["session_id"] = "stale-sess".into();
+            r["execution_id"] = "exec-stale".into();
+            r
+        };
+        let mut lines = vec![
+            rec("dispatch.start", 40, serde_json::json!({})),
+            rec("dispatch.model.start", 39, model(None)),
+            rec("dispatch.model.loading", 29, model(Some(10_000))),
+            rec("dispatch.model.loading", 19, model(Some(20_000))),
+            in_mission("dispatch.start", 40, serde_json::json!({})),
+            in_mission("dispatch.model.start", 39, model(None)),
+            in_mission("dispatch.model.loading", 29, model(Some(10_000))),
+            stale("dispatch.start", serde_json::json!({})),
+            stale("dispatch.model.start", model(None)),
+        ];
+        let rows = |lines: &[serde_json::Value]| {
+            write_day_file(flows.path(), &today(), lines);
+            build_runs_judged_by(None, flows.path(), None, &[], &ScanWindow::default_window(), &PeerClocks::default()).runs
+        };
+        let pick = |rows: &[Run], id: &str| rows.iter().find(|r| r.id == id).cloned().unwrap_or_else(|| panic!("no row {id}: {rows:?}"));
+        let row = |lines: &[serde_json::Value]| pick(&rows(lines), "tf-sess");
+        let first = rows(&lines);
+        let mission = pick(&first, "disp-1");
+        assert_eq!((mission.kind, mission.status), (RunKind::Dispatch, RunStatus::Running));
+        assert_eq!((mission.activity, mission.activity_elapsed_ms), (Some(RunActivity::StartingModel), Some(10_000)), "a tracked dispatch reads it too");
+        let gone = pick(&first, "stale-sess");
+        assert_eq!(gone.status, RunStatus::Abandoned);
+        assert_eq!((gone.activity, gone.activity_elapsed_ms), (None, None), "only a running run is doing anything");
+        let starting = row(&lines);
+        assert_eq!(starting.status, RunStatus::Running);
+        assert_eq!((starting.activity, starting.activity_elapsed_ms), (Some(RunActivity::StartingModel), Some(20_000)));
+        let wire = serde_json::to_value(&starting).unwrap();
+        assert_eq!((wire["activity"].as_str(), wire["activity_elapsed_ms"].as_u64()), (Some("starting_model"), Some(20_000)));
+
+        lines.push(rec("dispatch.model.ready", 15, model(Some(24_000))));
+        let ready = row(&lines);
+        assert_eq!(ready.status, RunStatus::Running);
+        assert_eq!((ready.activity, ready.activity_elapsed_ms), (None, None));
+        let wire = serde_json::to_value(&ready).unwrap();
+        assert!(wire.get("activity").is_none() && wire.get("activity_elapsed_ms").is_none(), "absent, not null: {wire}");
+    }
+
     #[test]
     fn ghost_runs_fresh_session_is_running_stale_session_is_abandoned() {
         let base_ts = "2000-01-01T00:00:00Z";
@@ -8434,6 +8590,8 @@ mod tests {
             relay: None,
             receive_key: 0,
             not_reporting: false,
+            activity: None,
+            activity_elapsed_ms: None,
         };
         let mut runs = vec![
             row("down", "studio", RunStatus::Running),

@@ -731,3 +731,33 @@ fn a_tensorfold_serve_spec_failure_is_model_start_failed() {
     let err = prepare_in(&t, &r.dirs, &tf, quick(), &FakeMachine::default(), &mut |_, _| {}).err().expect("refused");
     assert_eq!(err.code, "model_start_failed", "{err}");
 }
+
+/// (#3468) Every code a dispatch can write to `dispatch.error` (engine
+/// dispatch's refusals, and the engine server's errors) is a client code an
+/// app can branch on: read as spelled, never `dispatch_failed`. A new code
+/// here that the client enum lacks fails this, before an app ever sees it.
+#[test]
+fn every_dispatch_refusal_code_is_a_client_code() {
+    let src = |p: &str| std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(p)).unwrap();
+    let dispatch = src("src/engine_dispatch.rs");
+    let server = src("../darkmux-profiles/src/engine/server.rs");
+    let mut codes: Vec<String> = Vec::new();
+    for (i, _) in dispatch.match_indices("refuse(") {
+        let rest = dispatch[i + "refuse(".len()..].trim_start();
+        if let Some(code) = rest.strip_prefix('"').and_then(|r| r.split('"').next()) {
+            codes.push(code.to_string());
+        }
+    }
+    let code_fn = &server[server.find("pub fn code(&self)").expect("ServerError::code")..];
+    let code_fn = &code_fn[..code_fn.find("\n    }\n").unwrap()];
+    for line in code_fn.lines().filter(|l| l.contains("=> \"")) {
+        codes.push(line.split('"').nth(1).unwrap().to_string());
+    }
+    codes.sort();
+    codes.dedup();
+    assert!(codes.len() >= 7, "the scan found the producers: {codes:?}");
+    for code in &codes {
+        let read = darkmux_types::client_code::ClientCode::of_dispatch(Some(code));
+        assert_ne!(read, darkmux_types::client_code::ClientCode::DispatchFailed, "`{code}` is no client code");
+    }
+}
