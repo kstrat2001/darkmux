@@ -2799,6 +2799,60 @@
         );
     }
 
+    /// (#3457) A read-write workdir whose `.git` is a real directory hands
+    /// the run that repository's config and hooks; `dispatch()` says so at
+    /// the call site, and stays quiet when the mount is read-only.
+    #[test]
+    #[serial]
+    fn dispatch_notes_a_read_write_mount_of_a_checkouts_git_dir() {
+        let tmp = TempDir::new().unwrap();
+        let checkout = tmp.path().join("checkout");
+        std::fs::create_dir(&checkout).unwrap();
+        let init = std::process::Command::new("git").current_dir(&checkout).args(["init", "-q"]).output().unwrap();
+        assert!(init.status.success());
+        let home = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+
+        let run = |read_only: bool| {
+            let mut opts = dispatch_preflight_probe_opts();
+            opts.workdir = Some(checkout.clone());
+            opts.workspace_read_only = read_only;
+            capture_preflight_warnings(|| {
+                let _ = dispatch(opts);
+            })
+        };
+        // Read-only FIRST: the note is printed once per message per process,
+        // so asking second would pass whatever the read-only branch did.
+        let read_only = run(true);
+        let writable = run(false);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        let note = writable
+            .iter()
+            .find(|m| m.contains("mounted read-write"))
+            .unwrap_or_else(|| panic!("dispatch() must note the writable `.git`; got {writable:?}"));
+        assert!(note.contains(&checkout.display().to_string()), "{note}");
+        assert!(!read_only.iter().any(|m| m.contains("mounted read-write")), "{read_only:?}");
+    }
+
+    #[test]
+    fn writable_git_dir_note_only_for_a_real_git_dir_on_a_writable_mount() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(writable_git_dir_note(tmp.path(), false), None, "no .git");
+        std::fs::write(tmp.path().join(".git"), "gitdir: /elsewhere\n").unwrap();
+        assert_eq!(writable_git_dir_note(tmp.path(), false), None, "a worktree's pointer file");
+        std::fs::remove_file(tmp.path().join(".git")).unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        assert_eq!(writable_git_dir_note(tmp.path(), true), None, "read-only mount");
+        assert!(writable_git_dir_note(tmp.path(), false).is_some_and(|m| m.contains("mounted read-write")));
+    }
+
     /// The negative half of the call site: an ordinary directory workdir
     /// must produce NO warning out of `dispatch()`. Without this, a call
     /// site mutated to warn unconditionally would still pass the positive
@@ -3342,12 +3396,12 @@
     }
 
     /// (#3448) A model on a Tensorfold endpoint never takes the managed
-    /// (LM Studio) route: until darkmux starts its server, the route refuses
-    /// it by name even for a caller that skipped preflight, so the model is
-    /// never loaded into LM Studio by mistake.
+    /// (LM Studio) route: a tool-less role on it is one call to the server's
+    /// loopback port, and routing alone starts nothing (the dispatch makes
+    /// the model resident after its `dispatch.start`).
     #[test]
     #[serial]
-    fn a_tensorfold_target_is_refused_before_any_route_is_taken() {
+    fn a_tensorfold_target_takes_the_request_path_and_routing_starts_nothing() {
         let home = TempDir::new().unwrap();
         let prev = std::env::var("DARKMUX_HOME").ok();
         unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
@@ -3370,8 +3424,192 @@
                 None => std::env::remove_var("DARKMUX_HOME"),
             }
         }
-        let err = format!("{:#}", routed.expect_err("a Tensorfold target is refused, not routed"));
-        assert!(err.contains("tensorfold") && err.contains("#3448") && err.contains("Qwen3.8-27B"), "{err}");
+        let ctx = routed.unwrap().expect("a tool-less role on a Tensorfold endpoint is one call");
+        assert_eq!(ctx.model, "TensorFold/Qwen3.8-27B-MLX-4bit");
+        assert!(
+            darkmux_types::engine_record::list_in(&home.path().join("run").join("engines")).0.is_empty(),
+            "routing starts no server"
+        );
+    }
+
+    /// (#3448) The single-shot path end to end against a stand-in Tensorfold:
+    /// the first dispatch starts the server between `dispatch.start` and its
+    /// call (`dispatch.model.start`, then `.ready`) and sends the model under
+    /// its `darkmux:` name; the second finds it resident and writes no model
+    /// record; an unverified engine release ends the dispatch with a
+    /// `dispatch.error` carrying `code: engine_unavailable`.
+    #[test]
+    #[serial]
+    fn a_tensorfold_dispatch_starts_the_server_then_reuses_it() {
+        let home = TempDir::new().unwrap();
+        let flows = TempDir::new().unwrap();
+        let bin_dir = TempDir::new().unwrap();
+        let requests = bin_dir.path().join("requests.jsonl");
+        let server = bin_dir.path().join("serve.py");
+        std::fs::write(
+            &server,
+            format!(
+                r#"
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+a = sys.argv[1:]
+port = int(a[a.index("--port") + 1]); name = a[a.index("--name") + 1]
+class H(BaseHTTPRequestHandler):
+    def reply(self, doc):
+        body = json.dumps(doc).encode()
+        self.send_response(200); self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def do_GET(self):
+        self.reply({{"object": "list", "data": [{{"id": name}}]}})
+    def do_POST(self):
+        req = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        open({requests:?}, "ab").write(req + b"\n")
+        self.reply({{"choices": [{{"message": {{"content": "ok"}}}}], "usage": {{"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}}})
+    def log_message(self, *args): pass
+class S(HTTPServer):
+    def server_bind(self):
+        import socketserver
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = "localhost", self.server_address[1]
+S(("127.0.0.1", port), H).serve_forever()
+"#,
+                requests = requests.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let fake = |version: &str| {
+            let bin = bin_dir.path().join(format!("tensorfold-native-{version}"));
+            std::fs::write(
+                &bin,
+                format!(
+                    "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'tensorfold-native {version}' ;;\n  info) printf 'weights: 0.01 GiB (1024 bytes)\\nmemory floor: 0.01 GiB (weights plus a margin)\\n' ;;\n  serve) shift; exec python3 -u {} serve \"$@\" ;;\nesac\n",
+                    server.display()
+                ),
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            bin
+        };
+        let good = fake("1.2.4");
+        let unverified = fake("1.3.0");
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let pm: darkmux_types::ProfileModel = {
+            let mut reg: darkmux_types::ProfileRegistry = serde_json::from_value(serde_json::json!({
+                "profiles": {"p": {"models": [{"id": "TensorFold/m", "n_ctx": 8192, "endpoint": "tf"}]}},
+                "endpoints": {"tf": {"managed": "tensorfold", "port": port}}
+            }))
+            .unwrap();
+            reg.materialize_endpoints();
+            reg.profiles["p"].models[0].clone()
+        };
+        let target = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
+        let saved: Vec<(&str, Option<String>)> =
+            ["DARKMUX_HOME", "DARKMUX_FLOWS_DIR", "DARKMUX_TENSORFOLD_BIN"].iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", home.path());
+            std::env::set_var("DARKMUX_FLOWS_DIR", flows.path());
+            std::env::set_var("DARKMUX_TENSORFOLD_BIN", &good);
+        }
+        let run = |name: &str| {
+            let mut opts = dispatch_preflight_probe_opts();
+            opts.role_id = "pr-reviewer".to_string();
+            opts.session = crate::mission_test_session("m-3448", &format!("tf-{name}-{}", std::process::id()));
+            opts.json = false;
+            let session = opts.session.wire();
+            let result = dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), "s", &Default::default(), &target, true);
+            (result, session)
+        };
+        let (first, first_session) = run("first");
+        let (second, second_session) = run("second");
+        unsafe { std::env::set_var("DARKMUX_TENSORFOLD_BIN", &unverified) };
+        for rec in darkmux_types::engine_record::list_in(&home.path().join("run").join("engines")).0 {
+            let _ = darkmux_types::child_registry::kill_pid(rec.pid, darkmux_types::child_registry::SIGKILL);
+        }
+        let (refused, refused_session) = run("refused");
+        unsafe {
+            for (k, v) in &saved {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        let actions = |session: &str| -> Vec<serde_json::Value> {
+            let mut out = Vec::new();
+            for entry in std::fs::read_dir(flows.path()).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                for line in std::fs::read_to_string(&path).unwrap().lines() {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                        if v.get("session_id").and_then(|s| s.as_str()) == Some(session) {
+                            out.push(v);
+                        }
+                    }
+                }
+            }
+            out
+        };
+        let names = |recs: &[serde_json::Value]| -> Vec<String> {
+            recs.iter().filter_map(|r| r.get("action").and_then(|a| a.as_str()).map(str::to_string)).collect()
+        };
+        first.expect("the first dispatch succeeds against the started server");
+        let first_actions = names(&actions(&first_session));
+        let at = |a: &str| first_actions.iter().position(|x| x == a).unwrap_or_else(|| panic!("{a} in {first_actions:?}"));
+        assert!(at("dispatch.start") < at("dispatch.model.start"), "{first_actions:?}");
+        assert!(at("dispatch.model.start") < at("dispatch.model.ready"), "{first_actions:?}");
+        assert!(at("dispatch.model.ready") < at("dispatch.complete"), "{first_actions:?}");
+        second.expect("the second dispatch succeeds against the same server");
+        let second_actions = names(&actions(&second_session));
+        assert!(second_actions.iter().all(|a| !a.starts_with("dispatch.model.")), "{second_actions:?}");
+        let sent: Vec<serde_json::Value> =
+            std::fs::read_to_string(&requests).unwrap().lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+        assert_eq!(sent.len(), 2, "one request per dispatch");
+        assert!(sent.iter().all(|b| b["model"] == "darkmux:TensorFold/m"), "the darkmux: name on the wire: {sent:?}");
+        let err = refused.expect_err("an unverified release refuses the dispatch");
+        assert_eq!(crate::engine_dispatch::refusal_code(&err), Some("engine_unavailable"));
+        let refused_recs = actions(&refused_session);
+        let terminal = refused_recs.iter().find(|r| r["action"] == "dispatch.error").expect("a dispatch.error terminal");
+        assert_eq!(terminal["payload"]["code"], "engine_unavailable", "{terminal}");
+        assert!(names(&refused_recs).contains(&"dispatch.start".to_string()), "the refusal follows its dispatch.start");
+    }
+
+    /// (#3448 PR 4 review) The container path names the model the way the
+    /// server answers to it: `darkmux:<id>` on a Tensorfold endpoint.
+    #[test]
+    fn the_container_path_sends_a_tensorfold_model_under_its_darkmux_name() {
+        let pm: darkmux_types::ProfileModel = {
+            let mut reg: darkmux_types::ProfileRegistry = serde_json::from_value(serde_json::json!({
+                "profiles": {"p": {"models": [{"id": "TensorFold/m", "n_ctx": 8192, "endpoint": "tf"}]}},
+                "endpoints": {"tf": {"managed": "tensorfold", "port": 8091}}
+            }))
+            .unwrap();
+            reg.materialize_endpoints();
+            reg.profiles["p"].models[0].clone()
+        };
+        let target = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
+        let role = crate::loader::load_roles().unwrap().into_iter().find(|r| r.id == "coder").expect("the coder role");
+        let opts = dispatch_preflight_probe_opts();
+        let (model, profile, _) = resolve_container_model(&role, &opts, Some(&target)).unwrap();
+        assert_eq!((model.as_str(), profile.as_str()), ("darkmux:TensorFold/m", "p"));
+    }
+
+    /// (#3448 PR 4 review) The container path makes a Tensorfold model
+    /// resident before it launches the container. Its body needs Docker to
+    /// run, so this reads the source: `run_container` calls
+    /// `engine_resident`, before `launch_container`.
+    #[test]
+    fn the_container_path_starts_the_engine_server_before_the_container() {
+        let src = include_str!("dispatch_internal.rs");
+        let start = src.find("fn run_container(").expect("run_container exists");
+        let body = &src[start..];
+        let end = body.find("\nfn ").unwrap_or(body.len());
+        let body = &body[..end];
+        let resident = body.find("engine_resident(").expect("run_container calls engine_resident");
+        let launch = body.find("launch_container(").expect("run_container launches the container");
+        assert!(resident < launch, "the server is made resident before the container starts");
     }
 
     // ─── #1645 fix-pass MUST FIX 1 (fuller fix): dispatch_unmanaged itself ──

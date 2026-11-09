@@ -45,6 +45,7 @@ mod test_guard_conformance;
 /// out goes through — `mods.gate`'s `test_command`, `procedural.shell`.
 pub mod bounded_command;
 pub mod brief_refs;
+pub mod engine_dispatch;
 pub mod channel_markup;
 pub mod concurrent_dispatch;
 /// (#2973, #906) Model-written code (a mod's tests, a lab run's verify and

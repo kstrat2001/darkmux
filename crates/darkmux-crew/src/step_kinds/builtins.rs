@@ -222,15 +222,12 @@ fn resolve_local_placement_inner_with(
     // (#2902 review C4) Exhaustive on the kind, so a new kind is a compile
     // error at the placement decision.
     match target.kind {
-        // (#3448) The wave loader would `lms load` this model before any
-        // dispatch route runs, and LM Studio never serves a Tensorfold
-        // model. Every dispatching preflight refuses the endpoint first; this
-        // refuses it again for a caller that skipped preflight.
+        // (#3448) The wave loader never plans a model on a server darkmux
+        // starts as an LM Studio load: the dispatch itself starts the server
+        // (`engine_dispatch::prepare`), so placement treats it as a model
+        // with no LM Studio residency to plan, as it does an unmanaged one.
         darkmux_types::EndpointKind::Managed(darkmux_types::ManagedBackend::Tensorfold) => {
-            return Err(ResolutionFailed(format!(
-                "`{}` is on a `tensorfold` endpoint, whose server darkmux cannot start yet (#3448)",
-                target.model.id
-            )))
+            return Err(PlacementMiss::Unmanaged(crate::step_kinds::EndpointSlot::of(&target.endpoint)))
         }
         darkmux_types::EndpointKind::Managed(_) => {}
         darkmux_types::EndpointKind::Unmanaged => {
@@ -3298,6 +3295,8 @@ mod tests {
     /// does).
     fn empty_task() -> Task {
         Task {
+            repo_root: None,
+            branch: None,
             run_on: crate::types::default_run_on(),
             id: "t1".to_string(),
             phase_id: "p1".to_string(),
@@ -7940,9 +7939,9 @@ mod tests {
         let err = pick("dangling").unwrap_err();
         assert!(err.contains("nope") && err != "unmanaged", "{err}");
         // (#3448) A Tensorfold model is never planned as an LM Studio load:
-        // the wave loader would `lms load` it before any dispatch route ran.
-        let tf = pick("tf").unwrap_err();
-        assert!(tf.contains("tensorfold") && tf.contains("#3448"), "{tf}");
+        // like an unmanaged one, it has no LM Studio residency to plan, and
+        // the dispatch starts its server.
+        assert_eq!(pick("tf"), Err("unmanaged".into()));
     }
 
     // ─── (#2902 step 1a) usage conformance: one record per model call ──

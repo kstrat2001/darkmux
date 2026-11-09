@@ -1003,6 +1003,22 @@ pub struct Task {
     /// default image.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    /// (#3457) The git branch darkmux created this Task's worktree on (the
+    /// coder phase's `mission.worktree` task). `mission finalize`/`abort`
+    /// force-delete THIS name: never what the worktree's HEAD says, since
+    /// the worktree was mounted read-write and a run can point its `.git`
+    /// anywhere. `None` on every other Task, and on records written before
+    /// the field existed (contract 5: read-compat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// (#3457) The MAIN repository the coder phase's worktree was created
+    /// from (the `mission.worktree` task). `mission finalize`/`abort` tear
+    /// the worktree down through THIS repo, never one resolved from the
+    /// cwd: run from inside the worktree, the cwd's repository is whatever
+    /// the run left in its `.git`. `None` on every other Task, and on
+    /// records written before the field existed (contract 5: read-compat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_root: Option<PathBuf>,
 }
 
 #[cfg(test)]

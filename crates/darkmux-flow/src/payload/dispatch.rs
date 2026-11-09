@@ -587,6 +587,14 @@ pub struct DispatchEndPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub stop_reason: Option<String>,
+    /// (#3448) On a `dispatch.error` only: a stable code an app branches on,
+    /// beside `error` for a person: `busy` (the memory is held by a running
+    /// dispatch; retry later), `wont_fit` (the model does not fit even with
+    /// every darkmux resident evicted), `model_start_failed`, `port_in_use`,
+    /// `engine_unavailable`. Absent when the failure has no code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub code: Option<String>,
     /// The model turns the execution took: a direct single-shot call or a map item is 1, a
     /// container loop its fold's count, an execution that ended before any call 0. Every
     /// producer states it: `new` takes it and there is no `Default`, so a struct built without
@@ -1229,6 +1237,55 @@ impl Attribution for DispatchWorkdirGitUnavailablePayload {
     }
 }
 
+/// (#3448) The payload of `dispatch.model.start`, `.loading` and `.ready`: a
+/// dispatch making its model resident on an engine darkmux starts servers
+/// for. Written between `dispatch.start` and the first turn, only when the
+/// model was not already resident.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
+pub struct DispatchModelPayload {
+    /// The `managed` token (`tensorfold`).
+    pub engine: String,
+    /// The `endpoints` id.
+    pub endpoint: String,
+    /// The profile model's `id`.
+    pub model: String,
+    /// On `start`: the model darkmux's server on this endpoint ran, which it
+    /// stops to run this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub replacing: Option<String>,
+    /// On `start`: darkmux's own residents evicted to make room, by name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts-export", ts(as = "Option<Vec<String>>", optional))]
+    pub evicted: Vec<String>,
+    /// On `loading` and `ready`: how long the start has taken.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
+    pub elapsed_ms: Option<u64>,
+    /// The graph step the record belongs to, when its session is a step's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub step_id: Option<String>,
+    /// The provenance a dispatch caller supplied, a [`RecordContext`].
+    #[serde(default, deserialize_with = "super::context::lenient", skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub context: Option<RecordContext>,
+}
+
+impl Attribution for DispatchModelPayload {
+    fn step_slot(&mut self) -> Option<&mut Option<String>> {
+        Some(&mut self.step_id)
+    }
+    fn step(&self) -> Option<&str> {
+        self.step_id.as_deref()
+    }
+    fn context_slot(&mut self) -> Option<&mut Option<RecordContext>> {
+        Some(&mut self.context)
+    }
+}
+
 /// The routing decision of a dispatch: the payload of `dispatch.route`, emitted under the
 /// dispatch's own session so the topology view pairs it with the dispatch's later records.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1324,6 +1381,7 @@ impl DispatchEndPayload {
             result_class: None,
             error: None,
             stop_reason: None,
+            code: None,
             total_turns: Some(total_turns),
             total_tools: None,
             tool_calls_failed: None,

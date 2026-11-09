@@ -16,6 +16,17 @@ darkmux release.
 
 ### Added
 
+- **A dispatch to a Tensorfold profile starts its server (#3448).** darkmux makes the model resident
+  between `dispatch.start` and the first request on every dispatch path that runs a role (single-shot, the
+  container path, CLI `dispatch`, a mission's `dispatch` steps), reusing its server when it already runs the profile's
+  command. Short of memory, it first stops its own idle engine servers and unloads its own idle LM
+  Studio `darkmux:` loads, never one a running dispatch holds. The new `dispatch.model.start`,
+  `.loading` (every 10 s) and `.ready` records say so, and a refusal is a `dispatch.error` with a
+  stable `code`: `busy`, `wont_fit`, `model_start_failed`, `port_in_use` or `engine_unavailable`.
+  The model is sent under its `darkmux:` name. A utility binding on a Tensorfold endpoint is refused at
+  preflight, and a `dispatch.single_shot` / `dispatch.map` step naming one in `config.endpoint` is
+  refused by name: those steps call an endpoint directly and start no server. `FLOW_SCHEMA_VERSION` 2.6.0 -> 2.7.0, additive.
+
 - **Tensorfold endpoints are read and checked, not yet dispatched (#3448, part 1).** An endpoint
   can declare `"managed": "tensorfold"` with the `port` darkmux will serve it on, and a profile
   model on it can carry `engine_args` (extra `tensorfold-native serve` flags). `darkmux doctor`
@@ -52,6 +63,22 @@ darkmux release.
   (`schema_version` `1.0`, unknown keys refused), is read only from the checkout the workspace was
   made from, never from the workspace a run edits. A workspace cloned from a URL gets no preview;
   add `.darkmux/preview.json` to your own checkout of the repo and make the workspace from it.
+
+### Fixed
+
+- **Host git never runs what a dispatch wrote into a git directory (#3457).** A dispatch mounts its
+  workdir read-write, so a run could replace a coder-phase worktree's `.git` pointer with a
+  directory whose config runs a command (`core.fsmonitor`, a clean filter, a `textconv`) or whose
+  HEAD names another branch. The coder phase's review diff and finalize's unsaved-work check now
+  read the worktree only through the git directory the main repository holds for it, and
+  `mission finalize`/`abort` delete the branch darkmux recorded at launch (a new `Task.branch`),
+  never the one the worktree's HEAD names, through the main repository recorded at launch (a new
+  `Task.repo_root`), never one resolved from a cwd inside the worktree. A repo-defined filter
+  driver never runs under darkmux's host git, wherever attributes assign it (a driver only your
+  global config defines, such as Git LFS's default install, still does). Every host git call carries overrides for the settings
+  that run a command. A plain `dispatch --workdir <checkout>` whose `.git` is a real directory now
+  prints a note: the run can change that repository's config and hooks, which the git you run
+  there yourself still reads.
 
 ## [5.9.3] - 2026-10-29
 

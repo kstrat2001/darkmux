@@ -18,7 +18,6 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::UNIX_EPOCH;
 
 pub const BUNDLE_FORMAT: &str = "darkmux-evals-bundle";
@@ -1356,7 +1355,8 @@ fn name_words(name: &str) -> Vec<String> {
 
 /// git's `user.name`, which a run's text may carry.
 fn git_user_name() -> Option<String> {
-    let out = Command::new("git").args(["config", "--get", "user.name"]).output().ok()?;
+    let here = std::env::current_dir().ok()?;
+    let out = darkmux_types::host_git::HostGit::trusted(here).output(&["config", "--get", "user.name"]).ok()?;
     user_name_from(out.status.success(), &out.stdout)
 }
 
@@ -1699,8 +1699,9 @@ fn hash_weights(path: &Path, run_id: &str, model_id: &str, progress: &mut dyn Fn
 /// The fixture: a GitHub repo at the commit its checkout was on through the
 /// runs, and its `.fixture.json` as it was at that commit.
 pub fn fixture_at(source: &Path, starts: &[Option<u64>], stated_commit: Option<&str>) -> Result<(String, String, Value)> {
+    let host = darkmux_types::host_git::HostGit::trusted(source);
     let git = |args: &[&str]| -> Option<String> {
-        let out = Command::new("git").arg("-C").arg(source).args(args).output().ok()?;
+        let out = host.output(args).ok()?;
         out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
     };
     if git(&["status", "--porcelain"]).as_deref() != Some("") {
@@ -1746,11 +1747,8 @@ fn eval_workloads(source: &Path, commit_sha: &str, fixture_manifest: &Value, inp
             refused.push(format!("{}: its workload {path} is not in the eval's {eval_dir}/", input.run_id));
             continue;
         }
-        let at_commit = Command::new("git")
-            .arg("-C")
-            .arg(source)
-            .args(["show", &format!("{commit_sha}:{path}")])
-            .output()
+        let at_commit = darkmux_types::host_git::HostGit::trusted(source)
+            .output(&["show", &format!("{commit_sha}:{path}")])
             .ok()
             .filter(|o| o.status.success())
             .map(|o| sha256::hex(&o.stdout));

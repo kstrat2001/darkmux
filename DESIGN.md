@@ -675,7 +675,7 @@ Known gap: the sibling protection is seeded only from pins that pass a bare `dar
 
 ## Engine servers darkmux starts (planned, #3448)
 
-**Status: agreed design, not built.** This section is the interface an app built on darkmux can plan against; it lands in four PRs (config and the Tensorfold adapter, the server record, start and stop, then dispatch with eviction). Until the last one merges, a dispatch to one of these endpoints is refused. Tensorfold is the first engine; rec/Flint and `mlx_lm.server` follow the same shape.
+**Status: dispatch built for Tensorfold (#3448); the app-facing reads are planned.** Built: the endpoint and profile shape, the engine record, the server lifecycle, and dispatch making the model resident on every dispatch path (eviction of darkmux's own idle residents, the `dispatch.model.*` records, `dispatch.error`'s `code`). Still planned, as written below: the `availability` list, `dispatch --check`, `run list`'s `activity`, a `--json` failure envelope carrying the code, `fleet.busy_policy`'s `queue` for local dispatches (today a busy dispatch is refused with `busy`), the machine surfaces knowing darkmux's servers (`machine status`, `machine resources`, `machine eject`, #3450), and an LM Studio load evicting an idle engine server (today only a Tensorfold start evicts, on either engine). A utility binding on a Tensorfold endpoint is refused at preflight: utility jobs do not start servers. Tensorfold is the first engine; rec/Flint (#3453) and `mlx_lm.server` follow the same shape.
 
 Some engines serve one model per server process and have no load or unload call, so loading a model there means starting a server and unloading it means stopping one. darkmux does both for the servers it starts. A server darkmux started is darkmux's, exactly as a `darkmux:` load is in LM Studio (contract 4): it counts in the memory budget, darkmux may stop it to make room, and it is never confused with a server someone else started. A server darkmux did not start is another tenant: its memory counts as in use, and darkmux never stops it, adopts it or sends to it as if it were its own.
 
@@ -793,7 +793,7 @@ A dispatch that finds its model resident writes none of them. `darkmux run list 
 
 - `darkmux machine resources`: a row for each server darkmux started, with its model and measured memory. Other servers stay in "other tenants".
 - `darkmux machine status`: darkmux's servers listed beside its LM Studio loads.
-- `darkmux machine eject`: also stops the servers darkmux started, and never another one.
+- `darkmux machine eject`: also stops the servers darkmux started, and never another one (planned, #3450).
 - `darkmux doctor`: the binary, its version, each Tensorfold endpoint and its `engine_args`.
 
 ### Still open

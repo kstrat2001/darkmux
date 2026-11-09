@@ -8,6 +8,7 @@ import type { DispatchDegeneracyWarningPayload } from "./DispatchDegeneracyWarni
 import type { DispatchEndPayload } from "./DispatchEndPayload";
 import type { DispatchFeedbackPayload } from "./DispatchFeedbackPayload";
 import type { DispatchHeartbeatPayload } from "./DispatchHeartbeatPayload";
+import type { DispatchModelPayload } from "./DispatchModelPayload";
 import type { DispatchReasoningPayload } from "./DispatchReasoningPayload";
 import type { DispatchRestPayload } from "./DispatchRestPayload";
 import type { DispatchRoutePayload } from "./DispatchRoutePayload";
@@ -72,6 +73,9 @@ export type FlowPayloads = {
   "dispatch.degeneracy.warning": DispatchDegeneracyWarningPayload,
   "dispatch.workdir_git_unavailable": DispatchWorkdirGitUnavailablePayload,
   "dispatch.route": DispatchRoutePayload,
+  "dispatch.model.start": DispatchModelPayload,
+  "dispatch.model.loading": DispatchModelPayload,
+  "dispatch.model.ready": DispatchModelPayload,
   "gh.verb.executed": GhVerbExecutedPayload,
   "hook.fired": HookDeliveryPayload,
   "hook.failed": HookFailedPayload,

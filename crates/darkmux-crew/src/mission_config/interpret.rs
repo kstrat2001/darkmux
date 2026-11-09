@@ -74,6 +74,12 @@ pub struct TaskOverride {
     pub profile_name: Option<String>,
     pub workdir: Option<PathBuf>,
     pub image: Option<String>,
+    /// (#3457) The branch the task's worktree is created on, persisted on
+    /// `Task::branch` so teardown deletes a name darkmux recorded.
+    pub branch: Option<String>,
+    /// (#3457) The main repository the task's worktree is created from,
+    /// persisted on `Task::repo_root` so teardown never resolves it from the cwd.
+    pub repo_root: Option<PathBuf>,
     /// Overrides the whole rendered description (e.g. the coder-phase
     /// launcher's `dispatch \`{role}\` into the worktree`, where `{role}`
     /// is only known at launch).
@@ -485,6 +491,8 @@ fn push_task(
     let profile_name = override_.and_then(|o| o.profile_name.clone());
     let workdir = override_.and_then(|o| o.workdir.clone());
     let image = override_.and_then(|o| o.image.clone());
+    let branch = override_.and_then(|o| o.branch.clone());
+    let repo_root = override_.and_then(|o| o.repo_root.clone());
     tasks.push(Task {
         id: real_task_id.to_string(),
         phase_id: real_phase_id.to_string(),
@@ -497,6 +505,8 @@ fn push_task(
         profile_name,
         workdir,
         image,
+        branch,
+        repo_root,
         run_on: doc_run_on.map(|v| v.to_vec()).unwrap_or_else(crate::types::default_run_on),
     });
     Ok(())
@@ -639,6 +649,8 @@ mod tests {
                 role_id: Some("reviewer-bot".to_string()),
                 workdir: Some(PathBuf::from("/tmp/wt")),
                 image: Some("rust:slim".to_string()),
+                branch: Some("darkmux/s1".to_string()),
+                repo_root: Some(PathBuf::from("/repo")),
                 description: Some("dispatch `reviewer-bot` into the worktree".to_string()),
                 ..Default::default()
             },
@@ -649,6 +661,8 @@ mod tests {
         assert_eq!(tasks[0].role_id.as_deref(), Some("reviewer-bot"));
         assert_eq!(tasks[0].workdir, Some(PathBuf::from("/tmp/wt")));
         assert_eq!(tasks[0].image.as_deref(), Some("rust:slim"));
+        assert_eq!(tasks[0].branch.as_deref(), Some("darkmux/s1"), "(#3457) persisted for finalize/abort");
+        assert_eq!(tasks[0].repo_root, Some(PathBuf::from("/repo")), "(#3457) persisted for finalize/abort");
         assert_eq!(tasks[0].description, "dispatch `reviewer-bot` into the worktree");
     }
 

@@ -62,7 +62,16 @@ impl Target {
     /// unmanaged endpoint. `None` on a managed one: its records carry the LM
     /// Studio base instead (`usage::lmstudio_endpoint`).
     pub fn route_label(&self) -> Option<String> {
-        (!self.is_managed()).then(|| endpoint_route_label(&self.endpoint, &self.model.id))
+        match self.kind {
+            EndpointKind::Unmanaged => Some(endpoint_route_label(&self.endpoint, &self.model.id)),
+            // (#3448) A server darkmux starts is labeled by where it serves,
+            // never left to read as the LM Studio default.
+            EndpointKind::Managed(darkmux_types::ManagedBackend::Tensorfold) => Some(darkmux_flow::unmanaged_route_label(
+                &format!("127.0.0.1:{}", self.endpoint.port.unwrap_or_default()),
+                &self.model.id,
+            )),
+            EndpointKind::Managed(_) => None,
+        }
     }
 }
 
@@ -315,6 +324,15 @@ fn step_endpoint_of_any_kind(
         EndpointRef::Inline(inline) => (**inline).clone(),
     };
     let kind = ep.kind()?;
+    // (#3448) A step that names its own model and endpoint calls the endpoint
+    // directly and starts no server: on a Tensorfold endpoint it would fall
+    // through to an LM Studio load. Refused by name instead.
+    if kind == EndpointKind::Managed(darkmux_types::ManagedBackend::Tensorfold) {
+        anyhow::bail!(
+            "a step's `config.endpoint` names a `tensorfold` endpoint, and `dispatch.single_shot` / `dispatch.map` do \
+             not start engine servers (#3448); run it through a role and a `dispatch` step, which does"
+        );
+    }
     Ok(Some((ep, kind)))
 }
 
@@ -401,6 +419,22 @@ mod resolve_tests {
             r#"{"id":"r","description":"d","tool_palette":{"allow":[],"deny":[]},"escalation_contract":"bail-with-explanation"}"#,
         )
         .unwrap()
+    }
+
+    /// (#3448) A step naming a Tensorfold endpoint directly is refused by
+    /// name (it would otherwise be planned as an LM Studio load), as a
+    /// managed and as an unmanaged lookup alike.
+    #[test]
+    fn a_step_endpoint_on_tensorfold_is_refused_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let pf = dir.path().join("profiles.json");
+        std::fs::write(&pf, r#"{"profiles":{"p":{"models":[{"id":"m","n_ctx":8}]}},"endpoints":{"tf":{"managed":"tensorfold","port":8091}}}"#).unwrap();
+        let cfg = Some(pf.to_str().unwrap());
+        let tf = crate::step_config::EndpointRef::Id("tf".into());
+        for err in [super::step_unmanaged_endpoint(Some(&tf), cfg).unwrap_err(), super::step_managed_endpoint(Some(&tf), cfg).unwrap_err()] {
+            let msg = format!("{err:#}");
+            assert!(msg.contains("tensorfold") && msg.contains("#3448"), "{msg}");
+        }
     }
 
     /// A selected model whose endpoint id is undefined is an ERROR naming
