@@ -14,8 +14,8 @@
 //! the refusal as its reason, and no engine is asked. Otherwise it asks each
 //! engine once ([`list`]), every engine at the same time, and waits for each
 //! at most its [`listing_bound`]: 10 s for LM Studio (a cold `lms` takes
-//! seconds) and 3 s for a server binary darkmux runs (Tensorfold), a local
-//! binary's read-only probes. An engine that has not answered by then reads
+//! seconds) and 3 s for a server binary darkmux runs (Tensorfold, rec's
+//! Flint), a local binary's read-only probes. An engine that has not answered by then reads
 //! `unknown`, and a probe still running then is killed with its process
 //! group and reaped before the listing returns (the bounded runner's
 //! deadline is capped at the engine's), so no child outlives the caller.
@@ -24,6 +24,12 @@
 //! and downloaded models, the Tensorfold binary's `--version`,
 //! `capabilities --json` and `models --json`), darkmux's server records, and
 //! whether a port answers.
+//!
+//! Flint is `startable` only when rec is the verified release with exactly
+//! one runtime and one model directory for the revision (the adapter's own
+//! checks), the port is free, and rec's own server is not running: rec runs
+//! one server per machine, so its own server reads `unavailable` with the
+//! refusal a dispatch gives (`engine_in_use`, naming `rec stop`).
 //!
 //! `unknown` is a probe that could not run or ran out of time (LM Studio not
 //! running, a listing that failed once the engine answered). A Tensorfold

@@ -782,3 +782,55 @@ fn darkmuxs_running_flint_server_is_resident() {
     record_for(&answer.dirs, "fl", "flint", port, argv);
     assert_eq!(answer.judge(&model), Availability::resident());
 }
+
+/// darkmux's own Flint server on the endpoint running another command (a
+/// context change, say) is what `rec status` reports, and it is darkmux's,
+/// not rec's: the model is `startable` (darkmux replaces its own server),
+/// never `engine_in_use`.
+#[test]
+fn darkmuxs_own_flint_server_is_not_recs() {
+    let dir = tempfile::tempdir().unwrap();
+    rec_install(&dir.path().join("rec"), 1, &["flint-int4"]);
+    let port = serving("flint");
+    let model = flint_model(port);
+    let address = format!("http://127.0.0.1:{port}/v1");
+    let answer = flint_answer(&dir, Ok("0.1.0"), Ok(Some(&address)));
+    let mut argv = answer
+        .rec
+        .serve_spec("fl", port, &model, "0.1.0")
+        .unwrap()
+        .argv;
+    argv.push("--fast-sync".into());
+    record_for(&answer.dirs, "fl", "flint", port, argv);
+    assert_eq!(answer.judge(&model), Availability::startable());
+}
+
+/// The production Flint answer ([`ask`]) asks the installed `rec` its
+/// version and status and reads its install from the XDG data home, as
+/// dispatch's adapter does.
+#[test]
+#[serial_test::serial]
+fn asking_flint_reads_recs_version_status_and_install() {
+    let dir = tempfile::tempdir().unwrap();
+    rec_install(&dir.path().join("data/rec"), 1, &["flint-int4"]);
+    let rec = dir.path().join("rec");
+    std::fs::write(
+        &rec,
+        "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'rec 0.1.0';;\n  status) echo '{\"ready\": false}';;\n  *) exit 9;;\nesac\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&rec, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _ = std::process::Command::new(&rec).arg("--version").output();
+    let data = dir.path().join("data");
+    let home = dir.path().join("home");
+    let vars = [
+        ("DARKMUX_FLINT_BIN", rec.to_str().unwrap()),
+        ("XDG_DATA_HOME", data.to_str().unwrap()),
+        ("DARKMUX_HOME", home.to_str().unwrap()),
+    ];
+    let state = with_env(&vars, || {
+        ask(ManagedBackend::Flint).judge(&flint_model(free_port()))
+    });
+    assert_eq!(state, Availability::startable());
+}

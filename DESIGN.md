@@ -770,7 +770,7 @@ An app picking a model, waiting on one, and reporting a failure needs three answ
 ```
 
 - `resident`: loaded or served now, at the profile's context.
-- `startable`: not resident, and darkmux can load it or start its server (the engine is installed at a verified version, it has the model, the port is free). A stopped Tensorfold server reads `startable`, so an app keeps it among its choices instead of passing it over.
+- `startable`: not resident, and darkmux can load it or start its server (the engine is installed at a verified version, it has the model, the port is free). A stopped Tensorfold or Flint server reads `startable`, so an app keeps it among its choices instead of passing it over. For Flint, rec must also have exactly one runtime and one model directory for the revision, and rec's own server must not be running: rec runs one server per machine, so its own server reads `unavailable`, naming `rec stop` (a dispatch refuses it with `engine_in_use`).
 - `unavailable`: darkmux cannot make it resident, and `reason` says why in one line (no engine binary, an unverified version, a model the engine does not have, the port held by a server darkmux did not start).
 - `external`: an endpoint darkmux only sends requests to. darkmux does not vouch that it answers; an app that wants to know asks it, as it does today.
 - `unknown`: a probe that could not run or that timed out (LM Studio not running, say); `reason` names which. Never read as `unavailable`. A Tensorfold binary that is missing, or whose `--version` exits non-zero or prints no version darkmux can read, is `unavailable`, not `unknown`: a dispatch refuses exactly that with `engine_unavailable`.
