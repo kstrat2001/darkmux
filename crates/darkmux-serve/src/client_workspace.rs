@@ -174,6 +174,12 @@ pub fn status_of(wc: &crate::client_git::WorkCopy) -> Option<(String, String)> {
 /// (a fetch only moves remote-tracking refs, so the worst it can do is fetch
 /// the wrong objects).
 fn git_bounded(args: &[&std::ffi::OsStr], timeout: Duration) -> Result<(), String> {
+    git_bounded_with(&[], args, timeout)
+}
+
+/// [`git_bounded`] with `extra` settings after the transport rules (tests
+/// allow a local `file://` remote this way).
+fn git_bounded_with(extra: &[&str], args: &[&std::ffi::OsStr], timeout: Duration) -> Result<(), String> {
     let child = std::process::Command::new("git")
         .args([
             "-c",
@@ -184,6 +190,7 @@ fn git_bounded(args: &[&std::ffi::OsStr], timeout: Duration) -> Result<(), Strin
             "protocol.ssh.allow=always",
         ])
         .args(global_network_config())
+        .args(extra)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(std::process::Stdio::null())
@@ -304,20 +311,50 @@ fn last_stderr_line(child: &mut std::process::Child) -> String {
 /// <ref>] -- <url> <dest>`: the repository lives in `git_dir`, outside the
 /// work tree a run is given.
 pub fn clone_with_git(url: &str, git_ref: Option<&str>, dest: &Path, git_dir: &Path) -> Result<(), String> {
+    clone_at(url, git_ref, dest, git_dir, &[])
+}
+
+fn clone_at(url: &str, git_ref: Option<&str>, dest: &Path, git_dir: &Path, extra: &[&str]) -> Result<(), String> {
+    // A commit SHA (what a pinned template sends) is no branch: clone
+    // without checking out, then check out that commit, detached.
+    let sha = git_ref.filter(|r| is_commit_sha(r));
     let mut args: Vec<&std::ffi::OsStr> = vec![
         "clone".as_ref(),
         "--quiet".as_ref(),
         "--separate-git-dir".as_ref(),
         git_dir.as_os_str(),
     ];
-    if let Some(r) = git_ref {
-        args.push("--branch".as_ref());
-        args.push(r.as_ref());
+    match (git_ref, sha) {
+        (_, Some(_)) => args.push("--no-checkout".as_ref()),
+        (Some(r), None) => {
+            args.push("--branch".as_ref());
+            args.push(r.as_ref());
+        }
+        (None, None) => {}
     }
     args.push("--".as_ref());
     args.push(url.as_ref());
     args.push(dest.as_os_str());
-    git_bounded(&args, Duration::from_secs(600))
+    git_bounded_with(extra, &args, Duration::from_secs(600))?;
+    let Some(sha) = sha else { return Ok(()) };
+    fn in_dest<'a>(dest: &'a Path, rest: &[&'a str]) -> Vec<&'a std::ffi::OsStr> {
+        let mut a: Vec<&std::ffi::OsStr> = vec!["-C".as_ref(), dest.as_os_str()];
+        a.extend(rest.iter().map(|s| std::ffi::OsStr::new(*s)));
+        a
+    }
+    let object = format!("{sha}^{{commit}}");
+    // A commit off every branch the clone fetched: ask the remote for it.
+    if git_bounded_with(extra, &in_dest(dest, &["cat-file", "-e", &object]), Duration::from_secs(30)).is_err() {
+        git_bounded_with(extra, &in_dest(dest, &["fetch", "--quiet", "origin", sha]), Duration::from_secs(600))?;
+    }
+    git_bounded_with(extra, &in_dest(dest, &["checkout", "--quiet", "--detach", sha]), Duration::from_secs(120))
+}
+
+/// A full object name (SHA-1 or SHA-256, lowercase hex): a ref that names
+/// one commit, which `git clone --branch` cannot take. A short one is
+/// ambiguous and could be a branch, so it stays a branch or tag name.
+pub fn is_commit_sha(r: &str) -> bool {
+    matches!(r.len(), 40 | 64) && r.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
 }
 
 /// Production fetch: updates remote-tracking refs only; the checkout's
@@ -905,5 +942,102 @@ mod tests {
             .as_deref(),
             Some("owner-repo-2")
         );
+    }
+
+    /// A git repo at `dir` with two commits on `main`; returns the first
+    /// commit's full SHA (behind the branch tip, so only a SHA reaches it).
+    fn two_commit_repo(dir: &Path) -> String {
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        std::fs::create_dir_all(dir).unwrap();
+        git(&["init", "--quiet", "--initial-branch=main"]);
+        std::fs::write(dir.join("page.txt"), "first").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "--quiet", "-m", "first"]);
+        let first = git(&["rev-parse", "HEAD"]);
+        std::fs::write(dir.join("page.txt"), "second").unwrap();
+        git(&["commit", "--quiet", "-am", "second"]);
+        first
+    }
+
+    const ALLOW_FILE: &[&str] = &["-c", "protocol.file.allow=always"];
+
+    #[test]
+    fn a_template_pinned_to_a_commit_sha_clones_at_that_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("template");
+        let first = two_commit_repo(&src);
+        let url = format!("file://{}", src.display());
+        let dest = tmp.path().join("project");
+        let git_dir = tmp.path().join("project.git");
+        clone_at(&url, Some(&first), &dest, &git_dir, ALLOW_FILE).unwrap();
+        assert_eq!(std::fs::read_to_string(dest.join("page.txt")).unwrap(), "first");
+    }
+
+    #[test]
+    fn a_commit_on_no_branch_is_fetched_by_its_sha() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("template");
+        two_commit_repo(&src);
+        // A commit kept only by a non-branch ref (like a pull request's),
+        // which a clone does not fetch.
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git").arg("-C").arg(&src).args(args).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let tree = run(&["rev-parse", "HEAD^{tree}"]);
+        let lone = run(&["-c", "user.name=t", "-c", "user.email=t@t", "commit-tree", &tree, "-m", "lone"]);
+        run(&["update-ref", "refs/pull/1/head", &lone]);
+        let url = format!("file://{}", src.display());
+        let dest = tmp.path().join("project");
+        let git_dir = tmp.path().join("project.git");
+        clone_at(&url, Some(&lone), &dest, &git_dir, ALLOW_FILE).unwrap();
+        let head = std::process::Command::new("git").arg("-C").arg(&dest).args(["rev-parse", "HEAD"]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), lone);
+    }
+
+    #[test]
+    fn a_branch_ref_still_clones_that_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("template");
+        two_commit_repo(&src);
+        let url = format!("file://{}", src.display());
+        let dest = tmp.path().join("project");
+        let git_dir = tmp.path().join("project.git");
+        clone_at(&url, Some("main"), &dest, &git_dir, ALLOW_FILE).unwrap();
+        assert_eq!(std::fs::read_to_string(dest.join("page.txt")).unwrap(), "second");
+    }
+
+    #[test]
+    fn a_commit_sha_the_remote_does_not_have_fails_naming_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("template");
+        two_commit_repo(&src);
+        let url = format!("file://{}", src.display());
+        let dest = tmp.path().join("project");
+        let git_dir = tmp.path().join("project.git");
+        let missing = "0123456789abcdef0123456789abcdef01234567";
+        let err = clone_at(&url, Some(missing), &dest, &git_dir, ALLOW_FILE).unwrap_err();
+        assert!(err.starts_with("git exited with "), "{err}");
+    }
+
+    #[test]
+    fn only_full_hex_object_names_count_as_commit_shas() {
+        assert!(is_commit_sha("e044900cd94d086c841616b05ed63638aa402be4"));
+        assert!(is_commit_sha(&"a".repeat(64)));
+        assert!(!is_commit_sha("e044900"), "a short SHA is ambiguous, and could be a branch");
+        assert!(!is_commit_sha("main"));
+        assert!(!is_commit_sha("E044900CD94D086C841616B05ED63638AA402BE4"));
+        assert!(!is_commit_sha(&"g".repeat(40)));
     }
 }
