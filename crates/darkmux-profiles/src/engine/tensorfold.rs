@@ -271,6 +271,48 @@ impl Tensorfold {
     }
 }
 
+impl Tensorfold {
+    /// The server darkmux runs for `model` on `endpoint`: `tensorfold-native
+    /// serve <id>` with the model's `engine_args` first and darkmux's own
+    /// flags after them (loopback, the endpoint's `port`, the model's `n_ctx`
+    /// as `--context`, its `darkmux:` name, no update check), so darkmux's
+    /// win wherever the engine takes the last of a repeated flag. The
+    /// `engine_args` darkmux sets are refused before this is reached
+    /// (`ProfileModel::engine_args_problem`).
+    pub fn serve_spec(
+        &self,
+        endpoint: &str,
+        port: u16,
+        model: &darkmux_types::ProfileModel,
+        version: Version,
+    ) -> Result<super::server::ServerSpec> {
+        let n_ctx = model.require_n_ctx()?;
+        let served_name = crate::ownership::namespaced_identifier(model);
+        let mut argv = vec![self.bin.clone(), "serve".to_string(), model.id.clone()];
+        argv.extend(model.engine_args.iter().cloned());
+        for (flag, value) in [
+            ("--host", "127.0.0.1".to_string()),
+            ("--port", port.to_string()),
+            ("--context", n_ctx.to_string()),
+            ("--name", served_name.clone()),
+        ] {
+            argv.push(flag.to_string());
+            argv.push(value);
+        }
+        argv.push("--no-update-check".to_string());
+        Ok(super::server::ServerSpec {
+            endpoint: endpoint.to_string(),
+            engine: "tensorfold".to_string(),
+            model: model.id.clone(),
+            n_ctx,
+            port,
+            served_name,
+            argv,
+            engine_version: format!("tensorfold-native {version}"),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,6 +388,30 @@ mod tests {
         assert_eq!(info.memory_floor_bytes, (16.98_f64 * 1024.0 * 1024.0 * 1024.0).round() as u64);
         assert!(parse_info("weights: 14.98 GiB\nmemory floor: 16.98 GiB\n").unwrap_err().to_string().contains("byte count"));
         assert!(parse_info("weights: 1 GiB (5 bytes)\n").unwrap_err().to_string().contains("memory floor"));
+    }
+
+    /// The command darkmux runs: the model's `engine_args` first, darkmux's
+    /// own flags after them, served under the model's `darkmux:` name.
+    #[test]
+    fn the_serve_command_puts_darkmuxs_flags_after_the_models_engine_args() {
+        let model: darkmux_types::ProfileModel = serde_json::from_value(serde_json::json!({
+            "id": "TensorFold/Qwen3.8-27B-MLX-4bit", "n_ctx": 262144, "engine_args": ["--drafter", "z/d"]
+        }))
+        .unwrap();
+        let v = Version { major: 1, minor: 2, patch: 4 };
+        let spec = Tensorfold::at("/opt/tf/tensorfold-native").serve_spec("tf", 8091, &model, v).unwrap();
+        assert_eq!(
+            spec.argv,
+            [
+                "/opt/tf/tensorfold-native", "serve", "TensorFold/Qwen3.8-27B-MLX-4bit", "--drafter", "z/d", "--host",
+                "127.0.0.1", "--port", "8091", "--context", "262144", "--name", "darkmux:TensorFold/Qwen3.8-27B-MLX-4bit",
+                "--no-update-check",
+            ]
+        );
+        assert_eq!(spec.served_name, "darkmux:TensorFold/Qwen3.8-27B-MLX-4bit");
+        assert_eq!((spec.port, spec.n_ctx, spec.engine_version.as_str()), (8091, 262_144, "tensorfold-native 1.2.4"));
+        let no_ctx: darkmux_types::ProfileModel = serde_json::from_value(serde_json::json!({"id": "m"})).unwrap();
+        assert!(Tensorfold::at("t").serve_spec("tf", 8091, &no_ctx, v).is_err(), "n_ctx is the server's --context");
     }
 
     /// A probe of a binary that is not there, or not Tensorfold, is an error
