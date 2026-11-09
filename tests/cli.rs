@@ -7403,6 +7403,43 @@ impl Drop for EnvVarGuard {
 /// `set_var` (hence `#[serial]` — this mutates process-global env).
 /// `DARKMUX_HOME` isolates config.json, and `DARKMUX_REDIS_URL` is removed
 /// on both sides so the fleet input is an empty slice for each.
+/// (#3467) `run list --json` shows a dispatch that is starting its model as
+/// running with `activity: "starting_model"` and the latest `.loading`'s
+/// elapsed time, the reading `GET /runs` takes (one union, one lifecycle).
+#[test]
+#[serial_test::serial]
+fn run_list_json_shows_a_dispatch_starting_its_model() {
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let day = darkmux_flow::day_utc_now();
+    let now = darkmux_flow::ts_utc_now();
+    let rec = |action: &str, payload: serde_json::Value| {
+        serde_json::json!({"ts": now, "action": action, "session_id": "tf-sess", "execution_id": "exec-tf",
+            "handle": "coder", "model": "TF/m", "payload": payload})
+    };
+    let model = |ms: u64| serde_json::json!({"engine": "tensorfold", "endpoint": "tf", "model": "TF/m", "elapsed_ms": ms});
+    let lines = [
+        rec("dispatch.start", serde_json::json!({})),
+        rec("dispatch.model.start", model(0)),
+        rec("dispatch.model.loading", model(20_000)),
+    ];
+    let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    fs::write(flows.path().join(format!("{day}.jsonl")), body).unwrap();
+    let out = darkmux_cmd()
+        .args(["run", "list", "--json", "--all"])
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env_remove("DARKMUX_REDIS_URL")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let row = v["runs"].as_array().unwrap().iter().find(|r| r["id"] == "tf-sess").unwrap_or_else(|| panic!("{v}"));
+    assert_eq!(row["status"], "running", "{row}");
+    assert_eq!(row["activity"], "starting_model", "{row}");
+    assert_eq!(row["activity_elapsed_ms"], 20_000, "{row}");
+}
+
 #[test]
 #[serial_test::serial]
 fn run_list_binary_agrees_with_the_shared_union_it_calls() {

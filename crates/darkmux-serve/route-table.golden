@@ -106,6 +106,7 @@ Recipe.install?: Install | null
 Recipe.ready?: Ready | null
 Recipe.schema_version: string
 RecipeReply.recipe: Recipe
+RunActivity = "starting_model"
 RunChanges.diff: string
 RunChanges.files: Array<FileChange>
 RunChanges.skipped: Array<string>
@@ -117,7 +118,7 @@ Whoami.machine: ClientMachine
 Whoami.scopes: ClientScopes
 WorkAccepted.profile: string
 WorkAccepted.work_id: string
-WorkState = { status: "running" } | { status: "cancelling" } | { result: any, changes?: RunChanges | null, commit?: string | null, branch?: string | null, commit_error?: string | null, changes_error?: string | null, undone: boolean, status: "done" } | { error: string, reason: string, status: "error" } | { reason: string, error?: string | null, status: "cancelled" }
+WorkState = { activity?: RunActivity | null, activity_elapsed_ms?: integer | null, status: "running" } | { status: "cancelling" } | { result: any, changes?: RunChanges | null, commit?: string | null, branch?: string | null, commit_error?: string | null, changes_error?: string | null, undone: boolean, status: "done" } | { error: string, reason: string, status: "error" } | { reason: string, error?: string | null, status: "cancelled" }
 WorkspaceInfo.branch: string
 WorkspaceInfo.created: boolean
 WorkspaceInfo.fetch_error?: string | null

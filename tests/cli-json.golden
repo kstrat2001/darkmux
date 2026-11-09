@@ -972,6 +972,9 @@ Run
   relay?: RunRelay | null
   receive_key: uint64
   not_reporting?: boolean
+  activity?: RunActivity | null
+  activity_elapsed_ms?: uint64 | null
+RunActivity = "starting_model"
 RunChecks
   telemetry_covers_run: boolean
   policy_consistent: boolean | null

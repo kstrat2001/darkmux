@@ -79,6 +79,20 @@ struct Folded {
     /// A `step.complete` that names a later step of its task still planned: the task's session
     /// goes on (#3074).
     later_step_planned: bool,
+    /// (#3467) A `dispatch.model.loading`'s time so far, milliseconds.
+    model_elapsed_ms: Option<u64>,
+}
+
+/// (#3467) A `dispatch.model.loading`'s time so far, ms. Read only off a
+/// `.loading`, so no other record pays for the payload parse.
+fn model_elapsed_of(action: Option<&FlowAction>, v: &serde_json::Value) -> Option<u64> {
+    if action != Some(&FlowAction::DispatchModelLoading) {
+        return None;
+    }
+    match darkmux_flow::reader::payload_of(v) {
+        Some(darkmux_flow::Payload::DispatchModelLoading(p)) => p.elapsed_ms,
+        _ => None,
+    }
 }
 
 impl Folded {
@@ -94,6 +108,7 @@ impl Folded {
             _ => (false, 0, false),
         };
         let degraded = matches!(darkmux_flow::reader::payload_of(v), Some(darkmux_flow::Payload::RunComplete(p)) if p.is_degraded());
+        let model_elapsed_ms = model_elapsed_of(action, v);
         Folded {
             action: action.cloned(),
             mission: mission.map(str::to_string),
@@ -104,6 +119,7 @@ impl Folded {
             degraded,
             wait_ms,
             later_step_planned,
+            model_elapsed_ms,
         }
     }
 
@@ -232,12 +248,24 @@ pub(crate) struct Attempt {
     pub fold: CloseFold,
     /// While a `budget.wait` is open: when it lapses, epoch ms.
     pub wait_until_ms: Option<u64>,
+    /// (#3467) While its dispatch is starting its model (from
+    /// `dispatch.model.start` until `.ready`): the latest `.loading`'s time
+    /// so far, ms (0 before the first).
+    model_starting: Option<u64>,
 }
 
 impl Attempt {
     /// How it ended (rule 3), when it has closed.
     pub fn ending(&self) -> Option<Ending> {
         self.fold.ending()
+    }
+
+    /// (#3467) While the attempt is open and its dispatch is starting its
+    /// model (between `dispatch.model.start` and `dispatch.model.ready`):
+    /// how long the start has taken, from the latest `dispatch.model.loading`
+    /// (0 before the first). The one reading every run surface takes.
+    pub fn starting_model(&self) -> Option<u64> {
+        self.model_starting.filter(|_| self.fold.close.is_none())
     }
 
     fn add(&mut self, r: &Folded) {
@@ -260,6 +288,20 @@ impl Attempt {
             self.close_with(&r.ts, ending, r.is_bookend_terminal());
         }
         self.fold_wait(action, r);
+        self.fold_model(action, r);
+    }
+
+    /// (#3467) `dispatch.model.start` opens a model start, each `.loading`
+    /// moves its time on, `.ready` ends it (and so does any close).
+    fn fold_model(&mut self, action: &FlowAction, r: &Folded) {
+        match action {
+            FlowAction::DispatchModelStart => self.model_starting = Some(0),
+            // A `.loading` is itself proof a start is under way (its
+            // `.start` may sit in a day file the window no longer reads).
+            FlowAction::DispatchModelLoading => self.model_starting = r.model_elapsed_ms.or(self.model_starting),
+            FlowAction::DispatchModelReady => self.model_starting = None,
+            _ => {}
+        }
     }
 
     fn close_with(&mut self, ts: &str, ending: Ending, bookend_terminal: bool) {
@@ -451,6 +493,56 @@ mod tests {
         let stale = 1_200_000;
         assert!(quiet_clock_live(latest.last_activity_ts.as_deref(), None, at("2026-09-27T10:12:00Z"), stale));
         assert!(!quiet_clock_live(latest.last_activity_ts.as_deref(), None, at("2026-09-27T10:23:00Z"), stale));
+    }
+
+    /// One record of execution `exec-a`, as the fold reads it.
+    fn exec_record(f: &mut RunFold, action: &str, ts: &str, payload: serde_json::Value) {
+        let v = serde_json::json!({"action": action, "ts": ts, "execution_id": "exec-a", "payload": payload});
+        let a = darkmux_flow::reader::action_of(&v);
+        f.fold(a.as_ref(), None, ts, &v);
+    }
+
+    fn model(elapsed_ms: Option<u64>) -> serde_json::Value {
+        let mut p = serde_json::json!({"engine": "tensorfold", "endpoint": "tf", "model": "TF/m"});
+        if let Some(ms) = elapsed_ms {
+            p["elapsed_ms"] = ms.into();
+        }
+        p
+    }
+
+    /// (#3467) An attempt is starting its model from `dispatch.model.start`
+    /// until `dispatch.model.ready`, for as long as the latest `.loading`
+    /// says (none yet: 0); the next records leave it running as usual.
+    #[test]
+    fn an_attempt_is_starting_its_model_between_model_start_and_ready() {
+        let mut f = RunFold::default();
+        exec_record(&mut f, "dispatch.start", "2026-11-09T10:00:00Z", serde_json::json!({}));
+        f.seal();
+        assert_eq!(f.latest().unwrap().starting_model(), None, "a dispatch that starts no model");
+        exec_record(&mut f, "dispatch.model.start", "2026-11-09T10:00:01Z", model(None));
+        f.seal();
+        assert_eq!(f.latest().unwrap().starting_model(), Some(0));
+        exec_record(&mut f, "dispatch.model.loading", "2026-11-09T10:00:11Z", model(Some(10_000)));
+        exec_record(&mut f, "dispatch.model.loading", "2026-11-09T10:00:21Z", model(Some(20_000)));
+        f.seal();
+        assert_eq!(f.latest().unwrap().starting_model(), Some(20_000), "the latest `.loading`'s elapsed time");
+        exec_record(&mut f, "dispatch.model.ready", "2026-11-09T10:00:25Z", model(Some(24_000)));
+        f.seal();
+        let latest = f.latest().unwrap();
+        assert_eq!(latest.starting_model(), None, "ready: running as usual");
+        assert!(latest.fold.close.is_none(), "still running");
+    }
+
+    /// (#3467) A start that fails ends the dispatch, and with it the start.
+    #[test]
+    fn a_failed_model_start_is_not_starting_any_more() {
+        let mut f = RunFold::default();
+        exec_record(&mut f, "dispatch.start", "2026-11-09T10:00:00Z", serde_json::json!({}));
+        exec_record(&mut f, "dispatch.model.start", "2026-11-09T10:00:01Z", model(None));
+        exec_record(&mut f, "dispatch.model.loading", "2026-11-09T10:00:11Z", model(Some(10_000)));
+        exec_record(&mut f, "dispatch.error", "2026-11-09T10:00:12Z", serde_json::json!({"code": "model_start_failed"}));
+        f.seal();
+        assert_eq!(f.latest().unwrap().starting_model(), None);
     }
 
     /// A copy of a sealed fold shares its records and attempts.

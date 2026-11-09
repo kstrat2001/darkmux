@@ -123,7 +123,17 @@ pub struct RunChanges {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum WorkState {
-    Running,
+    Running {
+        /// (#3467) `starting_model` while the run's dispatch is starting its
+        /// model (an engine server, a load), as the run lifecycle decides it
+        /// (the same `activity` `GET /runs` and `run list --json` carry).
+        /// Absent otherwise.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        activity: Option<crate::runs::RunActivity>,
+        /// With `activity`: how long the start has taken so far, ms.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        activity_elapsed_ms: Option<u64>,
+    },
     Cancelling,
     Done {
         /// The dispatch's own `--json` envelope (that verb's contract).

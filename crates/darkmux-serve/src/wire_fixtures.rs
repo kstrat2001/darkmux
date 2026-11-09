@@ -168,6 +168,8 @@ mod tests {
             relay: None,
             receive_key: 1_785_401_200 * 1000 * 1024,
             not_reporting: false,
+            activity: None,
+            activity_elapsed_ms: None,
         };
         golden("runs-row.json", &run);
     }

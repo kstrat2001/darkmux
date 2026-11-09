@@ -43,6 +43,9 @@ struct Harness {
     fetched: Arc<Mutex<Vec<PathBuf>>>,
     /// A git repo with one commit, standing in for every remote.
     fixture: PathBuf,
+    /// What the run lifecycle says each running work item is doing
+    /// (default: nothing besides its turns).
+    activity: Arc<Mutex<(Option<crate::runs::RunActivity>, Option<u64>)>>,
     state: ClientServerState,
 }
 
@@ -71,6 +74,8 @@ fn harness() -> Harness {
     let pc = clock.clone();
     let containers = Arc::new(crate::client_preview::HostEmulator::default());
     let emu: Arc<dyn crate::client_preview::PreviewContainers> = containers.clone();
+    let activity = Arc::new(Mutex::new((None, None)));
+    let act = activity.clone();
     let (c, r, pol) = (clock.clone(), ran.clone(), policy.clone());
     let fixture = dir.path().join("fixture");
     fixture_repo(&fixture);
@@ -210,6 +215,7 @@ fn harness() -> Harness {
             )
         }),
         works: Arc::new(Mutex::new(HashMap::new())),
+        work_activity: Arc::new(move |_role, _work_id| *act.lock().unwrap()),
         worktrees_base: Arc::new(move || Ok(wb.clone())),
         // Every "remote" is the fixture; origin is then set to the URL asked
         // for, as a real clone would leave it. A URL naming "fail" fails
@@ -270,6 +276,7 @@ fn harness() -> Harness {
         preview_idle_minutes: Arc::new(move || pi.lock().unwrap().clone()),
     };
     Harness {
+        activity,
         preview_on,
         preview_idle,
         containers,
@@ -1721,6 +1728,60 @@ async fn only_the_client_that_started_a_run_may_cancel_it() {
     .await;
     assert_eq!(s["status"], "running");
     assert_eq!(cancel(&h, Some(&a), &id).await.0, 202);
+}
+
+/// (#3467) A running work item whose dispatch is starting its model says
+/// so, with the elapsed time, as the run lifecycle decides it; once the
+/// model is ready it reads plain `running` again (no extra keys).
+#[tokio::test]
+async fn running_work_says_when_it_is_starting_its_model() {
+    let h = harness();
+    let t = paired(&h).await;
+    let (_, v) = call(&h, post("/client/work", Some(&t), waiting_work())).await;
+    let id = v["work_id"].as_str().unwrap().to_string();
+    let status = || async { call(&h, get(&format!("/client/work/{id}"), &[("authorization", &bearer(&t))])).await.1 };
+    *h.activity.lock().unwrap() = (Some(crate::runs::RunActivity::StartingModel), Some(20_000));
+    assert_eq!(status().await, serde_json::json!({"status": "running", "activity": "starting_model", "activity_elapsed_ms": 20_000}));
+    *h.activity.lock().unwrap() = (None, None);
+    assert_eq!(status().await, serde_json::json!({"status": "running"}));
+    assert_eq!(cancel(&h, Some(&t), &id).await.0, 202);
+}
+
+/// (#3467) The production reader: the work's dispatch session
+/// (`.adhoc.<role>.<work_id>`) read from the flow day files through the run
+/// lifecycle, incrementally (a later read sees what was appended). Another
+/// session's model start is not this work's.
+#[test]
+fn the_work_activity_reader_follows_the_dispatchs_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let day = darkmux_flow::day_utc_now();
+    let path = dir.path().join(format!("{day}.jsonl"));
+    let append = |recs: &[serde_json::Value]| {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).unwrap();
+        for r in recs {
+            writeln!(f, "{r}").unwrap();
+        }
+    };
+    let rec = |session: &str, action: &str, payload: serde_json::Value| {
+        serde_json::json!({"ts": darkmux_flow::ts_utc_now(), "action": action, "session_id": session,
+            "execution_id": format!("exec-{session}"), "payload": payload})
+    };
+    let model = |ms: u64| serde_json::json!({"engine": "tensorfold", "endpoint": "tf", "model": "TF/m", "elapsed_ms": ms});
+    let ours = "run-x.adhoc.coder.w-1";
+    let store = crate::flow_window::FlowRecordStore::new(crate::client_pairing::feeds_work_activity);
+    let read = || crate::client_pairing::work_activity_in(&store, dir.path(), "coder", "w-1");
+    let theirs = "run-y.adhoc.coder.w-2";
+    append(&[
+        rec(ours, "dispatch.start", serde_json::json!({})),
+        rec(theirs, "dispatch.start", serde_json::json!({})),
+        rec(theirs, "dispatch.model.start", model(0)),
+    ]);
+    assert_eq!(read(), (None, None), "another work's start is not this one's");
+    append(&[rec(ours, "dispatch.model.start", model(0)), rec(ours, "dispatch.model.loading", model(30_000))]);
+    assert_eq!(read(), (Some(crate::runs::RunActivity::StartingModel), Some(30_000)));
+    append(&[rec(ours, "dispatch.model.ready", model(31_000))]);
+    assert_eq!(read(), (None, None), "ready: running as usual");
 }
 
 #[tokio::test]

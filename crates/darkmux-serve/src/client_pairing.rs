@@ -553,6 +553,9 @@ pub type PathAction = Arc<dyn Fn(&Path) -> Result<(), String> + Send + Sync>;
 pub type PreviewSwitch = Arc<dyn Fn() -> Result<bool, String> + Send + Sync>;
 /// `clients.preview.idle_minutes`, read per idle check.
 pub type PreviewMinutes = Arc<dyn Fn() -> Result<u64, String> + Send + Sync>;
+/// (role, work id) -> what that running work's dispatch is doing besides its
+/// turns, as the run lifecycle decides it ([`work_activity_in`]).
+pub type WorkActivity = Arc<dyn Fn(&str, &str) -> (Option<crate::runs::RunActivity>, Option<u64>) + Send + Sync>;
 /// Runs one role execution, blocking.
 pub type Execute = Arc<dyn Fn(WorkSpec, Arc<CancelFlag>) -> Result<Value, RunError> + Send + Sync>;
 
@@ -595,6 +598,9 @@ pub struct ClientServerState {
     /// It watches the [`CancelFlag`] and stops the run when it is raised.
     pub execute: Execute,
     pub works: Arc<Mutex<HashMap<String, WorkEntry>>>,
+    /// (#3467) What a running work item's dispatch is doing besides its
+    /// turns (`starting_model`), read per poll.
+    pub work_activity: WorkActivity,
     /// The canonical worktrees base workspaces live under.
     pub worktrees_base: PathSource,
     /// (url, ref, dest): clones a repo into `dest`, which must not exist.
@@ -660,6 +666,9 @@ impl ClientServerState {
                 run_dispatch_child(&exe, &spec, &cancel, CANCEL_GRACE, &ProductionTeardown)
             }),
             works: Arc::new(Mutex::new(HashMap::new())),
+            work_activity: Arc::new(|role, work_id| {
+                work_activity_in(&WORK_ACTIVITY_RECORDS, &darkmux_flow::flows_dir(), role, work_id)
+            }),
             worktrees_base: Arc::new(|| {
                 let base = darkmux_types::workdir::worktrees_base_dir();
                 std::fs::create_dir_all(&base).map_err(|e| format!("{}: {e}", base.display()))?;
@@ -2598,16 +2607,65 @@ pub(crate) async fn work_status_handler(
     };
     let entry = state.works.lock().unwrap().get(&work_id).cloned();
     match entry {
-        Some(w) if w.client_name == client.name => Json(work_status_json(w)).into_response(),
+        Some(w) if w.client_name == client.name => {
+            let st = state.clone();
+            tokio::task::spawn_blocking(move || Json(work_status_json(&st, &work_id, w)).into_response())
+                .await
+                .unwrap_or_else(|e| internal(anyhow!("work status panicked: {e}")))
+        }
         _ => not_found(),
     }
 }
 
+/// (#3467) The flow records a running work item's activity is read from:
+/// its dispatch's bookends and `dispatch.model.*` records, kept per day file
+/// and read again only past what was read (`flow_window`), so a poll costs
+/// what was appended since the last one.
+static WORK_ACTIVITY_RECORDS: crate::flow_window::FlowRecordStore =
+    crate::flow_window::FlowRecordStore::new(feeds_work_activity);
+
+/// Whether a record can change a client work item's activity: a dispatch
+/// bookend or `dispatch.model.*` record of a crew-of-one dispatch session
+/// (`darkmux dispatch <role> --name <work_id>` names it `.adhoc.<role>.<work_id>`).
+pub(crate) fn feeds_work_activity(v: &Value) -> bool {
+    use darkmux_flow::FlowAction as A;
+    let adhoc = v.get("session_id").and_then(Value::as_str).is_some_and(|s| s.contains(".adhoc."));
+    adhoc
+        && matches!(
+            darkmux_flow::reader::action_of(v),
+            Some(A::DispatchStart | A::DispatchModelStart | A::DispatchModelLoading | A::DispatchModelReady | A::DispatchComplete | A::DispatchError)
+        )
+}
+
+/// (#3467) What `role`'s running work `work_id` is doing besides its turns:
+/// its dispatch session's records (today's and yesterday's day files),
+/// folded and settled by the run lifecycle, the reading `GET /runs` takes.
+pub(crate) fn work_activity_in(
+    store: &crate::flow_window::FlowRecordStore,
+    flows_dir: &Path,
+    role: &str,
+    work_id: &str,
+) -> (Option<crate::runs::RunActivity>, Option<u64>) {
+    let suffix = format!(".adhoc.{role}.{work_id}");
+    let yesterday = crate::runs::day_string_from_epoch_ms(unix_now().saturating_sub(86_400) * 1_000);
+    let records = store.read(flows_dir, &yesterday);
+    crate::runs::running_session_activity(|fold| {
+        records.for_each(|v| {
+            if v.get("session_id").and_then(Value::as_str).is_some_and(|s| s.ends_with(&suffix)) {
+                fold(v);
+            }
+        })
+    })
+}
+
 /// A work item as its client polls it.
-fn work_status_json(w: WorkEntry) -> WorkState {
+fn work_status_json(state: &ClientServerState, work_id: &str, w: WorkEntry) -> WorkState {
     match w.status {
         WorkStatus::Running if w.cancel.requested() => WorkState::Cancelling,
-        WorkStatus::Running => WorkState::Running,
+        WorkStatus::Running => {
+            let (activity, activity_elapsed_ms) = (state.work_activity)(&w.role, work_id);
+            WorkState::Running { activity, activity_elapsed_ms }
+        }
         WorkStatus::Done {
             result,
             changes,

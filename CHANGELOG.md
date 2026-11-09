@@ -16,6 +16,12 @@ darkmux release.
 
 ### Added
 
+- **A run starting its model says so (#3467).** While a dispatch is between `dispatch.model.start` and
+  `dispatch.model.ready` (a Tensorfold server starting, say), its run reads `activity: "starting_model"`
+  with `activity_elapsed_ms` (from the latest `dispatch.model.loading`) in `GET /runs`, `darkmux run list
+  --json` and the client's `GET /client/work/{id}` while it is `running`. The run lifecycle decides it
+  once (`Attempt::starting_model`); every surface reads it. Both fields are additive and absent otherwise.
+
 - **Listings say whether darkmux can make each model resident (#3466).** `darkmux profile list --json`
   gains an `availability` list (one row per profile model: `profile`, `model`, `endpoint`, `engine`,
   `state`, `reason`), and each profile in `GET /client/profiles` an `availability` object
