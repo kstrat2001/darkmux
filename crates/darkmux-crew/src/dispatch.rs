@@ -213,7 +213,9 @@ pub struct DispatchOpts {
     /// read-write. By default it is mounted read-only over the writable
     /// workspace, so a run can change the work tree but not the repository's
     /// config and hooks, which git run on the host afterwards would honor.
-    /// A role meant to commit in a plain checkout needs this. A worktree's
+    /// That also stops `git checkout -- <file>` / `git restore` inside the
+    /// run, so it cannot undo its own edit that way. A role meant to commit
+    /// in a plain checkout needs this. A worktree's
     /// `.git` pointer file (the coder phase's shape) is unaffected, as is a
     /// read-only workspace. `darkmux dispatch --workdir-git-writable`, or a
     /// `dispatch.internal` step's `workdir_git_writable`. Recorded in

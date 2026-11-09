@@ -239,8 +239,12 @@ pub(crate) enum Cmd {
         /// gets it mounted read-only over the writable work tree: the run can
         /// edit files but cannot commit, stash, check out or change the
         /// repository's config and hooks, which git you run afterwards would
-        /// honor. Give this to a role meant to commit in place. A worktree
-        /// (whose `.git` is a pointer file) is unaffected.
+        /// honor. That includes `git checkout -- <file>` and `git restore`, so
+        /// a run cannot undo its own edit that way. Give this to a role meant
+        /// to commit in place. A worktree, or a subdirectory of a repository,
+        /// gets no read-only `.git` either way, and a repository the run
+        /// creates inside the work tree is not covered: inspect the tree
+        /// before running git there.
         #[arg(long = "workdir-git-writable")]
         workdir_git_writable: bool,
         /// Skip the pre-flight checks. Use only for debugging.

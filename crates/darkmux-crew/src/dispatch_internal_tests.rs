@@ -2918,6 +2918,10 @@
         let rw = writable_git_dir_note(w, Some(M::ReadWrite)).unwrap();
         assert!(rw.contains("`.git` was mounted read-write") && rw.contains("--workdir-git-writable"), "{rw}");
         assert!(rw.contains("hooks"), "{rw}");
+        for note in [&ro, &rw] {
+            assert!(note.contains("nested or bare") && note.contains("subdirectory of a repository"), "{note}");
+        }
+        assert!(ro.contains("`git checkout -- <file>`"), "{ro}");
     }
 
     /// (#3461) A read-only `.git` is a second bind, after the workspace's,
@@ -2943,6 +2947,19 @@
         assert!(argv.iter().position(|a| a == "/tmp/ws/.git:/workspace/.git:ro").unwrap() < fence);
         let plain = build_docker_run_argv(&base_argv_config());
         assert!(!plain.iter().any(|a| a.contains("/.git")), "{plain:?}");
+    }
+
+    /// (#3461 review F3) A failure to record the mount is said, naming the
+    /// file, not swallowed: an origin record that is not there, or not JSON.
+    #[test]
+    fn a_failed_git_mount_record_names_the_file() {
+        let none = TempDir::new().unwrap();
+        let err = record_origin_git_mount(none.path(), false).unwrap_err();
+        assert!(err.contains(&resume_origin_path(none.path()).display().to_string()), "{err}");
+        let bad = TempDir::new().unwrap();
+        std::fs::write(resume_origin_path(bad.path()), "not json").unwrap();
+        let err = record_origin_git_mount(bad.path(), true).unwrap_err();
+        assert!(err.contains(&resume_origin_path(bad.path()).display().to_string()), "{err}");
     }
 
     /// (#3461) `dispatch.start` names how the workdir's `.git` was mounted,
@@ -2973,28 +2990,30 @@
         let prior = TempDir::new().unwrap();
         std::fs::write(prior.path().join(CHECKPOINT_FILENAME), sample_checkpoint_json()).unwrap();
         write_resume_origin_meta(prior.path(), ws.path(), false, None, &ExecutionId::mint());
-        record_origin_git_mount(prior.path(), false);
+        record_origin_git_mount(prior.path(), false).unwrap();
         let hint = resume_hint_from_origin(prior.path(), "coder");
         assert!(!parse_hint_args(&hint).iter().any(|a| a == "--workdir-git-writable"), "{hint}");
-        record_origin_git_mount(prior.path(), true);
+        record_origin_git_mount(prior.path(), true).unwrap();
         let hint = resume_hint_from_origin(prior.path(), "coder");
         assert!(parse_hint_args(&hint).iter().any(|a| a == "--workdir-git-writable"), "{hint}");
     }
 
     /// (#3461) A resume may not grant a writable `.git` the run that wrote
-    /// the checkpoint did not have; an origin from before #3461 (no record)
-    /// had one, so it is not an escalation.
+    /// the checkpoint did not have. (review F3) It fails closed: an origin
+    /// with no record of the mount reads as read-only.
     #[test]
     fn a_resume_never_escalates_the_git_mount() {
         let ws = TempDir::new().unwrap();
         let prior = TempDir::new().unwrap();
         write_resume_origin_meta(prior.path(), ws.path(), false, None, &ExecutionId::mint());
-        check_resume_git_mount(prior.path(), true).expect("no record: the origin's .git was read-write");
-        record_origin_git_mount(prior.path(), false);
+        check_resume_git_mount(prior.path(), false).expect("no record, read-only asked: fine");
+        let err = check_resume_git_mount(prior.path(), true).unwrap_err().to_string();
+        assert!(err.contains("RESUME GIT MOUNT ESCALATION"), "no record reads as read-only: {err}");
+        record_origin_git_mount(prior.path(), false).unwrap();
         check_resume_git_mount(prior.path(), false).expect("read-only to read-only");
         let err = check_resume_git_mount(prior.path(), true).unwrap_err().to_string();
         assert!(err.contains("RESUME GIT MOUNT ESCALATION"), "{err}");
-        record_origin_git_mount(prior.path(), true);
+        record_origin_git_mount(prior.path(), true).unwrap();
         check_resume_git_mount(prior.path(), false).expect("read-write to read-only is no escalation");
         check_resume_git_mount(prior.path(), true).expect("read-write to read-write");
     }
