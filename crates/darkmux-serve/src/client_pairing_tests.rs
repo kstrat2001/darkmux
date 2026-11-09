@@ -3724,6 +3724,148 @@ async fn install_runs_only_when_its_marker_is_missing() {
     );
 }
 
+/// (#3484) Starts the preview with `body` (none when `None`), waits until it
+/// is ready or failed, and stops it. Returns the start's code and reply.
+async fn start_with(h: &Harness, token: &str, name: &str, body: Option<Value>) -> (u16, Value) {
+    let path = format!("/client/workspaces/{name}/preview");
+    let req = match body {
+        Some(b) => post(&path, Some(token), b),
+        None => Request::builder()
+            .method("POST")
+            .uri(&path)
+            .header("authorization", bearer(token))
+            .body(Body::empty())
+            .unwrap(),
+    };
+    let (code, v) = call(h, req).await;
+    if code == 200 || code == 202 {
+        let done = preview_until(h, token, name, &["ready", "failed"]).await;
+        assert_eq!(done["status"], "ready", "{done}");
+        h.state.previews.stop(name);
+    }
+    (code, v)
+}
+
+/// A served workspace whose recipe installs into `node_modules`, counting
+/// installs in `installs.txt`.
+async fn installing_workspace(h: &Harness, token: &str) -> (PathBuf, String, PathBuf) {
+    let (mine, name, ws) = served_workspace(h, token).await;
+    recipe(
+        &mine,
+        serde_json::json!({
+            "command": serve(), "env": {"PORT": "{port}"},
+            "install": {"command": "mkdir -p node_modules && echo ran >> installs.txt", "unless_exists": "node_modules"}
+        }),
+    );
+    (mine, name, ws)
+}
+
+fn installs(ws: &Path) -> usize {
+    std::fs::read_to_string(ws.join("installs.txt"))
+        .unwrap_or_default()
+        .lines()
+        .count()
+}
+
+/// (#3484) A plain start (no body, as before) installs once, then skips;
+/// `{"clean": true}` deletes `node_modules` and the install record and
+/// reinstalls; a clean start of a stopped preview just starts it fresh.
+#[tokio::test]
+async fn a_clean_restart_deletes_node_modules_and_reinstalls() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (_mine, name, ws) = installing_workspace(&h, &token).await;
+    assert_eq!(
+        start_with(&h, &token, &name, None).await.0,
+        202,
+        "no body: a plain start"
+    );
+    assert_eq!(installs(&ws), 1);
+    std::fs::write(ws.join("node_modules/stale.txt"), "old").unwrap();
+    assert_eq!(
+        start_with(&h, &token, &name, Some(serde_json::json!({})))
+            .await
+            .0,
+        202
+    );
+    assert_eq!(installs(&ws), 1, "an empty body is a plain start: skipped");
+    assert_eq!(
+        start_with(&h, &token, &name, Some(serde_json::json!({"clean": false})))
+            .await
+            .0,
+        202
+    );
+    assert_eq!(installs(&ws), 1, "clean: false is a plain start");
+    // The preview is stopped here; a clean start just starts it fresh.
+    let (code, v) = start_with(&h, &token, &name, Some(serde_json::json!({"clean": true}))).await;
+    assert_eq!(code, 202, "{v}");
+    assert_eq!(installs(&ws), 2, "reinstalled");
+    assert!(
+        !ws.join("node_modules/stale.txt").exists(),
+        "node_modules was deleted first"
+    );
+    // A clean restart of a RUNNING preview stops it first.
+    let path = format!("/client/workspaces/{name}/preview");
+    let (code, _) = call(&h, post(&path, Some(&token), serde_json::json!({}))).await;
+    assert_eq!(code, 202);
+    preview_until(&h, &token, &name, &["ready"]).await;
+    let (code, v) = start_with(&h, &token, &name, Some(serde_json::json!({"clean": true}))).await;
+    assert_eq!(code, 202, "a running preview is restarted: {v}");
+    assert_eq!(installs(&ws), 3);
+}
+
+/// (#3484) The clean restart's delete never follows a link: a
+/// `node_modules` that is a symlink out of the workspace is unlinked, and
+/// what it pointed at is untouched.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_clean_restart_unlinks_a_symlinked_node_modules_and_never_follows_it() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (_mine, name, ws) = installing_workspace(&h, &token).await;
+    let outside = h.dir.path().join("outside-modules");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("keep.txt"), "mine").unwrap();
+    std::os::unix::fs::symlink(&outside, ws.join("node_modules")).unwrap();
+    let (code, v) = start_with(&h, &token, &name, Some(serde_json::json!({"clean": true}))).await;
+    assert_eq!(code, 202, "{v}");
+    assert_eq!(
+        std::fs::read_to_string(outside.join("keep.txt")).unwrap(),
+        "mine",
+        "the target is untouched"
+    );
+    assert!(
+        !std::fs::symlink_metadata(ws.join("node_modules"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the link is gone, and the install made a real folder"
+    );
+    assert_eq!(installs(&ws), 1);
+}
+
+/// (#3484) The start body is parsed strictly: an unknown key is refused
+/// with a code, and nothing starts.
+#[tokio::test]
+async fn a_preview_start_refuses_an_unknown_body_key() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (_mine, name, ws) = installing_workspace(&h, &token).await;
+    let (code, v) = start_with(
+        &h,
+        &token,
+        &name,
+        Some(serde_json::json!({"clean": true, "cleen": 1})),
+    )
+    .await;
+    assert_eq!(code, 400, "{v}");
+    assert_eq!(v["code"], "bad_request", "{v}");
+    assert!(v["error"].as_str().unwrap().contains("cleen"), "{v}");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert_eq!(installs(&ws), 0, "nothing started");
+    assert!(h.state.previews.status(&name).is_none());
+}
+
 #[tokio::test]
 async fn a_worktree_preview_gets_env_files_from_its_checkout_without_overwriting() {
     let h = harness();

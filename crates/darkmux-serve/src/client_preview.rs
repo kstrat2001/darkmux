@@ -101,8 +101,20 @@
 //!
 //! Each preview gets its own free app port and HMR port, substituted into
 //! `env` (`{port}`, `{hmrPort}`), so two previews never collide. `install`
-//! runs first, in the container, when its `unless_exists` path is missing in
-//! the workspace. `env_from_source` copies untracked files (like `.env`) from
+//! runs first, in the container. (#3484) After it succeeds darkmux records a
+//! fingerprint of its inputs beside the workspace (`.<name>.install` in the
+//! worktrees base, like the `.source` record, where no run can write): the
+//! runtime image id, the install command, and each lockfile present
+//! (`package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml`,
+//! `yarn.lock`), else `package.json`, each read without following a link (a
+//! symlinked lockfile counts as its link text). The install is skipped only
+//! when its `unless_exists` path exists AND the record matches, so a
+//! dependency a run adds, a new image, or a broken earlier install is
+//! installed again; a failed install records nothing. A start with
+//! `{"clean": true}` stops the preview, forgets the record and deletes the
+//! `unless_exists` path inside the workspace (a symlink there is unlinked,
+//! never followed; nothing outside the work copy, never your checkout), then
+//! starts it with a fresh install. `env_from_source` copies untracked files (like `.env`) from
 //! that same checkout into the workspace, never overwriting and never
 //! through a symlink.
 
@@ -1072,6 +1084,40 @@ impl Previews {
         Ok((snap, false))
     }
 
+    /// (#3484) Clears the way for a fresh install: stops the preview (its
+    /// container removed), forgets its install record, and deletes the
+    /// recipe's `install.unless_exists` path inside the workspace. A recipe
+    /// with neither only has its record cleared. The workspace is
+    /// run-written, so the path is deleted only after it resolves inside the
+    /// work copy (no symlinked folder on the way), and a symlink there is
+    /// unlinked, never followed. Never the user's own checkout.
+    pub fn clean(
+        &self,
+        name: &str,
+        workdir: &Path,
+        source: &RecipeSource,
+    ) -> Result<(), RecipeRefusal> {
+        let recipe = source.load()?;
+        if source.checkout().is_some_and(|c| same_dir(c, workdir)) {
+            return Err(RecipeRefusal::Invalid(format!(
+                "{} is your own checkout, not darkmux's workspace; refusing to clean it",
+                workdir.display()
+            )));
+        }
+        self.stop(name);
+        if let Some(base) = workdir.parent() {
+            crate::client_workspace::forget_install(base, name);
+        }
+        let Some(rel) = recipe
+            .install
+            .as_ref()
+            .and_then(|i| i.unless_exists.as_deref())
+        else {
+            return Ok(());
+        };
+        remove_inside(workdir, rel).map_err(RecipeRefusal::Unreadable)
+    }
+
     /// The preview's state. An app asking counts: it restarts the idle
     /// count ([`Previews::stop_idle`]).
     pub fn status(&self, name: &str) -> Option<PreviewState> {
@@ -1245,8 +1291,7 @@ struct RunIn {
 }
 
 fn run(entry: Arc<Mutex<Entry>>, recipe: Recipe, at: RunIn, containers: &dyn PreviewContainers) {
-    let ended = prepare(&entry, &recipe, &at)
-        .and_then(|install_due| serve(&entry, &recipe, &at, install_due, containers));
+    let ended = prepare(&recipe, &at).and_then(|()| serve(&entry, &recipe, &at, containers));
     // A stop is already recorded; `set` never overwrites it with a failure.
     if let Err(Halt::Failed(why)) = ended {
         set(&entry, Status::Failed(why));
@@ -1266,24 +1311,148 @@ fn run(entry: Arc<Mutex<Entry>>, recipe: Recipe, at: RunIn, containers: &dyn Pre
 }
 
 /// Everything before the container, on the host: env files into the
-/// workspace, and whether the install step is due (its `unless_exists`
-/// path is missing). Returns that.
-fn prepare(entry: &Arc<Mutex<Entry>>, recipe: &Recipe, at: &RunIn) -> Result<bool, Halt> {
+/// workspace.
+fn prepare(recipe: &Recipe, at: &RunIn) -> Result<(), Halt> {
     if let Some(checkout) = &at.checkout {
         copy_env_from_source(recipe, &at.workdir, checkout)?;
     }
-    let Some(install) = &recipe.install else {
-        return Ok(false);
+    Ok(())
+}
+
+/// (#3484) The lockfiles whose contents an install's inputs are, in the
+/// workspace's root; with none, `package.json` stands in.
+const LOCKFILES: [&str; 4] = [
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+];
+/// The most of one input file the fingerprint reads.
+const MAX_INPUT_BYTES: u64 = 256 * 1024 * 1024;
+
+/// (#3484) The fingerprint of an install: the runtime image id, the install
+/// command and its inputs (each lockfile present, else `package.json`). The
+/// workspace is run-written, so an input is read without following a link:
+/// a symlink is hashed as its link text, never as what it points at.
+pub(crate) fn install_fingerprint(workdir: &Path, command: &str, image: &str) -> String {
+    let mut hash = blake3::Hasher::new();
+    hash_field(&mut hash, "image", image.as_bytes());
+    hash_field(&mut hash, "command", command.as_bytes());
+    let present: Vec<&str> = LOCKFILES
+        .into_iter()
+        .filter(|f| std::fs::symlink_metadata(workdir.join(f)).is_ok())
+        .collect();
+    let inputs = if present.is_empty() {
+        vec!["package.json"]
+    } else {
+        present
     };
-    let due = install
-        .unless_exists
-        .as_ref()
-        .map(|p| std::fs::symlink_metadata(at.workdir.join(p)).is_err())
-        .unwrap_or(true);
-    if due {
-        advance(entry, Status::Installing)?;
+    for file in inputs {
+        hash_field(&mut hash, file, &input_bytes(&workdir.join(file)));
     }
-    Ok(due)
+    hash.finalize().to_hex().to_string()
+}
+
+fn hash_field(hash: &mut blake3::Hasher, name: &str, bytes: &[u8]) {
+    hash.update(name.as_bytes());
+    hash.update(&[0]);
+    hash.update(&(bytes.len() as u64).to_le_bytes());
+    hash.update(bytes);
+}
+
+/// One input's bytes as the fingerprint sees them, tagged by kind.
+fn input_bytes(path: &Path) -> Vec<u8> {
+    use std::io::Read;
+    let tagged = |tag: &[u8], rest: &[u8]| [tag, rest].concat();
+    match std::fs::symlink_metadata(path) {
+        Err(_) => b"absent".to_vec(),
+        Ok(m) if m.file_type().is_symlink() => {
+            let target = std::fs::read_link(path).unwrap_or_default();
+            tagged(b"link:", target.as_os_str().as_encoded_bytes())
+        }
+        Ok(m) if !m.is_file() => b"not-a-file".to_vec(),
+        Ok(_) => {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.custom_flags(libc::O_NOFOLLOW);
+            }
+            let mut bytes = Vec::new();
+            match opts
+                .open(path)
+                .and_then(|f| f.take(MAX_INPUT_BYTES).read_to_end(&mut bytes))
+            {
+                Ok(_) => tagged(b"file:", &bytes),
+                Err(_) => b"unreadable".to_vec(),
+            }
+        }
+    }
+}
+
+/// (#3484) Whether the install is due, and the fingerprint to record once
+/// it succeeds. Without `unless_exists` it always runs. With it, the
+/// install is skipped only when that path exists AND the recorded
+/// fingerprint of the last successful install matches this one, so a
+/// changed lockfile, a changed image or a broken first install is redone.
+fn install_plan(recipe: &Recipe, at: &RunIn, image: &str) -> (bool, Option<String>) {
+    let Some(install) = &recipe.install else {
+        return (false, None);
+    };
+    let fingerprint = install_fingerprint(&at.workdir, &install.command, image);
+    let due = match &install.unless_exists {
+        None => true,
+        Some(p) => {
+            let missing = std::fs::symlink_metadata(at.workdir.join(p)).is_err();
+            missing || recorded_install(at).as_deref() != Some(fingerprint.as_str())
+        }
+    };
+    (due, Some(fingerprint))
+}
+
+/// The workspace's recorded install fingerprint, beside it in the base.
+fn recorded_install(at: &RunIn) -> Option<String> {
+    crate::client_workspace::install_fingerprint_of(at.workdir.parent()?, &at.name)
+}
+
+/// Records a successful install's fingerprint beside the workspace.
+fn record_installed(at: &RunIn, fingerprint: &str) {
+    let Some(base) = at.workdir.parent() else {
+        return;
+    };
+    if let Err(e) = crate::client_workspace::record_install(base, &at.name, fingerprint) {
+        eprintln!("darkmux client serve: preview {}: {e}", at.name);
+    }
+}
+
+/// Whether `a` and `b` are the same directory.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// (#3484) Deletes `rel` inside `workdir`: only once it resolves inside the
+/// work copy ([`check_unlinked_inside`]: no symlinked folder on the way),
+/// and a symlink at `rel` is unlinked, never followed. Absent is done.
+fn remove_inside(workdir: &Path, rel: &str) -> Result<(), String> {
+    if !plain_relative(rel) {
+        return Err(format!(
+            "{rel:?} is not a plain relative path; refusing to delete it"
+        ));
+    }
+    check_unlinked_inside(workdir, rel)?;
+    let path = workdir.join(rel);
+    let removed = match std::fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => Err(e),
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(&path),
+        // A file, or a symlink (removed as the link itself).
+        Ok(_) => std::fs::remove_file(&path),
+    };
+    removed.map_err(|e| format!("deleting {}: {e}", path.display()))
 }
 
 /// Untracked files the dev server needs, from the user's own checkout (the
@@ -1392,18 +1561,29 @@ fn serve(
     entry: &Arc<Mutex<Entry>>,
     recipe: &Recipe,
     at: &RunIn,
-    install_due: bool,
     containers: &dyn PreviewContainers,
 ) -> Result<(), Halt> {
     let resolved = containers
         .image_and_user()
         .map_err(|e| format!("a preview runs in a container: {e}"))?;
+    let (install_due, fingerprint) = install_plan(recipe, at, &resolved.0);
+    if install_due {
+        advance(entry, Status::Installing)?;
+    }
+    // Recorded once the dev server line shows the install succeeded.
+    let installed = fingerprint.filter(|_| install_due);
     let spec = spec_for(recipe, at, install_due, resolved, containers.host_labels());
     fresh_heartbeat(entry, &spec.heartbeat)?;
     containers.create(&spec)?;
     adopt(entry, &spec.name, containers)?;
     let mut child = containers.start(&spec.name, &at.log)?;
-    wait_ready(entry, &mut child, &spec.name, containers, at, recipe)?;
+    wait_ready(
+        entry,
+        &mut child,
+        (&spec.name, containers),
+        at,
+        (recipe, installed.as_deref()),
+    )?;
     // Ready: wait for it to end, and say why unless it was stopped.
     let status = child.wait();
     Err(Halt::Failed(exit_reason(recipe, &at.log, status)))
@@ -1482,10 +1662,9 @@ const READY_WITHIN: Duration = Duration::from_secs(180);
 fn wait_ready(
     entry: &Arc<Mutex<Entry>>,
     child: &mut std::process::Child,
-    name: &str,
-    containers: &dyn PreviewContainers,
+    (name, containers): (&str, &dyn PreviewContainers),
     at: &RunIn,
-    recipe: &Recipe,
+    (recipe, installed): (&Recipe, Option<&str>),
 ) -> Result<(), Halt> {
     let path = ready_path(recipe);
     let mut serving_since = None;
@@ -1499,7 +1678,7 @@ fn wait_ready(
         }
         if serving_since.is_none() && log_has(&at.log, SERVING_LINE) {
             serving_since = Some(Instant::now());
-            advance(entry, Status::Starting)?;
+            now_serving(entry, at, installed)?;
         }
         if serving_since.is_some() && http_ok(at.port, &path) {
             set(entry, Status::Ready);
@@ -1514,6 +1693,15 @@ fn wait_ready(
         }
         std::thread::sleep(Duration::from_millis(300));
     }
+}
+
+/// The dev server line appeared: the install, when one ran, succeeded
+/// (#3484: record it), and the preview is starting.
+fn now_serving(entry: &Arc<Mutex<Entry>>, at: &RunIn, installed: Option<&str>) -> Result<(), Halt> {
+    if let Some(fingerprint) = installed {
+        record_installed(at, fingerprint);
+    }
+    advance(entry, Status::Starting)
 }
 
 /// Why a dev server never answered on its published port. (#3456 review F5)
@@ -1594,6 +1782,8 @@ pub(crate) struct HostEmulator {
     pub removed: Mutex<Vec<String>>,
     /// Set: resolving the image fails with this.
     pub image_error: Mutex<Option<String>>,
+    /// Set: the image id resolving answers (default `emulated-runtime-image`).
+    pub image_id: Mutex<Option<String>>,
     /// How long `create` takes (a stop can land meanwhile).
     pub create_delay: Mutex<Duration>,
     /// How long `start` waits before starting (a stop can land between
@@ -1613,7 +1803,13 @@ impl PreviewContainers for HostEmulator {
     fn image_and_user(&self) -> Result<(String, Option<String>), String> {
         match self.image_error.lock().unwrap().clone() {
             Some(e) => Err(e),
-            None => Ok(("emulated-runtime-image".to_string(), None)),
+            None => {
+                let image = self.image_id.lock().unwrap().clone();
+                Ok((
+                    image.unwrap_or_else(|| "emulated-runtime-image".to_string()),
+                    None,
+                ))
+            }
         }
     }
 
@@ -2135,6 +2331,164 @@ mod tests {
             !emu.exists(&name) && !emu.running(&name),
             "the container was left running"
         );
+    }
+
+    /// (#3484) A workspace (in its own base folder) whose recipe installs
+    /// with `echo installed >> installs.txt` unless `node_modules` exists,
+    /// then serves with `sleep 30`; it has `node_modules` and a lockfile.
+    fn an_installed_workspace(dir: &Path, install: &str) -> PathBuf {
+        let wt = dir.join("base").join("w");
+        std::fs::create_dir_all(wt.join(".darkmux")).unwrap();
+        std::fs::create_dir_all(wt.join("node_modules")).unwrap();
+        std::fs::write(wt.join("package-lock.json"), "{\"v\": 1}").unwrap();
+        let recipe = serde_json::json!({
+            "schema_version": "1.0", "command": "sleep 30",
+            "install": {"command": install, "unless_exists": "node_modules"}
+        });
+        std::fs::write(wt.join(".darkmux/preview.json"), recipe.to_string()).unwrap();
+        wt
+    }
+
+    /// Starts the preview, waits for the dev server line (the install, when
+    /// it ran, succeeded), stops it, and says whether the install ran.
+    fn start_once(previews: &Previews, emu: &HostEmulator, wt: &Path, log: &Path) -> bool {
+        let _ = std::fs::remove_file(log);
+        let before = emu.specs.lock().unwrap().len();
+        previews
+            .start("w", wt, &RecipeSource::Checkout(wt.to_path_buf()))
+            .unwrap();
+        for _ in 0..200 {
+            let started = emu.specs.lock().unwrap().len() > before;
+            if started && log_has(log, SERVING_LINE) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        std::thread::sleep(Duration::from_millis(400));
+        previews.stop("w");
+        let spec = emu.specs.lock().unwrap().last().unwrap().clone();
+        spec.script.contains("installs.txt")
+    }
+
+    /// (#3484) The install reruns when its inputs change, even though
+    /// `node_modules` exists: a changed lockfile, and a changed runtime image.
+    /// An unchanged fingerprint skips it (the `unless_exists` fast path).
+    #[test]
+    fn a_changed_lockfile_or_image_reinstalls_and_an_unchanged_one_skips() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = an_installed_workspace(dir.path(), "echo installed >> installs.txt");
+        let (previews, emu) = emulated(dir.path());
+        let log = dir.path().join("p/w.log");
+        assert!(
+            start_once(&previews, &emu, &wt, &log),
+            "no record yet: install"
+        );
+        assert!(
+            !start_once(&previews, &emu, &wt, &log),
+            "unchanged: skipped"
+        );
+        std::fs::write(wt.join("package-lock.json"), "{\"v\": 2}").unwrap();
+        assert!(
+            start_once(&previews, &emu, &wt, &log),
+            "a changed lockfile reinstalls"
+        );
+        assert!(!start_once(&previews, &emu, &wt, &log), "recorded again");
+        *emu.image_id.lock().unwrap() = Some("sha256:node22".into());
+        assert!(
+            start_once(&previews, &emu, &wt, &log),
+            "a changed image reinstalls"
+        );
+        assert!(!start_once(&previews, &emu, &wt, &log), "and is recorded");
+        let record = std::fs::read_to_string(dir.path().join("base/.w.install")).unwrap();
+        assert_eq!(
+            record.trim(),
+            install_fingerprint(&wt, "echo installed >> installs.txt", "sha256:node22")
+        );
+    }
+
+    /// (#3484) `clean` forgets the install record and deletes the
+    /// `unless_exists` path, and nothing else in the workspace.
+    #[test]
+    fn clean_forgets_the_record_and_deletes_only_the_marker_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = an_installed_workspace(dir.path(), "echo installed >> installs.txt");
+        let (previews, emu) = emulated(dir.path());
+        let log = dir.path().join("p/w.log");
+        assert!(start_once(&previews, &emu, &wt, &log));
+        let record = dir.path().join("base/.w.install");
+        assert!(record.exists(), "recorded");
+        // The recipe comes from a checkout of the user's, never the workspace.
+        let mine = dir.path().join("mine");
+        std::fs::create_dir_all(mine.join(".darkmux")).unwrap();
+        std::fs::copy(
+            wt.join(".darkmux/preview.json"),
+            mine.join(".darkmux/preview.json"),
+        )
+        .unwrap();
+        let refused = previews.clean("w", &wt, &RecipeSource::Checkout(wt.clone()));
+        assert!(refused.is_err(), "never cleans the user's own checkout");
+        previews
+            .clean("w", &wt, &RecipeSource::Checkout(mine))
+            .unwrap();
+        assert!(!record.exists(), "the record is forgotten");
+        assert!(
+            !wt.join("node_modules").exists(),
+            "the marker path is deleted"
+        );
+        assert!(wt.join("package-lock.json").exists() && wt.join(".darkmux/preview.json").exists());
+    }
+
+    /// (#3484) A failed install records nothing, so the next start retries.
+    #[test]
+    fn a_failed_install_leaves_no_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = an_installed_workspace(dir.path(), "exit 4");
+        let (previews, _emu) = emulated(dir.path());
+        previews
+            .start("w", &wt, &RecipeSource::Checkout(wt.clone()))
+            .unwrap();
+        let v = until_failed(&previews, "w");
+        assert_eq!(v["status"], "failed", "{v}");
+        assert!(
+            !dir.path().join("base/.w.install").exists(),
+            "no record of a failed install"
+        );
+    }
+
+    /// (#3484) The fingerprint covers the lockfiles that exist, else
+    /// `package.json`, the install command and the image. A lockfile that is
+    /// a symlink is hashed as its link text, never read: what it points at
+    /// outside the workspace changes nothing.
+    #[cfg(unix)]
+    #[test]
+    fn the_fingerprint_never_reads_through_a_symlinked_lockfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().join("w");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join("package.json"), "{}").unwrap();
+        let fp = |wt: &Path| install_fingerprint(wt, "npm ci", "img");
+        let bare = fp(&wt);
+        std::fs::write(wt.join("package.json"), "{\"x\": 1}").unwrap();
+        assert_ne!(fp(&wt), bare, "with no lockfile, package.json counts");
+        assert_ne!(
+            install_fingerprint(&wt, "npm install", "img"),
+            fp(&wt),
+            "the command counts"
+        );
+        assert_ne!(
+            install_fingerprint(&wt, "npm ci", "img2"),
+            fp(&wt),
+            "the image counts"
+        );
+        let outside = dir.path().join("outside.lock");
+        std::fs::write(&outside, "secret one").unwrap();
+        std::os::unix::fs::symlink(&outside, wt.join("yarn.lock")).unwrap();
+        let linked = fp(&wt);
+        std::fs::write(&outside, "secret two, changed").unwrap();
+        assert_eq!(fp(&wt), linked, "the link's target is never read");
+        std::fs::remove_file(wt.join("yarn.lock")).unwrap();
+        std::fs::write(wt.join("yarn.lock"), "secret two, changed").unwrap();
+        assert_ne!(fp(&wt), linked, "a link is not the file it points at");
     }
 
     /// A workspace whose own recipe runs `command`.

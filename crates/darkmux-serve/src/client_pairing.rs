@@ -2365,13 +2365,18 @@ pub(crate) async fn preview_start_handler(
     State(state): State<ClientServerState>,
     ClientPath(name): ClientPath<String>,
     headers: HeaderMap,
+    body: Body,
 ) -> Response {
     if let Err(r) = authenticate(&state, &headers) {
         return *r;
     }
+    let ask = match preview_start_body(body).await {
+        Ok(ask) => ask,
+        Err(r) => return r,
+    };
     let st = state.clone();
     tokio::task::spawn_blocking(move || {
-        let reply = start_preview(&st, &name);
+        let reply = start_preview(&st, &name, ask.clean);
         let outcome = match reply.status() {
             StatusCode::OK => "already running (200)".to_string(),
             StatusCode::ACCEPTED => "starting (202)".to_string(),
@@ -2402,8 +2407,36 @@ fn previews_allowed(state: &ClientServerState) -> Result<(), Refused> {
     }
 }
 
-/// Starts workspace `name`'s preview from its trusted recipe.
-fn start_preview(state: &ClientServerState, name: &str) -> Response {
+/// (#3484) `POST /client/workspaces/{name}/preview`'s optional body.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct PreviewStartBody {
+    /// Stop the preview, delete its install record and the recipe's
+    /// `install.unless_exists` path in the workspace, then start it: a fresh
+    /// install.
+    #[serde(default)]
+    clean: bool,
+}
+
+/// The start body: none (or empty) is a plain start; anything else is
+/// parsed strictly, an unknown key refused with `bad_request`.
+async fn preview_start_body(body: Body) -> Result<PreviewStartBody, Response> {
+    let bytes = axum::body::to_bytes(body, MAX_BODY_BYTES).await.map_err(|_| {
+        err(
+            StatusCode::PAYLOAD_TOO_LARGE, ClientCode::PayloadTooLarge,
+            format!("body larger than {MAX_BODY_BYTES} bytes"),
+        )
+    })?;
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Ok(PreviewStartBody::default());
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, ClientCode::BadRequest, format!("bad JSON body: {e}")))
+}
+
+/// Starts workspace `name`'s preview from its trusted recipe; with `clean`,
+/// first stops it and clears its install ([`crate::client_preview::Previews::clean`]).
+fn start_preview(state: &ClientServerState, name: &str, clean: bool) -> Response {
     if let Err(r) = previews_allowed(state) {
         return *r;
     }
@@ -2411,6 +2444,11 @@ fn start_preview(state: &ClientServerState, name: &str) -> Response {
         Ok(found) => found,
         Err(r) => return *r,
     };
+    if clean {
+        if let Err(e) = state.previews.clean(name, &dir, &source) {
+            return recipe_refusal(&source, &no_recipe_in(&source, e));
+        }
+    }
     match state.previews.start(name, &dir, &source) {
         Ok((v, true)) => Json(v).into_response(),
         Ok((v, false)) => (StatusCode::ACCEPTED, Json(v)).into_response(),

@@ -614,10 +614,51 @@ pub fn record_source(base: &Path, name: &str, checkout: &Path) -> Result<(), Str
 }
 
 /// Forget workspace `name`'s checkout, and that it was a template project
-/// (a new workspace under a name an old one had).
+/// (a new workspace under a name an old one had), and its preview install.
 pub fn forget_source(base: &Path, name: &str) {
     let _ = std::fs::remove_file(source_record(base, name));
     let _ = std::fs::remove_file(template_record(base, name));
+    let _ = std::fs::remove_file(install_record(base, name));
+}
+
+/// (#3484) Where darkmux records the fingerprint of workspace `name`'s last
+/// successful preview install: beside the workspace, like
+/// [`source_record`], outside anything a run can write.
+fn install_record(base: &Path, name: &str) -> PathBuf {
+    base.join(format!(".{name}.install"))
+}
+
+/// Record workspace `name`'s last successful preview install. Replaces any
+/// earlier record, never through a link.
+pub fn record_install(base: &Path, name: &str, fingerprint: &str) -> Result<(), String> {
+    use std::io::Write;
+    if !valid_name(name) {
+        return Err(format!("{name:?} is not a workspace name"));
+    }
+    let path = install_record(base, name);
+    let _ = std::fs::remove_file(&path);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .and_then(|mut f| writeln!(f, "{fingerprint}"))
+        .map_err(|e| format!("recording {}'s install: {e}", path.display()))
+}
+
+/// Forget workspace `name`'s preview install, so the next start installs.
+pub fn forget_install(base: &Path, name: &str) {
+    let _ = std::fs::remove_file(install_record(base, name));
+}
+
+/// The fingerprint of workspace `name`'s last successful preview install,
+/// if any: a plain file (a link is no record).
+pub fn install_fingerprint_of(base: &Path, name: &str) -> Option<String> {
+    let path = install_record(base, name);
+    if !valid_name(name) || !std::fs::symlink_metadata(&path).ok()?.is_file() {
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    Some(text.trim_end_matches('\n').to_string()).filter(|t| !t.is_empty())
 }
 
 /// (#3460) Where darkmux records the first commit of a project it made from
