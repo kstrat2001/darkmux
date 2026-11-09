@@ -189,7 +189,10 @@ pub fn ensure(spec: &ServerSpec, dirs: &Dirs, bounds: Bounds, progress: &mut dyn
         log: dirs.log_for(&spec.endpoint),
         detail,
     };
-    let lock_path = engine_record::path_in(&dirs.records, &spec.endpoint).with_extension("lock");
+    // `<stem>.server.lock`, never a name the record's own `<stem>.json.lock`
+    // can take for another endpoint (holding both in one process would
+    // otherwise block on itself, since flock locks per open file).
+    let lock_path = engine_record::path_in(&dirs.records, &spec.endpoint).with_extension("server.lock");
     let _lock = darkmux_types::flock::lock_exclusive(&lock_path).map_err(|e| start_failed(format!("{e:#}")))?;
     if let Some(rec) = running(dirs, &spec.endpoint) {
         if rec.argv == spec.argv && answers(spec.port, &spec.served_name) {
@@ -312,7 +315,7 @@ fn log_tail(log: &Path) -> String {
 
 /// Stop darkmux's server `rec`, taking the endpoint's lock.
 pub fn stop(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds) -> Result<(), ServerError> {
-    let lock_path = engine_record::path_in(&dirs.records, &rec.endpoint).with_extension("lock");
+    let lock_path = engine_record::path_in(&dirs.records, &rec.endpoint).with_extension("server.lock");
     let _lock = darkmux_types::flock::lock_exclusive(&lock_path)
         .map_err(|e| ServerError::StopFailed { endpoint: rec.endpoint.clone(), pid: rec.pid, detail: format!("{e:#}") })?;
     stop_locked(dirs, rec, bounds)
