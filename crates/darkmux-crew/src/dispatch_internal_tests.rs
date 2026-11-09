@@ -3522,6 +3522,42 @@ S(("127.0.0.1", port), H).serve_forever()
         assert!(names(&refused_recs).contains(&"dispatch.start".to_string()), "the refusal follows its dispatch.start");
     }
 
+    /// (#3448 PR 4 review) The container path names the model the way the
+    /// server answers to it: `darkmux:<id>` on a Tensorfold endpoint.
+    #[test]
+    fn the_container_path_sends_a_tensorfold_model_under_its_darkmux_name() {
+        let pm: darkmux_types::ProfileModel = {
+            let mut reg: darkmux_types::ProfileRegistry = serde_json::from_value(serde_json::json!({
+                "profiles": {"p": {"models": [{"id": "TensorFold/m", "n_ctx": 8192, "endpoint": "tf"}]}},
+                "endpoints": {"tf": {"managed": "tensorfold", "port": 8091}}
+            }))
+            .unwrap();
+            reg.materialize_endpoints();
+            reg.profiles["p"].models[0].clone()
+        };
+        let target = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
+        let role = crate::loader::load_roles().unwrap().into_iter().find(|r| r.id == "coder").expect("the coder role");
+        let opts = dispatch_preflight_probe_opts();
+        let (model, profile, _) = resolve_container_model(&role, &opts, Some(&target)).unwrap();
+        assert_eq!((model.as_str(), profile.as_str()), ("darkmux:TensorFold/m", "p"));
+    }
+
+    /// (#3448 PR 4 review) The container path makes a Tensorfold model
+    /// resident before it launches the container. Its body needs Docker to
+    /// run, so this reads the source: `run_container` calls
+    /// `engine_resident`, before `launch_container`.
+    #[test]
+    fn the_container_path_starts_the_engine_server_before_the_container() {
+        let src = include_str!("dispatch_internal.rs");
+        let start = src.find("fn run_container(").expect("run_container exists");
+        let body = &src[start..];
+        let end = body.find("\nfn ").unwrap_or(body.len());
+        let body = &body[..end];
+        let resident = body.find("engine_resident(").expect("run_container calls engine_resident");
+        let launch = body.find("launch_container(").expect("run_container launches the container");
+        assert!(resident < launch, "the server is made resident before the container starts");
+    }
+
     // ─── #1645 fix-pass MUST FIX 1 (fuller fix): dispatch_unmanaged itself ──
 
     /// (#1645 fix-pass review) `build_unmanaged_record_threads_mission_id_

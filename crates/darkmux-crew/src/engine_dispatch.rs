@@ -92,8 +92,11 @@ pub(crate) trait Machine {
     /// darkmux's own (`darkmux:`) LM Studio residents.
     fn lmstudio_residents(&self) -> Vec<String>;
     fn lmstudio_unload(&self, identifier: &str) -> anyhow::Result<()>;
-    /// Served model names other darkmux processes are dispatching to.
-    fn leased(&self) -> Vec<String>;
+    /// Served model names every OTHER darkmux dispatch is using: other
+    /// processes', and other dispatches' in this one (#2663), never `own`'s.
+    fn leased(&self, own: &LeaseGuard) -> Vec<String>;
+    /// The machine's memory, for a model that could never fit.
+    fn capacity(&self) -> Option<u64>;
 }
 
 struct ThisMachine;
@@ -119,8 +122,11 @@ impl Machine for ThisMachine {
             .unload(identifier)
             .or_else(|e| if darkmux_profiles::engine::is_not_resident(&e) { Ok(()) } else { Err(e) })
     }
-    fn leased(&self) -> Vec<String> {
-        darkmux_types::residency_lease::live_leased_models(std::process::id())
+    fn leased(&self, own: &LeaseGuard) -> Vec<String> {
+        own.all_live_leased_models()
+    }
+    fn capacity(&self) -> Option<u64> {
+        darkmux_platform::current().ram_installed_bytes()
     }
 }
 
@@ -148,11 +154,24 @@ fn prepare_in(
     };
     let current = server::running(dirs, &endpoint);
     let reusable = current.as_ref().is_some_and(|r| r.argv == spec.argv);
+    let leased = machine.leased(&lease);
     let mut evicted = Vec::new();
     if !reusable {
+        // darkmux's own server on this endpoint runs another model or
+        // context; one a running dispatch is using is never replaced under it.
+        if let Some(cur) = current.as_ref().filter(|r| leased.contains(&served_name_of(r))) {
+            return Err(refuse(
+                "busy",
+                format!(
+                    "endpoint `{endpoint}` is serving `{}` for a running dispatch; retry when it finishes",
+                    cur.model
+                ),
+            ));
+        }
         let need = tf.info(&target.model.id).map(|i| i.memory_floor_bytes).ok();
         let freed_by_replacing = current.as_ref().and_then(|r| machine.footprint(r.pid)).unwrap_or(0);
-        evicted = make_room(need, freed_by_replacing, dirs, &endpoint, bounds, machine)?;
+        let room = Room { need, freed_by_replacing, endpoint: &endpoint, leased: &leased };
+        evicted = make_room(&room, dirs, bounds, machine)?;
     }
     let replacing = current.as_ref().map(|r| r.model.clone());
     let mut progress = |p: Progress| report(p, &base, &replacing, &evicted, note);
@@ -211,21 +230,33 @@ fn report(
     note(kind, payload);
 }
 
-fn make_room(
+/// What a start needs room for.
+struct Room<'a> {
+    /// The model's memory floor; `None` when the engine did not say.
     need: Option<u64>,
+    /// Memory darkmux's own server on this endpoint frees when replaced.
     freed_by_replacing: u64,
-    dirs: &Dirs,
-    endpoint: &str,
-    bounds: server::Bounds,
-    machine: &dyn Machine,
-) -> Result<Vec<String>, EngineRefusal> {
-    let Some(need) = need else { return Ok(Vec::new()) };
+    endpoint: &'a str,
+    leased: &'a [String],
+}
+
+fn make_room(room: &Room<'_>, dirs: &Dirs, bounds: server::Bounds, machine: &dyn Machine) -> Result<Vec<String>, EngineRefusal> {
+    let Some(need) = room.need else { return Ok(Vec::new()) };
+    let freed_by_replacing = room.freed_by_replacing;
     let fits = |free: u64| free.saturating_add(freed_by_replacing) >= need;
     // Room already: nothing is listed, LM Studio is not asked.
     if machine.reclaimable().is_none_or(fits) {
         return Ok(Vec::new());
     }
-    let (mut idle, held) = darkmux_residents(dirs, endpoint, &machine.leased(), machine.lmstudio_residents());
+    // Larger than the machine: evicting or waiting can never help.
+    if let Some(total) = machine.capacity().filter(|t| need > *t) {
+        let gib = |b: u64| b as f64 / f64::from(1u32 << 30);
+        return Err(refuse(
+            "wont_fit",
+            format!("the model needs {:.1} GiB and this machine has {:.1} GiB in all", gib(need), gib(total)),
+        ));
+    }
+    let (mut idle, held) = darkmux_residents(dirs, room.endpoint, room.leased, machine.lmstudio_residents());
     let mut evicted = Vec::new();
     loop {
         let Some(free) = machine.reclaimable() else { return Ok(evicted) };
@@ -250,6 +281,11 @@ fn make_room(
     }
 }
 
+/// The model name a recorded server was started under (its `--name`).
+fn served_name_of(rec: &EngineRecord) -> String {
+    rec.argv.iter().skip_while(|a| *a != "--name").nth(1).cloned().unwrap_or_default()
+}
+
 /// darkmux's own residents other than `endpoint`'s server: the idle ones,
 /// in eviction order (last is evicted first), and the names of those a
 /// running dispatch holds.
@@ -270,8 +306,7 @@ fn darkmux_residents(dirs: &Dirs, endpoint: &str, leased: &[String], lms: Vec<St
         }
     }
     for r in servers {
-        let served = r.argv.iter().skip_while(|a| *a != "--name").nth(1).cloned().unwrap_or_default();
-        if leased.contains(&served) {
+        if leased.contains(&served_name_of(&r)) {
             held.push(format!("{} ({})", r.model, r.endpoint));
         } else {
             idle.push(Resident::Server(r));
