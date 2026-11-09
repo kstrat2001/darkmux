@@ -345,7 +345,7 @@ impl From<PlanParams> for PlanParamsRecord {
 /// nothing in it is generated.
 fn linguist_generated(tree: &Path, all: &[String]) -> HashSet<String> {
     use std::io::Write;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     if all.is_empty() {
         return HashSet::new();
     }

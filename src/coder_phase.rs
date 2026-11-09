@@ -1134,6 +1134,46 @@ fn resolve_run_workdir(mission_id: &str, phase_id: &str, root: &Path) -> PathBuf
         .unwrap_or_else(|| worktree_path(root, phase_id))
 }
 
+/// (#1463/#3457) finalize's data-loss guard for one worktree: whether it holds
+/// work the operator has not saved, read through the git dir the main
+/// repository holds (`admin`). When the repository has no record of the
+/// worktree, darkmux cannot check it without reading what the run left
+/// there, so it counts as unsaved and is left in place.
+fn holds_unsaved_work(admin: &Result<PathBuf>, wt_path: &Path) -> bool {
+    match admin {
+        Ok(admin) => worktree_has_unsaved_work(&HostGit::run_written(admin, wt_path)),
+        Err(e) => {
+            eprintln!("{}", style::warn(&format!("cannot check {} for unsaved work: {e:#}", wt_path.display())));
+            true
+        }
+    }
+}
+
+/// Force-remove a phase's worktree (a gate-held run has uncommitted work by
+/// design; on `abort` that's intentional, and on `finalize` the unsaved-work
+/// guard already spared any UNSAVED tree). Best-effort: a failure is
+/// reported, never fatal. (#3457) `worktree remove` validates the `.git`
+/// pointer file, which a run may have replaced, so it is put back first
+/// when the main repository names the worktree's git dir (`admin`).
+fn remove_phase_worktree(root: &Path, wt_path: &Path, admin: Option<&PathBuf>) {
+    if let Some(Err(e)) = admin.map(|a| restore_worktree_pointer(wt_path, a)) {
+        eprintln!("{}", style::warn(&format!("could not restore {}/.git: {e}", wt_path.display())));
+    }
+    match HostGit::trusted(root).output(&["worktree", "remove", "--force", &wt_path.to_string_lossy()]) {
+        Ok(o) if o.status.success() => {
+            println!("{}", style::success(&format!("✓ removed worktree {}", wt_path.display())));
+        }
+        Ok(o) => eprintln!(
+            "{}",
+            style::warn(&format!(
+                "git worktree remove failed: {}: you may need `git worktree prune`.",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ))
+        ),
+        Err(e) => eprintln!("{}", style::warn(&format!("git worktree remove errored: {e:#}"))),
+    }
+}
+
 /// (#3457) The branch `mission launch coder-phase` created the phase's
 /// worktree on, as persisted on its worktree task (`Task.branch`). `None`
 /// for task records written before the field existed.
@@ -1199,18 +1239,17 @@ pub(crate) fn worktree_host_git(repo_root: &Path, wt_path: &Path) -> Result<Host
 /// `git worktree add` wrote, replacing whatever a run left there (a
 /// directory, a symlink, a pointer elsewhere), so `git worktree remove`
 /// validates and tears the worktree down. Only called right before that
-/// removal. `remove_dir_all` does not follow symlinks.
+/// removal, so an intact pointer is simply rewritten. `remove_dir_all` does
+/// not follow symlinks.
 fn restore_worktree_pointer(wt_path: &Path, admin: &Path) -> std::io::Result<()> {
     let dot_git = wt_path.join(".git");
-    let pointer = format!("gitdir: {}\n", admin.display());
     match std::fs::symlink_metadata(&dot_git) {
-        Ok(m) if m.is_file() && std::fs::read_to_string(&dot_git).is_ok_and(|t| t == pointer) => return Ok(()),
         Ok(m) if m.is_dir() => std::fs::remove_dir_all(&dot_git)?,
         Ok(_) => std::fs::remove_file(&dot_git)?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    std::fs::write(&dot_git, pointer)
+    std::fs::write(&dot_git, format!("gitdir: {}\n", admin.display()))
 }
 
 /// (#1426 ship-4 / #1433) After the narrow single-phase `abort --phase` drives
@@ -1370,18 +1409,7 @@ fn teardown_and_terminate_phase(
         // naming the path, and still flip the phase Complete + close the mission
         // (surface-don't-block, #44). Only finalize (the SUCCESS terminal) is
         // guarded; `abort` is destroy-by-intent and tears down regardless.
-        let unsaved = kind == MissionTerminal::Finalize
-            && match &admin {
-                Some(Ok(admin)) => worktree_has_unsaved_work(&HostGit::run_written(admin, &wt_path)),
-                // The repository has no record of this worktree, so darkmux
-                // cannot check it without reading what the run left there:
-                // treat it as unsaved and leave it in place.
-                Some(Err(e)) => {
-                    eprintln!("{}", style::warn(&format!("cannot check {} for unsaved work: {e:#}", wt_path.display())));
-                    true
-                }
-                None => false,
-            };
+        let unsaved = kind == MissionTerminal::Finalize && admin.as_ref().is_some_and(|a| holds_unsaved_work(a, &wt_path));
 
         if unsaved {
             eprintln!(
@@ -1401,31 +1429,9 @@ fn teardown_and_terminate_phase(
             // by design; on `abort` that's intentional, and on `finalize` the
             // guard above already spared any UNSAVED tree). Best-effort: a
             // missing worktree is reported, never fatal.
-            if wt_exists {
-                // (#3457) `worktree remove` validates the `.git` pointer file;
-                // a run that replaced it would leave the worktree stuck.
-                if let Some(Ok(admin)) = &admin {
-                    if let Err(e) = restore_worktree_pointer(&wt_path, admin) {
-                        eprintln!("{}", style::warn(&format!("could not restore {}/.git: {e}", wt_path.display())));
-                    }
-                }
-                match HostGit::trusted(root).output(&["worktree", "remove", "--force", &wt_path.to_string_lossy()]) {
-                    Ok(o) if o.status.success() => {
-                        println!("{}", style::success(&format!("✓ removed worktree {}", wt_path.display())));
-                    }
-                    Ok(o) => eprintln!(
-                        "{}",
-                        style::warn(&format!(
-                            "git worktree remove failed: {}: you may need `git worktree prune`.",
-                            String::from_utf8_lossy(&o.stderr).trim()
-                        ))
-                    ),
-                    Err(e) => {
-                        eprintln!("{}", style::warn(&format!("git worktree remove errored: {e:#}")))
-                    }
-                }
-            } else {
-                println!("{}", style::dim(&format!("worktree {} already gone", wt_path.display())));
+            match &admin {
+                Some(admin) => remove_phase_worktree(root, &wt_path, admin.as_ref().ok()),
+                None => println!("{}", style::dim(&format!("worktree {} already gone", wt_path.display()))),
             }
 
             // (#1463) Only force-delete a branch we KNOW is real — one darkmux

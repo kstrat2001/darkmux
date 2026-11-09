@@ -645,30 +645,40 @@ pub fn synthesize_diff_launch_inputs(config: &MissionConfig, cwd: &Path) -> Resu
     if fallback_to_last_commit {
         notes.push("no base branch found; reviewing only the last commit.".to_string());
     }
-    // (#3457) Attributes from the empty tree: a clean filter the
-    // repository's own config defines (a run may have written it) never
-    // runs. A file that really is filtered (Git LFS) and whose stat changed
-    // can read as changed, which only ever over-reports here.
-    let dirty = darkmux_types::host_git::HostGit::trusted(cwd)
-        .without_tree_attributes()
-        .and_then(|git| git.stdout(&["status", "--porcelain"]));
-    if dirty.is_none() {
-        notes.push("could not check this tree for uncommitted changes.".to_string());
-    }
-    if let Some(dirty) = dirty.filter(|s| !s.trim().is_empty()) {
-        let n = dirty.lines().count();
-        notes.push(format!(
-            "{n} uncommitted change{} in this tree {} NOT part of this review — it reads the \
-             committed tree at {}.",
-            if n == 1 { "" } else { "s" },
-            if n == 1 { "is" } else { "are" },
-            &head[..head.len().min(12)]
-        ));
-    }
+    notes.extend(uncommitted_note(cwd, &head));
     if !notes.is_empty() {
         synthesized.excluded_note = Some(notes.join(" "));
     }
     Ok(DiffLaunchInputs::Ready(synthesized))
+}
+
+/// The note for a tree whose working copy holds changes the review does not
+/// cover (it reads the committed tree at `head`), or `None` when it holds
+/// none.
+///
+/// (#3457) Attributes come from the empty tree: a clean filter the
+/// repository's own config defines (a run with this checkout mounted
+/// read-write may have written it) never runs. A file that really is
+/// filtered (Git LFS) and whose stat changed can read as changed, which only
+/// ever over-reports here. When the check cannot run, the note says so.
+fn uncommitted_note(cwd: &Path, head: &str) -> Option<String> {
+    let Some(dirty) = darkmux_types::host_git::HostGit::trusted(cwd)
+        .without_tree_attributes()
+        .and_then(|git| git.stdout(&["status", "--porcelain"]))
+    else {
+        return Some("could not check this tree for uncommitted changes.".to_string());
+    };
+    if dirty.trim().is_empty() {
+        return None;
+    }
+    let n = dirty.lines().count();
+    Some(format!(
+        "{n} uncommitted change{} in this tree {} NOT part of this review — it reads the \
+         committed tree at {}.",
+        if n == 1 { "" } else { "s" },
+        if n == 1 { "is" } else { "are" },
+        &head[..head.len().min(12)]
+    ))
 }
 
 /// `true` iff the config's graph declares at least one step AND every
