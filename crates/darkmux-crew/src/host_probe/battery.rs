@@ -399,7 +399,7 @@ pub fn minutes_to_empty_from(raw: Option<i64>, on_ac: bool, charging: bool) -> O
 pub const HOUR_MS: u64 = 3_600_000;
 
 pub fn parse_time_at_soc(bytes: &[u8]) -> Option<Vec<u32>> {
-    if bytes.is_empty() || bytes.len() % 4 != 0 {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
         return None;
     }
     Some(bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())

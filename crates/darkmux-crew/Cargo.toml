@@ -7,7 +7,8 @@ license = "MIT"
 homepage = "https://darkmux.com"
 repository = "https://github.com/kstrat2001/darkmux"
 authors = ["Kain Osterholt"]
-rust-version = "1.86"
+# 1.89: `rusqlite` 0.41 (RUSTSEC-2026-0459), directly or through darkmux-crew.
+rust-version = "1.89"
 
 [dependencies]
 darkmux-types = { path = "../darkmux-types" }
@@ -37,7 +38,7 @@ dirs = "5.0"
 # runtime each depend on it directly); this adds no new transitive surface.
 blake3 = "1.5"
 # Phase B (#45) — SQLite-backed derived index over crew manifests.
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 # (#2301) Optional, off by default — see the `ts-export` feature below.
 ts-rs = { version = "10", optional = true }
 # (#2310 P4c-2b PR #2357 review MUST FIX A) `mods.gate`'s scratch checkout
