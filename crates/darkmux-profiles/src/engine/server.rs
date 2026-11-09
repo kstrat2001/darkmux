@@ -368,19 +368,19 @@ fn stop_locked(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds) -> Result<(), Se
     Ok(())
 }
 
-/// Signal the server's process group (it leads one: `spawn_and_record`), or
-/// the server alone when it has left that group; a server that already
-/// exited is not an error.
+/// Signal the server's process group (it leads one: `spawn_and_record`, so
+/// the group is the server and every worker it forked) and the server
+/// itself, which may have left that group. Called only right after
+/// `alive(rec)`, so the pid is darkmux's; "no such process" for either is
+/// not an error (it already exited, or it leads no group).
 fn signal_server(pid: u32, sig: i32) -> std::io::Result<()> {
-    use darkmux_types::child_registry::{kill_group, kill_pid};
-    let no_such = |e: &std::io::Error| e.raw_os_error() == Some(darkmux_types::child_registry::ESRCH);
-    match kill_group(pid, sig) {
-        Err(e) if no_such(&e) => match kill_pid(pid, sig) {
-            Err(e) if no_such(&e) => Ok(()),
-            other => other,
-        },
+    use darkmux_types::child_registry::{kill_group, kill_pid, ESRCH};
+    let ok_if_gone = |r: std::io::Result<()>| match r {
+        Err(e) if e.raw_os_error() == Some(ESRCH) => Ok(()),
         other => other,
-    }
+    };
+    ok_if_gone(kill_group(pid, sig))?;
+    ok_if_gone(kill_pid(pid, sig))
 }
 
 fn gone_within(rec: &EngineRecord, bounds: Bounds) -> bool {
@@ -443,6 +443,11 @@ if "--stubborn-worker" in a:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         time.sleep(300); os._exit(0)
     open(a[a.index("--stubborn-worker") + 1], "w").write(str(pid))
+if "--leave-group-keep-worker" in a:
+    import os
+    if os.fork() == 0:
+        time.sleep(300); os._exit(0)
+    os.setpgid(0, os.getpgid(os.getppid()))
 if "--leave-group" in a:
     import os
     os.setpgid(0, os.getpgid(os.getppid()))
@@ -773,6 +778,17 @@ HTTPServer(("127.0.0.1", port), H).serve_forever()
         let s = spec(&f, "tf", "m/a", free_port(), &["--leave-group"]);
         let rec = ensure(&s, &f.dirs, quick(), &mut no_progress()).unwrap().record().clone();
         stop(&f.dirs, &rec, quick()).unwrap();
+        assert_eq!(rec.state_now(), ServerState::Exited);
+    }
+
+    /// (#3458 re-review) A server that left its group while a worker stayed
+    /// in it is stopped too: the group and the server are each signaled.
+    #[test]
+    fn a_server_that_left_its_group_behind_a_worker_is_still_stopped() {
+        let f = fixture();
+        let s = spec(&f, "tf", "m/a", free_port(), &["--leave-group-keep-worker"]);
+        let rec = ensure(&s, &f.dirs, quick(), &mut no_progress()).unwrap().record().clone();
+        stop(&f.dirs, &rec, Bounds { stop_grace: Duration::from_millis(500), ..quick() }).unwrap();
         assert_eq!(rec.state_now(), ServerState::Exited);
     }
 }
