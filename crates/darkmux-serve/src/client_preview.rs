@@ -67,6 +67,18 @@
 //! count). Each refusal says why and what to do: add
 //! `.darkmux/preview.json` to your own checkout of the repo.
 //!
+//! A project darkmux made from a template (#3460) has no checkout of the
+//! user's either, but its first commit is darkmux's own (`start_fresh`).
+//! darkmux records that commit's SHA beside the workspace (`.<name>.template`)
+//! and reads the recipe as it was there, with host git from the repository
+//! it holds ([`RecipeSource::TemplateCommit`]): a regular file, not a link,
+//! within the size cap, parsed as strictly. No later commit (a run's) and
+//! no edit in the work tree changes it. Such a recipe may not list
+//! `env_from_source` files, since there is no checkout to copy them from.
+//! The recipe is darkmux's own shape: an app's template keeps its own keys
+//! in a file of its own (the Mux Bot templates move theirs out of
+//! `.darkmux/preview.json`).
+//!
 //! Recipe shape (contract 7 and 5: an unknown key is refused naming it, and
 //! `schema_version` is required; each `env` key is a variable name):
 //!
@@ -310,6 +322,125 @@ fn check_env_names(recipe: &Recipe) -> Result<(), RecipeRefusal> {
 /// The recipe in the user's own `checkout`, read and checked.
 pub fn load_recipe(checkout: &Path) -> Result<Recipe, RecipeRefusal> {
     parse_recipe(&read_recipe_text(checkout)?)
+}
+
+/// Where a workspace's recipe is trusted from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecipeSource {
+    /// The user's own checkout the workspace was made from (#3451): the
+    /// recipe, and each `env_from_source` file, are read there.
+    Checkout(PathBuf),
+    /// (#3460) A project darkmux made from a template: the recipe as it was
+    /// in the first commit, the one darkmux made in `start_fresh`, read with
+    /// host git from the repository darkmux holds, never from the work tree.
+    /// A later commit (a run's) never changes what is trusted.
+    TemplateCommit { git_dir: PathBuf, commit: String },
+}
+
+impl RecipeSource {
+    /// The recipe, read and checked as strictly as a checkout's. A template
+    /// project has no checkout of the user's to copy `env_from_source` files
+    /// from, so a template recipe that lists any is refused, naming the key.
+    pub fn load(&self) -> Result<Recipe, RecipeRefusal> {
+        match self {
+            RecipeSource::Checkout(checkout) => load_recipe(checkout),
+            RecipeSource::TemplateCommit { git_dir, commit } => {
+                let recipe = parse_recipe(&read_recipe_at_commit(git_dir, commit)?)?;
+                if recipe.env_from_source.is_empty() {
+                    return Ok(recipe);
+                }
+                Err(RecipeRefusal::Invalid(format!(
+                    "{RECIPE_PATH}: `env_from_source` names files to copy from a checkout of yours, and a \
+                     project made from a template has none; remove `env_from_source` from the template's recipe"
+                )))
+            }
+        }
+    }
+
+    /// The user's own checkout, when the recipe comes from one.
+    pub fn checkout(&self) -> Option<&Path> {
+        match self {
+            RecipeSource::Checkout(c) => Some(c),
+            RecipeSource::TemplateCommit { .. } => None,
+        }
+    }
+}
+
+/// (#3460) The recipe's text as it is in `commit` of the repository at
+/// `git_dir` (`git show <commit>:.darkmux/preview.json`, through host git
+/// with no work tree). It must be a regular file (not a symlink, nor under
+/// a symlinked `.darkmux`) within [`MAX_RECIPE_BYTES`].
+pub fn read_recipe_at_commit(git_dir: &Path, commit: &str) -> Result<String, RecipeRefusal> {
+    if !crate::client_workspace::is_commit_sha(commit) {
+        return Err(RecipeRefusal::Invalid(format!(
+            "{commit:?} is not a full commit SHA; refusing the template's recipe"
+        )));
+    }
+    let git = darkmux_types::host_git::HostGit::held_git_dir(git_dir);
+    let unreadable = |e: String| {
+        RecipeRefusal::Unreadable(format!("reading the template's recipe at {commit}: {e}"))
+    };
+    let listed = git
+        .output(&["ls-tree", "-l", commit, "--", ".darkmux", RECIPE_PATH])
+        .map_err(|e| unreadable(e.to_string()))?;
+    if !listed.status.success() {
+        return Err(unreadable(
+            String::from_utf8_lossy(&listed.stderr).trim().to_string(),
+        ));
+    }
+    check_recipe_entries(&String::from_utf8_lossy(&listed.stdout), commit)?;
+    let blob = format!("{commit}:{RECIPE_PATH}");
+    let shown = git
+        .output(&["show", blob.as_str()])
+        .map_err(|e| unreadable(e.to_string()))?;
+    if !shown.status.success() {
+        return Err(unreadable(
+            String::from_utf8_lossy(&shown.stderr).trim().to_string(),
+        ));
+    }
+    // The size was checked on the tree entry, before reading the blob.
+    String::from_utf8(shown.stdout)
+        .map_err(|_| RecipeRefusal::Invalid(format!("{RECIPE_PATH} at {commit} is not UTF-8")))
+}
+
+/// `git ls-tree -l` lines for `.darkmux` and the recipe in `commit`: no
+/// symlink on the way, and the recipe a regular file within the size cap.
+fn check_recipe_entries(listed: &str, commit: &str) -> Result<(), RecipeRefusal> {
+    let entries: Vec<(&str, &str, &str)> = listed.lines().filter_map(ls_tree_entry).collect();
+    if let Some((_, _, path)) = entries.iter().find(|(mode, _, _)| *mode == "120000") {
+        return Err(RecipeRefusal::Symlink(format!(
+            "{path} is a symlink in the template's first commit {commit}; refusing"
+        )));
+    }
+    match entries.iter().find(|(_, _, path)| *path == RECIPE_PATH) {
+        None => Err(RecipeRefusal::NotFound(format!(
+            "no {RECIPE_PATH} in the template's first commit {commit}"
+        ))),
+        Some((mode, size, _)) => check_recipe_blob(mode, size, commit),
+    }
+}
+
+/// One `git ls-tree -l` line: (mode, size, path).
+fn ls_tree_entry(line: &str) -> Option<(&str, &str, &str)> {
+    let (meta, path) = line.split_once('\t')?;
+    let fields: Vec<&str> = meta.split_whitespace().collect();
+    Some((fields.first()?, fields.get(3).copied().unwrap_or("-"), path))
+}
+
+/// The recipe's tree entry: a regular file (`100644` or `100755`) of at
+/// most [`MAX_RECIPE_BYTES`].
+fn check_recipe_blob(mode: &str, size: &str, commit: &str) -> Result<(), RecipeRefusal> {
+    if mode != "100644" && mode != "100755" {
+        return Err(RecipeRefusal::Invalid(format!(
+            "{RECIPE_PATH} in the template's first commit {commit} is not a regular file"
+        )));
+    }
+    match size.parse::<u64>() {
+        Ok(n) if n <= MAX_RECIPE_BYTES => Ok(()),
+        _ => Err(RecipeRefusal::TooLarge(format!(
+            "{RECIPE_PATH} is larger than {MAX_RECIPE_BYTES} bytes"
+        ))),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -807,15 +938,15 @@ impl Previews {
     }
 
     /// Starts the workspace's preview (or returns the running one) from the
-    /// recipe in `checkout`, the user's own checkout the workspace was made
-    /// from: the recipe is read there, never in `workdir`, which is what
-    /// the preview's container mounts. The boolean says whether it was
-    /// already running.
+    /// recipe `source` names: the user's own checkout the workspace was made
+    /// from, or a template project's first commit. Never from `workdir`,
+    /// which is what the preview's container mounts. The boolean says
+    /// whether it was already running.
     pub fn start(
         &self,
         name: &str,
         workdir: &Path,
-        checkout: &Path,
+        source: &RecipeSource,
     ) -> Result<(PreviewState, bool), RecipeRefusal> {
         let mut entries = self.entries.lock().unwrap();
         if let Some(e) = entries.get(name) {
@@ -825,7 +956,7 @@ impl Previews {
                 return Ok((Self::snapshot(name, &e), true));
             }
         }
-        let recipe = load_recipe(checkout)?;
+        let recipe = source.load()?;
         let unreadable = |e: String| RecipeRefusal::Unreadable(e);
         std::fs::create_dir_all(&self.dir)
             .map_err(|e| unreadable(format!("{}: {e}", self.dir.display())))?;
@@ -851,7 +982,7 @@ impl Previews {
         let at = RunIn {
             name: name.to_string(),
             workdir: workdir.to_path_buf(),
-            checkout: checkout.to_path_buf(),
+            checkout: source.checkout().map(Path::to_path_buf),
             log,
             port,
             hmr_port,
@@ -1022,11 +1153,12 @@ fn advance(entry: &Arc<Mutex<Entry>>, status: Status) -> Result<(), Halt> {
 }
 
 /// Where one preview runs: its workspace, the user's own checkout its
-/// recipe and env files come from, its log and its ports.
+/// recipe and env files come from (none for a template project), its log
+/// and its ports.
 struct RunIn {
     name: String,
     workdir: PathBuf,
-    checkout: PathBuf,
+    checkout: Option<PathBuf>,
     log: PathBuf,
     port: u16,
     hmr_port: u16,
@@ -1057,7 +1189,9 @@ fn run(entry: Arc<Mutex<Entry>>, recipe: Recipe, at: RunIn, containers: &dyn Pre
 /// workspace, and whether the install step is due (its `unless_exists`
 /// path is missing). Returns that.
 fn prepare(entry: &Arc<Mutex<Entry>>, recipe: &Recipe, at: &RunIn) -> Result<bool, Halt> {
-    copy_env_from_source(recipe, &at.workdir, &at.checkout)?;
+    if let Some(checkout) = &at.checkout {
+        copy_env_from_source(recipe, &at.workdir, checkout)?;
+    }
     let Some(install) = &recipe.install else {
         return Ok(false);
     };
@@ -1558,7 +1692,7 @@ mod tests {
         let at = RunIn {
             name: "site".into(),
             workdir: PathBuf::from("/tmp/ws/site"),
-            checkout: PathBuf::from("/tmp/mine"),
+            checkout: Some(PathBuf::from("/tmp/mine")),
             log: PathBuf::from("/tmp/p/site.log"),
             port: 4100,
             hmr_port: 4200,
@@ -1856,7 +1990,9 @@ mod tests {
         let (previews, emu) = emulated(dir.path());
         *emu.create_delay.lock().unwrap() = Duration::from_millis(300);
         let wt = a_workspace(dir.path(), "touch ran; sleep 30");
-        previews.start("w", &wt, &wt).unwrap();
+        previews
+            .start("w", &wt, &RecipeSource::Checkout(wt.clone()))
+            .unwrap();
         std::thread::sleep(Duration::from_millis(50));
         assert!(previews.stop("w"));
         let name = until_removed(&emu);
@@ -1876,7 +2012,9 @@ mod tests {
         let (previews, emu) = emulated(dir.path());
         *emu.start_delay.lock().unwrap() = Duration::from_millis(300);
         let wt = a_workspace(dir.path(), "touch ran; sleep 30");
-        previews.start("w", &wt, &wt).unwrap();
+        previews
+            .start("w", &wt, &RecipeSource::Checkout(wt.clone()))
+            .unwrap();
         for _ in 0..100 {
             if previews.entries.lock().unwrap()["w"]
                 .lock()
@@ -1907,7 +2045,9 @@ mod tests {
         let (previews, emu) = emulated(dir.path());
         *emu.cli_exits_early.lock().unwrap() = true;
         let wt = a_workspace(dir.path(), "sleep 30");
-        previews.start("w", &wt, &wt).unwrap();
+        previews
+            .start("w", &wt, &RecipeSource::Checkout(wt.clone()))
+            .unwrap();
         let v = until_failed(&previews, "w");
         assert_eq!(v["status"], "failed", "{v}");
         let name = until_removed(&emu);
@@ -2004,7 +2144,9 @@ mod tests {
         std::fs::write(wt.join(".darkmux/preview.json"), recipe.to_string()).unwrap();
         let (previews, emu) = emulated(dir.path());
         *emu.image_error.lock().unwrap() = Some("darkmux's runtime requires Docker".into());
-        previews.start("w", &wt, &wt).unwrap();
+        previews
+            .start("w", &wt, &RecipeSource::Checkout(wt.clone()))
+            .unwrap();
         let v = until_failed(&previews, "w");
         assert_eq!(v["status"], "failed", "{v}");
         assert!(
@@ -2056,7 +2198,9 @@ mod tests {
         std::fs::create_dir_all(checkout.join(".darkmux")).unwrap();
         std::fs::write(checkout.join(".darkmux/preview.json"), recipe.to_string()).unwrap();
         let (previews, _emu) = emulated(dir.path());
-        previews.start("w", &wt, &checkout).unwrap();
+        previews
+            .start("w", &wt, &RecipeSource::Checkout(checkout.clone()))
+            .unwrap();
         let v = until_failed(&previews, "w");
         assert_eq!(v["status"], "failed", "{v}");
         assert!(v["error"].as_str().unwrap().contains("symlink"), "{v}");
@@ -2079,7 +2223,9 @@ mod tests {
         });
         std::fs::write(wt.join(".darkmux/preview.json"), recipe.to_string()).unwrap();
         let (previews, _emu) = emulated(dir.path());
-        previews.start("w", &wt, &wt).unwrap();
+        previews
+            .start("w", &wt, &RecipeSource::Checkout(wt.clone()))
+            .unwrap();
         let mut v = serde_json::Value::Null;
         for _ in 0..200 {
             v = serde_json::to_value(previews.status("w").unwrap()).unwrap();
@@ -2121,7 +2267,9 @@ mod tests {
         std::fs::write(wt.join(".darkmux/preview.json"), recipe.to_string()).unwrap();
         let (previews, emu) = emulated(dir);
         let previews = previews.with_clock(clock);
-        previews.start("w", &wt, &wt).unwrap();
+        previews
+            .start("w", &wt, &RecipeSource::Checkout(wt.clone()))
+            .unwrap();
         for _ in 0..200 {
             let container = previews.entries.lock().unwrap()["w"]
                 .lock()
@@ -2180,7 +2328,9 @@ mod tests {
         advance_minutes(&t, 60 * 24 * 365);
         assert!(previews.stop_idle(0).is_empty(), "0 is never");
         let wt = dir.path().join("w");
-        let (_, running) = previews.start("w", &wt, &wt).unwrap();
+        let (_, running) = previews
+            .start("w", &wt, &RecipeSource::Checkout(wt.clone()))
+            .unwrap();
         assert!(running, "the same preview, still running");
         advance_minutes(&t, 10);
         assert!(previews.stop_idle(15).is_empty(), "the 2nd start asked");
@@ -2224,7 +2374,9 @@ mod tests {
             dir.path().join("p"),
             Arc::new(Docker { image: Some(image) }),
         );
-        let (state, _) = previews.start("ws", &wt, &wt).unwrap();
+        let (state, _) = previews
+            .start("ws", &wt, &RecipeSource::Checkout(wt.clone()))
+            .unwrap();
         unsafe { std::env::remove_var("DARKMUX_TEST_HOST_SECRET") };
         let mut v = serde_json::Value::Null;
         for _ in 0..600 {
@@ -2288,6 +2440,176 @@ mod tests {
             "the container is removed"
         );
         assert!(!http_ok(state.port, "/"), "nothing answers any more");
+    }
+
+    /// `git <args>` in `dir`, with an identity, asserting it succeeded.
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "init.defaultBranch=main",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A repository whose one commit holds `files` (path, text); returns its
+    /// directory and the commit.
+    fn a_repo_with(dir: &Path, files: &[(&str, &str)]) -> (PathBuf, String) {
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "--quiet"]);
+        for (path, text) in files {
+            let at = repo.join(path);
+            std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+            std::fs::write(at, text).unwrap();
+        }
+        git(&repo, &["add", "-A"]);
+        git(
+            &repo,
+            &["commit", "--quiet", "--allow-empty", "-m", "first"],
+        );
+        let commit = git(&repo, &["rev-parse", "HEAD"]);
+        (repo, commit)
+    }
+
+    fn at_commit(repo: &Path, commit: &str) -> RecipeSource {
+        RecipeSource::TemplateCommit {
+            git_dir: repo.join(".git"),
+            commit: commit.to_string(),
+        }
+    }
+
+    const TEMPLATE_RECIPE: &str =
+        r#"{"schema_version": "1.0", "command": "npm run dev", "env": {"PORT": "{port}"}}"#;
+
+    /// (#3460) A template project's recipe is the one in its first commit:
+    /// an edit in the work tree, committed or not, changes nothing.
+    #[test]
+    fn a_template_recipe_is_read_from_the_first_commit_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, first) = a_repo_with(dir.path(), &[(RECIPE_PATH, TEMPLATE_RECIPE)]);
+        let edited = r#"{"schema_version": "1.0", "command": "touch pwned"}"#;
+        std::fs::write(repo.join(RECIPE_PATH), edited).unwrap();
+        assert_eq!(
+            at_commit(&repo, &first).load().unwrap().command,
+            "npm run dev",
+            "uncommitted edit"
+        );
+        git(&repo, &["commit", "--quiet", "-am", "a run"]);
+        assert_eq!(
+            at_commit(&repo, &first).load().unwrap().command,
+            "npm run dev",
+            "committed edit"
+        );
+        assert_eq!(
+            read_recipe_at_commit(&repo.join(".git"), &first).unwrap(),
+            TEMPLATE_RECIPE
+        );
+    }
+
+    /// (#3460) The first commit's recipe must be a regular file within the
+    /// size cap, there at all, and named by a full commit SHA.
+    #[cfg(unix)]
+    #[test]
+    fn a_template_recipe_that_is_a_link_or_too_large_or_missing_is_refused() {
+        let at = |files: &[(&str, &str)], link: Option<(&str, &str)>| {
+            let dir = tempfile::tempdir().unwrap();
+            let (repo, _) = a_repo_with(dir.path(), files);
+            if let Some((from, to)) = link {
+                std::fs::create_dir_all(repo.join(from).parent().unwrap()).unwrap();
+                std::os::unix::fs::symlink(to, repo.join(from)).unwrap();
+                git(&repo, &["add", "-A"]);
+                git(&repo, &["commit", "--quiet", "-m", "link"]);
+            }
+            let commit = git(&repo, &["rev-parse", "HEAD"]);
+            (dir, read_recipe_at_commit(&repo.join(".git"), &commit))
+        };
+        let (_d, linked) = at(
+            &[("real.json", TEMPLATE_RECIPE)],
+            Some((RECIPE_PATH, "../real.json")),
+        );
+        assert!(
+            matches!(linked, Err(RecipeRefusal::Symlink(_))),
+            "{linked:?}"
+        );
+        let (_d, linked_dir) = at(
+            &[("real/preview.json", TEMPLATE_RECIPE)],
+            Some((".darkmux", "real")),
+        );
+        assert!(
+            matches!(linked_dir, Err(RecipeRefusal::Symlink(_))),
+            "{linked_dir:?}"
+        );
+        let big = format!(
+            r#"{{"schema_version": "1.0", "command": "{}"}}"#,
+            "x".repeat(MAX_RECIPE_BYTES as usize)
+        );
+        let (_d, large) = at(&[(RECIPE_PATH, &big)], None);
+        assert!(
+            matches!(large, Err(RecipeRefusal::TooLarge(_))),
+            "{large:?}"
+        );
+        let (_d, missing) = at(&[("README.md", "hi")], None);
+        assert!(
+            matches!(missing, Err(RecipeRefusal::NotFound(_))),
+            "{missing:?}"
+        );
+        let (_d, dir_not_file) = at(&[(".darkmux/preview.json/x", "hi")], None);
+        assert!(
+            matches!(dir_not_file, Err(RecipeRefusal::Invalid(_))),
+            "{dir_not_file:?}"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, _) = a_repo_with(dir.path(), &[(RECIPE_PATH, TEMPLATE_RECIPE)]);
+        let short = read_recipe_at_commit(&repo.join(".git"), "HEAD");
+        assert!(
+            matches!(short, Err(RecipeRefusal::Invalid(_))),
+            "only a full SHA: {short:?}"
+        );
+    }
+
+    /// (#3460) A template recipe is parsed as strictly as a checkout's (the
+    /// Mux Bot template schema's keys are refused by name), and one that
+    /// lists `env_from_source` files is refused naming the key: a template
+    /// project has no checkout of the user's to copy them from.
+    #[test]
+    fn a_template_recipe_is_checked_like_a_checkouts_and_refuses_env_from_source() {
+        let load = |text: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            let (repo, first) = a_repo_with(dir.path(), &[(RECIPE_PATH, text)]);
+            at_commit(&repo, &first).load()
+        };
+        let muxbot = r#"{"schema": 1, "command": "npm run dev", "pages": ["/"], "viewports": [], "conventions": {}, "page_file": "x"}"#;
+        let e = load(muxbot).unwrap_err();
+        assert!(matches!(e, RecipeRefusal::Invalid(_)), "{e:?}");
+        let with_version = r#"{"schema_version": "1.0", "command": "npm run dev", "pages": ["/"]}"#;
+        assert!(load(with_version)
+            .unwrap_err()
+            .message()
+            .contains("unknown key `pages`"));
+        let e = load(r#"{"schema_version": "1.0", "command": "x", "env_from_source": [".env"]}"#)
+            .unwrap_err();
+        assert!(
+            matches!(e, RecipeRefusal::Invalid(_)) && e.message().contains("`env_from_source`"),
+            "{e:?}"
+        );
+        assert!(
+            load(r#"{"schema_version": "1.0", "command": "x", "env_from_source": []}"#).is_ok()
+        );
     }
 
     fn parsed(v: serde_json::Value) -> Result<Recipe, RecipeRefusal> {

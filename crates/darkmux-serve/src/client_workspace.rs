@@ -563,6 +563,8 @@ fn source_record(base: &Path, name: &str) -> PathBuf {
 /// link.
 pub fn record_source(base: &Path, name: &str, checkout: &Path) -> Result<(), String> {
     use std::io::Write;
+    // A worktree of the user's checkout is no template project.
+    forget_template_commit(base, name);
     let path = source_record(base, name);
     let _ = std::fs::remove_file(&path);
     std::fs::OpenOptions::new()
@@ -577,6 +579,48 @@ pub fn record_source(base: &Path, name: &str, checkout: &Path) -> Result<(), Str
 /// one had).
 pub fn forget_source(base: &Path, name: &str) {
     let _ = std::fs::remove_file(source_record(base, name));
+}
+
+/// (#3460) Where darkmux records the first commit of a project it made from
+/// a template: beside the workspace, like [`source_record`], outside
+/// anything a run can write.
+fn template_record(base: &Path, name: &str) -> PathBuf {
+    base.join(format!(".{name}.template"))
+}
+
+/// Record that workspace `name` is a project darkmux made from a template,
+/// whose first commit (darkmux's own) is `commit`. Replaces any earlier
+/// record, never through a link.
+pub fn record_template_commit(base: &Path, name: &str, commit: &str) -> Result<(), String> {
+    use std::io::Write;
+    if !is_commit_sha(commit) {
+        return Err(format!("{commit:?} is not a full commit SHA"));
+    }
+    let path = template_record(base, name);
+    let _ = std::fs::remove_file(&path);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .and_then(|mut f| writeln!(f, "{commit}"))
+        .map_err(|e| format!("recording {}'s first commit: {e}", path.display()))
+}
+
+/// Forget that workspace `name` was made from a template.
+pub fn forget_template_commit(base: &Path, name: &str) {
+    let _ = std::fs::remove_file(template_record(base, name));
+}
+
+/// The first commit recorded for template project `name`, if any: a plain
+/// file (a link is no record) holding a full commit SHA.
+pub fn template_commit_of(base: &Path, name: &str) -> Option<String> {
+    let path = template_record(base, name);
+    if !std::fs::symlink_metadata(&path).ok()?.is_file() {
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    let commit = text.trim_end_matches('\n');
+    is_commit_sha(commit).then(|| commit.to_string())
 }
 
 /// The checkout recorded for workspace `name`, if any (a record that is a
@@ -1029,6 +1073,32 @@ mod tests {
         let missing = "0123456789abcdef0123456789abcdef01234567";
         let err = clone_at(&url, Some(missing), &dest, &git_dir, ALLOW_FILE).unwrap_err();
         assert!(err.starts_with("git exited with "), "{err}");
+    }
+
+    /// (#3460) A template project's first commit is recorded beside the
+    /// workspace as a plain file holding a full SHA: a record that is a link,
+    /// or holds anything else, is no record, and a worktree recorded under
+    /// the name forgets it.
+    #[cfg(unix)]
+    #[test]
+    fn a_template_record_is_a_plain_file_holding_a_full_sha() {
+        let base = tempfile::tempdir().unwrap();
+        let sha = "e044900cd94d086c841616b05ed63638aa402be4";
+        assert!(record_template_commit(base.path(), "p", "HEAD").is_err());
+        record_template_commit(base.path(), "p", sha).unwrap();
+        assert_eq!(template_commit_of(base.path(), "p").as_deref(), Some(sha));
+        let elsewhere = base.path().join("elsewhere");
+        std::fs::write(&elsewhere, format!("{sha}\n")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, base.path().join(".q.template")).unwrap();
+        assert_eq!(template_commit_of(base.path(), "q"), None, "a link is no record");
+        std::fs::write(base.path().join(".r.template"), "main\n").unwrap();
+        assert_eq!(template_commit_of(base.path(), "r"), None, "not a SHA");
+        record_source(base.path(), "p", Path::new("/tmp/mine")).unwrap();
+        assert_eq!(
+            template_commit_of(base.path(), "p"),
+            None,
+            "a worktree is no template project"
+        );
     }
 
     #[test]
