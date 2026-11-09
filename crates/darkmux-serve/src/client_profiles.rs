@@ -165,7 +165,11 @@ fn describe(
             None => (backend, false, None),
         },
         (None, url) => {
-            let answered = url.as_ref().and_then(|u| up.get(u)).copied().unwrap_or(false);
+            let answered = url
+                .as_ref()
+                .and_then(|u| up.get(u))
+                .copied()
+                .unwrap_or(false);
             ("url", answered, Some(answered))
         }
     };
@@ -186,7 +190,10 @@ fn describe(
 /// all at the same time (about 1 s at most), and the managed backend's
 /// listing asked for once. Looked at per profile, 30-odd local profiles took
 /// longer than an app waits.
-pub fn describe_profiles(role_id: &str, names: &[String]) -> Vec<Result<ClientProfileInfo, String>> {
+pub fn describe_profiles(
+    role_id: &str,
+    names: &[String],
+) -> Vec<Result<ClientProfileInfo, String>> {
     let loaded = role_named(role_id).and_then(|role| {
         darkmux_profiles::profiles::load_registry_quiet(None)
             .map(|l| (role, l))

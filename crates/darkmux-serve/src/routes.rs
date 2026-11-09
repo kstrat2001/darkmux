@@ -123,9 +123,12 @@ pub(crate) fn table() -> Vec<Route> {
 /// never mounted on the daemon; it is a table so its routes are declared in
 /// one place and pinned by the same golden.
 pub(crate) struct ClientRoute {
+    /// Read by the golden (the router takes the method from `handler`).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) method: &'static str,
     pub(crate) path: &'static str,
-    /// The JSON body a success answers with.
+    /// The JSON body a success answers with (read by the golden).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) reply: &'static str,
     handler: MethodRouter<crate::client_pairing::ClientServerState>,
 }
