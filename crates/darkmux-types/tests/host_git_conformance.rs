@@ -128,8 +128,9 @@ const ALLOWED: &[(&str, Option<usize>, &str)] = &[
         "crates/darkmux-serve/src/client_workspace.rs",
         Some(1),
         "`git_bounded`: a paired app's clone and fetch, which need the operator's own credential helper \
-         and ssh command (HostGit clears both); a fetch names the repository darkmux holds, never one \
-         discovered in a work tree",
+         and ssh command (HostGit clears both). It takes those from the GLOBAL config only, turns hooks \
+         and fsmonitor off, and a fetch first refuses a checkout whose own config sets a network \
+         setting no override can switch off",
     ),
 ];
 

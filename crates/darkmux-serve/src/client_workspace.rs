@@ -159,10 +159,20 @@ pub fn status_of(wc: &crate::client_git::WorkCopy) -> Option<(String, String)> {
 
 /// Runs git with no terminal (credential prompts fail instead of hanging),
 /// only the https and ssh transports, and a deadline. For clone and fetch
-/// only, which need the operator's own credential helper and ssh command:
-/// `darkmux_types::host_git::HostGit` clears both, so this is the one spawn
-/// in this file its lint allows (#3457). A fetch runs against the repository
-/// darkmux holds, never one discovered in a work tree.
+/// only: `darkmux_types::host_git::HostGit` clears the credential helper and
+/// ssh command a network operation needs, so this is the one spawn in this
+/// file its lint allows (#3457).
+///
+/// A fetch runs in the user's checkout (or a worktree of it), whose own
+/// config a run may have written. So hooks and fsmonitor are off, and the
+/// settings that name a program a network operation runs come from the
+/// operator's GLOBAL config only ([`global_network_config`]): the
+/// checkout's own `credential.helper`, `core.sshCommand` and `core.askPass`
+/// are overridden. The network settings an override cannot switch off are
+/// refused before git runs ([`refused_network_keys`]). What this does NOT
+/// cover: a setting that names no program and that this list misses
+/// (a fetch only moves remote-tracking refs, so the worst it can do is fetch
+/// the wrong objects).
 fn git_bounded(args: &[&std::ffi::OsStr], timeout: Duration) -> Result<(), String> {
     let child = std::process::Command::new("git")
         .args([
@@ -173,6 +183,7 @@ fn git_bounded(args: &[&std::ffi::OsStr], timeout: Duration) -> Result<(), Strin
             "-c",
             "protocol.ssh.allow=always",
         ])
+        .args(global_network_config())
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(std::process::Stdio::null())
@@ -182,6 +193,80 @@ fn git_bounded(args: &[&std::ffi::OsStr], timeout: Duration) -> Result<(), Strin
         .map_err(|e| format!("running git: {e}"))?;
     wait_bounded(child, timeout)
 }
+
+/// The keys whose checkout-local values a network operation overrides with
+/// the operator's global ones (lowercase, as git lists them).
+const GLOBAL_ONLY_KEYS: [&str; 5] =
+    ["credential.helper", "core.sshcommand", "core.askpass", "core.hookspath", "core.fsmonitor"];
+
+/// `-c` settings for a network operation: hooks and fsmonitor off, and the
+/// credential helper, ssh command and askpass program the operator's GLOBAL
+/// config names (`ssh` and none when it names none). An empty
+/// `credential.helper` first resets the list a checkout's config built.
+fn global_network_config() -> Vec<String> {
+    let global = |key: &str| -> Vec<String> {
+        darkmux_types::host_git::HostGit::trusted("/")
+            .stdout(&["config", "--global", "--get-all", key])
+            .map(|o| o.lines().map(str::to_string).collect())
+            .unwrap_or_default()
+    };
+    let mut c: Vec<String> = ["core.hooksPath=/dev/null", "core.fsmonitor=false", "credential.helper="]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    c.extend(global("credential.helper").into_iter().map(|h| format!("credential.helper={h}")));
+    c.push(format!("core.sshCommand={}", global("core.sshCommand").pop().unwrap_or_else(|| "ssh".to_string())));
+    c.push(format!("core.askPass={}", global("core.askPass").pop().unwrap_or_default()));
+    c.into_iter().flat_map(|s| ["-c".to_string(), s]).collect()
+}
+
+/// The keys the repository at `dir` sets in its OWN config (local or
+/// worktree scope, includes followed), lowercase as git lists them.
+fn repo_local_keys(dir: &Path) -> Vec<String> {
+    let Some(out) = darkmux_types::host_git::HostGit::trusted(dir)
+        .output(&["config", "-z", "--show-scope", "--list"])
+        .ok()
+        .filter(|o| o.status.success())
+    else {
+        return Vec::new();
+    };
+    let fields: Vec<&[u8]> = out.stdout.split(|b| *b == 0).collect();
+    fields
+        .chunks_exact(2)
+        .filter(|p| p[0] == b"local" || p[0] == b"worktree")
+        .map(|p| String::from_utf8_lossy(p[1].split(|b| *b == b'\n').next().unwrap_or_default()).to_lowercase())
+        .collect()
+}
+
+/// Of `keys`, the network settings no override can switch off, so a fetch
+/// refuses them: a proxy or any other `http.*` setting (TLS verification,
+/// CA file, extra headers), a URL rewrite, a per-URL credential helper, a
+/// transport allowed or a remote helper named, a proxy command.
+fn refused_network_keys(keys: &[String]) -> Vec<String> {
+    keys.iter().filter(|k| is_refused_network_key(k)).cloned().collect()
+}
+
+/// (section prefix, key suffix) pairs [`refused_network_keys`] refuses; an
+/// empty suffix is the whole section.
+const REFUSED_NETWORK_KEYS: [(&str, &str); 7] = [
+    ("http.", ""),
+    ("protocol.", ""),
+    ("url.", ".insteadof"),
+    ("url.", ".pushinsteadof"),
+    ("remote.", ".proxy"),
+    ("remote.", ".vcs"),
+    ("core.gitproxy", ""),
+];
+
+fn is_refused_network_key(key: &str) -> bool {
+    let per_url_helper = key.starts_with("credential.") && key.ends_with(".helper") && key != "credential.helper";
+    per_url_helper || REFUSED_NETWORK_KEYS.iter().any(|(p, s)| key.starts_with(p) && key.ends_with(s))
+}
+
+/// How a checkout's own network setting is moved where darkmux reads it.
+const NETWORK_FIX: &str = "darkmux reads network settings from your global git config only (a run that \
+    had the checkout mounted could have written its own config): set it there, or for this one \
+    repository in a `[includeIf \"gitdir:<checkout>/\"]` section of your global config";
 
 /// Waits for git, killing it past `timeout`; a failure names git's last
 /// stderr line.
@@ -238,6 +323,18 @@ pub fn clone_with_git(url: &str, git_ref: Option<&str>, dest: &Path, git_dir: &P
 /// Production fetch: updates remote-tracking refs only; the checkout's
 /// branch and files are never touched.
 pub fn fetch_with_git(dir: &Path) -> Result<(), String> {
+    let local = repo_local_keys(dir);
+    let mut refused = refused_network_keys(&local);
+    refused.dedup();
+    if !refused.is_empty() {
+        return Err(format!(
+            "not fetched: {}'s own git config sets {}. {NETWORK_FIX}.",
+            dir.display(),
+            refused.join(", ")
+        ));
+    }
+    let mut ignored: Vec<&str> = GLOBAL_ONLY_KEYS.iter().copied().filter(|k| local.iter().any(|l| l == k)).collect();
+    ignored.dedup();
     let args: Vec<&std::ffi::OsStr> = vec![
         "-C".as_ref(),
         dir.as_os_str(),
@@ -245,7 +342,24 @@ pub fn fetch_with_git(dir: &Path) -> Result<(), String> {
         "--quiet".as_ref(),
         "origin".as_ref(),
     ];
-    git_bounded(&args, Duration::from_secs(120))
+    git_bounded(&args, Duration::from_secs(120)).map_err(|e| match ignored.is_empty() {
+        true => e,
+        false => format!(
+            "{e} (darkmux ignored {} from {}'s own git config: {NETWORK_FIX})",
+            ignored.iter().map(|k| spelled(k)).collect::<Vec<_>>().join(", "),
+            dir.display()
+        ),
+    })
+}
+
+/// A [`GLOBAL_ONLY_KEYS`] key as git's documentation spells it.
+fn spelled(key: &str) -> &str {
+    match key {
+        "core.sshcommand" => "core.sshCommand",
+        "core.askpass" => "core.askPass",
+        "core.hookspath" => "core.hooksPath",
+        other => other,
+    }
 }
 
 /// A label safe inside workspace and branch names: lowercase letters,
@@ -382,6 +496,12 @@ fn remote_default_with(git: impl Fn(&[&str]) -> Option<String>) -> Option<String
 /// the credentials [`git_bounded`] keeps, and the checkout's own config
 /// cannot run a program while git checks the files out.
 pub fn add_worktree(source: &Path, branch: &str, dest: &Path, commit: &str) -> Result<(), String> {
+    // (#3457) A filter the checkout's own config defines never runs here,
+    // so a worktree would hold its filtered form: refused instead.
+    let drivers = darkmux_types::host_git::HostGit::trusted(source).repo_filter_drivers();
+    if !drivers.is_empty() {
+        return Err(crate::client_git::repo_filter_refusal(&drivers, "adding a worktree"));
+    }
     let dest = dest.to_string_lossy();
     let child = darkmux_types::host_git::HostGit::trusted(source)
         .command(&["worktree", "add", "--quiet", "-b", branch, &dest, commit])
@@ -636,12 +756,9 @@ mod tests {
         assert!(err.contains("cannot change to"), "{err}");
     }
 
-    /// (#3457) `add_worktree` checks files out of the user's checkout, whose
-    /// config a run may have written (an earlier dispatch with it mounted):
-    /// a smudge filter or a post-checkout hook it names never runs.
-    #[test]
-    fn add_worktree_runs_no_filter_or_hook_the_checkout_config_names() {
-        let tmp = tempfile::tempdir().unwrap();
+    /// A checkout with one commit (`.gitattributes` gives every path filter
+    /// `x`), at `<tmp>/src`; returns (tmp root, checkout, marker path).
+    fn checkout_for_test(tmp: &tempfile::TempDir) -> (PathBuf, PathBuf, PathBuf) {
         let root = tmp.path().canonicalize().unwrap();
         let (src, marker) = (root.join("src"), root.join("host-ran"));
         std::fs::create_dir_all(&src).unwrap();
@@ -651,8 +768,17 @@ mod tests {
         std::fs::write(src.join("a.txt"), "a\n").unwrap();
         fx(&src, &["add", "."]);
         fx(&src, &["commit", "-qm", "one"]);
-        fx(&src, &["config", "filter.x.smudge", &format!("touch '{}'; cat", marker.display())]);
-        fx(&src, &["config", "filter.x.required", "true"]);
+        (root, src, marker)
+    }
+
+    /// (#3457) `add_worktree` checks files out of the user's checkout, whose
+    /// config a run may have written (an earlier dispatch with it mounted):
+    /// a post-checkout hook it names never runs.
+    #[test]
+    fn add_worktree_runs_no_hook_the_checkout_config_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, src, marker) = checkout_for_test(&tmp);
+        let fx = darkmux_types::host_git::fixture::git;
         let hooks = src.join(".git").join("hooks");
         std::fs::write(hooks.join("post-checkout"), format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -661,7 +787,93 @@ mod tests {
 
         add_worktree(&src, "mux/t", &root.join("wt"), "HEAD").expect("the worktree is added");
         assert!(root.join("wt").join("a.txt").exists());
-        assert!(!marker.exists(), "the checkout's own smudge filter or hook ran");
+        assert!(!marker.exists(), "the checkout's own hook ran");
+    }
+
+    /// (#3457) A filter driver the checkout's OWN config defines (git-crypt,
+    /// `git lfs install --local`, or one a run wrote) is refused, naming the
+    /// driver and the fix, rather than a worktree of its filtered form.
+    #[test]
+    fn add_worktree_refuses_a_checkout_whose_own_config_defines_a_filter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, src, marker) = checkout_for_test(&tmp);
+        let fx = darkmux_types::host_git::fixture::git;
+        fx(&src, &["config", "filter.x.smudge", &format!("touch '{}'; cat", marker.display())]);
+
+        let err = add_worktree(&src, "mux/t", &root.join("wt"), "HEAD").unwrap_err();
+        assert!(err.contains("filter.x"), "names the driver: {err}");
+        assert!(err.contains("--global"), "names the fix: {err}");
+        assert!(!root.join("wt").exists(), "nothing is made");
+        assert!(!marker.exists(), "the checkout's own smudge filter ran");
+    }
+
+    /// An origin nothing listens on: an ssh fetch fails fast, after git has
+    /// started the ssh command.
+    const DEAD_SSH_ORIGIN: &str = "ssh://127.0.0.1:1/x.git";
+
+    /// (#3457) A fetch in the user's checkout reads its config, which a run
+    /// may have written: a `core.sshCommand` there never runs, and the
+    /// failed fetch says the setting was ignored and where it belongs.
+    #[test]
+    fn fetch_runs_no_ssh_command_the_checkout_config_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_root, src, marker) = checkout_for_test(&tmp);
+        let fx = darkmux_types::host_git::fixture::git;
+        fx(&src, &["remote", "add", "origin", DEAD_SSH_ORIGIN]);
+        fx(&src, &["config", "core.sshCommand", &format!("touch '{}'; false", marker.display())]);
+
+        let err = fetch_with_git(&src).unwrap_err();
+        assert!(!marker.exists(), "the checkout's own core.sshCommand ran");
+        assert!(err.contains("core.sshCommand") && err.contains("global"), "{err}");
+    }
+
+    /// (#3457) Network settings darkmux cannot switch off by override (a
+    /// proxy, a URL rewrite, a per-URL credential helper, a protocol) in the
+    /// checkout's own config refuse the fetch, naming the key and the fix.
+    #[test]
+    fn fetch_refuses_a_checkout_whose_own_config_sets_network_settings() {
+        for (key, value) in [
+            ("http.proxy", "http://127.0.0.1:9"),
+            ("url.ext::sh.insteadOf", "ssh://"),
+            ("credential.https://example.com.helper", "!touch x"),
+            ("protocol.ext.allow", "always"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (_root, src, marker) = checkout_for_test(&tmp);
+            let fx = darkmux_types::host_git::fixture::git;
+            fx(&src, &["remote", "add", "origin", DEAD_SSH_ORIGIN]);
+            fx(&src, &["config", key, value]);
+            fx(&src, &["config", "core.sshCommand", &format!("touch '{}'; false", marker.display())]);
+            let err = fetch_with_git(&src).unwrap_err();
+            assert!(err.to_lowercase().contains(&key.to_lowercase()), "{key}: {err}");
+            assert!(err.contains("includeIf"), "{key}: names the per-repo fix: {err}");
+            assert!(!marker.exists(), "{key}: git ran");
+        }
+    }
+
+    /// The operator's GLOBAL `core.sshCommand` is the one a fetch runs.
+    #[test]
+    #[serial_test::serial]
+    fn fetch_runs_the_global_ssh_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, src, _marker) = checkout_for_test(&tmp);
+        let fx = darkmux_types::host_git::fixture::git;
+        fx(&src, &["remote", "add", "origin", DEAD_SSH_ORIGIN]);
+        let global_marker = root.join("global-ssh-ran");
+        let global = root.join("gitconfig");
+        std::fs::write(&global, format!("[core]\n\tsshCommand = touch '{}'; false\n", global_marker.display())).unwrap();
+        let prev = std::env::var_os("GIT_CONFIG_GLOBAL");
+        // SAFETY: #[serial]; restored below.
+        unsafe { std::env::set_var("GIT_CONFIG_GLOBAL", &global) };
+        let out = fetch_with_git(&src);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("GIT_CONFIG_GLOBAL", v),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+        }
+        assert!(out.is_err());
+        assert!(global_marker.exists(), "the global core.sshCommand must be the one used");
     }
 
     #[test]

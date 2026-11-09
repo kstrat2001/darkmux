@@ -148,8 +148,51 @@ pub fn command(wc: &WorkCopy, index: Option<&Path>, args: &[&str]) -> std::proce
     cmd
 }
 
+/// The subcommands that read or write a work copy's file CONTENT, and so
+/// pass it through any filter driver attributes name: `add` and `commit`
+/// hash files, `revert` (and the rest) check them out.
+const CONTENT_SUBCOMMANDS: [&str; 13] =
+    ["add", "commit", "revert", "checkout", "switch", "restore", "reset", "stash", "merge", "cherry-pick", "rebase", "apply", "pull"];
+
+/// (#3457) Refuses a content subcommand in a work copy whose held
+/// repository's config (not the operator's global one) defines a filter
+/// driver. `HostGit` runs no such driver, since a run could have written
+/// it, so the subcommand would hash or check out files unfiltered: a
+/// git-crypt repo would commit plaintext, an LFS repo whole files. Refused,
+/// never silently done the wrong way.
+fn refuse_repo_filters(wc: &WorkCopy, args: &[&str]) -> Result<(), String> {
+    let sub = darkmux_types::host_git::subcommand_of(args).unwrap_or_default();
+    if !CONTENT_SUBCOMMANDS.contains(&sub) {
+        return Ok(());
+    }
+    let drivers = darkmux_types::host_git::HostGit::run_written(&wc.git_dir, &wc.work_tree).repo_filter_drivers();
+    match drivers.is_empty() {
+        true => Ok(()),
+        false => Err(repo_filter_refusal(&drivers, &format!("`git {sub}` in {}", wc.work_tree.display()))),
+    }
+}
+
+/// (#3457) Why darkmux refuses `what` in a repository whose own config
+/// defines the filter `drivers`, and the fix: the driver in the GLOBAL config,
+/// where darkmux does run it.
+pub fn repo_filter_refusal(drivers: &[String], what: &str) -> String {
+    let named: Vec<String> = drivers.iter().map(|d| format!("`filter.{d}.*`")).collect();
+    let first = &drivers[0];
+    format!(
+        "refusing {what}: the repository's own git config defines the filter driver {}, and darkmux \
+         runs no filter a repository's config names (a run that had it mounted could have written \
+         that config), so its files would be read or written unfiltered. Define the driver in your \
+         global config instead, where darkmux runs it: `git config --global filter.{first}.clean ...` \
+         (and `.smudge`, `.process`, `.required` as the repo's config has them; `git lfs install` \
+         writes LFS's there by default, and git-crypt's four lines can be copied from the repo's \
+         .git/config), then remove them from the repository's config and retry.",
+        named.join(", ")
+    )
+}
+
 /// [`command`] run to completion; its output when git succeeded.
 pub fn run(wc: &WorkCopy, index: Option<&Path>, args: &[&str]) -> Option<std::process::Output> {
+    refuse_repo_filters(wc, args).ok()?;
     let out = command(wc, index, args).output().ok()?;
     out.status.success().then_some(out)
 }
@@ -166,6 +209,7 @@ pub fn run_or_why(
     index: Option<&Path>,
     args: &[&str],
 ) -> Result<std::process::Output, String> {
+    refuse_repo_filters(wc, args)?;
     let out = command(wc, index, args)
         .output()
         .map_err(|e| format!("running git: {e}"))?;
@@ -187,6 +231,7 @@ pub fn run_or_why(
 
 /// [`command`] for its effect; the last stderr line on failure.
 pub fn quiet(wc: &WorkCopy, args: &[&str]) -> Result<(), String> {
+    refuse_repo_filters(wc, args)?;
     let out = command(wc, None, args)
         .output()
         .map_err(|e| format!("running git: {e}"))?;

@@ -254,7 +254,7 @@ impl HostGit {
     /// The filter driver names any config but the operator's global one
     /// defines for this repository. Reading config runs nothing. A failed
     /// read (no repository, no driver) is an empty list.
-    fn repo_filter_drivers(&self) -> Vec<String> {
+    pub fn repo_filter_drivers(&self) -> Vec<String> {
         let out = self.base().args(["config", "-z", "--show-scope", "--get-regexp", "^filter\\."]).output();
         match out {
             Ok(o) if o.status.success() => repo_defined_drivers(&o.stdout),
@@ -302,13 +302,40 @@ fn neutralize_filters(cmd: &mut Command, names: &[String]) {
     cmd.env("GIT_CONFIG_COUNT", i.to_string());
 }
 
-/// The index just past the subcommand: past `args[0]`, or past `show` in
-/// `stash show`, so a flag lands where that subcommand reads it.
+/// git's global options that take their value as the next argument.
+const GLOBAL_OPTIONS_WITH_VALUE: [&str; 7] =
+    ["-c", "-C", "--git-dir", "--work-tree", "--namespace", "--config-env", "--attr-source"];
+
+/// The index of the subcommand in `args`: past any leading global options
+/// (`--literal-pathspecs`, `-c <setting>`, ...). `args.len()` when there is
+/// none.
+fn subcommand_at<S: AsRef<OsStr>>(args: &[S]) -> usize {
+    let mut i = 0;
+    while let Some(a) = args.get(i).and_then(|a| a.as_ref().to_str()) {
+        if GLOBAL_OPTIONS_WITH_VALUE.contains(&a) {
+            i += 2;
+        } else if a.starts_with('-') {
+            i += 1;
+        } else {
+            return i;
+        }
+    }
+    args.len()
+}
+
+/// The git subcommand `args` run, past any leading global options.
+pub fn subcommand_of<'a>(args: &[&'a str]) -> Option<&'a str> {
+    args.get(subcommand_at(args)).copied()
+}
+
+/// The index just past the subcommand (past `show` in `stash show`), so a
+/// flag lands where that subcommand reads it.
 fn subcommand_end(args: &[&OsStr]) -> usize {
-    match (args.first().and_then(|a| a.to_str()), args.get(1).and_then(|a| a.to_str())) {
-        (None, _) => 0,
-        (Some("stash"), Some("show")) => 2,
-        _ => 1,
+    let at = subcommand_at(args);
+    match (args.get(at).and_then(|a| a.to_str()), args.get(at + 1).and_then(|a| a.to_str())) {
+        (None, _) => args.len(),
+        (Some("stash"), Some("show")) => at + 2,
+        _ => at + 1,
     }
 }
 

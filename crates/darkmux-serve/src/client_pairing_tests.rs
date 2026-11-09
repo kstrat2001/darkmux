@@ -2066,6 +2066,22 @@ fn snapshot_runs_nothing_a_planted_submodule_or_nested_repo_names() {
     assert!(changes.skipped.contains(&"nested".to_string()), "{:?}", changes.skipped);
 }
 
+/// (#3457) A work copy whose held repository's config defines a filter
+/// driver (git-crypt, `git lfs install --local`, or one a run wrote) is
+/// refused for a snapshot and a commit, naming the driver and the fix, never
+/// read or committed in its unfiltered form.
+#[test]
+fn a_work_copy_whose_repo_config_defines_a_filter_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    git_repo(dir.path());
+    std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+    run_git(Some(dir.path()), &["config", "filter.crypt.clean", "cat"]);
+    let err = snapshot_tree(&wc(dir.path())).unwrap_err();
+    assert!(err.contains("filter.crypt") && err.contains("--global"), "{err}");
+    let err = commit_run(&wc(dir.path()), &["a.txt".to_string()], "m").unwrap_err();
+    assert!(err.contains("filter.crypt"), "{err}");
+}
+
 #[test]
 fn a_workdir_that_is_not_a_git_repo_has_no_snapshot() {
     let dir = tempfile::tempdir().unwrap();

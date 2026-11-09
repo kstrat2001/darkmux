@@ -113,6 +113,10 @@ fn each_subcommand_gets_its_flags_right_after_it() {
     assert!(args.ends_with(&["blame".into(), ALL[0].into(), ALL[1].into(), "a.txt".into()]), "{args:?}");
     let args = args_of(&HostGit::trusted("/r").command(&["status"]));
     assert!(args.ends_with(&["status".into(), ALL[2].into()]), "{args:?}");
+    let args = args_of(&HostGit::trusted("/r").command(&["--literal-pathspecs", "log", "-1"]));
+    assert!(args.ends_with(&["--literal-pathspecs".into(), "log".into(), ALL[0].into(), ALL[1].into(), ALL[2].into(), "-1".into()]), "a leading global option: {args:?}");
+    let args = args_of(&HostGit::trusted("/r").command(&["-c", "x.y=z", "--no-pager", "diff", "HEAD"]));
+    assert!(args.ends_with(&["diff".into(), ALL[0].into(), ALL[1].into(), ALL[2].into(), "HEAD".into()]), "-c takes a value: {args:?}");
     let args = args_of(&HostGit::trusted("/r").command(&["branch", "-D", "log"]));
     assert!(args.ends_with(&["branch".into(), "-D".into(), "log".into()]), "a branch named log is not a subcommand: {args:?}");
 }
