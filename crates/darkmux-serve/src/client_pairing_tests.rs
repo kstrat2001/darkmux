@@ -297,15 +297,9 @@ fn harness() -> Harness {
         // off (`clients.preview.enabled`).
         preview_enabled: Arc::new(move || Ok(*pe.lock().unwrap())),
         preview_idle_minutes: Arc::new(move || pi.lock().unwrap().clone()),
-        // The app is pid 100 (any port); `CONTAINER_PEER_PORTS..` are
-        // Docker's process (pid 900); `UNKNOWN_PEER_PORTS..` can't be told.
-        peer_process: Arc::new(|peer, _bound| match peer.port() {
-            p if p >= UNKNOWN_PEER_PORTS => None,
-            p if p >= CONTAINER_PEER_PORTS => Some(900),
-            _ => Some(100),
-        }),
+        peer_processes: Arc::new(|_bound, wanted| Some(test_peer_processes(wanted))),
         pair_peers: Arc::new(Mutex::new(HashMap::new())),
-        pair_lookups: Arc::new(tokio::sync::Semaphore::new(1)),
+        pair_lookups: Arc::new(PeerRounds::default()),
     };
     Harness {
         activity,
@@ -323,6 +317,20 @@ fn harness() -> Harness {
         policy,
         state,
     }
+}
+
+/// The process at each of `wanted`'s ends, as the harness tells it: the app
+/// is pid 100 (any port); `CONTAINER_PEER_PORTS..` are Docker's process
+/// (pid 900); `UNKNOWN_PEER_PORTS..` cannot be told.
+fn test_peer_processes(wanted: &[SocketAddr]) -> HashMap<SocketAddr, u32> {
+    wanted
+        .iter()
+        .filter_map(|peer| match peer.port() {
+            p if p >= UNKNOWN_PEER_PORTS => None,
+            p if p >= CONTAINER_PEER_PORTS => Some((*peer, 900)),
+            _ => Some((*peer, 100)),
+        })
+        .collect()
 }
 
 /// The address the harness's listener is taken to be bound on.
@@ -725,36 +733,59 @@ async fn an_unreadable_policy_does_not_consume_the_token_delivery() {
     assert!(v["token"].is_string());
 }
 
-/// The process a pairing request came from is asked only when another
-/// request is already waiting (a lone app's pairing asks the OS nothing),
-/// one lookup at a time however many requests arrive at once, and a request
-/// whose sender went away while it queued starts no lookup.
+/// The reviewer's probe: one request waiting, then a flood from one
+/// process that holds 40 requests open, then the app. Who sent each request
+/// is found in rounds (one look at every connection, about 0.2 s here), each
+/// answering every request waiting when it began, so the app waits for at
+/// most two rounds whatever the flood holds open, and the rounds stay few.
+/// A lone request asks nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn peer_lookups_run_only_when_needed_one_at_a_time() {
+async fn a_held_open_flood_delays_pairing_by_at_most_two_lookup_rounds() {
     let mut h = harness();
-    let (calls, inside, most) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
-    let (c, n, m) = (calls.clone(), inside.clone(), most.clone());
-    h.state.peer_process = Arc::new(move |_peer, _bound| {
+    let (rounds, inside, most) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+    let (c, n, m) = (rounds.clone(), inside.clone(), most.clone());
+    h.state.peer_processes = Arc::new(move |_bound, wanted| {
         c.fetch_add(1, Ordering::SeqCst);
         m.fetch_max(n.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(200));
         n.fetch_sub(1, Ordering::SeqCst);
-        Some(900)
+        Some(test_peer_processes(wanted))
     });
     let _ = request_pairing(&h).await;
-    assert_eq!(calls.load(Ordering::SeqCst), 0, "a lone request asks nothing");
-    let flood = (0..12u16).map(|i| call(&h, pair_from(CONTAINER_PEER_PORTS + i, "X")));
-    for (code, v) in futures::future::join_all(flood).await {
-        assert_eq!(code, 202, "{v}");
-    }
-    assert_eq!(calls.load(Ordering::SeqCst), 12);
-    assert_eq!(most.load(Ordering::SeqCst), 1, "never two lookups at once");
-    let held = h.state.pair_lookups.clone().acquire_owned().await.unwrap();
-    let gone = tokio::time::timeout(std::time::Duration::from_millis(50), call(&h, pair_from(CONTAINER_PEER_PORTS + 99, "X"))).await;
-    assert!(gone.is_err(), "it queued behind the held lookup");
+    assert_eq!(rounds.load(Ordering::SeqCst), 0, "a lone request asks nothing");
+    let flood = (0..40u16).map(|i| call(&h, pair_from(CONTAINER_PEER_PORTS + i, "X")));
+    let app = async {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let started = std::time::Instant::now();
+        let (code, v) = call(&h, pair_from(5555, "4F7-K2Q")).await;
+        (code, v, started.elapsed())
+    };
+    let (flooded, (code, v, waited)) = tokio::join!(futures::future::join_all(flood), app);
+    assert_eq!(code, 202, "{v}");
+    assert!(waited < std::time::Duration::from_millis(650), "the app waited {waited:?}");
+    assert!(flooded.iter().all(|(code, _)| *code == 202));
+    assert!(rounds.load(Ordering::SeqCst) <= 3, "{} rounds", rounds.load(Ordering::SeqCst));
+    assert_eq!(most.load(Ordering::SeqCst), 1, "never two rounds at once");
+}
+
+/// A request whose sender went away while it queued for a round starts
+/// none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_whose_sender_left_while_queued_starts_no_round() {
+    let mut h = harness();
+    let rounds = Arc::new(AtomicU64::new(0));
+    let c = rounds.clone();
+    h.state.peer_processes = Arc::new(move |_bound, wanted| {
+        c.fetch_add(1, Ordering::SeqCst);
+        Some(test_peer_processes(wanted))
+    });
+    let _ = request_pairing(&h).await;
+    let held = h.state.pair_lookups.turn.clone().lock_owned().await;
+    let gone = tokio::time::timeout(std::time::Duration::from_millis(50), call(&h, pair_from(CONTAINER_PEER_PORTS, "X"))).await;
+    assert!(gone.is_err(), "it queued behind the held turn");
     drop(held);
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    assert_eq!(calls.load(Ordering::SeqCst), 12, "a request whose sender went away starts no lookup");
+    assert_eq!(rounds.load(Ordering::SeqCst), 0);
 }
 
 /// An approval the app has not collected yet can be taken back: revoking
@@ -1142,6 +1173,36 @@ fn peeking_at_the_store_writes_nothing() {
     std::fs::write(&path, old).unwrap();
     assert_eq!(ClientStore::at(path.clone()).peek().unwrap().clients.len(), 1);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), old, "not migrated on disk");
+}
+
+/// `peek` reads under the store's shared lock, so it never catches a store
+/// half rewritten (truncated, then written) by a writer holding the lock.
+#[test]
+fn peeking_never_sees_a_half_written_store() {
+    use std::io::{Seek, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("clients.json");
+    let store = ClientStore::at(path.clone());
+    store.update(|f| { f.clients.push(ApprovedClient { name: "a".into(), id: "c-0000000000000001".into(), created: 1, token_hash: "00".into() }); Ok(()) }).unwrap();
+    let full = std::fs::read_to_string(&path).unwrap();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let p2 = path.clone();
+    let writer = std::thread::spawn(move || {
+        let mut guard = darkmux_types::flock::lock_exclusive(&p2).unwrap();
+        let file = guard.file();
+        file.set_len(0).unwrap();
+        file.rewind().unwrap();
+        file.write_all(&full.as_bytes()[..full.len() / 2]).unwrap();
+        locked_tx.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        file.set_len(0).unwrap();
+        file.rewind().unwrap();
+        file.write_all(full.as_bytes()).unwrap();
+    });
+    locked_rx.recv().unwrap();
+    let seen = store.peek().expect("never a half-written store");
+    assert_eq!(seen.clients.len(), 1);
+    writer.join().unwrap();
 }
 
 #[test]
@@ -2952,8 +3013,8 @@ async fn work_runs_only_in_a_workspace_made_for_this_app() {
     git_workspace(&h, "theirs");
     own(&h, "theirs", "c-0000000000000000");
     git_workspace(&h, "nobodys");
-    // With two apps paired, a workspace from before owners goes to neither.
-    let _second = paired(&h).await;
+    // A workspace from before owners, in a store with no legacy owner.
+    std::fs::remove_file(h.base.join(".nobodys.client")).unwrap();
     let base = h.base.canonicalize().unwrap();
     for name in ["darkmux-public", "theirs", "nobodys"] {
         for body in [
@@ -3009,18 +3070,73 @@ async fn each_app_gets_its_own_workspace_of_a_repo() {
     assert!(h.ran.lock().unwrap().is_empty());
 }
 
-/// A workspace darkmux made before workspaces had an owner goes to the
-/// paired app when exactly one is paired: it keeps working there, with no
-/// set-up again.
+/// A store written before clients had ids, holding one client that
+/// presents `token`.
+fn store_from_before_ids(h: &Harness, token: &str) {
+    let doc = serde_json::json!({
+        "schema_version": "1.1",
+        "pending": [],
+        "clients": [{"name": "mux-bot", "created": 1, "token_hash": hash_hex(token)}],
+    });
+    std::fs::write(h.store.path(), doc.to_string()).unwrap();
+}
+
+/// A workspace from before owners is the client's that was the only one
+/// paired when the store moved to ids: decided then, once. It stays that
+/// client's after a second app pairs; once that client is revoked nothing
+/// is given away.
 #[tokio::test]
-async fn a_workspace_from_before_owners_goes_to_the_one_paired_app() {
+async fn workspaces_from_before_owners_go_to_the_client_paired_when_the_store_moved() {
     let h = harness();
-    let token = paired(&h).await;
+    let first = "first-token-0123456789abcdef";
+    store_from_before_ids(&h, first);
+    let heir = h.store.read().unwrap().clients[0].id.clone();
+    assert_eq!(h.store.read().unwrap().legacy_owner, Some(heir.clone()));
+    let second = paired(&h).await;
     git_workspace(&h, "site");
-    assert_eq!(crate::client_workspace::owner_of(&h.base, "site"), None);
-    let id = run_in(&h, &token, "site", "edit-readme").await;
-    assert_eq!(status(&h, &token, &id).await["status"], "done");
-    assert_eq!(crate::client_workspace::owner_of(&h.base, "site"), Some(client_id(&h, FIRST_CLIENT)));
+    std::fs::remove_file(h.base.join(".site.client")).unwrap();
+    let (code, v) = call(&h, post("/client/work", Some(&second), serde_json::json!({"role": "coder", "message": "hi", "workspace": "site"}))).await;
+    assert_eq!(code, 403, "never the second app's: {v}");
+    let id = run_in(&h, first, "site", "hello").await;
+    assert_eq!(status(&h, first, &id).await["status"], "done");
+    assert_eq!(crate::client_workspace::owner_of(&h.base, "site"), Some(heir));
+    assert!(revoke(&h.store, "mux-bot").unwrap());
+    git_workspace(&h, "old");
+    std::fs::remove_file(h.base.join(".old.client")).unwrap();
+    let (code, v) = call(&h, post("/client/work", Some(&second), serde_json::json!({"role": "coder", "message": "hi", "workspace": "old"}))).await;
+    assert_eq!(code, 403, "nothing adopts once the heir is revoked: {v}");
+    assert_eq!(crate::client_workspace::owner_of(&h.base, "old"), None);
+}
+
+/// The reviewer's probe: A and B paired (no store migration, so no legacy
+/// owner), A's workspace from before owners. Revoking A leaves B the only
+/// client, and B still does not get it.
+#[tokio::test]
+async fn the_last_client_left_does_not_inherit_unowned_workspaces() {
+    let h = harness();
+    let a = paired(&h).await;
+    let b = paired(&h).await;
+    let (code, v) = call(&h, post("/client/workspaces", Some(&a), serde_json::json!({"repo_url": HCR}))).await;
+    assert_eq!(code, 201, "{v}");
+    std::fs::remove_file(h.base.join(".hcr.client")).unwrap();
+    let work = |t: &str| post("/client/work", Some(t), serde_json::json!({"role": "coder", "message": "hi", "workspace": "hcr"}));
+    assert_eq!(call(&h, work(&b)).await.0, 403);
+    assert!(revoke(&h.store, FIRST_CLIENT).unwrap());
+    let (code, v) = call(&h, work(&b)).await;
+    assert_eq!(code, 403, "{v}");
+    assert_eq!(crate::client_workspace::owner_of(&h.base, "hcr"), None);
+}
+
+/// A store moved to ids with two clients paired, or none, has no legacy
+/// owner.
+#[test]
+fn a_store_moved_with_several_clients_or_none_names_no_legacy_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    for (n, clients) in [(0, "[]"), (2, r#"[{"name":"a","created":1,"token_hash":"00"},{"name":"b","created":1,"token_hash":"00"}]"#)] {
+        let path = dir.path().join(format!("clients-{n}.json"));
+        std::fs::write(&path, format!(r#"{{"schema_version":"1.1","pending":[],"clients":{clients}}}"#)).unwrap();
+        assert_eq!(ClientStore::at(path).read().unwrap().legacy_owner, None, "{n} clients");
+    }
 }
 
 /// With two apps paired, a workspace from before owners goes to neither,
@@ -3301,6 +3417,10 @@ fn hold(h: &Harness, name: &str) {
     std::fs::rename(wt.join(".git"), &held).unwrap();
     std::fs::write(wt.join(".git"), format!("gitdir: {}\n", held.display())).unwrap();
     crate::client_git::record_git_dir(&h.base, name, &held).unwrap();
+    // Made for the first client paired, when one is.
+    if let Some(first) = h.store.read().unwrap().clients.first() {
+        own(h, name, &first.id);
+    }
 }
 
 /// The name the first client a test pairs gets ("Sam's iPhone").

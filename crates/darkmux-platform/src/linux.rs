@@ -180,20 +180,24 @@ impl Platform for LinuxPlatform {
         Some(pids)
     }
 
-    /// The ESTABLISHED socket in `/proc/net/tcp` (or `tcp6`, where a
-    /// dual-stack client's socket shows its v4-mapped address) whose own end
-    /// is `peer` and whose other end is `local`, matched to the process whose
-    /// fds hold it. A process this user cannot read is not found (a
+    /// The ESTABLISHED sockets in `/proc/net/tcp` and `tcp6` (where a
+    /// dual-stack client's socket shows its v4-mapped address) whose other
+    /// end is `local`, matched in one pass over every process's fds to the
+    /// process holding each. A process this user cannot read is left out (a
     /// host-network container run as root, say).
-    fn tcp_peer_pid(&self, local: std::net::SocketAddr, peer: std::net::SocketAddr) -> Option<u32> {
-        let inode = ["/proc/net/tcp", "/proc/net/tcp6"]
-            .iter()
-            .find_map(|t| connected_inode(&read_to_string(t)?, peer, local))?;
-        list_dir("/proc").into_iter().filter_map(|name| name.parse::<u32>().ok()).find(|pid| {
-            list_dir(&format!("/proc/{pid}/fd"))
-                .iter()
-                .any(|fd| read_link(&format!("/proc/{pid}/fd/{fd}")).and_then(|l| socket_inode(&l)) == Some(inode))
-        })
+    fn tcp_peers_of(&self, local: std::net::SocketAddr) -> Option<Vec<(std::net::SocketAddr, u32)>> {
+        let mut ends = connected_to(&read_to_string("/proc/net/tcp")?, local);
+        ends.extend(connected_to(&read_to_string("/proc/net/tcp6").unwrap_or_default(), local));
+        let mut peers = Vec::new();
+        for pid in list_dir("/proc").into_iter().filter_map(|name| name.parse::<u32>().ok()) {
+            for fd in list_dir(&format!("/proc/{pid}/fd")) {
+                let inode = read_link(&format!("/proc/{pid}/fd/{fd}")).and_then(|l| socket_inode(&l));
+                if let Some((peer, _)) = ends.iter().find(|(_, i)| Some(*i) == inode) {
+                    peers.push((*peer, pid));
+                }
+            }
+        }
+        Some(peers)
     }
 
     fn process_group(&self, pid: u32) -> Option<u32> {
@@ -274,15 +278,19 @@ pub(crate) fn listening_inodes(table: &str, port: u16) -> Vec<u64> {
         .collect()
 }
 
-/// The inode of `/proc/net/tcp{,6}`'s ESTABLISHED (`01`) socket whose own
-/// end is `from` and whose other end is `to` (a v4-mapped IPv6 address reads
-/// as its IPv4 one).
-pub(crate) fn connected_inode(table: &str, from: std::net::SocketAddr, to: std::net::SocketAddr) -> Option<u64> {
-    table.lines().skip(1).find_map(|line| {
-        let f: Vec<&str> = line.split_whitespace().collect();
-        let ends = (proc_net_addr(f.get(1)?)?, proc_net_addr(f.get(2)?)?);
-        (ends == (from, to) && *f.get(3)? == "01").then(|| f.get(9)?.parse().ok())?
-    })
+/// Every ESTABLISHED (`01`) socket in a `/proc/net/tcp{,6}` table whose
+/// other end is `to`: its own end and its inode (a v4-mapped IPv6 address
+/// reads as its IPv4 one).
+pub(crate) fn connected_to(table: &str, to: std::net::SocketAddr) -> Vec<(std::net::SocketAddr, u64)> {
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let (own, other) = (proc_net_addr(f.get(1)?)?, proc_net_addr(f.get(2)?)?);
+            (other == to && *f.get(3)? == "01").then(|| Some((own, f.get(9)?.parse().ok()?)))?
+        })
+        .collect()
 }
 
 /// `/proc/net/tcp`'s `0100007F:1F90` (or `tcp6`'s 32 hex digits): the

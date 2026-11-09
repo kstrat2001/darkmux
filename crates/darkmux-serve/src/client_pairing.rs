@@ -50,9 +50,10 @@
 //! which a later pairing can reuse), and every route that names a workspace
 //! refuses another app's, a revoked client's, a mission's worktrees, or any
 //! folder no app asked darkmux for ([`owned_workspace`]). One made before
-//! workspaces had an owner goes to the paired client when exactly one is
-//! paired ([`adopt_unowned`]); otherwise only `darkmux client claim
-//! <workspace> <client>` gives it to one, and `darkmux doctor` lists it.
+//! workspaces had an owner goes to the client that was the only one paired
+//! when the store moved to client ids, while it stays paired
+//! ([`adopt_unowned`]); otherwise only `darkmux client claim <workspace>
+//! <client>` gives it to one, and `darkmux doctor` lists it.
 //! `GET /client/recipe?workspace=` returns a workspace's preview recipe, for
 //! an app that cannot read the disk itself.
 //!
@@ -211,6 +212,12 @@ pub struct ClientsFile {
     pub pending: Vec<PendingRequest>,
     #[serde(default)]
     pub clients: Vec<ApprovedClient>,
+    /// The id of the one client paired when this store was migrated to
+    /// 1.2, if exactly one was: the workspaces darkmux made before they had
+    /// owners are that client's while it stays paired ([`adopt_unowned`]).
+    /// Decided once, at the migration; never set otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_owner: Option<String>,
 }
 
 impl Default for ClientsFile {
@@ -219,6 +226,7 @@ impl Default for ClientsFile {
             schema_version: CLIENTS_SCHEMA_VERSION.to_string(),
             pending: Vec::new(),
             clients: Vec::new(),
+            legacy_owner: None,
         }
     }
 }
@@ -251,15 +259,21 @@ impl ClientStore {
         self.update(|f| Ok(f.clone()))
     }
 
-    /// The store as it is now, read without its lock and never written (an
-    /// older store is migrated in memory only; an absent one reads as
-    /// empty): for a reader that must change nothing, `darkmux doctor`.
+    /// The store as it is now, read under its shared lock (so never half
+    /// written) and never written (an older store is migrated in memory
+    /// only; an absent one reads as empty and is not created): for a reader
+    /// that must change nothing, `darkmux doctor`.
     pub fn peek(&self) -> Result<ClientsFile> {
-        match std::fs::read_to_string(&self.path) {
-            Ok(text) => Ok(parse_clients(&self.path, &text)?.0),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ClientsFile::default()),
-            Err(e) => Err(e).with_context(|| format!("reading {}", self.path.display())),
-        }
+        let Some(mut guard) = darkmux_types::flock::lock_shared_existing(&self.path)? else {
+            return Ok(ClientsFile::default());
+        };
+        let mut text = String::new();
+        guard
+            .file()
+            .take(darkmux_types::user_files::MAX_USER_FILE_BYTES + 1)
+            .read_to_string(&mut text)
+            .with_context(|| format!("reading {}", self.path.display()))?;
+        Ok(parse_clients(&self.path, &text)?.0)
     }
 
     /// Load, change, save, all under the file's exclusive lock. `f`'s error
@@ -344,17 +358,24 @@ fn migrate_1_0(doc: &mut Value) {
     doc["schema_version"] = Value::from("1.1");
 }
 
-/// A 1.1 store's clients had no id; each gets one now.
+/// A 1.1 store's clients had no id; each gets one now. When exactly one
+/// client is paired, its id is recorded as `legacy_owner`: the workspaces
+/// from before owners are its.
 fn migrate_1_1(doc: &mut Value) -> Result<()> {
     if doc.get("schema_version").and_then(Value::as_str) != Some("1.1") {
         return Ok(());
     }
+    let mut ids = Vec::new();
     if let Some(items) = doc.get_mut("clients").and_then(Value::as_array_mut) {
         for item in items.iter_mut().filter_map(Value::as_object_mut) {
             if !item.contains_key("id") {
                 item.insert("id".to_string(), Value::from(new_client_id()?));
             }
+            ids.push(item["id"].clone());
         }
+    }
+    if let [only] = ids.as_slice() {
+        doc["legacy_owner"] = only.clone();
     }
     doc["schema_version"] = Value::from(CLIENTS_SCHEMA_VERSION);
     Ok(())
@@ -520,24 +541,22 @@ pub fn revoke(store: &ClientStore, name: &str) -> Result<bool> {
     })
 }
 
-/// The one paired client's id, when exactly one is paired.
-fn sole_client(store: &ClientStore) -> Result<Option<String>> {
-    let clients = store.read()?.clients;
-    Ok(match clients.as_slice() {
-        [only] => Some(only.id.clone()),
-        _ => None,
-    })
+/// The store's `legacy_owner`, while that client is still paired.
+fn legacy_heir(store: &ClientStore) -> Result<Option<String>> {
+    let f = store.read()?;
+    Ok(f.legacy_owner.filter(|id| f.clients.iter().any(|c| &c.id == id)))
 }
 
 /// Gives every workspace darkmux made for a paired app (it holds its
-/// repository) that is recorded for no client to the one paired client,
-/// when exactly one is paired: an app that had workspaces before they had
-/// owners keeps them. With none or several paired they stay unowned, and
-/// no app may use them until the operator runs `darkmux client claim`. A
-/// workspace recorded for a client since revoked is not given away either.
-/// Returns the names given.
+/// repository) that is recorded for no client to the store's
+/// `legacy_owner`: the one client paired when the store moved to ids, while
+/// it stays paired. An app that had workspaces before they had owners keeps
+/// them. A store that moved with none or several paired, or whose legacy
+/// owner was revoked, gives nothing: no app may use those workspaces until
+/// the operator runs `darkmux client claim`. A workspace recorded for a
+/// client since revoked is not given away either. Returns the names given.
 pub fn adopt_unowned(store: &ClientStore, base: &Path) -> Result<Vec<String>> {
-    let Some(id) = sole_client(store)? else {
+    let Some(id) = legacy_heir(store)? else {
         return Ok(Vec::new());
     };
     let mut given = Vec::new();
@@ -734,7 +753,57 @@ pub type PreviewMinutes = Arc<dyn Fn() -> Result<u64, String> + Send + Sync>;
 pub type WorkActivity = Arc<dyn Fn(&str, &str) -> (Option<crate::runs::RunActivity>, Option<u64>) + Send + Sync>;
 /// (peer, the listener's address) -> the process on this machine that sent
 /// a request from `peer`; `None` when that cannot be told.
-pub type PeerProcess = Arc<dyn Fn(SocketAddr, Option<SocketAddr>) -> Option<u32> + Send + Sync>;
+/// (the listener's address, the peers asked about) -> the process on this
+/// machine at each of those peers' ends that can be told, from one look at
+/// every connection to the listener; `None` when none can be told.
+pub type PeerProcesses =
+    Arc<dyn Fn(Option<SocketAddr>, &[SocketAddr]) -> Option<HashMap<SocketAddr, u32>> + Send + Sync>;
+
+/// Who sent each waiting pairing request, found in rounds: one look at every
+/// connection to the listener ([`ClientServerState::peer_processes`]) at a
+/// time, answering every request that was waiting when it began. A request
+/// that arrives while a round runs is answered by the next, so however many
+/// connections a flood holds open, a request waits for at most two rounds.
+#[derive(Default)]
+pub struct PeerRounds {
+    /// Held through a round; the requests that need one queue here.
+    pub(crate) turn: Arc<tokio::sync::Mutex<()>>,
+    /// Rounds begun so far.
+    begun: std::sync::atomic::AtomicU64,
+    /// The latest finished round's number and answers.
+    last: Mutex<(u64, HashMap<SocketAddr, u32>)>,
+    /// The peers of the requests waiting for an answer, each once per
+    /// request.
+    waiting: Mutex<Vec<SocketAddr>>,
+}
+
+impl PeerRounds {
+    /// The answer for `peer` from a round that began after `after`, if one
+    /// has finished.
+    fn answer_since(&self, after: u64, peer: SocketAddr) -> Option<Option<u32>> {
+        let last = self.last.lock().unwrap();
+        (last.0 > after).then(|| last.1.get(&peer).copied())
+    }
+}
+
+/// A request waiting for its peer's answer; it stops waiting when dropped.
+struct Waiting<'a>(&'a PeerRounds, SocketAddr);
+
+impl<'a> Waiting<'a> {
+    fn new(rounds: &'a PeerRounds, peer: SocketAddr) -> Self {
+        rounds.waiting.lock().unwrap().push(peer);
+        Waiting(rounds, peer)
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        let mut waiting = self.0.waiting.lock().unwrap();
+        if let Some(i) = waiting.iter().position(|p| *p == self.1) {
+            waiting.remove(i);
+        }
+    }
+}
 /// Runs one role execution, blocking.
 pub type Execute = Arc<dyn Fn(WorkSpec, Arc<CancelFlag>) -> Result<Value, RunError> + Send + Sync>;
 
@@ -800,11 +869,11 @@ pub struct ClientServerState {
     /// check (`Err`: unreadable, so that check stops nothing).
     pub preview_idle_minutes: PreviewMinutes,
     /// Which process on this machine sent a pairing request.
-    pub peer_process: PeerProcess,
-    /// One [`ClientServerState::peer_process`] lookup at a time: a flood of
-    /// pairing requests queues for it instead of fanning out (each asks the
-    /// OS, `lsof` on macOS, about a third of a second).
-    pub pair_lookups: Arc<tokio::sync::Semaphore>,
+    pub peer_processes: PeerProcesses,
+    /// The rounds [`ClientServerState::peer_processes`] is asked in: one at a
+    /// time (each asks the OS, one `lsof` on macOS), each answering every
+    /// request waiting when it began.
+    pub pair_lookups: Arc<PeerRounds>,
     /// The process each waiting pairing request came from, by request id,
     /// when it could be told: no process holds more than
     /// [`PAIR_REQUESTS_PER_PROCESS`] of them. In memory only; a restart
@@ -872,11 +941,18 @@ impl ClientServerState {
             bound: None,
             preview_enabled: Arc::new(read_preview_enabled),
             preview_idle_minutes: Arc::new(read_preview_idle_minutes),
-            peer_process: Arc::new(|peer, bound| darkmux_platform::current().tcp_peer_pid(bound?, peer)),
+            peer_processes: Arc::new(peer_processes_here),
             pair_peers: Arc::new(Mutex::new(HashMap::new())),
-            pair_lookups: Arc::new(tokio::sync::Semaphore::new(1)),
+            pair_lookups: Arc::new(PeerRounds::default()),
         })
     }
+}
+
+/// The process at each of `wanted`'s ends, from one look at every connection
+/// to the listener at `bound` ([`darkmux_platform::Platform::tcp_peers_of`]).
+fn peer_processes_here(bound: Option<SocketAddr>, wanted: &[SocketAddr]) -> Option<HashMap<SocketAddr, u32>> {
+    let all = darkmux_platform::current().tcp_peers_of(bound?)?;
+    Some(all.into_iter().filter(|(peer, _)| wanted.contains(peer)).collect())
 }
 
 /// `clients.profiles` from `config.json` as it is NOW (the process-wide
@@ -1299,16 +1375,31 @@ async fn request_process(
 }
 
 /// The process on this machine a pairing request came from, when that can
-/// be told. One lookup runs at a time ([`ClientServerState::pair_lookups`]),
-/// off the async workers; a request whose sender went away while it queued
-/// is dropped before its lookup starts.
+/// be told, from a round ([`PeerRounds`]) that began after it arrived: the
+/// one that finished while it queued, else one it runs itself, off the
+/// async workers, for every request waiting. A request whose sender went
+/// away while it queued is dropped before it starts a round.
 async fn peer_process_of(state: &ClientServerState, peer: Option<axum::extract::ConnectInfo<SocketAddr>>) -> Option<u32> {
+    use std::sync::atomic::Ordering::SeqCst;
     let axum::extract::ConnectInfo(p) = peer?;
-    let permit = state.pair_lookups.clone().acquire_owned().await.ok()?;
-    let st = state.clone();
+    let rounds = state.pair_lookups.clone();
+    let _waiting = Waiting::new(&rounds, p);
+    let arrived = rounds.begun.load(SeqCst);
+    let turn = rounds.turn.clone().lock_owned().await;
+    if let Some(answer) = rounds.answer_since(arrived, p) {
+        return answer;
+    }
+    let round = rounds.begun.fetch_add(1, SeqCst) + 1;
+    let wanted = rounds.waiting.lock().unwrap().clone();
+    let (st, r) = (state.clone(), rounds.clone());
+    // The turn and the answers go with the round, so it runs to its end and
+    // is the only one running even if this request's sender goes away.
     tokio::task::spawn_blocking(move || {
-        let _one_at_a_time = permit;
-        (st.peer_process)(p, st.bound)
+        let _one_round_at_a_time = turn;
+        let found = (st.peer_processes)(st.bound, &wanted).unwrap_or_default();
+        let pid = found.get(&p).copied();
+        *r.last.lock().unwrap() = (round, found);
+        pid
     })
     .await
     .unwrap_or(None)

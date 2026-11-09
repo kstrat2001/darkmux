@@ -94,7 +94,7 @@ impl Platform for OtherPlatform {
         None
     }
 
-    fn tcp_peer_pid(&self, _local: std::net::SocketAddr, _peer: std::net::SocketAddr) -> Option<u32> {
+    fn tcp_peers_of(&self, _local: std::net::SocketAddr) -> Option<Vec<(std::net::SocketAddr, u32)>> {
         None
     }
 
