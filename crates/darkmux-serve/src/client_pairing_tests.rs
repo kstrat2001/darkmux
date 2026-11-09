@@ -34,6 +34,8 @@ struct Harness {
     policy: Arc<Mutex<Policy>>,
     /// What `clients.preview.enabled` reads as right now (default here: on).
     preview_on: Arc<Mutex<bool>>,
+    /// What `clients.preview.idle_minutes` reads as right now (default 15).
+    preview_idle: Arc<Mutex<Result<u64, String>>>,
     /// URLs the injected clone was asked for, and dirs it fetched.
     cloned: Arc<Mutex<Vec<String>>>,
     fetched: Arc<Mutex<Vec<PathBuf>>>,
@@ -62,6 +64,9 @@ fn harness() -> Harness {
     let policy: Arc<Mutex<Policy>> = Arc::new(Mutex::new(Ok(None)));
     let preview_on = Arc::new(Mutex::new(true));
     let pe = preview_on.clone();
+    let preview_idle = Arc::new(Mutex::new(Ok(15)));
+    let pi = preview_idle.clone();
+    let pc = clock.clone();
     let (c, r, pol) = (clock.clone(), ran.clone(), policy.clone());
     let fixture = dir.path().join("fixture");
     fixture_repo(&fixture);
@@ -249,17 +254,20 @@ fn harness() -> Harness {
             Ok(())
         }),
         workspace_lock: Arc::new(Mutex::new(())),
-        previews: Arc::new(crate::client_preview::Previews::new(
-            dir.path().join("previews"),
-            std::process::id(),
-        )),
+        // On the harness's clock, so a test moves idle time by hand.
+        previews: Arc::new(
+            crate::client_preview::Previews::new(dir.path().join("previews"), std::process::id())
+                .with_clock(Arc::new(move || pc.load(Ordering::SeqCst))),
+        ),
         bound: Some(BOUND.parse().unwrap()),
         // On here, so the preview tests can run one; production's default is
         // off (`clients.preview.enabled`).
         preview_enabled: Arc::new(move || Ok(*pe.lock().unwrap())),
+        preview_idle_minutes: Arc::new(move || pi.lock().unwrap().clone()),
     };
     Harness {
         preview_on,
+        preview_idle,
         cloned,
         fetched,
         fixture,
@@ -3673,6 +3681,167 @@ fn clients_preview_enabled_is_read_fresh_and_defaults_off() {
     assert!(e.contains("clients.preview.enable"), "{e}");
     std::fs::remove_file(&path).unwrap();
     assert_eq!(read_preview_enabled_at(&path), Ok(false), "no file is off");
+}
+
+/// (#3459) Once a minute `client serve` stops a preview no app has asked
+/// about (a start or a status) for `clients.preview.idle_minutes`, read at
+/// each check: a status restarts the count, a setting changed between checks
+/// applies at the next one, and `0` never stops one.
+#[tokio::test]
+async fn a_preview_no_app_asks_about_is_stopped_by_the_idle_check() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (mine, name, _ws) = served_workspace(&h, &token).await;
+    recipe(
+        &mine,
+        serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}),
+    );
+    let (code, v) = start_preview(&h, &token, &name).await;
+    assert_eq!(code, 202, "{v}");
+    let ready = preview_until(&h, &token, &name, &["ready", "failed"]).await;
+    assert_eq!(ready["status"], "ready", "{ready}");
+    let port = ready["port"].as_u64().unwrap();
+    let minutes = |m: u64| h.clock.fetch_add(m * 60, Ordering::SeqCst);
+    let mut skipped = None;
+    minutes(14);
+    assert!(
+        preview_idle_tick(&h.state, &mut skipped).is_empty(),
+        "14 minutes is not idle"
+    );
+    let (code, _) = call(
+        &h,
+        get(
+            &format!("/client/workspaces/{name}/preview"),
+            &[("authorization", &bearer(&token))],
+        ),
+    )
+    .await;
+    assert_eq!(code, 200, "an app asks");
+    minutes(14);
+    assert!(
+        preview_idle_tick(&h.state, &mut skipped).is_empty(),
+        "the status restarted the count"
+    );
+    minutes(60);
+    *h.preview_idle.lock().unwrap() = Ok(0);
+    assert!(
+        preview_idle_tick(&h.state, &mut skipped).is_empty(),
+        "0 is never"
+    );
+    *h.preview_idle.lock().unwrap() = Ok(15);
+    let lines = preview_idle_tick(&h.state, &mut skipped);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].contains(&name) && lines[0].contains("clients.preview.idle_minutes"),
+        "{lines:?}"
+    );
+    for _ in 0..100 {
+        if !answers(port) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(!answers(port), "the dev server is gone");
+    let (code, v) = call(
+        &h,
+        get(
+            &format!("/client/workspaces/{name}/preview"),
+            &[("authorization", &bearer(&token))],
+        ),
+    )
+    .await;
+    assert_eq!((code, v["status"].as_str()), (200, Some("stopped")), "{v}");
+}
+
+/// (#3459) The idle check's thread ticks on its own, and ends when told.
+#[tokio::test]
+async fn the_idle_check_thread_stops_idle_previews_on_its_own() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (mine, name, _ws) = served_workspace(&h, &token).await;
+    recipe(
+        &mine,
+        serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}),
+    );
+    start_preview(&h, &token, &name).await;
+    let ready = preview_until(&h, &token, &name, &["ready", "failed"]).await;
+    assert_eq!(ready["status"], "ready", "{ready}");
+    h.clock.fetch_add(16 * 60, Ordering::SeqCst);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread = spawn_preview_idle_check(
+        h.state.clone(),
+        std::time::Duration::from_millis(20),
+        stop.clone(),
+    );
+    // Watched from outside (a status would be an app asking).
+    let port = ready["port"].as_u64().unwrap();
+    for _ in 0..200 {
+        if !answers(port) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(!answers(port), "stopped by the thread");
+    assert_eq!(h.state.previews.status(&name).unwrap().status, "stopped");
+    stop.store(true, Ordering::SeqCst);
+    thread.join().unwrap();
+}
+
+/// (#3459) While `clients.preview.idle_minutes` cannot be read, the idle
+/// check stops nothing on a guessed value, and says why once, not every
+/// minute.
+#[tokio::test]
+async fn an_unreadable_idle_setting_stops_nothing_and_says_so_once() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (mine, name, _ws) = served_workspace(&h, &token).await;
+    recipe(
+        &mine,
+        serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}),
+    );
+    start_preview(&h, &token, &name).await;
+    let ready = preview_until(&h, &token, &name, &["ready", "failed"]).await;
+    assert_eq!(ready["status"], "ready", "{ready}");
+    h.clock.fetch_add(24 * 3600, Ordering::SeqCst);
+    *h.preview_idle.lock().unwrap() = Err("config.json does not parse".to_string());
+    let mut skipped = None;
+    let first = preview_idle_tick(&h.state, &mut skipped);
+    assert_eq!(first.len(), 1, "{first:?}");
+    assert!(first[0].contains("config.json does not parse"), "{first:?}");
+    assert!(
+        preview_idle_tick(&h.state, &mut skipped).is_empty(),
+        "said once"
+    );
+    assert!(answers(ready["port"].as_u64().unwrap()), "still running");
+    h.state.previews.stop(&name);
+}
+
+/// (#3459) The idle setting is read fresh, through the config gate: absent
+/// is 15, `0` is kept, and a misspelled key refuses rather than reading as
+/// the default.
+#[test]
+#[serial_test::serial]
+fn clients_preview_idle_minutes_is_read_fresh_and_defaults_to_15() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.json");
+    let read = |text: &str| {
+        std::fs::write(&path, text).unwrap();
+        unsafe { std::env::remove_var("DARKMUX_CLIENTS_PREVIEW_IDLE_MINUTES") };
+        read_preview_idle_minutes_at(&path)
+    };
+    assert_eq!(read("{}"), Ok(15), "absent is 15");
+    assert_eq!(
+        read(r#"{"clients": {"preview": {"idle_minutes": 30}}}"#),
+        Ok(30)
+    );
+    assert_eq!(
+        read(r#"{"clients": {"preview": {"idle_minutes": 0}}}"#),
+        Ok(0)
+    );
+    let e = read(r#"{"clients": {"preview": {"idle_minute": 5}}}"#).unwrap_err();
+    assert!(e.contains("clients.preview.idle_minute"), "{e}");
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(read_preview_idle_minutes_at(&path), Ok(15), "no file is 15");
 }
 
 #[tokio::test]

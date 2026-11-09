@@ -436,8 +436,11 @@ use std::path::Path;
 //           as dispatch judges it; a hosted one only when listed), and
 //           `clients.preview.enabled` (bool, default false), whether a paired
 //           app may start a workspace's live preview (it runs the workspace's
-//           own code on this machine, outside the sandbox). An older binary
-//           refuses a config carrying either.
+//           own code on this machine, outside the sandbox), and
+//           `clients.preview.idle_minutes` (non-negative integer, default 15,
+//           `0` = never; `DARKMUX_CLIENTS_PREVIEW_IDLE_MINUTES`, #3459), how
+//           long a preview no app asks about runs before it is stopped. An
+//           older binary refuses a config carrying any of them.
 pub const CONFIG_SCHEMA_VERSION: &str = "2.8";
 
 /// A `config.json` key an older darkmux read (and `init` may have written)
@@ -1856,6 +1859,11 @@ pub struct ClientsConfig {
 pub struct ClientsPreviewConfig {
     /// `true` allows previews; absent or `false` refuses every preview start.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub enabled: Option<bool>,
+    /// (#3459) Minutes a running preview may go without an app asking about
+    /// it (a start or a status) before `client serve` stops it. Absent: 15.
+    /// `0`: never. Read fresh by each once-a-minute check.
+    /// `darkmux config set clients.preview.idle_minutes <n>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub idle_minutes: Option<u64>,
     #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 

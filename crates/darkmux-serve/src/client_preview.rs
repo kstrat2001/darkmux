@@ -264,7 +264,14 @@ struct Entry {
     status: Status,
     pgid: Option<i32>,
     log: PathBuf,
+    /// When an app last asked about it (a start or a status), in the
+    /// [`Previews`] clock's seconds.
+    last_asked: u64,
 }
+
+/// Seconds on a wall clock: Unix seconds in production. A wall clock, not
+/// `Instant`, so time a Mac spends asleep counts as idle.
+pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 /// All previews this darkmux runs, by workspace name.
 pub struct Previews {
@@ -272,6 +279,7 @@ pub struct Previews {
     /// The process whose exit stops every preview (darkmux itself).
     watch_pid: u32,
     entries: Mutex<HashMap<String, Arc<Mutex<Entry>>>>,
+    clock: Clock,
 }
 
 /// A relative path inside the work copy: no absolute paths, no `..`.
@@ -352,7 +360,14 @@ impl Previews {
             dir,
             watch_pid,
             entries: Mutex::new(HashMap::new()),
+            clock: Arc::new(unix_seconds),
         }
+    }
+
+    /// The same previews on another clock (a test's frozen one).
+    pub fn with_clock(mut self, clock: Clock) -> Self {
+        self.clock = clock;
+        self
     }
 
     pub fn production() -> Self {
@@ -391,8 +406,9 @@ impl Previews {
     ) -> Result<(PreviewState, bool), RecipeRefusal> {
         let mut entries = self.entries.lock().unwrap();
         if let Some(e) = entries.get(name) {
-            let e = e.lock().unwrap();
+            let mut e = e.lock().unwrap();
             if e.status.live() {
+                e.last_asked = (self.clock)();
                 return Ok((Self::snapshot(name, &e), true));
             }
         }
@@ -412,6 +428,7 @@ impl Previews {
             status: Status::Starting,
             pgid: None,
             log: log.clone(),
+            last_asked: (self.clock)(),
         }));
         let snap = Self::snapshot(name, &entry.lock().unwrap());
         entries.insert(name.to_string(), entry.clone());
@@ -429,9 +446,12 @@ impl Previews {
         Ok((snap, false))
     }
 
+    /// The preview's state. An app asking counts: it restarts the idle
+    /// count ([`Previews::stop_idle`]).
     pub fn status(&self, name: &str) -> Option<PreviewState> {
         let entries = self.entries.lock().unwrap();
-        let e = entries.get(name)?.lock().unwrap();
+        let mut e = entries.get(name)?.lock().unwrap();
+        e.last_asked = (self.clock)();
         Some(Self::snapshot(name, &e))
     }
 
@@ -445,19 +465,62 @@ impl Previews {
             e.pgid.take()
         };
         if let Some(pgid) = pgid {
-            #[cfg(unix)]
-            kill_group(pgid, libc::SIGTERM);
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while group_alive(pgid) && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            #[cfg(unix)]
-            if group_alive(pgid) {
-                kill_group(pgid, libc::SIGKILL);
-            }
+            end_group(pgid);
         }
         true
     }
+
+    /// (#3459) Stops every live preview nobody has asked about (a start or
+    /// a status) for `idle_minutes`, the way [`Previews::stop`] does; `0`
+    /// never stops one. An app that quit or crashed never stops its own
+    /// preview, so without this a dev server ran until darkmux did. Each
+    /// is judged and marked stopped under its own lock, so a status that
+    /// lands meanwhile either counts or finds it stopped. Returns the
+    /// workspaces stopped.
+    pub fn stop_idle(&self, idle_minutes: u64) -> Vec<String> {
+        if idle_minutes == 0 {
+            return Vec::new();
+        }
+        let now = (self.clock)();
+        let idle_after = idle_minutes.saturating_mul(60);
+        let mut ended = Vec::new();
+        for (name, entry) in self.entries.lock().unwrap().iter() {
+            let mut e = entry.lock().unwrap();
+            if e.status.live() && now.saturating_sub(e.last_asked) >= idle_after {
+                e.status = Status::Stopped;
+                ended.push((name.clone(), e.pgid.take()));
+            }
+        }
+        for (_, pgid) in &ended {
+            if let Some(pgid) = pgid {
+                end_group(*pgid);
+            }
+        }
+        let mut names: Vec<String> = ended.into_iter().map(|(n, _)| n).collect();
+        names.sort();
+        names
+    }
+}
+
+/// TERM to a process group, KILL after five seconds.
+fn end_group(pgid: i32) {
+    #[cfg(unix)]
+    kill_group(pgid, libc::SIGTERM);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while group_alive(pgid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    #[cfg(unix)]
+    if group_alive(pgid) {
+        kill_group(pgid, libc::SIGKILL);
+    }
+}
+
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn set(entry: &Arc<Mutex<Entry>>, status: Status) -> bool {
@@ -873,6 +936,85 @@ mod tests {
             "{v}"
         );
         assert!(!wt.join("server-ran").exists(), "the server never ran");
+    }
+
+    /// A frozen clock a test moves by hand, in seconds.
+    fn frozen_clock() -> (Arc<std::sync::atomic::AtomicU64>, Clock) {
+        let t = Arc::new(std::sync::atomic::AtomicU64::new(1_000_000));
+        let read = t.clone();
+        let clock: Clock = Arc::new(move || read.load(std::sync::atomic::Ordering::SeqCst));
+        (t, clock)
+    }
+
+    fn advance_minutes(t: &std::sync::atomic::AtomicU64, minutes: u64) {
+        t.fetch_add(minutes * 60, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// A preview whose server never answers (so it stays `starting`, live)
+    /// on a frozen clock; returns the previews and the server's process
+    /// group once it has one.
+    fn a_live_preview(dir: &Path, clock: Clock) -> (Previews, i32) {
+        let wt = dir.join("w");
+        std::fs::create_dir_all(wt.join(".darkmux")).unwrap();
+        let recipe = serde_json::json!({"schema_version": "1.0", "command": "sleep 30"});
+        std::fs::write(wt.join(".darkmux/preview.json"), recipe.to_string()).unwrap();
+        let previews = Previews::new(dir.join("p"), std::process::id()).with_clock(clock);
+        previews.start("w", &wt, &wt).unwrap();
+        for _ in 0..200 {
+            let pgid = previews.entries.lock().unwrap()["w"].lock().unwrap().pgid;
+            if let Some(pgid) = pgid {
+                return (previews, pgid);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the preview's server never started");
+    }
+
+    /// (#3459) A preview nobody has asked about for `idle_minutes` is
+    /// stopped, and its process group with it; asking (a status) restarts
+    /// the count.
+    #[cfg(unix)]
+    #[test]
+    fn an_idle_preview_is_stopped_once_nobody_asked_for_idle_minutes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (t, clock) = frozen_clock();
+        let (previews, pgid) = a_live_preview(dir.path(), clock);
+        advance_minutes(&t, 14);
+        assert!(previews.stop_idle(15).is_empty(), "14 minutes: not idle");
+        let asked = previews.status("w").unwrap();
+        assert_eq!(asked.status, "starting", "a status is an ask");
+        advance_minutes(&t, 1);
+        assert!(
+            previews.stop_idle(15).is_empty(),
+            "15 minutes since the start, but the status restarted the count"
+        );
+        advance_minutes(&t, 13);
+        assert!(previews.stop_idle(15).is_empty(), "14 since the status");
+        advance_minutes(&t, 1);
+        assert_eq!(previews.stop_idle(15), vec!["w".to_string()], "15 since");
+        let entry = previews.entries.lock().unwrap()["w"].clone();
+        assert_eq!(entry.lock().unwrap().status, Status::Stopped);
+        assert!(!group_alive(pgid), "its process group is gone");
+        assert!(previews.stop_idle(15).is_empty(), "stopped once only");
+    }
+
+    /// (#3459) `0` means never, however long nobody asks; asking again
+    /// for a running preview (a second start) counts as asking.
+    #[cfg(unix)]
+    #[test]
+    fn zero_idle_minutes_never_stops_and_a_repeated_start_is_an_ask() {
+        let dir = tempfile::tempdir().unwrap();
+        let (t, clock) = frozen_clock();
+        let (previews, _pgid) = a_live_preview(dir.path(), clock);
+        advance_minutes(&t, 60 * 24 * 365);
+        assert!(previews.stop_idle(0).is_empty(), "0 is never");
+        let wt = dir.path().join("w");
+        let (_, running) = previews.start("w", &wt, &wt).unwrap();
+        assert!(running, "the same preview, still running");
+        advance_minutes(&t, 10);
+        assert!(previews.stop_idle(15).is_empty(), "the 2nd start asked");
+        advance_minutes(&t, 5);
+        assert_eq!(previews.stop_idle(15), vec!["w".to_string()]);
     }
 
     fn parsed(v: serde_json::Value) -> Result<Recipe, RecipeRefusal> {
