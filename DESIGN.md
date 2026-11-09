@@ -755,6 +755,35 @@ darkmux dispatch <role> --profile <profile>[@<machine>] --check --json
 
 Over HTTP it is the work route's existing `mode: check` (see [Check mode](#fleet-addresses-trust-and-the-execution-channel)). Either way the answer gains a `fit` field: `resident` (loaded at the profile's context), `fits` (loads into free memory), `after_eviction` (fits once darkmux evicts its own idle residents, which it names), `busy`, or `wont_fit`, each with the model's memory cost and the budget it was measured against. `darkmux machine resources --json` and `GET /machine/resources` stay the full picture of what is loaded and free. A model held by a running dispatch is never evicted under it (the residency leases), whichever policy is set.
 
+### What an app reads: which models it can use, and what a run is doing
+
+An app picking a model, waiting on one, and reporting a failure needs three answers from darkmux, and each has one surface.
+
+**Whether darkmux can make a model resident at all.** `darkmux profile list --json` gains an `availability` list beside the registry, one entry per profile model:
+
+```json
+{"profile": "q38-27b-tensorfold", "model": "TensorFold/Qwen3.8-27B-MLX-4bit", "endpoint": "tensorfold",
+ "engine": "tensorfold", "state": "startable", "reason": null}
+```
+
+- `resident`: loaded or served now, at the profile's context.
+- `startable`: not resident, and darkmux can load it or start its server (the engine is installed at a verified version, it has the model, the port is free). A stopped Tensorfold server reads `startable`, so an app keeps it among its choices instead of passing it over.
+- `unavailable`: darkmux cannot make it resident, and `reason` says why in one line (no engine binary, an unverified version, a model the engine does not have, the port held by a server darkmux did not start).
+- `external`: an endpoint darkmux only sends requests to. darkmux does not vouch that it answers; an app that wants to know asks it, as it does today.
+- `unknown`: a probe failed or ran out of time (LM Studio not running, say); `reason` names which. Never read as `unavailable`.
+
+Each engine is asked once per listing, within a time bound, and the listing loads and starts nothing. Availability is whether a model can be made resident; whether it fits in memory right now is `dispatch --check`'s `fit` (above), since that changes with every dispatch. For a profile on another machine, that machine's card (`darkmux machine list --json`) carries the same field.
+
+**That a dispatch is starting its model.** A dispatch that has to make its model resident says so between `dispatch.start` and its first turn, with three flow records, the same for every managed engine (an LM Studio load of a large model takes long enough to need them too):
+
+- `dispatch.model.start`: the model, the engine, the endpoint, and the darkmux residents it evicts to make room.
+- `dispatch.model.loading`: every 10 seconds while the model loads or the server starts, with the time elapsed and the engine's own progress when it reports one. A start of minutes (a 62 GB Tensorfold model) is visibly alive, never a stall.
+- `dispatch.model.ready`: the model answers; how long it took.
+
+A dispatch that finds its model resident writes none of them. `darkmux run list --json` (and `GET /runs`) shows a running dispatch between `dispatch.model.start` and `dispatch.model.ready` with `activity: "starting_model"`, derived by the one function that owns a run's status, so a run card says "starting the model" without reading the record stream itself.
+
+**Why a dispatch failed, readable by code.** The `dispatch --json` envelope's refusal and `dispatch.error` carry one `code` an app can branch on, beside the message for a person: `busy` (retry later), `wont_fit` (retrying cannot help), `model_start_failed` (the server would not start or exited; the record names its log file), `port_in_use` (a server darkmux did not start holds the port) and `engine_unavailable` (no binary, or an unverified version). **darkmux never switches to another model on its own:** a failed start fails the dispatch, and offering the next model is the app's decision, made on these codes and the `availability` list.
+
 ### What the operator sees
 
 - `darkmux machine resources`: a row for each server darkmux started, with its model and measured memory. Other servers stay in "other tenants".
