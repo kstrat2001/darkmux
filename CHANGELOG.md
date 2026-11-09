@@ -14,6 +14,19 @@ darkmux release.
 
 ## [Unreleased]
 
+### Added
+
+- `darkmux client serve` (local prototype, #3447): a loopback-only endpoint an app on this machine
+  pairs with (`darkmux client approve`), then runs work through. It answers only this machine's
+  apps: a loopback connection naming the listener, through no proxy, with no `Origin` header (a web
+  page cannot drive it), and JSON request bodies. With `clients.profiles` unset an app may run on
+  any profile whose work stays on this machine, judged as dispatch judges it (LM Studio, or the
+  `default_engine` on loopback); the role's own profile is checked the same way.
+- Previews trust only your own checkout: a workspace's dev-server recipe, `.darkmux/preview.json`
+  (`schema_version` `1.0`, unknown keys refused), is read only from the checkout the workspace was
+  made from, never from the workspace a run edits. A workspace cloned from a URL gets no preview;
+  add `.darkmux/preview.json` to your own checkout of the repo and make the workspace from it.
+
 ## [5.9.3] - 2026-10-29
 
 A faster daemon for the viewer and the fleet. An idle viewer, or a fleet peer reading this

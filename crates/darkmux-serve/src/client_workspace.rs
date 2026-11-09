@@ -331,6 +331,73 @@ pub fn add_worktree(source: &Path, branch: &str, dest: &Path, commit: &str) -> R
     git_bounded(&args, Duration::from_secs(120))
 }
 
+/// Where darkmux records the user's own checkout a workspace was made from:
+/// beside the workspace under the base, never inside it, so nothing a run
+/// does in the workspace can change it.
+fn source_record(base: &Path, name: &str) -> PathBuf {
+    base.join(format!(".{name}.source"))
+}
+
+/// Record that workspace `name` is a worktree of the user's own `checkout`
+/// (already [`check_source`]d). Replaces any earlier record, never through a
+/// link.
+pub fn record_source(base: &Path, name: &str, checkout: &Path) -> Result<(), String> {
+    use std::io::Write;
+    let path = source_record(base, name);
+    let _ = std::fs::remove_file(&path);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .and_then(|mut f| writeln!(f, "{}", checkout.display()))
+        .map_err(|e| format!("recording {}'s checkout: {e}", path.display()))
+}
+
+/// Forget workspace `name`'s checkout (a new workspace under a name an old
+/// one had).
+pub fn forget_source(base: &Path, name: &str) {
+    let _ = std::fs::remove_file(source_record(base, name));
+}
+
+/// The checkout recorded for workspace `name`, if any (a record that is a
+/// link is no record).
+fn recorded_source(base: &Path, name: &str) -> Option<PathBuf> {
+    let path = source_record(base, name);
+    let meta = std::fs::symlink_metadata(&path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    Some(PathBuf::from(text.trim_end_matches('\n')))
+}
+
+/// The user's own checkout workspace `name` (at `dir`) was made from: as
+/// darkmux recorded it when it made the workspace, still a checkout of the
+/// user's ([`check_source`]), and still the repository the workspace is a
+/// worktree of. `Err` says why not, and what to do. This is the only place
+/// a preview recipe is read from: never the workspace, which a run writes.
+pub fn own_checkout_of(base: &Path, name: &str, dir: &Path) -> Result<PathBuf, String> {
+    let repo = origin_of(dir).unwrap_or_else(|| "this repo".to_string());
+    let Some(source) = recorded_source(base, name) else {
+        return Err(format!(
+            "workspace {name} was not made from a checkout of yours (it was cloned), so it has no \
+             preview: a preview runs only from .darkmux/preview.json in your own checkout. Make the \
+             workspace from your checkout (`source_path`), and add .darkmux/preview.json to your own \
+             checkout of {repo}"
+        ));
+    };
+    let source = check_source(&source, base).map_err(|e| {
+        format!("workspace {name}'s checkout {}: {e}; refusing its preview", source.display())
+    })?;
+    if common_dir(dir).is_none() || common_dir(dir) != common_dir(&source) {
+        return Err(format!(
+            "workspace {name} is no longer a worktree of your checkout {}; refusing its preview",
+            source.display()
+        ));
+    }
+    Ok(source)
+}
+
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Standard base64 with padding (file contents for an app-opened PR).

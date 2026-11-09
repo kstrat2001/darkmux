@@ -37,8 +37,17 @@
 //! (unset: any local profile, one that runs on this machine; a hosted one
 //! must be granted by name). A `workdir` must lie under
 //! the worktrees base (`validate_remote_workdir`).
-//! `GET /client/recipe?workdir=` reads `<workdir>/.darkmux/preview.json`
-//! under the same containment, for an app that cannot read the disk itself.
+//! `GET /client/recipe?workspace=` returns a workspace's preview recipe, for
+//! an app that cannot read the disk itself.
+//!
+//! **Previews trust only the user's own checkout.** A preview's recipe
+//! (`.darkmux/preview.json`) is a command darkmux runs, so it is read only
+//! from the checkout the workspace's worktree was made from (`source_path`),
+//! as darkmux recorded it when it made the workspace, and never from the
+//! workspace, where a Coder run writes. A workspace cloned from a URL gets no
+//! preview, and neither does one whose checkout has no recipe; the refusal
+//! names why and says to add `.darkmux/preview.json` to your own checkout of
+//! the repo ([`crate::client_preview`]).
 //!
 //! **State.** `~/.darkmux/clients.json` (0600), every read-modify-write under
 //! an exclusive `flock` on the file itself, so `client approve` in one process
@@ -1412,8 +1421,7 @@ fn admit(
     })
 }
 
-/// The largest `preview.json` `/client/recipe` reads.
-pub const MAX_RECIPE_BYTES: u64 = 16 * 1024;
+pub use crate::client_preview::MAX_RECIPE_BYTES;
 
 #[derive(Deserialize)]
 struct RecipeQuery {
@@ -1423,6 +1431,10 @@ struct RecipeQuery {
     workspace: Option<String>,
 }
 
+/// `GET /client/recipe?workspace=<name>` (or `workdir=<the workspace's
+/// directory>`): the workspace's preview recipe, read and checked exactly as
+/// a preview start reads it: from the user's own checkout the workspace was
+/// made from, never from the workspace.
 async fn recipe_handler(
     State(state): State<ClientServerState>,
     headers: HeaderMap,
@@ -1442,13 +1454,13 @@ async fn recipe_handler(
     };
     let st = state.clone();
     tokio::task::spawn_blocking(move || {
-        let wd = match (&q.workdir, &q.workspace) {
-            (Some(w), _) => checked_workdir(&st, w),
-            (_, Some(n)) => workspace_dir(&st, n),
+        let name = match (&q.workdir, &q.workspace) {
+            (Some(w), _) => workspace_of_workdir(&st, w),
+            (_, Some(n)) => Ok(n.clone()),
             _ => unreachable!("checked above"),
         };
-        match wd {
-            Ok(wd) => read_recipe(&wd),
+        match name.and_then(|n| workspace_and_checkout(&st, &n)) {
+            Ok((dir, checkout)) => read_recipe(&dir, &checkout),
             Err(r) => r,
         }
     })
@@ -1456,63 +1468,25 @@ async fn recipe_handler(
     .unwrap_or_else(|e| internal(anyhow!("recipe read panicked: {e}")))
 }
 
-/// `<workdir>/.darkmux/preview.json` under the same containment as work. A
-/// symlinked `.darkmux` or `preview.json` is refused, and the file itself is
-/// opened without following a link.
-fn read_recipe(wd: &Path) -> Response {
-    let dir = wd.join(".darkmux");
-    let file = dir.join("preview.json");
-    for p in [&dir, &file] {
-        match std::fs::symlink_metadata(p) {
-            Ok(m) if m.file_type().is_symlink() => {
-                return err(
-                    StatusCode::FORBIDDEN,
-                    format!("{} is a symlink; refusing", p.display()),
-                )
-            }
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return err(StatusCode::NOT_FOUND, "no recipe")
-            }
-            Err(e) => return internal(anyhow!("reading {}: {e}", p.display())),
-        }
+/// The workspace a client-named workdir is: a directory directly under the
+/// worktrees base (after the containment check); 404 for any other.
+fn workspace_of_workdir(state: &ClientServerState, w: &str) -> Result<String, Response> {
+    let dir = checked_workdir(state, w)?;
+    let base = (state.worktrees_base)().map_err(|e| internal(anyhow!(e)))?;
+    match (dir.parent(), dir.file_name().and_then(|n| n.to_str())) {
+        (Some(parent), Some(name)) if parent == base => Ok(name.to_string()),
+        _ => Err(err(
+            StatusCode::NOT_FOUND,
+            format!("{} is not a workspace, so it has no recipe", dir.display()),
+        )),
     }
-    let mut opts = std::fs::OpenOptions::new();
-    opts.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut text = String::new();
-    let read = opts.open(&file).and_then(|f| {
-        if !f.metadata()?.is_file() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "not a file",
-            ));
-        }
-        f.take(MAX_RECIPE_BYTES + 1).read_to_string(&mut text)
-    });
-    match read {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return err(StatusCode::NOT_FOUND, "no recipe")
-        }
-        Err(e) => return internal(anyhow!("reading {}: {e}", file.display())),
-    }
-    if text.len() as u64 > MAX_RECIPE_BYTES {
-        return err(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            format!("preview.json is larger than {MAX_RECIPE_BYTES} bytes"),
-        );
-    }
-    match serde_json::from_str::<Value>(&text) {
-        Ok(v @ Value::Object(_)) => Json(serde_json::json!({"recipe": v})).into_response(),
-        _ => err(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "preview.json is not a JSON object",
-        ),
+}
+
+/// The recipe in the user's `checkout`, checked, as `{"recipe": {..}}`.
+fn read_recipe(dir: &Path, checkout: &Path) -> Response {
+    match crate::client_preview::load_recipe(checkout) {
+        Ok(recipe) => Json(serde_json::json!({ "recipe": recipe })).into_response(),
+        Err(e) => recipe_refusal(&no_recipe_in(checkout, dir, e)),
     }
 }
 
@@ -1673,6 +1647,9 @@ fn clone_workspace(
         let _ = std::fs::remove_dir_all(&partial);
         return internal(anyhow!("placing workspace {name}: {e}"));
     }
+    // A clone is no checkout of the user's: no record, whatever an earlier
+    // workspace of this name had.
+    ws::forget_source(&base, &name);
     match workspace_dir(state, &name) {
         Ok(dir) => (StatusCode::CREATED, Json(workspace_json(&name, &dir, true))).into_response(),
         Err(r) => r,
@@ -1702,6 +1679,9 @@ fn worktree_workspace(
     };
     let _one_at_a_time = state.workspace_lock.lock().unwrap();
     if let Some(name) = ws::find_worktree_of(&base, &common, bot) {
+        if let Err(e) = ws::record_source(&base, &name, &source) {
+            return internal(anyhow!(e));
+        }
         return match workspace_dir(state, &name) {
             Ok(dir) => Json(workspace_json(&name, &dir, false)).into_response(),
             Err(r) => r,
@@ -1743,6 +1723,9 @@ fn worktree_workspace(
             format!("adding a worktree of {}: {e}", source.display()),
         );
     }
+    if let Err(e) = ws::record_source(&base, &name, &source) {
+        return internal(anyhow!(e));
+    }
     match workspace_dir(state, &name) {
         Ok(dir) => {
             let mut v = workspace_json(&name, &dir, true);
@@ -1756,9 +1739,50 @@ fn worktree_workspace(
     }
 }
 
+/// The status a recipe refusal answers with.
+fn recipe_refusal(r: &crate::client_preview::RecipeRefusal) -> Response {
+    use crate::client_preview::RecipeRefusal as R;
+    let code = match r {
+        R::NotFound(_) => StatusCode::NOT_FOUND,
+        R::Symlink(_) => StatusCode::FORBIDDEN,
+        R::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+        R::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        R::Unreadable(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    err(code, r.message())
+}
+
+/// Workspace `name`'s directory and the user's own checkout it was made
+/// from (where its recipe is read); a 404 naming why there is none.
+fn workspace_and_checkout(state: &ClientServerState, name: &str) -> Result<(PathBuf, PathBuf), Response> {
+    let dir = workspace_dir(state, name)?;
+    let base = (state.worktrees_base)().map_err(|e| internal(anyhow!(e)))?;
+    let checkout = crate::client_workspace::own_checkout_of(&base, name, &dir)
+        .map_err(|e| err(StatusCode::NOT_FOUND, e))?;
+    Ok((dir, checkout))
+}
+
+/// A recipe the user's checkout lacks, said with what to do about it.
+fn no_recipe_in(checkout: &Path, dir: &Path, r: crate::client_preview::RecipeRefusal) -> crate::client_preview::RecipeRefusal {
+    use crate::client_preview::RecipeRefusal as R;
+    match r {
+        R::NotFound(_) => {
+            let repo = crate::client_workspace::origin_of(dir).unwrap_or_else(|| "this repo".to_string());
+            R::NotFound(format!(
+                "no .darkmux/preview.json in your checkout {}: add .darkmux/preview.json to your own \
+                 checkout of {repo} (a copy in the workspace is never read)",
+                checkout.display()
+            ))
+        }
+        other => other,
+    }
+}
+
 /// `POST /client/workspaces/{name}/preview`: runs the workspace's dev
-/// server from its `.darkmux/preview.json` on free ports. 202 while it
-/// starts, 200 when it was already running; poll GET for `ready` and `url`.
+/// server, from the `.darkmux/preview.json` in the user's own checkout the
+/// workspace was made from, on free ports. 202 while it starts, 200 when it
+/// was already running; poll GET for `ready` and `url`. 404 when there is no
+/// recipe to run (a cloned workspace, or none in the checkout).
 async fn preview_start_handler(
     State(state): State<ClientServerState>,
     UrlPath(name): UrlPath<String>,
@@ -1769,15 +1793,15 @@ async fn preview_start_handler(
     }
     let st = state.clone();
     tokio::task::spawn_blocking(move || {
-        let dir = match workspace_dir(&st, &name) {
+        let (dir, checkout) = match workspace_and_checkout(&st, &name) {
             Ok(d) => d,
             Err(r) => {
-                eprintln!("{}", preview_log_line(&name, "start", "no such workspace"));
+                eprintln!("{}", preview_log_line(&name, "start", &format!("refused ({})", r.status().as_u16())));
                 return r;
             }
         };
         let status_of = |v: &serde_json::Value| v["status"].as_str().unwrap_or("?").to_string();
-        match st.previews.start(&name, &dir) {
+        match st.previews.start(&name, &dir, &checkout) {
             Ok((v, true)) => {
                 eprintln!(
                     "{}",
@@ -1792,19 +1816,13 @@ async fn preview_start_handler(
                 );
                 (StatusCode::ACCEPTED, Json(v)).into_response()
             }
-            Err(e) if e.contains("no .darkmux/preview.json") => {
-                eprintln!(
-                    "{}",
-                    preview_log_line(&name, "start", "no preview recipe (404)")
-                );
-                err(StatusCode::NOT_FOUND, e)
-            }
             Err(e) => {
+                let r = recipe_refusal(&no_recipe_in(&checkout, &dir, e));
                 eprintln!(
                     "{}",
-                    preview_log_line(&name, "start", &format!("refused (422): {e}"))
+                    preview_log_line(&name, "start", &format!("refused ({})", r.status().as_u16()))
                 );
-                err(StatusCode::UNPROCESSABLE_ENTITY, e)
+                r
             }
         }
     })

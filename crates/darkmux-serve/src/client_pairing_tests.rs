@@ -1272,37 +1272,79 @@ fn write_recipe(wt: &Path, text: &str) {
     std::fs::write(wt.join(".darkmux/preview.json"), text).unwrap();
 }
 
-#[tokio::test]
-async fn a_recipe_under_the_base_is_returned() {
-    let h = harness();
-    let token = paired(&h).await;
-    let wt = h.base.join("wt1");
-    write_recipe(&wt, r#"{"command": ["npm", "run", "dev"], "port": 5173}"#);
+/// A workspace made from the user's own checkout (`source_path`): the
+/// checkout, the workspace's name and its directory.
+async fn checkout_workspace(h: &Harness, token: &str) -> (PathBuf, String, PathBuf) {
+    let mine = h.dir.path().join("site");
+    fixture_repo(&mine);
     let (code, v) = call(
-        &h,
-        get(&recipe_url(&wt), &[("authorization", &bearer(&token))]),
-    )
-    .await;
-    assert_eq!(code, 200, "{v}");
-    assert_eq!(
-        v,
-        serde_json::json!({"recipe": {"command": ["npm", "run", "dev"], "port": 5173}})
-    );
-}
-
-#[tokio::test]
-async fn no_recipe_is_404() {
-    let h = harness();
-    let token = paired(&h).await;
-    let (code, v) = call(
-        &h,
-        get(
-            &recipe_url(&h.base.join("wt1")),
-            &[("authorization", &bearer(&token))],
+        h,
+        post(
+            "/client/workspaces",
+            Some(token),
+            serde_json::json!({"source_path": mine.to_str(), "bot": "b"}),
         ),
     )
     .await;
-    assert_eq!((code, v), (404, serde_json::json!({"error": "no recipe"})));
+    assert_eq!(code, 201, "{v}");
+    let name = v["workspace"].as_str().unwrap().to_string();
+    let ws = h.base.join(&name);
+    (mine, name, ws)
+}
+
+const A_RECIPE: &str = r#"{"schema_version": "1.0", "command": "npm run dev", "env": {"PORT": "{port}"}}"#;
+
+/// The recipe comes from the user's own checkout, by workspace name or by
+/// the workspace's directory, checked.
+#[tokio::test]
+async fn a_recipe_is_read_from_the_users_own_checkout() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (mine, name, ws) = checkout_workspace(&h, &token).await;
+    write_recipe(&mine, A_RECIPE);
+    write_recipe(&ws, r#"{"schema_version": "1.0", "command": "touch pwned"}"#);
+    for url in [recipe_url(&ws), format!("/client/recipe?workspace={name}")] {
+        let (code, v) = call(&h, get(&url, &[("authorization", &bearer(&token))])).await;
+        assert_eq!(code, 200, "{url}: {v}");
+        assert_eq!(v["recipe"]["command"], "npm run dev", "the checkout's, never the workspace's: {v}");
+        assert_eq!(v["recipe"]["env"]["PORT"], "{port}");
+    }
+    let (code, _) = call(&h, get("/client/recipe", &[("authorization", &bearer(&token))])).await;
+    assert_eq!(code, 400);
+}
+
+/// No checkout of the user's (a plain folder, a clone), or none of the
+/// recipe in it, is a 404 that says what to do; a workspace's own copy
+/// never counts.
+#[tokio::test]
+async fn no_recipe_is_404_and_says_where_to_put_one() {
+    let h = harness();
+    let token = paired(&h).await;
+    write_recipe(&h.base.join("wt1"), A_RECIPE);
+    let (code, v) = call(
+        &h,
+        get(&recipe_url(&h.base.join("wt1")), &[("authorization", &bearer(&token))]),
+    )
+    .await;
+    assert_eq!(code, 404, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("your own checkout"), "{v}");
+    let (_mine, name, ws) = checkout_workspace(&h, &token).await;
+    write_recipe(&ws, A_RECIPE);
+    let (code, v) = call(
+        &h,
+        get(&format!("/client/recipe?workspace={name}"), &[("authorization", &bearer(&token))]),
+    )
+    .await;
+    assert_eq!(code, 404, "{v}");
+    let e = v["error"].as_str().unwrap();
+    assert!(
+        e.contains("add .darkmux/preview.json to your own checkout") && e.contains("never read"),
+        "{v}"
+    );
+    // A folder below a workspace is not a workspace.
+    std::fs::create_dir_all(ws.join("sub")).unwrap();
+    let (code, v) = call(&h, get(&recipe_url(&ws.join("sub")), &[("authorization", &bearer(&token))])).await;
+    assert_eq!(code, 404, "{v}");
 }
 
 #[tokio::test]
@@ -1345,41 +1387,39 @@ async fn a_recipe_needs_a_token() {
 async fn a_symlinked_recipe_is_refused() {
     let h = harness();
     let token = paired(&h).await;
+    let (mine, name, _ws) = checkout_workspace(&h, &token).await;
     let outside = h.dir.path().join("secret.json");
-    std::fs::write(&outside, r#"{"secret": true}"#).unwrap();
-    let wt = h.base.join("wt1");
-    std::fs::create_dir_all(wt.join(".darkmux")).unwrap();
-    std::os::unix::fs::symlink(&outside, wt.join(".darkmux/preview.json")).unwrap();
+    std::fs::write(&outside, A_RECIPE).unwrap();
+    std::fs::create_dir_all(mine.join(".darkmux")).unwrap();
+    std::os::unix::fs::symlink(&outside, mine.join(".darkmux/preview.json")).unwrap();
     let (code, v) = call(
         &h,
-        get(&recipe_url(&wt), &[("authorization", &bearer(&token))]),
+        get(&format!("/client/recipe?workspace={name}"), &[("authorization", &bearer(&token))]),
     )
     .await;
     assert_eq!(code, 403, "{v}");
 }
 
 #[tokio::test]
-async fn an_oversized_or_non_object_recipe_is_refused() {
+async fn an_oversized_unknown_keyed_or_non_object_recipe_is_refused() {
     let h = harness();
     let token = paired(&h).await;
-    let wt = h.base.join("wt1");
+    let (mine, name, _ws) = checkout_workspace(&h, &token).await;
+    let url = format!("/client/recipe?workspace={name}");
+    let auth = bearer(&token);
     write_recipe(
-        &wt,
+        &mine,
         &format!(r#"{{"pad": "{}"}}"#, "x".repeat(MAX_RECIPE_BYTES as usize)),
     );
-    let (code, _) = call(
-        &h,
-        get(&recipe_url(&wt), &[("authorization", &bearer(&token))]),
-    )
-    .await;
+    let (code, _) = call(&h, get(&url, &[("authorization", &auth)])).await;
     assert_eq!(code, 413);
-    write_recipe(&wt, "[1, 2]");
-    let (code, _) = call(
-        &h,
-        get(&recipe_url(&wt), &[("authorization", &bearer(&token))]),
-    )
-    .await;
+    write_recipe(&mine, "[1, 2]");
+    let (code, _) = call(&h, get(&url, &[("authorization", &auth)])).await;
     assert_eq!(code, 422);
+    write_recipe(&mine, r#"{"schema_version": "1.0", "command": "x", "port": 5173}"#);
+    let (code, v) = call(&h, get(&url, &[("authorization", &auth)])).await;
+    assert_eq!(code, 422, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("unknown key `port`"), "{v}");
 }
 
 // ─── The production executor ─────────────────────────────────────────────
@@ -2314,23 +2354,6 @@ async fn work_refuses_bad_unknown_or_doubled_workspaces() {
     assert!(h.ran.lock().unwrap().is_empty());
 }
 
-#[tokio::test]
-async fn the_recipe_can_be_read_by_workspace() {
-    let h = harness();
-    let token = paired(&h).await;
-    write_recipe(&h.base.join("wt1"), r#"{"command": "npm run dev"}"#);
-    let auth = bearer(&token);
-    let (code, v) = call(
-        &h,
-        get("/client/recipe?workspace=wt1", &[("authorization", &auth)]),
-    )
-    .await;
-    assert_eq!(code, 200, "{v}");
-    assert_eq!(v["recipe"]["command"], "npm run dev");
-    let (code, _) = call(&h, get("/client/recipe", &[("authorization", &auth)])).await;
-    assert_eq!(code, 400);
-}
-
 // A local checkout becomes a worktree on a new branch; the owner's own
 // working tree, branch and uncommitted files are untouched.
 
@@ -2851,14 +2874,22 @@ async fn old_clients_keep_and_discard_still_work() {
 
 const SERVE: &str = "exec python3 -m http.server \"$PORT\" --bind 127.0.0.1";
 
-fn recipe(wt: &Path, json: Value) {
-    std::fs::create_dir_all(wt.join(".darkmux")).unwrap();
-    std::fs::write(wt.join(".darkmux/preview.json"), json.to_string()).unwrap();
+/// Writes a recipe (with this darkmux's `schema_version` unless it names one).
+fn recipe(checkout: &Path, mut json: Value) {
+    if json.get("schema_version").is_none() {
+        json["schema_version"] = darkmux_types::data_version::PREVIEW_RECIPE_SCHEMA_VERSION.into();
+    }
+    write_recipe(checkout, &json.to_string());
 }
 
+/// Polls the preview until its status is one of `done`. The panic names the
+/// last status the listener reported, with its error and log.
 async fn preview_until(h: &Harness, token: &str, name: &str, done: &[&str]) -> Value {
     let auth = bearer(token);
-    for _ in 0..600 {
+    let mut last = Value::Null;
+    // Up to 120 s: under a full parallel suite a cold dev server can be slow
+    // to answer (the listener's own deadline is 180 s).
+    for _ in 0..2400 {
         let (code, v) = call(
             h,
             get(
@@ -2871,57 +2902,61 @@ async fn preview_until(h: &Harness, token: &str, name: &str, done: &[&str]) -> V
         if done.contains(&v["status"].as_str().unwrap()) {
             return v;
         }
+        last = v;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    panic!("preview {name} never reached {done:?}");
+    panic!("preview {name} never reached {done:?}; last: {last}");
 }
 
 fn answers(port: u64) -> bool {
     std::net::TcpStream::connect(("127.0.0.1", port as u16)).is_ok()
 }
 
+async fn start_preview(h: &Harness, token: &str, name: &str) -> (u16, Value) {
+    call(
+        h,
+        post(
+            &format!("/client/workspaces/{name}/preview"),
+            Some(token),
+            serde_json::json!({}),
+        ),
+    )
+    .await
+}
+
+/// A workspace made from the user's checkout, with a page for the dev
+/// server to serve (so readiness never depends on a directory listing).
+async fn served_workspace(h: &Harness, token: &str) -> (PathBuf, String, PathBuf) {
+    let (mine, name, ws) = checkout_workspace(h, token).await;
+    std::fs::write(ws.join("index.html"), "hello preview").unwrap();
+    (mine, name, ws)
+}
+
 #[tokio::test]
 async fn a_preview_runs_from_the_recipe_and_stops() {
     let h = harness();
     let token = paired(&h).await;
-    let wt = h.base.join("wt1");
-    std::fs::write(wt.join("index.html"), "hello preview").unwrap();
+    let (mine, name, _ws) = served_workspace(&h, &token).await;
     recipe(
-        &wt,
+        &mine,
         serde_json::json!({"command": SERVE, "env": {"PORT": "{port}"}, "ready": {"http": "/"}}),
     );
-    let (code, v) = call(
-        &h,
-        post(
-            "/client/workspaces/wt1/preview",
-            Some(&token),
-            serde_json::json!({}),
-        ),
-    )
-    .await;
+    let (code, v) = start_preview(&h, &token, &name).await;
     assert_eq!(code, 202, "{v}");
-    let ready = preview_until(&h, &token, "wt1", &["ready", "failed"]).await;
+    let ready = preview_until(&h, &token, &name, &["ready", "failed"]).await;
     assert_eq!(ready["status"], "ready", "{ready}");
     let port = ready["port"].as_u64().unwrap();
     assert_eq!(ready["url"], format!("http://127.0.0.1:{port}/"));
     assert_ne!(ready["port"], ready["hmr_port"]);
     assert!(answers(port));
     // Asking again returns the same one.
-    let (code, again) = call(
-        &h,
-        post(
-            "/client/workspaces/wt1/preview",
-            Some(&token),
-            serde_json::json!({}),
-        ),
-    )
-    .await;
+    let (code, again) = start_preview(&h, &token, &name).await;
     assert_eq!(code, 200);
     assert_eq!(again["port"], ready["port"]);
     // Stop: the server is gone.
     let req = Request::builder()
         .method("DELETE")
-        .uri("/client/workspaces/wt1/preview")
+        .uri(format!("/client/workspaces/{name}/preview"))
         .header("authorization", bearer(&token))
         .body(Body::empty())
         .unwrap();
@@ -2941,50 +2976,112 @@ async fn a_preview_runs_from_the_recipe_and_stops() {
     assert!(!answers(port), "stopped");
 }
 
+/// (review, operator decision 2026-11-09) A preview runs only from the
+/// recipe in the user's own checkout. A recipe a run wrote in the workspace
+/// is never read: with none in the checkout there is no preview, and with
+/// one there, it is the checkout's that runs.
+#[tokio::test]
+async fn a_preview_never_runs_the_workspaces_own_recipe() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (mine, name, ws) = served_workspace(&h, &token).await;
+    recipe(
+        &ws,
+        serde_json::json!({"command": format!("touch pwned; {SERVE}"), "env": {"PORT": "{port}"},
+            "install": {"command": "touch pwned-install"}}),
+    );
+    let (code, v) = start_preview(&h, &token, &name).await;
+    assert_eq!(code, 404, "{v}");
+    let e = v["error"].as_str().unwrap();
+    assert!(e.contains("add .darkmux/preview.json to your own checkout"), "{v}");
+    assert!(e.contains(mine.to_str().unwrap()), "names the checkout: {v}");
+    recipe(&mine, serde_json::json!({"command": SERVE, "env": {"PORT": "{port}"}}));
+    let (code, v) = start_preview(&h, &token, &name).await;
+    assert_eq!(code, 202, "{v}");
+    let ready = preview_until(&h, &token, &name, &["ready", "failed"]).await;
+    assert_eq!(ready["status"], "ready", "{ready}");
+    h.state.previews.stop(&name);
+    assert!(!ws.join("pwned").exists() && !ws.join("pwned-install").exists(), "the workspace's recipe ran");
+}
+
+/// A workspace cloned from a URL has no checkout of the user's, so no
+/// preview, even with a recipe in it; the refusal names the repo.
+#[tokio::test]
+async fn a_cloned_workspace_gets_no_preview() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (code, v) = call(
+        &h,
+        post("/client/workspaces", Some(&token), ws_body(serde_json::json!({"repo_url": "https://github.com/kstrat2001/hcr"}))),
+    )
+    .await;
+    assert_eq!(code, 201, "{v}");
+    let ws = h.base.join("hcr");
+    recipe(&ws, serde_json::json!({"command": format!("touch pwned; {SERVE}")}));
+    let (code, v) = start_preview(&h, &token, "hcr").await;
+    assert_eq!(code, 404, "{v}");
+    let e = v["error"].as_str().unwrap();
+    assert!(e.contains("not made from a checkout of yours") && e.contains("github.com/kstrat2001/hcr"), "{v}");
+    assert!(!ws.join("pwned").exists());
+}
+
+/// What darkmux recorded is what counts: a clone that takes the name of an
+/// old checkout-made workspace inherits nothing, and a workspace whose `.git`
+/// no longer points at the recorded checkout gets no preview.
+#[tokio::test]
+async fn a_preview_needs_the_workspace_to_still_be_a_worktree_of_the_checkout() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (mine, name, ws) = served_workspace(&h, &token).await;
+    recipe(&mine, serde_json::json!({"command": SERVE, "env": {"PORT": "{port}"}}));
+    // A run rewrites the workspace's `.git` to a repository of its own.
+    std::fs::remove_file(ws.join(".git")).unwrap();
+    run_git(Some(&ws), &["init", "--quiet"]);
+    let (code, v) = start_preview(&h, &token, &name).await;
+    assert_eq!(code, 404, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("no longer a worktree"), "{v}");
+    // A stale record under the name a clone then takes.
+    let base = h.base.canonicalize().unwrap();
+    std::fs::write(base.join(".hcr.source"), format!("{}\n", mine.display())).unwrap();
+    let (code, v) = call(
+        &h,
+        post("/client/workspaces", Some(&token), ws_body(serde_json::json!({"repo_url": "https://github.com/kstrat2001/hcr"}))),
+    )
+    .await;
+    assert_eq!(code, 201, "{v}");
+    assert!(!base.join(".hcr.source").exists(), "the clone forgot the old record");
+    let (code, v) = start_preview(&h, &token, "hcr").await;
+    assert_eq!(code, 404, "{v}");
+}
+
 #[tokio::test]
 async fn install_runs_only_when_its_marker_is_missing() {
     let h = harness();
     let token = paired(&h).await;
-    let wt = h.base.join("wt1");
+    let (mine, name, ws) = served_workspace(&h, &token).await;
     recipe(
-        &wt,
+        &mine,
         serde_json::json!({
             "command": SERVE, "env": {"PORT": "{port}"},
             "install": {"command": "mkdir deps && echo ran >> installs.txt", "unless_exists": "deps"}
         }),
     );
-    call(
-        &h,
-        post(
-            "/client/workspaces/wt1/preview",
-            Some(&token),
-            serde_json::json!({}),
-        ),
-    )
-    .await;
+    start_preview(&h, &token, &name).await;
     assert_eq!(
-        preview_until(&h, &token, "wt1", &["ready", "failed"]).await["status"],
+        preview_until(&h, &token, &name, &["ready", "failed"]).await["status"],
         "ready"
     );
-    h.state.previews.stop("wt1");
-    call(
-        &h,
-        post(
-            "/client/workspaces/wt1/preview",
-            Some(&token),
-            serde_json::json!({}),
-        ),
-    )
-    .await;
+    h.state.previews.stop(&name);
+    start_preview(&h, &token, &name).await;
     assert_eq!(
-        preview_until(&h, &token, "wt1", &["ready", "failed"]).await["status"],
+        preview_until(&h, &token, &name, &["ready", "failed"]).await["status"],
         "ready"
     );
-    h.state.previews.stop("wt1");
+    h.state.previews.stop(&name);
     assert_eq!(
-        std::fs::read_to_string(wt.join("installs.txt")).unwrap(),
+        std::fs::read_to_string(ws.join("installs.txt")).unwrap(),
         "ran\n",
-        "installed once"
+        "installed once, in the workspace"
     );
 }
 
@@ -2992,36 +3089,15 @@ async fn install_runs_only_when_its_marker_is_missing() {
 async fn a_worktree_preview_gets_env_files_from_its_checkout_without_overwriting() {
     let h = harness();
     let token = paired(&h).await;
-    let mine = h.dir.path().join("site");
-    fixture_repo(&mine);
+    let (mine, name, ws) = served_workspace(&h, &token).await;
     std::fs::write(mine.join(".env"), "SECRET=from-source\n").unwrap();
     std::fs::write(mine.join(".env.local"), "LOCAL=from-source\n").unwrap();
-    let (code, v) = call(
-        &h,
-        post(
-            "/client/workspaces",
-            Some(&token),
-            serde_json::json!({"source_path": mine.to_str(), "bot": "b"}),
-        ),
-    )
-    .await;
-    assert_eq!(code, 201, "{v}");
-    let name = v["workspace"].as_str().unwrap().to_string();
-    let ws = h.base.join(&name);
     std::fs::write(ws.join(".env.local"), "LOCAL=already-here\n").unwrap();
     recipe(
-        &ws,
+        &mine,
         serde_json::json!({"command": SERVE, "env": {"PORT": "{port}"}, "env_from_source": [".env", ".env.local"]}),
     );
-    call(
-        &h,
-        post(
-            &format!("/client/workspaces/{name}/preview"),
-            Some(&token),
-            serde_json::json!({}),
-        ),
-    )
-    .await;
+    start_preview(&h, &token, &name).await;
     assert_eq!(
         preview_until(&h, &token, &name, &["ready", "failed"]).await["status"],
         "ready"
@@ -3042,20 +3118,13 @@ async fn a_worktree_preview_gets_env_files_from_its_checkout_without_overwriting
 async fn a_failing_dev_server_says_why() {
     let h = harness();
     let token = paired(&h).await;
+    let (mine, name, _ws) = checkout_workspace(&h, &token).await;
     recipe(
-        &h.base.join("wt1"),
+        &mine,
         serde_json::json!({"command": "echo boom-from-the-server; exit 3"}),
     );
-    call(
-        &h,
-        post(
-            "/client/workspaces/wt1/preview",
-            Some(&token),
-            serde_json::json!({}),
-        ),
-    )
-    .await;
-    let v = preview_until(&h, &token, "wt1", &["ready", "failed"]).await;
+    start_preview(&h, &token, &name).await;
+    let v = preview_until(&h, &token, &name, &["ready", "failed"]).await;
     assert_eq!(v["status"], "failed", "{v}");
     assert!(v["error"].as_str().unwrap().contains("exited"), "{v}");
     assert!(
@@ -3081,44 +3150,30 @@ async fn previews_refuse_what_they_cant_run() {
     )
     .await;
     assert_eq!(code, 401);
-    let (code, v) = call(
-        &h,
-        post(
-            "/client/workspaces/wt1/preview",
-            Some(&token),
-            serde_json::json!({}),
-        ),
-    )
-    .await;
-    assert_eq!(code, 404, "no recipe: {v}");
-    let (code, _) = call(
-        &h,
-        post(
-            "/client/workspaces/nope/preview",
-            Some(&token),
-            serde_json::json!({}),
-        ),
-    )
-    .await;
+    let (code, v) = start_preview(&h, &token, "wt1").await;
+    assert_eq!(code, 404, "no checkout of yours: {v}");
+    let (code, _) = start_preview(&h, &token, "nope").await;
     assert_eq!(code, 404);
+    let (mine, name, _ws) = checkout_workspace(&h, &token).await;
+    let (code, v) = start_preview(&h, &token, &name).await;
+    assert_eq!(code, 404, "no recipe in the checkout: {v}");
     recipe(
-        &h.base.join("wt1"),
+        &mine,
         serde_json::json!({"command": SERVE, "env_from_source": ["../../etc/passwd"]}),
     );
-    let (code, v) = call(
-        &h,
-        post(
-            "/client/workspaces/wt1/preview",
-            Some(&token),
-            serde_json::json!({}),
-        ),
-    )
-    .await;
+    let (code, v) = start_preview(&h, &token, &name).await;
     assert_eq!(code, 422, "{v}");
+    recipe(&mine, serde_json::json!({"command": SERVE, "comand": "typo"}));
+    let (code, v) = start_preview(&h, &token, &name).await;
+    assert_eq!(code, 422, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("unknown key `comand`"), "{v}");
+    write_recipe(&mine, &serde_json::json!({"command": SERVE}).to_string());
+    let (code, v) = start_preview(&h, &token, &name).await;
+    assert_eq!(code, 422, "no schema_version: {v}");
     let (code, _) = call(
         &h,
         get(
-            "/client/workspaces/wt1/preview",
+            &format!("/client/workspaces/{name}/preview"),
             &[("authorization", &bearer(&token))],
         ),
     )
@@ -3131,8 +3186,11 @@ async fn a_preview_ends_when_darkmux_does() {
     let dir = tempfile::tempdir().unwrap();
     let wt = dir.path().join("w");
     std::fs::create_dir_all(&wt).unwrap();
+    std::fs::write(wt.join("index.html"), "up").unwrap();
+    let checkout = dir.path().join("mine");
+    std::fs::create_dir_all(&checkout).unwrap();
     recipe(
-        &wt,
+        &checkout,
         serde_json::json!({"command": SERVE, "env": {"PORT": "{port}"}}),
     );
     // "darkmux" here is a short-lived process; when it exits, so does the preview.
@@ -3141,7 +3199,7 @@ async fn a_preview_ends_when_darkmux_does() {
         .spawn()
         .unwrap();
     let previews = crate::client_preview::Previews::new(dir.path().join("p"), stand_in.id());
-    let (v, _) = previews.start("w", &wt).unwrap();
+    let (v, _) = previews.start("w", &wt, &checkout).unwrap();
     let port = v["port"].as_u64().unwrap();
     let mut up = false;
     for _ in 0..100 {

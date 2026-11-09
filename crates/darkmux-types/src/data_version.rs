@@ -51,6 +51,10 @@ pub const LAB_FIXTURE_SCHEMA_VERSION: &str = "1.2";
 /// (#3363) The first lab fixture schema whose eval owns its roles
 /// ([`LAB_FIXTURE_SCHEMA_VERSION`]'s 1.2).
 pub const LAB_FIXTURE_EVAL_ROLES_SINCE: &str = "1.2";
+/// A repo's `.darkmux/preview.json` (the preview recipe `darkmux client
+/// serve` runs, read only from the user's own checkout). Required, not
+/// lenient: the format was born with its marker.
+pub const PREVIEW_RECIPE_SCHEMA_VERSION: &str = "1.0";
 /// `mission.json`.
 pub const MISSION_SCHEMA_VERSION: &str = "1.0";
 /// A phase JSON.

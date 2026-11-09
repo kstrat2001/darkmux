@@ -1,10 +1,22 @@
 //! Live previews for paired apps: darkmux runs a workspace's dev server from
-//! the repo's own `.darkmux/preview.json` and tells the app its URL.
+//! a `.darkmux/preview.json` recipe and tells the app its URL.
 //!
-//! Draft recipe shape (unknown keys are ignored while the format settles):
+//! **Trust.** The recipe is a command darkmux runs, so it is read ONLY from
+//! the user's own checkout: the `source_path` checkout the workspace's
+//! worktree was made from, as darkmux recorded it when it made the workspace
+//! (`client_workspace::own_checkout_of`), never from the workspace itself. A
+//! file a Coder run wrote in the workspace is never read. A workspace cloned
+//! from a URL has no checkout of the user's, so it gets no preview; neither
+//! does one whose checkout has no recipe (a copy in the workspace does not
+//! count). Each refusal says why and what to do: add
+//! `.darkmux/preview.json` to your own checkout of the repo.
+//!
+//! Recipe shape (contract 7 and 5: an unknown key is refused naming it, and
+//! `schema_version` is required):
 //!
 //! ```json
 //! {
+//!   "schema_version": "1.0",
 //!   "command": "npm run dev",
 //!   "env": {"PORT": "{port}", "HOST": "127.0.0.1", "VITE_HMR_PORT": "{hmrPort}"},
 //!   "ready": {"http": "/"},
@@ -14,43 +26,182 @@
 //! ```
 //!
 //! Each preview gets its own free app port and HMR port, substituted into
-//! `env` (`{port}`, `{hmrPort}`), so two previews never collide. `install`
-//! runs first when its `unless_exists` path is missing. `env_from_source`
-//! copies untracked files (like `.env`) from the checkout a worktree was made
-//! from, never overwriting. The dev server runs in its own process group with
-//! a watchdog: it stops when darkmux stops, when it is stopped, or when it
-//! exits on its own.
+//! `env` (`{port}`, `{hmrPort}`), so two previews never collide. The command
+//! runs in the workspace. `install` runs first when its `unless_exists` path
+//! is missing there. `env_from_source` copies untracked files (like `.env`)
+//! from that same checkout into the workspace, never overwriting. The dev
+//! server runs in its own process group with a watchdog: it stops when
+//! darkmux stops, when it is stopped, or when it exits on its own.
 
-use serde::Deserialize;
+use darkmux_types::data_version::PREVIEW_RECIPE_SCHEMA_VERSION;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-#[derive(Deserialize, Debug, Clone)]
+/// Where a repo keeps its recipe, relative to the checkout's top.
+pub const RECIPE_PATH: &str = ".darkmux/preview.json";
+/// The largest `preview.json` darkmux reads.
+pub const MAX_RECIPE_BYTES: u64 = 16 * 1024;
+
+/// A `.darkmux/preview.json`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, schemars::JsonSchema)]
 pub struct Recipe {
+    /// The recipe format's version ([`PREVIEW_RECIPE_SCHEMA_VERSION`]).
+    pub schema_version: String,
     pub command: String,
     #[serde(default)]
     pub env: HashMap<String, String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ready: Option<Ready>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install: Option<Install>,
     #[serde(default)]
     pub env_from_source: Vec<String>,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, schemars::JsonSchema)]
 pub struct Ready {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http: Option<String>,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, schemars::JsonSchema)]
 pub struct Install {
     pub command: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unless_exists: Option<String>,
+}
+
+/// Why a recipe was not used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecipeRefusal {
+    /// There is none to use (no checkout of the user's, or no file in it).
+    NotFound(String),
+    /// A symlink where the recipe or its folder should be.
+    Symlink(String),
+    TooLarge(String),
+    /// Not a recipe this darkmux runs: not JSON, an unknown key, a missing
+    /// or unknown `schema_version`, a path that escapes the work copy.
+    Invalid(String),
+    /// The disk could not be read.
+    Unreadable(String),
+}
+
+impl RecipeRefusal {
+    pub fn message(&self) -> &str {
+        match self {
+            RecipeRefusal::NotFound(m)
+            | RecipeRefusal::Symlink(m)
+            | RecipeRefusal::TooLarge(m)
+            | RecipeRefusal::Invalid(m)
+            | RecipeRefusal::Unreadable(m) => m,
+        }
+    }
+}
+
+/// The recipe file's text in `checkout`: a symlinked `.darkmux` or
+/// `preview.json` is refused, and the file is opened without following a
+/// link.
+pub fn read_recipe_text(checkout: &Path) -> Result<String, RecipeRefusal> {
+    use std::io::Read;
+    let dir = checkout.join(".darkmux");
+    let file = checkout.join(RECIPE_PATH);
+    for p in [&dir, &file] {
+        match std::fs::symlink_metadata(p) {
+            Ok(m) if m.file_type().is_symlink() => {
+                return Err(RecipeRefusal::Symlink(format!("{} is a symlink; refusing", p.display())))
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(RecipeRefusal::NotFound(format!("no {RECIPE_PATH} in {}", checkout.display())))
+            }
+            Err(e) => return Err(RecipeRefusal::Unreadable(format!("reading {}: {e}", p.display()))),
+        }
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut text = String::new();
+    opts.open(&file)
+        .and_then(|f| {
+            if !f.metadata()?.is_file() {
+                return Err(std::io::Error::other("not a file"));
+            }
+            f.take(MAX_RECIPE_BYTES + 1).read_to_string(&mut text)
+        })
+        .map_err(|e| RecipeRefusal::Unreadable(format!("reading {}: {e}", file.display())))?;
+    if text.len() as u64 > MAX_RECIPE_BYTES {
+        return Err(RecipeRefusal::TooLarge(format!(
+            "{RECIPE_PATH} is larger than {MAX_RECIPE_BYTES} bytes"
+        )));
+    }
+    Ok(text)
+}
+
+/// The recipe's `schema_version` must be one this darkmux reads.
+fn check_version(doc: &serde_json::Value) -> Result<(), RecipeRefusal> {
+    if let Some(v) = darkmux_types::data_version::newer(doc, PREVIEW_RECIPE_SCHEMA_VERSION) {
+        return Err(RecipeRefusal::Invalid(format!(
+            "{RECIPE_PATH}: {}",
+            darkmux_types::data_version::newer_refusal("preview recipe", &v, PREVIEW_RECIPE_SCHEMA_VERSION)
+        )));
+    }
+    match doc.get("schema_version").and_then(serde_json::Value::as_str) {
+        Some(PREVIEW_RECIPE_SCHEMA_VERSION) => Ok(()),
+        other => Err(RecipeRefusal::Invalid(format!(
+            "{RECIPE_PATH}: `schema_version` {} is not one this darkmux reads (write \"{PREVIEW_RECIPE_SCHEMA_VERSION}\")",
+            other.map_or_else(|| "is missing; it".to_string(), |v| format!("\"{v}\""))
+        ))),
+    }
+}
+
+/// Paths the recipe names inside the work copy: plain relative ones only.
+fn check_paths(recipe: &Recipe) -> Result<(), RecipeRefusal> {
+    let unless = recipe.install.as_ref().and_then(|i| i.unless_exists.as_ref());
+    let named = recipe
+        .env_from_source
+        .iter()
+        .map(|f| ("env_from_source", f))
+        .chain(unless.map(|u| ("install.unless_exists", u)));
+    for (key, p) in named {
+        if !plain_relative(p) {
+            return Err(RecipeRefusal::Invalid(format!("{key}: {p:?} must be a plain relative path")));
+        }
+    }
+    Ok(())
+}
+
+/// A recipe's text, checked: a JSON object whose every key the format
+/// knows (an unknown or misspelled one is refused naming it and the closest
+/// valid key), a `schema_version` this darkmux reads, and paths that stay
+/// inside the work copy.
+pub fn parse_recipe(text: &str) -> Result<Recipe, RecipeRefusal> {
+    let doc: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| RecipeRefusal::Invalid(format!("{RECIPE_PATH} is not JSON: {e}")))?;
+    if !doc.is_object() {
+        return Err(RecipeRefusal::Invalid(format!("{RECIPE_PATH} is not a JSON object")));
+    }
+    check_version(&doc)?;
+    let issues = darkmux_types::user_files::key_issues::<Recipe>(&doc, &darkmux_types::user_files::no_retired);
+    if !issues.is_empty() {
+        let lines: Vec<String> = issues.iter().map(ToString::to_string).collect();
+        return Err(RecipeRefusal::Invalid(format!("{RECIPE_PATH}: {}", lines.join("; "))));
+    }
+    let recipe: Recipe =
+        serde_json::from_value(doc).map_err(|e| RecipeRefusal::Invalid(format!("{RECIPE_PATH}: {e}")))?;
+    check_paths(&recipe)?;
+    Ok(recipe)
+}
+
+/// The recipe in the user's own `checkout`, read and checked.
+pub fn load_recipe(checkout: &Path) -> Result<Recipe, RecipeRefusal> {
+    parse_recipe(&read_recipe_text(checkout)?)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,17 +267,6 @@ fn substitute(value: &str, port: u16, hmr: u16) -> String {
     value
         .replace("{port}", &port.to_string())
         .replace("{hmrPort}", &hmr.to_string())
-}
-
-/// The checkout a worktree was made from (its main working tree), if `dir`
-/// is a linked worktree.
-pub fn source_of(dir: &Path) -> Option<PathBuf> {
-    let common = crate::client_workspace::common_dir(dir)?;
-    let own = dir.join(".git").canonicalize().ok();
-    if own.as_deref() == Some(common.as_path()) {
-        return None;
-    }
-    common.parent().map(Path::to_path_buf)
 }
 
 /// One HTTP GET; ready on any 2xx or 3xx.
@@ -209,9 +349,16 @@ impl Previews {
         v
     }
 
-    /// Starts the workspace's preview (or returns the running one). The
-    /// boolean says whether it was already running.
-    pub fn start(&self, name: &str, workdir: &Path) -> Result<(serde_json::Value, bool), String> {
+    /// Starts the workspace's preview (or returns the running one) from the
+    /// recipe in `checkout`, the user's own checkout the workspace was made
+    /// from: the recipe is read there, never in `workdir`, where the dev
+    /// server runs. The boolean says whether it was already running.
+    pub fn start(
+        &self,
+        name: &str,
+        workdir: &Path,
+        checkout: &Path,
+    ) -> Result<(serde_json::Value, bool), RecipeRefusal> {
         let mut entries = self.entries.lock().unwrap();
         if let Some(e) = entries.get(name) {
             let e = e.lock().unwrap();
@@ -219,37 +366,10 @@ impl Previews {
                 return Ok((Self::snapshot(name, &e), true));
             }
         }
-        let recipe_path = workdir.join(".darkmux/preview.json");
-        if std::fs::symlink_metadata(&recipe_path)
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(false)
-        {
-            return Err("the preview recipe is a symlink; refusing".into());
-        }
-        let text = std::fs::read_to_string(&recipe_path)
-            .map_err(|_| "this workspace has no .darkmux/preview.json".to_string())?;
-        let recipe: Recipe =
-            serde_json::from_str(&text).map_err(|e| format!("preview.json: {e}"))?;
-        for f in &recipe.env_from_source {
-            if !plain_relative(f) {
-                return Err(format!(
-                    "env_from_source: {f:?} must be a plain relative path"
-                ));
-            }
-        }
-        if let Some(u) = recipe
-            .install
-            .as_ref()
-            .and_then(|i| i.unless_exists.as_ref())
-        {
-            if !plain_relative(u) {
-                return Err(format!(
-                    "install.unless_exists: {u:?} must be a plain relative path"
-                ));
-            }
-        }
-        std::fs::create_dir_all(&self.dir).map_err(|e| format!("{}: {e}", self.dir.display()))?;
-        let (port, hmr_port) = (free_port()?, free_port()?);
+        let recipe = load_recipe(checkout)?;
+        let unreadable = |e: String| RecipeRefusal::Unreadable(e);
+        std::fs::create_dir_all(&self.dir).map_err(|e| unreadable(format!("{}: {e}", self.dir.display())))?;
+        let (port, hmr_port) = (free_port().map_err(unreadable)?, free_port().map_err(unreadable)?);
         let log = self.dir.join(format!("{name}.log"));
         let _ = std::fs::write(&log, "");
         let entry = Arc::new(Mutex::new(Entry {
@@ -263,9 +383,15 @@ impl Previews {
         entries.insert(name.to_string(), entry.clone());
         drop(entries);
 
-        let workdir = workdir.to_path_buf();
-        let watch = self.watch_pid;
-        std::thread::spawn(move || run(entry, recipe, workdir, log, port, hmr_port, watch));
+        let run_in = RunIn {
+            workdir: workdir.to_path_buf(),
+            checkout: checkout.to_path_buf(),
+            log,
+            port,
+            hmr_port,
+            watch: self.watch_pid,
+        };
+        std::thread::spawn(move || run(entry, recipe, run_in));
         Ok((snap, false))
     }
 
@@ -327,27 +453,29 @@ fn sh(command: &str, workdir: &Path, log: &Path) -> std::process::Command {
     cmd
 }
 
-fn run(
-    entry: Arc<Mutex<Entry>>,
-    recipe: Recipe,
+/// Where one preview runs: its work copy, the checkout its recipe and env
+/// files come from, its log, its ports, and the process whose exit ends it.
+struct RunIn {
     workdir: PathBuf,
+    checkout: PathBuf,
     log: PathBuf,
     port: u16,
     hmr_port: u16,
     watch: u32,
-) {
+}
+
+fn run(entry: Arc<Mutex<Entry>>, recipe: Recipe, at: RunIn) {
+    let RunIn { workdir, checkout, log, port, hmr_port, watch } = at;
     let fail = |why: String| {
         set(&entry, Status::Failed(why));
     };
-    // Untracked files the dev server needs, from the checkout this worktree
-    // came from; never overwritten.
-    if let Some(source) = source_of(&workdir) {
-        for f in &recipe.env_from_source {
-            let (from, to) = (source.join(f), workdir.join(f));
-            if from.is_file() && std::fs::symlink_metadata(&to).is_err() {
-                if let Err(e) = std::fs::copy(&from, &to) {
-                    return fail(format!("copying {f} from {}: {e}", source.display()));
-                }
+    // Untracked files the dev server needs, from the user's own checkout;
+    // never overwritten.
+    for f in &recipe.env_from_source {
+        let (from, to) = (checkout.join(f), workdir.join(f));
+        if from.is_file() && std::fs::symlink_metadata(&to).is_err() {
+            if let Err(e) = std::fs::copy(&from, &to) {
+                return fail(format!("copying {f} from {}: {e}", checkout.display()));
             }
         }
     }
@@ -463,13 +591,51 @@ mod tests {
         assert_eq!(substitute("127.0.0.1", 1, 2), "127.0.0.1");
     }
 
+    fn parsed(v: serde_json::Value) -> Result<Recipe, RecipeRefusal> {
+        parse_recipe(&v.to_string())
+    }
+
+    /// Contract 7: a key the recipe format does not know is refused, named
+    /// with the closest valid key, at the top and nested.
     #[test]
-    fn recipes_ignore_keys_they_dont_know() {
-        let r: Recipe = serde_json::from_str(
-            r#"{"schema":"draft","command":"npm run dev","port":3333,"hmr":{"framework":"vite"},"env":{"PORT":"{port}"}}"#,
-        )
-        .unwrap();
-        assert_eq!(r.command, "npm run dev");
-        assert_eq!(r.env["PORT"], "{port}");
+    fn a_recipe_refuses_keys_it_does_not_know() {
+        let ok = serde_json::json!({"schema_version": "1.0", "command": "npm run dev", "env": {"PORT": "{port}"}});
+        assert_eq!(parsed(ok.clone()).unwrap().command, "npm run dev");
+        for (doc, key) in [
+            (serde_json::json!({"schema_version": "1.0", "command": "x", "comand": "y"}), "`comand`"),
+            (serde_json::json!({"schema_version": "1.0", "command": "x", "port": 3333}), "`port`"),
+            (serde_json::json!({"schema_version": "1.0", "command": "x", "ready": {"htp": "/"}}), "`ready.htp`"),
+            (serde_json::json!({"schema_version": "1.0", "command": "x", "install": {"command": "i", "unless": "n"}}), "`install.unless`"),
+        ] {
+            let e = parsed(doc).unwrap_err();
+            assert!(matches!(e, RecipeRefusal::Invalid(_)), "{e:?}");
+            assert!(e.message().contains(&format!("unknown key {key}")), "{e:?}");
+        }
+        let e = parsed(serde_json::json!({"schema_version": "1.0", "command": "x", "comand": "y"})).unwrap_err();
+        assert!(e.message().contains("did you mean `command`?"), "{e:?}");
+    }
+
+    /// Contract 5: `schema_version` is required and must be one this darkmux
+    /// reads; a newer one says to upgrade.
+    #[test]
+    fn a_recipe_needs_a_schema_version_this_darkmux_reads() {
+        let missing = parsed(serde_json::json!({"command": "x"})).unwrap_err();
+        assert!(missing.message().contains("`schema_version`") && missing.message().contains("missing"), "{missing:?}");
+        let unknown = parsed(serde_json::json!({"schema_version": "0.9", "command": "x"})).unwrap_err();
+        assert!(unknown.message().contains("`schema_version` \"0.9\""), "{unknown:?}");
+        let newer = parsed(serde_json::json!({"schema_version": "2.0", "command": "x"})).unwrap_err();
+        assert!(newer.message().contains("newer darkmux"), "{newer:?}");
+        let typed = parsed(serde_json::json!({"schema_version": 1, "command": "x"})).unwrap_err();
+        assert!(typed.message().contains("`schema_version`"), "{typed:?}");
+    }
+
+    #[test]
+    fn a_recipe_is_a_json_object_with_paths_inside_the_work_copy() {
+        assert!(matches!(parse_recipe("[1]"), Err(RecipeRefusal::Invalid(_))));
+        assert!(matches!(parse_recipe("{nope"), Err(RecipeRefusal::Invalid(_))));
+        let e = parsed(serde_json::json!({"schema_version": "1.0", "command": "x", "env_from_source": ["../.env"]})).unwrap_err();
+        assert!(e.message().contains("env_from_source"), "{e:?}");
+        let e = parsed(serde_json::json!({"schema_version": "1.0", "command": "x", "install": {"command": "i", "unless_exists": "/etc"}})).unwrap_err();
+        assert!(e.message().contains("install.unless_exists"), "{e:?}");
     }
 }
