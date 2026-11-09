@@ -22,10 +22,15 @@
 //! shutdown and any end of the preview (a failure, the docker CLI exiting)
 //! remove it. A `client serve` killed without its handlers cannot, so each
 //! container watches a heartbeat file `client serve` touches every 30 s
-//! (mounted read-only at [`HEARTBEAT_AT`]) and stops itself once it is two
-//! minutes old; one left behind is also removed when the next `client serve`
-//! starts (it carries its host's labels, like a dispatch container). No
-//! preview process runs on the host.
+//! (mounted read-only at [`HEARTBEAT_AT`]) and stops itself once the file
+//! has not changed for 12 looks 10 s apart. It counts looks rather than
+//! comparing the file with the clock, which Docker Desktop resyncs after the
+//! Mac sleeps; sleep counts nothing there (the idle timeout is the one
+//! policy that counts it). The watchdog runs in the same container as the
+//! workspace's code, which can kill it; such a preview is left to what
+//! covered it before the heartbeat: one left behind is removed when the next
+//! `client serve` starts (it carries its host's labels, like a dispatch
+//! container). No preview process runs on the host.
 //!
 //! **What a preview container can reach.** No host file outside the
 //! workspace and no host environment. It does have the network, and on
@@ -444,16 +449,22 @@ const STALE_LINE: &str =
 
 /// (#3456 review F2) Where a preview container sees its heartbeat folder,
 /// read-only. `client serve` touches the file in it every [`BEAT_EVERY`];
-/// the container stops itself once the file is [`HEARTBEAT_STALE_SECS`]
-/// old, so a `client serve` killed without its handlers (SIGKILL, a crash)
-/// does not leave a dev server running until the next one starts.
+/// the container stops itself once the file's mtime has not changed for
+/// [`HEARTBEAT_MISSED_LOOKS`] looks in a row, so a `client serve` killed
+/// without its handlers (SIGKILL, a crash) does not leave a dev server
+/// running until the next one starts. It counts looks, never compares the
+/// mtime with the clock: after the Mac sleeps, Docker Desktop resyncs the
+/// VM's clock, which would make a live preview's heartbeat look old. Sleep
+/// counts nothing here; the idle timeout (#3459) is the one policy that
+/// counts it.
 pub const HEARTBEAT_AT: &str = "/darkmux-heartbeat";
 /// The heartbeat file's name, in its folder.
 pub const HEARTBEAT_FILE: &str = "alive";
 /// How often `client serve` touches each live preview's heartbeat.
 pub const BEAT_EVERY: Duration = Duration::from_secs(30);
-/// How old the heartbeat may get before the container stops itself.
-pub const HEARTBEAT_STALE_SECS: u64 = 120;
+/// How many looks in a row may find the heartbeat unchanged before the
+/// container stops itself: 12 looks 10 s apart, two minutes of running time.
+pub const HEARTBEAT_MISSED_LOOKS: u32 = 12;
 /// How often the container looks at its heartbeat, in seconds.
 const HEARTBEAT_CHECK_SECS: &str = "10";
 
@@ -462,7 +473,8 @@ const HEARTBEAT_CHECK_SECS: &str = "10";
 struct Watch {
     /// The heartbeat file, as the container sees it.
     file: String,
-    stale_secs: u64,
+    /// Looks in a row that may find it unchanged.
+    missed: u32,
     /// `sleep`'s argument between looks.
     every: String,
 }
@@ -471,7 +483,7 @@ impl Watch {
     fn production() -> Self {
         Watch {
             file: format!("{HEARTBEAT_AT}/{HEARTBEAT_FILE}"),
-            stale_secs: HEARTBEAT_STALE_SECS,
+            missed: HEARTBEAT_MISSED_LOOKS,
             every: HEARTBEAT_CHECK_SECS.to_string(),
         }
     }
@@ -583,17 +595,21 @@ fn container_script(recipe: &Recipe, install_due: bool, watch: &Watch) -> String
 
 /// The background loop that stops the container when darkmux stops
 /// beating: every `watch.every` it reads the heartbeat's mtime (GNU `stat`,
-/// else BSD's), and once it is more than `watch.stale_secs` old (or gone)
-/// it says so and ends the script (`$$`, the script's own pid).
+/// else BSD's; a missing file reads as `gone`), counts the looks in a row
+/// that found it unchanged, and once that reaches `watch.missed` it says so
+/// and ends the script (`$$`, the script's own pid). Workspace code runs in
+/// the same container and can kill this loop; then the preview is left to
+/// the reaper at the next `client serve` start, as before the heartbeat.
 fn watchdog(watch: &Watch) -> String {
     format!(
-        "( while kill -0 $$ 2>/dev/null && sleep {every}; do \
-         seen=$(stat -c %Y '{file}' 2>/dev/null || stat -f %m '{file}' 2>/dev/null || echo 0); \
-         if [ $(( $(date +%s) - seen )) -gt {stale} ]; then echo '{STALE_LINE}'; kill -TERM $$; exit 0; fi; \
+        "( last=''; same=0; while kill -0 $$ 2>/dev/null && sleep {every}; do \
+         seen=$(stat -c %Y '{file}' 2>/dev/null || stat -f %m '{file}' 2>/dev/null || echo gone); \
+         if [ \"$seen\" = \"$last\" ]; then same=$((same + 1)); else same=0; last=$seen; fi; \
+         if [ $same -ge {missed} ]; then echo '{STALE_LINE}'; kill -TERM $$; exit 0; fi; \
          done ) &\n",
         every = watch.every,
         file = watch.file,
-        stale = watch.stale_secs,
+        missed = watch.missed,
     )
 }
 
@@ -914,7 +930,7 @@ impl Previews {
 
     /// (#3456 review F2) Touches the heartbeat of every live preview. `client
     /// serve` calls it every [`BEAT_EVERY`]; a container whose heartbeat is
-    /// [`HEARTBEAT_STALE_SECS`] old stops itself.
+    /// heartbeat stops changing for [`HEARTBEAT_MISSED_LOOKS`] looks stops itself.
     pub fn beat(&self) {
         let files: Vec<PathBuf> = self
             .entries
@@ -1688,7 +1704,7 @@ mod tests {
             "install": {"command": "echo installing; exit 4", "unless_exists": "node_modules"}
         }));
         let beat = tempfile::NamedTempFile::new().unwrap();
-        let watch = a_watch(beat.path(), 60);
+        let watch = a_watch(beat.path(), 600);
         let not_due = container_script(&recipe, false, &watch);
         assert!(!not_due.contains("installing"), "{not_due}");
         // Waited on, not `output()`: the watchdog in the background keeps
@@ -1711,10 +1727,10 @@ mod tests {
     }
 
     /// A watchdog on a host file, looking every 0.1 s.
-    fn a_watch(file: &Path, stale_secs: u64) -> Watch {
+    fn a_watch(file: &Path, missed: u32) -> Watch {
         Watch {
             file: file.display().to_string(),
-            stale_secs,
+            missed,
             every: "0.1".to_string(),
         }
     }
@@ -1726,46 +1742,62 @@ mod tests {
             .unwrap();
     }
 
+    /// Sets `file`'s mtime to `secs` seconds after a fixed point a day ago.
+    fn beat_at(file: &Path, secs: u64) {
+        let day_ago = std::time::SystemTime::now() - Duration::from_secs(86_400);
+        let f = std::fs::OpenOptions::new().write(true).open(file).unwrap();
+        f.set_modified(day_ago + Duration::from_secs(secs)).unwrap();
+    }
+
     /// (#3456 review F2, the old `a_preview_ends_when_darkmux_does`) A
     /// preview container stops itself once darkmux stops beating: its script
-    /// runs while the heartbeat is fresh, and ends, saying why, once it is
-    /// stale. Driven directly with a 1 s threshold, not two minutes.
+    /// runs while the heartbeat keeps changing, and ends, saying why, once it
+    /// has not changed for `missed` looks. (#3456 review B) It never compares
+    /// the heartbeat with the clock: these beats are a day behind it, as
+    /// they would look after the VM's clock jumped on wake, and still count.
+    /// Driven directly, looking every 0.1 s.
     #[cfg(unix)]
     #[test]
     fn a_preview_ends_when_darkmux_does() {
         use std::os::unix::process::CommandExt;
         let beat = tempfile::NamedTempFile::new().unwrap();
+        beat_at(beat.path(), 0);
         let recipe = a_recipe(serde_json::json!({"schema_version": "1.0", "command": "sleep 30"}));
         let out = tempfile::NamedTempFile::new().unwrap();
         let mut sh = std::process::Command::new("sh")
             .arg("-c")
-            .arg(container_script(&recipe, false, &a_watch(beat.path(), 1)))
+            .arg(container_script(&recipe, false, &a_watch(beat.path(), 5)))
             .stdout(out.reopen().unwrap())
             .process_group(0)
             .spawn()
             .unwrap();
         let group = sh.id() as i32;
-        for _ in 0..8 {
-            touch(beat.path());
-            std::thread::sleep(Duration::from_millis(200));
+        // A beat every 0.3 s, the looks every 0.1 s: two or so unchanged looks
+        // between beats, under the 5 allowed only because a change resets
+        // the count.
+        for i in 1..=12 {
+            beat_at(beat.path(), i);
+            std::thread::sleep(Duration::from_millis(300));
         }
-        assert!(
-            sh.try_wait().unwrap().is_none(),
-            "a fresh heartbeat keeps it running"
-        );
-        age(beat.path(), 5);
+        let alive = sh.try_wait().unwrap().is_none();
         let mut ended = None;
-        for _ in 0..40 {
-            ended = sh.try_wait().unwrap();
-            if ended.is_some() {
-                break;
+        if alive {
+            for _ in 0..40 {
+                ended = sh.try_wait().unwrap();
+                if ended.is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
             }
-            std::thread::sleep(Duration::from_millis(100));
         }
         unsafe { libc::kill(-group, libc::SIGKILL) };
         assert!(
+            alive,
+            "a changing heartbeat keeps it running, however old its mtime"
+        );
+        assert!(
             ended.is_some(),
-            "a stale heartbeat ends the container's script"
+            "an unchanging heartbeat ends the container's script"
         );
         let said = std::fs::read_to_string(out.path()).unwrap();
         assert!(said.contains(STALE_LINE), "{said}");

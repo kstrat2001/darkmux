@@ -83,7 +83,9 @@ darkmux release.
   installed there holds Linux binaries (the workspace is darkmux's worktree, not your checkout).
   A dev server that binds 127.0.0.1 in its container is named as the reason when it never
   answers. If `client serve` is killed without stopping its previews, each container stops itself
-  once a heartbeat `client serve` touches every 30 s is two minutes old. A preview container has
+  once a heartbeat `client serve` touches every 30 s has not changed for 12 looks 10 s apart (it
+  never compares the heartbeat with the clock, so a Mac waking from sleep does not stop a live
+  preview). A preview container has
   the network, and through `host.docker.internal` it reaches this Mac's loopback services (LM
   Studio, the darkmux daemons, local databases), as a dispatch container does. A recipe's `env`
   keys must be variable names. Previews need Docker now.
