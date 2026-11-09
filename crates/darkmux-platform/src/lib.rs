@@ -136,6 +136,17 @@ pub trait Platform: Send + Sync {
     /// from another answering on the same port under the same model name.
     fn tcp_listeners(&self, port: u16) -> Option<Vec<u32>>;
 
+    /// The process on this machine at the other end of a loopback TCP
+    /// connection to this process's listener `local`, for every such
+    /// connection at once: `(peer, pid)`, where `peer` is the other end's
+    /// own address (a process this user cannot see is left out). `None` when
+    /// the platform cannot say. What tells apart the processes that connect
+    /// to a loopback listener, since every container's connection to this
+    /// machine arrives from the one process forwarding it (Docker's); one
+    /// call answers every connection, so a flood costs one read, not one per
+    /// connection.
+    fn tcp_peers_of(&self, local: std::net::SocketAddr) -> Option<Vec<(std::net::SocketAddr, u32)>>;
+
     /// The process group `pid` is in; `None` for no such process, or where
     /// the platform has no reader.
     fn process_group(&self, pid: u32) -> Option<u32>;
@@ -362,6 +373,25 @@ pub fn xdg_data_home_from(
 /// other field line is skipped.
 pub(crate) fn pids_from_lsof_fp(out: &str) -> Vec<u32> {
     out.lines().filter_map(|l| l.strip_prefix('p')).filter_map(|p| p.trim().parse().ok()).collect()
+}
+
+/// Every `(peer, pid)` in `lsof -Fpn`'s answer whose socket is connected
+/// to `local` (a `n<peer>-><local>` line under its `p<pid>` line). The
+/// listener's own ends (`n<local>-><peer>`) are not peers.
+pub(crate) fn peers_from_lsof_fpn(out: &str, local: std::net::SocketAddr) -> Vec<(std::net::SocketAddr, u32)> {
+    let to = format!("->{local}");
+    let mut pid = None;
+    let mut peers = Vec::new();
+    for line in out.lines() {
+        if let Some(p) = line.strip_prefix('p') {
+            pid = p.trim().parse().ok();
+        } else if let Some(peer) = line.strip_prefix('n').and_then(|n| n.strip_suffix(to.as_str())) {
+            if let (Ok(peer), Some(pid)) = (peer.parse(), pid) {
+                peers.push((peer, pid));
+            }
+        }
+    }
+    peers
 }
 
 /// `getpgid(pid)`, shared by the Unix strategies.

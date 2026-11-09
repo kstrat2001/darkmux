@@ -739,10 +739,18 @@ pub fn cmd_allowed(verb: &str) -> bool {
 /// request (the process-wide [`config`] tier is read once), the same way the
 /// fleet listener reads its allow-list.
 pub fn clients_profiles_in(cfg: &DarkmuxConfig) -> Option<Vec<String>> {
+    clients_profiles_with_source_in(cfg).0
+}
+/// [`clients_profiles_in`] and the tier that set it (unset is built-in).
+fn clients_profiles_with_source_in(cfg: &DarkmuxConfig) -> (Option<Vec<String>>, Source) {
     if let Some(s) = env_str("DARKMUX_CLIENTS_PROFILES") {
-        return Some(s.split(',').map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).collect());
+        let list = s.split(',').map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).collect();
+        return (Some(list), Source::Env);
     }
-    cfg.clients.as_ref().and_then(|c| c.profiles.clone())
+    match cfg.clients.as_ref().and_then(|c| c.profiles.clone()) {
+        Some(list) => (Some(list), Source::Config),
+        None => (None, Source::BuiltIn),
+    }
 }
 /// Whether a paired app may start a live preview, against `cfg`:
 /// `env(DARKMUX_CLIENTS_PREVIEW_ENABLED)` > `cfg.clients.preview.enabled` >
@@ -750,10 +758,17 @@ pub fn clients_profiles_in(cfg: &DarkmuxConfig) -> Option<Vec<String>> {
 /// preview runs the workspace's own code (in a container with network
 /// access, #3456), which is why it is off by default.
 pub fn clients_preview_enabled_in(cfg: &DarkmuxConfig) -> bool {
+    clients_preview_enabled_with_source_in(cfg).0
+}
+/// [`clients_preview_enabled_in`] and the tier that set it.
+fn clients_preview_enabled_with_source_in(cfg: &DarkmuxConfig) -> (bool, Source) {
     if let Some(s) = env_str("DARKMUX_CLIENTS_PREVIEW_ENABLED") {
-        return parse_bool_token(&s).unwrap_or(false);
+        return (parse_bool_token(&s).unwrap_or(false), Source::Env);
     }
-    cfg.clients.as_ref().and_then(|c| c.preview.as_ref()).and_then(|p| p.enabled).unwrap_or(false)
+    match cfg.clients.as_ref().and_then(|c| c.preview.as_ref()).and_then(|p| p.enabled) {
+        Some(on) => (on, Source::Config),
+        None => (false, Source::BuiltIn),
+    }
 }
 /// The built-in `clients.preview.idle_minutes`.
 pub const CLIENTS_PREVIEW_IDLE_MINUTES_DEFAULT: u64 = 15;
@@ -763,21 +778,39 @@ pub const CLIENTS_PREVIEW_IDLE_MINUTES_DEFAULT: u64 = 15;
 /// `cfg.clients.preview.idle_minutes` > 15. `0` means never. Read fresh by
 /// each idle check, so `darkmux config set` applies without a restart.
 pub fn clients_preview_idle_minutes_in(cfg: &DarkmuxConfig) -> u64 {
+    clients_preview_idle_minutes_with_source_in(cfg).0
+}
+/// [`clients_preview_idle_minutes_in`] and the tier that set it.
+fn clients_preview_idle_minutes_with_source_in(cfg: &DarkmuxConfig) -> (u64, Source) {
     let written = cfg
         .clients
         .as_ref()
         .and_then(|c| c.preview.as_ref())
         .and_then(|p| p.idle_minutes);
-    pick_parsed(
+    let (v, s) = pick_parsed_with_source(
         "DARKMUX_CLIENTS_PREVIEW_IDLE_MINUTES",
         written,
         Some(CLIENTS_PREVIEW_IDLE_MINUTES_DEFAULT),
-    )
-    .unwrap_or(CLIENTS_PREVIEW_IDLE_MINUTES_DEFAULT)
+    );
+    (v.unwrap_or(CLIENTS_PREVIEW_IDLE_MINUTES_DEFAULT), s)
 }
 /// [`clients_profiles_in`] against this process's config tier.
 pub fn clients_profiles() -> Option<Vec<String>> {
     clients_profiles_in(config())
+}
+/// [`clients_profiles`] and the tier that set it.
+pub fn clients_profiles_with_source() -> (Option<Vec<String>>, Source) {
+    clients_profiles_with_source_in(config())
+}
+/// [`clients_preview_enabled_in`] against this process's config tier, and
+/// the tier that set it.
+pub fn clients_preview_enabled_with_source() -> (bool, Source) {
+    clients_preview_enabled_with_source_in(config())
+}
+/// [`clients_preview_idle_minutes_in`] against this process's config tier,
+/// and the tier that set it.
+pub fn clients_preview_idle_minutes_with_source() -> (u64, Source) {
+    clients_preview_idle_minutes_with_source_in(config())
 }
 
 // ── (#2093) Hooks — flow-record hook sink (match → HTTP POST) ──
@@ -4369,6 +4402,53 @@ mod tests {
             match prev {
                 Some(v) => std::env::set_var(key, v),
                 None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    /// Each `clients.*` setting names the tier its value came from: env,
+    /// config.json, or the built-in default when neither is set.
+    #[serial_test::serial]
+    #[test]
+    fn clients_settings_name_the_tier_that_set_them() {
+        let keys = ["DARKMUX_CLIENTS_PROFILES", "DARKMUX_CLIENTS_PREVIEW_ENABLED", "DARKMUX_CLIENTS_PREVIEW_IDLE_MINUTES"];
+        let prev: Vec<Option<String>> = keys.iter().map(|k| std::env::var(k).ok()).collect();
+        for k in keys {
+            unsafe { std::env::remove_var(k); }
+        }
+        let unset = crate::config::DarkmuxConfig::default();
+        let written = crate::config::DarkmuxConfig {
+            clients: Some(crate::config::ClientsConfig {
+                profiles: Some(vec!["deep".into()]),
+                preview: Some(crate::config::ClientsPreviewConfig {
+                    enabled: Some(true),
+                    idle_minutes: Some(40),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(clients_profiles_with_source_in(&unset), (None, Source::BuiltIn));
+        assert_eq!(clients_preview_enabled_with_source_in(&unset), (false, Source::BuiltIn));
+        assert_eq!(clients_preview_idle_minutes_with_source_in(&unset), (15, Source::BuiltIn));
+        assert_eq!(clients_profiles_with_source_in(&written), (Some(vec!["deep".to_string()]), Source::Config));
+        assert_eq!(clients_preview_enabled_with_source_in(&written), (true, Source::Config));
+        assert_eq!(clients_preview_idle_minutes_with_source_in(&written), (40, Source::Config));
+        unsafe {
+            std::env::set_var(keys[0], "fast");
+            std::env::set_var(keys[1], "false");
+            std::env::set_var(keys[2], "5");
+        }
+        assert_eq!(clients_profiles_with_source_in(&written), (Some(vec!["fast".to_string()]), Source::Env));
+        assert_eq!(clients_preview_enabled_with_source_in(&written), (false, Source::Env));
+        assert_eq!(clients_preview_idle_minutes_with_source_in(&written), (5, Source::Env));
+        for (k, v) in keys.iter().zip(prev) {
+            unsafe {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
             }
         }
     }

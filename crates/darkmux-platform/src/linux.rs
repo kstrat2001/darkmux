@@ -180,6 +180,26 @@ impl Platform for LinuxPlatform {
         Some(pids)
     }
 
+    /// The ESTABLISHED sockets in `/proc/net/tcp` and `tcp6` (where a
+    /// dual-stack client's socket shows its v4-mapped address) whose other
+    /// end is `local`, matched in one pass over every process's fds to the
+    /// process holding each. A process this user cannot read is left out (a
+    /// host-network container run as root, say).
+    fn tcp_peers_of(&self, local: std::net::SocketAddr) -> Option<Vec<(std::net::SocketAddr, u32)>> {
+        let mut ends = connected_to(&read_to_string("/proc/net/tcp")?, local);
+        ends.extend(connected_to(&read_to_string("/proc/net/tcp6").unwrap_or_default(), local));
+        let mut peers = Vec::new();
+        for pid in list_dir("/proc").into_iter().filter_map(|name| name.parse::<u32>().ok()) {
+            for fd in list_dir(&format!("/proc/{pid}/fd")) {
+                let inode = read_link(&format!("/proc/{pid}/fd/{fd}")).and_then(|l| socket_inode(&l));
+                if let Some((peer, _)) = ends.iter().find(|(_, i)| Some(*i) == inode) {
+                    peers.push((*peer, pid));
+                }
+            }
+        }
+        Some(peers)
+    }
+
     fn process_group(&self, pid: u32) -> Option<u32> {
         crate::unix_process_group(pid)
     }
@@ -256,6 +276,49 @@ pub(crate) fn listening_inodes(table: &str, port: u16) -> Vec<u64> {
             (local_port == port && *f.get(3)? == "0A").then(|| f.get(9)?.parse().ok())?
         })
         .collect()
+}
+
+/// Every ESTABLISHED (`01`) socket in a `/proc/net/tcp{,6}` table whose
+/// other end is `to`: its own end and its inode (a v4-mapped IPv6 address
+/// reads as its IPv4 one).
+pub(crate) fn connected_to(table: &str, to: std::net::SocketAddr) -> Vec<(std::net::SocketAddr, u64)> {
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let (own, other) = (proc_net_addr(f.get(1)?)?, proc_net_addr(f.get(2)?)?);
+            (other == to && *f.get(3)? == "01").then(|| Some((own, f.get(9)?.parse().ok()?)))?
+        })
+        .collect()
+}
+
+/// `/proc/net/tcp`'s `0100007F:1F90` (or `tcp6`'s 32 hex digits): the
+/// address as the kernel's in-memory bytes printed as native 32-bit words,
+/// then the port, in hex.
+fn proc_net_addr(s: &str) -> Option<std::net::SocketAddr> {
+    let (ip, port) = s.split_once(':')?;
+    let port = u16::from_str_radix(port, 16).ok()?;
+    let bytes = proc_net_bytes(ip)?;
+    let ip: std::net::IpAddr = match bytes.len() {
+        4 => std::net::Ipv4Addr::from(<[u8; 4]>::try_from(bytes).ok()?).into(),
+        16 => {
+            let v6 = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(bytes).ok()?);
+            v6.to_ipv4_mapped().map_or(v6.into(), Into::into)
+        }
+        _ => return None,
+    };
+    Some(std::net::SocketAddr::from((ip, port)))
+}
+
+/// The address bytes `/proc/net/tcp{,6}` prints as native 32-bit words.
+fn proc_net_bytes(hex: &str) -> Option<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(16);
+    for i in (0..hex.len()).step_by(8) {
+        let word = u32::from_str_radix(hex.get(i..i + 8)?, 16).ok()?;
+        bytes.extend_from_slice(&word.to_ne_bytes());
+    }
+    Some(bytes)
 }
 
 /// The inode an fd's link names when it is a socket (`socket:[41231]`).

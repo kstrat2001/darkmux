@@ -24,6 +24,7 @@ mod checks_power;
 // (#2093) The flow-record hook sink's rows — see the module doc.
 mod checks_hooks;
 mod checks_engines;
+mod checks_clients;
 use checks_hooks::check_hooks;
 mod fleet_submission;
 pub use fleet_submission::{
@@ -193,6 +194,8 @@ pub fn run() -> DoctorReport {
     // (#2947) `None` when a thermal threshold is bad config; that value's
     // own enum-settings row reports it.
     checks.extend(check_thermal_governor());
+    // What `darkmux client serve` reads on every request (`clients.*`).
+    checks.extend(checks_clients::check_clients_settings());
     checks.extend(vec![
         check_host_probe(),
         check_quarantined_mirrors(),
@@ -12710,8 +12713,11 @@ mod tests {
         // the lms binary row.
         //
         // (#3453) 73: `checks_engines::check_flint_engine` joined beside it.
+        //
+        // 76: `checks_clients::check_clients_settings` adds one row per
+        // `clients.*` setting (three), after the thermal rows.
         let expected =
-            73 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            76 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

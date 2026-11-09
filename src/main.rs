@@ -677,6 +677,8 @@ fn cmd_doctor(verbose: bool, probe: bool) -> Result<i32> {
     // (#3022) The fleet hub and the defaults it hands out, read from the same
     // fleet view `machine list` prints.
     report.checks.extend(fleet_defaults::doctor_checks());
+    // Client workspaces no paired app owns, and how to give one to a client.
+    report.checks.extend(client_cli::doctor_checks());
 
     // (#1177) Opt-in live endpoint probes append to the same report so they
     // share the verdict/exit-code path — a failed probe exits 1 like any

@@ -26,6 +26,9 @@ pub struct FakePlatform {
     /// How many [`Platform::tcp_listeners`] reads cannot say (`None`) before
     /// the reads answer; each read counts one down.
     pub tcp_listeners_unreadable_reads: std::sync::atomic::AtomicU32,
+    /// The `(peer, pid)` pairs [`Platform::tcp_peers_of`] answers, whatever
+    /// the listener.
+    pub tcp_peers: Vec<(std::net::SocketAddr, u32)>,
     /// `(pid, group)` pairs [`Platform::process_group`] answers.
     pub process_groups: Vec<(u32, u32)>,
 }
@@ -51,6 +54,7 @@ impl Default for FakePlatform {
             tcp_listeners: Vec::new(),
             tcp_listeners_unreadable: false,
             tcp_listeners_unreadable_reads: std::sync::atomic::AtomicU32::new(0),
+            tcp_peers: Vec::new(),
             process_groups: Vec::new(),
         }
     }
@@ -153,6 +157,10 @@ impl Platform for FakePlatform {
             return None;
         }
         Some(self.tcp_listeners.iter().find(|(p, _)| *p == port).map(|(_, pids)| pids.clone()).unwrap_or_default())
+    }
+
+    fn tcp_peers_of(&self, _local: std::net::SocketAddr) -> Option<Vec<(std::net::SocketAddr, u32)>> {
+        Some(self.tcp_peers.clone())
     }
 
     fn process_group(&self, pid: u32) -> Option<u32> {

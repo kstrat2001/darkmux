@@ -23,6 +23,10 @@ darkmux-fleet = { path = "../darkmux-fleet" }
 # promoted to direct because this crate now names it.
 darkmux-hardware = { path = "../darkmux-hardware" }
 darkmux-doctor = { path = "../darkmux-doctor" }
+# `tcp_peer_pid`: which process on this machine sent a pairing request. Already
+# in this crate's dependency tree through darkmux-crew; promoted to direct
+# because this crate now names it.
+darkmux-platform = { path = "../darkmux-platform" }
 # (#1247 Part 3) Lab observer lens — reuses `lab::review::ReviewEnvelope` +
 # `lab::scores::{ScoresDoc, read_scores}` so the daemon parses the SAME
 # artifact shapes the lab writes instead of re-deriving a

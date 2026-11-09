@@ -953,3 +953,60 @@ fn the_host_names_a_ports_listener_and_a_process_group() {
     let fake = FakePlatform { tcp_listeners: vec![(port, vec![7])], process_groups: vec![(7, 5)], ..Default::default() };
     assert_eq!((fake.tcp_listeners(port), fake.tcp_listeners(1), fake.process_group(7)), (Some(vec![7]), Some(vec![]), Some(5)));
 }
+
+/// `lsof -Fpn`: every process holding a peer's end of a connection to the
+/// listener, from the name lines that run from a peer to the listener; the
+/// listener's own ends (the reverse direction) and other ports are not.
+#[test]
+fn lsof_names_the_process_at_each_peers_end() {
+    let local: std::net::SocketAddr = "127.0.0.1:8767".parse().unwrap();
+    let out = "p11936\nf4\nn127.0.0.1:8767->127.0.0.1:55807\nf5\nn127.0.0.1:8767->127.0.0.1:55808\n\
+               p92120\nf390\nn127.0.0.1:55807->127.0.0.1:8767\nf391\nn127.0.0.1:55808->127.0.0.1:8767\n\
+               p500\nf3\nn127.0.0.1:55809->127.0.0.1:9999\n";
+    assert_eq!(
+        crate::peers_from_lsof_fpn(out, local),
+        vec![("127.0.0.1:55807".parse().unwrap(), 92120), ("127.0.0.1:55808".parse().unwrap(), 92120)]
+    );
+    assert!(crate::peers_from_lsof_fpn("p11936\nf4\nn127.0.0.1:8767->127.0.0.1:55807\n", local).is_empty());
+    assert!(crate::peers_from_lsof_fpn("", local).is_empty());
+}
+
+/// `/proc/net/tcp{,6}`: every ESTABLISHED socket whose other end is the
+/// listener, by its own end; the listener's own sockets (the reverse), a
+/// LISTEN socket and another port are not. A dual-stack client's socket in
+/// `tcp6` shows its v4-mapped address.
+#[test]
+fn proc_net_tcp_names_the_socket_at_each_peers_end() {
+    let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+   0: 0100007F:223F 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 41231 1 0000000000000000 100 0 0 10 0\n\
+   1: 0100007F:223F 0100007F:D431 01 00000000:00000000 00:00000000 00000000  1000        0 41232 1 0000000000000000 100 0 0 10 0\n\
+   2: 0100007F:D431 0100007F:223F 01 00000000:00000000 00:00000000 00000000  1000        0 41233 1 0000000000000000 100 0 0 10 0\n\
+   3: 0100007F:D432 0100007F:0001 01 00000000:00000000 00:00000000 00000000  1000        0 41234 1 0000000000000000 100 0 0 10 0\n";
+    let local: std::net::SocketAddr = "127.0.0.1:8767".parse().unwrap();
+    let peer: std::net::SocketAddr = "127.0.0.1:54321".parse().unwrap();
+    assert_eq!(crate::linux::connected_to(table, local), vec![(peer, 41233)]);
+    assert!(crate::linux::connected_to(table, "127.0.0.1:2".parse().unwrap()).is_empty());
+    let table6 = "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+   0: 0000000000000000FFFF00000100007F:D431 0000000000000000FFFF00000100007F:223F 01 00000000:00000000 00:00000000 00000000  1000        0 51233 1 0000000000000000 20 4 30 10 -1\n";
+    assert_eq!(crate::linux::connected_to(table6, local), vec![(peer, 51233)]);
+}
+
+/// This host's strategy names the process at the other end of every
+/// loopback connection to a listener at once: here, this test's own process
+/// for both of two connections. An OS with no strategy cannot say; the fake
+/// answers what the test set.
+#[test]
+fn the_host_names_the_process_at_each_loopback_connections_other_end() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let local = listener.local_addr().unwrap();
+    let clients = [std::net::TcpStream::connect(local).unwrap(), std::net::TcpStream::connect(local).unwrap()];
+    let _accepted = [listener.accept().unwrap(), listener.accept().unwrap()];
+    let mut found = current().tcp_peers_of(local).unwrap();
+    found.sort();
+    let mut want: Vec<_> = clients.iter().map(|c| (c.local_addr().unwrap(), std::process::id())).collect();
+    want.sort();
+    assert_eq!(found, want);
+    assert_eq!(OtherPlatform.tcp_peers_of(local), None);
+    let fake = FakePlatform { tcp_peers: vec![(want[0].0, 7)], ..Default::default() };
+    assert_eq!(fake.tcp_peers_of(local), Some(vec![(want[0].0, 7)]));
+}
