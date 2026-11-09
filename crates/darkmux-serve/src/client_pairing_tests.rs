@@ -2507,6 +2507,193 @@ fn a_work_copy_whose_repo_config_defines_a_filter_is_refused() {
     assert!(err.contains("filter.crypt"), "{err}");
 }
 
+/// The operator's global `diff.submodule = diff` makes a diff that shows a
+/// changed submodule run `git diff` inside it, in the repository the run
+/// planted there: reading a run's changes still runs none of its commands.
+#[test]
+#[serial_test::serial]
+fn reading_changes_runs_nothing_a_planted_submodule_names_under_diff_submodule_diff() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let marker = root.join("host-ran-a-planted-submodule");
+    let sub_src = root.join("subsrc");
+    std::fs::create_dir_all(&sub_src).unwrap();
+    run_git(Some(&sub_src), &["init", "-q"]);
+    std::fs::write(sub_src.join("s.txt"), "s\n").unwrap();
+    run_git(Some(&sub_src), &["add", "s.txt"]);
+    run_git(Some(&sub_src), &["commit", "-qm", "s"]);
+    let (w, g) = (root.join("w"), root.join(".w.git"));
+    run_git(None, &["init", "-q", "--separate-git-dir", g.to_str().unwrap(), w.to_str().unwrap()]);
+    run_git(Some(&w), &["-c", "protocol.file.allow=always", "submodule", "add", "-q", sub_src.to_str().unwrap(), "sub"]);
+    run_git(Some(&w), &["commit", "-qm", "with sub"]);
+    run_git(Some(&w), &["submodule", "--quiet", "deinit", "-f", "--", "sub"]);
+    let wd = WorkCopy { work_tree: w.clone(), git_dir: g.canonicalize().unwrap() };
+    let global = root.join("global-config");
+    std::fs::write(&global, "[diff]\n\tsubmodule = diff\n").unwrap();
+    let prev = std::env::var_os("GIT_CONFIG_GLOBAL");
+    // SAFETY: #[serial]; restored below.
+    unsafe { std::env::set_var("GIT_CONFIG_GLOBAL", &global) };
+    let read = (|| {
+        let before = snapshot_tree(&wd)?;
+        // The run: its own clone with a commit of its own, carrying filters
+        // and a textconv, and a changed file.
+        let sub = w.join("sub");
+        let _ = std::fs::remove_dir_all(&sub);
+        run_git(None, &["clone", "-q", sub_src.to_str().unwrap(), sub.to_str().unwrap()]);
+        let cfg = sub.join(".git").join("config");
+        let mut config = std::fs::read_to_string(&cfg).unwrap();
+        config.push_str(&format!(
+            "[core]\n\tfsmonitor = \"touch '{m}'; false\"\n[filter \"x\"]\n\tclean = \"touch '{m}'; cat\"\n\
+             \tsmudge = \"touch '{m}'; cat\"\n[diff \"x\"]\n\ttextconv = \"touch '{m}'; cat\"\n",
+            m = marker.display()
+        ));
+        std::fs::write(&cfg, config).unwrap();
+        std::fs::write(sub.join(".gitattributes"), "* filter=x diff=x\n").unwrap();
+        run_git(Some(&sub), &["-c", "filter.x.clean=cat", "add", ".gitattributes"]);
+        run_git(Some(&sub), &["-c", "filter.x.clean=cat", "commit", "-qm", "planted"]);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(sub.join("s.txt"), "t\n").unwrap();
+        let _ = std::fs::remove_file(&marker);
+        changes_since(&wd, &before.tree)
+    })();
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("GIT_CONFIG_GLOBAL", v),
+            None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+        }
+    }
+    let changes = read.expect("the changes read");
+    assert!(changes.files.iter().any(|f| f.path == "sub"), "the fixture must arm: {:?}", changes.files);
+    assert!(!marker.exists(), "reading the changes ran the planted submodule's config");
+}
+
+/// A run that fills the work copy's unpopulated submodule with a repository
+/// of its own, at the very commit the index records, so git sees no new
+/// commit and checks its files instead, which spawns git inside it. The
+/// changes read report the submodule; committing them runs nothing the
+/// planted repository names, and its gitlink stays out of the commit while
+/// the run's ordinary file goes in.
+#[test]
+fn committing_a_run_runs_nothing_a_planted_submodule_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let marker = root.join("host-ran-a-planted-submodule");
+    let sub_src = root.join("subsrc");
+    std::fs::create_dir_all(&sub_src).unwrap();
+    run_git(Some(&sub_src), &["init", "-q"]);
+    std::fs::write(sub_src.join("s.txt"), "s\n").unwrap();
+    run_git(Some(&sub_src), &["add", "s.txt"]);
+    run_git(Some(&sub_src), &["commit", "-qm", "s"]);
+    let (w, g) = (root.join("w"), root.join(".w.git"));
+    run_git(None, &["init", "-q", "--separate-git-dir", g.to_str().unwrap(), w.to_str().unwrap()]);
+    std::fs::write(w.join("a.txt"), "a\n").unwrap();
+    run_git(Some(&w), &["add", "a.txt"]);
+    run_git(Some(&w), &["-c", "protocol.file.allow=always", "submodule", "add", "-q", sub_src.to_str().unwrap(), "sub"]);
+    run_git(Some(&w), &["commit", "-qm", "with sub"]);
+    // Unpopulated, as in a fresh worktree: the gitlink is in the index, the
+    // folder is empty.
+    run_git(Some(&w), &["submodule", "--quiet", "deinit", "-f", "--", "sub"]);
+    run_git(Some(&w), &["config", "user.name", "t"]);
+    run_git(Some(&w), &["config", "user.email", "t@t"]);
+    let wd = WorkCopy { work_tree: w.clone(), git_dir: g.canonicalize().unwrap() };
+    let before = snapshot_tree(&wd).expect("snapshots");
+
+    // The run: its own clone at the recorded commit, carrying an fsmonitor
+    // and a clean filter, a changed file inside it, `ignore = none`.
+    let sub = w.join("sub");
+    let _ = std::fs::remove_dir_all(&sub);
+    run_git(None, &["clone", "-q", sub_src.to_str().unwrap(), sub.to_str().unwrap()]);
+    let cfg = sub.join(".git").join("config");
+    let mut config = std::fs::read_to_string(&cfg).unwrap();
+    config.push_str(&format!(
+        "[core]\n\tfsmonitor = \"touch '{m}'; false\"\n[filter \"x\"]\n\tclean = \"touch '{m}'; cat\"\n",
+        m = marker.display()
+    ));
+    std::fs::write(&cfg, config).unwrap();
+    std::fs::write(sub.join(".gitattributes"), "* filter=x\n").unwrap();
+    let mut gitmodules = std::fs::read_to_string(w.join(".gitmodules")).unwrap();
+    gitmodules.push_str("\tignore = none\n");
+    std::fs::write(w.join(".gitmodules"), gitmodules).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::fs::write(sub.join("s.txt"), "t\n").unwrap();
+    std::fs::write(w.join("a.txt"), "changed by the run\n").unwrap();
+
+    let changes = changes_since(&wd, &before.tree).expect("the changes read");
+    assert!(!marker.exists(), "reading the changes ran the planted config");
+    let paths: Vec<String> = changes.files.iter().map(|f| f.path.clone()).collect();
+    assert!(paths.contains(&"sub".to_string()), "the fixture must arm: the submodule is a change: {paths:?}");
+
+    let (sha, _) = commit_run(&wd, &paths, "coder: t (work w-1)").expect("the run's files commit");
+    assert!(!marker.exists(), "committing the run ran the planted submodule's config");
+    let committed = run_git(None, &[&format!("--git-dir={}", g.display()), "show", "--name-only", "--format=", &sha]);
+    assert!(committed.lines().any(|l| l == "a.txt"), "the run's file is committed: {committed}");
+    assert!(!committed.lines().any(|l| l == "sub"), "a gitlink is never committed: {committed}");
+}
+
+/// Each way a submodule reaches a run's paths stays out of its commit: a
+/// gitlink the index records (here one whose folder the run deleted), a
+/// repository the run made (no gitlink yet), and a file inside a populated
+/// submodule. The run's ordinary file still commits.
+#[test]
+fn a_runs_submodules_stay_out_of_its_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let sub_src = root.join("subsrc");
+    std::fs::create_dir_all(&sub_src).unwrap();
+    run_git(Some(&sub_src), &["init", "-q"]);
+    std::fs::write(sub_src.join("s.txt"), "s\n").unwrap();
+    run_git(Some(&sub_src), &["add", "s.txt"]);
+    run_git(Some(&sub_src), &["commit", "-qm", "s"]);
+    let w = root.join("w");
+    std::fs::create_dir_all(&w).unwrap();
+    git_repo(&w);
+    run_git(Some(&w), &["config", "user.name", "t"]);
+    run_git(Some(&w), &["config", "user.email", "t@t"]);
+    std::fs::write(w.join("a.txt"), "a\n").unwrap();
+    run_git(Some(&w), &["add", "a.txt"]);
+    for s in ["gone", "kept"] {
+        run_git(Some(&w), &["-c", "protocol.file.allow=always", "submodule", "add", "-q", sub_src.to_str().unwrap(), s]);
+    }
+    run_git(Some(&w), &["commit", "-qm", "with subs"]);
+    std::fs::remove_dir_all(w.join("gone")).unwrap();
+    run_git(None, &["clone", "-q", sub_src.to_str().unwrap(), w.join("made").to_str().unwrap()]);
+    std::fs::write(w.join("kept").join("s.txt"), "t\n").unwrap();
+    std::fs::write(w.join("a.txt"), "changed by the run\n").unwrap();
+
+    let paths: Vec<String> = ["a.txt", "gone", "made", "kept/s.txt"].iter().map(|s| s.to_string()).collect();
+    let (sha, _) = commit_run(&wc(&w), &paths, "m").expect("the run's file commits");
+    let committed = run_git(Some(&w), &["show", "--name-only", "--format=", &sha]);
+    assert_eq!(committed, "a.txt", "only the run's ordinary file is committed");
+}
+
+/// A run whose only change is a submodule commits nothing, and says why,
+/// rather than handing git an empty path list (which would commit whatever
+/// else is staged).
+#[test]
+fn a_run_that_changed_only_a_submodule_commits_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let sub_src = root.join("subsrc");
+    std::fs::create_dir_all(&sub_src).unwrap();
+    run_git(Some(&sub_src), &["init", "-q"]);
+    std::fs::write(sub_src.join("s.txt"), "s\n").unwrap();
+    run_git(Some(&sub_src), &["add", "s.txt"]);
+    run_git(Some(&sub_src), &["commit", "-qm", "s"]);
+    let w = root.join("w");
+    std::fs::create_dir_all(&w).unwrap();
+    git_repo(&w);
+    run_git(Some(&w), &["-c", "protocol.file.allow=always", "submodule", "add", "-q", sub_src.to_str().unwrap(), "sub"]);
+    run_git(Some(&w), &["commit", "-qm", "with sub"]);
+    run_git(Some(&w), &["config", "user.name", "t"]);
+    run_git(Some(&w), &["config", "user.email", "t@t"]);
+    std::fs::write(w.join("staged.txt"), "the user's, staged\n").unwrap();
+    run_git(Some(&w), &["add", "staged.txt"]);
+    let head = run_git(Some(&w), &["rev-parse", "HEAD"]);
+    let err = commit_run(&wc(&w), &["sub".to_string()], "m").unwrap_err();
+    assert!(err.contains("submodule"), "{err}");
+    assert_eq!(run_git(Some(&w), &["rev-parse", "HEAD"]), head, "nothing was committed");
+}
+
 #[test]
 fn a_workdir_that_is_not_a_git_repo_has_no_snapshot() {
     let dir = tempfile::tempdir().unwrap();
@@ -2543,6 +2730,24 @@ async fn a_done_run_reports_its_changes_and_null_outside_git() {
     let (_, v) = call(&h, post("/client/work", Some(&token), work_for("coder"))).await;
     let done = wait_done(&h, &token, v["work_id"].as_str().unwrap()).await;
     assert_eq!(done["changes"], Value::Null, "no workdir, nothing to diff");
+}
+
+/// Once `client serve` begins to stop, a request that could start
+/// something (work, a preview, a pairing) is refused with `unavailable`
+/// and starts nothing; reads still answer.
+#[tokio::test]
+async fn once_stopping_a_request_that_could_start_something_is_refused() {
+    let h = harness();
+    let token = paired(&h).await;
+    h.state.previews.begin_shutdown();
+    let (code, v) = call(&h, post("/client/work", Some(&token), work_for("coder"))).await;
+    assert_eq!((code, v["code"].as_str()), (503, Some("unavailable")), "{v}");
+    let (code, v) = call(&h, post("/client/workspaces/wt1/preview", Some(&token), serde_json::json!({}))).await;
+    assert_eq!((code, v["code"].as_str()), (503, Some("unavailable")), "{v}");
+    assert!(h.ran.lock().unwrap().is_empty(), "no work ran");
+    assert!(h.containers.specs.lock().unwrap().is_empty(), "no preview container");
+    let (code, _) = call(&h, get("/client/profiles", &[("authorization", &format!("Bearer {token}"))])).await;
+    assert_eq!(code, 200, "reads still answer");
 }
 
 #[test]

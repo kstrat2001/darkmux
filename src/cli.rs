@@ -1715,7 +1715,8 @@ pub(crate) enum SubmitCmd {
 #[derive(Subcommand)]
 pub enum ClientCmd {
     /// Listen for pairing and work requests on 127.0.0.1 (never any other
-    /// address). Runs until Ctrl-C.
+    /// address). Runs until Ctrl-C, SIGTERM or SIGHUP, each of which stops
+    /// its previews on the way out.
     Serve {
         /// Port on 127.0.0.1.
         #[arg(long, default_value_t = darkmux_serve::client_pairing::DEFAULT_PORT)]

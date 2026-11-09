@@ -14,13 +14,15 @@
 //! `.rs` file under the root crate's `src/` and each workspace crate's
 //! `src/`, skips test code (`*_tests.rs`, `tests.rs`, and any item under a
 //! `#[cfg(test)]` attribute), and fails on any line in a file not on
-//! [`ALLOWED`] that spawns git in one of the shapes [`is_git_spawn`] knows:
-//! `Command::new("git")` or `Command::new("/usr/bin/git")`, `Command::new(X)`
-//! where the file declares `const X: &str = "git"`, the program built as a
-//! value (`"git".to_string()`, `String::from("git")`, `OsStr::new("git")`),
-//! and a shell string running git (`"git status"`, `"…; git …"`) near a
-//! `"-c"`. A spawn written some other way (the program read from config, or
-//! assembled from pieces) is not seen.
+//! [`ALLOWED`] that names git in one of the shapes [`is_git_spawn`] knows:
+//! any string literal (plain or raw) that is `git` or ends in `/git` and is
+//! not a key or a comparison (so a binding, a wrapper's argument, `xcrun` or
+//! `env` running it, a constant and a spawn split over lines are all seen
+//! where the name is written), `Command::new(X)` where any scanned file
+//! declares `const X: &str = "git"`, and a shell string running git (`"git
+//! status"`, `"…; git …"`, `"exec git …"`, `"env git …"`) near a `"-c"` or
+//! `"-lc"`. A spawn written some other way (the program read from config,
+//! or assembled from pieces) is not seen.
 //! `runtime/` is not scanned: it runs inside the container, where git reads
 //! only what the container can see.
 //!
@@ -29,82 +31,172 @@
 
 use std::path::{Path, PathBuf};
 
-/// Ways of naming git as a program VALUE, outside `Command::new`.
-const VALUE_SHAPES: [&str; 6] = [
-    "\"git\".to_string()",
-    "\"git\".to_owned()",
-    "\"git\".into()",
-    "String::from(\"git\")",
-    "OsStr::new(\"git\")",
-    "OsString::from(\"git\")",
-];
+/// Shell words that run the command after them (`exec git`, `env -i git`).
+const SHELL_PREFIXES: [&str; 6] = ["exec", "env", "xcrun", "command", "nohup", "time"];
 
-/// How a shell string starts git: at its start or after a separator.
-const SHELL_GIT: [&str; 7] = ["\"git ", "; git ", "&& git ", "|| git ", "| git ", "$(git ", "\\ngit "];
-
-/// The string literals on a code line, roughly: the text between pairs of
-/// unescaped quotes.
-fn literals(code: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur: Option<String> = None;
-    let mut chars = code.chars();
-    while let Some(c) = chars.next() {
-        match (&mut cur, c) {
-            (Some(buf), '\\') => {
-                buf.push('\\');
-                if let Some(n) = chars.next() {
-                    buf.push(n);
-                }
-            }
-            (Some(_), '"') => out.push(cur.take().unwrap()),
-            (Some(buf), c) => buf.push(c),
-            (None, '"') => cur = Some(String::new()),
-            (None, _) => {}
-        }
-    }
-    out
+/// A string literal on a code line: its byte span (from its opening quote,
+/// or the `r` of a raw string, to just past its closing quote) and its text.
+struct Lit {
+    start: usize,
+    end: usize,
+    text: String,
 }
 
-/// The names a file binds to the git program: `const X: &str = "git";`.
+/// The string literals on a code line (plain, with escapes kept as written,
+/// and raw), and where its code ends (a `//` comment outside a literal).
+/// Char literals and lifetimes are stepped over.
+fn literals(code: &str) -> (Vec<Lit>, usize) {
+    let c: Vec<(usize, char)> = code.char_indices().collect();
+    let at = |i: usize| c.get(i).map(|x| x.1);
+    let byte = |i: usize| c.get(i).map_or(code.len(), |x| x.0);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < c.len() {
+        let ch = c[i].1;
+        let after_ident = i > 0 && (c[i - 1].1.is_alphanumeric() || c[i - 1].1 == '_');
+        if ch == '/' && at(i + 1) == Some('/') {
+            return (out, byte(i));
+        }
+        if ch == '\'' {
+            if at(i + 1) == Some('\\') {
+                i += 2;
+                while i < c.len() && c[i].1 != '\'' {
+                    i += 1;
+                }
+                i += 1;
+            } else if at(i + 2) == Some('\'') {
+                i += 3;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        let hashes = c[(i + 1).min(c.len())..].iter().take_while(|x| x.1 == '#').count();
+        if ch == 'r' && !after_ident && at(i + 1 + hashes) == Some('"') {
+            let body = i + 2 + hashes;
+            let mut j = body;
+            while j < c.len() && !(c[j].1 == '"' && c[j + 1..].iter().take(hashes).filter(|x| x.1 == '#').count() == hashes) {
+                j += 1;
+            }
+            let end = (j + 1 + hashes).min(c.len());
+            out.push(Lit { start: byte(i), end: byte(end), text: c[body..j.min(c.len())].iter().map(|x| x.1).collect() });
+            i = end;
+            continue;
+        }
+        if ch == '"' {
+            let mut j = i + 1;
+            let mut text = String::new();
+            while j < c.len() && c[j].1 != '"' {
+                if c[j].1 == '\\' && j + 1 < c.len() {
+                    text.push('\\');
+                    j += 1;
+                }
+                text.push(c[j].1);
+                j += 1;
+            }
+            out.push(Lit { start: byte(i), end: byte(j + 1), text });
+            i = j + 1;
+            continue;
+        }
+        i += 1;
+    }
+    (out, code.len())
+}
+
+/// A literal that names the git program.
+fn names_git(text: &str) -> bool {
+    text == "git" || text.ends_with("/git")
+}
+
+/// Whether `lit` on `code` is a key or a comparison operand rather than a
+/// program: `{"git": …}`, `x == "git"`, `obj.get("git")`, `s.contains("git")`.
+fn is_key_or_comparison(code: &str, lit: &Lit) -> bool {
+    let after = code[lit.end..].trim_start();
+    let before = code[..lit.start].trim_end();
+    (after.starts_with(':') && !after.starts_with("::"))
+        || after.starts_with("=>")
+        || ["==", "!=", ".get(", ".remove(", "contains(", "contains_key(", "starts_with(", "ends_with(", ".eq("]
+            .iter()
+            .any(|p| before.ends_with(p))
+}
+
+/// Whether a shell string runs git: `git` (or a path ending `/git`) as a
+/// command word, at the start, after a separator, or after a word that runs
+/// what follows it ([`SHELL_PREFIXES`], with any flags or `VAR=value`).
+fn shell_runs_git(text: &str) -> bool {
+    let text = text.replace("\\n", " ; ");
+    let mut words: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for ch in text.chars() {
+        if ch.is_whitespace() || ";&|()`{}$".contains(ch) {
+            if !cur.is_empty() {
+                words.push(std::mem::take(&mut cur));
+            }
+            if !ch.is_whitespace() {
+                words.push(ch.to_string());
+            }
+        } else {
+            cur.push(ch);
+        }
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    let mut at_command = true;
+    let mut after_prefix = false;
+    for w in &words {
+        if w.len() == 1 && ";&|()`{}$".contains(w.as_str()) {
+            (at_command, after_prefix) = (true, false);
+            continue;
+        }
+        if at_command && names_git(w) {
+            return true;
+        }
+        let prefix = SHELL_PREFIXES.contains(&w.as_str()) || (w.contains('=') && !w.starts_with('-'));
+        after_prefix = prefix || (after_prefix && w.starts_with('-'));
+        at_command = at_command && after_prefix;
+    }
+    false
+}
+
+/// A `-c` style flag (`"-c"`, `"-lc"`, `"-ec"`): what hands a shell (or
+/// git) the next argument as its script.
+fn is_dash_c(lit: &Lit) -> bool {
+    let t = &lit.text;
+    t.len() >= 2 && t.len() <= 4 && t.starts_with('-') && t.ends_with('c') && t[1..].chars().all(|c| c.is_ascii_lowercase())
+}
+
+/// The names a file binds to the git program: `const X: &str = "git";`
+/// (or a raw string).
 fn git_consts(src: &str) -> Vec<String> {
     src.lines()
         .filter_map(|l| {
             let t = l.trim_start().trim_start_matches("pub(crate) ").trim_start_matches("pub ");
             let rest = t.strip_prefix("const ").or_else(|| t.strip_prefix("static "))?;
             let (name, value) = rest.split_once(':')?;
-            let lit = value.split_once('=')?.1.trim().trim_end_matches(';');
-            let lit = lit.strip_prefix('"')?.strip_suffix('"')?;
-            (lit == "git" || lit.ends_with("/git")).then(|| name.trim().to_string())
+            let (lits, _) = literals(value.split_once('=')?.1);
+            (lits.len() == 1 && names_git(&lits[0].text)).then(|| name.trim().to_string())
         })
         .collect()
 }
 
-/// Whether `code` (a line with its comment cut) spawns git in a known shape.
-/// `near_dash_c`: a `"-c"` is on this line or one of the three before it in
-/// the same statement.
-fn is_git_spawn(code: &str, consts: &[String], near_dash_c: bool) -> bool {
+/// Whether `code` (one line, its comment cut) spawns git in a known shape.
+/// `consts`: the git constants of every scanned file. `near_dash_c`: a
+/// `"-c"` is on this line or one of the three before it in the same
+/// statement.
+fn is_git_spawn(code: &str, lits: &[Lit], consts: &[String], near_dash_c: bool) -> bool {
+    if lits.iter().any(|l| names_git(&l.text) && !is_key_or_comparison(code, l)) {
+        return true;
+    }
     let mut rest = code;
     while let Some(at) = rest.find("Command::new(") {
         rest = &rest[at + "Command::new(".len()..];
-        let arg = rest.trim_start();
-        if let Some(lit) = arg.strip_prefix('"').and_then(|a| a.split('"').next()) {
-            if lit == "git" || lit.ends_with("/git") {
-                return true;
-            }
-        }
-        let ident: String = arg.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
-        if consts.contains(&ident) {
+        let path: String = rest.trim_start().chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':').collect();
+        if consts.iter().any(|k| path.rsplit("::").next() == Some(k.as_str())) {
             return true;
         }
     }
-    if VALUE_SHAPES.iter().any(|v| code.contains(v)) {
-        return true;
-    }
-    near_dash_c
-        && literals(code).iter().any(|l| {
-            let quoted = format!("\"{l}");
-            SHELL_GIT.iter().any(|g| quoted.starts_with(g) || l.contains(g.trim_start_matches('"')) && !g.starts_with('"'))
-        })
+    near_dash_c && lits.iter().any(|l| shell_runs_git(&l.text))
 }
 
 /// Production files that may spawn git directly: the path, how many spawns
@@ -127,7 +219,7 @@ const ALLOWED: &[(&str, Option<usize>, &str)] = &[
     (
         "crates/darkmux-serve/src/client_workspace.rs",
         Some(1),
-        "`git_bounded`: a paired app's clone and fetch, which need the operator's own credential helper \
+        "`git_bounded_with`: a paired app's clone and fetch, which need the operator's own credential helper \
          and ssh command (HostGit clears both). It takes those from the GLOBAL config only, turns hooks \
          and fsmonitor off, and a fetch first refuses a checkout whose own config sets a network \
          setting no override can switch off",
@@ -270,9 +362,24 @@ fn is_test_attr(line: &str) -> bool {
     t.starts_with("#[cfg(test)]") || (t.starts_with("#[cfg(any(test") && !t.contains("not(test"))
 }
 
-/// The 1-based line numbers of production `git` spawns in `src`.
-fn production_spawns(src: &str) -> Vec<usize> {
-    let consts = git_consts(src);
+/// `line` as code to scan, given the lexer state it starts in: a line that
+/// opens inside a string gets that string's opening quote back, so its text
+/// still reads as a literal; one that opens inside a block comment starts
+/// after the comment (`None`: the whole line is comment).
+fn scannable(line: &str, lexer: &Lexer) -> Option<String> {
+    if lexer.in_block_comment {
+        return line.split_once("*/").map(|(_, rest)| rest.to_string());
+    }
+    Some(match lexer.raw_hashes {
+        Some(h) => format!("r{}\"{line}", "#".repeat(h)),
+        None if lexer.in_str => format!("\"{line}"),
+        None => line.to_string(),
+    })
+}
+
+/// The 1-based line numbers of production `git` spawns in `src`. `consts`:
+/// the git constants of every scanned file.
+fn production_spawns(src: &str, consts: &[String]) -> Vec<usize> {
     let mut recent: std::collections::VecDeque<bool> = std::collections::VecDeque::new();
     let mut hits = Vec::new();
     let mut lexer = Lexer::default();
@@ -280,8 +387,10 @@ fn production_spawns(src: &str) -> Vec<usize> {
     let mut depth: i64 = 0;
     let mut skipping: Option<i64> = None;
     let mut pending_test_attr = false;
+    let mut opens_new = false;
     for (n, line) in src.lines().enumerate() {
         let code_starts_in_string = lexer.in_str || lexer.raw_hashes.is_some() || lexer.in_block_comment;
+        let scanned = scannable(line, &lexer);
         let before = depth;
         depth += lexer.brace_delta(line);
         if let Some(open_at) = skipping {
@@ -307,11 +416,22 @@ fn production_spawns(src: &str) -> Vec<usize> {
             pending_test_attr = true;
             continue;
         }
-        let code = line.split("//").next().unwrap_or("");
-        let dash_c = code.contains("\"-c\"");
-        if is_git_spawn(code, &consts, dash_c || recent.iter().any(|d| *d)) {
+        let Some(scanned) = scanned else { continue };
+        let (lits, cut) = literals(&scanned);
+        let code = &scanned[..cut];
+        // `Command::new(` closing on a later line: its argument opens this one.
+        let code = match opens_new {
+            true => format!("Command::new({}", code.trim_start()),
+            false => code.to_string(),
+        };
+        let shift = code.len() - scanned[..cut].len();
+        let lits: Vec<Lit> =
+            lits.into_iter().map(|l| Lit { start: l.start + shift, end: l.end + shift, text: l.text }).collect();
+        let dash_c = lits.iter().any(is_dash_c);
+        if is_git_spawn(&code, &lits, consts, dash_c || recent.iter().any(|d| *d)) {
             hits.push(n + 1);
         }
+        opens_new = code.trim_end().ends_with("Command::new(");
         recent.push_back(dash_c);
         if recent.len() > 3 {
             recent.pop_front();
@@ -324,6 +444,17 @@ fn production_spawns(src: &str) -> Vec<usize> {
     hits
 }
 
+/// The production spawns of each `(path, source)` with any, a git constant
+/// declared in one file counting in every other.
+fn spawns_by_file(sources: &[(String, String)]) -> Vec<(String, Vec<usize>)> {
+    let consts: Vec<String> = sources.iter().flat_map(|(_, s)| git_consts(s)).collect();
+    sources
+        .iter()
+        .map(|(rel, src)| (rel.clone(), production_spawns(src, &consts)))
+        .filter(|(_, hits)| !hits.is_empty())
+        .collect()
+}
+
 #[test]
 fn every_production_git_spawn_goes_through_host_git() {
     let root = workspace_root();
@@ -332,14 +463,13 @@ fn every_production_git_spawn_goes_through_host_git() {
         rust_files(&dir, &mut files);
     }
     assert!(files.len() > 100, "the walk found too few files ({}): wrong root?", files.len());
+    let sources: Vec<(String, String)> = files
+        .iter()
+        .map(|f| (f.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/"), std::fs::read_to_string(f).unwrap()))
+        .collect();
     let mut offenders = Vec::new();
     let mut allowed_seen = Vec::new();
-    for file in &files {
-        let rel = file.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/");
-        let hits = production_spawns(&std::fs::read_to_string(file).unwrap());
-        if hits.is_empty() {
-            continue;
-        }
+    for (rel, hits) in spawns_by_file(&sources) {
         if let Some((_, count, _)) = ALLOWED.iter().find(|(p, _, _)| *p == rel) {
             if count.is_some_and(|n| n != hits.len()) {
                 offenders.push(format!("{rel}: {} spawns, ALLOWED says {count:?}", hits.len()));
@@ -393,5 +523,59 @@ fn shell_start() { Command::new("bash").args(["-c", "git diff"]); }
 fn not_git() { Command::new("gitk"); let m = "git worktree add failed"; eprintln!("{m}"); }
 fn json_key() { let v = obj.get("git"); }
 "#;
-    assert_eq!(production_spawns(src), vec![2, 9, 15, 17, 18, 19, 23, 25]);
+    let consts = git_consts(src);
+    assert_eq!(production_spawns(src, &consts), vec![2, 9, 15, 16, 17, 18, 19, 23, 25]);
+}
+
+/// A constant naming git in one file makes `Command::new` of it a spawn in
+/// another, wherever the path to it is spelled.
+#[test]
+fn a_git_constant_counts_in_every_file() {
+    let sources = [
+        ("a.rs".to_string(), "pub const GIT_BIN: &str = \"git\";\n".to_string()),
+        ("b.rs".to_string(), "fn f() {\n    Command::new(crate::a::GIT_BIN).status();\n}\n".to_string()),
+    ];
+    let found = spawns_by_file(&sources);
+    assert!(found.contains(&("b.rs".to_string(), vec![2])), "{found:?}");
+}
+
+/// Each shape a spawn can be written in, every one seen; and the shapes
+/// that only mention git, none seen. One case per shape, so a scanner change
+/// that loses one names it.
+#[test]
+fn each_spawn_shape_is_seen_and_each_mention_is_not() {
+    let other_file = "pub const GIT_BIN: &str = \"git\";";
+    let consts = git_consts(other_file);
+    assert_eq!(consts, ["GIT_BIN"], "a constant in another file is collected");
+    let spawns = [
+        ("a let binding", "fn f() { let prog = \"git\"; Command::new(prog).status(); }"),
+        ("a line break", "fn f() {\n    Command::new(\n        \"git\",\n    )\n    .status();\n}"),
+        ("a raw string", "fn f() { Command::new(r\"git\").status(); }"),
+        ("a raw string with hashes", "fn f() { Command::new(r#\"/usr/bin/git\"#).status(); }"),
+        ("xcrun git", "fn f() { Command::new(\"xcrun\").arg(\"git\").status(); }"),
+        ("env git", "fn f() { Command::new(\"/usr/bin/env\").args([\"git\", \"status\"]).status(); }"),
+        ("a wrapper fn", "fn tool(p: &str) -> Command { Command::new(p) }\nfn f() { tool(\"git\").status(); }"),
+        ("a const from another file", "fn f() { Command::new(crate::tools::GIT_BIN).status(); }"),
+        ("a const from another file, on the next line", "fn f() {\n    Command::new(\n        GIT_BIN,\n    );\n}"),
+        ("sh -c \"exec git\"", "fn f() { Command::new(\"sh\").args([\"-c\", \"exec git status\"]).status(); }"),
+        ("sh -lc \"env git\"", "fn f() { Command::new(\"sh\").args([\"-lc\", \"cd x && env -i GIT_DIR=y git log\"]); }"),
+        ("a multi-line shell script", "fn f() {\n    Command::new(\"sh\").arg(\"-c\").arg(\"set -e\n    git status\");\n}"),
+        ("a spawn after a URL on the line", "fn f() { run(\"https://example.com\", \"git\"); }"),
+        ("a spawn after a raw string ending in a backslash", "fn f() { let sep = r\"\\\"; Command::new(\"env\").arg(\"git\"); }"),
+    ];
+    for (shape, src) in spawns {
+        assert!(!production_spawns(src, &consts).is_empty(), "{shape} is not seen:\n{src}");
+    }
+    let mentions = [
+        ("a json key", "fn f() { let v = obj.get(\"git\"); let j = json!({\"git\": url}); }"),
+        ("a comparison", "fn f() { if ext == \"git\" || s.ends_with(\"git\") {} }"),
+        ("a match arm", "fn f() { match k { \"git\" => 1, _ => 2 }; }"),
+        ("a message", "fn f() { let m = \"git worktree add failed\"; eprintln!(\"{m}\"); }"),
+        ("a comment", "fn f() {} // Command::new(\"git\")"),
+        ("a char literal quote", "fn f() { let q = '\"'; Command::new(\"gitk\"); let r = '\"'; }"),
+        ("another program", "fn f() { Command::new(\"gitleaks\").status(); }"),
+    ];
+    for (shape, src) in mentions {
+        assert!(production_spawns(src, &consts).is_empty(), "{shape} is read as a spawn:\n{src}");
+    }
 }
