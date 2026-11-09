@@ -285,30 +285,39 @@ pub(crate) fn connected_to(table: &str, to: std::net::SocketAddr) -> Vec<(std::n
     table
         .lines()
         .skip(1)
-        .filter_map(|line| {
-            let f: Vec<&str> = line.split_whitespace().collect();
-            let (own, other) = (proc_net_addr(f.get(1)?)?, proc_net_addr(f.get(2)?)?);
-            (other == to && *f.get(3)? == "01").then(|| Some((own, f.get(9)?.parse().ok()?)))?
-        })
+        .filter_map(established)
+        .filter(|(_, other, _)| *other == to)
+        .map(|(own, _, inode)| (own, inode))
         .collect()
+}
+
+/// One `/proc/net/tcp{,6}` row, when it is an ESTABLISHED (`01`) socket
+/// that reads whole: its own end, its other end, its inode.
+pub(crate) fn established(line: &str) -> Option<(std::net::SocketAddr, std::net::SocketAddr, u64)> {
+    let f: Vec<&str> = line.split_whitespace().collect();
+    if f.get(3) != Some(&"01") {
+        return None;
+    }
+    Some((proc_net_addr(f.get(1)?)?, proc_net_addr(f.get(2)?)?, f.get(9)?.parse().ok()?))
 }
 
 /// `/proc/net/tcp`'s `0100007F:1F90` (or `tcp6`'s 32 hex digits): the
 /// address as the kernel's in-memory bytes printed as native 32-bit words,
 /// then the port, in hex.
-fn proc_net_addr(s: &str) -> Option<std::net::SocketAddr> {
+pub(crate) fn proc_net_addr(s: &str) -> Option<std::net::SocketAddr> {
     let (ip, port) = s.split_once(':')?;
     let port = u16::from_str_radix(port, 16).ok()?;
-    let bytes = proc_net_bytes(ip)?;
-    let ip: std::net::IpAddr = match bytes.len() {
-        4 => std::net::Ipv4Addr::from(<[u8; 4]>::try_from(bytes).ok()?).into(),
-        16 => {
-            let v6 = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(bytes).ok()?);
-            v6.to_ipv4_mapped().map_or(v6.into(), Into::into)
-        }
-        _ => return None,
-    };
-    Some(std::net::SocketAddr::from((ip, port)))
+    Some(std::net::SocketAddr::from((ip_of(proc_net_bytes(ip)?)?, port)))
+}
+
+/// An address from its 4 or 16 bytes; a v4-mapped IPv6 one reads as its
+/// IPv4 address.
+fn ip_of(bytes: Vec<u8>) -> Option<std::net::IpAddr> {
+    if let Ok(v4) = <[u8; 4]>::try_from(bytes.as_slice()) {
+        return Some(std::net::Ipv4Addr::from(v4).into());
+    }
+    let v6 = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(bytes.as_slice()).ok()?);
+    Some(v6.to_ipv4_mapped().map_or(v6.into(), Into::into))
 }
 
 /// The address bytes `/proc/net/tcp{,6}` prints as native 32-bit words.

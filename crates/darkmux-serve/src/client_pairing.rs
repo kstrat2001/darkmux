@@ -893,38 +893,16 @@ impl ClientServerState {
         Ok(Self {
             store: Arc::new(ClientStore::production()),
             now: Arc::new(unix_now),
-            role_known: Arc::new(|role| {
-                darkmux_crew::loader::load_roles()
-                    .map(|rs| rs.iter().any(|r| r.id == role))
-                    .map_err(|e| format!("{e:#}"))
-            }),
+            role_known: Arc::new(role_known_here),
             resolve_profile: Arc::new(|role, requested| {
-                use darkmux_fleet::ProfileResolution as R;
-                match darkmux_fleet::resolve_work_profile(role, requested, "this machine") {
-                    R::Work { profile, .. } => match requested {
-                        Some(asked) if asked != profile => Err(format!(
-                            "profile {asked} resolves to {profile} here; refusing"
-                        )),
-                        _ => Ok(profile),
-                    },
-                    R::UtilityOnly(p) => Err(format!(
-                        "profile {p} holds only the utility model; work never runs on it"
-                    )),
-                    R::Unresolved(why) => Err(why),
-                }
+                profile_verdict(requested, darkmux_fleet::resolve_work_profile(role, requested, "this machine"))
             }),
             profiles_policy: Arc::new(read_profiles_policy),
             profile_info: Arc::new(crate::client_profiles::describe_profiles),
             profile_is_local: Arc::new(crate::client_profiles::work_stays_here),
-            registry_profiles: Arc::new(|| {
-                darkmux_profiles::profiles::load_registry_quiet(None)
-                    .map(|l| l.registry.profiles.keys().cloned().collect())
-                    .map_err(|e| format!("{e:#}"))
-            }),
+            registry_profiles: Arc::new(registry_profiles_here),
             machine: ClientMachine::this_one(),
-            check_workdir: Arc::new(|p| {
-                darkmux_types::workdir::validate_remote_workdir(p).map_err(|e| format!("{e:#}"))
-            }),
+            check_workdir: Arc::new(check_workdir_here),
             execute: Arc::new(move |spec, cancel| {
                 run_dispatch_child(&exe, &spec, &cancel, CANCEL_GRACE, &ProductionTeardown)
             }),
@@ -932,12 +910,7 @@ impl ClientServerState {
             work_activity: Arc::new(|role, work_id| {
                 work_activity_in(&WORK_ACTIVITY_RECORDS, &darkmux_flow::flows_dir(), role, work_id)
             }),
-            worktrees_base: Arc::new(|| {
-                let base = darkmux_types::workdir::worktrees_base_dir();
-                std::fs::create_dir_all(&base).map_err(|e| format!("{}: {e}", base.display()))?;
-                base.canonicalize()
-                    .map_err(|e| format!("{}: {e}", base.display()))
-            }),
+            worktrees_base: Arc::new(|| canonical_base(&darkmux_types::workdir::worktrees_base_dir())),
             clone_repo: Arc::new(crate::client_workspace::clone_with_git),
             fetch_repo: Arc::new(crate::client_workspace::fetch_with_git),
             workspace_lock: Arc::new(Mutex::new(())),
@@ -950,6 +923,49 @@ impl ClientServerState {
             pair_lookups: Arc::new(PeerRounds::default()),
         })
     }
+}
+
+/// Whether `role` is defined in this machine's role library.
+fn role_known_here(role: &str) -> Result<bool, String> {
+    let roles = darkmux_crew::loader::load_roles().map_err(|e| format!("{e:#}"))?;
+    Ok(roles.iter().any(|r| r.id == role))
+}
+
+/// Every profile name in this machine's registry.
+fn registry_profiles_here() -> Result<Vec<String>, String> {
+    let loaded = darkmux_profiles::profiles::load_registry_quiet(None).map_err(|e| format!("{e:#}"))?;
+    Ok(loaded.registry.profiles.keys().cloned().collect())
+}
+
+/// The workdir containment check against this machine's worktrees base.
+fn check_workdir_here(p: &Path) -> Result<PathBuf, String> {
+    darkmux_types::workdir::validate_remote_workdir(p).map_err(|e| format!("{e:#}"))
+}
+
+/// What a work request may run on, from how `darkmux dispatch <role>
+/// [--profile <p>]` resolves it here: the resolved work profile, never one
+/// other than the profile asked for, never a utility-only one.
+fn profile_verdict(requested: Option<&str>, resolved: darkmux_fleet::ProfileResolution) -> Result<String, String> {
+    use darkmux_fleet::ProfileResolution as R;
+    match resolved {
+        R::Work { profile, .. } => match requested {
+            Some(asked) if asked != profile => Err(format!(
+                "profile {asked} resolves to {profile} here; refusing"
+            )),
+            _ => Ok(profile),
+        },
+        R::UtilityOnly(p) => Err(format!(
+            "profile {p} holds only the utility model; work never runs on it"
+        )),
+        R::Unresolved(why) => Err(why),
+    }
+}
+
+/// `base`, made if missing, canonical.
+fn canonical_base(base: &Path) -> Result<PathBuf, String> {
+    let named = |e: std::io::Error| format!("{}: {e}", base.display());
+    std::fs::create_dir_all(base).map_err(named)?;
+    base.canonicalize().map_err(named)
 }
 
 /// The process at each of `wanted`'s ends, from one look at every connection
