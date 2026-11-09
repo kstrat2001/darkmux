@@ -738,56 +738,6 @@ impl WorkerProc {
     }
 }
 
-/// `proc_pid_rusage(pid, RUSAGE_INFO_V0, &buf).ri_phys_footprint` — the
-/// per-process memory figure Activity Monitor displays and jetsam kills on.
-///
-/// Called directly rather than shelling out to `/usr/bin/footprint`, which
-/// returns the same number: measured at **0.05 s per process** versus a
-/// gather that currently completes in ~490 ms and repeats every 5 s. This
-/// page's own doctrine (#1286: the observer must not join the observed)
-/// makes a ~30% gather-cost increase for three subprocess spawns the wrong
-/// trade when a frozen libSystem call costs nothing. `vmmap --summary`
-/// yields the same figure at 1.3 s/process and was never a candidate.
-///
-/// `rusage_info_v0` is a stable, frozen ABI — later flavors append fields
-/// and never reorder these. `ri_phys_footprint` is its 8th `u64`.
-/// Cross-checked against `/usr/bin/footprint -p` on a live worker: 3.25 GiB
-/// both ways, to the byte-rounding shown.
-#[cfg(target_os = "macos")]
-fn phys_footprint(pid: i64) -> Option<u64> {
-    #[repr(C)]
-    #[derive(Default)]
-    struct RUsageInfoV0 {
-        uuid: [u8; 16],
-        user_time: u64,
-        system_time: u64,
-        pkg_idle_wkups: u64,
-        interrupt_wkups: u64,
-        pageins: u64,
-        wired_size: u64,
-        resident_size: u64,
-        phys_footprint: u64,
-        proc_start_abstime: u64,
-        proc_exit_abstime: u64,
-    }
-    unsafe extern "C" {
-        fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut std::ffi::c_void) -> i32;
-    }
-    let mut buf = RUsageInfoV0::default();
-    // SAFETY: `buf` is a correctly-sized, correctly-aligned `#[repr(C)]`
-    // mirror of `rusage_info_v0`, and the callee writes only within it. A
-    // dead or unreadable pid returns non-zero and we report `None` rather
-    // than reading the buffer.
-    let rc = unsafe { proc_pid_rusage(pid as i32, 0, (&raw mut buf).cast()) };
-    (rc == 0).then_some(buf.phys_footprint)
-}
-
-/// Non-macOS: no footprint concept to read. Callers fall back to RSS alone,
-/// which is what this page did everywhere before #1821.
-#[cfg(not(target_os = "macos"))]
-fn phys_footprint(_pid: i64) -> Option<u64> {
-    None
-}
 
 #[derive(Debug, Clone, Default)]
 pub struct LedgerInputs {
@@ -1811,7 +1761,11 @@ fn gather_machine(messages: &mut Vec<LedgerMessage>) -> MachineProbes {
         SYS_PROBE_BOUND,
         messages,
     )
-    .map(|out| enrich_with_footprint(parse_worker_rss(&out), phys_footprint));
+    .map(|out| {
+        enrich_with_footprint(parse_worker_rss(&out), |pid| {
+            u32::try_from(pid).ok().and_then(|p| darkmux_platform::current().process_footprint(p))
+        })
+    });
 
     MachineProbes { pool, swap_used_bytes, compressor_bytes, margin_percent, workers }
 }
@@ -3298,26 +3252,6 @@ mod tests {
         let out = enrich_with_footprint(ws, |_| None);
         assert_eq!(out[0].footprint_bytes, None);
         assert_eq!(out[0].memory_bytes(), 4_242);
-    }
-
-    /// The real FFI, against THIS process: `rusage_info_v0`'s layout is a
-    /// frozen ABI, and a wrong field offset would return garbage rather than
-    /// fail loudly. Asserting a plausible range is what catches a shifted
-    /// struct — a mis-parsed field reads as either 0 or an absurd value.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn phys_footprint_reads_a_plausible_figure_for_the_test_process_itself() {
-        let me = std::process::id() as i64;
-        let fp = phys_footprint(me).expect("own footprint is readable");
-        assert!(fp > 1_000_000, "implausibly small: {fp} bytes — struct offset likely wrong");
-        assert!(fp < 100 * (1u64 << 30), "implausibly large: {fp} bytes — struct offset likely wrong");
-    }
-
-    /// A pid that cannot exist reports `None`, never a fabricated figure.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn phys_footprint_declines_for_a_dead_pid() {
-        assert_eq!(phys_footprint(i64::from(i32::MAX)), None);
     }
 
     /// `memory_bytes` is `max(rss, footprint)`, and these are the two REAL

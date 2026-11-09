@@ -96,6 +96,11 @@ pub trait Platform: Send + Sync {
     /// method produced for the same pid on this same machine: two equal
     /// stamps mean the pid was not reused in between.
     fn process_start_stamp(&self, pid: u32) -> Option<u64>;
+    /// (#3448) How much memory process `pid` holds, in bytes: macOS's
+    /// physical footprint (what Activity Monitor's Memory column shows, which
+    /// counts a Metal model's GPU allocations that RSS does not). `None` for
+    /// no such process, or where the platform has no reader.
+    fn process_footprint(&self, pid: u32) -> Option<u64>;
 
     /// (#3200) Which pid namespace this process lives in: two processes
     /// whose answers differ cannot judge each other's pids. `None` when it

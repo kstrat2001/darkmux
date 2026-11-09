@@ -111,6 +111,12 @@ impl Platform for LinuxPlatform {
         start_ticks_from_proc_stat(&read_to_string(&format!("/proc/{pid}/stat"))?)
     }
 
+    /// No reader yet: the residency ledger falls back to RSS here, as it
+    /// always has off macOS.
+    fn process_footprint(&self, _pid: u32) -> Option<u64> {
+        None
+    }
+
     /// The inode of `/proc/self/ns/pid` (its link reads `pid:[4026531836]`).
     /// Two processes see each other's pids only when this matches.
     fn pid_namespace(&self) -> Option<String> {

@@ -851,3 +851,28 @@ fn other_platforms_report_no_machine_config() {
     let config = MachineConfig { gpu_cores: Some(10), ..Default::default() };
     assert_eq!(FakePlatform { machine_config: config.clone(), ..FakePlatform::default() }.machine_config(), config);
 }
+
+/// (#3448, moved from the residency ledger) macOS reads a process's
+/// physical footprint (`proc_pid_rusage`'s `ri_phys_footprint`, a frozen
+/// ABI): a plausible figure for this process, `None` for no process. A
+/// wrong field offset would read as 0 or an absurd figure. Every other
+/// strategy reads nothing, as the ledger did off macOS.
+#[test]
+fn the_current_strategy_reads_this_process_footprint_on_macos_and_nothing_elsewhere() {
+    let own = current().process_footprint(std::process::id());
+    if current().id() != "macos" {
+        assert_eq!(own, None);
+        return;
+    }
+    let fp = own.expect("own footprint is readable");
+    assert!(fp > 1_000_000, "implausibly small: {fp} bytes; struct offset likely wrong");
+    assert!(fp < 100 * (1u64 << 30), "implausibly large: {fp} bytes; struct offset likely wrong");
+    assert_eq!(current().process_footprint(i32::MAX as u32), None, "no such process");
+}
+
+#[test]
+fn the_fake_answers_only_the_footprints_the_test_set() {
+    let fake = FakePlatform { process_footprints: vec![(7, 7_000)], ..Default::default() };
+    assert_eq!(fake.process_footprint(7), Some(7_000));
+    assert_eq!(fake.process_footprint(8), None);
+}

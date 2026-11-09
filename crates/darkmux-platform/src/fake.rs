@@ -10,6 +10,8 @@ pub struct FakePlatform {
     /// `(pid, stamp)` pairs [`Platform::process_start_stamp`] answers; any
     /// other pid reads as `None`.
     pub process_start_stamps: Vec<(u32, u64)>,
+    /// `(pid, bytes)` pairs [`Platform::process_footprint`] answers.
+    pub process_footprints: Vec<(u32, u64)>,
     pub pid_namespace: Option<String>,
     pub os_release: Option<crate::OsRelease>,
     pub secret_store: crate::SecretStore,
@@ -28,6 +30,7 @@ impl Default for FakePlatform {
             machine_uid: None,
             reclaimable_memory_bytes: None,
             process_start_stamps: Vec::new(),
+            process_footprints: Vec::new(),
             pid_namespace: None,
             os_release: None,
             secret_store: crate::SecretStore::PrivateFile,
@@ -97,6 +100,10 @@ impl Platform for FakePlatform {
 
     fn process_start_stamp(&self, pid: u32) -> Option<u64> {
         self.process_start_stamps.iter().find(|(p, _)| *p == pid).map(|(_, s)| *s)
+    }
+
+    fn process_footprint(&self, pid: u32) -> Option<u64> {
+        self.process_footprints.iter().find(|(p, _)| *p == pid).map(|(_, b)| *b)
     }
 
     fn pid_namespace(&self) -> Option<String> {
