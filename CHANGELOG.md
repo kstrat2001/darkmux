@@ -53,6 +53,19 @@ darkmux release.
   made from, never from the workspace a run edits. A workspace cloned from a URL gets no preview;
   add `.darkmux/preview.json` to your own checkout of the repo and make the workspace from it.
 
+### Fixed
+
+- **Host git never runs what a dispatch wrote into a git directory (#3457).** A dispatch mounts its
+  workdir read-write, so a run could replace a coder-phase worktree's `.git` pointer with a
+  directory whose config runs a command (`core.fsmonitor`, a clean filter, a `textconv`) or whose
+  HEAD names another branch. The coder phase's review diff and finalize's unsaved-work check now
+  read the worktree only through the git directory the main repository holds for it, and
+  `mission finalize`/`abort` delete the branch darkmux recorded at launch (a new `Task.branch`),
+  never the one the worktree's HEAD names. Every host git call carries overrides for the settings
+  that run a command. A plain `dispatch --workdir <checkout>` whose `.git` is a real directory now
+  prints a note: the run can change that repository's config and hooks, which the git you run
+  there yourself still reads.
+
 ## [5.9.3] - 2026-10-29
 
 A faster daemon for the viewer and the fleet. An idle viewer, or a fleet peer reading this
