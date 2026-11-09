@@ -276,14 +276,14 @@ impl Tensorfold {
 /// row and a profile listing's availability read the same facts, asked the
 /// same way.
 #[derive(Debug, Clone)]
-pub struct Facts {
+pub struct TensorfoldProbe {
     pub version: Result<Version, String>,
     pub flags: Result<ServeFlags, String>,
     /// The repos `models --json` lists.
     pub models: Result<Vec<String>, String>,
 }
 
-impl Facts {
+impl TensorfoldProbe {
     /// Ask `tf` its three read-only questions, all at once: each is bounded
     /// by [`PROBE_BOUND`], so the whole probe is too.
     pub fn probe(tf: &Tensorfold) -> Self {
@@ -300,7 +300,7 @@ impl Facts {
                 })
             });
             let gone = |what: &str| format!("the `{what}` probe panicked");
-            Facts {
+            TensorfoldProbe {
                 version: version.join().unwrap_or_else(|_| Err(gone("--version"))),
                 flags: flags.join().unwrap_or_else(|_| Err(gone("capabilities --json"))),
                 models: models.join().unwrap_or_else(|_| Err(gone("models --json"))),

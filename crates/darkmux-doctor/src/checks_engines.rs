@@ -5,7 +5,7 @@
 
 use crate::{Check, Status};
 use darkmux_profiles::engine::flint::{Rec, VERIFIED_RELEASE};
-use darkmux_profiles::engine::tensorfold::{Facts, ServeFlags, Tensorfold, Version, VERIFIED_RELEASES};
+use darkmux_profiles::engine::tensorfold::{TensorfoldProbe, ServeFlags, Tensorfold, Version, VERIFIED_RELEASES};
 use darkmux_types::config_access::Source;
 use darkmux_types::{EndpointKind, ManagedBackend, ProfileRegistry};
 
@@ -25,7 +25,7 @@ impl TensorfoldFacts {
     fn probe() -> Self {
         let (bin, source) = darkmux_types::config_access::tensorfold_bin_with_source();
         // The same facts a profile listing's availability reads (#3466).
-        let Facts { version, flags, models } = Facts::probe(&Tensorfold::at(bin.clone()));
+        let TensorfoldProbe { version, flags, models } = TensorfoldProbe::probe(&Tensorfold::at(bin.clone()));
         TensorfoldFacts { bin, source, version, flags, models }
     }
 }
@@ -113,9 +113,9 @@ fn verified(facts: &TensorfoldFacts, via: &str) -> Result<Version, Check> {
 
 /// Every Tensorfold model the engine does not have, and every `engine_args`
 /// it does not accept: the per-model checks a listing's availability makes
-/// too ([`Facts::has_model`], [`Facts::args_problem`]).
+/// too ([`TensorfoldProbe::has_model`], [`TensorfoldProbe::args_problem`]).
 fn model_problems(models: &[TfModel], facts: &TensorfoldFacts) -> Vec<String> {
-    let shared = Facts { version: facts.version.clone(), flags: facts.flags.clone(), models: facts.models.clone() };
+    let shared = TensorfoldProbe { version: facts.version.clone(), flags: facts.flags.clone(), models: facts.models.clone() };
     let mut problems = Vec::new();
     match &facts.models {
         Ok(_) => problems.extend(models.iter().filter(|(_, _, m)| shared.has_model(m) == Ok(false)).map(|(p, i, m)| {

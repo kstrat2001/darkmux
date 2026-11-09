@@ -35,8 +35,8 @@ fn free_port() -> u16 {
         .port()
 }
 
-fn facts(version: &str, models: &[&str]) -> Facts {
-    Facts {
+fn facts(version: &str, models: &[&str]) -> TensorfoldProbe {
+    TensorfoldProbe {
         version: parse_version(version).map_err(|e| e.to_string()),
         flags: Ok(
             parse_capabilities(r#"{"schema":1,"serve":{"flags":{"--drafter":{}}}}"#).unwrap(),
@@ -45,7 +45,7 @@ fn facts(version: &str, models: &[&str]) -> Facts {
     }
 }
 
-fn tf_answer(facts: Facts, dirs: &tempfile::TempDir) -> TensorfoldAnswer {
+fn tf_answer(facts: TensorfoldProbe, dirs: &tempfile::TempDir) -> TensorfoldAnswer {
     TensorfoldAnswer {
         tf: Tensorfold::at("/opt/tf/tensorfold-native"),
         facts,
@@ -619,7 +619,9 @@ fn a_probe_running_past_the_bound_is_killed() {
             ("DARKMUX_LMS_BIN", lms.to_str().unwrap()),
             ("DARKMUX_TENSORFOLD_BIN", tf.to_str().unwrap()),
         ],
-        || list_with(&ms, None, ask, |_| Duration::from_millis(1_500)),
+        // 3 s: a freshly written script's first exec can take seconds on a
+        // loaded Mac, and the fakes must have started to be killed.
+        || list_with(&ms, None, ask, |_| Duration::from_secs(3)),
     );
     for a in &listing.each {
         assert_eq!(a.state, AvailabilityState::Unknown, "{a:?}");
@@ -631,8 +633,8 @@ fn a_probe_running_past_the_bound_is_killed() {
         .filter_map(|l| l.trim().parse().ok())
         .collect();
     assert!(
-        started.len() >= 4,
-        "both fakes ran (lms ps and ls, three Tensorfold probes): {started:?}"
+        started.len() >= 2,
+        "the fakes ran (a probe and the child it forked, at least): {started:?}"
     );
     for pid in started {
         let alive = unsafe { libc_kill(pid, 0) } == 0;

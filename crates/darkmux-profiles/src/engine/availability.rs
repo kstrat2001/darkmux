@@ -41,7 +41,7 @@
 //! with every dispatch, and `dispatch --check`'s `fit` answers it.
 
 use super::server::{self, Dirs};
-use super::tensorfold::{Facts, Tensorfold, VERIFIED_RELEASES};
+use super::tensorfold::{Tensorfold, TensorfoldProbe, VERIFIED_RELEASES};
 use darkmux_types::{EndpointKind, LoadedModel, ManagedBackend, ProfileModel};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -198,7 +198,8 @@ pub fn list_with(
             .any(|(b, d)| *b == backend && std::time::Instant::now() <= *d)
         {
             accept(&mut each, &by_engine, backend, judged);
-            if backend == ManagedBackend::Lmstudio {
+            // Only LM Studio's answer reports residents (`EngineAnswer::residents`).
+            if residents.is_some() {
                 lmstudio_residents = residents;
             }
         }
@@ -400,13 +401,13 @@ impl EngineAnswer for LmStudioAnswer {
 #[derive(Debug, Clone)]
 pub struct TensorfoldAnswer {
     pub tf: Tensorfold,
-    pub facts: Facts,
+    pub facts: TensorfoldProbe,
     pub dirs: Dirs,
 }
 
 impl TensorfoldAnswer {
     pub fn ask(tf: Tensorfold, dirs: Dirs) -> Self {
-        let facts = Facts::probe(&tf);
+        let facts = TensorfoldProbe::probe(&tf);
         TensorfoldAnswer { tf, facts, dirs }
     }
 }

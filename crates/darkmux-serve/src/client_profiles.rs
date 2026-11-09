@@ -177,20 +177,21 @@ fn describe(
         AvailabilityState::Resident | AvailabilityState::Startable
     );
     let (endpoint, reachable, loaded) = match (s.managed, &s.url) {
-        // LM Studio's `loaded` keeps its older reading of its residents.
-        (Some(ManagedBackend::Lmstudio), _) => {
+        // An engine server darkmux starts: `loaded` is its availability.
+        (Some(backend), _) if EndpointKind::Managed(backend).starts_servers() => {
+            let state = availability.state;
+            let here = (state != AvailabilityState::Unknown)
+                .then_some(state == AvailabilityState::Resident);
+            (backend.token(), can_run, here)
+        }
+        // The managed backend that reports its residents (LM Studio): its
+        // `loaded` keeps its older reading of them.
+        (Some(backend), _) => {
             let here = lmstudio_loaded.map(|models| {
                 models
                     .iter()
                     .any(|m| m.model == s.model || m.identifier.ends_with(&s.model))
             });
-            (ManagedBackend::Lmstudio.token(), can_run, here)
-        }
-        // An engine server darkmux starts: `loaded` is its availability.
-        (Some(backend), _) => {
-            let state = availability.state;
-            let here = (state != AvailabilityState::Unknown)
-                .then_some(state == AvailabilityState::Resident);
             (backend.token(), can_run, here)
         }
         (None, url) => {
