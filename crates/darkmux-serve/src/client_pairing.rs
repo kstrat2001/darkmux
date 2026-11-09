@@ -2512,26 +2512,9 @@ pub(crate) async fn workspace_changes_handler(
         let Some(dir) = work_copy_for(&st, &dir) else {
             return err(StatusCode::CONFLICT, "darkmux holds no repository for this workspace");
         };
-        // (#3480) A project darkmux made from a template has no origin: it
-        // compares with darkmux's own first commit, on the branch that
-        // commit started.
-        let (default, base_branch) = match ws::remote_default_of(&dir) {
-            Some(d) => {
-                let b = d.trim_start_matches("origin/").to_string();
-                (d, b)
-            }
-            None => {
-                let wbase = match (st.worktrees_base)() {
-                    Ok(b) => b,
-                    Err(e) => return internal(anyhow!(e)),
-                };
-                match ws::template_commit_of(&wbase, &name) {
-                    Some(first) => (first, TEMPLATE_BRANCH.to_string()),
-                    None => {
-                        return err(StatusCode::CONFLICT, "this work copy has no origin default branch to compare with")
-                    }
-                }
-            }
+        let (default, base_branch) = match changes_base(&st, &dir, &name) {
+            Ok(b) => b,
+            Err(r) => return *r,
         };
         let branch = git_line(&dir, &["branch", "--show-current"]).unwrap_or_default();
         if branch.is_empty() {
@@ -2589,6 +2572,22 @@ pub(crate) async fn workspace_changes_handler(
     })
     .await
     .unwrap_or_else(|e| internal(anyhow!("changes panicked: {e}")))
+}
+
+/// What `/changes` compares the work copy's branch with, and that base's
+/// branch name: origin's default branch; or, for a project darkmux made
+/// from a template, which has no origin (#3480), darkmux's own recorded
+/// first commit on the branch it started. Any other work copy with no
+/// origin is a 409.
+fn changes_base(state: &ClientServerState, dir: &WorkCopy, name: &str) -> Result<(String, String), Refused> {
+    if let Some(d) = crate::client_workspace::remote_default_of(dir) {
+        let branch = d.trim_start_matches("origin/").to_string();
+        return Ok((d, branch));
+    }
+    let base = (state.worktrees_base)().map_err(|e| Box::new(internal(anyhow!(e))))?;
+    crate::client_workspace::template_commit_of(&base, name)
+        .map(|first| (first, TEMPLATE_BRANCH.to_string()))
+        .ok_or_else(|| refuse(StatusCode::CONFLICT, "this work copy has no origin default branch to compare with"))
 }
 
 /// `GET /client/workspaces/{name}`: branch, head and repo of one workspace.
