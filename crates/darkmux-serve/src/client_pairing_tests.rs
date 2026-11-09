@@ -2685,7 +2685,40 @@ async fn old_clients_keep_and_discard_still_work() {
 
 // ─── Previews ────────────────────────────────────────────────────────────
 
-const SERVE: &str = "exec python3 -m http.server \"$PORT\" --bind 127.0.0.1";
+/// The previews' dev server: this test binary itself, running
+/// [`fake_dev_server`], so a preview test depends on nothing the machine
+/// may lack or start slowly (an interpreter, a package). It serves `$PORT`
+/// as soon as it has bound it and exits on SIGTERM like a real dev server.
+fn serve() -> String {
+    let exe = std::env::current_exe().unwrap();
+    format!(
+        "FAKE_DEV_SERVER=1 exec '{}' --exact client_pairing::tests::fake_dev_server --ignored --nocapture --test-threads 1",
+        exe.display()
+    )
+}
+
+/// Not a test: the stand-in dev server [`serve`] starts. Without
+/// `FAKE_DEV_SERVER` it does nothing. It answers every request with 200 and
+/// the working directory's `index.html` (else "ok").
+#[test]
+#[ignore]
+fn fake_dev_server() {
+    if std::env::var_os("FAKE_DEV_SERVER").is_none() {
+        return;
+    }
+    use std::io::{Read, Write};
+    let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    for stream in listener.incoming() {
+        let Ok(mut s) = stream else { continue };
+        let mut buf = [0u8; 4096];
+        let _ = s.read(&mut buf);
+        let body = std::fs::read("index.html").unwrap_or_else(|_| b"ok".to_vec());
+        let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+        let _ = s.write_all(head.as_bytes());
+        let _ = s.write_all(&body);
+    }
+}
 
 fn recipe(wt: &Path, json: Value) {
     std::fs::create_dir_all(wt.join(".darkmux")).unwrap();
@@ -2724,7 +2757,7 @@ async fn a_preview_runs_from_the_recipe_and_stops() {
     std::fs::write(wt.join("index.html"), "hello preview").unwrap();
     recipe(
         &wt,
-        serde_json::json!({"command": SERVE, "env": {"PORT": "{port}"}, "ready": {"http": "/"}}),
+        serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}, "ready": {"http": "/"}}),
     );
     let (code, v) = call(
         &h,
@@ -2785,7 +2818,7 @@ async fn install_runs_only_when_its_marker_is_missing() {
     recipe(
         &wt,
         serde_json::json!({
-            "command": SERVE, "env": {"PORT": "{port}"},
+            "command": serve(), "env": {"PORT": "{port}"},
             "install": {"command": "mkdir deps && echo ran >> installs.txt", "unless_exists": "deps"}
         }),
     );
@@ -2847,7 +2880,7 @@ async fn a_worktree_preview_gets_env_files_from_its_checkout_without_overwriting
     std::fs::write(ws.join(".env.local"), "LOCAL=already-here\n").unwrap();
     recipe(
         &ws,
-        serde_json::json!({"command": SERVE, "env": {"PORT": "{port}"}, "env_from_source": [".env", ".env.local"]}),
+        serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}, "env_from_source": [".env", ".env.local"]}),
     );
     call(
         &h,
@@ -2939,7 +2972,7 @@ async fn previews_refuse_what_they_cant_run() {
     assert_eq!(code, 404);
     recipe(
         &h.base.join("wt1"),
-        serde_json::json!({"command": SERVE, "env_from_source": ["../../etc/passwd"]}),
+        serde_json::json!({"command": serve(), "env_from_source": ["../../etc/passwd"]}),
     );
     let (code, v) = call(
         &h,
@@ -2969,7 +3002,7 @@ async fn a_preview_ends_when_darkmux_does() {
     std::fs::create_dir_all(&wt).unwrap();
     recipe(
         &wt,
-        serde_json::json!({"command": SERVE, "env": {"PORT": "{port}"}}),
+        serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}),
     );
     // "darkmux" here is a short-lived process; when it exits, so does the preview.
     let mut stand_in = std::process::Command::new("sleep")
@@ -3516,3 +3549,4 @@ fn describing_many_profiles_looks_at_each_server_once() {
         .unwrap_err()
         .contains("not in this machine's profiles.json"));
 }
+
