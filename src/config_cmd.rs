@@ -230,6 +230,8 @@ const KEYS: &[(&str, Ty)] = &[
     ("cmd.allowed", Ty::StrList),
     // The profiles a paired client app may run on — see `ClientsConfig`.
     ("clients.profiles", Ty::StrList),
+    // Whether a paired app may start a live preview — see `ClientsPreviewConfig`.
+    ("clients.preview.enabled", Ty::Bool),
     // (#2093) The flow-record hook sink — see `HooksConfig`'s own doc.
     // `hooks.rules` is deliberately NOT a per-field-settable structure (a
     // rule is an object, not a scalar) — it's settable only as a whole,

@@ -32,6 +32,8 @@ struct Harness {
     ran: Arc<Mutex<Vec<WorkSpec>>>,
     /// What `clients.profiles` reads as right now (default: unset).
     policy: Arc<Mutex<Policy>>,
+    /// What `clients.preview.enabled` reads as right now (default here: on).
+    preview_on: Arc<Mutex<bool>>,
     /// URLs the injected clone was asked for, and dirs it fetched.
     cloned: Arc<Mutex<Vec<String>>>,
     fetched: Arc<Mutex<Vec<PathBuf>>>,
@@ -58,6 +60,8 @@ fn harness() -> Harness {
     let canon_base = base.canonicalize().unwrap();
     let ran = Arc::new(Mutex::new(Vec::new()));
     let policy: Arc<Mutex<Policy>> = Arc::new(Mutex::new(Ok(None)));
+    let preview_on = Arc::new(Mutex::new(true));
+    let pe = preview_on.clone();
     let (c, r, pol) = (clock.clone(), ran.clone(), policy.clone());
     let fixture = dir.path().join("fixture");
     fixture_repo(&fixture);
@@ -232,8 +236,12 @@ fn harness() -> Harness {
             std::process::id(),
         )),
         bound: Some(BOUND.parse().unwrap()),
+        // On here, so the preview tests can run one; production's default is
+        // off (`clients.preview.enabled`).
+        preview_enabled: Arc::new(move || Ok(*pe.lock().unwrap())),
     };
     Harness {
+        preview_on,
         cloned,
         fetched,
         fixture,
@@ -3421,6 +3429,60 @@ async fn preview_status_and_stop_need_a_token() {
     }
     assert!(answers(ready["port"].as_u64().unwrap()), "still running");
     h.state.previews.stop(&name);
+}
+
+/// (operator decision 2026-11-09) Previews are off unless this machine turns
+/// them on: a preview runs the workspace's own code on this machine, outside
+/// the sandbox. Off, starting or reading one is refused with what it would
+/// do and how to turn it on, and nothing starts; stopping one still works.
+#[tokio::test]
+async fn previews_are_refused_while_clients_preview_enabled_is_off() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (mine, name, ws) = served_workspace(&h, &token).await;
+    recipe(&mine, serde_json::json!({"command": format!("touch ran; {}", serve()), "env": {"PORT": "{port}"}}));
+    *h.preview_on.lock().unwrap() = false;
+    let (code, v) = start_preview(&h, &token, &name).await;
+    assert_eq!(code, 403, "{v}");
+    let e = v["error"].as_str().unwrap();
+    assert!(
+        e.contains("darkmux config set clients.preview.enabled true")
+            && e.contains("runs the workspace's own code")
+            && e.contains("outside the sandbox"),
+        "{v}"
+    );
+    let (code, v) = call(&h, get(&format!("/client/workspaces/{name}/preview"), &[("authorization", &bearer(&token))])).await;
+    assert_eq!(code, 403, "{v}");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(!ws.join("ran").exists(), "nothing started");
+    // An unreadable switch refuses too.
+    *h.preview_on.lock().unwrap() = true;
+    let mut h2 = h;
+    h2.state.preview_enabled = Arc::new(|| Err("config.json does not parse".to_string()));
+    let (code, v) = start_preview(&h2, &token, &name).await;
+    assert_eq!(code, 503, "{v}");
+}
+
+/// The switch reads `clients.preview.enabled` fresh, through the config
+/// gate: absent is off, and a misspelling refuses rather than reading as off
+/// or on.
+#[test]
+#[serial_test::serial]
+fn clients_preview_enabled_is_read_fresh_and_defaults_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.json");
+    let read = |text: &str| {
+        std::fs::write(&path, text).unwrap();
+        unsafe { std::env::remove_var("DARKMUX_CLIENTS_PREVIEW_ENABLED") };
+        read_preview_enabled_at(&path)
+    };
+    assert_eq!(read("{}"), Ok(false), "absent is off");
+    assert_eq!(read(r#"{"clients": {"preview": {"enabled": true}}}"#), Ok(true));
+    assert_eq!(read(r#"{"clients": {"preview": {"enabled": false}}}"#), Ok(false));
+    let e = read(r#"{"clients": {"preview": {"enable": true}}}"#).unwrap_err();
+    assert!(e.contains("clients.preview.enable"), "{e}");
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(read_preview_enabled_at(&path), Ok(false), "no file is off");
 }
 
 #[tokio::test]

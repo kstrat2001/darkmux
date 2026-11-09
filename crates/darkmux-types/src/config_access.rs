@@ -723,6 +723,17 @@ pub fn clients_profiles_in(cfg: &DarkmuxConfig) -> Option<Vec<String>> {
     }
     cfg.clients.as_ref().and_then(|c| c.profiles.clone())
 }
+/// Whether a paired app may start a live preview, against `cfg`:
+/// `env(DARKMUX_CLIENTS_PREVIEW_ENABLED)` > `cfg.clients.preview.enabled` >
+/// `false`. Fail closed: an unrecognized env token leaves previews off. A
+/// preview runs the workspace's own code on this machine, outside the
+/// sandbox, which is why it is off by default.
+pub fn clients_preview_enabled_in(cfg: &DarkmuxConfig) -> bool {
+    if let Some(s) = env_str("DARKMUX_CLIENTS_PREVIEW_ENABLED") {
+        return parse_bool_token(&s).unwrap_or(false);
+    }
+    cfg.clients.as_ref().and_then(|c| c.preview.as_ref()).and_then(|p| p.enabled).unwrap_or(false)
+}
 /// [`clients_profiles_in`] against this process's config tier.
 pub fn clients_profiles() -> Option<Vec<String>> {
     clients_profiles_in(config())

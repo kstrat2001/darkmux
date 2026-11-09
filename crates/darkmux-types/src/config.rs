@@ -1842,6 +1842,20 @@ pub struct ClientsConfig {
     /// judged the same way. A hosted profile runs only when listed. An empty
     /// list allows none. `darkmux config set clients.profiles <comma-separated-list>`.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub profiles: Option<Vec<String>>,
+    /// Live previews of a workspace's dev server — see [`ClientsPreviewConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub preview: Option<ClientsPreviewConfig>,
+    #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+/// (CONFIG 2.8) Whether a paired app may start a workspace's live preview.
+/// A preview runs the workspace's own code (its `package.json` scripts and
+/// whatever they call, which a model may have written) on this machine as
+/// you, outside the dispatch sandbox, so it is OFF unless turned on here:
+/// `darkmux config set clients.preview.enabled true`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ClientsPreviewConfig {
+    /// `true` allows previews; absent or `false` refuses every preview start.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub enabled: Option<bool>,
     #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 

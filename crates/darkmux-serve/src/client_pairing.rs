@@ -537,6 +537,8 @@ pub type PathCheck = Arc<dyn Fn(&Path) -> Result<PathBuf, String> + Send + Sync>
 pub type PathSource = Arc<dyn Fn() -> Result<PathBuf, String> + Send + Sync>;
 /// Something done to a path (a fetch).
 pub type PathAction = Arc<dyn Fn(&Path) -> Result<(), String> + Send + Sync>;
+/// `clients.preview.enabled`, read per request.
+pub type PreviewSwitch = Arc<dyn Fn() -> Result<bool, String> + Send + Sync>;
 /// Runs one role execution, blocking.
 pub type Execute = Arc<dyn Fn(WorkSpec, Arc<CancelFlag>) -> Result<Value, RunError> + Send + Sync>;
 
@@ -592,6 +594,9 @@ pub struct ClientServerState {
     /// The address the listener bound, so a `Host` naming another port is
     /// not this listener's ([`crate::is_local_at`]); `None` until bound.
     pub bound: Option<SocketAddr>,
+    /// This machine's `clients.preview.enabled`, read per request (`Err`:
+    /// unreadable, so previews are refused).
+    pub preview_enabled: PreviewSwitch,
 }
 
 impl ClientServerState {
@@ -649,6 +654,7 @@ impl ClientServerState {
             workspace_lock: Arc::new(Mutex::new(())),
             previews: Arc::new(crate::client_preview::Previews::production()),
             bound: None,
+            preview_enabled: Arc::new(read_preview_enabled),
         })
     }
 }
@@ -674,6 +680,25 @@ pub fn preflight() -> Result<()> {
 
 /// [`read_profiles_policy`] against the config at `path`.
 pub(crate) fn read_profiles_policy_at(path: &Path) -> Result<Option<Vec<String>>, String> {
+    read_config_at(path).map(|cfg| darkmux_types::config_access::clients_profiles_in(&cfg))
+}
+
+/// `clients.preview.enabled` from `config.json` as it is now, env first;
+/// absent is off.
+fn read_preview_enabled() -> Result<bool, String> {
+    read_preview_enabled_at(
+        &darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config,
+    )
+}
+
+/// [`read_preview_enabled`] against the config at `path`.
+pub(crate) fn read_preview_enabled_at(path: &Path) -> Result<bool, String> {
+    read_config_at(path).map(|cfg| darkmux_types::config_access::clients_preview_enabled_in(&cfg))
+}
+
+/// `config.json` at `path`, read now through the config gate (a missing file
+/// is the defaults; one that cannot be read, parse or pass the gate refuses).
+fn read_config_at(path: &Path) -> Result<darkmux_types::config::DarkmuxConfig, String> {
     let cfg = match std::fs::read_to_string(path) {
         Ok(text) => {
             // The same gate as the start's: a key written while serving is
@@ -696,7 +721,7 @@ pub(crate) fn read_profiles_policy_at(path: &Path) -> Result<Option<Vec<String>>
             ))
         }
     };
-    Ok(darkmux_types::config_access::clients_profiles_in(&cfg))
+    Ok(cfg)
 }
 
 fn unix_now() -> u64 {
@@ -2143,8 +2168,28 @@ pub(crate) async fn preview_start_handler(
     .unwrap_or_else(|e| internal(anyhow!("preview start panicked: {e}")))
 }
 
+/// Why previews are refused on this machine right now, if they are: off
+/// unless `clients.preview.enabled` is true (a 403 that says what a preview
+/// does and how to turn it on), and refused when it cannot be read (503).
+fn previews_allowed(state: &ClientServerState) -> Result<(), Refused> {
+    match (state.preview_enabled)() {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(refuse(
+            StatusCode::FORBIDDEN,
+            "previews are off on this machine: a preview runs the workspace's own code (its \
+             package.json scripts and whatever they call, which a model may have written) on this \
+             machine as you, outside the sandbox. To allow it: \
+             `darkmux config set clients.preview.enabled true`",
+        )),
+        Err(e) => Err(refuse(StatusCode::SERVICE_UNAVAILABLE, e)),
+    }
+}
+
 /// Starts workspace `name`'s preview from the recipe in its checkout.
 fn start_preview(state: &ClientServerState, name: &str) -> Response {
+    if let Err(r) = previews_allowed(state) {
+        return *r;
+    }
     let (dir, checkout) = match workspace_and_checkout(state, name) {
         Ok(found) => found,
         Err(r) => return *r,
@@ -2161,7 +2206,7 @@ pub(crate) async fn preview_status_handler(
     UrlPath(name): UrlPath<String>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(r) = authenticate(&state, &headers) {
+    if let Err(r) = authenticate(&state, &headers).and_then(|_| previews_allowed(&state)) {
         return *r;
     }
     let status = state.previews.status(&name);
