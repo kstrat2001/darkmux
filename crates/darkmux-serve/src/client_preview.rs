@@ -72,7 +72,13 @@
 //! darkmux records that commit's SHA beside the workspace (`.<name>.template`)
 //! and reads the recipe as it was there, with host git from the repository
 //! it holds ([`RecipeSource::TemplateCommit`]): a regular file, not a link,
-//! within the size cap, parsed as strictly. No later commit (a run's) and
+//! within the size cap, parsed as strictly. Every object on its path (the
+//! commit, its root tree, the `.darkmux` tree, the recipe's blob) is read by
+//! id and refused unless it hashes back to that id, and replace refs are off
+//! in every host git call, so a forged object or a planted
+//! `refs/replace/` in that repository changes nothing. `start_fresh` adds
+//! the recipe to the first commit even when an ignore rule would leave it
+//! out. No later commit (a run's) and
 //! no edit in the work tree changes it. Such a recipe may not list
 //! `env_from_source` files, since there is no checkout to copy them from.
 //! The recipe is darkmux's own shape: an app's template keeps its own keys
@@ -377,54 +383,128 @@ pub fn read_recipe_at_commit(git_dir: &Path, commit: &str) -> Result<String, Rec
         )));
     }
     let git = darkmux_types::host_git::HostGit::held_git_dir(git_dir);
-    let unreadable = |e: String| {
-        RecipeRefusal::Unreadable(format!("reading the template's recipe at {commit}: {e}"))
-    };
-    let listed = git
-        .output(&["ls-tree", "-l", commit, "--", ".darkmux", RECIPE_PATH])
-        .map_err(|e| unreadable(e.to_string()))?;
-    if !listed.status.success() {
-        return Err(unreadable(
-            String::from_utf8_lossy(&listed.stderr).trim().to_string(),
-        ));
-    }
-    check_recipe_entries(&String::from_utf8_lossy(&listed.stdout), commit)?;
-    let blob = format!("{commit}:{RECIPE_PATH}");
-    let shown = git
-        .output(&["show", blob.as_str()])
-        .map_err(|e| unreadable(e.to_string()))?;
-    if !shown.status.success() {
-        return Err(unreadable(
-            String::from_utf8_lossy(&shown.stderr).trim().to_string(),
-        ));
-    }
+    // (#3460 review) Every object on the recipe's path is checked against
+    // its id (git does not check a loose object's hash when it reads it), so
+    // what `ls-tree` reports below comes from objects that are what their
+    // ids say. Replace refs are off in every `HostGit` call.
+    let commit_body = verified_object(&git, "commit", commit)?;
+    let root = String::from_utf8_lossy(&commit_body)
+        .lines()
+        .next()
+        .and_then(|l| l.strip_prefix("tree "))
+        .map(str::to_string)
+        .ok_or_else(|| RecipeRefusal::Invalid(format!("commit {commit} names no tree")))?;
+    verified_object(&git, "tree", &root)?;
+    let listed = git_stdout(
+        &git,
+        &["ls-tree", "-l", "-t", commit, "--", ".darkmux", RECIPE_PATH],
+    )?;
+    let (folder, blob) = check_recipe_entries(&listed, commit)?;
+    verified_object(&git, "tree", &folder)?;
     // The size was checked on the tree entry, before reading the blob.
-    String::from_utf8(shown.stdout)
+    String::from_utf8(verified_object(&git, "blob", &blob)?)
         .map_err(|_| RecipeRefusal::Invalid(format!("{RECIPE_PATH} at {commit} is not UTF-8")))
 }
 
-/// `git ls-tree -l` lines for `.darkmux` and the recipe in `commit`: no
-/// symlink on the way, and the recipe a regular file within the size cap.
-fn check_recipe_entries(listed: &str, commit: &str) -> Result<(), RecipeRefusal> {
-    let entries: Vec<(&str, &str, &str)> = listed.lines().filter_map(ls_tree_entry).collect();
-    if let Some((_, _, path)) = entries.iter().find(|(mode, _, _)| *mode == "120000") {
-        return Err(RecipeRefusal::Symlink(format!(
-            "{path} is a symlink in the template's first commit {commit}; refusing"
+/// `git <args>`'s stdout, through host git; a failure is unreadable.
+fn git_stdout(
+    git: &darkmux_types::host_git::HostGit,
+    args: &[&str],
+) -> Result<String, RecipeRefusal> {
+    let out = git
+        .output(args)
+        .map_err(|e| RecipeRefusal::Unreadable(format!("reading the template's recipe: {e}")))?;
+    if !out.status.success() {
+        return Err(RecipeRefusal::Unreadable(format!(
+            "reading the template's recipe: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
-    match entries.iter().find(|(_, _, path)| *path == RECIPE_PATH) {
-        None => Err(RecipeRefusal::NotFound(format!(
-            "no {RECIPE_PATH} in the template's first commit {commit}"
-        ))),
-        Some((mode, size, _)) => check_recipe_blob(mode, size, commit),
-    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-/// One `git ls-tree -l` line: (mode, size, path).
-fn ls_tree_entry(line: &str) -> Option<(&str, &str, &str)> {
+/// The object `oid` of type `kind`, read with `cat-file` and refused unless
+/// its content hashes back to `oid` (`hash-object --stdin`, the repository's
+/// own hash, no filters).
+fn verified_object(
+    git: &darkmux_types::host_git::HostGit,
+    kind: &str,
+    oid: &str,
+) -> Result<Vec<u8>, RecipeRefusal> {
+    use std::io::Write;
+    let unreadable = |e: String| RecipeRefusal::Unreadable(format!("reading {kind} {oid}: {e}"));
+    let read = git
+        .output(&["cat-file", kind, oid])
+        .map_err(|e| unreadable(e.to_string()))?;
+    if !read.status.success() {
+        return Err(unreadable(
+            String::from_utf8_lossy(&read.stderr).trim().to_string(),
+        ));
+    }
+    let mut hash = git
+        .command(&["hash-object", "-t", kind, "--no-filters", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| unreadable(e.to_string()))?;
+    if let Some(mut stdin) = hash.stdin.take() {
+        stdin
+            .write_all(&read.stdout)
+            .map_err(|e| unreadable(e.to_string()))?;
+    }
+    let hashed = hash
+        .wait_with_output()
+        .map_err(|e| unreadable(e.to_string()))?;
+    if String::from_utf8_lossy(&hashed.stdout).trim() != oid {
+        return Err(RecipeRefusal::Invalid(format!(
+            "{kind} {oid} in the template's repository does not match its content; refusing its recipe"
+        )));
+    }
+    Ok(read.stdout)
+}
+
+/// `git ls-tree -l` lines for `.darkmux` and the recipe in `commit`: no
+/// symlink on the way, `.darkmux` a folder, and the recipe a regular file
+/// within the size cap. Returns the folder's and the recipe's object ids.
+fn check_recipe_entries(listed: &str, commit: &str) -> Result<(String, String), RecipeRefusal> {
+    let entries: Vec<LsTreeEntry> = listed.lines().filter_map(ls_tree_entry).collect();
+    if let Some(e) = entries.iter().find(|e| e.mode == "120000") {
+        return Err(RecipeRefusal::Symlink(format!(
+            "{} is a symlink in the template's first commit {commit}; refusing",
+            e.path
+        )));
+    }
+    let Some(recipe) = entries.iter().find(|e| e.path == RECIPE_PATH) else {
+        return Err(RecipeRefusal::NotFound(format!(
+            "no {RECIPE_PATH} in the template's first commit {commit}"
+        )));
+    };
+    check_recipe_blob(recipe.mode, recipe.size, commit)?;
+    let folder = entries
+        .iter()
+        .find(|e| e.path == ".darkmux" && e.mode == "040000")
+        .ok_or_else(|| RecipeRefusal::Invalid(format!(".darkmux is not a folder in {commit}")))?;
+    Ok((folder.oid.to_string(), recipe.oid.to_string()))
+}
+
+/// One `git ls-tree -l` line.
+struct LsTreeEntry<'a> {
+    mode: &'a str,
+    oid: &'a str,
+    size: &'a str,
+    path: &'a str,
+}
+
+fn ls_tree_entry(line: &str) -> Option<LsTreeEntry<'_>> {
     let (meta, path) = line.split_once('\t')?;
     let fields: Vec<&str> = meta.split_whitespace().collect();
-    Some((fields.first()?, fields.get(3).copied().unwrap_or("-"), path))
+    Some(LsTreeEntry {
+        mode: fields.first()?,
+        oid: fields.get(2)?,
+        size: fields.get(3).copied().unwrap_or("-"),
+        path,
+    })
 }
 
 /// The recipe's tree entry: a regular file (`100644` or `100755`) of at
@@ -2580,6 +2660,77 @@ mod tests {
             matches!(short, Err(RecipeRefusal::Invalid(_))),
             "only a full SHA: {short:?}"
         );
+    }
+
+    /// The blob id of the recipe in `commit`.
+    fn recipe_blob(repo: &Path, commit: &str) -> String {
+        git(repo, &["rev-parse", &format!("{commit}:{RECIPE_PATH}")])
+    }
+
+    /// (#3460 review) A replace ref planted in the held repository changes
+    /// nothing: the recipe read is the first commit's own.
+    #[test]
+    fn a_planted_replace_ref_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, first) = a_repo_with(dir.path(), &[(RECIPE_PATH, TEMPLATE_RECIPE)]);
+        let forged = r#"{"schema_version": "1.0", "command": "touch pwned"}"#;
+        std::fs::write(repo.join("forged.json"), forged).unwrap();
+        let fake = git(&repo, &["hash-object", "-w", "forged.json"]);
+        git(&repo, &["replace", &recipe_blob(&repo, &first), &fake]);
+        assert_eq!(
+            git(&repo, &["show", &format!("{first}:{RECIPE_PATH}")]),
+            forged,
+            "plain git honors it"
+        );
+        assert_eq!(
+            read_recipe_at_commit(&repo.join(".git"), &first).unwrap(),
+            TEMPLATE_RECIPE
+        );
+    }
+
+    /// (#3460 review) An object overwritten in place (git does not check a
+    /// loose object's hash when it reads it) is refused: every object on the
+    /// recipe's path must hash to its id.
+    #[test]
+    fn an_overwritten_object_is_refused() {
+        // Overwrites `which`'s object with a valid object of the same type
+        // holding the forged recipe, so git reads it without complaint.
+        let overwrite = |tree: bool| {
+            let dir = tempfile::tempdir().unwrap();
+            let (repo, first) = a_repo_with(dir.path(), &[(RECIPE_PATH, TEMPLATE_RECIPE)]);
+            let forged_text = r#"{"schema_version": "1.0", "command": "touch pwned"}"#;
+            std::fs::write(repo.join(RECIPE_PATH), forged_text).unwrap();
+            git(&repo, &["add", RECIPE_PATH]);
+            let forged_root = git(&repo, &["write-tree"]);
+            let (victim, forged) = if tree {
+                let at = |root: &str| git(&repo, &["rev-parse", &format!("{root}:.darkmux")]);
+                (at(&first), at(&forged_root))
+            } else {
+                let at = |root: &str| git(&repo, &["rev-parse", &format!("{root}:{RECIPE_PATH}")]);
+                (at(&first), at(&forged_root))
+            };
+            let object = |oid: &str| repo.join(".git/objects").join(&oid[..2]).join(&oid[2..]);
+            let bytes = std::fs::read(object(&forged)).unwrap();
+            let at = object(&victim);
+            let mut perms = std::fs::metadata(&at).unwrap().permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            std::fs::set_permissions(&at, perms).unwrap();
+            std::fs::write(&at, bytes).unwrap();
+            let plain = git(&repo, &["show", &format!("{first}:{RECIPE_PATH}")]);
+            assert_eq!(
+                plain, forged_text,
+                "plain git reads the forgery (tree={tree})"
+            );
+            read_recipe_at_commit(&repo.join(".git"), &first)
+        };
+        for tree in [false, true] {
+            let read = overwrite(tree);
+            assert!(
+                matches!(read, Err(RecipeRefusal::Invalid(ref m)) if m.contains("does not match")),
+                "tree={tree}: {read:?}"
+            );
+        }
     }
 
     /// (#3460) A template recipe is parsed as strictly as a checkout's (the

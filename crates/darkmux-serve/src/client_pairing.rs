@@ -2015,6 +2015,13 @@ fn first_commit(dir: &WorkCopy, message: &str) -> Result<String, String> {
         git_quiet(dir, &["config", "user.email", "darkmux@localhost"])?;
     }
     git_quiet(dir, &["add", "-A"])?;
+    // (#3460 review) The recipe a preview of this project trusts is read
+    // from this commit, so it goes in even when an ignore rule (the
+    // template's `.gitignore`, the user's global excludes) leaves it out.
+    let recipe = crate::client_preview::RECIPE_PATH;
+    if std::fs::symlink_metadata(dir.work_tree.join(recipe)).is_ok() {
+        git_quiet(dir, &["add", "-f", "--", recipe])?;
+    }
     git_quiet(dir, &["commit", "--quiet", "-m", message])?;
     git_line(dir, &["rev-parse", "HEAD"]).ok_or_else(|| "reading the first commit".to_string())
 }

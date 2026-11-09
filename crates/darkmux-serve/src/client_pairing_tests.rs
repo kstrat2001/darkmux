@@ -4661,6 +4661,37 @@ async fn a_template_project_previews_from_its_first_commits_recipe() {
     assert!(!ws.join("pwned").exists(), "the workspace's recipe ran");
 }
 
+/// (#3460 review) A template whose `.gitignore` (or the user's global
+/// excludes) ignores `.darkmux/` still has its recipe in the project's first
+/// commit, so it still previews.
+#[tokio::test]
+async fn an_ignored_recipe_still_reaches_the_first_commit() {
+    let h = harness();
+    let token = paired(&h).await;
+    recipe(
+        &h.fixture,
+        serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}),
+    );
+    std::fs::write(h.fixture.join(".gitignore"), ".darkmux/\n").unwrap();
+    run_git(
+        Some(&h.fixture),
+        &["add", "-f", ".gitignore", ".darkmux/preview.json"],
+    );
+    run_git(
+        Some(&h.fixture),
+        &["commit", "--quiet", "-m", "ignored recipe"],
+    );
+    let (name, ws) = template_project(&h, &token, None).await;
+    let listed = run_git(Some(&ws), &["ls-tree", "--name-only", "-r", "HEAD"]);
+    assert!(
+        listed.lines().any(|l| l == ".darkmux/preview.json"),
+        "{listed}"
+    );
+    let (code, v) = start_preview(&h, &token, &name).await;
+    assert_eq!(code, 202, "{v}");
+    h.state.previews.stop(&name);
+}
+
 /// (#3460) A template recipe that lists `env_from_source` files is refused
 /// naming the key (a template project has no checkout of the user's to
 /// copy them from), and one without a recipe says why. A clone that takes
