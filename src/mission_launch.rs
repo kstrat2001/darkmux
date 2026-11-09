@@ -3405,10 +3405,7 @@ fn register_coder_phase_kinds(
         Mutex<Option<std::result::Result<crate::phase_review::PhaseReviewOutput, String>>>,
     > = Arc::new(Mutex::new(None));
 
-    let repo_root = coder_phase::repo_root()?;
-    // (#3457) A cwd inside a coder worktree answers with whatever a run left
-    // in its `.git`; refuse it before anything is created from it.
-    coder_phase::refuse_as_main_repo(&repo_root, &workdir)?;
+    let repo_root = coder_phase::launch_repo_root(&workdir)?;
 
     // (#1546, mirroring #1545's bundling-becomes-runtime migration for the
     // review pipeline) The coder brief's INPUTS are the build-time-known

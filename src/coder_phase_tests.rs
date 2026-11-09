@@ -2482,6 +2482,20 @@ edit loop detected on src/widget.rs in an earlier dispatch
         assert!(refuse_as_main_repo(&f.repo, &f.wt).is_ok());
     }
 
+    /// `mission launch coder-phase` from a cwd inside an earlier coder
+    /// worktree (under the worktrees base) refuses to take it as the main repo.
+    #[test]
+    #[serial_test::serial]
+    fn launch_from_inside_a_coder_worktree_refuses_it_as_the_main_repo() {
+        let _g = CrewEnvGuard::new();
+        let old_wt = darkmux_types::workdir::worktrees_base_dir().join("repo").join("p0");
+        std::fs::create_dir_all(&old_wt).unwrap();
+        darkmux_types::host_git::fixture::git(&old_wt, &["init", "-q"]);
+        let _cwd = CwdGuard::enter(&old_wt);
+        let err = launch_repo_root(&old_wt.parent().unwrap().join("p1")).unwrap_err();
+        assert!(err.to_string().contains("worktrees dir"), "{err}");
+    }
+
     /// The same cwd, for a mission launched with this change: its worktree
     /// task records the main repo, so `mission abort` run from inside the
     /// planted worktree still tears it down through the real repository,

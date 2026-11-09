@@ -1203,6 +1203,16 @@ pub(crate) fn refuse_as_main_repo(root: &Path, wt_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// (#3457) The cwd's repository as the main repo a coder phase creates its
+/// worktree at `wt_path` from, refused when [`refuse_as_main_repo`] refuses
+/// it: a cwd inside a coder worktree answers with whatever a run left in its
+/// `.git`, so nothing is created from it.
+pub(crate) fn launch_repo_root(wt_path: &Path) -> Result<PathBuf> {
+    let root = repo_root()?;
+    refuse_as_main_repo(&root, wt_path)?;
+    Ok(root)
+}
+
 /// (#3457) The main repository and worktree a phase's teardown works on: the
 /// repo darkmux recorded at launch (`Task.repo_root`), else `ambient` (the
 /// cwd's, for records written before the field existed), refused when it is
