@@ -98,29 +98,7 @@ fn harness() -> Harness {
             id: "m-0123456789abcdef".into(),
             name: "studio".into(),
         },
-        // `fast` is served and loaded; `deep` is declared but its server is
-        // down; anything else isn't in the registry.
-        profile_info: Arc::new(|name| match name {
-            "fast" => Ok(ClientProfileInfo {
-                name: "fast".into(),
-                description: Some("Fast coder".into()),
-                model: Some("m-fast".into()),
-                endpoint: "url".into(),
-                reachable: true,
-                loaded: Some(true),
-                error: None,
-            }),
-            "deep" => Ok(ClientProfileInfo {
-                name: "deep".into(),
-                description: None,
-                model: Some("m-deep".into()),
-                endpoint: "lmstudio".into(),
-                reachable: false,
-                loaded: Some(false),
-                error: None,
-            }),
-            other => Err(format!("profile {other} is not in the registry")),
-        }),
+        profile_info: Arc::new(|names| names.iter().map(|n| test_profile_info(n)).collect()),
         check_workdir: Arc::new(move |p| {
             darkmux_types::workdir::validate_remote_workdir_in(p, &canon_base)
                 .map_err(|e| format!("{e:#}"))
@@ -3301,6 +3279,32 @@ async fn profiles_refuse_an_unknown_role() {
     assert_eq!(code, 400);
 }
 
+/// The harness's profiles: `fast` is served and loaded; `deep` is declared
+/// but its server is down; anything else isn't in the registry.
+fn test_profile_info(name: &str) -> Result<ClientProfileInfo, String> {
+    match name {
+        "fast" => Ok(ClientProfileInfo {
+            name: "fast".into(),
+            description: Some("Fast coder".into()),
+            model: Some("m-fast".into()),
+            endpoint: "url".into(),
+            reachable: true,
+            loaded: Some(true),
+            error: None,
+        }),
+        "deep" => Ok(ClientProfileInfo {
+            name: "deep".into(),
+            description: None,
+            model: Some("m-deep".into()),
+            endpoint: "lmstudio".into(),
+            reachable: false,
+            loaded: Some(false),
+            error: None,
+        }),
+        other => Err(format!("profile {other} is not in the registry")),
+    }
+}
+
 // ---- describe_profile, the production profile_info ------------------------
 
 /// Sets env vars for one closure, restoring them after (serial tests only).
@@ -3448,4 +3452,67 @@ fn the_machine_id_is_stable_and_never_the_raw_hardware_uuid() {
     // No hardware uuid (some platforms): still an id, from the name.
     let unknown = ClientMachine::from_parts(None, "box");
     assert!(unknown.id.starts_with("m-"));
+}
+
+/// A model server that takes the connection and never answers: a probe of
+/// it waits out its whole timeout.
+fn never_answering() -> (std::net::TcpListener, u16) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    (listener, port)
+}
+
+#[test]
+#[serial_test::serial]
+fn describing_many_profiles_looks_at_each_server_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Three servers that hang, two profiles on each: looked at one by one
+    // that's six 1 s probes, past an app's 5 s wait (three, even probing
+    // each server once in turn); all at the same time, it's about one.
+    let (_a, pa) = never_answering();
+    let (_b, pb) = never_answering();
+    let (_c, pc) = never_answering();
+    let profiles: Vec<String> = (0..6)
+        .map(|i| {
+            format!(
+                r#""p{i}":{{"models":[{{"id":"m{i}","n_ctx":32000,"endpoint":"{}"}}]}}"#,
+                ["a", "b", "c"][i % 3]
+            )
+        })
+        .collect();
+    let registry = tmp.path().join("profiles.json");
+    std::fs::write(
+        &registry,
+        format!(
+            r#"{{"profiles":{{{}}},"endpoints":{{
+                "a":{{"url":"http://127.0.0.1:{pa}/v1"}},
+                "b":{{"url":"http://127.0.0.1:{pb}/v1"}},
+                "c":{{"url":"http://127.0.0.1:{pc}/v1"}}
+            }}}}"#,
+            profiles.join(",")
+        ),
+    )
+    .unwrap();
+    let mut names: Vec<String> = (0..6).map(|i| format!("p{i}")).collect();
+    names.push("nope".into());
+    let started = std::time::Instant::now();
+    let got = with_env_vars(&[("DARKMUX_PROFILES", registry.as_os_str())], || {
+        describe_profiles(&names)
+    });
+    let took = started.elapsed();
+    assert!(
+        took < std::time::Duration::from_millis(2500),
+        "took {took:?}"
+    );
+    assert_eq!(got.len(), 7, "one answer per name, in order");
+    for (i, info) in got.iter().take(6).enumerate() {
+        let info = info.as_ref().unwrap();
+        assert_eq!(info.name, format!("p{i}"));
+        assert_eq!(info.model.as_deref(), Some(format!("m{i}").as_str()));
+        assert!(!info.reachable, "it never answered: {info:?}");
+    }
+    assert!(got[6]
+        .as_ref()
+        .unwrap_err()
+        .contains("not in this machine's profiles.json"));
 }
