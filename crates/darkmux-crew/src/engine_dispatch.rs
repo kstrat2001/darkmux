@@ -26,7 +26,7 @@
 use darkmux_flow::payload::DispatchModelPayload;
 use darkmux_profiles::engine::server::{self, Dirs, Progress};
 use darkmux_profiles::engine::tensorfold::Tensorfold;
-use darkmux_types::engine_record::{self, EngineRecord, ServerState};
+use darkmux_types::engine_record::{self, EngineRecord};
 use darkmux_types::residency_lease::LeaseGuard;
 use darkmux_types::{EndpointKind, ManagedBackend};
 
@@ -258,7 +258,7 @@ fn darkmux_residents(dirs: &Dirs, endpoint: &str, leased: &[String], lms: Vec<St
     let mut servers: Vec<EngineRecord> = engine_record::list_in(&dirs.records)
         .0
         .into_iter()
-        .filter(|r| r.endpoint != endpoint && r.state_now() == ServerState::Running)
+        .filter(|r| r.endpoint != endpoint && server::alive(r))
         .collect();
     // Newest first, so the oldest server is popped first.
     servers.sort_by_key(|r| std::cmp::Reverse(r.started_at_ms));

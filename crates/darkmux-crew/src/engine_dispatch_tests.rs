@@ -2,6 +2,7 @@
 //! machine: no real engine, no real LM Studio, no real memory reading.
 
 use super::*;
+use darkmux_types::engine_record::ServerState;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::time::Duration;

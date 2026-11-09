@@ -173,7 +173,7 @@ fn is_zombie(pid: u32) -> bool {
 
 /// darkmux's server `rec` is alive: its record matches the live process,
 /// and that process has not exited.
-fn alive(rec: &EngineRecord) -> bool {
+pub fn alive(rec: &EngineRecord) -> bool {
     reap_exited();
     rec.state_now() == ServerState::Running && !is_zombie(rec.pid)
 }
