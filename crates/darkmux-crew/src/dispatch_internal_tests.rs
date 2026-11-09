@@ -3747,6 +3747,88 @@ S(("127.0.0.1", port), H).serve_forever()
         assert!(names(&refused_recs).contains(&"dispatch.start".to_string()), "the refusal follows its dispatch.start");
     }
 
+    /// (#3448) The container path makes an engine server's model resident
+    /// after its `dispatch.start`: a refusal (here an unverified release)
+    /// closes the dispatch with one `dispatch.error` carrying the refusal's
+    /// code, and a brain on no engine server makes nothing resident and
+    /// closes nothing.
+    #[test]
+    #[serial]
+    fn the_container_path_closes_an_engine_refusal_with_its_code() {
+        let home = TempDir::new().unwrap();
+        let bin_dir = TempDir::new().unwrap();
+        let bin = bin_dir.path().join("tensorfold-native");
+        std::fs::write(&bin, "#!/bin/sh\necho 'tensorfold-native 1.3.0'\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::process::Command::new(&bin).output();
+        let engine = |endpoint: serde_json::Value| -> crate::target::Target {
+            let mut reg: darkmux_types::ProfileRegistry = serde_json::from_value(serde_json::json!({
+                "profiles": {"p": {"models": [{"id": "TensorFold/m", "n_ctx": 8192, "endpoint": "tf"}]}},
+                "endpoints": {"tf": endpoint}
+            }))
+            .unwrap();
+            reg.materialize_endpoints();
+            crate::target::target_for("p".into(), Default::default(), reg.profiles["p"].models[0].clone()).unwrap()
+        };
+        let tf = engine(serde_json::json!({"managed": "tensorfold", "port": 8091}));
+        let hosted = engine(serde_json::json!({"url": "https://h.example/v1"}));
+        let saved: Vec<(&str, Option<String>)> =
+            ["DARKMUX_HOME", "DARKMUX_TENSORFOLD_BIN"].iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", home.path());
+            std::env::set_var("DARKMUX_TENSORFOLD_BIN", &bin);
+        }
+        let opts = dispatch_preflight_probe_opts();
+        let execution = darkmux_types::execution_id::ExecutionId::mint();
+        let mut closed: Vec<darkmux_flow::FlowRecord> = Vec::new();
+        let (none, refused) = {
+            let mut sink = |r: darkmux_flow::FlowRecord| closed.push(r);
+            let mut bookend = DispatchBookendGuard::new(
+                &mut sink,
+                opts.role_id.clone(),
+                opts.session.clone(),
+                execution.clone(),
+                "TensorFold/m".into(),
+                None,
+                None,
+            );
+            bookend.open(crate::dispatch::build_dispatch_record(
+                darkmux_flow::Level::Info,
+                &opts.role_id,
+                &opts.session,
+                &execution,
+                Some("TensorFold/m"),
+                None,
+                darkmux_flow::Payload::DispatchStart(DispatchStartPayload::default()),
+            ));
+            let started = std::time::Instant::now();
+            let none = container_model_resident(&opts, &execution, "TensorFold/m", None, None, &mut bookend, started)
+                .map(|r| r.is_none());
+            let hosted = container_model_resident(&opts, &execution, "TensorFold/m", Some(&hosted), None, &mut bookend, started)
+                .map(|r| r.is_none());
+            assert!(matches!(hosted, Ok(true)), "a hosted brain starts nothing");
+            let refused = container_model_resident(&opts, &execution, "TensorFold/m", Some(&tf), None, &mut bookend, started);
+            (none, refused)
+        };
+        unsafe {
+            for (k, v) in &saved {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        assert!(matches!(none, Ok(true)), "no brain target starts nothing");
+        let err = refused.err().expect("an unverified engine refuses");
+        assert_eq!(crate::engine_dispatch::refusal_code(&err), Some("engine_unavailable"));
+        let records: Vec<serde_json::Value> = closed.iter().map(|r| serde_json::to_value(r).unwrap()).collect();
+        let actions: Vec<&str> = records.iter().filter_map(|r| r["action"].as_str()).collect();
+        assert_eq!(actions, ["dispatch.start", "dispatch.error"], "one terminal, the refusal's: {records:?}");
+        assert_eq!(records[1]["payload"]["code"], "engine_unavailable", "{}", records[1]);
+        assert_eq!(records[1]["level"], "error", "{}", records[1]);
+    }
+
     /// (#3448 PR 4 review) The container path names the model the way the
     /// server answers to it: `darkmux:<id>` on a Tensorfold endpoint.
     #[test]
@@ -3932,13 +4014,16 @@ S(("127.0.0.1", port), H).serve_forever()
     #[test]
     fn the_container_path_starts_the_engine_server_before_the_container() {
         let src = include_str!("dispatch_internal.rs");
-        let start = src.find("fn run_container(").expect("run_container exists");
-        let body = &src[start..];
-        let end = body.find("\nfn ").unwrap_or(body.len());
-        let body = &body[..end];
-        let resident = body.find("engine_resident(").expect("run_container calls engine_resident");
-        let launch = body.find("launch_container(").expect("run_container launches the container");
+        let body_of = |name: &str| {
+            let start = src.find(&format!("fn {name}(")).unwrap_or_else(|| panic!("{name} exists"));
+            let body = &src[start..];
+            &body[..body.find("\nfn ").unwrap_or(body.len())]
+        };
+        let run = body_of("run_container");
+        let resident = run.find("container_model_resident(").expect("run_container makes the model resident");
+        let launch = run.find("launch_container(").expect("run_container launches the container");
         assert!(resident < launch, "the server is made resident before the container starts");
+        assert!(body_of("container_model_resident").contains("engine_resident("), "through the engine's own start");
     }
 
     // ─── #1645 fix-pass MUST FIX 1 (fuller fix): dispatch_unmanaged itself ──

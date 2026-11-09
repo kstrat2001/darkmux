@@ -261,32 +261,78 @@ fn gate_one_mod(
         Ok(p) => p,
         Err(refused) => return (None, Some(refused.clone())),
     };
+    match apply_kit_in_scratch(m, workdir) {
+        Err(reason) => (None, Some(reason)),
+        Ok((_scratch, _, KitApplied::No(reason))) => (
+            Some(GateOutcome {
+                passed: false,
+                command: command.to_string(),
+                exit_code: None,
+                applied: Some(false),
+                reason: Some(reason.to_string()),
+            }),
+            None,
+        ),
+        // (#2310 P4c-2b PR #2357 review MUST FIX B) `test_command` runs
+        // INSIDE the checkout, never `workdir`/`tree_root` — the whole point
+        // of the fix. A command that cannot even be SPAWNED (a missing
+        // interpreter, a workdir that vanished) is an infra skip; a command
+        // that runs and exits nonzero is a real, data `passed: false`.
+        //
+        // (#2361, swarm S4-4) BOUNDED, in its own process group, and
+        // registered with the child registry — see
+        // `crate::bounded_command`'s module doc for the three failures the
+        // unbounded `.output()` here produced live. A command that outruns
+        // `runtime.step_command_timeout_seconds` is a named SKIP, not a
+        // `passed: false`: a suite that hung says nothing about the kit.
+        Ok((_scratch, scratch_checkout, KitApplied::Yes)) => run_gate_command(placement, command, &scratch_checkout),
+    }
+}
+
+/// Whether the mod's kit changed the scratch checkout. A kit that does not
+/// apply is DATA about the mod (`passed: false`, `applied: false`), never
+/// an infra skip; the reason says which way it failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KitApplied {
+    Yes,
+    No(&'static str),
+}
+
+/// [`gate_one_mod`]'s steps up to its `test_command`: the kit and the one
+/// source checkout it applies to, a scratch copy of that checkout, the kit
+/// as a patch file beside it, and the apply. `Err` is an infra-level skip
+/// reason; the scratch dir is returned so it outlives the gate command.
+fn apply_kit_in_scratch(m: &ModRecord, workdir: Option<&str>) -> Result<(tempfile::TempDir, PathBuf, KitApplied), String> {
+    let (source_dir, kit) = gate_inputs(m, workdir)?;
+    let (scratch, scratch_checkout) = scratch_copy(&source_dir)?;
+    let patch_path = write_kit_patch(scratch.path(), &source_dir, kit)?;
+    let applied = apply_kit(scratch.path(), &scratch_checkout, &patch_path)?;
+    Ok((scratch, scratch_checkout, applied))
+}
+
+/// The mod's unified-diff kit and the one source checkout beneath
+/// `workdir` it applies to, or why there is nothing to gate.
+fn gate_inputs<'m>(m: &'m ModRecord, workdir: Option<&str>) -> Result<(PathBuf, &'m str), String> {
     if m.kit_kind.as_deref() != Some("unified-diff") {
         // (#2310 P4c-2b PR #2357 review MUST FIX A) Only a kit DECLARED as
         // a unified diff can be mechanically applied — same discipline
         // `deliver_github_review`'s own suggestion-block rendering
         // follows for the identical reason (an opaque kit is never
         // guessed at). A kit-less mod (attachments only) falls here too.
-        return (None, Some("no applicable kit".to_string()));
+        return Err("no applicable kit".to_string());
     }
-    let Some(kit) = m.kit.as_deref() else {
-        return (None, Some("no applicable kit".to_string()));
-    };
-    let Some(workdir) = workdir else {
-        return (None, Some("no workdir configured".to_string()));
-    };
-    let source_dir = match resolve_single_source_dir(Path::new(workdir)) {
-        Ok(d) => d,
-        Err(reason) => return (None, Some(reason)),
-    };
-    let scratch = match new_scratch_dir() {
-        Ok(t) => t,
-        Err(e) => return (None, Some(format!("could not create a scratch dir: {e}"))),
-    };
+    let kit = m.kit.as_deref().ok_or("no applicable kit")?;
+    let workdir = workdir.ok_or("no workdir configured")?;
+    let source_dir = resolve_single_source_dir(Path::new(workdir))?;
+    Ok((source_dir, kit))
+}
+
+/// A scratch dir holding a copy of `source_dir` at `<scratch>/checkout`,
+/// detached from git.
+fn scratch_copy(source_dir: &Path) -> Result<(tempfile::TempDir, PathBuf), String> {
+    let scratch = new_scratch_dir().map_err(|e| format!("could not create a scratch dir: {e}"))?;
     let scratch_checkout = scratch.path().join("checkout");
-    if let Err(e) = copy_dir_recursive(&source_dir, &scratch_checkout) {
-        return (None, Some(format!("could not copy the source checkout: {e}")));
-    }
+    copy_dir_recursive(source_dir, &scratch_checkout).map_err(|e| format!("could not copy the source checkout: {e}"))?;
     // (#2361, swarm S5-6a) The copy must not carry the source's `.git`. A
     // materialized source is a LINKED WORKTREE, so its `.git` is a small
     // FILE (`gitdir: …/worktrees/<id>`) pointing back at the shared bare
@@ -296,9 +342,13 @@ fn gate_one_mod(
     // unit in the run is reading from. Nothing here needs a repo: `git
     // apply` runs as a raw patch tool under `GIT_CEILING_DIRECTORIES`
     // (below), which is the mode this kind already wants.
-    if let Err(e) = strip_git_dir(&scratch_checkout) {
-        return (None, Some(format!("could not detach the scratch copy from git: {e}")));
-    }
+    strip_git_dir(&scratch_checkout).map_err(|e| format!("could not detach the scratch copy from git: {e}"))?;
+    Ok((scratch, scratch_checkout))
+}
+
+/// `kit` written as `<scratch>/mod.patch`, in the coordinates of the
+/// checkout copied from `source_dir`, and terminated.
+fn write_kit_patch(scratch: &Path, source_dir: &Path, kit: &str) -> Result<PathBuf, String> {
     // (live proof 2026-09-05) A create-mod dispatch carries no `context.source`,
     // so its kit reaches the store in container coordinates — `a/<source
     // id>/src/x.ts` — with nothing having mapped it (`create_from_emission`
@@ -314,29 +364,20 @@ fn gate_one_mod(
         }
         _ => kit,
     };
-    let patch_path = scratch.path().join("mod.patch");
+    let patch_path = scratch.join("mod.patch");
     // (#2387) Terminate the patch. A kit arrives as a JSON string, which
     // needs no trailing newline and rarely has one; `git apply` reads an
     // unterminated last hunk line as "corrupt patch" — three of four kits in
     // the first live review run failed here byte-for-byte applicable.
     let kit: std::borrow::Cow<str> = if kit.ends_with('\n') { kit.into() } else { format!("{kit}\n").into() };
-    if let Err(e) = std::fs::write(&patch_path, kit.as_bytes()) {
-        return (None, Some(format!("could not write the mod's kit to a scratch file: {e}")));
-    }
+    std::fs::write(&patch_path, kit.as_bytes())
+        .map_err(|e| format!("could not write the mod's kit to a scratch file: {e}"))?;
+    Ok(patch_path)
+}
 
-    let not_applied = || {
-        (
-            Some(GateOutcome {
-                passed: false,
-                command: command.to_string(),
-                exit_code: None,
-                applied: Some(false),
-                reason: Some("kit did not apply".to_string()),
-            }),
-            None,
-        )
-    };
-
+/// Apply `patch_path` to `scratch_checkout` as a raw patch tool, and say
+/// whether the checkout changed. `Err` is an infra-level skip reason.
+fn apply_kit(scratch: &Path, scratch_checkout: &Path, patch_path: &Path) -> Result<KitApplied, String> {
     // (#2310 P4c-2b PR #2357 round-2 review item 2, proven live) Without
     // `GIT_CEILING_DIRECTORIES`, `git apply` run from `scratch_checkout`
     // walks UP looking for a `.git` — if the scratch dir happens to sit
@@ -347,15 +388,15 @@ fn gate_one_mod(
     // touching nothing in the checkout at all — reproduced manually: the
     // exact same patch, same cwd, differs ONLY in this env var, and only
     // the ceiling'd run actually changes the file. Bounding repo discovery
-    // AT `scratch.path()` (one level above the checkout, where nothing
+    // AT `scratch` (one level above the checkout, where nothing
     // this kind ever writes a `.git`) means `git` finds no repo at all —
     // exactly the "operate as a raw patch tool" mode this kind needs.
-    let ceiling = scratch.path().to_string_lossy().to_string();
+    let ceiling = scratch.to_string_lossy().to_string();
 
     // `git apply --check` first — a dry run that never touches the
     // checkout, so a kit that fails to apply is detected before anything
     // is mutated.
-    let check = darkmux_types::host_git::HostGit::trusted(&scratch_checkout)
+    let check = darkmux_types::host_git::HostGit::trusted(scratch_checkout)
         .command(&["apply", "--check", "--recount", &patch_path.to_string_lossy()])
         .env("GIT_CEILING_DIRECTORIES", &ceiling)
         // `--recount` (both calls): a model-written hunk header's line counts
@@ -365,15 +406,12 @@ fn gate_one_mod(
         // which is the part the model actually looked at; wrong CONTEXT still
         // fails as "patch does not apply", honestly.
         .output();
-    let applied_cleanly = match check {
-        Ok(out) => out.status.success(),
-        Err(e) => return (None, Some(format!("could not run `git apply --check`: {e}"))),
-    };
+    let applied_cleanly = check.map_err(|e| format!("could not run `git apply --check`: {e}"))?.status.success();
     if !applied_cleanly {
         // (#2310 P4c-2b PR #2357 review MUST FIX A) A kit that does not
         // apply is DATA about the mod, not an infrastructure failure —
         // `passed: false`, `applied: false`, never a skip.
-        return not_applied();
+        return Ok(KitApplied::No("kit did not apply"));
     }
 
     // (#2310 P4c-2b PR #2357 round-2 review item 2) A fingerprint BEFORE
@@ -382,55 +420,30 @@ fn gate_one_mod(
     // version, a different ambient-repo shape): `git apply` reporting
     // exit 0 is not proof the checkout changed; comparing the tree itself
     // is.
-    let Ok(before) = tree_fingerprint(&scratch_checkout) else {
-        return (None, Some("could not fingerprint the scratch checkout before applying".to_string()));
-    };
-    let apply = darkmux_types::host_git::HostGit::trusted(&scratch_checkout)
+    let before = tree_fingerprint(scratch_checkout)
+        .map_err(|_| "could not fingerprint the scratch checkout before applying".to_string())?;
+    let apply = darkmux_types::host_git::HostGit::trusted(scratch_checkout)
         .command(&["apply", "--recount", &patch_path.to_string_lossy()])
         .env("GIT_CEILING_DIRECTORIES", &ceiling)
         .output();
-    match apply {
-        Ok(out) if out.status.success() => {}
+    if !apply.is_ok_and(|out| out.status.success()) {
         // `--check` passed but the real apply failed anyway (rare —
         // a race on the scratch dir, a disk error) — same "kit did not
         // apply" data outcome, not a skip: the reviewer asked for the
         // kit's OWN applicability to be the signal, and this IS that.
-        Ok(_) | Err(_) => return not_applied(),
+        return Ok(KitApplied::No("kit did not apply"));
     }
-    let Ok(after) = tree_fingerprint(&scratch_checkout) else {
-        return (None, Some("could not fingerprint the scratch checkout after applying".to_string()));
-    };
+    let after = tree_fingerprint(scratch_checkout)
+        .map_err(|_| "could not fingerprint the scratch checkout after applying".to_string())?;
     if before == after {
         // (#2310 P4c-2b PR #2357 round-2 review item 2, proven live) The
         // exact reproduction: `git apply` exited 0 but the tree it
         // reported applying to is byte-identical to before. Never a
         // false `applied: true` — this IS "the kit did not apply",
         // stated with the precise reason a reader can act on.
-        return (
-            Some(GateOutcome {
-                passed: false,
-                command: command.to_string(),
-                exit_code: None,
-                applied: Some(false),
-                reason: Some("apply reported success but changed nothing".to_string()),
-            }),
-            None,
-        );
+        return Ok(KitApplied::No("apply reported success but changed nothing"));
     }
-
-    // (#2310 P4c-2b PR #2357 review MUST FIX B) `test_command` runs
-    // INSIDE the checkout, never `workdir`/`tree_root` — the whole point
-    // of the fix. A command that cannot even be SPAWNED (a missing
-    // interpreter, a workdir that vanished) is an infra skip; a command
-    // that runs and exits nonzero is a real, data `passed: false`.
-    //
-    // (#2361, swarm S4-4) BOUNDED, in its own process group, and
-    // registered with the child registry — see
-    // `crate::bounded_command`'s module doc for the three failures the
-    // unbounded `.output()` here produced live. A command that outruns
-    // `runtime.step_command_timeout_seconds` is a named SKIP, not a
-    // `passed: false`: a suite that hung says nothing about the kit.
-    run_gate_command(placement, command, &scratch_checkout)
+    Ok(KitApplied::Yes)
 }
 
 /// Why no mod in this step is run at all, or `None` when each is gated:
@@ -853,6 +866,37 @@ mod tests {
         let listed = vec![("darkmux-gate-1-0".to_string(), Some(111)), ("darkmux-gate-2-0".to_string(), Some(222)), ("x".to_string(), None)];
         let orphans = crate::contained_command::orphaned_containers(&listed, |pid| pid == 222);
         assert_eq!(orphans, vec!["darkmux-gate-1-0".to_string()]);
+    }
+
+    /// A unified-diff mod with no kit text, or with no workdir to find its
+    /// source in, is an infra skip naming why, and nothing is copied or run.
+    #[test]
+    fn a_mod_with_no_kit_text_or_no_workdir_is_skipped_naming_why() {
+        let mut kitless = a_mod_kit("mod-kitless", "kitless/1", "--- a/x\n+++ b/x\n", Some("unified-diff"));
+        kitless.kit = None;
+        let (outcome, reason) = gate_one_mod(&kitless, "touch /tmp/should-not-run", Some("/nonexistent"), &Ok(GatePlacement::Host));
+        assert!(outcome.is_none());
+        assert_eq!(reason.as_deref(), Some("no applicable kit"));
+        let m = a_mod_kit("mod-nowhere", "nowhere/1", "--- a/x\n+++ b/x\n", Some("unified-diff"));
+        let (outcome, reason) = gate_one_mod(&m, "touch /tmp/should-not-run", None, &Ok(GatePlacement::Host));
+        assert!(outcome.is_none());
+        assert_eq!(reason.as_deref(), Some("no workdir configured"));
+    }
+
+    /// The kit is written beside the scratch checkout in the checkout's own
+    /// coordinates (the source id stripped from container paths) and ends
+    /// in a newline, so `git apply` never reads its last line as corrupt.
+    #[test]
+    fn the_kit_patch_is_mapped_to_the_checkout_and_terminated() {
+        let scratch = TempDir::new().unwrap();
+        let source = scratch.path().join("src1");
+        let kit = "--- a/src1/x.txt\n+++ b/src1/x.txt\n@@ -1 +1 @@\n-old\n+new";
+        let path = write_kit_patch(scratch.path(), &source, kit).unwrap();
+        assert_eq!(path, scratch.path().join("mod.patch"));
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written, "--- a/x.txt\n+++ b/x.txt\n@@ -1 +1 @@\n-old\n+new\n");
+        let missing = write_kit_patch(&scratch.path().join("no-such-dir"), &source, kit).unwrap_err();
+        assert!(missing.contains("could not write the mod's kit"), "{missing}");
     }
 
     /// With a `test_command` but no placement chosen, every mod records the
