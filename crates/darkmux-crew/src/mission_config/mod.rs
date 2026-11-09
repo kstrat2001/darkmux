@@ -3276,7 +3276,10 @@ mod tests {
         //
         // Bumped to "4.0" (MAJOR): the `panel` key is refused and step
         // `config` is checked, so 3.x documents can now fail their gates.
-        assert_eq!(MISSION_CONFIG_SCHEMA, "4.0");
+        //
+        // Bumped to "4.1" — additive: a `dispatch.internal` step's
+        // `workdir_git_writable`. A 4.0 document means what it always did.
+        assert_eq!(MISSION_CONFIG_SCHEMA, "4.1");
     }
 
     // ── (#2300) `grow` — the run-time fan-out ────────────────────────────

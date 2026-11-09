@@ -84,7 +84,7 @@ pub(crate) struct ModelAvailability {
     pub model: String,
     /// The model's `endpoints` id; `null` for a model that names none.
     pub endpoint: Option<String>,
-    /// The managed engine (`lmstudio`, `tensorfold`); `null` for an endpoint
+    /// The managed engine (`lmstudio`, `tensorfold`, `flint`); `null` for an endpoint
     /// darkmux only sends requests to, or one it cannot resolve.
     pub engine: Option<String>,
     pub state: darkmux_profiles::engine::availability::AvailabilityState,

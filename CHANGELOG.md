@@ -84,27 +84,27 @@ darkmux release.
   command. Short of memory, it first stops its own idle engine servers and unloads its own idle LM
   Studio `darkmux:` loads, never one a running dispatch holds. The new `dispatch.model.start`,
   `.loading` (every 10 s) and `.ready` records say so, and a refusal is a `dispatch.error` with a
-  stable `code`: `busy`, `wont_fit`, `model_start_failed`, `port_in_use` or `engine_unavailable`.
+  stable `code`: `busy`, `wont_fit`, `model_start_failed`, `model_stop_failed` (darkmux's own
+  server would not stop when it was replaced or evicted), `port_in_use` or `engine_unavailable`.
   The model is sent under its `darkmux:` name. A utility binding on a Tensorfold endpoint is refused at
   preflight, and a `dispatch.single_shot` / `dispatch.map` step naming one in `config.endpoint` is
   refused by name: those steps call an endpoint directly and start no server. `FLOW_SCHEMA_VERSION` 2.6.0 -> 2.7.0, additive.
 
-- **Tensorfold endpoints are read and checked, not yet dispatched (#3448, part 1).** An endpoint
+- **Tensorfold endpoints are read and checked (#3448, part 1).** An endpoint
   can declare `"managed": "tensorfold"` with the `port` darkmux will serve it on, and a profile
   model on it can carry `engine_args` (extra `tensorfold-native serve` flags). `darkmux doctor`
   gains a `tensorfold engine` row that asks the installed binary its version (darkmux supports
   Tensorfold 1.2.x), its models and its serve flags, and checks each Tensorfold profile model
   against them. `darkmux config set engines.tensorfold.bin <path>` (or `DARKMUX_TENSORFOLD_BIN`)
-  names the binary when it is not on `PATH`. darkmux does not start Tensorfold servers yet, so
-  every dispatching preflight refuses a Tensorfold endpoint, naming the `url` form that works
-  today. `PROFILES_SCHEMA_VERSION` 2.2 -> 2.3 and `CONFIG_SCHEMA_VERSION` 2.6 -> 2.7, both
+  names the binary when it is not on `PATH`. `PROFILES_SCHEMA_VERSION` 2.2 -> 2.3 and `CONFIG_SCHEMA_VERSION` 2.6 -> 2.7, both
   additive; an older binary refuses the new keys and value.
 - `darkmux client serve` (local prototype, #3447): a loopback-only endpoint an app on this machine
   pairs with (`darkmux client approve`), then runs work through. It answers only this machine's
   apps: a loopback connection naming the listener, through no proxy, with no `Origin` header (a web
   page cannot drive it), and JSON request bodies. With `clients.profiles` unset an app may run on
-  any profile whose work stays on this machine, judged as dispatch judges it (LM Studio, or the
-  `default_engine` on loopback); the role's own profile is checked the same way. Its 17 routes
+  any profile whose work stays on this machine, judged as dispatch judges it (a managed engine:
+  LM Studio, or a Tensorfold or Flint server darkmux starts; or the `default_engine` on
+  loopback); the role's own profile is checked the same way. Its 17 routes
   and their response types are in `route-table.golden` (a new contract surface; nothing changes
   for the viewer daemon's routes).
 - Host git never reads git config a run can write: a client workspace's repository is held by
@@ -167,7 +167,8 @@ darkmux release.
   read-only over it, so a run can edit files but cannot commit, stash, check out or rewrite the
   repository's config and hooks, which git you run afterwards would honor. `git status`, `log` and
   `diff` still work. **Behavior change:** a role that commits in a plain `--workdir` checkout now
-  needs `darkmux dispatch --workdir-git-writable` (a mission step: `workdir_git_writable`). No
+  needs `darkmux dispatch --workdir-git-writable` (a `dispatch.internal` mission step:
+  `workdir_git_writable`, which moves `MISSION_CONFIG_SCHEMA` 4.0 -> 4.1; see below). No
   built-in role or mission config does that: `coder` commits only when asked, the reviewers and
   the crawler only read, and the coder phase works in its own worktrees, whose `.git` is a pointer
   file and is unaffected. The preflight note says how `.git` was mounted, `dispatch.start` records
@@ -181,7 +182,25 @@ darkmux release.
   read-only mount and whose pointer a run can rewrite. Inspect the work tree before running git in
   it, or use darkmux's own worktrees.
 
+- **Two state shapes move a minor version, so an older darkmux refuses what this one writes.**
+  `TASK_SCHEMA_VERSION` 1.0 -> 1.1: a task record gains `branch` and `repo_root` (#3457), and a
+  darkmux reading 1.0 would drop both on its next save and tear a coder phase's worktree down from
+  the branch its HEAD names. darkmux 5.0 through 5.9 refuse a 1.1 task ("written by a newer
+  darkmux") instead. `MISSION_CONFIG_SCHEMA` 4.0 -> 4.1: a `dispatch.internal` step's `workdir_git_writable`
+  (#3461); the shipped configs declare 4.1, and `gate_image` / `gate_on_host` (#3177, added in 5.1
+  without a bump) are named by it too. A 4.0 config means what it always did, and `darkmux doctor`
+  notes one as an older minor, informational only. Upgrade every darkmux that reads the same
+  `~/.darkmux`, a `brew services` daemon included (`brew services restart darkmux`), or the older
+  one refuses this one's task records.
+
+- **The minimum supported Rust is 1.89** for the `darkmux` binary and the crates that reach
+  SQLite (`darkmux-crew`, `-doctor`, `-fleet`, `-lab`, `-serve`), up from 1.88 and 1.86:
+  `rusqlite` 0.41 (below) needs it.
+
 ### Fixed
+
+<!-- 5.10 fix PRs in flight: engine hardening, client git/preview hardening, client work/pairing.
+     The orchestrator adds their Fixed lines here, above this release's earlier entries. -->
 
 - **A preview's heartbeat belongs to its run, not its workspace's name (#3485).** A preview's
   container and heartbeat folder were named by workspace and port, so two runs of one workspace on
@@ -193,9 +212,30 @@ darkmux release.
 
 - **The runtime image carries Node 22 (#3482).** It moves from Alpine 3.20 (Node 20.15) to Alpine 3.22 (Node 22.23 LTS, npm 11). Client previews run a project's dev server in this image, and current Vite, rolldown and @vitejs/plugin-react need `^20.19 || >=22.12`: on 20.15, `npm ci` skipped their native bindings and the dev server could not start. Dispatches run in the same image, so their tools move with it (git 2.49, Python 3.12).
 - **The bundled SQLite is patched (RUSTSEC-2026-0459).** `rusqlite` 0.31 -> 0.41, which bundles
-  `libsqlite3-sys` 0.39 and with it a SQLite past the CVE the advisory names. `rusqlite` 0.41 needs
-  Rust 1.89, so the minimum supported Rust for the `darkmux` binary and the crates that reach SQLite
-  (`darkmux-crew`, `-doctor`, `-fleet`, `-lab`, `-serve`) rises to 1.89 (from 1.88 and 1.86).
+  `libsqlite3-sys` 0.39 and with it a SQLite past the CVE the advisory names. It raises the
+  minimum supported Rust (see Changed).
+
+- **A single-shot reply that stops at its cap with no answer fails the dispatch (#3446).** A
+  hosted single-shot dispatch (`darkmux dispatch`, or a mission's `dispatch.internal` step, to a
+  tool-less role on an endpoint with a `url`) whose reply ended at its output cap with an empty
+  answer completed, so a mission reported `finished clean` and a later step delivered the empty
+  result. It now ends in `dispatch.error` and fails, naming the cap and how to raise it
+  (`max_completion_tokens` in the step's config, or `darkmux dispatch --max-completion-tokens <n>`;
+  a dispatch sent from another machine runs at the default cap, which its job does not carry, and
+  its error says so). The usage record and the budget still settle. A `dispatch.single_shot` step
+  fails the same way, naming its `max_tokens`. Unchanged: a lab dispatch still records the empty
+  reply, so its run is graded rather than lost; radio's answering seat keeps its own refusal; a
+  reply cut off with content still completes. `--max-completion-tokens`' help now states the
+  default, 4096, or 16384 when the endpoint sets `reasoning_effort` (the default itself is
+  unchanged).
+
+- **`/runs` answers from its last build while it rebuilds (#3442).** Once the 10 s cache had
+  expired, about one `/runs` poll in four rebuilt the whole run list on the request path (~1 s)
+  even when nothing new had been recorded. With its inputs unchanged, the last build is now served
+  at once while one background rebuild replaces it, for at most 20 s from that build; past that,
+  or after any new flow record, the request waits for a fresh build as before. Statuses that turn
+  on elapsed time can therefore lag by up to 20 s, up from 10 s. The `/machine/resources` cache is
+  now keyed by the engine setting and `lms` binary, like the residents read beside it.
 
 - **A paired app's `workdir` is exactly one workspace (#3451 review).** `POST /client/work` checked a
   raw `workdir` only for lying under the worktrees base, so it admitted the base itself and the dot
@@ -213,7 +253,8 @@ darkmux release.
   read the worktree only through the git directory the main repository holds for it, and
   `mission finalize`/`abort` delete the branch darkmux recorded at launch (a new `Task.branch`),
   never the one the worktree's HEAD names, through the main repository recorded at launch (a new
-  `Task.repo_root`), never one resolved from a cwd inside the worktree. A repo-defined filter
+  `Task.repo_root`, both under task schema 1.1, which an older darkmux refuses; see Changed),
+  never one resolved from a cwd inside the worktree. A repo-defined filter
   driver never runs under darkmux's host git, wherever attributes assign it (a driver only your
   global config defines, such as Git LFS's default install, still does). Every host git call carries overrides for the settings
   that run a command. A plain `dispatch --workdir <checkout>` whose `.git` is a real directory now

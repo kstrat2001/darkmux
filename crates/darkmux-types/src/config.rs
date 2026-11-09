@@ -1838,7 +1838,7 @@ pub struct RadioConfig {
     #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
-/// (CONFIG 2.7) What a paired client app (`darkmux client serve`) may run on
+/// (CONFIG 2.8) What a paired client app (`darkmux client serve`) may run on
 /// this machine. A pairing records identity only; this block is the policy,
 /// read on every work request, so `darkmux config set clients.profiles ...`
 /// takes effect without a restart or a re-pair.
@@ -1846,7 +1846,8 @@ pub struct RadioConfig {
 pub struct ClientsConfig {
     /// The profile names a paired app's work may run on. Absent: any local
     /// profile, one whose work stays on this machine as dispatch judges it
-    /// (LM Studio, or the `default_engine` on loopback); an omitted profile
+    /// (a managed engine: LM Studio, or a Tensorfold or Flint server darkmux
+    /// starts; or the `default_engine` on loopback); an omitted profile
     /// is the role's own (`role_profiles.<role>`, else `default_profile`),
     /// judged the same way. A hosted profile runs only when listed. An empty
     /// list allows none. `darkmux config set clients.profiles <comma-separated-list>`.

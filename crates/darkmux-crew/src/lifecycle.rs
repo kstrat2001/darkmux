@@ -2283,6 +2283,33 @@ mod task_step_storage_tests {
         assert!(load_tasks_for_phase("m-new", "p-new").is_err());
     }
 
+    /// A task records the branch and main repository its worktree was made
+    /// from (#3457). A darkmux reading task schema 1.0 would drop both on its
+    /// next save and tear the worktree down from the branch its HEAD names, so
+    /// the marker darkmux writes is past 1.0 and that reader refuses the file.
+    /// A 1.0 task, with neither field, still loads here.
+    #[test]
+    #[serial]
+    fn a_task_holding_its_launch_branch_is_refused_by_a_task_schema_1_0_reader() {
+        let _g = CrewGuard::new();
+        let mut t = task("t-br", "p-br");
+        t.branch = Some("darkmux/m-br".to_string());
+        t.repo_root = Some(std::path::PathBuf::from("/repo"));
+        save_task("m-br", &t).unwrap();
+        let path = task_path("m-br", "p-br", "t-br");
+        let mut doc = on_disk(&path);
+        assert_eq!(doc["branch"], "darkmux/m-br", "{doc}");
+        assert!(darkmux_types::data_version::newer(&doc, "1.0").is_some(), "a task schema 1.0 reader must refuse it: {doc}");
+
+        let obj = doc.as_object_mut().unwrap();
+        obj.remove("branch");
+        obj.remove("repo_root");
+        obj.insert("schema_version".into(), serde_json::json!("1.0"));
+        std::fs::write(&path, doc.to_string()).unwrap();
+        let old = load_task("m-br", "p-br", "t-br").unwrap();
+        assert_eq!((old.branch, old.repo_root), (None, None));
+    }
+
     /// (#3035) No verb moves a mission or phase whose status a newer darkmux
     /// wrote: the transition cannot be checked, so it is refused with the
     /// upgrade message and the file is left as it was.
