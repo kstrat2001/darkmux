@@ -2946,7 +2946,40 @@ async fn old_clients_keep_and_discard_still_work() {
 
 // ─── Previews ────────────────────────────────────────────────────────────
 
-const SERVE: &str = "exec python3 -m http.server \"$PORT\" --bind 127.0.0.1";
+/// The previews' dev server: this test binary itself, running
+/// [`fake_dev_server`], so a preview test depends on nothing the machine
+/// may lack or start slowly (an interpreter, a package). It serves `$PORT`
+/// as soon as it has bound it and exits on SIGTERM like a real dev server.
+fn serve() -> String {
+    let exe = std::env::current_exe().unwrap();
+    format!(
+        "FAKE_DEV_SERVER=1 exec '{}' --exact client_pairing::tests::fake_dev_server --ignored --nocapture --test-threads 1",
+        exe.display()
+    )
+}
+
+/// Not a test: the stand-in dev server [`serve`] starts. Without
+/// `FAKE_DEV_SERVER` it does nothing. It answers every request with 200 and
+/// the working directory's `index.html` (else "ok").
+#[test]
+#[ignore]
+fn fake_dev_server() {
+    if std::env::var_os("FAKE_DEV_SERVER").is_none() {
+        return;
+    }
+    use std::io::{Read, Write};
+    let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    for stream in listener.incoming() {
+        let Ok(mut s) = stream else { continue };
+        let mut buf = [0u8; 4096];
+        let _ = s.read(&mut buf);
+        let body = std::fs::read("index.html").unwrap_or_else(|_| b"ok".to_vec());
+        let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+        let _ = s.write_all(head.as_bytes());
+        let _ = s.write_all(&body);
+    }
+}
 
 /// Writes a recipe (with this darkmux's `schema_version` unless it names one).
 fn recipe(checkout: &Path, mut json: Value) {
@@ -3013,7 +3046,7 @@ async fn a_preview_runs_from_the_recipe_and_stops() {
     let (mine, name, _ws) = served_workspace(&h, &token).await;
     recipe(
         &mine,
-        serde_json::json!({"command": SERVE, "env": {"PORT": "{port}"}, "ready": {"http": "/"}}),
+        serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}, "ready": {"http": "/"}}),
     );
     let (code, v) = start_preview(&h, &token, &name).await;
     assert_eq!(code, 202, "{v}");
@@ -3061,7 +3094,7 @@ async fn a_preview_never_runs_the_workspaces_own_recipe() {
     let (mine, name, ws) = served_workspace(&h, &token).await;
     recipe(
         &ws,
-        serde_json::json!({"command": format!("touch pwned; {SERVE}"), "env": {"PORT": "{port}"},
+        serde_json::json!({"command": format!("touch pwned; {}", serve()), "env": {"PORT": "{port}"},
             "install": {"command": "touch pwned-install"}}),
     );
     let (code, v) = start_preview(&h, &token, &name).await;
@@ -3069,7 +3102,7 @@ async fn a_preview_never_runs_the_workspaces_own_recipe() {
     let e = v["error"].as_str().unwrap();
     assert!(e.contains("add .darkmux/preview.json to your own checkout"), "{v}");
     assert!(e.contains(mine.to_str().unwrap()), "names the checkout: {v}");
-    recipe(&mine, serde_json::json!({"command": SERVE, "env": {"PORT": "{port}"}}));
+    recipe(&mine, serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}));
     let (code, v) = start_preview(&h, &token, &name).await;
     assert_eq!(code, 202, "{v}");
     let ready = preview_until(&h, &token, &name, &["ready", "failed"]).await;
@@ -3091,7 +3124,7 @@ async fn a_cloned_workspace_gets_no_preview() {
     .await;
     assert_eq!(code, 201, "{v}");
     let ws = h.base.join("hcr");
-    recipe(&ws, serde_json::json!({"command": format!("touch pwned; {SERVE}")}));
+    recipe(&ws, serde_json::json!({"command": format!("touch pwned; {}", serve())}));
     let (code, v) = start_preview(&h, &token, "hcr").await;
     assert_eq!(code, 404, "{v}");
     let e = v["error"].as_str().unwrap();
@@ -3107,7 +3140,7 @@ async fn a_preview_needs_the_workspace_to_still_be_a_worktree_of_the_checkout() 
     let h = harness();
     let token = paired(&h).await;
     let (mine, name, ws) = served_workspace(&h, &token).await;
-    recipe(&mine, serde_json::json!({"command": SERVE, "env": {"PORT": "{port}"}}));
+    recipe(&mine, serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}));
     // A run rewrites the workspace's `.git` to a repository of its own.
     std::fs::remove_file(ws.join(".git")).unwrap();
     run_git(Some(&ws), &["init", "--quiet"]);
@@ -3140,7 +3173,7 @@ async fn a_recorded_checkout_that_became_a_symlink_gets_no_preview() {
     let moved = h.dir.path().join("site-moved");
     std::fs::rename(&mine, &moved).unwrap();
     std::os::unix::fs::symlink(&moved, &mine).unwrap();
-    recipe(&moved, serde_json::json!({"command": SERVE, "env": {"PORT": "{port}"}}));
+    recipe(&moved, serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}));
     let (code, v) = start_preview(&h, &token, &name).await;
     assert_eq!(code, 404, "{v}");
     assert!(v["error"].as_str().unwrap().contains("symlink"), "{v}");
@@ -3154,7 +3187,7 @@ async fn install_runs_only_when_its_marker_is_missing() {
     recipe(
         &mine,
         serde_json::json!({
-            "command": SERVE, "env": {"PORT": "{port}"},
+            "command": serve(), "env": {"PORT": "{port}"},
             "install": {"command": "mkdir deps && echo ran >> installs.txt", "unless_exists": "deps"}
         }),
     );
@@ -3187,7 +3220,7 @@ async fn a_worktree_preview_gets_env_files_from_its_checkout_without_overwriting
     std::fs::write(ws.join(".env.local"), "LOCAL=already-here\n").unwrap();
     recipe(
         &mine,
-        serde_json::json!({"command": SERVE, "env": {"PORT": "{port}"}, "env_from_source": [".env", ".env.local"]}),
+        serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}, "env_from_source": [".env", ".env.local"]}),
     );
     start_preview(&h, &token, &name).await;
     assert_eq!(
@@ -3235,7 +3268,7 @@ async fn preview_status_and_stop_need_a_token() {
     let h = harness();
     let token = paired(&h).await;
     let (mine, name, _ws) = served_workspace(&h, &token).await;
-    recipe(&mine, serde_json::json!({"command": SERVE, "env": {"PORT": "{port}"}}));
+    recipe(&mine, serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}));
     let (code, v) = start_preview(&h, &token, &name).await;
     assert_eq!(code, 202, "{v}");
     let ready = preview_until(&h, &token, &name, &["ready", "failed"]).await;
@@ -3279,15 +3312,15 @@ async fn previews_refuse_what_they_cant_run() {
     assert_eq!(code, 404, "no recipe in the checkout: {v}");
     recipe(
         &mine,
-        serde_json::json!({"command": SERVE, "env_from_source": ["../../etc/passwd"]}),
+        serde_json::json!({"command": serve(), "env_from_source": ["../../etc/passwd"]}),
     );
     let (code, v) = start_preview(&h, &token, &name).await;
     assert_eq!(code, 422, "{v}");
-    recipe(&mine, serde_json::json!({"command": SERVE, "comand": "typo"}));
+    recipe(&mine, serde_json::json!({"command": serve(), "comand": "typo"}));
     let (code, v) = start_preview(&h, &token, &name).await;
     assert_eq!(code, 422, "{v}");
     assert!(v["error"].as_str().unwrap().contains("unknown key `comand`"), "{v}");
-    write_recipe(&mine, &serde_json::json!({"command": SERVE}).to_string());
+    write_recipe(&mine, &serde_json::json!({"command": serve()}).to_string());
     let (code, v) = start_preview(&h, &token, &name).await;
     assert_eq!(code, 422, "no schema_version: {v}");
     let (code, _) = call(
@@ -3311,7 +3344,7 @@ async fn a_preview_ends_when_darkmux_does() {
     std::fs::create_dir_all(&checkout).unwrap();
     recipe(
         &checkout,
-        serde_json::json!({"command": SERVE, "env": {"PORT": "{port}"}}),
+        serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}),
     );
     // "darkmux" here is a short-lived process; when it exits, so does the preview.
     let mut stand_in = std::process::Command::new("sleep")
@@ -3901,4 +3934,83 @@ fn describing_many_profiles_looks_at_each_server_once() {
         .as_ref()
         .unwrap_err()
         .contains("not in this machine's profiles.json"));
+}
+
+// ---- template workspaces (a new project from a template) -------------------
+
+#[tokio::test]
+async fn a_template_becomes_a_fresh_local_project_named_for_the_bot() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"repo_url": HCR, "ref": "dev", "template": true, "bot": "Bakery"}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 201, "{v}");
+    assert_eq!(v["workspace"], "bakery");
+    assert_eq!(v["branch"], "main", "a fresh repo on main, runs commit there");
+    assert_eq!(v["repo"], Value::Null, "no remote: it's local until it goes to GitHub");
+    assert_eq!(v["from"], "github.com/kstrat2001/hcr@dev");
+    let dir = h.base.join("bakery");
+    assert!(dir.join("README.md").exists());
+    assert_eq!(run_git(Some(&dir), &["rev-list", "--count", "HEAD"]).trim(), "1", "none of the template's history");
+    assert_eq!(
+        run_git(Some(&dir), &["log", "-1", "--format=%s"]).trim(),
+        "Start from github.com/kstrat2001/hcr@dev"
+    );
+    assert!(run_git(Some(&dir), &["remote"]).trim().is_empty());
+    assert!(run_git(Some(&dir), &["status", "--porcelain"]).trim().is_empty(), "everything is in the first commit");
+    assert!(!h.base.join(".bakery.partial").exists());
+}
+
+#[tokio::test]
+async fn a_template_is_never_reused() {
+    let h = harness();
+    let token = paired(&h).await;
+    let body = serde_json::json!({"repo_url": HCR, "ref": "dev", "template": true, "bot": "Bakery"});
+    let (first, a) = call(&h, post("/client/workspaces", Some(&token), body.clone())).await;
+    let (second, b) = call(&h, post("/client/workspaces", Some(&token), body)).await;
+    assert_eq!((first, second), (201, 201), "{a} {b}");
+    assert_eq!(b["workspace"], "bakery-2", "a second project, never the first one's files");
+    assert_eq!(h.cloned.lock().unwrap().len(), 2);
+    // And a plain clone of the same repo never picks up a template project.
+    let (code, c) = call(&h, post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR}))).await;
+    assert_eq!(code, 201, "{c}");
+    assert_eq!(c["workspace"], "hcr");
+}
+
+#[tokio::test]
+async fn a_template_needs_a_repo_url_and_nothing_else() {
+    let h = harness();
+    let token = paired(&h).await;
+    for body in [
+        serde_json::json!({"template": true, "bot": "Bakery"}),
+        serde_json::json!({"source_path": "/tmp/x", "template": true}),
+    ] {
+        let (code, v) = call(&h, post("/client/workspaces", Some(&token), body.clone())).await;
+        assert_eq!(code, 400, "{body}: {v}");
+    }
+    assert!(h.cloned.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_template_clone_leaves_nothing_behind() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"repo_url": "https://github.com/kstrat2001/fail", "template": true, "bot": "Bakery"}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 502, "{v}");
+    assert!(!h.base.join("bakery").exists() && !h.base.join(".bakery.partial").exists());
 }

@@ -34,32 +34,42 @@ pub fn valid_name(name: &str) -> bool {
 /// or `git@host:owner/repo`, optionally ending in `.git`. Returns the
 /// normalized `host/owner/repo` (lowercase host, no `.git`).
 pub fn normalize_repo_url(url: &str) -> Option<String> {
-    let rest = if let Some(r) = url.strip_prefix("https://") {
-        let (host, path) = r.split_once('/')?;
-        (host.to_ascii_lowercase(), path.to_string())
-    } else {
-        let (host, path) = url.strip_prefix("git@")?.split_once(':')?;
-        (host.to_ascii_lowercase(), path.to_string())
-    };
-    let (host, path) = rest;
+    let (host, path) = split_repo_url(url)?;
     let path = path.trim_end_matches('/');
     let path = path.strip_suffix(".git").unwrap_or(path);
-    let segment = |s: &str| {
-        !s.is_empty()
-            && s != "."
-            && s != ".."
-            && !s.starts_with('-')
-            && s.chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    let parts: Vec<&str> = path.split('/').collect();
+    (valid_host(&host) && parts.len() == 2 && parts.iter().all(|p| valid_url_segment(p)))
+        .then(|| format!("{host}/{}/{}", parts[0], parts[1]))
+}
+
+/// The lowercase host and the raw path of an `https://` or `git@` URL; any
+/// other transport is `None`.
+fn split_repo_url(url: &str) -> Option<(String, String)> {
+    let (host, path) = if let Some(r) = url.strip_prefix("https://") {
+        r.split_once('/')?
+    } else {
+        url.strip_prefix("git@")?.split_once(':')?
     };
-    let host_ok = !host.is_empty()
+    Some((host.to_ascii_lowercase(), path.to_string()))
+}
+
+/// A host name that can't be read as an option.
+fn valid_host(host: &str) -> bool {
+    !host.is_empty()
         && !host.starts_with('-')
         && host
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.'));
-    let parts: Vec<&str> = path.split('/').collect();
-    (host_ok && parts.len() == 2 && parts.iter().all(|p| segment(p)))
-        .then(|| format!("{host}/{}/{}", parts[0], parts[1]))
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.'))
+}
+
+/// One owner or repo segment: no dot paths, no leading dash.
+fn valid_url_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && !s.starts_with('-')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 /// A branch or tag a client may ask for: git's ref rules, minus anything
@@ -133,7 +143,7 @@ pub fn status_of(dir: &Path) -> Option<(String, String)> {
 /// Runs git with no terminal (credential prompts fail instead of hanging),
 /// only the https and ssh transports, and a deadline.
 fn git_bounded(args: &[&std::ffi::OsStr], timeout: Duration) -> Result<(), String> {
-    let mut child = std::process::Command::new("git")
+    let child = std::process::Command::new("git")
         .args([
             "-c",
             "protocol.allow=never",
@@ -149,17 +159,18 @@ fn git_bounded(args: &[&std::ffi::OsStr], timeout: Duration) -> Result<(), Strin
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("running git: {e}"))?;
+    wait_bounded(child, timeout)
+}
+
+/// Waits for git, killing it past `timeout`; a failure names git's last
+/// stderr line.
+fn wait_bounded(mut child: std::process::Child, timeout: Duration) -> Result<(), String> {
     let start = Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(status)) if status.success() => return Ok(()),
             Ok(Some(status)) => {
-                let mut err = String::new();
-                if let Some(mut s) = child.stderr.take() {
-                    use std::io::Read;
-                    let _ = s.read_to_string(&mut err);
-                }
-                let last = err.lines().last().unwrap_or("").trim().to_string();
+                let last = last_stderr_line(&mut child);
                 return Err(format!("git exited with {status}: {last}"));
             }
             Ok(None) if start.elapsed() > timeout => {
@@ -171,6 +182,16 @@ fn git_bounded(args: &[&std::ffi::OsStr], timeout: Duration) -> Result<(), Strin
             Err(e) => return Err(format!("waiting for git: {e}")),
         }
     }
+}
+
+/// The last line git wrote to stderr, trimmed; empty when it wrote none.
+fn last_stderr_line(child: &mut std::process::Child) -> String {
+    let mut err = String::new();
+    if let Some(mut s) = child.stderr.take() {
+        use std::io::Read;
+        let _ = s.read_to_string(&mut err);
+    }
+    err.lines().last().unwrap_or("").trim().to_string()
 }
 
 /// Production clone: `git clone [--branch <ref>] -- <url> <dest>`.
@@ -220,33 +241,53 @@ pub fn slug(s: &str) -> String {
 /// as, outside the worktrees base, and the top of a git work tree. Returns
 /// the canonical top-level path.
 pub fn check_source(path: &Path, canon_base: &Path) -> Result<PathBuf, String> {
-    if !path.is_absolute() {
-        return Err("source_path must be absolute".into());
-    }
-    match std::fs::symlink_metadata(path) {
-        Ok(m) if m.file_type().is_symlink() => {
-            return Err(format!("{} is a symlink; refusing", path.display()))
-        }
-        Ok(m) if !m.is_dir() => return Err(format!("{} is not a folder", path.display())),
-        Ok(_) => {}
-        Err(_) => return Err(format!("{} does not exist", path.display())),
-    }
+    check_plain_dir(path)?;
     let canon = path
         .canonicalize()
         .map_err(|e| format!("resolving {}: {e}", path.display()))?;
     if canon.starts_with(canon_base) {
         return Err("source_path is already inside the worktrees base".into());
     }
+    check_owned_by_me(&canon)?;
+    check_git_top(&canon)?;
+    Ok(canon)
+}
+
+/// An absolute path to a directory that exists and is not a symlink.
+fn check_plain_dir(path: &Path) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err("source_path must be absolute".into());
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => {
+            Err(format!("{} is a symlink; refusing", path.display()))
+        }
+        Ok(m) if !m.is_dir() => Err(format!("{} is not a folder", path.display())),
+        Ok(_) => Ok(()),
+        Err(_) => Err(format!("{} does not exist", path.display())),
+    }
+}
+
+/// Owned by the user darkmux runs as (unix; elsewhere there is no owner to
+/// compare).
+fn check_owned_by_me(canon: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         let me = unsafe { libc::geteuid() };
-        let owner = std::fs::metadata(&canon).map_err(|e| e.to_string())?.uid();
+        let owner = std::fs::metadata(canon).map_err(|e| e.to_string())?.uid();
         if owner != me {
             return Err(format!("{} is not owned by you", canon.display()));
         }
     }
-    let top = git_out(&canon, &["rev-parse", "--show-toplevel"])
+    #[cfg(not(unix))]
+    let _ = canon;
+    Ok(())
+}
+
+/// `canon` is the top folder of a git work tree, not a folder inside one.
+fn check_git_top(canon: &Path) -> Result<(), String> {
+    let top = git_out(canon, &["rev-parse", "--show-toplevel"])
         .ok_or_else(|| format!("{} is not a git repository", canon.display()))?;
     let top = PathBuf::from(top)
         .canonicalize()
@@ -258,7 +299,7 @@ pub fn check_source(path: &Path, canon_base: &Path) -> Result<PathBuf, String> {
             top.display()
         ));
     }
-    Ok(canon)
+    Ok(())
 }
 
 /// The shared `.git` directory of a checkout or any of its worktrees.
@@ -558,6 +599,30 @@ mod tests {
         assert_eq!(slug("--x--"), "x");
         assert_eq!(slug("***"), "");
         assert!(slug(&"ab ".repeat(40)).len() <= 32);
+    }
+
+    #[test]
+    fn a_failing_git_names_its_last_stderr_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let args: Vec<&std::ffi::OsStr> =
+            vec!["-C".as_ref(), missing.as_os_str(), "status".as_ref()];
+        let err = git_bounded(&args, Duration::from_secs(30)).unwrap_err();
+        assert!(err.starts_with("git exited with "), "{err}");
+        assert!(err.contains("cannot change to"), "{err}");
+    }
+
+    #[test]
+    fn a_slow_git_is_killed_at_its_deadline() {
+        let args: Vec<&std::ffi::OsStr> =
+            vec!["-c".as_ref(), "alias.nap=!sleep 5".as_ref(), "nap".as_ref()];
+        let started = Instant::now();
+        let err = git_bounded(&args, Duration::from_secs(1)).unwrap_err();
+        assert_eq!(err, "git took longer than 1s");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "killed, not waited out"
+        );
     }
 
     #[test]
