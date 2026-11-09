@@ -341,17 +341,20 @@ pub fn stop(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds) -> Result<(), Serve
 /// [`stop`] with the lock already held. Signals only a process the record
 /// still matches; a stale record is just removed.
 fn stop_locked(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds) -> Result<(), ServerError> {
-    use darkmux_types::child_registry::{kill_group, SIGKILL, SIGTERM};
+    use darkmux_types::child_registry::{SIGKILL, SIGTERM};
     let failed = |detail: String| ServerError::StopFailed { endpoint: rec.endpoint.clone(), pid: rec.pid, detail };
-    for (sig, name) in [(SIGTERM, "SIGTERM"), (SIGKILL, "SIGKILL")] {
-        if !alive(rec) {
-            break;
-        }
-        // The server leads its own process group (`spawn_and_record`), so
-        // the group is the server and every worker it forked.
-        kill_group(rec.pid, sig).map_err(|e| failed(format!("{name}: {e}")))?;
-        if gone_within(rec, bounds) {
-            break;
+    // Only a server the record still matches is ever signaled; a stale
+    // record names a pid (and so a group) that may be someone else's now.
+    if alive(rec) {
+        signal_server(rec.pid, SIGTERM).map_err(|e| failed(format!("SIGTERM: {e}")))?;
+        let exited = gone_within(rec, bounds);
+        // Whether or not the server exited on SIGTERM, a worker in its group
+        // may have ignored it: SIGKILL the group. Its id cannot be reused
+        // while any member is left, and with none left this is a no-op.
+        let _ = darkmux_types::child_registry::kill_group(rec.pid, SIGKILL);
+        if !exited {
+            signal_server(rec.pid, SIGKILL).map_err(|e| failed(format!("SIGKILL: {e}")))?;
+            gone_within(rec, bounds);
         }
     }
     if alive(rec) {
@@ -363,6 +366,21 @@ fn stop_locked(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds) -> Result<(), Se
     }
     let _ = engine_record::remove_if_in(&dirs.records, rec);
     Ok(())
+}
+
+/// Signal the server's process group (it leads one: `spawn_and_record`), or
+/// the server alone when it has left that group; a server that already
+/// exited is not an error.
+fn signal_server(pid: u32, sig: i32) -> std::io::Result<()> {
+    use darkmux_types::child_registry::{kill_group, kill_pid};
+    let no_such = |e: &std::io::Error| e.raw_os_error() == Some(darkmux_types::child_registry::ESRCH);
+    match kill_group(pid, sig) {
+        Err(e) if no_such(&e) => match kill_pid(pid, sig) {
+            Err(e) if no_such(&e) => Ok(()),
+            other => other,
+        },
+        other => other,
+    }
 }
 
 fn gone_within(rec: &EngineRecord, bounds: Bounds) -> bool {
@@ -418,6 +436,16 @@ if "--fork-child" in a:
     import subprocess
     child = subprocess.Popen(["sleep", "300"])
     open(a[a.index("--fork-child") + 1], "w").write(str(child.pid))
+if "--stubborn-worker" in a:
+    import os
+    pid = os.fork()
+    if pid == 0:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        time.sleep(300); os._exit(0)
+    open(a[a.index("--stubborn-worker") + 1], "w").write(str(pid))
+if "--leave-group" in a:
+    import os
+    os.setpgid(0, os.getpgid(os.getppid()))
 if "--silent-name" in a:
     name = "someone-else"
 class H(BaseHTTPRequestHandler):
@@ -441,7 +469,8 @@ HTTPServer(("127.0.0.1", port), H).serve_forever()
         fn drop(&mut self) {
             for rec in engine_record::list_in(&self.dirs.records).0 {
                 if rec.state_now() == ServerState::Running {
-                    let _ = darkmux_types::child_registry::kill_pid(rec.pid, darkmux_types::child_registry::SIGKILL);
+                    use darkmux_types::child_registry::{kill_group, kill_pid, SIGKILL};
+                    let _ = kill_group(rec.pid, SIGKILL).or_else(|_| kill_pid(rec.pid, SIGKILL));
                 }
             }
             reap_exited();
@@ -713,5 +742,37 @@ HTTPServer(("127.0.0.1", port), H).serve_forever()
         assert!(began.elapsed() < Duration::from_secs(1), "a stop of a dead server does not wait out the grace");
         let _ = parent.kill();
         let _ = parent.wait();
+    }
+
+    /// (#3458 re-review) A worker that ignores SIGTERM is SIGKILLed with its
+    /// group even when the server itself exits on SIGTERM.
+    #[test]
+    fn a_worker_that_ignores_sigterm_dies_with_the_stop() {
+        let f = fixture();
+        let file = f.dirs.logs.with_extension("worker");
+        let s = spec(&f, "tf", "m/a", free_port(), &["--stubborn-worker", file.to_str().unwrap()]);
+        let rec = ensure(&s, &f.dirs, quick(), &mut no_progress()).unwrap().record().clone();
+        let worker: u32 = std::fs::read_to_string(&file).unwrap().trim().parse().unwrap();
+        stop(&f.dirs, &rec, Bounds { stop_grace: Duration::from_millis(500), ..quick() }).unwrap();
+        let until = Instant::now() + Duration::from_secs(3);
+        while pid_alive(worker) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let survived = pid_alive(worker);
+        if survived {
+            let _ = darkmux_types::child_registry::kill_pid(worker, darkmux_types::child_registry::SIGKILL);
+        }
+        assert!(!survived, "the SIGTERM-ignoring worker died with the stop");
+    }
+
+    /// (#3458 re-review) A server that moved itself out of its own process
+    /// group is still stopped, by its pid.
+    #[test]
+    fn a_server_that_left_its_group_is_still_stopped() {
+        let f = fixture();
+        let s = spec(&f, "tf", "m/a", free_port(), &["--leave-group"]);
+        let rec = ensure(&s, &f.dirs, quick(), &mut no_progress()).unwrap().record().clone();
+        stop(&f.dirs, &rec, quick()).unwrap();
+        assert_eq!(rec.state_now(), ServerState::Exited);
     }
 }
