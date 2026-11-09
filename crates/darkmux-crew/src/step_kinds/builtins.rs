@@ -1252,21 +1252,45 @@ impl DispatchSingleShotStepKind {
         if let Some(em) = session_emitter.take() {
             em.stop();
         }
-        bookend.close(records.record(
-            darkmux_flow::Level::Info,
-            darkmux_flow::Payload::DispatchComplete(records.stamp(crate::dispatch_internal::single_call_complete(
-                &crate::dispatch_envelope::DirectTokens::of(&reply.counts),
-                call_started.elapsed().as_millis() as u64,
-                reply.content.len() as u64,
-            ))),
-        ));
-
-        Ok(StepOutcome {
+        let wall_ms = call_started.elapsed().as_millis() as u64;
+        close_answered_single_shot(&mut bookend, &records, &reply, max_tokens, &step.id, wall_ms).map(|()| StepOutcome {
             output: reply.content,
             flow_records,
             degraded: None,
         })
     }
+}
+
+/// The terminal of a `dispatch.single_shot` call that answered:
+/// `dispatch.complete`, unless (#3445) it stopped at its `max_tokens` with no
+/// answer, which fails the step naming the cap and the step's knob, as it
+/// fails a single-shot dispatch. The call's usage record stands either way.
+fn close_answered_single_shot(
+    bookend: &mut StepBookend<'_>,
+    records: &ExecutionBookends<'_>,
+    reply: &crate::single_shot::SingleShotReply,
+    max_tokens: u32,
+    step_id: &str,
+    wall_ms: u64,
+) -> Result<()> {
+    if reply.hit_cap_with_no_answer() {
+        let e = crate::dispatch_internal::cap_hit_error(
+            max_tokens,
+            reply.counts.completion,
+            &format!("set `max_tokens` in step `{step_id}`'s config"),
+        );
+        bookend.fail(&e, wall_ms);
+        return Err(e);
+    }
+    bookend.close(records.record(
+        darkmux_flow::Level::Info,
+        darkmux_flow::Payload::DispatchComplete(records.stamp(crate::dispatch_internal::single_call_complete(
+            &crate::dispatch_envelope::DirectTokens::of(&reply.counts),
+            wall_ms,
+            reply.content.len() as u64,
+        ))),
+    ));
+    Ok(())
 }
 
 // ─── dispatch.map (#1442) ───────────────────────────────────────────────
@@ -3677,6 +3701,54 @@ mod tests {
         }
     }
 
+    /// (#3445) A `dispatch.single_shot` step whose call stopped at its
+    /// `max_tokens` with no answer fails, naming the cap and the step's own
+    /// knob: one `dispatch.error` terminal, no `dispatch.complete`, and still
+    /// the call's usage record.
+    #[test]
+    #[serial_test::serial] // mutates DARKMUX_LMSTUDIO_URL
+    fn dispatch_single_shot_that_hits_its_cap_with_no_answer_fails_naming_max_tokens() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).header("content-type", "application/json").json_body(json!({
+                "model": "qwen3-4b",
+                "choices": [{ "index": 0, "message": { "role": "assistant", "content": "" }, "finish_reason": "length" }],
+                "usage": { "prompt_tokens": 5, "completion_tokens": 300, "total_tokens": 305 },
+            }));
+        });
+        let url_key = "DARKMUX_LMSTUDIO_URL";
+        let prev = std::env::var(url_key).ok();
+        unsafe {
+            std::env::set_var(url_key, server.base_url());
+        }
+        let s = step("s1", "dispatch.single_shot", json!({ "model": "qwen3-4b", "user": "hi", "max_tokens": 300 }));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = StepRunCtx::new(crate::test_run(), Some(tx), None, std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()));
+        let result = DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new(), &ctx);
+        drop(ctx);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(url_key, v),
+                None => std::env::remove_var(url_key),
+            }
+        }
+        let msg = format!("{:#}", result.expect_err("an empty answer at the cap fails the step"));
+        assert!(msg.contains("300") && msg.contains("`max_tokens`"), "names the cap and the step's knob: {msg}");
+        let emitted: Vec<darkmux_flow::FlowRecord> = rx
+            .into_iter()
+            .filter_map(|sig| match sig {
+                crate::step_kinds::WaveSignal::Record(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        let count = |a: darkmux_flow::FlowAction| emitted.iter().filter(|r| r.action == a).count();
+        assert_eq!(count(darkmux_flow::FlowAction::DispatchComplete), 0, "{emitted:?}");
+        assert_eq!(count(darkmux_flow::FlowAction::DispatchError), 1, "{emitted:?}");
+        assert_eq!(count(darkmux_flow::FlowAction::TelemetryTokens), 1, "the spent call keeps its usage record: {emitted:?}");
+    }
+
     #[test]
     #[serial_test::serial] // mutates DARKMUX_LMSTUDIO_URL
     fn dispatch_single_shot_local_streaming_bookends_carry_the_namespaced_identifier() {
@@ -4987,6 +5059,7 @@ mod tests {
                 content: "answer".into(),
                 model: None,
                 counts: darkmux_trajectory::UsageCounts { total: Some(700), ..Default::default() },
+                finish_reason: None,
             })
         });
         let out = map_hosted_item(
@@ -5012,6 +5085,7 @@ mod tests {
                 content: "answer".into(),
                 model: None,
                 counts: darkmux_trajectory::UsageCounts { prompt: Some(30), completion: Some(12), ..Default::default() },
+                finish_reason: None,
             })
         });
         let mut calls = Vec::new();
@@ -5037,6 +5111,7 @@ mod tests {
                 content: "answer".into(),
                 model: None,
                 counts: darkmux_trajectory::UsageCounts { completion: Some(12), ..Default::default() },
+                finish_reason: None,
             })
         });
         let mut calls = Vec::new();
@@ -5086,6 +5161,7 @@ mod tests {
                 content: String::new(),
                 model: None,
                 counts: darkmux_trajectory::UsageCounts { total: Some(1), ..Default::default() },
+                finish_reason: None,
             })
         });
         let out = map_hosted_item(
@@ -5114,6 +5190,7 @@ mod tests {
                 content: String::new(),
                 model: None,
                 counts: darkmux_trajectory::UsageCounts { total: Some(1), ..Default::default() },
+                finish_reason: None,
             })
         });
         let out = map_local_item(3, "m", "sys", "user", 0.0, 100, 5, 0, 1, Some(&ovr), &mut Vec::new(), None);
@@ -5132,6 +5209,7 @@ mod tests {
                 content: String::new(),
                 model: None,
                 counts: darkmux_trajectory::UsageCounts { total: Some(1), ..Default::default() },
+                finish_reason: None,
             })
         });
         let out = map_local_item(3, "m", "sys", "user", 0.0, 100, 5, 0, 1, Some(&ovr), &mut Vec::new(), None);
@@ -5283,6 +5361,7 @@ mod tests {
                 content: "ok".into(),
                 model: None,
                 counts: darkmux_trajectory::UsageCounts { total: Some(12), ..Default::default() },
+                finish_reason: None,
             })
         });
         let bucket = Arc::new(Mutex::new(DispatchBudget::new(Some(10), darkmux_types::BudgetPolicy::Warn)));
@@ -5309,6 +5388,7 @@ mod tests {
                 content: "ok".into(),
                 model: None,
                 counts: darkmux_trajectory::UsageCounts { total: Some(1), ..Default::default() },
+                finish_reason: None,
             })
         });
         let bucket = Arc::new(Mutex::new(DispatchBudget::new(None, darkmux_types::BudgetPolicy::Warn)));
@@ -5723,6 +5803,7 @@ mod tests {
             content: "ok".to_string(),
             model: Some("hosted".to_string()),
             counts: darkmux_trajectory::UsageCounts { total: Some(1261), prompt: Some(75), completion: Some(1186), reasoning: Some(1024), cached: Some(64), cache_write: None },
+            finish_reason: None,
         };
         let payload = serde_json::to_value(hosted_single_shot_step_payload("s1", Some(500_000), 4096, 4096, &reply)).unwrap();
         assert_eq!(payload["reasoning_tokens"], 1024);
@@ -5747,6 +5828,7 @@ mod tests {
             content: "ok".to_string(),
             model: None,
             counts: darkmux_trajectory::UsageCounts { total: Some(42), prompt: Some(30), completion: Some(12), ..Default::default() },
+            finish_reason: None,
         };
         let payload = serde_json::to_value(hosted_single_shot_step_payload("s1", Some(500_000), 4096, 4096, &reply)).unwrap();
         let obj = payload.as_object().expect("object");
@@ -6254,6 +6336,7 @@ mod tests {
             content: "flag".to_string(),
             model: Some("hosted".to_string()),
             counts: darkmux_trajectory::UsageCounts { total, ..Default::default() },
+            finish_reason: None,
         }
     }
 
@@ -6334,6 +6417,7 @@ mod tests {
                 content: content.to_string(),
                 model: Some("hosted".to_string()),
                 counts: darkmux_trajectory::UsageCounts { total, ..Default::default() },
+                finish_reason: None,
             })
         });
     }
@@ -6440,6 +6524,7 @@ mod tests {
                     content: content.to_string(),
                     model: Some("hosted".to_string()),
                     counts: darkmux_trajectory::UsageCounts { total: *total, ..Default::default() },
+                    finish_reason: None,
                 }),
                 Err(e) => Err(anyhow!("{e}")),
             }
@@ -6593,6 +6678,7 @@ mod tests {
                 content: "flag".to_string(),
                 model: served.map(str::to_string),
                 counts: darkmux_trajectory::UsageCounts { total, ..Default::default() },
+                finish_reason: None,
             })
         });
     }
@@ -7002,6 +7088,7 @@ mod tests {
                     content: "ok".to_string(),
                     model: None,
                     counts: darkmux_trajectory::UsageCounts { total: Some(5), ..Default::default() },
+                    finish_reason: None,
                 })
             });
             let s = map_step(json!({ "model": "qwen3.6-35b", "user_template": "check {item}", "collection": ["a", "b"] }));
@@ -7107,6 +7194,7 @@ mod tests {
                 content: "ok".to_string(),
                 model: None,
                 counts: darkmux_trajectory::UsageCounts { total: Some(5), ..Default::default() },
+                finish_reason: None,
             })
         });
 
@@ -7589,6 +7677,7 @@ mod tests {
                     content: content.to_string(),
                     model: Some("served-r".to_string()),
                     counts: darkmux_trajectory::UsageCounts { total, ..Default::default() },
+                    finish_reason: None,
                 })
             });
         }
@@ -8001,6 +8090,7 @@ mod tests {
             content: content.to_string(),
             model: Some("served-by-script".to_string()),
             counts: darkmux_trajectory::UsageCounts { total, prompt: total.map(|t| t - 2), completion: total.map(|_| 2), ..Default::default() },
+            finish_reason: None,
         }
     }
 

@@ -435,7 +435,7 @@
         );
         let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::full_window().stopped_after(1, "mission `m` is aborted"));
         let result = crate::budget::with_test_env(env.clone(), || {
-            dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), "system prompt", &Default::default(), &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap())
+            dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), "system prompt", &Default::default(), &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap(), true)
         });
         unsafe {
             match prev_home {
@@ -3398,7 +3398,7 @@
 
         let pm = darkmux_types::ProfileModel::hosted_for_test("gpt-remote", Some(100000), serde_json::json!({"url": base_url}));
 
-        let result = dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), "system prompt", &Default::default(), &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap());
+        let result = dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), "system prompt", &Default::default(), &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap(), true);
 
         unsafe {
             match prev_home {
@@ -3494,7 +3494,7 @@
             let pm = darkmux_types::ProfileModel::hosted_for_test("gpt-remote", Some(100000), serde_json::json!({"url": base_url}));
             let target = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
             let result = with_redis_url(&url, || {
-                dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), "system prompt", &Default::default(), &target)
+                dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), "system prompt", &Default::default(), &target, true)
             });
             unsafe {
                 match prev_home {
@@ -3603,7 +3603,7 @@
             opts.json = false;
             let pm = darkmux_types::ProfileModel::hosted_for_test("gpt-remote", Some(100000), serde_json::json!({"url": base_url}));
             let result =
-                dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), "system prompt", &Default::default(), &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap()).expect("dispatch_unmanaged must succeed");
+                dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), "system prompt", &Default::default(), &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap(), true).expect("dispatch_unmanaged must succeed");
             assert_eq!(result.session_id, step_session, "dispatch_unmanaged runs under its caller's session");
             seen_session_ids.insert(result.session_id);
         }
@@ -3652,7 +3652,7 @@
             opts.role_id = "pr-reviewer".to_string();
             opts.json = true;
             let pm = darkmux_types::ProfileModel::hosted_for_test("gpt-remote", Some(100000), serde_json::json!({"url": base_url}));
-            let result = dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), "system prompt", &Default::default(), &crate::target::target_for("p".into(), Default::default(), pm).unwrap())
+            let result = dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), "system prompt", &Default::default(), &crate::target::target_for("p".into(), Default::default(), pm).unwrap(), true)
                 .expect("dispatch_unmanaged must succeed");
             let envelope: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
             seen.push(envelope["metrics"].get("finish_reason").cloned());
@@ -3855,7 +3855,7 @@
         let target = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
         let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
         let result = crate::budget::with_test_env(env.clone(), || {
-            dispatch_unmanaged(&opts, &ExecutionId::mint(), "system prompt", &Default::default(), &target)
+            dispatch_unmanaged(&opts, &ExecutionId::mint(), "system prompt", &Default::default(), &target, true)
         });
         unsafe {
             match prev_home {
@@ -20039,7 +20039,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
                 &opts, &darkmux_types::execution_id::ExecutionId::mint(),
                 "system prompt",
                 &Default::default(),
-                &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap(),
+                &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap(), true,
             )
         });
         let records = drain_flow_records_for_session(flows_dir.path(), &crate::test_session(&session));
@@ -20196,7 +20196,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
             &darkmux_types::execution_id::ExecutionId::mint(),
             "system prompt",
             &Default::default(),
-            &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap(),
+            &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap(), true,
         );
         let records = drain_flow_records_for_session(flows_dir.path(), &crate::test_session(&session));
         unsafe {
@@ -20217,6 +20217,189 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         let start = records.iter().find(|r| r["action"] == "dispatch.start").expect("a start bookend");
         assert!(p["endpoint"].as_str().is_some_and(|e| e.contains("127.0.0.1")), "{p}");
         assert_eq!(p["endpoint"], start["payload"]["endpoint"], "the terminal names the endpoint the start named");
+    }
+
+    /// Which entry point a #3445 case drives.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum CapEntry {
+        /// `dispatch_unmanaged` directly, failing at the cap.
+        Unmanaged,
+        /// `dispatch()`, the entry missions, the CLI and the lab share,
+        /// routed to the hosted one-call path.
+        Dispatch,
+        /// `dispatch_local_single_shot` (radio's answering seat) on a local model.
+        RadioLocal,
+        /// `dispatch_local_single_shot` on a profile that routes it hosted.
+        RadioHosted,
+    }
+
+    /// The outcome of one #3445 case: the dispatch's result, the session's
+    /// flow records, and the budget records (`FakeEnv`).
+    struct CapRun {
+        result: Result<DispatchResult>,
+        records: Vec<serde_json::Value>,
+        env: std::rc::Rc<crate::budget::tests::FakeEnv>,
+    }
+
+    /// One single-shot dispatch through `entry` against a mock answering
+    /// `body`, with `cap` as `max_completion_tokens`, `lab_inputs` set when
+    /// `lab`, and `remote_origin` set when `remote`. Every hosted endpoint
+    /// carries a 5-token `tokens_per_dispatch`, so a settle shows as a warn.
+    fn single_shot_against(body: &'static str, entry: CapEntry, cap: Option<u32>, lab: bool, remote: bool) -> CapRun {
+        let (base_url, _rx) = one_shot_http_mock(body);
+        let home = TempDir::new().unwrap();
+        let flows_dir = TempDir::new().unwrap();
+        let keys = ["DARKMUX_HOME", "DARKMUX_FLOWS_DIR", "DARKMUX_REDIS_URL"];
+        let prev: Vec<Option<String>> = keys.iter().map(|k| std::env::var(k).ok()).collect();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", home.path());
+            std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
+            std::env::remove_var("DARKMUX_REDIS_URL");
+        }
+        let session = format!("single-shot-cap-{entry:?}-{}", std::process::id());
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.role_id = "pr-reviewer".to_string(); // built-in, tool-less
+        opts.session = crate::test_session(&session);
+        opts.phase_id = None;
+        opts.max_completion_tokens = cap;
+        opts.lab_inputs = lab.then_some(crate::dispatch::LabInputs::Builtin);
+        opts.remote_origin = remote.then(|| "peer".to_string());
+        let pf = home.path().join("profiles.json");
+        let registry = match entry {
+            CapEntry::RadioLocal => r#"{"profiles":{"p":{"models":[{"id":"m","n_ctx":8192,"endpoint":"lms"}]}},
+                "endpoints":{"lms":{"managed":"lmstudio"}},"default_profile":"p"}"#
+                .to_string(),
+            _ => format!(
+                r#"{{"profiles":{{"p":{{"models":[{{"id":"gpt-remote","n_ctx":100000,"endpoint":"mock"}}]}}}},
+                "endpoints":{{"mock":{{"url":"{base_url}","limits":{{"tokens_per_dispatch":5}}}}}},"default_profile":"p"}}"#
+            ),
+        };
+        std::fs::write(&pf, registry).unwrap();
+        opts.config_path = Some(pf.to_str().unwrap().to_string());
+        if entry == CapEntry::RadioLocal {
+            opts.model_base_url_override = Some(base_url.clone());
+        }
+        let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
+        let result = crate::budget::with_test_env(env.clone(), || match entry {
+            CapEntry::Unmanaged => {
+                let pm = darkmux_types::ProfileModel::hosted_for_test(
+                    "gpt-remote",
+                    None,
+                    serde_json::json!({"url": base_url, "limits": {"tokens_per_dispatch": 5}}),
+                );
+                let target = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
+                dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), "system prompt", &Default::default(), &target, true)
+            }
+            CapEntry::Dispatch => crate::dispatch::dispatch(opts),
+            CapEntry::RadioLocal | CapEntry::RadioHosted => dispatch_local_single_shot(opts),
+        });
+        let records = drain_flow_records_for_session(flows_dir.path(), &crate::test_session(&session));
+        unsafe {
+            for (k, v) in keys.iter().zip(prev) {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        CapRun { result, records, env }
+    }
+
+    const CAP_HIT_EMPTY: &str = r#"{"choices":[{"message":{"content":"","reasoning":"thinking..."},"finish_reason":"length"}],"usage":{"prompt_tokens":900,"completion_tokens":4096,"total_tokens":4996}}"#;
+
+    /// Asserts `run` failed as #3445 says: one `dispatch.error` carrying the
+    /// error the caller got, no `dispatch.complete`, the usage record kept,
+    /// and the budget settled with the reply's real spend. Returns the error.
+    fn assert_failed_at_cap(run: CapRun, what: &str) -> String {
+        let msg = run.result.expect_err(&format!("{what}: an empty answer at the cap fails the dispatch")).to_string();
+        let actions: Vec<&str> = run.records.iter().filter_map(|r| r["action"].as_str()).collect();
+        assert!(!actions.contains(&"dispatch.complete"), "{what}: {actions:?}");
+        let terminals: Vec<&serde_json::Value> = run.records.iter().filter(|r| r["action"] == "dispatch.error").collect();
+        assert_eq!(terminals.len(), 1, "{what}: exactly one error terminal: {actions:?}");
+        assert_eq!(terminals[0]["payload"]["error"], msg, "{what}: the terminal carries the error the caller got");
+        let rec = crate::usage::assert_one_usage_record(&run.records, crate::usage::CallKind::SingleShot, what);
+        assert_eq!(rec["payload"]["completion_tokens"], 4096, "{what}: {rec}");
+        let w = run.env.payload(darkmux_flow::FlowAction::BudgetWarn);
+        assert_eq!(w["spent"].as_u64(), Some(4996), "{what}: the spent call still settles its budget: {w}");
+        msg
+    }
+
+    /// Asserts `run` completed: a `dispatch.complete` and no `dispatch.error`.
+    fn assert_completed(run: &CapRun, what: &str) {
+        if let Err(e) = &run.result {
+            panic!("{what}: {e}");
+        }
+        assert!(run.records.iter().any(|r| r["action"] == "dispatch.complete"), "{what}");
+        assert!(!run.records.iter().any(|r| r["action"] == "dispatch.error"), "{what}");
+    }
+
+    /// (#3445) A hosted single-shot that stopped at the output cap with no
+    /// answer is a failed dispatch, named by the cap it hit and how to raise
+    /// it: through `dispatch_unmanaged` and through `dispatch()`, the entry
+    /// a mission step and the CLI take.
+    #[test]
+    #[serial]
+    fn a_hosted_single_shot_that_hits_its_cap_with_no_answer_fails_naming_the_cap() {
+        for (entry, cap, cap_text) in
+            [(CapEntry::Unmanaged, None, "4096"), (CapEntry::Unmanaged, Some(2000), "2000"), (CapEntry::Dispatch, Some(2000), "2000")]
+        {
+            let what = format!("{entry:?} cap={cap:?}");
+            let msg = assert_failed_at_cap(single_shot_against(CAP_HIT_EMPTY, entry, cap, false, false), &what);
+            assert!(msg.contains(&format!("cap of {cap_text} tokens")), "{what}: names the cap it hit: {msg}");
+            assert!(
+                msg.contains("`max_completion_tokens` in the mission step's config") && msg.contains("--max-completion-tokens"),
+                "{what}: names both remedies: {msg}"
+            );
+        }
+    }
+
+    /// (#3445) A dispatch run here for another machine got the default cap (a
+    /// cross-machine job carries none), so its error says that instead of
+    /// pointing at knobs that cannot reach it.
+    #[test]
+    #[serial]
+    fn a_cap_hit_on_a_dispatch_for_another_machine_names_the_default_it_ran_at() {
+        let msg = assert_failed_at_cap(single_shot_against(CAP_HIT_EMPTY, CapEntry::Unmanaged, None, false, true), "remote");
+        assert!(msg.contains("sent from another machine runs at the default cap"), "{msg}");
+        assert!(!msg.contains("mission step's config"), "{msg}");
+    }
+
+    /// (#3445) A lab dispatch keeps the reply as it came: an empty answer at
+    /// the cap completes, its envelope carrying the `length` finish and the
+    /// empty answer for the lab's grading, since a lab dispatch that errors
+    /// writes no run manifest at all.
+    #[test]
+    #[serial]
+    fn a_lab_single_shot_that_hits_its_cap_still_completes_for_grading() {
+        let run = single_shot_against(CAP_HIT_EMPTY, CapEntry::Dispatch, None, true, false);
+        assert_completed(&run, "lab");
+        let out = run.result.unwrap();
+        let env: serde_json::Value = serde_json::from_str(&out.stdout).expect("the hosted envelope");
+        assert_eq!((env["metrics"]["finish_reason"].as_str(), env["final_assistant"].as_str()), (Some("length"), Some("")), "{env}");
+    }
+
+    /// (#3445) Radio's answering seat (`dispatch_local_single_shot`), on a
+    /// local model or routed hosted, still completes an empty answer at the
+    /// cap: radio refuses it itself, naming the setting that raises its cap.
+    #[test]
+    #[serial]
+    fn radios_single_shot_leaves_an_empty_answer_at_the_cap_to_radio() {
+        for entry in [CapEntry::RadioLocal, CapEntry::RadioHosted] {
+            assert_completed(&single_shot_against(CAP_HIT_EMPTY, entry, None, false, false), &format!("{entry:?}"));
+        }
+    }
+
+    /// (#3445, the inverted case) A reply cut off at the cap that still
+    /// carries an answer, and an empty answer the model ended on its own, are
+    /// both left as they were: completed dispatches.
+    #[test]
+    #[serial]
+    fn a_single_shot_cut_off_with_an_answer_or_empty_by_choice_still_completes() {
+        const CUT_OFF: &str = r#"{"choices":[{"message":{"content":"partial answer"},"finish_reason":"length"}],"usage":{"total_tokens":10}}"#;
+        const EMPTY_STOP: &str = r#"{"choices":[{"message":{"content":""},"finish_reason":"stop"}],"usage":{"total_tokens":10}}"#;
+        for body in [CUT_OFF, EMPTY_STOP] {
+            assert_completed(&single_shot_against(body, CapEntry::Unmanaged, None, false, false), body);
+        }
     }
 
     /// A reply with no prompt count has an unknown spend: the step settles
@@ -20253,7 +20436,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
                 &opts, &darkmux_types::execution_id::ExecutionId::mint(),
                 "system prompt",
                 &Default::default(),
-                &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap(),
+                &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap(), true,
             )
         });
         let records = drain_flow_records_for_session(flows_dir.path(), &crate::test_session(&session));
@@ -20666,7 +20849,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
             &opts, &darkmux_types::execution_id::ExecutionId::mint(),
             "system prompt",
             &Default::default(),
-            &crate::target::target_for("p".into(), Default::default(), pm).unwrap(),
+            &crate::target::target_for("p".into(), Default::default(), pm).unwrap(), true,
         );
         unsafe {
             match prev_home {
@@ -20705,7 +20888,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         opts.phase_id = None;
         opts.json = false;
         let pm = darkmux_types::ProfileModel::hosted_for_test("gpt-remote", Some(100000), serde_json::json!({"url": base_url}));
-        let result = dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), "system prompt", &Default::default(), &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap());
+        let result = dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), "system prompt", &Default::default(), &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap(), true);
         unsafe {
             match prev_home {
                 Some(v) => std::env::set_var("DARKMUX_HOME", v),
@@ -20869,7 +21052,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         opts.json = false;
         let pm = darkmux_types::ProfileModel::hosted_for_test("gpt-remote", Some(100000), endpoint);
         let target = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
-        let result = dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), "system prompt", &Default::default(), &target);
+        let result = dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), "system prompt", &Default::default(), &target, true);
         for (k, v) in prev {
             unsafe {
                 match v {

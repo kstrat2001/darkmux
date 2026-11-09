@@ -41,6 +41,7 @@ This document is the **why**: how darkmux is built, the decisions behind the sha
 - [Lab reproducibility: fixtures + content hashing](#lab-reproducibility-fixtures--content-hashing)
 - [An eval owns its roles](#an-eval-owns-its-roles)
 - [Residency: a pure planner, leases and an owned namespace](#residency-a-pure-planner-leases-and-an-owned-namespace)
+- [Engine servers darkmux starts (planned, #3448)](#engine-servers-darkmux-starts-planned-3448)
 - [Thermal and power governors: pause, never kill](#thermal-and-power-governors-pause-never-kill)
 - [Platforms: one strategy per OS, asked and never branched on](#platforms-one-strategy-per-os-asked-and-never-branched-on)
 
@@ -670,6 +671,135 @@ darkmux began as the thing that loads the right models at the right context. Tha
 **Leases give the planner liveness.** A planner plans on residency (`lms ps`), never on what another darkmux process is actively doing, so an exclusive reconcile from one command could unload a model a concurrent command is mid-dispatch on (a CI review runner overlapping a local dispatch). `darkmux_types::residency_lease` is the missing input: one JSON file per live process at `<darkmux-home>/residency/<pid>.lease`, holding the models the process desires and the subset it has confirmed loaded. The leases feed the planner's `AcquireOpts.pinned`, so a reconcile never touches a busy resident. Only a lease whose pid is verified to still be its writer counts, so a lease orphaned by a crash under a reused pid never names the wrong process.
 
 Known gap: the sibling protection is seeded only from pins that pass a bare `darkmux:` prefix test, so any pin naming a non-`darkmux:` alias never enters the claimed set ([Seat classes](#seat-classes-every-step-says-what-it-consumes)).
+
+## Engine servers darkmux starts (planned, #3448)
+
+**Status: agreed design, not built.** This section is the interface an app built on darkmux can plan against; it lands in four PRs (config and the Tensorfold adapter, the server record, start and stop, then dispatch with eviction). Until the last one merges, a dispatch to one of these endpoints is refused. Tensorfold is the first engine; rec/Flint and `mlx_lm.server` follow the same shape.
+
+Some engines serve one model per server process and have no load or unload call, so loading a model there means starting a server and unloading it means stopping one. darkmux does both for the servers it starts. A server darkmux started is darkmux's, exactly as a `darkmux:` load is in LM Studio (contract 4): it counts in the memory budget, darkmux may stop it to make room, and it is never confused with a server someone else started. A server darkmux did not start is another tenant: its memory counts as in use, and darkmux never stops it, adopts it or sends to it as if it were its own.
+
+### What an app does: name a profile
+
+Nothing new. An app dispatches exactly as it does to an LM Studio profile, and darkmux puts the right model in memory:
+
+```bash
+darkmux dispatch <role> "<message>" --profile <profile> [--json]
+darkmux dispatch <role> "<message>" --profile <profile>@<machine>   # on another fleet machine
+```
+
+**The CLI is the app interface (operator, 2026-11-09).** An app runs `darkmux` on its own machine and reads `--json`; for a profile on another machine it uses `@<machine>`, so the fleet token stays in darkmux's Keychain item and never reaches the app. Calling `POST /fleet/work` directly would put that shared token in the app; it waits for a need and a per-client token.
+
+Missions name profiles the same way. An app never starts, stops or addresses an engine server, and never sends to the server's port itself: darkmux owns that port and may stop or restart the server between dispatches.
+
+### What the operator declares once
+
+An endpoint in `profiles.json` says which engine darkmux manages and the port it serves on; the profile model says which model to load, as for LM Studio:
+
+```json
+{
+  "endpoints": {
+    "tensorfold": { "managed": "tensorfold", "port": 8091 }
+  },
+  "profiles": {
+    "q38-27b-tensorfold": {
+      "models": [{
+        "id": "TensorFold/Qwen3.8-27B-MLX-4bit",
+        "n_ctx": 262144,
+        "endpoint": "tensorfold",
+        "engine_args": ["--drafter", "<drafter-repo>"]
+      }]
+    }
+  }
+}
+```
+
+```bash
+darkmux config set engines.tensorfold.bin <path-to-tensorfold-native>   # when it is not on PATH
+darkmux doctor                                                           # checks the binary, its version and engine_args
+```
+
+- `port` is required on a Tensorfold endpoint and refused anywhere else. A Tensorfold endpoint has no `url`.
+- `id` is the model the server loads (a name `tensorfold-native models` lists), and `n_ctx` is required: it becomes the server's `--context`.
+- `engine_args` are extra `tensorfold-native serve` flags for this model. darkmux refuses the flags it sets itself (`--port`, `--host`, `--context`, `--name`) and `--api-key` (a secret does not belong in `profiles.json`), and `darkmux doctor` checks every flag against the installed engine's `capabilities --json`.
+- darkmux supports the engine versions it has been verified against (Tensorfold 1.2.x) and refuses others, naming the version.
+- One endpoint is one server slot. Two profiles on the same endpoint with different models or contexts share it, and darkmux restarts the server to switch between them. Declare two endpoints on two ports for two models that should be resident together.
+
+### What darkmux does on each dispatch
+
+1. Preflight, as for every dispatch.
+2. When the endpoint's server is running with the profile's model and context, send the request.
+3. Otherwise make room: stop or unload darkmux's own least recently used residents, on any engine (LM Studio `darkmux:` loads and servers darkmux started), until the model fits the machine's memory budget. Nothing darkmux did not start is touched.
+4. Start the server, `tensorfold-native serve <id> --host 127.0.0.1 --port <port> --context <n_ctx> --name darkmux:<id> --no-update-check <engine_args>`, in its own process group with its output in a log file, and wait for it to answer. The dispatch's live records show it starting, so a long start never looks like a stall.
+5. Send the request, naming the model `darkmux:<id>` on the wire.
+6. Leave the model resident when the dispatch ends. The next dispatch to the same profile pays no start; a dispatch that needs the memory evicts it (step 3).
+
+Any darkmux process can start a server: a CLI dispatch, the daemon or a mission. The server outlives the process that started it, and darkmux keeps a record of it (pid, process start time, command line, port) under `~/.darkmux/run/engines/`. A server is darkmux's only while that record matches the live process, so a reused pid or a server restarted by hand is never mistaken for darkmux's.
+
+### What the app sees
+
+The dispatch envelope, the flow records and the exit codes are unchanged. The first dispatch after a switch is slower by the server's start time. A dispatch is refused (`dispatch.error`, a nonzero exit, a message naming the fix) when:
+
+- something darkmux did not start already holds the endpoint's port;
+- the server fails to start or exits early (the message names its log file);
+- the model does not fit even after darkmux evicts everything it owns;
+- the engine binary is missing, or its version is one darkmux has not verified;
+- the memory it needs is held by another darkmux dispatch that is still running, and `fleet.busy_policy` is `refuse` (the default).
+
+**Busy memory follows `fleet.busy_policy` (operator, 2026-11-09).** A local dispatch whose memory is held by a running dispatch gets the answer a fleet job gets for a busy seat: `refuse` says so at once, naming what is running; `queue` waits until the memory frees, bounded by the dispatch's timeout, with a `queued` line every 20 seconds so the wait never looks like a stall. An app with its own queue keeps the default and retries: the busy refusal, and the one for a model that does not fit at all, each carry a stable code in the `--json` envelope, so an app retries those and treats every other failure as a failure. `queue` is for callers that would rather darkmux wait for them.
+
+**Whether a profile fits is readable before and after, on the CLI and over HTTP.** The two codes, `busy` (the memory is held by a running dispatch; retry later) and `wont_fit` (the model does not fit this machine's budget even with every darkmux resident evicted; retrying cannot help), are the same on every surface: the `dispatch --json` envelope, and the daemon's answer to a submitted job. An app can also ask before it dispatches, and nothing runs, loads or is evicted by asking:
+
+```bash
+darkmux dispatch <role> --profile <profile>[@<machine>] --check --json
+```
+
+Over HTTP it is the work route's existing `mode: check` (see [Check mode](#fleet-addresses-trust-and-the-execution-channel)). Either way the answer gains a `fit` field: `resident` (loaded at the profile's context), `fits` (loads into free memory), `after_eviction` (fits once darkmux evicts its own idle residents, which it names), `busy`, or `wont_fit`, each with the model's memory cost and the budget it was measured against. `darkmux machine resources --json` and `GET /machine/resources` stay the full picture of what is loaded and free.
+
+`--check` answers for every gate a dispatch meets, not memory alone, so one call says whether the dispatch could start now: the battery gate and the thermal governor (`ready`, or `paused` with the reading and the floor or ceiling that decided), the seat (`free` or `busy` under `fleet.busy_policy`), the model's `availability`, and its `fit`. The overview stays where it is today: `darkmux machine list --json` gives each roster machine's card (its profiles and their endpoints, held seats and queued jobs, thermal state, battery and whether the battery gate refuses starts), and `darkmux machine resources --json` this machine's memory, resident by resident. A model held by a running dispatch is never evicted under it (the residency leases), whichever policy is set.
+
+### What an app reads: which models it can use, and what a run is doing
+
+An app picking a model, waiting on one, and reporting a failure needs three answers from darkmux, and each has one surface.
+
+**Whether darkmux can make a model resident at all.** `darkmux profile list --json` gains an `availability` list beside the registry, one entry per profile model:
+
+```json
+{"profile": "q38-27b-tensorfold", "model": "TensorFold/Qwen3.8-27B-MLX-4bit", "endpoint": "tensorfold",
+ "engine": "tensorfold", "state": "startable", "reason": null}
+```
+
+- `resident`: loaded or served now, at the profile's context.
+- `startable`: not resident, and darkmux can load it or start its server (the engine is installed at a verified version, it has the model, the port is free). A stopped Tensorfold server reads `startable`, so an app keeps it among its choices instead of passing it over.
+- `unavailable`: darkmux cannot make it resident, and `reason` says why in one line (no engine binary, an unverified version, a model the engine does not have, the port held by a server darkmux did not start).
+- `external`: an endpoint darkmux only sends requests to. darkmux does not vouch that it answers; an app that wants to know asks it, as it does today.
+- `unknown`: a probe failed or ran out of time (LM Studio not running, say); `reason` names which. Never read as `unavailable`.
+
+Each engine is asked once per listing, within a time bound, and the listing loads and starts nothing. Availability is whether a model can be made resident; whether it fits in memory right now is `dispatch --check`'s `fit` (above), since that changes with every dispatch. For a profile on another machine, that machine's card (`darkmux machine list --json`) carries the same field.
+
+**That a dispatch is starting its model.** A dispatch that has to make its model resident says so between `dispatch.start` and its first turn, with three flow records, the same for every managed engine (an LM Studio load of a large model takes long enough to need them too):
+
+<!-- flow-action-guard:allow-start — planned #3448 actions, not in the vocabulary until PR 4 adds them -->
+- `dispatch.model.start`: the model, the engine, the endpoint, and the darkmux residents it evicts to make room.
+- `dispatch.model.loading`: every 10 seconds while the model loads or the server starts, with the time elapsed and the engine's own progress when it reports one. A start of minutes (a 62 GB Tensorfold model) is visibly alive, never a stall.
+- `dispatch.model.ready`: the model answers; how long it took.
+
+A dispatch that finds its model resident writes none of them. `darkmux run list --json` (and `GET /runs`) shows a running dispatch between `dispatch.model.start` and `dispatch.model.ready` with `activity: "starting_model"`, derived by the one function that owns a run's status, so a run card says "starting the model" without reading the record stream itself.
+<!-- flow-action-guard:allow-end -->
+
+**Why a dispatch failed, readable by code.** The `dispatch --json` envelope's refusal and `dispatch.error` carry one `code` an app can branch on, beside the message for a person: `busy` (retry later), `wont_fit` (retrying cannot help), `model_start_failed` (the server would not start or exited; the record names its log file), `port_in_use` (a server darkmux did not start holds the port) and `engine_unavailable` (no binary, or an unverified version). **darkmux never switches to another model on its own:** a failed start fails the dispatch, and offering the next model is the app's decision, made on these codes and the `availability` list.
+
+### What the operator sees
+
+- `darkmux machine resources`: a row for each server darkmux started, with its model and measured memory. Other servers stay in "other tenants".
+- `darkmux machine status`: darkmux's servers listed beside its LM Studio loads.
+- `darkmux machine eject`: also stops the servers darkmux started, and never another one.
+- `darkmux doctor`: the binary, its version, each Tensorfold endpoint and its `engine_args`.
+
+### Still open
+
+- How concurrent dispatches to one server share it.
+- An idle timeout that frees memory for programs other than darkmux.
+- How long a start takes at a 262k context, which sets what an eviction costs.
 
 ## Thermal and power governors: pause, never kill
 
