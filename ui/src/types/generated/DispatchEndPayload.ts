@@ -54,6 +54,14 @@ error?: string,
  */
 stop_reason?: string, 
 /**
+ * (#3448) On a `dispatch.error` only: a stable code an app branches on,
+ * beside `error` for a person: `busy` (the memory is held by a running
+ * dispatch; retry later), `wont_fit` (the model does not fit even with
+ * every darkmux resident evicted), `model_start_failed`, `port_in_use`,
+ * `engine_unavailable`. Absent when the failure has no code.
+ */
+code?: string, 
+/**
  * The model turns the execution took: a direct single-shot call or a map item is 1, a
  * container loop its fold's count, an execution that ended before any call 0. Every
  * producer states it: `new` takes it and there is no `Default`, so a struct built without

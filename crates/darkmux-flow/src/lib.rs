@@ -4079,6 +4079,9 @@ mod tests {
         //   2.6.0 — (#3363) additive: `dispatch.start`'s `system_sha256` and
         //            `prompt_additions`, and a lab dispatch's `role` block
         //            (`source`: eval | builtin | legacy_root).
+        //   2.7.0 — (#3448) additive: `dispatch.model.start` / `.loading` /
+        //            `.ready` (`DispatchModelPayload`) and `dispatch.error`'s
+        //            `payload.code`.
         //   2.0.0 — (4.0) MAJOR: one wire spelling per action, dotted on
         //            write; a retired spelling reads as an unknown action
         //            (5.0, #3036). Also drops
@@ -4090,7 +4093,7 @@ mod tests {
         //            `FlowRecord.work_id` / `attempt`; `source` is closed
         //            (`FlowSource`), `tier` names who acted, and payload
         //            time keys use `*_ms` / `*_at_ms`. See schema.rs.
-        assert_eq!(FLOW_SCHEMA_VERSION, "2.6.0");
+        assert_eq!(FLOW_SCHEMA_VERSION, "2.7.0");
     }
 
     #[test]
