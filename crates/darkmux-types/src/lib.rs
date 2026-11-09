@@ -371,6 +371,11 @@ fn reserved_engine_arg(arg: &str) -> Option<String> {
     if arg.trim().is_empty() {
         return Some("`engine_args` holds an empty argument; remove it".to_string());
     }
+    // A bare `--` would turn darkmux's own flags after it into positional
+    // arguments the engine may ignore (its `--host` and `--port` with them).
+    if arg == "--" {
+        return Some("`engine_args` holds `--`, which would make darkmux's own flags after it positional; remove it".to_string());
+    }
     // A short flag (`-p`) could alias one darkmux sets, and neither this
     // check nor doctor's can tell which; a value like `-1` is not one.
     let mut chars = arg.chars();

@@ -100,6 +100,22 @@ pub fn kill_pid(pid: u32, sig: i32) -> std::io::Result<()> {
     }
 }
 
+/// (#3448) Signal every process in group `pgid` (a server darkmux spawned
+/// as its own group's leader, so its workers die with it). Refuses group 0
+/// and 1, a value `kill(2)` would read otherwise, and this process's own
+/// group, so it can never signal darkmux itself.
+pub fn kill_group(pgid: u32, sig: i32) -> std::io::Result<()> {
+    let own = unsafe { libc::getpgrp() } as u32;
+    if pgid < 2 || pgid > i32::MAX as u32 || pgid == own {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing to signal process group {pgid}"),
+        ));
+    }
+    let rc = unsafe { libc::kill(-(pgid as libc::pid_t), sig) };
+    if rc == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+}
+
 /// Register a just-spawned child pid. Call BEFORE blocking on it (a
 /// `Command::spawn()` + later `.wait()`/`.wait_with_output()`, never a
 /// plain `.output()`, which offers no window to register the pid before

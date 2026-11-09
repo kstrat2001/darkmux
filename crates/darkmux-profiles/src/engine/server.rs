@@ -161,6 +161,23 @@ impl Ensured {
 /// holding its pid and start stamp, until reaped here.
 static SPAWNED: Mutex<Vec<Child>> = Mutex::new(Vec::new());
 
+/// Whether `pid` is a zombie: exited, but its parent (another process than
+/// this one, which reaps its own) has not reaped it yet. It still holds its
+/// pid and start stamp, so the record alone would read it as running.
+fn is_zombie(pid: u32) -> bool {
+    let mut cmd = Command::new("ps");
+    cmd.args(["-o", "stat=", "-p", &pid.to_string()]);
+    crate::process::pin_cwd(&mut cmd);
+    cmd.output().is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim_start().starts_with('Z'))
+}
+
+/// darkmux's server `rec` is alive: its record matches the live process,
+/// and that process has not exited.
+fn alive(rec: &EngineRecord) -> bool {
+    reap_exited();
+    rec.state_now() == ServerState::Running && !is_zombie(rec.pid)
+}
+
 fn reap_exited() {
     if let Ok(mut spawned) = SPAWNED.lock() {
         spawned.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
@@ -172,9 +189,8 @@ fn reap_exited() {
 /// belongs to someone else) is removed and reads as none; an unreadable one
 /// claims nothing.
 pub fn running(dirs: &Dirs, endpoint: &str) -> Option<EngineRecord> {
-    reap_exited();
     let rec = engine_record::read_in(&dirs.records, endpoint).ok().flatten()?;
-    if rec.state_now() == ServerState::Running {
+    if alive(&rec) {
         return Some(rec);
     }
     let _ = engine_record::remove_if_in(&dirs.records, &rec);
@@ -236,9 +252,12 @@ fn spawn_and_record(spec: &ServerSpec, dirs: &Dirs) -> Result<EngineRecord, Stri
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     let mut child = cmd.spawn().map_err(|e| format!("could not run `{bin}`: {e}"))?;
     let pid = child.id();
-    let Some(start_stamp) = start_stamp_of(pid) else {
-        let _ = child.kill();
+    let kill_spawned = |child: &mut Child| {
+        let _ = darkmux_types::child_registry::kill_group(child.id(), darkmux_types::child_registry::SIGKILL);
         let _ = child.wait();
+    };
+    let Some(start_stamp) = start_stamp_of(pid) else {
+        kill_spawned(&mut child);
         return Err("darkmux could not read the server's start time, so it could not record it as its own".into());
     };
     let rec = EngineRecord {
@@ -257,8 +276,7 @@ fn spawn_and_record(spec: &ServerSpec, dirs: &Dirs) -> Result<EngineRecord, Stri
         engine_version: spec.engine_version.clone(),
     };
     if let Err(e) = engine_record::write_in(&dirs.records, &rec) {
-        let _ = child.kill();
-        let _ = child.wait();
+        kill_spawned(&mut child);
         return Err(format!("could not write its record: {e}"));
     }
     if let Ok(mut spawned) = SPAWNED.lock() {
@@ -282,8 +300,7 @@ fn wait_ready(spec: &ServerSpec, dirs: &Dirs, rec: &EngineRecord, bounds: Bounds
     let began = Instant::now();
     let mut last_beat = began;
     loop {
-        reap_exited();
-        if rec.state_now() != ServerState::Running {
+        if !alive(rec) {
             return Err(format!("it exited during its start{}", log_tail(&dirs.log_for(&spec.endpoint))));
         }
         if answers(spec.port, &spec.served_name) {
@@ -324,19 +341,20 @@ pub fn stop(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds) -> Result<(), Serve
 /// [`stop`] with the lock already held. Signals only a process the record
 /// still matches; a stale record is just removed.
 fn stop_locked(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds) -> Result<(), ServerError> {
-    use darkmux_types::child_registry::{kill_pid, SIGKILL, SIGTERM};
+    use darkmux_types::child_registry::{kill_group, SIGKILL, SIGTERM};
     let failed = |detail: String| ServerError::StopFailed { endpoint: rec.endpoint.clone(), pid: rec.pid, detail };
     for (sig, name) in [(SIGTERM, "SIGTERM"), (SIGKILL, "SIGKILL")] {
-        reap_exited();
-        if rec.state_now() != ServerState::Running {
+        if !alive(rec) {
             break;
         }
-        kill_pid(rec.pid, sig).map_err(|e| failed(format!("{name}: {e}")))?;
+        // The server leads its own process group (`spawn_and_record`), so
+        // the group is the server and every worker it forked.
+        kill_group(rec.pid, sig).map_err(|e| failed(format!("{name}: {e}")))?;
         if gone_within(rec, bounds) {
             break;
         }
     }
-    if rec.state_now() == ServerState::Running {
+    if alive(rec) {
         return Err(failed("it is still running after SIGKILL".into()));
     }
     let until = Instant::now() + bounds.stop_grace;
@@ -350,8 +368,7 @@ fn stop_locked(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds) -> Result<(), Se
 fn gone_within(rec: &EngineRecord, bounds: Bounds) -> bool {
     let until = Instant::now() + bounds.stop_grace;
     while Instant::now() < until {
-        reap_exited();
-        if rec.state_now() != ServerState::Running {
+        if !alive(rec) {
             return true;
         }
         std::thread::sleep(bounds.poll.min(Duration::from_millis(100)));
@@ -397,6 +414,12 @@ if "--slow" in a:
     time.sleep(float(a[a.index("--slow") + 1]))
 if "--ignore-term" in a:
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
+if "--fork-child" in a:
+    import subprocess
+    child = subprocess.Popen(["sleep", "300"])
+    open(a[a.index("--fork-child") + 1], "w").write(str(child.pid))
+if "--silent-name" in a:
+    name = "someone-else"
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
         body = json.dumps({"object": "list", "data": [{"id": name}]}).encode()
@@ -592,5 +615,103 @@ HTTPServer(("127.0.0.1", port), H).serve_forever()
         stop(&f.dirs, &stale, quick()).unwrap();
         stale.start_stamp = stamp;
         assert_eq!(stale.state_now(), ServerState::Running, "still alive: never signaled");
+    }
+
+    fn pid_alive(pid: u32) -> bool {
+        darkmux_types::residency_lease::process_alive(pid) && !is_zombie(pid)
+    }
+
+    /// (#3458 review) A stop takes down the server's whole process group, so a
+    /// worker it forked never outlives it.
+    #[test]
+    fn a_stop_takes_down_the_servers_forked_workers() {
+        let f = fixture();
+        let child_file = f.dirs.logs.with_extension("child");
+        let s = spec(&f, "tf", "m/a", free_port(), &["--fork-child", child_file.to_str().unwrap()]);
+        let rec = ensure(&s, &f.dirs, quick(), &mut no_progress()).unwrap().record().clone();
+        let child: u32 = std::fs::read_to_string(&child_file).unwrap().trim().parse().unwrap();
+        assert!(pid_alive(child));
+        stop(&f.dirs, &rec, quick()).unwrap();
+        let until = Instant::now() + Duration::from_secs(3);
+        while pid_alive(child) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!pid_alive(child), "the forked worker died with its server");
+    }
+
+    /// (#3458 review) A server that is alive and runs the same command but
+    /// does not answer under the `darkmux:` name is never reused: darkmux
+    /// replaces it (and here the replacement never answers either, so the
+    /// start fails rather than returning the silent server as ready).
+    #[test]
+    fn a_server_that_does_not_answer_under_its_name_is_not_reused() {
+        let f = fixture();
+        let silent = spec(&f, "tf", "m/a", free_port(), &["--silent-name"]);
+        let up = spawn_and_record(&silent, &f.dirs).unwrap();
+        let until = Instant::now() + Duration::from_secs(10);
+        while !port_taken(silent.port) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(alive(&up), "the silent server is up under the same command");
+        let result = ensure(&silent, &f.dirs, Bounds { start: Duration::from_millis(800), ..quick() }, &mut no_progress());
+        assert!(!matches!(result, Ok(Ensured::Reused(_))), "never reused: {result:?}");
+    }
+
+    /// (#3458 review) A record that cannot be written leaves no server
+    /// running: the spawned process is killed, never orphaned.
+    #[test]
+    fn a_record_that_cannot_be_written_leaves_no_server() {
+        let f = fixture();
+        std::fs::create_dir_all(&f.dirs.records).unwrap();
+        std::fs::create_dir_all(&f.dirs.logs).unwrap();
+        // Make the record file's own name a directory, so the rename fails.
+        std::fs::create_dir_all(engine_record::path_in(&f.dirs.records, "tf")).unwrap();
+        let port = free_port();
+        let err = ensure(&spec(&f, "tf", "m/a", port, &[]), &f.dirs, quick(), &mut no_progress()).unwrap_err();
+        assert_eq!(err.code(), "model_start_failed");
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!port_taken(port), "no server survives a failed record write");
+    }
+
+    /// (#3458 review) A dead server whose parent is another process (a
+    /// zombie it has not reaped) is not darkmux's running server, and a stop
+    /// of it ends at once instead of timing out.
+    #[test]
+    fn a_dead_server_another_process_has_not_reaped_is_not_running() {
+        let f = fixture();
+        // A parent that spawns a child and never reaps it: the child exits
+        // at once and stays a zombie of that parent.
+        let mut parent = Command::new("python3")
+            .args(["-c", "import os,time,sys\npid=os.fork()\nif pid==0: os._exit(0)\nprint(pid,flush=True)\ntime.sleep(30)"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(parent.stdout.take().unwrap()), &mut line).unwrap();
+        let zombie: u32 = line.trim().parse().unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        let stamp = darkmux_platform::current().process_start_stamp(zombie);
+        let rec = EngineRecord {
+            schema: ENGINE_RECORD_SCHEMA,
+            endpoint: "tf".into(),
+            engine: "tensorfold".into(),
+            model: "m/a".into(),
+            n_ctx: 8192,
+            port: free_port(),
+            pid: zombie,
+            start_stamp: stamp.unwrap_or(1),
+            owner_pid: parent.id(),
+            argv: vec![],
+            log: f.dirs.log_for("tf"),
+            started_at_ms: 0,
+            engine_version: String::new(),
+        };
+        engine_record::write_in(&f.dirs.records, &rec).unwrap();
+        assert_eq!(running(&f.dirs, "tf"), None, "a zombie is not a running server");
+        let began = Instant::now();
+        stop(&f.dirs, &rec, quick()).unwrap();
+        assert!(began.elapsed() < Duration::from_secs(1), "a stop of a dead server does not wait out the grace");
+        let _ = parent.kill();
+        let _ = parent.wait();
     }
 }
