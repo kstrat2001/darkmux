@@ -12179,6 +12179,27 @@ mod tests {
         assert!(c.message.contains("`another-machine`") && c.message.contains("endpoints.studio.hardware"), "{}", c.message);
     }
 
+    /// (#3448) A Tensorfold endpoint reads as one darkmux cannot start yet, and
+    /// a model's `engine_args` that every preflight refuses is Fail here too,
+    /// naming the path.
+    #[test]
+    fn a_tensorfold_endpoint_is_labeled_and_bad_engine_args_fail() {
+        let ok = materialized(
+            r#"{"profiles":{"p":{"models":[{"id":"TensorFold/m","n_ctx":8,"endpoint":"tf","engine_args":["--drafter","z/d"]}]}},
+                "endpoints":{"tf":{"managed":"tensorfold","port":8091}}}"#,
+        );
+        let c = endpoints_status(&ok, &mut no_spend, REGISTRY);
+        assert_eq!(c.status, Status::Pass, "{}", c.message);
+        assert!(c.message.contains("`tf`: managed (tensorfold, port 8091") && c.message.contains("#3448"), "{}", c.message);
+        let bad = materialized(
+            r#"{"profiles":{"p":{"models":[{"id":"TensorFold/m","n_ctx":8,"endpoint":"tf","engine_args":["--host","0.0.0.0"]}]}},
+                "endpoints":{"tf":{"managed":"tensorfold","port":8091}}}"#,
+        );
+        let c = endpoints_status(&bad, &mut no_spend, REGISTRY);
+        assert_eq!(c.status, Status::Fail, "{}", c.message);
+        assert!(c.message.contains("profiles.p.models[0].engine_args") && c.message.contains("--host"), "{}", c.message);
+    }
+
     /// (#3397, #3399 review) `hardware` where darkmux already knows the
     /// answer, and an endpoint whose host it cannot read unambiguously, are
     /// Fail: every dispatching preflight refuses them. The URL (it may carry

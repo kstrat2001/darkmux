@@ -222,6 +222,16 @@ fn resolve_local_placement_inner_with(
     // (#2902 review C4) Exhaustive on the kind, so a new kind is a compile
     // error at the placement decision.
     match target.kind {
+        // (#3448) The wave loader would `lms load` this model before any
+        // dispatch route runs, and LM Studio never serves a Tensorfold
+        // model. Every dispatching preflight refuses the endpoint first; this
+        // refuses it again for a caller that skipped preflight.
+        darkmux_types::EndpointKind::Managed(darkmux_types::ManagedBackend::Tensorfold) => {
+            return Err(ResolutionFailed(format!(
+                "`{}` is on a `tensorfold` endpoint, whose server darkmux cannot start yet (#3448)",
+                target.model.id
+            )))
+        }
         darkmux_types::EndpointKind::Managed(_) => {}
         darkmux_types::EndpointKind::Unmanaged => {
             return Err(PlacementMiss::Unmanaged(crate::step_kinds::EndpointSlot::of(&target.endpoint)))
@@ -7905,9 +7915,10 @@ mod tests {
             &reg,
             serde_json::json!({
                 "default_profile": "local",
-                "endpoints": { "hosted": { "url": "https://h.example/v1" } },
+                "endpoints": { "hosted": { "url": "https://h.example/v1" }, "tf": { "managed": "tensorfold", "port": 8091 } },
                 "profiles": {
                     "local": {"models": [{"id": "m-local", "n_ctx": 4096}]},
+                    "tf": {"models": [{"id": "TensorFold/m", "n_ctx": 4096, "endpoint": "tf"}]},
                     "named": {"models": [{"id": "gpt", "endpoint": "hosted"}]},
                     "dangling": {"models": [{"id": "gpt", "endpoint": "nope"}]}
                 }
@@ -7928,6 +7939,10 @@ mod tests {
         assert_eq!(pick("named"), Err("unmanaged".into()));
         let err = pick("dangling").unwrap_err();
         assert!(err.contains("nope") && err != "unmanaged", "{err}");
+        // (#3448) A Tensorfold model is never planned as an LM Studio load:
+        // the wave loader would `lms load` it before any dispatch route ran.
+        let tf = pick("tf").unwrap_err();
+        assert!(tf.contains("tensorfold") && tf.contains("#3448"), "{tf}");
     }
 
     // ─── (#2902 step 1a) usage conformance: one record per model call ──

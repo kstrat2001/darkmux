@@ -335,3 +335,31 @@ mod unloadable_registry_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod tensorfold_preflight_tests {
+    use darkmux_types::config_enum::Scope;
+
+    /// (#3448) Every dispatching preflight refuses a Tensorfold endpoint, and
+    /// a Tensorfold model's unusable `engine_args`, naming each path: until
+    /// darkmux starts its servers this is what keeps such a model out of LM
+    /// Studio on every path (the wave loader and the dispatch route refuse it
+    /// again behind this).
+    #[test]
+    fn every_dispatching_preflight_refuses_a_tensorfold_endpoint_and_bad_engine_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        std::fs::write(
+            &path,
+            r#"{"profiles":{"tf":{"models":[{"id":"TensorFold/m","n_ctx":8192,"endpoint":"tf","engine_args":["--port","9"]}]}},
+                "endpoints":{"tf":{"managed":"tensorfold","port":8091}}}"#,
+        )
+        .unwrap();
+        for scope in [Scope::Dispatch, Scope::MissionLaunch, Scope::LabRun] {
+            let refusal = super::preflight_with(scope, Some(path.to_str().unwrap())).expect_err("refused");
+            let paths: Vec<String> = refusal.invalid.iter().map(|v| v.set_in.to_string()).collect();
+            assert!(paths.iter().any(|p| p.contains("endpoints.tf.managed")), "{scope:?}: {paths:?}");
+            assert!(paths.iter().any(|p| p.contains("profiles.tf.models[0].engine_args")), "{scope:?}: {paths:?}");
+        }
+    }
+}

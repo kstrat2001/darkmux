@@ -232,7 +232,12 @@ impl Tensorfold {
         let run = run_bounded(cmd, "tensorfold probe", Deadline(PROBE_BOUND), StdoutMode::Capture)
             .map_err(|e| anyhow::anyhow!("{shown} failed: {}", e.to_string().replace(&self.bin, self.label())))?;
         if !run.status.success() {
-            bail!("{shown} {}", run.exit_detail().replace(&self.bin, self.label()));
+            // Its first stderr line only, bounded: doctor's row reaches a
+            // remote console viewer, and a path the binary prints is not a
+            // configured location the redaction knows to hide.
+            let first = run.stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or_default();
+            let first: String = first.replace(&self.bin, self.label()).chars().take(160).collect();
+            bail!("{shown} exited with {}: {first}", run.status);
         }
         Ok(run.stdout)
     }

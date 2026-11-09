@@ -2064,7 +2064,11 @@ mod tests {
                     {"id":"port","n_ctx":8192,"endpoint":"tf","engine_args":["--port","9000"]},
                     {"id":"eq","n_ctx":8192,"endpoint":"tf","engine_args":["--context=4096"]},
                     {"id":"key","n_ctx":8192,"endpoint":"tf","engine_args":["--api-key","s3cret"]},
-                    {"id":"blank","n_ctx":8192,"endpoint":"tf","engine_args":[""]}]}},
+                    {"id":"blank","n_ctx":8192,"endpoint":"tf","engine_args":[""]},
+                    {"id":"host","n_ctx":8192,"endpoint":"tf","engine_args":["--host","0.0.0.0"]},
+                    {"id":"name","n_ctx":8192,"endpoint":"tf","engine_args":["--name=x"]},
+                    {"id":"short","n_ctx":8192,"endpoint":"tf","engine_args":["-p","9000"]},
+                    {"id":"negative","n_ctx":8192,"endpoint":"tf","engine_args":["--seed","-1"]}]}},
                 "endpoints":{"tf":{"managed":"tensorfold","port":8091},
                              "hosted":{"url":"https://h.example/v1"}}}"#,
         );
@@ -2078,6 +2082,9 @@ mod tests {
             (4, &["--context", "n_ctx"][..]),
             (5, &["--api-key", "secret"][..]),
             (6, &["empty"][..]),
+            (7, &["--host", "loopback"][..]),
+            (8, &["--name", "darkmux:"][..]),
+            (9, &["short flag", "`-p`", "long"][..]),
         ] {
             let why = models[i].engine_args_problem().unwrap_or_else(|| panic!("model {i}: refused"));
             for n in needles {
@@ -2087,7 +2094,8 @@ mod tests {
         }
         let invalid = crate::config_enum::invalid_engine_args(&r);
         let paths: Vec<String> = invalid.iter().map(|v| v.set_in.to_string()).collect();
-        assert_eq!(paths.len(), 6, "{paths:?}");
+        assert_eq!(models[10].engine_args_problem(), None, "a negative value is not a short flag");
+        assert_eq!(paths.len(), 9, "{paths:?}");
         assert!(paths.iter().all(|p| p.contains("engine_args")), "{paths:?}");
         assert!(paths[0].contains("models[1]"), "{paths:?}");
         assert!(invalid.iter().all(|v| !v.to_string().contains("s3cret")));

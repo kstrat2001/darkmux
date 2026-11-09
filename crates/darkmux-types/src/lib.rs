@@ -370,6 +370,15 @@ fn reserved_engine_arg(arg: &str) -> Option<String> {
     if arg.trim().is_empty() {
         return Some("`engine_args` holds an empty argument; remove it".to_string());
     }
+    // A short flag (`-p`) could alias one darkmux sets, and neither this
+    // check nor doctor's can tell which; a value like `-1` is not one.
+    let mut chars = arg.chars();
+    if chars.next() == Some('-') && chars.next().is_some_and(|c| c.is_ascii_alphabetic()) {
+        return Some(format!(
+            "`engine_args` holds the short flag `{}`; write its long `--` form, which darkmux can check",
+            arg.split('=').next().unwrap_or(arg)
+        ));
+    }
     let flag = arg.split('=').next().unwrap_or(arg);
     let why = match flag {
         "--port" => "darkmux sets it from the endpoint's `port`",
