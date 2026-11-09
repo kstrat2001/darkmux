@@ -171,6 +171,7 @@ darkmux release.
 
 ### Fixed
 
+- **The runtime image carries Node 22 (#3482).** It moves from Alpine 3.20 (Node 20.15) to Alpine 3.22 (Node 22.23 LTS, npm 11). Client previews run a project's dev server in this image, and current Vite, rolldown and @vitejs/plugin-react need `^20.19 || >=22.12`: on 20.15, `npm ci` skipped their native bindings and the dev server could not start. Dispatches run in the same image, so their tools move with it (git 2.49, Python 3.12).
 - **The bundled SQLite is patched (RUSTSEC-2026-0459).** `rusqlite` 0.31 -> 0.41, which bundles
   `libsqlite3-sys` 0.39 and with it a SQLite past the CVE the advisory names. `rusqlite` 0.41 needs
   Rust 1.89, so the minimum supported Rust for the `darkmux` binary and the crates that reach SQLite
