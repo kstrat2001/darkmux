@@ -743,7 +743,15 @@ The dispatch envelope, the flow records and the exit codes are unchanged. The fi
 - the engine binary is missing, or its version is one darkmux has not verified;
 - the memory it needs is held by another darkmux dispatch that is still running, and `fleet.busy_policy` is `refuse` (the default).
 
-**Busy memory follows `fleet.busy_policy` (operator, 2026-11-09).** A local dispatch whose memory is held by a running dispatch gets the answer a fleet job gets for a busy seat: `refuse` says so at once, naming what is running; `queue` waits until the memory frees, bounded by the dispatch's timeout, with a `queued` line every 20 seconds so the wait never looks like a stall. An app with its own queue keeps the default and retries: the busy refusal, and the one for a model that does not fit at all, each carry a stable code in the `--json` envelope, so an app retries those and treats every other failure as a failure. `queue` is for callers that would rather darkmux wait for them. A model held by a running dispatch is never evicted under it (the residency leases), whichever policy is set.
+**Busy memory follows `fleet.busy_policy` (operator, 2026-11-09).** A local dispatch whose memory is held by a running dispatch gets the answer a fleet job gets for a busy seat: `refuse` says so at once, naming what is running; `queue` waits until the memory frees, bounded by the dispatch's timeout, with a `queued` line every 20 seconds so the wait never looks like a stall. An app with its own queue keeps the default and retries: the busy refusal, and the one for a model that does not fit at all, each carry a stable code in the `--json` envelope, so an app retries those and treats every other failure as a failure. `queue` is for callers that would rather darkmux wait for them.
+
+**Whether a profile fits is readable before and after, on the CLI and over HTTP.** The two codes, `busy` (the memory is held by a running dispatch; retry later) and `wont_fit` (the model does not fit this machine's budget even with every darkmux resident evicted; retrying cannot help), are the same on every surface: the `dispatch --json` envelope, and the daemon's answer to a submitted job. An app can also ask before it dispatches, and nothing runs, loads or is evicted by asking:
+
+```bash
+darkmux dispatch <role> --profile <profile>[@<machine>] --check --json
+```
+
+Over HTTP it is the work route's existing `mode: check` (see [Check mode](#fleet-addresses-trust-and-the-execution-channel)). Either way the answer gains a `fit` field: `resident` (loaded at the profile's context), `fits` (loads into free memory), `after_eviction` (fits once darkmux evicts its own idle residents, which it names), `busy`, or `wont_fit`, each with the model's memory cost and the budget it was measured against. `darkmux machine resources --json` and `GET /machine/resources` stay the full picture of what is loaded and free. A model held by a running dispatch is never evicted under it (the residency leases), whichever policy is set.
 
 ### What the operator sees
 
