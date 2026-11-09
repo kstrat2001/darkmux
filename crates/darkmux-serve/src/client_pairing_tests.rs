@@ -3054,6 +3054,24 @@ async fn a_preview_needs_the_workspace_to_still_be_a_worktree_of_the_checkout() 
     assert_eq!(code, 404, "{v}");
 }
 
+/// The recorded checkout is checked again at every start: one that has
+/// since become a symlink (to the same repository, even) is not the user's
+/// checkout any more.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_recorded_checkout_that_became_a_symlink_gets_no_preview() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (mine, name, _ws) = served_workspace(&h, &token).await;
+    let moved = h.dir.path().join("site-moved");
+    std::fs::rename(&mine, &moved).unwrap();
+    std::os::unix::fs::symlink(&moved, &mine).unwrap();
+    recipe(&moved, serde_json::json!({"command": SERVE, "env": {"PORT": "{port}"}}));
+    let (code, v) = start_preview(&h, &token, &name).await;
+    assert_eq!(code, 404, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("symlink"), "{v}");
+}
+
 #[tokio::test]
 async fn install_runs_only_when_its_marker_is_missing() {
     let h = harness();
