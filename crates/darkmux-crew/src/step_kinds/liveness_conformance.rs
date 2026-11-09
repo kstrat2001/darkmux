@@ -138,11 +138,12 @@ const ENTRY_POINTS: &[Site] = &[
         func: "dispatch_local_single_shot",
         anchor: "cannot serve a tool-bearing role",
     },
-    // The hosted arm of every `darkmux dispatch` and fleet-queue job.
+    // The direct single-shot arm (a hosted endpoint, or a server darkmux
+    // starts) of every `darkmux dispatch` and fleet-queue job.
     Site {
         file: "src/dispatch_internal.rs",
         func: "dispatch_unmanaged",
-        anchor: "runtime=direct (hosted)",
+        anchor: "runtime=direct ({served_by})",
     },
 ];
 
@@ -342,7 +343,7 @@ fn the_extractor_discriminates_between_neighboring_functions() {
     let src = read_src("src/dispatch_internal.rs");
     let remote = fn_body(&src, "dispatch_unmanaged");
     assert!(
-        remote.contains("runtime=direct (hosted)"),
+        remote.contains("runtime=direct ({served_by})"),
         "sanity: the extracted body is `dispatch_unmanaged`'s own"
     );
     assert!(

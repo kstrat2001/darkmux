@@ -14,7 +14,9 @@
 //! ([`VERIFIED_RELEASES`]) and refuses any other, naming the version: a flag
 //! renamed between releases would otherwise start a server darkmux cannot
 //! account for. Every call is bounded ([`PROBE_BOUND`]), so a wedged binary
-//! is reported rather than hanging `doctor`.
+//! is reported rather than hanging `doctor`. `capabilities --json` names
+//! the `serve` flags but not which take a value; `serve --help`'s usage line
+//! says that, and is read beside it ([`Tensorfold::serve_flags`]).
 
 use crate::gestalt_host::lms_host::{run_bounded, StdoutMode};
 use anyhow::{bail, Context, Result};
@@ -63,47 +65,128 @@ pub fn parse_version(text: &str) -> Result<Version> {
     }
 }
 
-/// The flags `tensorfold-native serve` accepts, from `capabilities --json`:
-/// each flag, and the values it takes when the engine lists them.
+/// One `serve` flag: the values it takes when the engine lists them, and
+/// whether it takes a value at all when its usage says (`None`: it does not
+/// say, so a following token may be its value or not).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ServeFlags(BTreeMap<String, Option<Vec<String>>>);
+pub struct ServeFlag {
+    pub values: Option<Vec<String>>,
+    pub takes_value: Option<bool>,
+}
+
+/// The flags `tensorfold-native serve` accepts, from `capabilities --json`,
+/// each with what it takes ([`ServeFlag`]); arity from `serve --help`
+/// ([`ServeFlags::with_usage`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServeFlags(BTreeMap<String, ServeFlag>);
+
+/// Where a left-to-right read of `engine_args` stands: the flag the next
+/// token is the value of, and whether it must be.
+enum Pending<'a> {
+    Required(&'a str, &'a ServeFlag),
+    Optional,
+    /// A switch was just read; a token after it would be a positional.
+    Switch(&'a str),
+}
 
 impl ServeFlags {
     pub fn knows(&self, flag: &str) -> bool {
         self.0.contains_key(flag)
     }
 
-    /// Why `args` (a profile model's `engine_args`) would not start a server,
-    /// or `Ok`: a flag this engine does not accept, or a value outside the
-    /// list it declares for that flag. A token that is not a flag is the
-    /// value of the flag before it. Never echoes a value (it may be a secret).
-    pub fn check(&self, args: &[String]) -> std::result::Result<(), String> {
-        // The flag whose value list the next token must be on, if any.
-        let mut pending: Option<(String, &[String])> = None;
-        for arg in args {
-            let Some(stripped) = arg.strip_prefix("--") else {
-                if let Some((flag, allowed)) = pending.take() {
-                    one_of(&flag, allowed, arg)?;
-                }
-                continue;
-            };
-            let (flag, inline) = match stripped.split_once('=') {
-                Some((f, v)) => (format!("--{f}"), Some(v)),
-                None => (format!("--{stripped}"), None),
-            };
-            let Some(values) = self.0.get(&flag) else {
-                return Err(format!("`{flag}` is not a flag `tensorfold-native serve` accepts"));
-            };
-            pending = None;
-            if let Some(allowed) = values {
-                match inline {
-                    Some(v) => one_of(&flag, allowed, v)?,
-                    None => pending = Some((flag, allowed.as_slice())),
-                }
+    /// The arity each flag has in `serve --help`'s usage line (`[--port
+    /// PORT]` takes a value, `[--slide]` does not). A flag the usage leaves
+    /// out keeps what `capabilities --json` said: a value when it lists
+    /// values, else unknown.
+    pub fn with_usage(mut self, usage: &str) -> Self {
+        for (flag, takes_value) in usage_arity(usage) {
+            if let Some(spec) = self.0.get_mut(&flag) {
+                spec.takes_value = Some(takes_value || spec.values.is_some());
             }
         }
-        Ok(())
+        self
     }
+
+    /// Why `args` (a profile model's `engine_args`) would not start a server,
+    /// or `Ok`: a flag this engine does not accept, a value outside the list
+    /// it declares for that flag, a flag missing the value it takes, a value
+    /// given to a switch, or a token with no flag before it (the engine would
+    /// read it as its model). Never echoes a value (it may be a secret).
+    pub fn check(&self, args: &[String]) -> std::result::Result<(), String> {
+        let mut pending: Option<Pending<'_>> = None;
+        for arg in args {
+            pending = match arg.strip_prefix("--") {
+                None => {
+                    value_after(pending.take(), arg)?;
+                    None
+                }
+                Some(stripped) => {
+                    if let Some(Pending::Required(flag, _)) = pending {
+                        return Err(missing_value(flag));
+                    }
+                    self.flag(stripped)?
+                }
+            };
+        }
+        match pending {
+            Some(Pending::Required(flag, _)) => Err(missing_value(flag)),
+            _ => Ok(()),
+        }
+    }
+
+    /// A `--flag` or `--flag=value` token (`stripped` of its `--`): what the
+    /// next token must be, or why this one is refused.
+    fn flag(&self, stripped: &str) -> std::result::Result<Option<Pending<'_>>, String> {
+        let (flag, inline) = match stripped.split_once('=') {
+            Some((f, v)) => (format!("--{f}"), Some(v)),
+            None => (format!("--{stripped}"), None),
+        };
+        let Some((name, spec)) = self.0.get_key_value(&flag) else {
+            return Err(format!("`{flag}` is not a flag `tensorfold-native serve` accepts"));
+        };
+        Ok(match (spec.takes_value.or(spec.values.as_ref().map(|_| true)), inline) {
+            (Some(false), Some(_)) => return Err(format!("`{name}` takes no value")),
+            (Some(false), None) => Some(Pending::Switch(name)),
+            (_, Some(v)) => {
+                spec.values.as_deref().map_or(Ok(()), |allowed| one_of(name, allowed, v))?;
+                None
+            }
+            (Some(true), None) => Some(Pending::Required(name, spec)),
+            (None, None) => Some(Pending::Optional),
+        })
+    }
+}
+
+/// A token that is not a flag, read after `pending`: the value it takes,
+/// or why it is refused.
+fn value_after(pending: Option<Pending<'_>>, arg: &str) -> std::result::Result<(), String> {
+    match pending {
+        Some(Pending::Required(flag, spec)) => spec.values.as_deref().map_or(Ok(()), |v| one_of(flag, v, arg)),
+        Some(Pending::Optional) => Ok(()),
+        Some(Pending::Switch(flag)) => Err(format!("`{flag}` takes no value, and a token follows it")),
+        None => Err("a value with no flag before it; remove it".to_string()),
+    }
+}
+
+fn missing_value(flag: &str) -> String {
+    format!("`{flag}` takes a value, and none follows it")
+}
+
+/// Each `--flag` in a usage line and whether a value follows it inside its
+/// own `[...]` group (a bracket or `|` ends one): `[--port PORT]` and
+/// `[--kv {a,b}]` take one, `[--slide]` and `[--a | --b]` do not.
+fn usage_arity(usage: &str) -> Vec<(String, bool)> {
+    let spaced = usage.replace('[', " [ ").replace(']', " ] ").replace('|', " | ");
+    let tokens: Vec<&str> = spaced.split_whitespace().collect();
+    tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.starts_with("--"))
+        .map(|(i, t)| {
+            let next = tokens.get(i + 1);
+            (t.to_string(), next.is_some_and(|n| !n.starts_with('-') && !["[", "]", "|"].contains(n)))
+        })
+        .collect()
 }
 
 /// `value` is one of the values `flag` lists, or the refusal naming them
@@ -131,7 +214,7 @@ pub fn parse_capabilities(json: &str) -> Result<ServeFlags> {
             let values = spec.get("values").and_then(|v| v.as_array()).map(|vs| {
                 vs.iter().filter_map(|v| v.as_str().map(str::to_string)).collect::<Vec<_>>()
             });
-            (flag.clone(), values)
+            (flag.clone(), ServeFlag { values, takes_value: None })
         })
         .collect();
     Ok(ServeFlags(parsed))
@@ -258,8 +341,16 @@ impl Tensorfold {
         Ok(v)
     }
 
+    /// The `serve` flags `capabilities --json` lists, with the arity
+    /// `serve --help` gives them. A usage that cannot be read leaves the
+    /// arity unknown: the flags are still checked, and the server refuses a
+    /// missing value itself when it starts.
     pub fn serve_flags(&self) -> Result<ServeFlags> {
-        parse_capabilities(&self.run(&["capabilities", "--json"])?)
+        let flags = parse_capabilities(&self.run(&["capabilities", "--json"])?)?;
+        Ok(match self.run(&["serve", "--help"]) {
+            Ok(usage) => flags.with_usage(&usage),
+            Err(_) => flags,
+        })
     }
 
     pub fn models(&self) -> Result<Vec<EngineModel>> {
@@ -436,7 +527,7 @@ mod tests {
     fn engine_args_are_checked_against_the_engines_own_flags() {
         let flags = parse_capabilities(CAPABILITIES).unwrap();
         let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(flags.check(&args(&["--drafter", "z/d", "--keep-warm", "--kv-cache", "fp8"])), Ok(()));
+        assert_eq!(flags.check(&args(&["--drafter", "z/d", "--keep-warm", "30", "--kv-cache", "fp8"])), Ok(()));
         assert_eq!(flags.check(&args(&["--kv-cache=bf16", "--drafter-bits", "4"])), Ok(()));
         let unknown = flags.check(&args(&["--drafter", "z/d", "--turbo"])).unwrap_err();
         assert!(unknown.contains("--turbo"), "{unknown}");
@@ -513,5 +604,52 @@ mod tests {
         assert_eq!(tf.version().unwrap(), Version { major: 1, minor: 3, patch: 0 });
         let err = tf.verified_version().unwrap_err().to_string();
         assert!(err.contains("1.3.0") && err.contains(VERIFIED_RELEASES), "{err}");
+    }
+
+    /// `serve --help` from 1.2.5 on this machine, cut to the flags of
+    /// [`CAPABILITIES`].
+    const USAGE: &str = "usage: tensorfold serve [-h] [--host HOST] [--port PORT] [--name NAME] [--context CONTEXT] \
+        [--drafter DRAFTER] [--drafter-bits {0,4}] [--keep-warm SECONDS] [--idle-unload SECONDS] [--slide] model";
+
+    /// A stand-in binary answering `capabilities --json` and `serve --help`.
+    fn flags_of_fake(dir: &std::path::Path) -> ServeFlags {
+        let fake = dir.join("tensorfold-native");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\ncase \"$1 $2\" in\n  'capabilities --json') echo '{}' ;;\n  'serve --help') echo '{USAGE}' ;;\n  *) exit 9 ;;\nesac\n",
+                CAPABILITIES.replace('\n', " ").replace(r#""--keep-warm":{},"#, r#""--keep-warm":{},"--slide":{},"#)
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A freshly written script's first exec can take seconds on a loaded
+        // Mac; run it once so the bounded probes measure the probe.
+        let _ = std::process::Command::new(&fake).arg("x").output();
+        Tensorfold::at(fake.to_string_lossy().into_owned()).serve_flags().unwrap()
+    }
+
+    /// The flags the installed binary takes carry their arity from its own
+    /// `serve --help` (`capabilities --json` says none): a flag that takes a
+    /// value must have one, a switch must not, and nothing is left over as
+    /// a stray positional argument the engine would read as its model.
+    #[test]
+    fn engine_args_are_checked_for_arity_from_the_engines_own_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let flags = flags_of_fake(dir.path());
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(flags.check(&args(&["--keep-warm", "30", "--slide", "--drafter=z/d"])), Ok(()));
+        for (bad, says) in [
+            (&["--keep-warm"][..], "takes a value"),
+            (&["--keep-warm", "--slide"][..], "takes a value"),
+            (&["--slide", "other/model"][..], "takes no value"),
+            (&["--slide=1"][..], "takes no value"),
+            (&["other/model"][..], "no flag before it"),
+        ] {
+            let why = flags.check(&args(bad)).expect_err(&format!("{bad:?} refused"));
+            assert!(why.contains(says), "{bad:?}: {why}");
+            assert!(!why.contains("other/model"), "a refusal never repeats a value: {why}");
+        }
     }
 }

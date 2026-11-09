@@ -2248,6 +2248,40 @@ mod tests {
         assert!(why.contains("tensorfold") && why.contains("flint"), "names both engines that take them: {why}");
     }
 
+    /// A Tensorfold model's `engine_args` never reach a flag darkmux sets by
+    /// another spelling the engine could read as it (an abbreviation such as
+    /// `--ho`, `--por=9`), nor `--api-key-file` (a secret's path) or `--alias`
+    /// (another name the server would answer to beside its `darkmux:` one).
+    /// A longer flag that merely starts with a reserved one is the engine's.
+    #[test]
+    fn tensorfold_engine_args_refuse_abbreviations_the_key_file_and_alias() {
+        let model = |args: &[&str]| {
+            let r = registry(&format!(
+                r#"{{"profiles":{{"p":{{"models":[{{"id":"m","n_ctx":8192,"endpoint":"tf","engine_args":{}}}]}}}},
+                    "endpoints":{{"tf":{{"managed":"tensorfold","port":8091}}}}}}"#,
+                serde_json::to_string(args).unwrap()
+            ));
+            r.profiles["p"].models[0].clone()
+        };
+        for (args, needles) in [
+            (&["--ho", "0.0.0.0"][..], &["`--ho`", "`--host`"][..]),
+            (&["--por=9"][..], &["`--por`", "`--port`"][..]),
+            (&["--cont", "4"][..], &["`--cont`", "`--context`"][..]),
+            (&["--na", "x"][..], &["`--na`", "`--name`"][..]),
+            (&["--api-key-f", "/k"][..], &["`--api-key-f`", "`--api-key-file`"][..]),
+            (&["--api-key-file", "/k"][..], &["`--api-key-file`", "secret"][..]),
+            (&["--alias", "x"][..], &["`--alias`", "darkmux:"][..]),
+        ] {
+            let why = model(args).engine_args_problem().unwrap_or_else(|| panic!("{args:?}: refused"));
+            for n in needles {
+                assert!(why.contains(n), "{args:?}: expected {n:?} in: {why}");
+            }
+        }
+        for ok in [&["--name-priority", "x"][..], &["--allowed-host", "h"][..], &["--no-update-check"][..]] {
+            assert_eq!(model(ok).engine_args_problem(), None, "{ok:?}");
+        }
+    }
+
     /// (#3453) rec holds a single-instance lock, so a machine runs one Flint
     /// server: a second `"managed": "flint"` endpoint is refused by every
     /// dispatching preflight (contract 7 style: the key path and why),
