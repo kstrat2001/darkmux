@@ -107,18 +107,29 @@ fn is_git_spawn(code: &str, consts: &[String], near_dash_c: bool) -> bool {
         })
 }
 
-/// Production files that may spawn git directly, each with its reason.
-const ALLOWED: &[(&str, &str)] = &[
-    ("crates/darkmux-types/src/host_git.rs", "the helper itself"),
+/// Production files that may spawn git directly: the path, how many spawns
+/// it may hold (`None`: any number; `Some(n)`: exactly `n`, so a new spawn
+/// beside an allowed one still fails), and the reason.
+const ALLOWED: &[(&str, Option<usize>, &str)] = &[
+    ("crates/darkmux-types/src/host_git.rs", None, "the helper itself"),
     (
         "crates/darkmux-types/src/host_git_fixture.rs",
+        None,
         "test-support only (`test-support` feature): plays the run's side, building and planting repos",
     ),
     (
         "crates/darkmux-crew/src/workspace_spec/materialize.rs",
+        None,
         "bare mirrors and their detached snapshot worktrees, outside every dispatch's read-write mount; \
          clone and fetch need the operator's own credential helper and ssh command, which HostGit's \
          flags override",
+    ),
+    (
+        "crates/darkmux-serve/src/client_workspace.rs",
+        Some(1),
+        "`git_bounded`: a paired app's clone and fetch, which need the operator's own credential helper \
+         and ssh command (HostGit clears both); a fetch names the repository darkmux holds, never one \
+         discovered in a work tree",
     ),
 ];
 
@@ -328,7 +339,10 @@ fn every_production_git_spawn_goes_through_host_git() {
         if hits.is_empty() {
             continue;
         }
-        if ALLOWED.iter().any(|(p, _)| *p == rel) {
+        if let Some((_, count, _)) = ALLOWED.iter().find(|(p, _, _)| *p == rel) {
+            if count.is_some_and(|n| n != hits.len()) {
+                offenders.push(format!("{rel}: {} spawns, ALLOWED says {count:?}", hits.len()));
+            }
             allowed_seen.push(rel);
             continue;
         }
@@ -344,7 +358,7 @@ fn every_production_git_spawn_goes_through_host_git() {
         offenders.join("\n  ")
     );
     let stale: Vec<&str> =
-        ALLOWED.iter().map(|(p, _)| *p).filter(|p| !allowed_seen.iter().any(|s| s == p)).collect();
+        ALLOWED.iter().map(|(p, _, _)| *p).filter(|p| !allowed_seen.iter().any(|s| s == p)).collect();
     assert!(stale.is_empty(), "ALLOWED entries with no git spawn left (remove them): {stale:?}");
 }
 

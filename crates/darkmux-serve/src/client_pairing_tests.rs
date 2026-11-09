@@ -2006,6 +2006,66 @@ fn a_large_diff_is_capped_with_a_marker() {
     );
 }
 
+/// (#3457) A run that turns the work copy's submodule into a repository of
+/// its own (and adds an untracked nested one), each carrying an fsmonitor
+/// and a clean filter, and sets `ignore = none` for the submodule in
+/// `.gitmodules`: the snapshot and the diff of what changed run none of it.
+#[test]
+fn snapshot_runs_nothing_a_planted_submodule_or_nested_repo_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let marker = root.join("host-ran-a-nested-repos-config");
+    let sub_src = root.join("subsrc");
+    std::fs::create_dir_all(&sub_src).unwrap();
+    run_git(Some(&sub_src), &["init", "-q"]);
+    std::fs::write(sub_src.join("s.txt"), "s\n").unwrap();
+    run_git(Some(&sub_src), &["add", "s.txt"]);
+    run_git(Some(&sub_src), &["commit", "-qm", "s"]);
+    let (w, g) = (root.join("w"), root.join(".w.git"));
+    run_git(None, &["init", "-q", "--separate-git-dir", g.to_str().unwrap(), w.to_str().unwrap()]);
+    run_git(Some(&w), &["-c", "protocol.file.allow=always", "submodule", "add", "-q", sub_src.to_str().unwrap(), "sub"]);
+    run_git(Some(&w), &["commit", "-qm", "with sub"]);
+    let wd = WorkCopy { work_tree: w.clone(), git_dir: g.canonicalize().unwrap() };
+    let before = snapshot_tree(&wd).expect("snapshots");
+
+    let plant = |repo: &Path| {
+        let _ = std::fs::remove_dir_all(repo);
+        run_git(None, &["clone", "-q", sub_src.to_str().unwrap(), repo.to_str().unwrap()]);
+        let cfg = repo.join(".git").join("config");
+        let mut config = std::fs::read_to_string(&cfg).unwrap();
+        config.push_str(&format!(
+            "[core]\n\tfsmonitor = \"touch '{m}'; false\"\n[filter \"x\"]\n\tclean = \"touch '{m}'; cat\"\n",
+            m = marker.display()
+        ));
+        std::fs::write(&cfg, config).unwrap();
+        std::fs::write(repo.join(".gitattributes"), "* filter=x\n").unwrap();
+    };
+    plant(&w.join("sub"));
+    plant(&w.join("nested"));
+    let mut gitmodules = std::fs::read_to_string(w.join(".gitmodules")).unwrap();
+    gitmodules.push_str("\tignore = none\n");
+    std::fs::write(w.join(".gitmodules"), gitmodules).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    for repo in ["sub", "nested"] {
+        std::fs::write(w.join(repo).join("s.txt"), "t\n").unwrap();
+    }
+
+    // The probe arms: git that checks the submodule's work tree runs it.
+    let _ = std::process::Command::new("git")
+        .arg(format!("--git-dir={}", g.display()))
+        .arg(format!("--work-tree={}", w.display()))
+        .args(["status", "--porcelain"])
+        .current_dir(&w)
+        .output()
+        .unwrap();
+    assert!(marker.exists(), "the fixture must arm: plain status runs the planted submodule's config");
+    std::fs::remove_file(&marker).unwrap();
+
+    let changes = changes_since(&wd, &before.tree).expect("the changes read");
+    assert!(!marker.exists(), "host git ran a planted repository's config");
+    assert!(changes.skipped.contains(&"nested".to_string()), "{:?}", changes.skipped);
+}
+
 #[test]
 fn a_workdir_that_is_not_a_git_repo_has_no_snapshot() {
     let dir = tempfile::tempdir().unwrap();

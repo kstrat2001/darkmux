@@ -100,10 +100,8 @@ pub fn name_for(normalized: &str, taken: impl Fn(&str) -> bool) -> Option<String
 }
 
 fn git_out(wd: &Path, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(wd)
-        .args(args)
+    let out = darkmux_types::host_git::HostGit::trusted(wd)
+        .command(args)
         .stdin(std::process::Stdio::null())
         .output()
         .ok()?;
@@ -160,7 +158,11 @@ pub fn status_of(wc: &crate::client_git::WorkCopy) -> Option<(String, String)> {
 }
 
 /// Runs git with no terminal (credential prompts fail instead of hanging),
-/// only the https and ssh transports, and a deadline.
+/// only the https and ssh transports, and a deadline. For clone and fetch
+/// only, which need the operator's own credential helper and ssh command:
+/// `darkmux_types::host_git::HostGit` clears both, so this is the one spawn
+/// in this file its lint allows (#3457). A fetch runs against the repository
+/// darkmux holds, never one discovered in a work tree.
 fn git_bounded(args: &[&std::ffi::OsStr], timeout: Duration) -> Result<(), String> {
     let child = std::process::Command::new("git")
         .args([
@@ -375,22 +377,21 @@ fn remote_default_with(git: impl Fn(&[&str]) -> Option<String>) -> Option<String
 }
 
 /// `git worktree add -b <branch> <dest> <commit>` from `source`, with the
-/// repo's hooks off (an app asked for this, not the owner at a terminal).
+/// repo's hooks off (an app asked for this, not the owner at a terminal),
+/// through `HostGit`'s trusted mode (#3457): no network, so it needs none of
+/// the credentials [`git_bounded`] keeps, and the checkout's own config
+/// cannot run a program while git checks the files out.
 pub fn add_worktree(source: &Path, branch: &str, dest: &Path, commit: &str) -> Result<(), String> {
-    let args: Vec<&std::ffi::OsStr> = vec![
-        "-c".as_ref(),
-        "core.hooksPath=/dev/null".as_ref(),
-        "-C".as_ref(),
-        source.as_os_str(),
-        "worktree".as_ref(),
-        "add".as_ref(),
-        "--quiet".as_ref(),
-        "-b".as_ref(),
-        branch.as_ref(),
-        dest.as_os_str(),
-        commit.as_ref(),
-    ];
-    git_bounded(&args, Duration::from_secs(120))
+    let dest = dest.to_string_lossy();
+    let child = darkmux_types::host_git::HostGit::trusted(source)
+        .command(&["worktree", "add", "--quiet", "-b", branch, &dest, commit])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("running git: {e}"))?;
+    wait_bounded(child, Duration::from_secs(120))
 }
 
 /// Where darkmux records the user's own checkout a workspace was made from:
@@ -633,6 +634,34 @@ mod tests {
         let err = git_bounded(&args, Duration::from_secs(30)).unwrap_err();
         assert!(err.starts_with("git exited with "), "{err}");
         assert!(err.contains("cannot change to"), "{err}");
+    }
+
+    /// (#3457) `add_worktree` checks files out of the user's checkout, whose
+    /// config a run may have written (an earlier dispatch with it mounted):
+    /// a smudge filter or a post-checkout hook it names never runs.
+    #[test]
+    fn add_worktree_runs_no_filter_or_hook_the_checkout_config_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (src, marker) = (root.join("src"), root.join("host-ran"));
+        std::fs::create_dir_all(&src).unwrap();
+        let fx = darkmux_types::host_git::fixture::git;
+        fx(&src, &["init", "-q"]);
+        std::fs::write(src.join(".gitattributes"), "* filter=x\n").unwrap();
+        std::fs::write(src.join("a.txt"), "a\n").unwrap();
+        fx(&src, &["add", "."]);
+        fx(&src, &["commit", "-qm", "one"]);
+        fx(&src, &["config", "filter.x.smudge", &format!("touch '{}'; cat", marker.display())]);
+        fx(&src, &["config", "filter.x.required", "true"]);
+        let hooks = src.join(".git").join("hooks");
+        std::fs::write(hooks.join("post-checkout"), format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(hooks.join("post-checkout"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        fx(&src, &["config", "core.hooksPath", hooks.to_str().unwrap()]);
+
+        add_worktree(&src, "mux/t", &root.join("wt"), "HEAD").expect("the worktree is added");
+        assert!(root.join("wt").join("a.txt").exists());
+        assert!(!marker.exists(), "the checkout's own smudge filter or hook ran");
     }
 
     #[test]

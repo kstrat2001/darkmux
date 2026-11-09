@@ -19,7 +19,11 @@
 //! rewrites or replaces it changes nothing on the host. On top of that every
 //! call turns off the config that runs a program ([`HOST_GIT_CONFIG`]), and
 //! reads no system config (`GIT_CONFIG_NOSYSTEM`); diffs pass
-//! `--no-textconv --no-ext-diff`.
+//! `--no-textconv --no-ext-diff`. (#3457) Every call is built by
+//! `darkmux_types::host_git::HostGit` (run-written mode with the held git
+//! dir), so it also gets that helper's submodule flag, its neutralization of
+//! every filter driver the repository's config defines, and its cleared
+//! environment.
 
 use std::path::{Path, PathBuf};
 
@@ -34,22 +38,6 @@ pub const HOST_GIT_CONFIG: &[&str] = &[
     "credential.helper=",
     "diff.external=",
     "core.untrackedCache=false",
-];
-
-/// Environment a host git call must not inherit: it would point git at
-/// another repository or index, or run another program. (`client serve`'s
-/// own environment is the operator's, never a run's; the operator's own
-/// config, `GIT_CONFIG_*` included, still applies.)
-const GIT_ENV: &[&str] = &[
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_INDEX_FILE",
-    "GIT_COMMON_DIR",
-    "GIT_EXTERNAL_DIFF",
-    "GIT_SSH",
-    "GIT_SSH_COMMAND",
-    "GIT_ASKPASS",
-    "GIT_EXEC_PATH",
 ];
 
 /// A workspace as host git sees it: its work tree, and the repository
@@ -145,34 +133,24 @@ pub fn worktree_admin_dir(work_tree: &Path, common: &Path) -> Result<PathBuf, St
     Ok(dir)
 }
 
-/// `git` against `wc`'s held repository and work tree, with
-/// [`HOST_GIT_CONFIG`] set, no system config, no inherited git environment,
-/// and `index` as the index when given.
-pub fn command(wc: &WorkCopy, index: Option<&Path>) -> std::process::Command {
-    let mut cmd = std::process::Command::new("git");
-    for var in GIT_ENV {
-        cmd.env_remove(var);
-    }
-    cmd.env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .arg("--git-dir")
-        .arg(&wc.git_dir)
-        .arg("--work-tree")
-        .arg(&wc.work_tree);
-    for c in HOST_GIT_CONFIG {
-        cmd.args(["-c", c]);
-    }
+/// `git <args>` against `wc`'s held repository and work tree, through
+/// `HostGit::run_written` with [`HOST_GIT_CONFIG`] added, no terminal, and
+/// `index` as the index when given.
+pub fn command(wc: &WorkCopy, index: Option<&Path>, args: &[&str]) -> std::process::Command {
+    let mut cmd = darkmux_types::host_git::HostGit::run_written(&wc.git_dir, &wc.work_tree)
+        .with_config(HOST_GIT_CONFIG)
+        .command(args);
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
     if let Some(i) = index {
         cmd.env("GIT_INDEX_FILE", i);
     }
-    cmd.current_dir(&wc.work_tree)
-        .stdin(std::process::Stdio::null());
+    cmd.stdin(std::process::Stdio::null());
     cmd
 }
 
 /// [`command`] run to completion; its output when git succeeded.
 pub fn run(wc: &WorkCopy, index: Option<&Path>, args: &[&str]) -> Option<std::process::Output> {
-    let out = command(wc, index).args(args).output().ok()?;
+    let out = command(wc, index, args).output().ok()?;
     out.status.success().then_some(out)
 }
 
@@ -188,8 +166,7 @@ pub fn run_or_why(
     index: Option<&Path>,
     args: &[&str],
 ) -> Result<std::process::Output, String> {
-    let out = command(wc, index)
-        .args(args)
+    let out = command(wc, index, args)
         .output()
         .map_err(|e| format!("running git: {e}"))?;
     if out.status.success() {
@@ -210,8 +187,7 @@ pub fn run_or_why(
 
 /// [`command`] for its effect; the last stderr line on failure.
 pub fn quiet(wc: &WorkCopy, args: &[&str]) -> Result<(), String> {
-    let out = command(wc, None)
-        .args(args)
+    let out = command(wc, None, args)
         .output()
         .map_err(|e| format!("running git: {e}"))?;
     if out.status.success() {
@@ -229,11 +205,8 @@ pub fn quiet(wc: &WorkCopy, args: &[&str]) -> Result<(), String> {
 /// The repository `git_dir` shares its objects and config with (itself, or
 /// a worktree's main checkout's `.git`).
 pub fn common_of(git_dir: &Path) -> Option<PathBuf> {
-    let out = std::process::Command::new("git")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .arg("--git-dir")
-        .arg(git_dir)
-        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+    let out = darkmux_types::host_git::HostGit::held_git_dir(git_dir)
+        .command(&["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .stdin(std::process::Stdio::null())
         .output()
         .ok()?;
@@ -352,7 +325,7 @@ mod tests {
             work_tree: PathBuf::from("/w"),
             git_dir: PathBuf::from("/g"),
         };
-        let cmd = command(&wc, None);
+        let cmd = command(&wc, None, &["status"]);
         let args: Vec<String> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -362,6 +335,9 @@ mod tests {
             "core.hooksPath=/dev/null",
             "commit.gpgsign=false",
             "credential.helper=",
+            "tag.gpgsign=false",
+            "core.untrackedCache=false",
+            "diff.external=",
         ] {
             let at = args
                 .iter()
@@ -369,7 +345,11 @@ mod tests {
                 .unwrap_or_else(|| panic!("{setting} missing: {args:?}"));
             assert_eq!(args[at - 1], "-c", "{args:?}");
         }
-        assert_eq!(&args[..4], ["--git-dir", "/g", "--work-tree", "/w"]);
+        let sub = args.iter().position(|a| a == "status").unwrap();
+        for held in ["--git-dir=/g", "--work-tree=/w"] {
+            let at = args.iter().position(|a| a == held).unwrap_or_else(|| panic!("{held} missing: {args:?}"));
+            assert!(at < sub, "{held} must come before the subcommand: {args:?}");
+        }
         let nosystem = cmd
             .get_envs()
             .any(|(k, v)| k == "GIT_CONFIG_NOSYSTEM" && v == Some(std::ffi::OsStr::new("1")));

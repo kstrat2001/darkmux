@@ -138,19 +138,23 @@ enum Repo {
     Trusted { dir: PathBuf },
     /// A work tree a run wrote: git is told the git dir, never discovers it.
     RunWritten { git_dir: PathBuf, work_tree: PathBuf },
+    /// A git dir darkmux holds, asked about without any work tree.
+    HeldGitDir { git_dir: PathBuf },
 }
 
 /// A host git invocation target. See the module doc.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostGit {
     repo: Repo,
+    /// More `-c` settings a caller adds after [`HARDENING_CONFIG`].
+    extra_config: Vec<String>,
 }
 
 impl HostGit {
     /// A checkout the operator owns. git runs with `dir` as its working
     /// directory and finds the repository from there.
     pub fn trusted(dir: impl Into<PathBuf>) -> Self {
-        Self { repo: Repo::Trusted { dir: dir.into() } }
+        Self { repo: Repo::Trusted { dir: dir.into() }, extra_config: Vec::new() }
     }
 
     /// A work tree a run wrote. `git_dir` MUST be a git directory the caller
@@ -160,7 +164,22 @@ impl HostGit {
     /// whatever the run left there. git runs in `work_tree` with
     /// `--git-dir` and `--work-tree` given, so it discovers nothing.
     pub fn run_written(git_dir: impl Into<PathBuf>, work_tree: impl Into<PathBuf>) -> Self {
-        Self { repo: Repo::RunWritten { git_dir: git_dir.into(), work_tree: work_tree.into() } }
+        Self { repo: Repo::RunWritten { git_dir: git_dir.into(), work_tree: work_tree.into() }, extra_config: Vec::new() }
+    }
+
+    /// A git dir darkmux holds (one it recorded, outside every work tree),
+    /// asked about with no work tree at all: `--git-dir` given, git run in
+    /// that directory. For questions about the repository itself
+    /// (`rev-parse --git-common-dir`), never the files of a work tree.
+    pub fn held_git_dir(git_dir: impl Into<PathBuf>) -> Self {
+        Self { repo: Repo::HeldGitDir { git_dir: git_dir.into() }, extra_config: Vec::new() }
+    }
+
+    /// Adds `-c` settings after [`HARDENING_CONFIG`], for a caller with its
+    /// own (a later setting wins over an earlier one for the same key).
+    pub fn with_config(mut self, settings: &[&str]) -> Self {
+        self.extra_config.extend(settings.iter().map(|s| s.to_string()));
+        self
     }
 
     /// The directory git runs in: the trusted checkout, or the run's work
@@ -169,6 +188,7 @@ impl HostGit {
         match &self.repo {
             Repo::Trusted { dir } => dir,
             Repo::RunWritten { work_tree, .. } => work_tree,
+            Repo::HeldGitDir { git_dir } => git_dir,
         }
     }
 
@@ -211,6 +231,9 @@ impl HostGit {
         for setting in HARDENING_CONFIG {
             cmd.arg("-c").arg(setting);
         }
+        for setting in &self.extra_config {
+            cmd.arg("-c").arg(setting);
+        }
         match &self.repo {
             Repo::Trusted { dir } => {
                 cmd.current_dir(dir);
@@ -219,6 +242,10 @@ impl HostGit {
                 cmd.arg(prefixed("--git-dir=", git_dir));
                 cmd.arg(prefixed("--work-tree=", work_tree));
                 cmd.current_dir(work_tree);
+            }
+            Repo::HeldGitDir { git_dir } => {
+                cmd.arg(prefixed("--git-dir=", git_dir));
+                cmd.current_dir(git_dir);
             }
         }
         cmd

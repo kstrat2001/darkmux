@@ -86,6 +86,18 @@ fn run_written_command_names_the_held_git_dir_and_work_tree() {
 }
 
 #[test]
+fn a_held_git_dir_names_only_the_git_dir_and_extra_config_follows_the_hardening() {
+    let cmd = HostGit::held_git_dir("/g").with_config(&["tag.gpgsign=false"]).command(&["rev-parse", "HEAD"]);
+    let args = args_of(&cmd);
+    assert_hardened(&args, "rev-parse");
+    assert!(args.contains(&"--git-dir=/g".to_string()) && !args.iter().any(|a| a.starts_with("--work-tree")), "{args:?}");
+    let extra = args.iter().position(|a| a == "tag.gpgsign=false").expect("extra -c");
+    assert_eq!(args[extra - 1], "-c");
+    assert!(extra > args.iter().position(|a| a == "diff.ignoreSubmodules=dirty").unwrap(), "after the hardening: {args:?}");
+    assert_eq!(cmd.get_current_dir(), Some(Path::new("/g")));
+}
+
+#[test]
 fn each_subcommand_gets_its_flags_right_after_it() {
     const ALL: [&str; 3] = ["--no-textconv", "--no-ext-diff", "--ignore-submodules=dirty"];
     for sub in ["diff", "diff-index", "diff-files", "diff-tree", "log", "show", "format-patch"] {
