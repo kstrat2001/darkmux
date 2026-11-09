@@ -3230,7 +3230,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_constant_is_3_5() {
+    fn schema_version_constant_is_4_1() {
         // (#1550 cluster item 2) Retired the `expand`/`ExpansionSpec`/
         // `LaunchParams::expansions` primitive — never fed by either
         // production launcher. A field REMOVAL is a MAJOR bump per this
