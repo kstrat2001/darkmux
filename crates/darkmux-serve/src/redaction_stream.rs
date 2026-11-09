@@ -51,7 +51,7 @@ struct KindStack {
 
 impl KindStack {
     fn push(&mut self, is_object: bool) {
-        if self.len % 64 == 0 {
+        if self.len.is_multiple_of(64) {
             self.words.push(0);
         }
         if is_object {
@@ -70,7 +70,7 @@ impl KindStack {
             return;
         }
         self.len -= 1;
-        if self.len % 64 == 0 {
+        if self.len.is_multiple_of(64) {
             self.words.pop();
         } else {
             self.words[self.len / 64] &= !(1 << (self.len % 64));

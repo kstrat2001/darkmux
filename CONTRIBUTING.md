@@ -82,7 +82,7 @@ build`, verify by reloading the page rather than by running `cargo test`.
 
 ## Code style
 
-- Rust 2021 edition, MSRV 1.88 for the `darkmux` binary (raised from 1.80 by `agent-client-protocol` 2.0.0; see the root `Cargo.toml`'s `rust-version` comment) and 1.86 for the member crates and `runtime/`. CI's `msrv` job checks each package on the version it declares (`scripts/ci-msrv-check.sh`), so a `rust-version` edit changes the check with it
+- Rust 2021 edition, MSRV 1.89 for the `darkmux` binary and for the member crates that use SQLite (`darkmux-crew`, and through it `darkmux-doctor`, `-fleet`, `-lab` and `-serve`), raised by `rusqlite` 0.41 for RUSTSEC-2026-0459 (the binary went 1.80 -> 1.88 for `agent-client-protocol` 2.0.0 before that; see the root `Cargo.toml`'s `rust-version` comment), and 1.86 for the other member crates and `runtime/`. CI's `msrv` job checks each package on the version it declares (`scripts/ci-msrv-check.sh`), so a `rust-version` edit changes the check with it
 - `cargo fmt` before every commit
 - `cargo clippy` clean (warnings tolerated in legacy dead-code paths; new warnings in changed files must be fixed)
 - Single-purpose PRs

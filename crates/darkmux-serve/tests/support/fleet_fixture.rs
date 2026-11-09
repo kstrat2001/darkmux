@@ -58,7 +58,7 @@ pub fn realistic_records(n: usize, now_secs: u64) -> Vec<serde_json::Value> {
     let mut mission = 0usize;
     while out.len() < n {
         let mid = format!("mis-{mission:04}-review-the-fleet-window-change");
-        let machine = if mission % 3 == 0 {
+        let machine = if mission.is_multiple_of(3) {
             ("example-laptop", "00000000-0000-4000-8000-ABCDEF000001")
         } else {
             ("example-studio", "00000000-0000-4000-8000-ABCDEF000002")
@@ -113,7 +113,7 @@ pub fn realistic_records(n: usize, now_secs: u64) -> Vec<serde_json::Value> {
                 json!({
                     "image": "darkmux-runtime:5.1.1-arm64", "tools_requested": ["read", "edit", "bash", "grep"], "brief_refs": [],
                     "prompt_chars": 4_000, "prompt": text(mission * 10 + k, 4_000), "system_chars": 2_400, "workspace": "/work/darkmux",
-                    "turn_delay_ms": 0, "beats": mission % 2 == 0, "endpoint": endpoint,
+                    "turn_delay_ms": 0, "beats": mission.is_multiple_of(2), "endpoint": endpoint,
                     "bounds": { "max_tokens_per_call": { "value": null, "source": "default" }, "inactivity_timeout_seconds": { "value": 600, "source": "config" }, "max_turns": { "value": null, "source": "default" } },
                 }),
             ));
@@ -251,7 +251,7 @@ pub fn realistic_records(n: usize, now_secs: u64) -> Vec<serde_json::Value> {
         }
         // A usage record written under a spelling this binary does not know:
         // the usage fold still counts it by its category and source.
-        if mission % 5 == 0 {
+        if mission.is_multiple_of(5) {
             // flow-action-guard:allow — a deliberately unknown action: the usage fold counts it by category and source
             recs.push(base("telemetry.usage_legacy", "telemetry", "tokens", &run_sid, None, json!({ "prompt_tokens": 7_000, "completion_tokens": 300, "total_tokens": 7_300, "endpoint": "lmstudio:127.0.0.1:1234/qwen3-coder" })));
         }
@@ -279,7 +279,7 @@ pub fn realistic_records(n: usize, now_secs: u64) -> Vec<serde_json::Value> {
         // An ad-hoc dispatch beside every other mission (no mission: its own
         // row), ending three ways a payload decides: stopped by the operator,
         // a step that says a later one is planned (so not an ending), done.
-        if mission % 2 == 0 {
+        if mission.is_multiple_of(2) {
             let sid = format!("adhoc-{mission:04}-dispatch");
             let exec = format!("exec-adhoc-{mission:x}");
             let mut adhoc = vec![base(
