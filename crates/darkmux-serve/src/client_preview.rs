@@ -105,21 +105,39 @@ impl RecipeRefusal {
 /// `preview.json` is refused, and the file is opened without following a
 /// link.
 pub fn read_recipe_text(checkout: &Path) -> Result<String, RecipeRefusal> {
-    use std::io::Read;
-    let dir = checkout.join(".darkmux");
     let file = checkout.join(RECIPE_PATH);
-    for p in [&dir, &file] {
-        match std::fs::symlink_metadata(p) {
-            Ok(m) if m.file_type().is_symlink() => {
-                return Err(RecipeRefusal::Symlink(format!("{} is a symlink; refusing", p.display())))
-            }
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(RecipeRefusal::NotFound(format!("no {RECIPE_PATH} in {}", checkout.display())))
-            }
-            Err(e) => return Err(RecipeRefusal::Unreadable(format!("reading {}: {e}", p.display()))),
-        }
+    for p in [&checkout.join(".darkmux"), &file] {
+        exists_unlinked(p, checkout)?;
     }
+    let text = read_capped(&file)?;
+    if text.len() as u64 > MAX_RECIPE_BYTES {
+        return Err(RecipeRefusal::TooLarge(format!(
+            "{RECIPE_PATH} is larger than {MAX_RECIPE_BYTES} bytes"
+        )));
+    }
+    Ok(text)
+}
+
+/// `p` exists and is not a symlink.
+fn exists_unlinked(p: &Path, checkout: &Path) -> Result<(), RecipeRefusal> {
+    match std::fs::symlink_metadata(p) {
+        Ok(m) if m.file_type().is_symlink() => Err(RecipeRefusal::Symlink(format!(
+            "{} is a symlink; refusing",
+            p.display()
+        ))),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(RecipeRefusal::NotFound(format!(
+            "no {RECIPE_PATH} in {}",
+            checkout.display()
+        ))),
+        Err(e) => Err(RecipeRefusal::Unreadable(format!("reading {}: {e}", p.display()))),
+    }
+}
+
+/// A regular file's text, opened without following a link, one byte past
+/// the cap at most (so an oversized file is told apart).
+fn read_capped(file: &Path) -> Result<String, RecipeRefusal> {
+    use std::io::Read;
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
     #[cfg(unix)]
@@ -128,7 +146,7 @@ pub fn read_recipe_text(checkout: &Path) -> Result<String, RecipeRefusal> {
         opts.custom_flags(libc::O_NOFOLLOW);
     }
     let mut text = String::new();
-    opts.open(&file)
+    opts.open(file)
         .and_then(|f| {
             if !f.metadata()?.is_file() {
                 return Err(std::io::Error::other("not a file"));
@@ -136,11 +154,6 @@ pub fn read_recipe_text(checkout: &Path) -> Result<String, RecipeRefusal> {
             f.take(MAX_RECIPE_BYTES + 1).read_to_string(&mut text)
         })
         .map_err(|e| RecipeRefusal::Unreadable(format!("reading {}: {e}", file.display())))?;
-    if text.len() as u64 > MAX_RECIPE_BYTES {
-        return Err(RecipeRefusal::TooLarge(format!(
-            "{RECIPE_PATH} is larger than {MAX_RECIPE_BYTES} bytes"
-        )));
-    }
     Ok(text)
 }
 
