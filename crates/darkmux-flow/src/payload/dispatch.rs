@@ -615,10 +615,12 @@ pub struct DispatchEndPayload {
     /// (#3448) On a `dispatch.error` only: a stable code an app branches on,
     /// beside `error` for a person: `busy` (the memory is held by a running
     /// dispatch; retry later), `wont_fit` (the model does not fit even with
-    /// every darkmux resident evicted), `model_start_failed`, `port_in_use`,
-    /// `engine_unavailable`, `engine_in_use` (#3453: the engine's own server,
-    /// one darkmux did not start, is running, as rec's can be). Absent when
-    /// the failure has no code.
+    /// every darkmux resident evicted), `model_start_failed`,
+    /// `model_stop_failed` (darkmux's own server would not stop when it was
+    /// replaced or evicted), `port_in_use`, `engine_unavailable`,
+    /// `engine_in_use` (#3453: the engine's own server, one darkmux did not
+    /// start, is running, as rec's can be). Absent when the failure has no
+    /// code.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub code: Option<String>,
