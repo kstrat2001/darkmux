@@ -961,6 +961,62 @@ fn work_body(profile: Option<&str>, workdir: Option<&str>) -> Value {
     serde_json::json!({"role": "coder", "message": "hello", "profile": profile, "workdir": workdir})
 }
 
+/// (#3451 review) A client's `workdir` must be exactly one workspace
+/// directly under the worktrees base. The base itself, darkmux's held
+/// repositories and records beside the workspaces (dot entries), a path
+/// inside a workspace and a symlink to any of them are refused before
+/// anything runs; a real workspace is admitted.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_client_workdir_is_exactly_one_workspace() {
+    let h = harness();
+    let token = paired(&h).await;
+    let base = h.base.canonicalize().unwrap();
+    std::fs::create_dir_all(base.join(".p.git/objects")).unwrap();
+    std::fs::write(
+        base.join(".p.template"),
+        "e044900cd94d086c841616b05ed63638aa402be4\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(base.join(".p.tmpl-dir")).unwrap();
+    std::fs::create_dir_all(base.join("wt1/sub")).unwrap();
+    std::os::unix::fs::symlink(base.join(".p.git"), base.join("linked")).unwrap();
+    std::os::unix::fs::symlink(&base, h.dir.path().join("base-link")).unwrap();
+    let refused = [
+        base.clone(),
+        base.join(".p.git"),
+        base.join(".p.git/objects"),
+        base.join(".p.template"),
+        base.join(".p.tmpl-dir"),
+        base.join("wt1/sub"),
+        base.join("linked"),
+        h.dir.path().join("base-link"),
+    ];
+    for w in refused {
+        let (code, v) = call(
+            &h,
+            post(
+                "/client/work",
+                Some(&token),
+                work_body(Some("fast"), w.to_str()),
+            ),
+        )
+        .await;
+        assert!(code == 403 || code == 404, "{}: {code} {v}", w.display());
+    }
+    assert!(h.ran.lock().unwrap().is_empty(), "nothing ran");
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/work",
+            Some(&token),
+            work_body(Some("fast"), base.join("wt1").to_str()),
+        ),
+    )
+    .await;
+    assert_eq!(code, 202, "a real workspace: {v}");
+}
+
 fn work_for(role: &str) -> Value {
     serde_json::json!({"role": role, "message": "hello"})
 }
