@@ -1169,6 +1169,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
     /// `mission.worktree`/`mission.coder`/`mission.verify` kinds).
     fn test_task(id: &str) -> Task {
         Task {
+            repo_root: None,
             branch: None,
             run_on: darkmux_crew::types::default_run_on(),
             id: id.to_string(),
@@ -1589,18 +1590,9 @@ edit loop detected on src/widget.rs in an earlier dispatch
     #[test]
     #[serial_test::serial]
     fn mission_verify_step_kind_clean_diff_needs_no_dispatch() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let repo = tmp.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        let git = |args: &[&str]| {
-            let o = Command::new("git").current_dir(&repo).args(args).output().unwrap();
-            assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
-        };
-        git(&["init", "-q"]);
-        git(&["config", "user.email", "t@example.com"]);
-        git(&["config", "user.name", "t"]);
-        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
-        git(&["branch", "-m", "main"]);
+        // (#3457) A real linked worktree: the step refuses a "worktree" that
+        // is the main checkout itself.
+        let f = PlantedWorktree::new();
 
         let flows = tempfile::TempDir::new().unwrap();
         let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
@@ -1618,8 +1610,8 @@ edit loop detected on src/widget.rs in an earlier dispatch
         let slot: Arc<Mutex<Option<std::result::Result<crate::phase_review::PhaseReviewOutput, String>>>> =
             Arc::new(Mutex::new(None));
         let ctx = Arc::new(CoderPhaseContext {
-            repo_root: repo.clone(),
-            wt_path: repo.clone(),
+            repo_root: f.repo.clone(),
+            wt_path: f.wt.clone(),
             branch: "darkmux/s1".to_string(),
             base: "main".to_string(),
             mission_id: "m1".to_string(),
@@ -2423,6 +2415,100 @@ edit loop detected on src/widget.rs in an earlier dispatch
         assert!(f.wt.join("a.txt").exists(), "unsaved work must be spared");
         assert!(f.branch_exists("phase") && f.branch_exists("keep-me"));
         assert!(!f.anything_ran(), "a planted command ran on the host");
+    }
+
+    /// Points the process cwd at `dir` for the guard's life. `#[serial]` only.
+    struct CwdGuard {
+        prev: std::path::PathBuf,
+    }
+    impl CwdGuard {
+        fn enter(dir: &Path) -> Self {
+            let prev = std::env::current_dir().unwrap();
+            std::env::set_current_dir(dir).unwrap();
+            Self { prev }
+        }
+    }
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.prev);
+        }
+    }
+
+    /// `mission finalize` run from INSIDE the coder's worktree, whose `.git`
+    /// the run replaced, for a mission whose records name no main repo (one
+    /// launched before they did): the cwd's "repository" is the planted one,
+    /// so darkmux refuses it as the main repo and runs nothing it planted.
+    #[test]
+    #[serial_test::serial]
+    fn finalize_from_inside_a_planted_worktree_refuses_it_as_the_main_repo() {
+        let _g = CrewEnvGuard::new();
+        let f = PlantedWorktree::new();
+        let mid = "planted-cwd";
+        seed_finalize_mission(mid, &[("p1", PhaseStatus::Running)]);
+        let mut t = test_task("p1-worktree");
+        t.phase_id = "p1".to_string();
+        t.workdir = Some(f.wt.clone());
+        t.branch = Some("phase".to_string());
+        crew::lifecycle::save_task(mid, &t).unwrap();
+        f.plant(TreeChange::Content);
+
+        assert!(teardown_target(mid, "p1", Some(&f.wt)).is_none(), "the cwd's planted repo is refused as the root");
+        {
+            let _cwd = CwdGuard::enter(&f.wt);
+            assert_eq!(finalize(mid, None).unwrap(), 0);
+        }
+        assert!(!f.anything_ran(), "a planted command ran on the host");
+        assert!(f.branch_exists("keep-me") && f.branch_exists("phase"));
+        assert!(f.wt.join("a.txt").exists(), "nothing is torn down through a refused root");
+    }
+
+    /// A root resolved from inside the worktree, or from anywhere under the
+    /// worktrees base, is never taken as the main repository.
+    #[test]
+    #[serial_test::serial]
+    fn a_worktree_is_never_its_own_main_repo() {
+        let _g = CrewEnvGuard::new();
+        let f = PlantedWorktree::new();
+        f.plant(TreeChange::Content);
+        for root in [f.wt.clone(), f.wt.join("sub")] {
+            let err = worktree_admin_dir(&root, &f.wt).unwrap_err().to_string();
+            assert!(err.contains("not the main repository"), "refused as the main repo, not by luck: {err}");
+        }
+        assert!(!f.anything_ran(), "a planted command ran on the host");
+        let under_base = darkmux_types::workdir::worktrees_base_dir().join("repo").join("p0");
+        std::fs::create_dir_all(&under_base).unwrap();
+        let err = refuse_as_main_repo(&under_base, &f.wt).unwrap_err();
+        assert!(err.to_string().contains("worktrees dir"), "{err}");
+        assert!(refuse_as_main_repo(&f.repo, &f.wt).is_ok());
+    }
+
+    /// The same cwd, for a mission launched with this change: its worktree
+    /// task records the main repo, so `mission abort` run from inside the
+    /// planted worktree still tears it down through the real repository,
+    /// deleting the recorded branch and running nothing the run planted.
+    #[test]
+    #[serial_test::serial]
+    fn abort_from_inside_a_planted_worktree_uses_the_recorded_main_repo() {
+        let _g = CrewEnvGuard::new();
+        let f = PlantedWorktree::new();
+        let mid = "planted-cwd-recorded";
+        seed_finalize_mission(mid, &[("p1", PhaseStatus::Running)]);
+        let mut t = test_task("p1-worktree");
+        t.phase_id = "p1".to_string();
+        t.workdir = Some(f.wt.clone());
+        t.branch = Some("phase".to_string());
+        t.repo_root = Some(f.repo.clone());
+        crew::lifecycle::save_task(mid, &t).unwrap();
+        f.plant(TreeChange::Content);
+
+        {
+            let _cwd = CwdGuard::enter(&f.wt);
+            assert_eq!(abort(mid, None).unwrap(), 0);
+        }
+        assert!(!f.anything_ran(), "a planted command ran on the host");
+        assert!(f.branch_exists("keep-me"), "the planted HEAD chose the branch abort deleted");
+        assert!(!f.branch_exists("phase"), "the recorded branch is deleted");
+        assert!(!f.wt.exists(), "the worktree is torn down");
     }
 
     /// The run's `.git` names `keep-me` as HEAD. abort force-deletes the

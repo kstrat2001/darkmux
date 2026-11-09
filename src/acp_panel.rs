@@ -2256,6 +2256,7 @@ pub(crate) mod tests {
         // test since `interpret()` itself has no live producer of a
         // non-empty warnings Vec today (see `InterpretedGraph`'s doc).
         let t = Task {
+            repo_root: None,
             branch: None,
             run_on: darkmux_crew::types::default_run_on(),
             id: "t1".to_string(),
@@ -2310,6 +2311,7 @@ pub(crate) mod tests {
     #[test]
     fn render_ephemeral_result_flips_success_false_when_a_side_branch_errored() {
         let t = Task {
+            repo_root: None,
             branch: None,
             run_on: darkmux_crew::types::default_run_on(),
             id: "t1".to_string(),

@@ -972,6 +972,7 @@ mod tests {
 
     fn task() -> Task {
         Task {
+            repo_root: None,
             branch: None,
             id: "create-mod-1".into(),
             phase_id: "p".into(),

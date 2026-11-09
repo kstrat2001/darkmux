@@ -2513,6 +2513,7 @@ mod tests {
             stop_reason: None,
         };
         let task = Task {
+            repo_root: None,
             branch: None,
             run_on: crate::types::default_run_on(),
             id: "deliver-task".into(),
@@ -2560,6 +2561,7 @@ mod tests {
             stop_reason: None,
         };
         let task = Task {
+            repo_root: None,
             branch: None,
             run_on: crate::types::default_run_on(),
             id: "deliver-task".into(),
@@ -3180,6 +3182,7 @@ mod tests {
             stop_reason: None,
         };
         let task = Task {
+            repo_root: None,
             branch: None,
             run_on: crate::types::default_run_on(),
             id: "deliver-task".into(),
@@ -3243,6 +3246,7 @@ mod tests {
             "emit": out_path.to_string_lossy(),
         });
         let task = Task {
+            repo_root: None,
             branch: None,
             run_on: crate::types::default_run_on(),
             id: "deliver-task".into(),
@@ -4080,6 +4084,7 @@ mod tests {
             stop_reason: None,
         };
         let task = Task {
+            repo_root: None,
             branch: None,
             run_on: crate::types::default_run_on(),
             id: "deliver-task".into(),

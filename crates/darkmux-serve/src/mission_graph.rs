@@ -1716,6 +1716,7 @@ mod tests {
 
     fn task(id: &str, deps: &[&str], step_ids: &[&str]) -> Task {
         Task {
+            repo_root: None,
             branch: None,
             run_on: darkmux_crew::types::default_run_on(),
             id: id.to_string(),

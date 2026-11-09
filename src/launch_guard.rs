@@ -895,6 +895,7 @@ mod tests {
         darkmux_types::child_registry::reset_for_test();
 
         let task = crew::types::Task {
+            repo_root: None,
             branch: None,
             run_on: crew::types::default_run_on(),
             id: "t1".to_string(),

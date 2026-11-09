@@ -735,6 +735,7 @@ mod tests {
 
     fn task() -> Task {
         Task {
+            repo_root: None,
             branch: None,
             id: "deliver".into(),
             phase_id: PHASE.into(),

@@ -1174,6 +1174,57 @@ fn remove_phase_worktree(root: &Path, wt_path: &Path, admin: Option<&PathBuf>) {
     }
 }
 
+/// (#3457) Refuse `root` as the MAIN repository of the coder worktree at
+/// `wt_path` when it lies inside that worktree, or under darkmux's worktrees
+/// base (where every coder worktree lives by default). Either means the root
+/// was resolved from a cwd inside a worktree a run had mounted read-write,
+/// whose `.git` is whatever the run left there: git would read the run's
+/// config and HEAD as the main repository's.
+pub(crate) fn refuse_as_main_repo(root: &Path, wt_path: &Path) -> Result<()> {
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let root_c = canon(root);
+    if root_c.starts_with(canon(wt_path)) {
+        bail!(
+            "{} is inside the worktree {}, not the main repository: run `darkmux mission` from \
+             the main checkout",
+            root.display(),
+            wt_path.display()
+        );
+    }
+    let base = darkmux_types::workdir::worktrees_base_dir();
+    if root_c.starts_with(canon(&base)) {
+        bail!(
+            "{} is under darkmux's worktrees dir {}, not a main repository: run `darkmux mission` \
+             from the main checkout",
+            root.display(),
+            base.display()
+        );
+    }
+    Ok(())
+}
+
+/// (#3457) The main repository and worktree a phase's teardown works on: the
+/// repo darkmux recorded at launch (`Task.repo_root`), else `ambient` (the
+/// cwd's, for records written before the field existed), refused when it is
+/// the worktree or under the worktrees base ([`refuse_as_main_repo`]).
+/// `None` skips the git teardown: no repository, or a refused one.
+fn teardown_target(mission_id: &str, phase_id: &str, ambient: Option<&Path>) -> Option<(PathBuf, PathBuf)> {
+    let recorded = crew::lifecycle::load_tasks_for_phase(mission_id, phase_id)
+        .ok()
+        .into_iter()
+        .flatten()
+        .find_map(|t| t.repo_root);
+    let root = recorded.or_else(|| ambient.map(Path::to_path_buf))?;
+    let wt_path = resolve_run_workdir(mission_id, phase_id, &root);
+    match refuse_as_main_repo(&root, &wt_path) {
+        Ok(()) => Some((root, wt_path)),
+        Err(e) => {
+            eprintln!("{}", style::warn(&format!("skipping the git teardown of phase {phase_id}: {e:#}")));
+            None
+        }
+    }
+}
+
 /// (#3457) The branch `mission launch coder-phase` created the phase's
 /// worktree on, as persisted on its worktree task (`Task.branch`). `None`
 /// for task records written before the field existed.
@@ -1190,18 +1241,16 @@ fn resolve_run_branch(mission_id: &str, phase_id: &str) -> Option<String> {
 /// `gitdir` back-link names `<wt_path>/.git`. Never read from the worktree's
 /// own `.git`: a dispatch had the worktree mounted read-write, and a run can
 /// replace that pointer file with a directory whose config runs commands or
-/// whose HEAD names another branch. The main working tree itself
-/// (`wt_path` = `repo_root`) is its common dir.
+/// whose HEAD names another branch. A `repo_root` that
+/// [`refuse_as_main_repo`] refuses is an error, never a git dir.
 pub(crate) fn worktree_admin_dir(repo_root: &Path, wt_path: &Path) -> Result<PathBuf> {
+    refuse_as_main_repo(repo_root, wt_path)?;
     let common = HostGit::trusted(repo_root)
         .stdout(&["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .ok_or_else(|| anyhow!("`git rev-parse --git-common-dir` failed in {}", repo_root.display()))?;
     let wt = wt_path.canonicalize().with_context(|| format!("resolving {}", wt_path.display()))?;
-    if repo_root.canonicalize().ok().as_deref() == Some(wt.as_path()) {
-        return Ok(common);
-    }
     let want = wt.join(".git");
     let entries = std::fs::read_dir(common.join("worktrees")).into_iter().flatten().flatten();
     for admin in entries.map(|e| e.path()) {
@@ -1361,10 +1410,12 @@ impl MissionTerminal {
 /// reported, never fatal) and drive the phase to `kind`'s terminal status.
 /// Shared by `mission finalize`, `mission abort` (whole-mission), and the
 /// narrow single-phase `--phase` abort (#1463). Emits a `mission.run.<verb>`
-/// flow record for the phase. `root` is the engagement repo's main working
-/// tree; `None` when finalize/abort runs outside any git repo (a pure-planning
-/// mission that never created a worktree) — the phase flip + close still happen,
-/// only the worktree/branch git teardown is skipped (there's nothing to remove).
+/// flow record for the phase. `root` is the repo the cwd resolves to, used
+/// only when the phase's records name no main repo (#3457: they do since the
+/// launch records `Task.repo_root`; see [`teardown_target`]); `None` when
+/// finalize/abort runs outside any git repo (a pure-planning mission that never
+/// created a worktree) — the phase flip + close still happen, only the
+/// worktree/branch git teardown is skipped (there's nothing to remove).
 fn teardown_and_terminate_phase(
     root: Option<&Path>,
     mission: &crew::types::Mission,
@@ -1379,12 +1430,13 @@ fn teardown_and_terminate_phase(
     // mission (no worktrees) finalized from a non-git dir skips it entirely.
     let mut branch: Option<String> = None;
     let mut wt_display: Option<String> = None;
-    if let Some(root) = root {
-        // (#1426 ship-4) Target the ACTUAL launch worktree (Task.workdir), and
-        // delete the branch the worktree is actually on — a launch may have used
-        // a non-default workdir/branch. Fall back to the derived path/name when
-        // the worktree is already gone or a task didn't record one.
-        let wt_path = resolve_run_workdir(mission_id, &phase.id, root);
+    // (#1426 ship-4) Target the ACTUAL launch worktree (Task.workdir), and
+    // delete the branch the worktree is actually on — a launch may have used
+    // a non-default workdir/branch. Fall back to the derived path/name when
+    // the worktree is already gone or a task didn't record one. (#3457) The
+    // main repo is the recorded one, never a cwd inside the worktree.
+    if let Some((root, wt_path)) = teardown_target(mission_id, &phase.id, root) {
+        let root = root.as_path();
         let wt_exists = wt_path.exists();
         // (#3457) `Some` here means the branch is the one darkmux recorded
         // when it created the worktree — a REAL ref. Never read from the

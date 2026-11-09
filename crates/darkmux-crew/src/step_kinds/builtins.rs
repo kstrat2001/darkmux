@@ -3298,6 +3298,7 @@ mod tests {
     /// does).
     fn empty_task() -> Task {
         Task {
+            repo_root: None,
             branch: None,
             run_on: crate::types::default_run_on(),
             id: "t1".to_string(),

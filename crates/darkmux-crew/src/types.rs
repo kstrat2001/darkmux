@@ -1011,6 +1011,14 @@ pub struct Task {
     /// the field existed (contract 5: read-compat).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// (#3457) The MAIN repository the coder phase's worktree was created
+    /// from (the `mission.worktree` task). `mission finalize`/`abort` tear
+    /// the worktree down through THIS repo, never one resolved from the
+    /// cwd: run from inside the worktree, the cwd's repository is whatever
+    /// the run left in its `.git`. `None` on every other Task, and on
+    /// records written before the field existed (contract 5: read-compat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_root: Option<PathBuf>,
 }
 
 #[cfg(test)]

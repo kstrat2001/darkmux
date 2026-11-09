@@ -61,7 +61,10 @@ darkmux release.
   HEAD names another branch. The coder phase's review diff and finalize's unsaved-work check now
   read the worktree only through the git directory the main repository holds for it, and
   `mission finalize`/`abort` delete the branch darkmux recorded at launch (a new `Task.branch`),
-  never the one the worktree's HEAD names. Every host git call carries overrides for the settings
+  never the one the worktree's HEAD names, through the main repository recorded at launch (a new
+  `Task.repo_root`), never one resolved from a cwd inside the worktree. A repo-defined filter
+  driver never runs under darkmux's host git, wherever attributes assign it (a driver only your
+  global config defines, such as Git LFS's default install, still does). Every host git call carries overrides for the settings
   that run a command. A plain `dispatch --workdir <checkout>` whose `.git` is a real directory now
   prints a note: the run can change that repository's config and hooks, which the git you run
   there yourself still reads.
