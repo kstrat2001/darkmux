@@ -11,9 +11,10 @@ use std::time::Duration;
 /// floor the test asks for) and `serve`, which runs a tiny server answering
 /// `GET /v1/models` with its `--name`.
 fn fake_tensorfold(dir: &std::path::Path, version: &str, floor_gib: f64) -> PathBuf {
-    let server = dir.join("serve.py");
-    std::fs::write(
-        &server,
+    // Stable scripts behind a per-test link (see `stable_script`): a freshly
+    // written executable can wait seconds for macOS to assess it.
+    let server = stable_script(
+        "tf_serve.py",
         r#"
 import json, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -31,19 +32,17 @@ class S(HTTPServer):
         self.server_name, self.server_port = "localhost", self.server_address[1]
 S(("127.0.0.1", port), H).serve_forever()
 "#,
-    )
-    .unwrap();
-    let bin = dir.join("tensorfold-native");
-    std::fs::write(
-        &bin,
-        format!(
+    );
+    let stable = stable_script(
+        "tensorfold-native",
+        &format!(
             "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'tensorfold-native {version}' ;;\n  info) printf 'weights: 1.00 GiB (1073741824 bytes)\\nmemory floor: {floor_gib:.2} GiB (weights plus a margin)\\n' ;;\n  serve) shift; exec python3 -u {} serve \"$@\" ;;\nesac\n",
             server.display()
         ),
-    )
-    .unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
+    let bin = dir.join("tensorfold-native");
+    let _ = std::fs::remove_file(&bin);
+    std::os::unix::fs::symlink(&stable, &bin).unwrap();
     bin
 }
 
@@ -629,4 +628,98 @@ fn a_held_flint_server_is_busy_never_replaced() {
         .expect("refused");
     assert_eq!(err.code, "busy", "{err}");
     assert!(server::alive(&a.record), "the held server is untouched");
+}
+
+/// (#3453 review) The own-server exemption is for the port darkmux's own
+/// server serves: with darkmux's server up on one port and `rec status`
+/// naming another, rec's own server is up too, and the dispatch is refused.
+#[test]
+#[serial_test::serial]
+fn rec_status_naming_another_port_than_darkmuxs_server_is_refused() {
+    let r = rig();
+    let rec = fake_rec(r.dir.path(), "0.1.0");
+    let port = free_port();
+    let roomy = FakeMachine { reclaimable: RefCell::new(Some(64 * GIB)), ..Default::default() };
+    drop(prepare_in(&flint_target("flint-int4", port), &r.dirs, &rec, quick(), &roomy, &mut |_, _| {}).unwrap());
+    std::fs::write(r.dir.path().join("status.json"), r#"{"ready":true,"endpoint":"http://127.0.0.1:11500/v1"}"#).unwrap();
+    let err = prepare_in(&flint_target("flint-int4", port), &r.dirs, &rec, quick(), &roomy, &mut |_, _| {})
+        .err()
+        .expect("refused");
+    assert_eq!(err.code, "engine_in_use", "{err}");
+}
+
+/// (#3453 review) A live darkmux record on the port `rec status` names does
+/// not exempt the answer when something else is the listener there: the
+/// exemption is gated on darkmux's server being the listener.
+#[test]
+#[serial_test::serial]
+fn rec_status_naming_darkmuxs_port_held_by_a_foreign_listener_is_refused() {
+    let r = rig();
+    let rec = fake_rec(r.dir.path(), "0.1.0");
+    // darkmux's "server": alive, leading its own group, never listening.
+    let mut ours = std::process::Command::new("sleep");
+    ours.arg("30");
+    std::os::unix::process::CommandExt::process_group(&mut ours, 0);
+    let mut ours = ours.spawn().unwrap();
+    // The listener: something darkmux did not start.
+    let foreign = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = foreign.local_addr().unwrap().port();
+    let stamp = (0..50).find_map(|_| {
+        std::thread::sleep(Duration::from_millis(10));
+        darkmux_platform::current().process_start_stamp(ours.id())
+    });
+    let record = EngineRecord {
+        schema: darkmux_types::engine_record::ENGINE_RECORD_SCHEMA,
+        endpoint: "fl".into(),
+        engine: "flint".into(),
+        model: "flint-int4".into(),
+        n_ctx: 8192,
+        port,
+        pid: ours.id(),
+        start_stamp: stamp.expect("a start stamp"),
+        owner_pid: std::process::id(),
+        argv: vec!["rec-mlx".into()],
+        log: r.dirs.log_for("fl"),
+        started_at_ms: 0,
+        engine_version: "rec 0.1.0".into(),
+    };
+    engine_record::write_in(&r.dirs.records, &record).unwrap();
+    assert!(server::running(&r.dirs, "fl").is_some(), "the fixture holds: darkmux's record is live");
+    std::fs::write(r.dir.path().join("status.json"), format!(r#"{{"ready":true,"endpoint":"http://127.0.0.1:{port}/v1"}}"#)).unwrap();
+    let machine = FakeMachine { reclaimable: RefCell::new(Some(64 * GIB)), ..Default::default() };
+    let result = prepare_in(&flint_target("flint-int4", port), &r.dirs, &rec, quick(), &machine, &mut |_, _| {});
+    let _ = ours.kill();
+    let _ = ours.wait();
+    drop(foreign);
+    assert_eq!(result.err().map(|e| e.code), Some("engine_in_use"));
+}
+
+/// (#3453 review) Fail closed: any JSON object `rec status` prints, a server
+/// still starting (`ready: false`) included, is rec's own server present.
+#[test]
+#[serial_test::serial]
+fn rec_status_ready_false_is_still_recs_server_and_refused() {
+    let r = rig();
+    let rec = fake_rec(r.dir.path(), "0.1.0");
+    std::fs::write(r.dir.path().join("status.json"), r#"{"ready":false,"endpoint":"http://127.0.0.1:11500/v1"}"#).unwrap();
+    let machine = FakeMachine { reclaimable: RefCell::new(Some(64 * GIB)), ..Default::default() };
+    let err = prepare_in(&flint_target("flint-int4", free_port()), &r.dirs, &rec, quick(), &machine, &mut |_, _| {})
+        .err()
+        .expect("refused");
+    assert_eq!(err.code, "engine_in_use");
+    assert!(engine_record::list_in(&r.dirs.records).0.is_empty(), "nothing started");
+}
+
+/// (#3453 review) Tensorfold's `serve_spec` failing (here a model with no
+/// `n_ctx`) is `model_start_failed`, never `engine_unavailable`: the engine
+/// is there, the model's start is what cannot be built.
+#[test]
+#[serial_test::serial]
+fn a_tensorfold_serve_spec_failure_is_model_start_failed() {
+    let r = rig();
+    let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 2.0).to_string_lossy().into_owned());
+    let mut t = target("TensorFold/m", free_port());
+    t.model.n_ctx = None;
+    let err = prepare_in(&t, &r.dirs, &tf, quick(), &FakeMachine::default(), &mut |_, _| {}).err().expect("refused");
+    assert_eq!(err.code, "model_start_failed", "{err}");
 }

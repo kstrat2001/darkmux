@@ -47,16 +47,17 @@ pub fn parse_version(text: &str) -> Result<String> {
     }
 }
 
-/// Whether rec's own server is up, from what `rec status` printed: its JSON
-/// with `"ready": true` names the endpoint it serves. Anything else reads as
-/// not running. (rec 0.1.0's output with its server stopped was not observed
-/// when this was written: only the running form was.)
+/// Whether rec's own server is present, from what `rec status` printed (on a
+/// zero exit): any JSON object is (fail closed, #3453 review), `"ready":
+/// false` included, since a server still loading holds rec's lock and its
+/// memory as surely as a ready one; its `endpoint` names it. Only output
+/// that is not a JSON object reads as no server. rec 0.1.0's output with its
+/// server stopped was never observed (its server was running whenever this
+/// was checked), so "not running" is inferred from anything else.
 pub fn parse_status(stdout: &str) -> Option<String> {
     let doc: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
-    if doc.get("ready").and_then(|r| r.as_bool()) != Some(true) {
-        return None;
-    }
-    Some(doc.get("endpoint").and_then(|e| e.as_str()).unwrap_or("an endpoint it did not name").to_string())
+    let obj = doc.as_object()?;
+    Some(obj.get("endpoint").and_then(|e| e.as_str()).unwrap_or("an endpoint it did not name").to_string())
 }
 
 /// The bytes of a model's weights on disk (its `*.safetensors`): the floor a
@@ -129,10 +130,12 @@ impl Rec {
         Ok(v)
     }
 
-    /// The endpoint rec's own server serves, when it is up (`rec status`).
+    /// The endpoint rec's own server serves, when it is up or starting
+    /// (`rec status`, [`parse_status`]). A non-zero exit reads as no server.
     /// An error only when `rec status` could not be run at all.
     pub fn own_server(&self) -> Result<Option<String>> {
-        Ok(parse_status(&self.call(&["status"])?.stdout))
+        let run = self.call(&["status"])?;
+        Ok(if run.status.success() { parse_status(&run.stdout) } else { None })
     }
 
     fn data(&self) -> Result<&Path> {
@@ -290,23 +293,33 @@ mod tests {
             assert!(parse_version(bad).unwrap_err().to_string().contains("rec --version"), "{bad:?}");
         }
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(fake_install(dir.path(), "0.1.0", "{}").verified_version().unwrap(), "0.1.0");
+        assert_eq!(fake_install(dir.path(), "0.1.0", "").verified_version().unwrap(), "0.1.0");
         let dir = tempfile::tempdir().unwrap();
-        let err = fake_install(dir.path(), "0.2.0", "{}").verified_version().unwrap_err().to_string();
+        let err = fake_install(dir.path(), "0.2.0", "").verified_version().unwrap_err().to_string();
         assert!(err.contains("rec 0.2.0 is installed") && err.contains("rec 0.1.0"), "{err}");
     }
 
-    /// `rec status`'s running form names its endpoint; any other output,
-    /// a stopped `ready: false` included, reads as not running.
+    /// (#3453 review) Fail closed: any JSON object `rec status` prints is
+    /// rec's server present, a starting `ready: false` included; only output
+    /// that is not a JSON object reads as none.
     #[test]
-    fn rec_status_reads_running_only_from_ready_true() {
+    fn rec_status_reads_any_json_object_as_recs_server() {
         assert_eq!(parse_status(RUNNING).as_deref(), Some("http://127.0.0.1:11500/v1"));
         assert_eq!(parse_status(r#"{"ready":true}"#).as_deref(), Some("an endpoint it did not name"));
-        for stopped in [r#"{"ready":false}"#, "", "rec is not running", r#"{"ready":"true"}"#, "[]"] {
+        let starting = r#"{"ready":false,"endpoint":"http://127.0.0.1:11500/v1"}"#;
+        assert_eq!(parse_status(starting).as_deref(), Some("http://127.0.0.1:11500/v1"));
+        assert!(parse_status(r#"{"ready":false}"#).is_some(), "an object with no endpoint is still a server");
+        for stopped in ["", "rec is not running", "[]", "\"stopped\""] {
             assert_eq!(parse_status(stopped), None, "{stopped:?}");
         }
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(fake_install(dir.path(), "0.1.0", RUNNING).own_server().unwrap().as_deref(), Some("http://127.0.0.1:11500/v1"));
+        // A non-zero exit is no server, whatever it printed.
+        let dir = tempfile::tempdir().unwrap();
+        let failing = dir.path().join("rec-failing");
+        std::fs::write(&failing, format!("#!/bin/sh\necho '{RUNNING}'\nexit 1\n")).unwrap();
+        std::fs::set_permissions(&failing, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(Rec::at(failing.to_string_lossy().into_owned(), None).own_server().unwrap(), None);
     }
 
     /// The runtime and model directory come from rec's install: exactly one
@@ -315,7 +328,7 @@ mod tests {
     #[test]
     fn the_runtime_and_model_dir_are_the_one_rec_installed() {
         let dir = tempfile::tempdir().unwrap();
-        let rec = fake_install(dir.path(), "0.1.0", "{}");
+        let rec = fake_install(dir.path(), "0.1.0", "");
         let data = dir.path().join("share").join("rec");
         assert_eq!(rec.runtime().unwrap(), data.join("runtimes/0906aa/rec-mlx"));
         assert_eq!(rec.model_dir("flint-int4").unwrap(), data.join("models/fdc852"));
@@ -352,7 +365,7 @@ mod tests {
     #[test]
     fn the_serve_command_is_recs_runtime_with_darkmuxs_flags_after_engine_args() {
         let dir = tempfile::tempdir().unwrap();
-        let rec = fake_install(dir.path(), "0.1.0", "{}");
+        let rec = fake_install(dir.path(), "0.1.0", "");
         let data = dir.path().join("share").join("rec");
         let spec = rec.serve_spec("fl", 8092, &model("flint-int4", &["--grammar", "flint"]), "0.1.0").unwrap();
         let s = |p: PathBuf| p.to_string_lossy().into_owned();

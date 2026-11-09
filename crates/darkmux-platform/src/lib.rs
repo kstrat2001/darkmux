@@ -130,6 +130,16 @@ pub trait Platform: Send + Sync {
     /// no such layout, or there is no home directory.
     fn xdg_data_home(&self) -> Option<std::path::PathBuf>;
 
+    /// (#3453 review) The processes listening for TCP on `port` (bound to
+    /// loopback or every address): `Some(vec![])` when none does, `None`
+    /// when this platform cannot say. What tells a server darkmux started
+    /// from another answering on the same port under the same model name.
+    fn tcp_listeners(&self, port: u16) -> Option<Vec<u32>>;
+
+    /// The process group `pid` is in; `None` for no such process, or where
+    /// the platform has no reader.
+    fn process_group(&self, pid: u32) -> Option<u32>;
+
     /// What would identify this machine if it were shared: its hardware id,
     /// its serial number and its names on the network. darkmux never sends
     /// these; what it shares is checked against them. Empty where none is read.
@@ -346,6 +356,25 @@ pub fn xdg_data_home_from(
 ) -> Option<std::path::PathBuf> {
     let xdg = xdg_data_home.map(std::path::PathBuf::from).filter(|p| p.is_absolute());
     xdg.or_else(|| home.filter(|h| !h.is_empty()).map(|h| std::path::PathBuf::from(h).join(".local").join("share")))
+}
+
+/// The pids in `lsof -Fp`'s answer: one `p<pid>` line per process; every
+/// other field line is skipped.
+pub(crate) fn pids_from_lsof_fp(out: &str) -> Vec<u32> {
+    out.lines().filter_map(|l| l.strip_prefix('p')).filter_map(|p| p.trim().parse().ok()).collect()
+}
+
+/// `getpgid(pid)`, shared by the Unix strategies.
+#[cfg(unix)]
+pub(crate) fn unix_process_group(pid: u32) -> Option<u32> {
+    let pid = i32::try_from(pid).ok().filter(|p| *p > 0)?;
+    let group = unsafe { libc::getpgid(pid) };
+    (group > 0).then_some(group as u32)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn unix_process_group(_pid: u32) -> Option<u32> {
+    None
 }
 
 /// A value as a file or a command gives it: trimmed of whitespace and the

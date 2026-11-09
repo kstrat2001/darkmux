@@ -2212,7 +2212,8 @@ mod tests {
             r.profiles["p"].models[0].clone()
         };
         for ok in [
-            &["--grammar", "flint", "--enforce-tool-schemas", "--metrics"][..],
+            &["--grammar", "flint", "--enforce-tool-schemas", "--metrics", "/tmp/flint-metrics.jsonl"][..],
+            &["--metrics=/tmp/m.jsonl", "--fast-sync"][..],
             &["--temperature", "0.6", "--top-p=0.95", "--top-k", "20", "--max-tokens", "4096"][..],
             &["--fast-sync"][..],
             &["--no-fast-sync", "--grammar=none"][..],
@@ -2225,8 +2226,10 @@ mod tests {
             (&["--grammar"][..], &["`--grammar`", "value"][..]),
             (&["--temperature", "warm"][..], &["`--temperature`", "number"][..]),
             (&["--top-k", "2.5"][..], &["`--top-k`", "whole number"][..]),
-            (&["--metrics", "yes"][..], &["`--metrics`", "takes no value"][..]),
-            (&["--metrics=yes"][..], &["`--metrics`", "takes no value"][..]),
+            (&["--metrics"][..], &["`--metrics`", "takes a value"][..]),
+            (&["--metrics", "--fast-sync"][..], &["`--metrics`", "takes a value"][..]),
+            (&["--fast-sync", "yes"][..], &["`--fast-sync`", "takes no value"][..]),
+            (&["--enforce-tool-schemas=yes"][..], &["`--enforce-tool-schemas`", "takes no value"][..]),
             (&["--model-dir", "/x"][..], &["`--model-dir`", "darkmux sets"][..]),
             (&["--manifest=/x.json"][..], &["`--manifest`", "darkmux sets"][..]),
             (&["--context-limit", "9"][..], &["`--context-limit`", "n_ctx"][..]),
@@ -2240,7 +2243,7 @@ mod tests {
             }
             assert!(!why.contains("s3cret") && !why.contains("warm"), "never echoes a value: {why}");
         }
-        let lms = pm(r#"{"id":"m","n_ctx":8,"engine_args":["--metrics"]}"#);
+        let lms = pm(r#"{"id":"m","n_ctx":8,"engine_args":["--fast-sync"]}"#);
         let why = lms.engine_args_problem().unwrap();
         assert!(why.contains("tensorfold") && why.contains("flint"), "names both engines that take them: {why}");
     }

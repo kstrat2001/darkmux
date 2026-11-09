@@ -241,17 +241,19 @@ fn prepare_in(
 /// (#3453) Refuse `engine_in_use` when the engine's own server (one darkmux
 /// did not start) is up: rec holds a single-instance lock, and darkmux never
 /// stops or takes it over. The server darkmux itself runs on this endpoint
-/// is not that one, whatever the engine reports: its record is darkmux's.
+/// is not that one when the engine names its port and darkmux's recorded
+/// server is what listens there (`server::listens`, #3453 review): a name
+/// or a port alone proves nothing.
 fn refuse_engines_own_server(engine: &dyn ServerEngine, dirs: &Dirs, endpoint: &str) -> Result<(), EngineRefusal> {
     let Some(address) = engine.own_server()? else { return Ok(()) };
-    let ours = server::running(dirs, endpoint).is_some_and(|r| address_port(&address) == Some(r.port));
+    let ours = server::running(dirs, endpoint).is_some_and(|r| address_port(&address) == Some(r.port) && server::listens(&r));
     if ours {
         return Ok(());
     }
     Err(refuse(
         "engine_in_use",
         format!(
-            "rec's own server is running (at {address}), and rec runs one server per machine; darkmux never stops or \
+            "rec's own server is up or starting (at {address}), and rec runs one server per machine; darkmux never stops or \
              takes over a server it did not start. Run `rec stop`, then dispatch again"
         ),
     ))

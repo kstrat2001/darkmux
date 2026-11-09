@@ -23,11 +23,11 @@ darkmux release.
   only from rec 0.1.0, the release whose layout darkmux was verified against) on loopback with no
   API key, and reuses, evicts and stops it exactly as it does a Tensorfold server. The model is
   sent as `flint`, the one name rec's server answers to. `engine_args` take the `rec-mlx serve
-  flint` flags darkmux does not set itself (`--grammar`, `--enforce-tool-schemas`, `--metrics`,
+  flint` flags darkmux does not set itself (`--grammar`, `--enforce-tool-schemas`, `--metrics <path>`,
   `--temperature`, `--top-p`, `--top-k`, `--max-tokens`, `--fast-sync`/`--no-fast-sync`), checked
   at load. rec runs one server per machine, so a second Flint endpoint is refused by every
   dispatching preflight and failed by `darkmux doctor`, and a dispatch while rec's own server runs
-  is refused with the new code `engine_in_use`, naming `rec stop`: darkmux never stops or takes
+  (even one still starting) is refused with the new code `engine_in_use`, naming `rec stop`: darkmux never stops or takes
   over a server it did not start. `darkmux doctor` gains a `flint engine` row (rec's version, its
   runtime and each Flint model's directory, and whether rec's own server is up).
   `darkmux config set engines.flint.bin <path>` (or `DARKMUX_FLINT_BIN`) names `rec` when it is not

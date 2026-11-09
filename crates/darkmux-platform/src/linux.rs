@@ -157,6 +157,33 @@ impl Platform for LinuxPlatform {
         }
     }
 
+    /// (#3453 review) The LISTEN sockets on `port` in `/proc/net/tcp` and
+    /// `tcp6`, matched to the processes whose fds hold them. A process this
+    /// user cannot read is not listed, so a foreign listener never reads as
+    /// darkmux's.
+    fn tcp_listeners(&self, port: u16) -> Option<Vec<u32>> {
+        let mut inodes = listening_inodes(&read_to_string("/proc/net/tcp")?, port);
+        inodes.extend(listening_inodes(&read_to_string("/proc/net/tcp6").unwrap_or_default(), port));
+        if inodes.is_empty() {
+            return Some(Vec::new());
+        }
+        let mut pids: Vec<u32> = list_dir("/proc")
+            .into_iter()
+            .filter_map(|name| name.parse::<u32>().ok())
+            .filter(|pid| {
+                list_dir(&format!("/proc/{pid}/fd")).iter().any(|fd| {
+                    read_link(&format!("/proc/{pid}/fd/{fd}")).and_then(|l| socket_inode(&l)).is_some_and(|i| inodes.contains(&i))
+                })
+            })
+            .collect();
+        pids.sort_unstable();
+        Some(pids)
+    }
+
+    fn process_group(&self, pid: u32) -> Option<u32> {
+        crate::unix_process_group(pid)
+    }
+
     /// (#3453) The XDG layout, read from this process's environment.
     fn xdg_data_home(&self) -> Option<std::path::PathBuf> {
         crate::xdg_data_home_from(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))
@@ -215,6 +242,35 @@ pub(crate) fn start_ticks_from_proc_stat(stat: &str) -> Option<u64> {
 pub(crate) fn pid_namespace_from_link(link: &str) -> Option<String> {
     let inode = link.trim().strip_prefix("pid:[")?.strip_suffix(']')?;
     (!inode.is_empty() && inode.bytes().all(|b| b.is_ascii_digit())).then(|| format!("pid:{inode}"))
+}
+
+/// (#3453 review) The inodes of `/proc/net/tcp{,6}`'s sockets in LISTEN
+/// (`0A`) on `port`, whatever address they bound.
+pub(crate) fn listening_inodes(table: &str, port: u16) -> Vec<u64> {
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let local_port = f.get(1)?.rsplit_once(':').and_then(|(_, p)| u16::from_str_radix(p, 16).ok())?;
+            (local_port == port && *f.get(3)? == "0A").then(|| f.get(9)?.parse().ok())?
+        })
+        .collect()
+}
+
+/// The inode an fd's link names when it is a socket (`socket:[41231]`).
+pub(crate) fn socket_inode(link: &str) -> Option<u64> {
+    link.strip_prefix("socket:[")?.strip_suffix(']')?.parse().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn list_dir(path: &str) -> Vec<String> {
+    std::fs::read_dir(path).map(|rd| rd.flatten().filter_map(|e| e.file_name().into_string().ok()).collect()).unwrap_or_default()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn list_dir(_path: &str) -> Vec<String> {
+    Vec::new()
 }
 
 #[cfg(target_os = "linux")]

@@ -257,7 +257,7 @@ fn flint_server_row(lead: &str, facts: &FlintFacts, models: usize) -> Check {
     match &facts.own_server {
         Ok(Some(address)) => flint_row(
             Status::Warn,
-            format!("{lead}: rec's own server is running at {address}"),
+            format!("{lead}: rec's own server is up or starting at {address}"),
             Some("every Flint dispatch is refused (`engine_in_use`) while it runs: darkmux never stops or takes over \
                   rec's server. Run `rec stop` to let darkmux start its own"
                 .into()),

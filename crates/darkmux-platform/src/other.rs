@@ -90,6 +90,14 @@ impl Platform for OtherPlatform {
         None
     }
 
+    fn tcp_listeners(&self, _port: u16) -> Option<Vec<u32>> {
+        None
+    }
+
+    fn process_group(&self, _pid: u32) -> Option<u32> {
+        None
+    }
+
     fn secret_store(&self) -> crate::SecretStore {
         crate::SecretStore::PrivateFile
     }
