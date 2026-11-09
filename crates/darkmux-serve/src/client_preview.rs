@@ -1,6 +1,18 @@
 //! Live previews for paired apps: darkmux runs a workspace's dev server from
 //! a `.darkmux/preview.json` recipe and tells the app its URL.
 //!
+//! **Off by default.** Even with the recipe read only from the user's own
+//! checkout, a preview runs the WORKSPACE's code: its `package.json`
+//! scripts, its dev server and whatever they load, which a model may have
+//! written. That code runs on this machine as the user, outside the
+//! dispatch sandbox. So a paired app can start a preview only when this
+//! machine says so (`darkmux config set clients.preview.enabled true`). A
+//! preview in its own sandboxed container is planned as separate work.
+//! Known gap: a file a running preview writes in the workspace while a run
+//! is working there (a build output, a cache the repo does not ignore) is
+//! indistinguishable from the run's own change and can be committed as the
+//! run's.
+//!
 //! **Trust.** The recipe is a command darkmux runs, so it is read ONLY from
 //! the user's own checkout: the `source_path` checkout the workspace's
 //! worktree was made from, as darkmux recorded it when it made the workspace
