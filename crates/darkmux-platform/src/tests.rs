@@ -991,6 +991,27 @@ fn proc_net_tcp_names_the_socket_at_each_peers_end() {
     assert_eq!(crate::linux::connected_to(table6, local), vec![(peer, 51233)]);
 }
 
+/// A `/proc/net/tcp{,6}` address reads as IPv4 from 8 hex digits, as IPv6
+/// from 32 (a v4-mapped one as its IPv4 address); anything else, and a row
+/// that is not ESTABLISHED or does not read whole, is no connection.
+#[test]
+fn proc_net_addresses_and_rows_read_whole_or_not_at_all() {
+    use crate::linux::{established, proc_net_addr};
+    assert_eq!(proc_net_addr("0100007F:1F90"), Some("127.0.0.1:8080".parse().unwrap()));
+    assert_eq!(proc_net_addr("0000000000000000FFFF00000100007F:1F90"), Some("127.0.0.1:8080".parse().unwrap()));
+    assert_eq!(proc_net_addr("00000000000000000000000001000000:1F90"), Some("[::1]:8080".parse().unwrap()));
+    for bad in ["0100007F", "0100007F:ZZZZ", "0100:1F90", "0100007G:1F90", "0000000000000000FFFF0000:1F90"] {
+        assert_eq!(proc_net_addr(bad), None, "{bad}");
+    }
+    let row = |st: &str, inode: &str| format!("   1: 0100007F:D431 0100007F:223F {st} 00000000:00000000 00:00000000 00000000  1000        0 {inode} 1");
+    let (own, other) = ("127.0.0.1:54321".parse().unwrap(), "127.0.0.1:8767".parse().unwrap());
+    assert_eq!(established(&row("01", "41233")), Some((own, other, 41233)));
+    assert_eq!(established(&row("0A", "41233")), None, "not ESTABLISHED");
+    assert_eq!(established(&row("01", "x")), None, "no inode");
+    assert_eq!(established("   1: nonsense 0100007F:223F 01"), None, "an end that does not read");
+    assert_eq!(established("   1: 0100007F:D431"), None, "too short");
+}
+
 /// This host's strategy names the process at the other end of every
 /// loopback connection to a listener at once: here, this test's own process
 /// for both of two connections. An OS with no strategy cannot say; the fake

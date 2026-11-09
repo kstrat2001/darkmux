@@ -2667,3 +2667,34 @@ edit loop detected on src/widget.rs in an earlier dispatch
             Some(blake3::hash(b"fn host() {}").to_hex().to_string())
         );
     }
+
+    /// (#3457) Whatever a run left at a worktree's `.git` (a directory, a
+    /// file, a symlink, or nothing) is replaced by the pointer to its admin
+    /// directory; a symlink's target is never touched, and a path that
+    /// cannot be read is refused.
+    #[test]
+    fn restore_worktree_pointer_replaces_whatever_the_run_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let admin = dir.path().join("repo/.git/worktrees/wt");
+        let target = dir.path().join("elsewhere");
+        std::fs::create_dir_all(target.join("keep")).unwrap();
+        let wt = dir.path().join("wt");
+        let pointer = format!("gitdir: {}\n", admin.display());
+        type Leave<'a> = &'a dyn Fn(&Path);
+        let cases: [(&str, Leave); 4] = [
+            ("a directory", &|g| std::fs::create_dir_all(g.join("hooks")).unwrap()),
+            ("a file", &|g| std::fs::write(g, "gitdir: /somewhere/else\n").unwrap()),
+            ("a symlink", &|g| std::os::unix::fs::symlink(&target, g).unwrap()),
+            ("nothing", &|_| {}),
+        ];
+        for (what, leave) in cases {
+            std::fs::create_dir_all(&wt).unwrap();
+            leave(&wt.join(".git"));
+            restore_worktree_pointer(&wt, &admin).unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!(std::fs::read_to_string(wt.join(".git")).unwrap(), pointer, "{what}");
+            std::fs::remove_dir_all(&wt).unwrap();
+        }
+        assert!(target.join("keep").is_dir(), "a symlink's target is never touched");
+        std::fs::write(dir.path().join("file"), "").unwrap();
+        assert!(restore_worktree_pointer(&dir.path().join("file/wt"), &admin).is_err());
+    }

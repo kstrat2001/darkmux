@@ -6246,3 +6246,66 @@ fn every_client_route_reads_its_path_through_client_path() {
     assert!(bare.is_empty(), "a handler takes a bare `UrlPath`: {bare:?}");
     assert!(src.matches(": ClientPath<").count() >= 10, "the routes were found");
 }
+
+// ─── Production wiring ───────────────────────────────────────────────────
+
+/// What a work request may run on is the profile `darkmux dispatch` would
+/// resolve: the profile asked for, else the role's own, never another than
+/// the one asked for and never a utility-only one; an unresolved one says
+/// why.
+#[test]
+fn the_profile_verdict_follows_dispatchs_resolution() {
+    use darkmux_fleet::{ProfileResolution as R, WorkSeat};
+    let work = |p: &str| R::Work { profile: p.into(), seat: WorkSeat::Local { model: "m".into() } };
+    assert_eq!(profile_verdict(None, work("fast")), Ok("fast".to_string()));
+    assert_eq!(profile_verdict(Some("fast"), work("fast")), Ok("fast".to_string()));
+    assert_eq!(
+        profile_verdict(Some("fast"), work("deep")),
+        Err("profile fast resolves to deep here; refusing".to_string())
+    );
+    assert_eq!(
+        profile_verdict(Some("utility"), R::UtilityOnly("utility".into())),
+        Err("profile utility holds only the utility model; work never runs on it".to_string())
+    );
+    assert_eq!(profile_verdict(None, R::Unresolved("no profile".into())), Err("no profile".to_string()));
+}
+
+/// The worktrees base is made when missing and handed back canonical; one
+/// that cannot be made says which path and why.
+#[test]
+fn the_worktrees_base_is_made_and_canonical() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("a/../worktrees");
+    assert_eq!(canonical_base(&base).unwrap(), dir.path().canonicalize().unwrap().join("worktrees"));
+    assert!(dir.path().join("worktrees").is_dir());
+    std::fs::write(dir.path().join("file"), "").unwrap();
+    let refused = canonical_base(&dir.path().join("file/worktrees")).unwrap_err();
+    assert!(refused.contains("file/worktrees"), "{refused}");
+}
+
+/// The production peer lookup names this process at both ends of a real
+/// loopback connection, answers only the peers asked about, and says
+/// nothing before the listener is bound.
+#[test]
+fn the_production_peer_lookup_answers_the_peers_asked_about() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let local = listener.local_addr().unwrap();
+    let clients = [std::net::TcpStream::connect(local).unwrap(), std::net::TcpStream::connect(local).unwrap()];
+    let _accepted = [listener.accept().unwrap(), listener.accept().unwrap()];
+    let asked = clients[0].local_addr().unwrap();
+    let found = peer_processes_here(Some(local), &[asked]).unwrap();
+    assert_eq!(found, HashMap::from([(asked, std::process::id())]));
+    assert_eq!(peer_processes_here(None, &[asked]), None);
+}
+
+/// A store whose file cannot be opened and locked (a folder sits where it
+/// should be) refuses every read and change.
+#[test]
+fn a_store_that_cannot_be_locked_refuses() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("clients.json")).unwrap();
+    let store = ClientStore::at(dir.path().join("clients.json"));
+    assert!(store.read().is_err());
+    assert!(store.update(|f| { f.legacy_owner = Some("x".into()); Ok(()) }).is_err());
+    assert!(dir.path().join("clients.json").is_dir(), "nothing written");
+}

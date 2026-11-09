@@ -11,53 +11,60 @@ use std::io::{BufRead, Write};
 use crate::cli::ClientCmd;
 
 pub fn run(sub: ClientCmd) -> Result<i32> {
+    if let ClientCmd::Serve { port } = sub {
+        return cp::run(port).map(|()| 0);
+    }
+    let (list, source) = darkmux_types::config_access::clients_profiles_with_source();
+    let here = Here {
+        store: ClientStore::production(),
+        base: darkmux_types::workdir::worktrees_base_dir(),
+        now: now(),
+        policy: policy_line(list, source),
+    };
+    let stdin = std::io::stdin();
+    run_verb(sub, &here, &mut stdin.lock(), &mut std::io::stdout(), &mut std::io::stderr())
+}
+
+/// What the operator's verbs act on: the client store, the worktrees base,
+/// the time, and what apps may run here (`client list`'s policy line).
+struct Here {
+    store: ClientStore,
+    base: std::path::PathBuf,
+    now: u64,
+    policy: String,
+}
+
+/// Every verb but `serve`, against `here`, reading answers from `input`
+/// and writing to `out` (and refusals to `err`).
+fn run_verb(sub: ClientCmd, here: &Here, input: &mut dyn BufRead, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32> {
     match sub {
-        ClientCmd::Serve { port } => {
-            cp::run(port)?;
-            Ok(0)
-        }
         ClientCmd::Approve { code, code_arg } => {
-            let store = ClientStore::production();
-            let stdin = std::io::stdin();
-            let mut input = stdin.lock();
-            approve_interactive(
-                &store,
-                now(),
-                approve_code(code, code_arg).as_deref(),
-                &mut input,
-                &mut std::io::stdout(),
-            )
+            approve_interactive(&here.store, here.now, approve_code(code, code_arg).as_deref(), input, out)
         }
-        ClientCmd::List => {
-            let (list, source) = darkmux_types::config_access::clients_profiles_with_source();
-            list_to(&ClientStore::production(), now(), &policy_line(list, source), &mut std::io::stdout())
-        }
-        ClientCmd::Claim { workspace, client } => claim(&workspace, &client),
-        ClientCmd::Revoke { name } => {
-            if cp::revoke(&ClientStore::production(), &name)? {
-                println!("revoked client {name}");
-                Ok(0)
-            } else {
-                eprintln!("no paired client named {name} (see `darkmux client list`)");
-                Ok(1)
-            }
-        }
+        ClientCmd::List => list_to(&here.store, here.now, &here.policy, out),
+        ClientCmd::Claim { workspace, client } => claim(here, &workspace, &client, out, err),
+        ClientCmd::Revoke { name } => revoke(here, &name, out, err),
+        ClientCmd::Serve { .. } => anyhow::bail!("`client serve` listens; it is not run as a verb here"),
     }
 }
 
-/// `client claim <workspace> <client>`.
-fn claim(workspace: &str, client: &str) -> Result<i32> {
-    let base = darkmux_types::workdir::worktrees_base_dir();
-    match cp::claim(&ClientStore::production(), &base, workspace, client) {
-        Ok(_) => {
-            println!("workspace {workspace} now belongs to client {client}");
-            Ok(0)
-        }
-        Err(e) => {
-            eprintln!("{e:#}");
-            Ok(1)
-        }
+/// `client revoke <name>`.
+fn revoke(here: &Here, name: &str, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32> {
+    if cp::revoke(&here.store, name)? {
+        writeln!(out, "revoked client {name}")?;
+        return Ok(0);
     }
+    writeln!(err, "no paired client named {name} (see `darkmux client list`)")?;
+    Ok(1)
+}
+
+/// `client claim <workspace> <client>`.
+fn claim(here: &Here, workspace: &str, client: &str, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32> {
+    match cp::claim(&here.store, &here.base, workspace, client) {
+        Ok(_) => writeln!(out, "workspace {workspace} now belongs to client {client}").map(|()| 0),
+        Err(e) => writeln!(err, "{e:#}").map(|()| 1),
+    }
+    .map_err(Into::into)
 }
 
 /// The code `client approve` was given: `--code <CODE>` or the bare `<CODE>`
@@ -142,22 +149,23 @@ fn approve_by_code(
 ) -> Result<i32> {
     let p = match cp::find_by_code(store, code, now) {
         Ok(p) => p,
-        Err(e) => {
-            writeln!(out, "{e}")?;
-            return Ok(1);
-        }
+        Err(e) => return writeln!(out, "{e}").map(|()| 1).map_err(Into::into),
     };
     writeln!(out, "pairing request:\n{}", describe(&p, now))?;
-    if ask(input, out, "approve? [y/N] ")? == "y" {
-        let name = cp::approve(store, &p.request_id, now)?;
-        writeln!(
-            out,
-            "approved as client {name}; the app collects its token on its next poll"
-        )?;
-        return Ok(0);
+    let reply = ask(input, out, "approve? [y/N] ")?;
+    let (said, code) = approve_on_yes(store, now, &p, &reply)?;
+    writeln!(out, "{said}")?;
+    Ok(code)
+}
+
+/// `--code`'s reply carried out: only `y` approves. What to say, and the
+/// exit code.
+fn approve_on_yes(store: &ClientStore, now: u64, p: &PendingRequest, reply: &str) -> Result<(String, i32)> {
+    if reply != "y" {
+        return Ok(("not approved".to_string(), 1));
     }
-    writeln!(out, "not approved")?;
-    Ok(1)
+    let name = cp::approve(store, &p.request_id, now)?;
+    Ok((format!("approved as client {name}; the app collects its token on its next poll"), 0))
 }
 
 /// No `--code`: every live request in turn.
@@ -279,16 +287,14 @@ pub(crate) const APPROVE_COMMAND: &str = "darkmux client approve --code <CODE>";
 /// how to approve what waits.
 fn list_to(store: &ClientStore, now: u64, policy: &str, out: &mut dyn Write) -> Result<i32> {
     let waiting = cp::list_pending(store, now)?.len();
-    for line in client_lines(store, now)? {
-        writeln!(out, "{line}")?;
-    }
-    writeln!(out, "{policy}")?;
+    let mut lines = client_lines(store, now)?;
+    lines.push(policy.to_string());
     if waiting > 0 {
-        writeln!(
-            out,
+        lines.push(format!(
             "{waiting} pairing request(s) waiting: {APPROVE_COMMAND}, with the code your app shows"
-        )?;
+        ));
     }
+    writeln!(out, "{}", lines.join("\n"))?;
     Ok(0)
 }
 
@@ -457,4 +463,103 @@ mod tests {
         assert_eq!(policy_line(Some(vec![]), Source::Env), "apps may run on: nothing (DARKMUX_CLIENTS_PROFILES env is empty)");
         assert!(policy_line(None, Source::BuiltIn).ends_with("(clients.profiles unset)"));
     }
+
+    /// The verbs `run` hands on, against a store and worktrees base of the
+    /// test's own: `Here` with `paired` clients and `ws` workspaces darkmux
+    /// made for an app.
+    fn here(paired: &[&str], ws: &[&str]) -> (tempfile::TempDir, Here) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ClientStore::at(dir.path().join("clients.json"));
+        store
+            .update(|f| {
+                for (i, name) in paired.iter().enumerate() {
+                    f.clients.push(cp::ApprovedClient {
+                        name: name.to_string(),
+                        id: format!("c-{i:016}"),
+                        created: 1,
+                        token_hash: "00".repeat(32),
+                    });
+                }
+                Ok(())
+            })
+            .unwrap();
+        let base = dir.path().join("worktrees");
+        for name in ws {
+            std::fs::create_dir_all(base.join(name)).unwrap();
+            let held = base.join(format!(".{name}.git"));
+            std::fs::create_dir_all(&held).unwrap();
+            darkmux_serve::client_git::record_git_dir(&base, name, &held).unwrap();
+        }
+        let here = Here { store, base, now: 200, policy: "apps may run on: x".into() };
+        (dir, here)
+    }
+
+    /// Runs `sub` with `answers` as the operator's replies: (exit code, out, err).
+    fn verb(here: &Here, sub: ClientCmd, answers: &str) -> (i32, String, String) {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run_verb(sub, here, &mut answers.as_bytes(), &mut out, &mut err).unwrap();
+        (code, String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
+    }
+
+    /// `client revoke` says what it revoked, or refuses a name no client has.
+    #[test]
+    fn revoke_names_what_it_took_back_or_refuses() {
+        let (_d, here) = here(&["phone"], &[]);
+        let (code, out, _) = verb(&here, ClientCmd::Revoke { name: "phone".into() }, "");
+        assert_eq!((code, out.as_str()), (0, "revoked client phone\n"));
+        let (code, _, err) = verb(&here, ClientCmd::Revoke { name: "phone".into() }, "");
+        assert_eq!(code, 1);
+        assert!(err.contains("no paired client named phone"), "{err}");
+    }
+
+    /// `client claim` gives a workspace darkmux made to a paired client, and
+    /// refuses an unknown client or a folder darkmux did not make.
+    #[test]
+    fn claim_gives_a_workspace_or_says_why_not() {
+        let (_d, here) = here(&["phone"], &["hcr"]);
+        let claim = |w: &str, c: &str| ClientCmd::Claim { workspace: w.into(), client: c.into() };
+        let (code, out, _) = verb(&here, claim("hcr", "phone"), "");
+        assert_eq!((code, out.as_str()), (0, "workspace hcr now belongs to client phone\n"));
+        assert_eq!(darkmux_serve::client_workspace::owner_of(&here.base, "hcr").as_deref(), Some("c-0000000000000000"));
+        let (code, _, err) = verb(&here, claim("hcr", "nobody"), "");
+        assert_eq!(code, 1);
+        assert!(err.contains("no paired client named nobody"), "{err}");
+        let (code, _, err) = verb(&here, claim("missions", "phone"), "");
+        assert_eq!(code, 1);
+        assert!(err.contains("missions is not a workspace darkmux made"), "{err}");
+    }
+
+    /// `client list` with no clients says so and how to approve what waits;
+    /// with nothing waiting it names no approve command; an unreadable store
+    /// refuses.
+    #[test]
+    fn list_says_what_is_paired_and_what_waits() {
+        let (_d, here) = here(&[], &[]);
+        let (code, out, _) = verb(&here, ClientCmd::List, "");
+        assert_eq!((code, out.as_str()), (0, "no paired clients\napps may run on: x\n"));
+        let (_d2, store, _) = store_with(&["AAA"]);
+        let here = Here { store, ..here };
+        let (_, out, _) = verb(&here, ClientCmd::List, "");
+        assert!(out.ends_with("1 pairing request(s) waiting: darkmux client approve --code <CODE>, with the code your app shows\n"), "{out}");
+        std::fs::write(here.store.path(), "not json").unwrap();
+        assert!(run_verb(ClientCmd::List, &here, &mut "".as_bytes(), &mut Vec::new(), &mut Vec::new()).is_err());
+    }
+
+    /// `client approve --code` names a code no request shows, approves on
+    /// `y` and leaves it pending otherwise; `serve` is not a verb here.
+    #[test]
+    fn approve_by_code_through_the_verb() {
+        let (_d, store, _) = store_with(&["AAA"]);
+        let (_d2, here) = here(&[], &[]);
+        let here = Here { store, ..here };
+        let approve = |c: &str| ClientCmd::Approve { code: Some(c.into()), code_arg: None };
+        let (code, out, _) = verb(&here, approve("ZZZ"), "");
+        assert_eq!((code, out.as_str()), (1, "no live pairing request shows code ZZZ\n"));
+        let (code, out, _) = verb(&here, approve("AAA"), "n\n");
+        assert!(code == 1 && out.ends_with("not approved\n"), "{out}");
+        let (code, out, _) = verb(&here, ClientCmd::Approve { code: None, code_arg: Some("aaa".into()) }, "y\n");
+        assert!(code == 0 && out.contains("approved as client phone-0"), "{out}");
+        assert!(run_verb(ClientCmd::Serve { port: 1 }, &here, &mut "".as_bytes(), &mut Vec::new(), &mut Vec::new()).is_err());
+    }
+
 }
