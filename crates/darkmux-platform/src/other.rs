@@ -66,6 +66,10 @@ impl Platform for OtherPlatform {
         None
     }
 
+    fn process_footprint(&self, _pid: u32) -> Option<u64> {
+        None
+    }
+
     fn pid_namespace(&self) -> Option<String> {
         None
     }

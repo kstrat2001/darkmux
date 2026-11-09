@@ -106,6 +106,12 @@ impl Platform for MacPlatform {
         kinfo_start_stamp(pid)
     }
 
+    /// `proc_pid_rusage`'s `ri_phys_footprint` (moved from the residency
+    /// ledger, #3448).
+    fn process_footprint(&self, pid: u32) -> Option<u64> {
+        phys_footprint(pid)
+    }
+
     /// macOS has one pid namespace per machine.
     fn pid_namespace(&self) -> Option<String> {
         Some("macos".to_string())
@@ -285,6 +291,56 @@ fn kinfo_start_stamp(pid: u32) -> Option<u64> {
 
 #[cfg(not(target_os = "macos"))]
 fn kinfo_start_stamp(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// (#1821, moved here from the residency ledger by #3448) `proc_pid_rusage(pid, RUSAGE_INFO_V0, &buf).ri_phys_footprint` — the
+/// per-process memory figure Activity Monitor displays and jetsam kills on.
+///
+/// Called directly rather than shelling out to `/usr/bin/footprint`, which
+/// returns the same number: measured at **0.05 s per process** versus a
+/// gather that currently completes in ~490 ms and repeats every 5 s. This
+/// page's own doctrine (#1286: the observer must not join the observed)
+/// makes a ~30% gather-cost increase for three subprocess spawns the wrong
+/// trade when a frozen libSystem call costs nothing. `vmmap --summary`
+/// yields the same figure at 1.3 s/process and was never a candidate.
+///
+/// `rusage_info_v0` is a stable, frozen ABI — later flavors append fields
+/// and never reorder these. `ri_phys_footprint` is its 8th `u64`.
+/// Cross-checked against `/usr/bin/footprint -p` on a live worker: 3.25 GiB
+/// both ways, to the byte-rounding shown.
+#[cfg(target_os = "macos")]
+fn phys_footprint(pid: u32) -> Option<u64> {
+    #[repr(C)]
+    #[derive(Default)]
+    struct RUsageInfoV0 {
+        uuid: [u8; 16],
+        user_time: u64,
+        system_time: u64,
+        pkg_idle_wkups: u64,
+        interrupt_wkups: u64,
+        pageins: u64,
+        wired_size: u64,
+        resident_size: u64,
+        phys_footprint: u64,
+        proc_start_abstime: u64,
+        proc_exit_abstime: u64,
+    }
+    unsafe extern "C" {
+        fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut std::ffi::c_void) -> i32;
+    }
+    let mut buf = RUsageInfoV0::default();
+    // SAFETY: `buf` is a correctly-sized, correctly-aligned `#[repr(C)]`
+    // mirror of `rusage_info_v0`, and the callee writes only within it. A
+    // dead or unreadable pid returns non-zero and we report `None` rather
+    // than reading the buffer.
+    let Ok(pid) = i32::try_from(pid) else { return None };
+    let rc = unsafe { proc_pid_rusage(pid, 0, (&raw mut buf).cast()) };
+    (rc == 0).then_some(buf.phys_footprint)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn phys_footprint(_pid: u32) -> Option<u64> {
     None
 }
 

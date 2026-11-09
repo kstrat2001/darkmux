@@ -113,6 +113,12 @@ impl Platform for LinuxPlatform {
 
     /// The inode of `/proc/self/ns/pid` (its link reads `pid:[4026531836]`).
     /// Two processes see each other's pids only when this matches.
+    /// No reader yet: the residency ledger falls back to RSS here, as it
+    /// always has off macOS.
+    fn process_footprint(&self, _pid: u32) -> Option<u64> {
+        None
+    }
+
     fn pid_namespace(&self) -> Option<String> {
         pid_namespace_from_link(&read_link("/proc/self/ns/pid")?)
     }
