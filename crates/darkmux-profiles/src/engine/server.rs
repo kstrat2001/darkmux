@@ -408,6 +408,20 @@ HTTPServer(("127.0.0.1", port), H).serve_forever()
         script: PathBuf,
     }
 
+    /// A failed assertion must not leave a stand-in server running: every
+    /// server the fixture's records still name as running is killed when the
+    /// test ends, pass or fail.
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            for rec in engine_record::list_in(&self.dirs.records).0 {
+                if rec.state_now() == ServerState::Running {
+                    let _ = darkmux_types::child_registry::kill_pid(rec.pid, darkmux_types::child_registry::SIGKILL);
+                }
+            }
+            reap_exited();
+        }
+    }
+
     fn fixture() -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("fake_engine.py");
