@@ -1952,7 +1952,7 @@ async fn workspace_changes_handler(
             if total > MAX_CHANGES_BYTES {
                 return err(StatusCode::PAYLOAD_TOO_LARGE, "the branch's changes are too large to send");
             }
-            let mode = git_line(&dir, &["ls-tree", &head, "--", path])
+            let mode = git_line(&dir, &["--literal-pathspecs", "ls-tree", &head, "--", path])
                 .and_then(|l| l.split_whitespace().next().map(str::to_string))
                 .unwrap_or_else(|| "100644".to_string());
             files.push(serde_json::json!({"path": path, "mode": mode, "content": ws::base64_encode(&blob.stdout)}));
@@ -2093,7 +2093,10 @@ fn git_quiet(wd: &Path, args: &[&str]) -> Result<(), String> {
 }
 
 /// Commits exactly `paths` to the work copy's branch. Anything else in the
-/// work copy, staged or not, stays out. Returns (full id, branch).
+/// work copy, staged or not, stays out. The paths are a run's file names,
+/// passed to git literally (`--literal-pathspecs`): a file named `[ab].txt`
+/// is that file, never a glob that also takes the owner's `b.txt`. Returns
+/// (full id, branch).
 pub(crate) fn commit_run(
     wd: &Path,
     paths: &[String],
@@ -2103,10 +2106,10 @@ pub(crate) fn commit_run(
     if branch.is_empty() {
         return Err("the work copy isn't on a branch, so the run wasn't committed".to_string());
     }
-    let mut add = vec!["add", "-A", "--"];
+    let mut add = vec!["--literal-pathspecs", "add", "-A", "--"];
     add.extend(paths.iter().map(String::as_str));
     git_quiet(wd, &add)?;
-    let mut commit = vec!["commit", "--quiet", "-m", message, "--"];
+    let mut commit = vec!["--literal-pathspecs", "commit", "--quiet", "-m", message, "--"];
     commit.extend(paths.iter().map(String::as_str));
     git_quiet(wd, &commit)?;
     let sha = git_line(wd, &["rev-parse", "HEAD"]).ok_or("reading the new commit failed")?;
@@ -2162,6 +2165,7 @@ async fn undo_handler(
             return err(StatusCode::CONFLICT, "the run has no git work copy");
         };
         let mut log = vec![
+            "--literal-pathspecs".to_string(),
             "log".to_string(),
             "--format=%H".to_string(),
             format!("{commit}..HEAD"),

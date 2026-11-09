@@ -2586,6 +2586,22 @@ async fn status(h: &Harness, token: &str, id: &str) -> Value {
     .1
 }
 
+/// (review) A run's paths are passed to git literally: a file named
+/// `[ab].txt` is not a glob that also matches the owner's uncommitted
+/// `b.txt`.
+#[tokio::test]
+async fn a_runs_paths_are_committed_literally_never_as_globs() {
+    let h = harness();
+    let wt = git_workspace(&h, "glob");
+    std::fs::write(wt.join("[ab].txt"), "made by the run\n").unwrap();
+    std::fs::write(wt.join("b.txt"), "the owner's, uncommitted\n").unwrap();
+    let (sha, _) = commit_run(&wt, &["[ab].txt".to_string()], "coder: glob (work w-1)").unwrap();
+    let files = run_git(Some(&wt), &["show", "--name-only", "--format=", &sha]);
+    assert_eq!(files.lines().collect::<Vec<_>>(), ["[ab].txt"], "{files}");
+    let status = run_git(Some(&wt), &["status", "--porcelain", "--", "b.txt"]);
+    assert!(status.contains("?? b.txt"), "b.txt stays the owner's, uncommitted: {status}");
+}
+
 #[tokio::test]
 async fn a_finished_run_commits_exactly_its_files_to_the_branch() {
     let h = harness();
