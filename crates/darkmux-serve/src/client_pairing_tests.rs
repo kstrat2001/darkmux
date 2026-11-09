@@ -205,6 +205,7 @@ fn harness() -> Harness {
             dir.path().join("previews"),
             std::process::id(),
         )),
+        bound: Some(BOUND.parse().unwrap()),
     };
     Harness {
         cloned,
@@ -220,7 +221,23 @@ fn harness() -> Harness {
     }
 }
 
-async fn call(h: &Harness, req: Request<Body>) -> (u16, Value) {
+/// The address the harness's listener is taken to be bound on.
+const BOUND: &str = "127.0.0.1:8767";
+
+/// A request as this machine's app sends it: from a loopback peer, with a
+/// `Host` naming the listener (each added only when the test set none).
+async fn call(h: &Harness, mut req: Request<Body>) -> (u16, Value) {
+    if req.extensions().get::<axum::extract::ConnectInfo<SocketAddr>>().is_none() {
+        req.extensions_mut().insert(axum::extract::ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5555))));
+    }
+    if !req.headers().contains_key(axum::http::header::HOST) {
+        req.headers_mut().insert(axum::http::header::HOST, BOUND.parse().unwrap());
+    }
+    call_raw(h, req).await
+}
+
+/// A request exactly as built: no peer or `Host` added.
+async fn call_raw(h: &Harness, req: Request<Body>) -> (u16, Value) {
     let resp = router(h.state.clone()).oneshot(req).await.unwrap();
     let code = resp.status().as_u16();
     let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
@@ -286,6 +303,111 @@ async fn paired(h: &Harness) -> String {
     let (code, v) = poll(h, &id, SECRET).await;
     assert_eq!(code, 200, "{v}");
     v["token"].as_str().unwrap().to_string()
+}
+
+// ─── Only this machine ───────────────────────────────────────────────────
+
+/// A `POST /client/pair` from a loopback peer carrying `headers` (a `Host`
+/// among them, or none), with `content_type`.
+fn forged_pair(headers: &[(&str, &str)], content_type: &str) -> Request<Body> {
+    let mut b = Request::builder()
+        .method("POST")
+        .uri("/client/pair")
+        .header("content-type", content_type);
+    for (k, v) in headers {
+        b = b.header(*k, *v);
+    }
+    let mut req = b.body(Body::from(pair_body().to_string())).unwrap();
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5555))));
+    req
+}
+
+fn pending_count(h: &Harness) -> usize {
+    h.store.read().unwrap().pending.len()
+}
+
+/// A page rebound by DNS to 127.0.0.1, a browser page on any origin, and a
+/// form post (`text/plain`, which a browser sends without asking) are all
+/// refused before anything is recorded: native apps on this machine send
+/// none of these.
+#[tokio::test]
+async fn a_request_that_is_not_this_machines_app_is_refused_and_records_nothing() {
+    let h = harness();
+    let json = "application/json";
+    for (why, req) in [
+        ("a rebound Host", forged_pair(&[("host", "evil.example")], json)),
+        ("a rebound Host with a port", forged_pair(&[("host", "evil.example:8767")], json)),
+        ("an Origin", forged_pair(&[("host", BOUND), ("origin", "http://evil.example")], json)),
+        ("a null Origin", forged_pair(&[("host", BOUND), ("origin", "null")], json)),
+        ("a text/plain body", forged_pair(&[("host", BOUND)], "text/plain")),
+        ("a form body", forged_pair(&[("host", BOUND)], "application/x-www-form-urlencoded")),
+        ("another port", forged_pair(&[("host", "127.0.0.1:9999")], json)),
+        ("a proxy header", forged_pair(&[("host", BOUND), ("x-forwarded-for", "100.64.0.7")], json)),
+        ("no Host", forged_pair(&[], json)),
+    ] {
+        let (code, v) = call_raw(&h, req).await;
+        assert!(code == 403 || code == 415, "{why}: {code} {v}");
+        assert!(v["error"].is_string(), "{why}: {v}");
+        assert_eq!(pending_count(&h), 0, "{why}: a pending request was recorded");
+    }
+    // A request from a peer that is not loopback, whatever it says.
+    let mut req = forged_pair(&[("host", BOUND)], json);
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo(SocketAddr::from(([100, 64, 0, 7], 5555))));
+    let (code, _) = call_raw(&h, req).await;
+    assert_eq!(code, 403);
+    // And one with no peer at all (no connection to judge).
+    let mut req = forged_pair(&[("host", BOUND)], json);
+    req.extensions_mut().remove::<axum::extract::ConnectInfo<SocketAddr>>();
+    let (code, _) = call_raw(&h, req).await;
+    assert_eq!(code, 403);
+    assert_eq!(pending_count(&h), 0);
+    // The same request from this machine's app goes through.
+    for host in [BOUND, "localhost:8767", "localhost", "[::1]:8767", "127.0.0.1"] {
+        let (code, v) = call_raw(&h, forged_pair(&[("host", host)], "application/json; charset=utf-8")).await;
+        assert_eq!(code, 202, "{host}: {v}");
+    }
+}
+
+/// Every route sits behind the gate, the authenticated ones included, and a
+/// bodyless POST (cancel, a preview start) needs no content type.
+#[tokio::test]
+async fn every_route_refuses_a_browser_and_a_bodyless_post_needs_no_type() {
+    let h = harness();
+    let token = paired(&h).await;
+    let auth = bearer(&token);
+    for (method, path) in [
+        ("GET", "/client/whoami"),
+        ("GET", "/client/profiles"),
+        ("POST", "/client/work"),
+        ("GET", "/client/work/w-1"),
+        ("POST", "/client/work/w-1/cancel"),
+        ("POST", "/client/workspaces"),
+        ("GET", "/client/workspaces/wt1"),
+        ("POST", "/client/workspaces/wt1/preview"),
+        ("DELETE", "/client/workspaces/wt1/preview"),
+        ("GET", "/client/recipe?workspace=wt1"),
+        ("GET", "/nope"),
+    ] {
+        let req = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("authorization", &auth)
+            .header("origin", "https://evil.example")
+            .body(Body::empty())
+            .unwrap();
+        let (code, v) = call(&h, req).await;
+        assert_eq!(code, 403, "{method} {path}: {v}");
+    }
+    let req = Request::builder()
+        .method("POST")
+        .uri("/client/work/w-unknown/cancel")
+        .header("authorization", &auth)
+        .body(Body::empty())
+        .unwrap();
+    let (code, v) = call(&h, req).await;
+    assert_eq!(code, 404, "past the gate: {v}");
 }
 
 // ─── Pairing ─────────────────────────────────────────────────────────────
@@ -518,6 +640,7 @@ async fn a_malformed_pair_request_is_refused_with_json() {
         Request::builder()
             .method("POST")
             .uri("/client/pair")
+            .header("content-type", "application/json")
             .body(Body::from("{not json"))
             .unwrap(),
     )

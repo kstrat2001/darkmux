@@ -3,7 +3,13 @@
 //! A third listener, beside the viewer daemon and the fleet listener and
 //! sharing nothing with either, that lets an app on this machine (the Mux Bot
 //! app) pair once and then run scoped work. It binds `127.0.0.1` ONLY
-//! ([`bind_addr`]): never `0.0.0.0`, never the tailnet address.
+//! ([`bind_addr`]): never `0.0.0.0`, never the tailnet address. Every route
+//! sits behind one gate ([`foreign_request`]): the request must be from this
+//! machine as the viewer daemon decides it (`is_local_request`: a loopback
+//! peer, no reverse-proxy header, a `Host` naming this listener), must carry
+//! no `Origin` (a web page sends one; a native app does not), and a POST with
+//! a body must be `Content-Type: application/json`. A browser page on any
+//! site therefore cannot drive it, whatever DNS it rebinds.
 //!
 //! **Pairing.** The app `POST`s `/client/pair` with a device name, a code it
 //! shows its user and a random `pair_secret` (a `scopes` field is accepted
@@ -527,6 +533,9 @@ pub struct ClientServerState {
     pub workspace_lock: Arc<Mutex<()>>,
     /// Workspaces' live previews (dev servers from `.darkmux/preview.json`).
     pub previews: Arc<crate::client_preview::Previews>,
+    /// The address the listener bound, so a `Host` naming another port is
+    /// not this listener's ([`crate::is_local_at`]); `None` until bound.
+    pub bound: Option<SocketAddr>,
 }
 
 impl ClientServerState {
@@ -583,6 +592,7 @@ impl ClientServerState {
             fetch_repo: Arc::new(crate::client_workspace::fetch_with_git),
             workspace_lock: Arc::new(Mutex::new(())),
             previews: Arc::new(crate::client_preview::Previews::production()),
+            bound: None,
         })
     }
 }
@@ -650,7 +660,12 @@ pub fn run(port: u16) -> Result<()> {
             "darkmux client serve: store {}",
             state.store.path().display()
         );
-        axum::serve(listener, router(state))
+        let mut state = state;
+        state.bound = Some(listener.local_addr()?);
+        axum::serve(
+            listener,
+            router(state).into_make_service_with_connect_info::<SocketAddr>(),
+        )
             .with_graceful_shutdown(async {
                 let _ = tokio::signal::ctrl_c().await;
             })
@@ -688,7 +703,68 @@ pub fn router(state: ClientServerState) -> Router {
         .method_not_allowed_fallback(|| async {
             err(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
         })
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            only_this_machines_apps,
+        ))
         .with_state(state)
+}
+
+/// The gate in front of every route: the request must come from this machine
+/// the way the viewer daemon decides it ([`crate::is_local_at`]: a loopback
+/// peer, no reverse-proxy header, a `Host` naming this listener), must not
+/// come from a web page (it carries no `Origin`; a native app sends none,
+/// and every browser sends one on a cross-site POST), and a POST with a body
+/// must say `Content-Type: application/json` (a form post a page can send
+/// without asking is `text/plain` or `application/x-www-form-urlencoded`).
+async fn only_this_machines_apps(
+    State(state): State<ClientServerState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    match foreign_request(&req, state.bound) {
+        Some((code, why)) => err(code, why),
+        None => next.run(req).await,
+    }
+}
+
+/// Why [`only_this_machines_apps`] refuses `req`, or `None` to let it in.
+fn foreign_request(
+    req: &axum::extract::Request,
+    bound: Option<SocketAddr>,
+) -> Option<(StatusCode, &'static str)> {
+    use axum::body::HttpBody;
+    use axum::http::header::{CONTENT_TYPE, ORIGIN};
+    let peer = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map(|c| c.0);
+    if !crate::is_local_at(peer, req.headers(), bound) {
+        return Some((
+            StatusCode::FORBIDDEN,
+            "darkmux client serve answers only apps on this machine (a loopback connection naming this listener, through no proxy)",
+        ));
+    }
+    if req.headers().contains_key(ORIGIN) {
+        return Some((
+            StatusCode::FORBIDDEN,
+            "a request from a web page (it carries an Origin header) is refused: only an app on this machine may use darkmux client serve",
+        ));
+    }
+    let has_body = req.body().size_hint().exact() != Some(0);
+    let json = req
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|t| t.trim().eq_ignore_ascii_case("application/json"));
+    if req.method() == axum::http::Method::POST && has_body && !json {
+        return Some((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "a request body must be Content-Type: application/json",
+        ));
+    }
+    None
 }
 
 fn err(code: StatusCode, msg: impl Into<String>) -> Response {
