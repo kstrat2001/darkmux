@@ -15673,6 +15673,7 @@ fn client_serve_shuts_down_cleanly_on_sigterm_sighup_and_sigint() {
         };
         assert_eq!(status.code(), Some(0), "{name}: {status:?}, not a clean exit: {}", said());
         assert!(said().contains(&format!("stopping ({name})")), "{name}: {}", said());
+        assert!(said().contains("previews stopped"), "{name}: the cleanup ran: {}", said());
     }
 }
 
@@ -15732,6 +15733,7 @@ fn client_serve_shutdown_is_bounded_by_a_half_open_request_and_a_second_signal_i
         .unwrap_or_else(|| panic!("client serve did not exit within 20s of SIGTERM with a half-open request: {}", said()));
     assert_eq!(status.code(), Some(0), "{status:?}: {}", said());
     assert!(took < std::time::Duration::from_secs(12), "took {took:?}: {}", said());
+    assert!(said().contains("previews stopped"), "the cleanup ran after the bounded drain: {}", said());
 
     let (mut child, port, log) = a_listening_client_serve();
     let _held = half_open(port);
@@ -15744,4 +15746,38 @@ fn client_serve_shutdown_is_bounded_by_a_half_open_request_and_a_second_signal_i
         .unwrap_or_else(|| panic!("client serve did not exit after a second SIGTERM: {}", said()));
     assert_eq!(status.code(), Some(0), "{status:?}: {}", said());
     assert!(took < std::time::Duration::from_secs(3), "a second signal took {took:?}: {}", said());
+}
+
+/// A request whose body arrives after the stop began is refused, not acted
+/// on: here a pairing request (it writes the store) finished while the
+/// server drains. Before, it was handled as if nothing were stopping, and
+/// a preview start sent the same way could create a container the shutdown
+/// had already stopped looking for. The shutdown still stops every preview
+/// and says so.
+#[test]
+fn client_serve_refuses_a_request_finished_after_the_stop_began() {
+    use std::io::{Read, Write};
+    let (mut child, port, log) = a_listening_client_serve();
+    let body = r#"{"device_name":"probe","code":"ABC123","pair_secret":"0123456789abcdef0123"}"#;
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let head = format!(
+        "POST /client/pair HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    s.write_all(head.as_bytes()).unwrap();
+    s.write_all(&body.as_bytes()[..10]).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    // SAFETY: signalling the child this test spawned.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+    s.write_all(&body.as_bytes()[10..]).unwrap();
+    s.set_read_timeout(Some(std::time::Duration::from_secs(15))).unwrap();
+    let mut reply = String::new();
+    let _ = s.read_to_string(&mut reply);
+    let said = || std::fs::read_to_string(log.path()).unwrap_or_default();
+    let status_line = reply.lines().next().unwrap_or("").to_string();
+    assert!(status_line.contains(" 503 ") && reply.contains("\"unavailable\""), "acted on after the stop began: {reply}\n{}", said());
+    let (_, status) = exits_within(&mut child, std::time::Duration::from_secs(20)).expect("client serve exits");
+    assert_eq!(status.code(), Some(0), "{}", said());
+    assert!(said().contains("previews stopped"), "the shutdown cleanup ran: {}", said());
 }

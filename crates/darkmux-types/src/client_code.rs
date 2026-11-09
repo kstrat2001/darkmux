@@ -33,7 +33,8 @@ pub enum ClientCode {
     Unprocessable,
     /// Too many pending pairings or running work items.
     TooManyRequests,
-    /// This machine's config could not be read.
+    /// Not now: this machine's config could not be read, or `client serve`
+    /// is stopping (send the request again once it is back).
     Unavailable,
     /// darkmux failed; its log says why.
     Internal,

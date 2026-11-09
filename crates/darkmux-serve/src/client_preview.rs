@@ -592,6 +592,8 @@ pub struct Previews {
     clock: Clock,
     /// Picks a free port (a test pins one, to make two runs share it).
     ports: Arc<dyn Fn() -> Result<u16, String> + Send + Sync>,
+    /// Set once `client serve` begins to stop: no preview starts after it.
+    stopping: std::sync::atomic::AtomicBool,
 }
 
 /// A relative path inside the work copy, spelled plainly: no absolute
@@ -1016,7 +1018,22 @@ impl Previews {
             entries: Mutex::new(HashMap::new()),
             clock: Arc::new(unix_seconds),
             ports: Arc::new(free_port),
+            stopping: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// `client serve` has begun to stop: every later [`Previews::start`] is
+    /// refused, so nothing starts after [`Previews::stop_all`] looked.
+    pub fn begin_shutdown(&self) {
+        // Under the entries lock, so a start holding it either finished
+        // registering its entry (which `stop_all` then finds) or sees this.
+        let _entries = self.entries.lock().unwrap();
+        self.stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether [`Previews::begin_shutdown`] ran.
+    pub fn stopping(&self) -> bool {
+        self.stopping.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The same previews picking ports with `ports` (a test's fixed ones).
@@ -1071,6 +1088,11 @@ impl Previews {
         source: &RecipeSource,
     ) -> Result<(PreviewState, bool), RecipeRefusal> {
         let mut entries = self.entries.lock().unwrap();
+        if self.stopping() {
+            return Err(RecipeRefusal::Unreadable(
+                "darkmux client serve is stopping; start the preview again once it is back".to_string(),
+            ));
+        }
         if let Some(e) = entries.get(name) {
             let mut e = e.lock().unwrap();
             if e.status.live() {
@@ -1208,9 +1230,13 @@ impl Previews {
                 ended.push((name.clone(), e.container.take()));
             }
         }
-        for container in ended.iter().filter_map(|(_, c)| c.as_ref()) {
-            self.containers.remove(container);
-        }
+        // All at once: each `docker stop` may wait out a server that traps
+        // TERM, and a shutdown has launchd's budget for all of them.
+        std::thread::scope(|scope| {
+            for container in ended.iter().filter_map(|(_, c)| c.as_ref()) {
+                scope.spawn(|| self.containers.remove(container));
+            }
+        });
         let mut names: Vec<String> = ended.into_iter().map(|(n, _)| n).collect();
         names.sort();
         names
@@ -1890,6 +1916,9 @@ pub(crate) struct HostEmulator {
     pub cli_exits_early: Mutex<bool>,
     /// What `listeners` answers.
     pub proc_net: Mutex<Option<String>>,
+    /// How long `remove` takes (a `docker stop` waiting out a TERM-trapping
+    /// server).
+    pub remove_delay: Mutex<Duration>,
     created: Mutex<HashMap<String, ContainerSpec>>,
     groups: Mutex<HashMap<String, i32>>,
 }
@@ -1978,6 +2007,8 @@ impl PreviewContainers for HostEmulator {
     }
 
     fn remove(&self, name: &str) {
+        let delay = *self.remove_delay.lock().unwrap();
+        std::thread::sleep(delay);
         self.removed.lock().unwrap().push(name.to_string());
         self.created.lock().unwrap().remove(name);
         let Some(pgid) = self.groups.lock().unwrap().remove(name) else {
@@ -3107,6 +3138,49 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("the preview's container never started");
+    }
+
+    /// Once shutdown began, a start is refused and creates nothing, so no
+    /// container appears after `stop_all` looked.
+    #[test]
+    fn once_shutdown_began_a_start_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = a_workspace(dir.path(), "sleep 30");
+        let (previews, emu) = emulated(dir.path());
+        previews.begin_shutdown();
+        let refused = previews.start("w", &wt, &RecipeSource::Checkout(wt.clone()));
+        assert!(refused.is_err_and(|e| e.message().contains("stopping")));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(emu.specs.lock().unwrap().is_empty(), "a container was created");
+    }
+
+    /// Shutting down stops every preview at once, not one after another:
+    /// three that each take a second to stop (a `docker stop` waiting out a
+    /// TERM-trapping server) take about one second in all, not three.
+    #[test]
+    fn stop_all_stops_the_previews_in_parallel() {
+        let dir = tempfile::tempdir().unwrap();
+        let (previews, emu) = emulated(dir.path());
+        for name in ["w1", "w2", "w3"] {
+            let wt = dir.path().join(name);
+            std::fs::create_dir_all(wt.join(".darkmux")).unwrap();
+            let recipe = serde_json::json!({"schema_version": "1.0", "command": "sleep 30"});
+            std::fs::write(wt.join(".darkmux/preview.json"), recipe.to_string()).unwrap();
+            previews.start(name, &wt, &RecipeSource::Checkout(wt.clone())).unwrap();
+        }
+        for _ in 0..300 {
+            if emu.specs.lock().unwrap().len() == 3 && previews.entries.lock().unwrap().values().all(|e| e.lock().unwrap().container.is_some()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        *emu.remove_delay.lock().unwrap() = Duration::from_millis(1000);
+        let started = Instant::now();
+        let stopped = previews.stop_all();
+        let took = started.elapsed();
+        assert_eq!(stopped, ["w1", "w2", "w3"]);
+        assert_eq!(emu.removed.lock().unwrap().len(), 3, "every container removed");
+        assert!(took < Duration::from_millis(2500), "stopped one after another: {took:?}");
     }
 
     /// (#3459) A preview nobody has asked about for `idle_minutes` is

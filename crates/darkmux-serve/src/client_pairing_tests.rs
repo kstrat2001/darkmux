@@ -2486,6 +2486,24 @@ async fn a_done_run_reports_its_changes_and_null_outside_git() {
     assert_eq!(done["changes"], Value::Null, "no workdir, nothing to diff");
 }
 
+/// Once `client serve` begins to stop, a request that could start
+/// something (work, a preview, a pairing) is refused with `unavailable`
+/// and starts nothing; reads still answer.
+#[tokio::test]
+async fn once_stopping_a_request_that_could_start_something_is_refused() {
+    let h = harness();
+    let token = paired(&h).await;
+    h.state.previews.begin_shutdown();
+    let (code, v) = call(&h, post("/client/work", Some(&token), work_for("coder"))).await;
+    assert_eq!((code, v["code"].as_str()), (503, Some("unavailable")), "{v}");
+    let (code, v) = call(&h, post("/client/workspaces/wt1/preview", Some(&token), serde_json::json!({}))).await;
+    assert_eq!((code, v["code"].as_str()), (503, Some("unavailable")), "{v}");
+    assert!(h.ran.lock().unwrap().is_empty(), "no work ran");
+    assert!(h.containers.specs.lock().unwrap().is_empty(), "no preview container");
+    let (code, _) = call(&h, get("/client/profiles", &[("authorization", &format!("Bearer {token}"))])).await;
+    assert_eq!(code, 200, "reads still answer");
+}
+
 #[test]
 fn exit_reasons_are_short_and_machine_readable() {
     assert_eq!(exit_reason(Some(143), None), "exit 143/SIGTERM");

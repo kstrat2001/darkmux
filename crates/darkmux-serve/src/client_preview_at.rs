@@ -108,9 +108,26 @@ fn names_in(dir: &OwnedFd) -> io::Result<Vec<OsString>> {
     Ok(names)
 }
 
+/// One open folder in [`remove_tree_at`]'s walk: its descriptor, its name
+/// in the folder below it on the stack, and the entries left to visit.
+struct Frame {
+    fd: OwnedFd,
+    name: OsString,
+    pending: Vec<OsString>,
+}
+
+impl Frame {
+    fn open(dir: RawFd, name: &OsStr) -> io::Result<Frame> {
+        let fd = open_at(dir, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let pending = names_in(&fd)?;
+        Ok(Frame { fd, name: name.to_os_string(), pending })
+    }
+}
+
 /// Removes `name` in `dir`: a folder with everything in it, each entry
 /// reached from its own folder's descriptor; a file or a symlink unlinked
-/// (a link is never followed).
+/// (a link is never followed). Iterative, with the open folders on an
+/// explicit stack: a run can build a tree deeper than any thread's stack.
 fn remove_tree_at(dir: RawFd, name: &OsStr) -> io::Result<()> {
     let Some(st) = lstat_at(dir, name)? else {
         return Ok(());
@@ -118,11 +135,32 @@ fn remove_tree_at(dir: RawFd, name: &OsStr) -> io::Result<()> {
     if !is_dir(&st) {
         return unlink_at(dir, name, 0);
     }
-    let sub = open_at(dir, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
-    for entry in names_in(&sub)? {
-        remove_tree_at(sub.as_raw_fd(), &entry)?;
+    let mut stack = vec![Frame::open(dir, name)?];
+    while let Some(top) = stack.last_mut() {
+        match top.pending.pop() {
+            Some(entry) => {
+                if let Some(sub) = remove_or_open(top.fd.as_raw_fd(), &entry)? {
+                    stack.push(sub);
+                }
+            }
+            None => {
+                let done = stack.pop().expect("a frame");
+                let parent = stack.last().map_or(dir, |f| f.fd.as_raw_fd());
+                unlink_at(parent, &done.name, libc::AT_REMOVEDIR)?;
+            }
+        }
     }
-    unlink_at(dir, name, libc::AT_REMOVEDIR)
+    Ok(())
+}
+
+/// `entry` in `at`: a folder is opened for the walk to descend into;
+/// anything else is unlinked now (absent is done).
+fn remove_or_open(at: RawFd, entry: &OsStr) -> io::Result<Option<Frame>> {
+    match lstat_at(at, entry)? {
+        Some(st) if is_dir(&st) => Frame::open(at, entry).map(Some),
+        Some(_) => unlink_at(at, entry, 0).map(|_| None),
+        None => Ok(None),
+    }
 }
 
 /// The folder holding `rel` under `root`, opened one folder at a time with
@@ -166,13 +204,20 @@ pub(crate) fn create_new(root: &Path, rel: &str, mode: u32) -> io::Result<File> 
 }
 
 /// Opens the regular file `rel` inside `root` for reading, with its
-/// permission bits.
+/// permission bits. Opened `O_NONBLOCK`, so a FIFO (or a device) there
+/// never waits for a writer before it is refused; blocking reads again once
+/// it is known to be a regular file.
 pub(crate) fn open_regular(root: &Path, rel: &str) -> io::Result<(File, u32)> {
     let (dir, name) = parent_of(root, rel)?;
-    let file = File::from(open_at(dir.as_raw_fd(), &name, libc::O_RDONLY, 0)?);
+    let file = File::from(open_at(dir.as_raw_fd(), &name, libc::O_RDONLY | libc::O_NONBLOCK, 0)?);
     let meta = file.metadata()?;
     if !meta.is_file() {
         return Err(invalid("not a regular file"));
+    }
+    // SAFETY: an fd we own; reads its flags and clears one.
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
     }
     use std::os::unix::fs::PermissionsExt;
     Ok((file, meta.permissions().mode() & 0o777))
@@ -224,6 +269,60 @@ mod tests {
         remove(&root, "deps").unwrap();
         assert!(std::fs::symlink_metadata(root.join("deps")).is_err(), "the link is gone");
         assert!(outside.join("deps/keep").exists(), "followed the link");
+    }
+
+    /// Folders nested `depth` deep under `root/deep`, built one level at a
+    /// time from descriptors (the whole path is far past `PATH_MAX`).
+    fn nest(root: &Path, depth: usize) {
+        std::fs::create_dir_all(root).unwrap();
+        let mut at = File::open(root).unwrap();
+        let name = std::ffi::CString::new("deep").unwrap();
+        for _ in 0..depth {
+            // SAFETY: valid fd and name.
+            assert_eq!(unsafe { libc::mkdirat(at.as_raw_fd(), name.as_ptr(), 0o700) }, 0);
+            // SAFETY: valid fd and name; the result is checked.
+            let fd = unsafe { libc::openat(at.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+            assert!(fd >= 0);
+            // SAFETY: a fresh fd.
+            at = unsafe { File::from_raw_fd(fd) };
+        }
+    }
+
+    /// A run can build a tree deeper than a recursive walk's stack (about
+    /// 2,000 levels on a 2 MiB stack in a debug build): removing one 1,000
+    /// deep on a 64 KiB stack neither overflows nor fails. (Deeper trees
+    /// are slow to build on APFS, where each level costs more than the
+    /// last, so the depth is scaled down and the stack with it.)
+    #[test]
+    fn a_tree_deeper_than_a_recursive_walk_could_take_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        nest(&root, 1000);
+        let removed = std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(move || remove(&root, "deep").map(|_| root))
+            .unwrap()
+            .join()
+            .expect("the walk overflowed its stack");
+        let root = removed.unwrap();
+        assert!(std::fs::symlink_metadata(root.join("deep")).is_err(), "the tree is gone");
+    }
+
+    /// A FIFO where the file should be is refused at once, never opened in a
+    /// way that waits for a writer.
+    #[test]
+    fn a_fifo_at_the_source_is_refused_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let fifo = std::ffi::CString::new(root.join(".env").as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(open_regular(&root, ".env").map(|_| ()));
+        });
+        let out = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("opening the FIFO blocked");
+        assert!(out.is_err(), "a FIFO is not a regular file");
     }
 
     #[test]

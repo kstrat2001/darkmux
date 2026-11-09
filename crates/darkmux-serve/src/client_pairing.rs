@@ -833,30 +833,42 @@ pub fn run(port: u16) -> Result<()> {
             PREVIEW_IDLE_CHECK_INTERVAL,
             idle_stop.clone(),
         );
-        let served = serve_until_stopped(listener, router(state)).await;
+        let stopping = state.previews.clone();
+        let served = serve_until_stopped(listener, router(state), move || stopping.begin_shutdown()).await;
         idle_stop.store(true, std::sync::atomic::Ordering::SeqCst);
         // (#3456) Shutting down removes every preview container.
         let previews = shutdown_previews.clone();
         let removed = tokio::task::spawn_blocking(move || previews.stop_all())
             .await
             .unwrap_or_default();
-        for name in removed {
-            eprintln!("{}", preview_log_line(&name, "shutdown", "stopped"));
+        for name in &removed {
+            eprintln!("{}", preview_log_line(name, "shutdown", "stopped"));
         }
+        eprintln!("darkmux client serve: previews stopped ({})", removed.len());
         served
     })
 }
 
-/// How long a stopping `client serve` waits for open connections to finish
-/// before it closes them and cleans up: well inside launchd's own wait
-/// (20 s) before it sends SIGKILL, so the previews are always stopped.
+/// How long a stopping `client serve` waits for open connections before it
+/// stops its previews. Then the previews stop all at once, each `docker
+/// stop -t 5` (about five seconds for a server that traps TERM), so the
+/// whole shutdown fits launchd's 20 s before SIGKILL; only a wedged docker
+/// call (bounded at 30 s) can outlast it.
 const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Serves until a signal, then stops accepting and lets open connections
-/// finish for at most [`SHUTDOWN_DRAIN`]: a connection holding half a
-/// request (one a container can open) is closed rather than waited on. A
-/// second signal while draining closes them at once.
-async fn serve_until_stopped(listener: tokio::net::TcpListener, app: Router) -> Result<()> {
+/// Serves until a signal. Then `on_stop` runs (from here on, a request that
+/// could start something is refused: [`refused_while_stopping`]), new
+/// connections are no longer accepted, and open ones get at most
+/// [`SHUTDOWN_DRAIN`], or until a second signal. Past that, darkmux stops
+/// waiting for them and moves on to its cleanup; a connection still open
+/// (one holding half a request, which a container can do) is dropped when
+/// the process exits, and anything it finishes asking for meanwhile is
+/// refused.
+async fn serve_until_stopped(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    on_stop: impl FnOnce(),
+) -> Result<()> {
     let stop = Arc::new(tokio::sync::Notify::new());
     let graceful = stop.clone();
     let server = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
@@ -869,6 +881,9 @@ async fn serve_until_stopped(listener: tokio::net::TcpListener, app: Router) -> 
             None
         }
     };
+    if ended.is_none() {
+        on_stop();
+    }
     let ended = match ended {
         Some(ended) => ended,
         None => {
@@ -877,14 +892,14 @@ async fn serve_until_stopped(listener: tokio::net::TcpListener, app: Router) -> 
                 ended = &mut serving => ended,
                 _ = tokio::time::sleep(SHUTDOWN_DRAIN) => {
                     eprintln!(
-                        "darkmux client serve: connections still open after {}s; closing them",
+                        "darkmux client serve: connections still open after {}s; no longer waiting for them",
                         SHUTDOWN_DRAIN.as_secs()
                     );
                     serving.abort();
                     Ok(Ok(()))
                 }
                 signal = shutdown_signal() => {
-                    eprintln!("darkmux client serve: {signal} again; closing open connections now");
+                    eprintln!("darkmux client serve: {signal} again; no longer waiting for open connections");
                     serving.abort();
                     Ok(Ok(()))
                 }
@@ -952,10 +967,43 @@ pub(crate) async fn only_this_machines_apps(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    match foreign_request(&req, state.bound) {
-        Some((status, code, why)) => err(status, code, why),
-        None => next.run(req).await,
+    if let Some((status, code, why)) = foreign_request(&req, state.bound) {
+        return err(status, code, why);
     }
+    match refused_while_stopping(&state, req).await {
+        Ok(req) => next.run(req).await,
+        Err(refused) => refused,
+    }
+}
+
+/// Once `client serve` has begun to stop, a request that could start or
+/// change something (every method but GET and HEAD) is refused with
+/// `unavailable`. Its body is read first (the limit every handler applies),
+/// so the check lands when the whole request has arrived: one whose body
+/// was still coming when the stop began is refused too, never acted on
+/// after the previews were stopped.
+async fn refused_while_stopping(
+    state: &ClientServerState,
+    req: axum::extract::Request,
+) -> Result<axum::extract::Request, Response> {
+    use axum::http::Method;
+    if matches!(*req.method(), Method::GET | Method::HEAD) {
+        return Ok(req);
+    }
+    let (parts, body) = req.into_parts();
+    let bytes = axum::body::to_bytes(body, MAX_BODY_BYTES).await.map_err(|_| {
+        err(
+            StatusCode::PAYLOAD_TOO_LARGE, ClientCode::PayloadTooLarge,
+            format!("body larger than {MAX_BODY_BYTES} bytes"),
+        )
+    })?;
+    if state.previews.stopping() {
+        return Err(err(
+            StatusCode::SERVICE_UNAVAILABLE, ClientCode::Unavailable,
+            "darkmux client serve is stopping; send the request again once it is back",
+        ));
+    }
+    Ok(axum::extract::Request::from_parts(parts, Body::from(bytes)))
 }
 
 /// Why [`only_this_machines_apps`] refuses `req`, or `None` to let it in.
