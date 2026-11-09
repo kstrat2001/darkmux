@@ -526,12 +526,12 @@ const WORKSPACE_KEY: &str = "workspace";
 pub const SYNTHESIZED_FILE_KEYS: [&str; 2] = [DIFF_FILE_KEY, WORKSPACE_KEY];
 
 /// Run `git` in `cwd`, returning trimmed stdout on success.
+///
+/// (#3457) Through the hardened host-git helper: `cwd` is the operator's
+/// project, but an earlier `dispatch --workdir` may have had it mounted
+/// read-write, so its `.git` may hold what a run wrote.
 fn git_out(cwd: &Path, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new("git").args(args).current_dir(cwd).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    darkmux_types::host_git::HostGit::trusted(cwd).stdout(args)
 }
 
 /// See [`DiffLaunchInputs`]. `Err` only for genuine IO failures (the repo
@@ -645,20 +645,36 @@ pub fn synthesize_diff_launch_inputs(config: &MissionConfig, cwd: &Path) -> Resu
     if fallback_to_last_commit {
         notes.push("no base branch found; reviewing only the last commit.".to_string());
     }
-    if let Some(dirty) = git_out(cwd, &["status", "--porcelain"]).filter(|s| !s.trim().is_empty()) {
-        let n = dirty.lines().count();
-        notes.push(format!(
-            "{n} uncommitted change{} in this tree {} NOT part of this review — it reads the \
-             committed tree at {}.",
-            if n == 1 { "" } else { "s" },
-            if n == 1 { "is" } else { "are" },
-            &head[..head.len().min(12)]
-        ));
-    }
+    notes.extend(uncommitted_note(cwd, &head));
     if !notes.is_empty() {
         synthesized.excluded_note = Some(notes.join(" "));
     }
     Ok(DiffLaunchInputs::Ready(synthesized))
+}
+
+/// The note for a tree whose working copy holds changes the review does not
+/// cover (it reads the committed tree at `head`), or `None` when it holds
+/// none. When the check cannot run, the note says so.
+///
+/// (#3457) Through the hardened helper, which passes every filter driver the
+/// checkout's own config defines empty, wherever attributes assign it
+/// (`.gitattributes`, `.git/info/attributes`, `core.attributesFile`): a run
+/// that had this checkout mounted read-write may have written that config.
+fn uncommitted_note(cwd: &Path, head: &str) -> Option<String> {
+    let Some(dirty) = darkmux_types::host_git::HostGit::trusted(cwd).stdout(&["status", "--porcelain"]) else {
+        return Some("could not check this tree for uncommitted changes.".to_string());
+    };
+    if dirty.trim().is_empty() {
+        return None;
+    }
+    let n = dirty.lines().count();
+    Some(format!(
+        "{n} uncommitted change{} in this tree {} NOT part of this review — it reads the \
+         committed tree at {}.",
+        if n == 1 { "" } else { "s" },
+        if n == 1 { "is" } else { "are" },
+        &head[..head.len().min(12)]
+    ))
 }
 
 /// `true` iff the config's graph declares at least one step AND every
@@ -2240,6 +2256,8 @@ pub(crate) mod tests {
         // test since `interpret()` itself has no live producer of a
         // non-empty warnings Vec today (see `InterpretedGraph`'s doc).
         let t = Task {
+            repo_root: None,
+            branch: None,
             run_on: darkmux_crew::types::default_run_on(),
             id: "t1".to_string(),
             phase_id: "p1".to_string(),
@@ -2293,6 +2311,8 @@ pub(crate) mod tests {
     #[test]
     fn render_ephemeral_result_flips_success_false_when_a_side_branch_errored() {
         let t = Task {
+            repo_root: None,
+            branch: None,
             run_on: darkmux_crew::types::default_run_on(),
             id: "t1".to_string(),
             phase_id: "p1".to_string(),
@@ -2725,6 +2745,39 @@ pub(crate) mod tests {
 
     fn embedded_review() -> MissionConfig {
         mission_config::load("review").expect("the embedded review config loads").config
+    }
+
+    /// (#3457) The panel runs in the operator's project, which an earlier
+    /// `dispatch --workdir` may have mounted read-write: here a run replaced
+    /// a worktree's `.git` pointer with a directory whose config names an
+    /// fsmonitor, a clean filter and a textconv. The panel's diff and its
+    /// uncommitted-change check run none of them, and still report the change.
+    ///
+    /// The attributes that name the drivers are planted in each place git
+    /// reads them from: the work tree's `.gitattributes`, the git dir's
+    /// `info/attributes`, and a file the planted config names as
+    /// `core.attributesFile`.
+    #[test]
+    fn diff_synthesis_runs_nothing_a_run_planted_in_the_checkout() {
+        use darkmux_types::host_git::fixture::{AttrPlace, PlantedWorktree, TreeChange};
+        for place in [AttrPlace::WorkTree, AttrPlace::InfoAttributes, AttrPlace::AttributesFile] {
+            let f = PlantedWorktree::new();
+            f.plant_with(TreeChange::Content, place);
+            let synth = match synthesize_diff_launch_inputs(&embedded_review(), &f.wt).unwrap() {
+                DiffLaunchInputs::Ready(s) => s,
+                DiffLaunchInputs::NotNeeded | DiffLaunchInputs::Nothing(_) => panic!("expected a diff to review"),
+            };
+            let place = match place {
+                AttrPlace::WorkTree => ".gitattributes",
+                AttrPlace::InfoAttributes => "info/attributes",
+                AttrPlace::AttributesFile => "core.attributesFile",
+            };
+            assert!(!f.fsmonitor_ran(), "{place}: the planted fsmonitor ran on the host");
+            assert!(!f.clean_ran(), "{place}: the planted clean filter ran on the host");
+            assert!(!f.textconv_ran(), "{place}: the planted textconv ran on the host");
+            let note = synth.excluded_note.as_deref().unwrap_or_default();
+            assert!(note.contains("uncommitted"), "{place}: the change is still reported: {note:?}");
+        }
     }
 
     /// (#2404 P4d round 3) A no-remote repo whose base branch is only

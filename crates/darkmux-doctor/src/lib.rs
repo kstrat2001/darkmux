@@ -5751,9 +5751,7 @@ fn find_darkmux_source_root(start: &std::path::Path) -> Option<PathBuf> {
 /// detached repo is "nothing to compare", not an error.
 fn source_head_sha(root: &std::path::Path) -> Option<String> {
     let out = bounded_output(
-        Command::new("git")
-            .args(["rev-parse", "--short", "HEAD"])
-            .current_dir(root),
+        &mut darkmux_types::host_git::HostGit::trusted(root).command(&["rev-parse", "--short", "HEAD"]),
         std::time::Duration::from_secs(5),
     )?;
     if !out.status.success() {

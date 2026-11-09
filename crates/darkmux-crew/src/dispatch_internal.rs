@@ -6605,6 +6605,7 @@ fn prepare_container_run(
     let (image_arg, mut execution_lock) = resume_preflight(opts.resume_from.as_deref(), opts.image.as_deref())?;
     admit_container_start(opts, execution, brain.limits_pm())?;
     let workdir_split_gitdirs = warn_split_gitdirs(opts);
+    warn_writable_git_dir(opts);
     let image = resolve_runtime_image(image_arg.as_deref(), opts.skip_preflight)?;
     let (role, system_prompt, allowed_tools, provenance) =
         container_role(opts, brain.agentic_pm.as_ref().is_some_and(brain_leaves_this_machine), &workdir_split_gitdirs)?;
@@ -6711,6 +6712,42 @@ fn warn_split_gitdirs(opts: &DispatchOpts) -> Vec<darkmux_types::workdir::SplitG
         }
     }
     workdir_split_gitdirs
+}
+
+/// (#3457) PREFLIGHT: is the workdir a checkout whose `.git` is a real
+/// directory, mounted read-write? Then the run can write that repository's
+/// config and hooks. darkmux's own later git calls there go through
+/// `darkmux_types::host_git` (the settings that run a command are switched
+/// off), but a clean or smudge filter the repo's own config names still runs
+/// under any git that reads the work tree, and git the operator runs by hand
+/// reads all of it. darkmux cannot fix that side, so it says so.
+///
+/// Deliberately a note, not a refusal and not a read-only `.git` mount: a
+/// plain `dispatch --workdir <checkout>` is ordinary work, and a role may be
+/// asked to commit there. A worktree workdir (the coder phase's shape) has a
+/// pointer file, not a directory, and is not noted: its git dir is outside
+/// the mount, and darkmux reads it only through the main repository.
+fn warn_writable_git_dir(opts: &DispatchOpts) {
+    let Some(workdir) = opts.workdir.as_deref() else { return };
+    if let Some(msg) = writable_git_dir_note(workdir, opts.workspace_read_only) {
+        emit_preflight_warning_once(&msg);
+    }
+}
+
+/// The [`warn_writable_git_dir`] note, or `None` when there is nothing to
+/// say (a read-only mount, or no `.git` directory at the workdir).
+pub(crate) fn writable_git_dir_note(workdir: &Path, read_only: bool) -> Option<String> {
+    if read_only || !std::fs::symlink_metadata(workdir.join(".git")).is_ok_and(|m| m.is_dir()) {
+        return None;
+    }
+    Some(format!(
+        "darkmux dispatch: note: workdir {} is a git checkout mounted read-write, so this run can \
+         change its `.git` (config, hooks). darkmux's own git calls there afterwards switch off the \
+         settings that run a command, but a filter the repo's config names still runs, and git you \
+         run yourself reads all of it: check `git config --local --list` and `.git/hooks` after the \
+         run, or dispatch into a worktree or a copy instead.",
+        workdir.display()
+    ))
 }
 
 /// The image a container dispatch runs, checked before any role-load,

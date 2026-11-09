@@ -1914,11 +1914,9 @@ fn start_fresh(base: &Path, name: &str, message: &str) -> Result<(), String> {
     let git_dir = crate::client_git::clone_git_dir(base, name);
     std::fs::remove_dir_all(&git_dir).map_err(|e| format!("removing the template's history: {e}"))?;
     let _ = std::fs::remove_file(dir.join(".git"));
-    let init = std::process::Command::new("git")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .args(["init", "--quiet", "--initial-branch=main", "--separate-git-dir"])
-        .arg(&git_dir)
-        .arg(&dir)
+    let (gd, wd) = (git_dir.to_string_lossy(), dir.to_string_lossy());
+    let init = darkmux_types::host_git::HostGit::trusted(base)
+        .command(&["init", "--quiet", "--initial-branch=main", "--separate-git-dir", &gd, &wd])
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|e| format!("running git: {e}"))?;
@@ -2031,11 +2029,8 @@ fn worktree_workspace(
 /// a retry never leaves an orphan behind.
 fn remove_worktree(source: &Path, dest: &Path, branch: &str) {
     let in_checkout = |args: &[&str]| {
-        let _ = std::process::Command::new("git")
-            .arg("-C")
-            .arg(source)
-            .args(["-c", "core.hooksPath=/dev/null"])
-            .args(args)
+        let _ = darkmux_types::host_git::HostGit::trusted(source)
+            .command(args)
             .stdin(std::process::Stdio::null())
             .output();
     };

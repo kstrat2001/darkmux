@@ -373,6 +373,8 @@ fn build_graph(opts: &DispatchOpts, mission_id: &str) -> (Mission, Phase, Task, 
     };
 
     let task = Task {
+        repo_root: None,
+        branch: None,
         run_on: crate::types::default_run_on(),
         id: task_id.clone(),
         phase_id: phase_id.clone(),

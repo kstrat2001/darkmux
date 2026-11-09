@@ -2117,6 +2117,8 @@ mod task_step_storage_tests {
 
     fn task(id: &str, phase_id: &str) -> Task {
         Task {
+            repo_root: None,
+            branch: None,
             run_on: crate::types::default_run_on(),
             id: id.to_string(),
             phase_id: phase_id.to_string(),

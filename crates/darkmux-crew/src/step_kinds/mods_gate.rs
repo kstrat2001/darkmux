@@ -355,8 +355,8 @@ fn gate_one_mod(
     // `git apply --check` first — a dry run that never touches the
     // checkout, so a kit that fails to apply is detected before anything
     // is mutated.
-    let check = std::process::Command::new("git")
-        .current_dir(&scratch_checkout)
+    let check = darkmux_types::host_git::HostGit::trusted(&scratch_checkout)
+        .command(&["apply", "--check", "--recount", &patch_path.to_string_lossy()])
         .env("GIT_CEILING_DIRECTORIES", &ceiling)
         // `--recount` (both calls): a model-written hunk header's line counts
         // are wrong often enough (`@@ -1,7 +1,5 @@` over an 8/9-line body —
@@ -364,7 +364,6 @@ fn gate_one_mod(
         // patch" was sinking correct bodies. Recounting trusts the body,
         // which is the part the model actually looked at; wrong CONTEXT still
         // fails as "patch does not apply", honestly.
-        .args(["apply", "--check", "--recount", &patch_path.to_string_lossy()])
         .output();
     let applied_cleanly = match check {
         Ok(out) => out.status.success(),
@@ -386,10 +385,9 @@ fn gate_one_mod(
     let Ok(before) = tree_fingerprint(&scratch_checkout) else {
         return (None, Some("could not fingerprint the scratch checkout before applying".to_string()));
     };
-    let apply = std::process::Command::new("git")
-        .current_dir(&scratch_checkout)
+    let apply = darkmux_types::host_git::HostGit::trusted(&scratch_checkout)
+        .command(&["apply", "--recount", &patch_path.to_string_lossy()])
         .env("GIT_CEILING_DIRECTORIES", &ceiling)
-        .args(["apply", "--recount", &patch_path.to_string_lossy()])
         .output();
     match apply {
         Ok(out) if out.status.success() => {}
@@ -974,6 +972,8 @@ mod tests {
 
     fn task() -> Task {
         Task {
+            repo_root: None,
+            branch: None,
             id: "create-mod-1".into(),
             phase_id: "p".into(),
             description: String::new(),

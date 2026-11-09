@@ -7,6 +7,7 @@
 
 use super::*;
 use serde_json::json;
+use std::process::Command;
 
 fn golden() -> Value {
     serde_json::from_str(include_str!("golden/site_bundle_v3.json")).unwrap()
