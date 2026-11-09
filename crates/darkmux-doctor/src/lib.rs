@@ -4234,11 +4234,9 @@ fn endpoint_kind_label(ep: &darkmux_types::ModelEndpoint) -> String {
         Ok(darkmux_types::EndpointKind::Managed(darkmux_types::ManagedBackend::Lmstudio)) => {
             "managed (lmstudio)".to_string()
         }
-        // (#3448) Read and checked, but no dispatch starts its server yet;
-        // every dispatching preflight refuses it
-        // (`config_enum::undispatchable_engine_endpoints`).
+        // (#3448) darkmux starts its server when a dispatch needs it.
         Ok(darkmux_types::EndpointKind::Managed(darkmux_types::ManagedBackend::Tensorfold)) => format!(
-            "managed (tensorfold, port {}; darkmux does not start its server yet, so dispatch refuses it, #3448)",
+            "managed (tensorfold, port {}; darkmux starts its server when a dispatch needs it)",
             ep.port.unwrap_or_default()
         ),
         Ok(darkmux_types::EndpointKind::Unmanaged) => {
@@ -12190,7 +12188,7 @@ mod tests {
         );
         let c = endpoints_status(&ok, &mut no_spend, REGISTRY);
         assert_eq!(c.status, Status::Pass, "{}", c.message);
-        assert!(c.message.contains("`tf`: managed (tensorfold, port 8091") && c.message.contains("#3448"), "{}", c.message);
+        assert!(c.message.contains("`tf`: managed (tensorfold, port 8091; darkmux starts its server"), "{}", c.message);
         let bad = materialized(
             r#"{"profiles":{"p":{"models":[{"id":"TensorFold/m","n_ctx":8,"endpoint":"tf","engine_args":["--host","0.0.0.0"]}]}},
                 "endpoints":{"tf":{"managed":"tensorfold","port":8091}}}"#,

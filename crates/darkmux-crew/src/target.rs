@@ -62,7 +62,16 @@ impl Target {
     /// unmanaged endpoint. `None` on a managed one: its records carry the LM
     /// Studio base instead (`usage::lmstudio_endpoint`).
     pub fn route_label(&self) -> Option<String> {
-        (!self.is_managed()).then(|| endpoint_route_label(&self.endpoint, &self.model.id))
+        match self.kind {
+            EndpointKind::Unmanaged => Some(endpoint_route_label(&self.endpoint, &self.model.id)),
+            // (#3448) A server darkmux starts is labeled by where it serves,
+            // never left to read as the LM Studio default.
+            EndpointKind::Managed(darkmux_types::ManagedBackend::Tensorfold) => Some(darkmux_flow::unmanaged_route_label(
+                &format!("127.0.0.1:{}", self.endpoint.port.unwrap_or_default()),
+                &self.model.id,
+            )),
+            EndpointKind::Managed(_) => None,
+        }
     }
 }
 

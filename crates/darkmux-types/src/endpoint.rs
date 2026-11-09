@@ -2105,21 +2105,24 @@ mod tests {
         assert!(serde_json::to_value(pm(r#"{"id":"m"}"#)).unwrap().get("engine_args").is_none(), "absent stays absent");
     }
 
-    /// (#3448) Until darkmux starts Tensorfold servers, an endpoint declaring
-    /// one is refused at every dispatching preflight, so no path can treat
-    /// its model as an LM Studio load; the refusal names the `url` form
-    /// that works today.
+    /// (#3448) A profile model on a Tensorfold endpoint is dispatchable (the
+    /// dispatch starts its server); the utility binding on one is refused,
+    /// naming the binding, since utility jobs do not start servers.
     #[test]
-    fn a_tensorfold_endpoint_is_refused_for_dispatch_until_darkmux_starts_servers() {
-        let r = registry(
-            r#"{"profiles":{"p":{"models":[{"id":"m","n_ctx":8192,"endpoint":"tf"}]}},
-                "endpoints":{"tf":{"managed":"tensorfold","port":8091},
-                             "lms":{"managed":"lmstudio"},
-                             "hosted":{"url":"http://127.0.0.1:8090/v1"}}}"#,
-        );
-        let refused = crate::config_enum::undispatchable_engine_endpoints(&r);
-        assert_eq!(refused.len(), 1, "only the Tensorfold endpoint: {refused:?}");
+    fn only_the_utility_binding_on_a_tensorfold_endpoint_is_refused() {
+        let with_utility = |utility: &str| {
+            registry(&format!(
+                r#"{{"profiles":{{"p":{{"models":[{{"id":"m","n_ctx":8192,"endpoint":"tf"}}]}}}},
+                    "endpoints":{{"tf":{{"managed":"tensorfold","port":8091}},
+                                 "hosted":{{"url":"http://127.0.0.1:8090/v1"}}}},
+                    "internal":{{"utility":{utility}}}}}"#
+            ))
+        };
+        assert!(crate::config_enum::utility_on_engine_server(&with_utility(r#"{"id":"u","n_ctx":8}"#)).is_empty());
+        assert!(crate::config_enum::utility_on_engine_server(&with_utility(r#"{"id":"u","n_ctx":8,"endpoint":"hosted"}"#)).is_empty());
+        let refused = crate::config_enum::utility_on_engine_server(&with_utility(r#"{"id":"u","n_ctx":8,"endpoint":"tf"}"#));
+        assert_eq!(refused.len(), 1);
         let line = refused[0].to_string();
-        assert!(line.contains("endpoints.tf") && line.contains("#3448") && line.contains("\"url\""), "{line}");
+        assert!(line.contains("internal.utility.endpoint") && line.contains("#3448"), "{line}");
     }
 }
