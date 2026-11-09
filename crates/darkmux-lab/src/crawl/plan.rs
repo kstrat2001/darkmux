@@ -349,9 +349,8 @@ fn linguist_generated(tree: &Path, all: &[String]) -> HashSet<String> {
     if all.is_empty() {
         return HashSet::new();
     }
-    let child = Command::new("git")
-        .current_dir(tree)
-        .args(["check-attr", "-z", "--stdin", "linguist-generated"])
+    let child = darkmux_types::host_git::HostGit::trusted(tree)
+        .command(&["check-attr", "-z", "--stdin", "linguist-generated"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

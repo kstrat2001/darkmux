@@ -526,12 +526,12 @@ const WORKSPACE_KEY: &str = "workspace";
 pub const SYNTHESIZED_FILE_KEYS: [&str; 2] = [DIFF_FILE_KEY, WORKSPACE_KEY];
 
 /// Run `git` in `cwd`, returning trimmed stdout on success.
+///
+/// (#3457) Through the hardened host-git helper: `cwd` is the operator's
+/// project, but an earlier `dispatch --workdir` may have had it mounted
+/// read-write, so its `.git` may hold what a run wrote.
 fn git_out(cwd: &Path, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new("git").args(args).current_dir(cwd).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    darkmux_types::host_git::HostGit::trusted(cwd).stdout(args)
 }
 
 /// See [`DiffLaunchInputs`]. `Err` only for genuine IO failures (the repo
@@ -645,7 +645,17 @@ pub fn synthesize_diff_launch_inputs(config: &MissionConfig, cwd: &Path) -> Resu
     if fallback_to_last_commit {
         notes.push("no base branch found; reviewing only the last commit.".to_string());
     }
-    if let Some(dirty) = git_out(cwd, &["status", "--porcelain"]).filter(|s| !s.trim().is_empty()) {
+    // (#3457) Attributes from the empty tree: a clean filter the
+    // repository's own config defines (a run may have written it) never
+    // runs. A file that really is filtered (Git LFS) and whose stat changed
+    // can read as changed, which only ever over-reports here.
+    let dirty = darkmux_types::host_git::HostGit::trusted(cwd)
+        .without_tree_attributes()
+        .and_then(|git| git.stdout(&["status", "--porcelain"]));
+    if dirty.is_none() {
+        notes.push("could not check this tree for uncommitted changes.".to_string());
+    }
+    if let Some(dirty) = dirty.filter(|s| !s.trim().is_empty()) {
         let n = dirty.lines().count();
         notes.push(format!(
             "{n} uncommitted change{} in this tree {} NOT part of this review — it reads the \
@@ -2727,6 +2737,26 @@ pub(crate) mod tests {
 
     fn embedded_review() -> MissionConfig {
         mission_config::load("review").expect("the embedded review config loads").config
+    }
+
+    /// (#3457) The panel runs in the operator's project, which an earlier
+    /// `dispatch --workdir` may have mounted read-write: here a run replaced
+    /// a worktree's `.git` pointer with a directory whose config names an
+    /// fsmonitor, a clean filter and a textconv. The panel's diff and its
+    /// uncommitted-change check run none of them, and still report the change.
+    #[test]
+    fn diff_synthesis_runs_nothing_a_run_planted_in_the_checkout() {
+        let f = darkmux_types::host_git::fixture::PlantedWorktree::new();
+        f.plant(darkmux_types::host_git::fixture::TreeChange::Content);
+        let synth = match synthesize_diff_launch_inputs(&embedded_review(), &f.wt).unwrap() {
+            DiffLaunchInputs::Ready(s) => s,
+            DiffLaunchInputs::NotNeeded | DiffLaunchInputs::Nothing(_) => panic!("expected a diff to review"),
+        };
+        assert!(!f.fsmonitor_ran(), "the planted fsmonitor ran on the host");
+        assert!(!f.clean_ran(), "the planted clean filter ran on the host");
+        assert!(!f.textconv_ran(), "the planted textconv ran on the host");
+        let note = synth.excluded_note.as_deref().unwrap_or_default();
+        assert!(note.contains("uncommitted"), "the change is still reported: {note:?}");
     }
 
     /// (#2404 P4d round 3) A no-remote repo whose base branch is only
