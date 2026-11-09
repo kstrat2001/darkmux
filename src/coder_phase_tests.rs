@@ -2355,6 +2355,76 @@ edit loop detected on src/widget.rs in an earlier dispatch
         assert!(!f.clean_ran(), "the planted clean filter ran on the host");
     }
 
+    /// The `mission.verify` step reviews the worktree through the git dir
+    /// the main repository holds: the planted HEAD (`keep-me`) and the
+    /// planted commands never reach it. (`TouchOnly` keeps the diff empty,
+    /// so no reviewer is dispatched.)
+    #[test]
+    #[serial_test::serial]
+    fn verify_step_reviews_the_worktree_without_reading_what_a_run_planted() {
+        let _g = CrewEnvGuard::new();
+        let f = PlantedWorktree::new();
+        f.plant(TreeChange::TouchOnly);
+        let slot: Arc<Mutex<Option<std::result::Result<crate::phase_review::PhaseReviewOutput, String>>>> =
+            Arc::new(Mutex::new(None));
+        let ctx = Arc::new(CoderPhaseContext {
+            repo_root: f.repo.clone(),
+            wt_path: f.wt.clone(),
+            branch: "phase".to_string(),
+            base: "main".to_string(),
+            mission_id: "m1".to_string(),
+            phase_id: "s1".to_string(),
+            role: "coder".to_string(),
+        });
+        let mut bus = crew::step_kinds::ArtifactBus::new();
+        bus.seed(CODER_VERIFY_RESULT_ARTIFACT, slot.clone() as Arc<dyn std::any::Any + Send + Sync>);
+        bus.seed(CODER_CONTEXT_ARTIFACT, ctx as Arc<dyn std::any::Any + Send + Sync>);
+        let run_ctx = crew::step_kinds::StepRunCtx::new(crate::test_run(), None, None, Arc::new(bus));
+        let step = crew::types::Step {
+            id: "s1-verify-step".to_string(),
+            task_id: "s1-verify".to_string(),
+            gate: None,
+            kind: "mission.verify".to_string(),
+            status: NodeStatus::Planned,
+            config: serde_json::Value::Null,
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+            stop_reason: None,
+        };
+        let outcome = MissionVerifyStepKind.run(&step, &test_task("s1-verify"), &std::collections::BTreeMap::new(), &run_ctx);
+        assert_eq!(outcome.unwrap().output, "clean");
+        let review = slot.lock().unwrap().take().expect("a result").expect("the review ran");
+        assert_eq!(review.branch, "phase", "the branch came from the planted HEAD");
+        assert!(!f.anything_ran(), "a planted command ran on the host");
+    }
+
+    /// finalize's unsaved-work check on a worktree whose `.git` the run
+    /// replaced: it reads the real index (the change is unsaved, so the
+    /// worktree is spared) and runs nothing the run planted.
+    #[test]
+    #[serial_test::serial]
+    fn finalize_checks_unsaved_work_without_running_what_a_run_planted() {
+        let _g = CrewEnvGuard::new();
+        let f = PlantedWorktree::new();
+        let mid = "planted-finalize";
+        seed_finalize_mission(mid, &[("p1", PhaseStatus::Running)]);
+        let mut t = test_task("p1-worktree");
+        t.phase_id = "p1".to_string();
+        t.workdir = Some(f.wt.clone());
+        t.branch = Some("phase".to_string());
+        crew::lifecycle::save_task(mid, &t).unwrap();
+        f.plant(TreeChange::Content);
+
+        let m = crew::loader::load_missions().unwrap().into_iter().find(|m| m.id == mid).unwrap();
+        let p = phase("p1", mid, PhaseStatus::Running);
+        teardown_and_terminate_phase(Some(&f.repo), &m, &p, None, MissionTerminal::Finalize);
+
+        assert!(f.wt.join("a.txt").exists(), "unsaved work must be spared");
+        assert!(f.branch_exists("phase") && f.branch_exists("keep-me"));
+        assert!(!f.anything_ran(), "a planted command ran on the host");
+    }
+
     /// The run's `.git` names `keep-me` as HEAD. abort force-deletes the
     /// branch darkmux recorded at launch (`phase`), never the one the
     /// planted HEAD names, and runs nothing the run planted.
