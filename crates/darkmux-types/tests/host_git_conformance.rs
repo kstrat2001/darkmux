@@ -13,10 +13,14 @@
 //! `crates/darkmux-profiles/tests/pin_cwd_conformance.rs`: it walks every
 //! `.rs` file under the root crate's `src/` and each workspace crate's
 //! `src/`, skips test code (`*_tests.rs`, `tests.rs`, and any item under a
-//! `#[cfg(test)]` attribute), and fails on any line spawning
-//! `Command::new("git")` in a file not on [`ALLOWED`]. A spawn written some
-//! other way (the program bound to a variable first) is not seen; this
-//! catches the shape every git spawn in this codebase has been written in.
+//! `#[cfg(test)]` attribute), and fails on any line in a file not on
+//! [`ALLOWED`] that spawns git in one of the shapes [`is_git_spawn`] knows:
+//! `Command::new("git")` or `Command::new("/usr/bin/git")`, `Command::new(X)`
+//! where the file declares `const X: &str = "git"`, the program built as a
+//! value (`"git".to_string()`, `String::from("git")`, `OsStr::new("git")`),
+//! and a shell string running git (`"git status"`, `"…; git …"`) near a
+//! `"-c"`. A spawn written some other way (the program read from config, or
+//! assembled from pieces) is not seen.
 //! `runtime/` is not scanned: it runs inside the container, where git reads
 //! only what the container can see.
 //!
@@ -25,8 +29,83 @@
 
 use std::path::{Path, PathBuf};
 
-/// The literal this lint looks for.
-const SPAWN: &str = "Command::new(\"git\")";
+/// Ways of naming git as a program VALUE, outside `Command::new`.
+const VALUE_SHAPES: [&str; 6] = [
+    "\"git\".to_string()",
+    "\"git\".to_owned()",
+    "\"git\".into()",
+    "String::from(\"git\")",
+    "OsStr::new(\"git\")",
+    "OsString::from(\"git\")",
+];
+
+/// How a shell string starts git: at its start or after a separator.
+const SHELL_GIT: [&str; 7] = ["\"git ", "; git ", "&& git ", "|| git ", "| git ", "$(git ", "\\ngit "];
+
+/// The string literals on a code line, roughly: the text between pairs of
+/// unescaped quotes.
+fn literals(code: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur: Option<String> = None;
+    let mut chars = code.chars();
+    while let Some(c) = chars.next() {
+        match (&mut cur, c) {
+            (Some(buf), '\\') => {
+                buf.push('\\');
+                if let Some(n) = chars.next() {
+                    buf.push(n);
+                }
+            }
+            (Some(_), '"') => out.push(cur.take().unwrap()),
+            (Some(buf), c) => buf.push(c),
+            (None, '"') => cur = Some(String::new()),
+            (None, _) => {}
+        }
+    }
+    out
+}
+
+/// The names a file binds to the git program: `const X: &str = "git";`.
+fn git_consts(src: &str) -> Vec<String> {
+    src.lines()
+        .filter_map(|l| {
+            let t = l.trim_start().trim_start_matches("pub(crate) ").trim_start_matches("pub ");
+            let rest = t.strip_prefix("const ").or_else(|| t.strip_prefix("static "))?;
+            let (name, value) = rest.split_once(':')?;
+            let lit = value.split_once('=')?.1.trim().trim_end_matches(';');
+            let lit = lit.strip_prefix('"')?.strip_suffix('"')?;
+            (lit == "git" || lit.ends_with("/git")).then(|| name.trim().to_string())
+        })
+        .collect()
+}
+
+/// Whether `code` (a line with its comment cut) spawns git in a known shape.
+/// `near_dash_c`: a `"-c"` is on this line or one of the three before it in
+/// the same statement.
+fn is_git_spawn(code: &str, consts: &[String], near_dash_c: bool) -> bool {
+    let mut rest = code;
+    while let Some(at) = rest.find("Command::new(") {
+        rest = &rest[at + "Command::new(".len()..];
+        let arg = rest.trim_start();
+        if let Some(lit) = arg.strip_prefix('"').and_then(|a| a.split('"').next()) {
+            if lit == "git" || lit.ends_with("/git") {
+                return true;
+            }
+        }
+        let ident: String = arg.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+        if consts.contains(&ident) {
+            return true;
+        }
+    }
+    if VALUE_SHAPES.iter().any(|v| code.contains(v)) {
+        return true;
+    }
+    near_dash_c
+        && literals(code).iter().any(|l| {
+            let quoted = format!("\"{l}");
+            SHELL_GIT.iter().any(|g| quoted.starts_with(g) || l.contains(g.trim_start_matches('"')) && !g.starts_with('"'))
+        })
+}
 
 /// Production files that may spawn git directly, each with its reason.
 const ALLOWED: &[(&str, &str)] = &[
@@ -181,6 +260,8 @@ fn is_test_attr(line: &str) -> bool {
 
 /// The 1-based line numbers of production `git` spawns in `src`.
 fn production_spawns(src: &str) -> Vec<usize> {
+    let consts = git_consts(src);
+    let mut recent: std::collections::VecDeque<bool> = std::collections::VecDeque::new();
     let mut hits = Vec::new();
     let mut lexer = Lexer::default();
     // Some(depth) while skipping a test item that opened at `depth`.
@@ -215,8 +296,17 @@ fn production_spawns(src: &str) -> Vec<usize> {
             continue;
         }
         let code = line.split("//").next().unwrap_or("");
-        if code.contains(SPAWN) {
+        let dash_c = code.contains("\"-c\"");
+        if is_git_spawn(code, &consts, dash_c || recent.iter().any(|d| *d)) {
             hits.push(n + 1);
+        }
+        recent.push_back(dash_c);
+        if recent.len() > 3 {
+            recent.pop_front();
+        }
+        // The window is one statement: it ends where the statement does.
+        if code.trim_end().ends_with(';') || code.trim_end().ends_with('}') {
+            recent.clear();
         }
     }
     hits
@@ -275,6 +365,18 @@ fn helper() -> String {
     format!("{}", Command::new("git").get_program().len())
 }
 fn last() { Command::new("git"); }
+const GIT: &str = "git";
+fn by_const() { Command::new(GIT).status(); }
+fn by_path() { tokio::process::Command::new("/usr/bin/git"); }
+fn by_value() { let p = "git".to_string(); spawn(p); }
+fn shell() {
+    Command::new("sh")
+        .arg("-c")
+        .arg("cd /x && git status");
+}
+fn shell_start() { Command::new("bash").args(["-c", "git diff"]); }
+fn not_git() { Command::new("gitk"); let m = "git worktree add failed"; eprintln!("{m}"); }
+fn json_key() { let v = obj.get("git"); }
 "#;
-    assert_eq!(production_spawns(src), vec![2, 9, 15]);
+    assert_eq!(production_spawns(src), vec![2, 9, 15, 17, 18, 19, 23, 25]);
 }
