@@ -388,6 +388,77 @@ fn collect_within(rx: &std::sync::mpsc::Receiver<String>, cap: Duration) -> Stri
     out
 }
 
+// (#3466) An outer bound on every `run_bounded` call on this thread: a
+// caller that waits only so long for a whole set of probes (a profile
+// listing) sets it, so a probe still running when the caller stops waiting
+// is killed and reaped then, not left to run out its own longer bound.
+thread_local! {
+    static DEADLINE_CAP: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with every [`run_bounded`] call on this thread ending by `until`
+/// at the latest (`None`: no cap). A thread `f` spawns does not inherit it:
+/// read [`deadline_cap`] and set it there too.
+pub(crate) fn with_deadline_cap<T>(until: Option<Instant>, f: impl FnOnce() -> T) -> T {
+    let before = DEADLINE_CAP.with(|c| c.replace(until));
+    let out = f();
+    DEADLINE_CAP.with(|c| c.set(before));
+    out
+}
+
+/// This thread's cap ([`with_deadline_cap`]).
+pub(crate) fn deadline_cap() -> Option<Instant> {
+    DEADLINE_CAP.with(|c| c.get())
+}
+
+/// `deadline`, cut short by this thread's cap when that comes sooner.
+fn capped(deadline: Duration, start: Instant) -> Duration {
+    deadline_cap().map_or(deadline, |cap| deadline.min(cap.saturating_duration_since(start)))
+}
+
+/// Spawn `cmd` for [`run_bounded`]. Under a deadline cap
+/// ([`with_deadline_cap`]) the child gets its own process group, so the
+/// cap's kill ([`kill_child`]) reaches anything it forked too.
+fn spawn_capped(mut cmd: Command, phase: &'static str) -> Result<std::process::Child, HostError> {
+    if deadline_cap().is_some() {
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    }
+    // Name the actual program in the spawn error: the #1286 ledger reuses this
+    // runner for non-`lms` probes (vm_stat / sysctl / ps), so a hardcoded
+    // "lms" prefix would mislabel those failures.
+    let program = cmd.get_program().to_string_lossy().into_owned();
+    cmd.spawn().map_err(|e| HostError::CommandFailed {
+        detail: if e.kind() == std::io::ErrorKind::NotFound && is_lms_program(&program) {
+            // The first-run shape: LM Studio installed, its CLI never
+            // enabled (or `lms_bin` pointing somewhere wrong). Name the fix
+            // here, at the only place that knows the program was the problem.
+            // Only for `lms`: this runner also spawns the host-telemetry
+            // probes (vm_stat / sysctl / ps), and a missing one of those is
+            // not an LM Studio problem.
+            format!(
+                "`{program}` was not found ({phase}). Install LM Studio and enable its \
+                 command-line tool (`~/.lmstudio/bin/lms bootstrap`), or set `lms_bin` in \
+                 ~/.darkmux/config.json to where `lms` lives."
+            )
+        } else if e.kind() == std::io::ErrorKind::NotFound {
+            format!("`{program}` was not found ({phase})")
+        } else {
+            format!("spawning `{program}` ({phase}): {e}")
+        },
+    })
+}
+
+/// Kill a [`run_bounded`] child that ran out of time and reap it. Under a
+/// deadline cap it leads its own group ([`spawn_capped`]): the whole group
+/// is killed, so nothing it forked outlives the caller that stopped waiting.
+fn kill_child(child: &mut std::process::Child) {
+    if deadline_cap().is_some() {
+        let _ = darkmux_types::child_registry::kill_group(child.id(), darkmux_types::child_registry::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait(); // reap — the kill must not leave a zombie
+}
+
 /// Spawn `cmd` and wait for it under `deadline` — the #1276 fix as a
 /// mechanism: `spawn` + `try_wait` polling (std-only; no wait-timeout crate),
 /// and on expiry `kill()` + `wait()` (reaped, no zombie) + a typed
@@ -447,32 +518,11 @@ pub(crate) fn run_bounded(
         StdoutMode::Capture => Stdio::piped(),
     });
     cmd.stderr(Stdio::piped());
-    // Name the actual program in the spawn error: the #1286 ledger reuses this
-    // runner for non-`lms` probes (vm_stat / sysctl / ps), so a hardcoded
-    // "lms" prefix would mislabel those failures.
-    let program = cmd.get_program().to_string_lossy().into_owned();
-    let mut child = cmd.spawn().map_err(|e| HostError::CommandFailed {
-        detail: if e.kind() == std::io::ErrorKind::NotFound && is_lms_program(&program) {
-            // The first-run shape: LM Studio installed, its CLI never
-            // enabled (or `lms_bin` pointing somewhere wrong). Name the fix
-            // here, at the only place that knows the program was the problem.
-            // Only for `lms`: this runner also spawns the host-telemetry
-            // probes (vm_stat / sysctl / ps), and a missing one of those is
-            // not an LM Studio problem.
-            format!(
-                "`{program}` was not found ({phase}). Install LM Studio and enable its \
-                 command-line tool (`~/.lmstudio/bin/lms bootstrap`), or set `lms_bin` in \
-                 ~/.darkmux/config.json to where `lms` lives."
-            )
-        } else if e.kind() == std::io::ErrorKind::NotFound {
-            format!("`{program}` was not found ({phase})")
-        } else {
-            format!("spawning `{program}` ({phase}): {e}")
-        },
-    })?;
+    let mut child = spawn_capped(cmd, phase)?;
     let stdout_rx = spawn_drain(child.stdout.take());
     let stderr_rx = spawn_drain(child.stderr.take());
     let start = Instant::now();
+    let bound = capped(deadline.0, start);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -482,9 +532,8 @@ pub(crate) fn run_bounded(
             }
             Ok(None) => {
                 let waited = start.elapsed();
-                if waited >= deadline.0 {
-                    let _ = child.kill();
-                    let _ = child.wait(); // reap — the kill must not leave a zombie
+                if waited >= bound {
+                    kill_child(&mut child);
                     return Err(HostError::Timeout { phase, waited });
                 }
                 std::thread::sleep(POLL_INTERVAL);

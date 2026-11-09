@@ -96,6 +96,16 @@ pub fn preflight_with(scope: Scope, profiles_file: Option<&str>) -> Result<(), P
     refusal.into_result()
 }
 
+/// (#3466) Why every dispatch is refused at preflight now, on one line, for
+/// a listing's availability (`darkmux_profiles::engine::availability::list`);
+/// `None` when it passes. [`preflight_with`] at the dispatch scope, the
+/// chain every dispatch runs (config, registry, roles, skills), not a copy.
+pub fn dispatch_refusal(profiles_file: Option<&str>) -> Option<String> {
+    let text = preflight_with(Scope::Dispatch, profiles_file).err()?.to_string();
+    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    Some(lines.join("; "))
+}
+
 /// [`preflight_with`] against the default registry search.
 pub fn preflight(scope: Scope) -> Result<(), PreflightRefusal> {
     preflight_with(scope, None)

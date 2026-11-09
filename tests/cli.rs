@@ -900,6 +900,133 @@ fn profile_list_names_each_defined_endpoint() {
         .stdout(predicate::str::contains("hosted: unmanaged @ h.example"));
 }
 
+/// (#3466) `profile list --json` lists each profile model's availability:
+/// a stopped Tensorfold server whose engine is verified and has the model is
+/// `startable`, a model on LM Studio while LM Studio does not answer is
+/// `unknown`, and an unmanaged endpoint is `external`. The registry is still
+/// printed as before. Fakes stand in for `lms` and `tensorfold-native`, and
+/// each logs its calls: the listing loads and starts nothing.
+#[test]
+fn profile_list_json_reports_each_models_availability() {
+    let tmp = TempDir::new().unwrap();
+    let calls = tmp.path().join("calls.log");
+    let script = |name: &str, body: &str| {
+        let path = tmp.path().join(name);
+        fs::write(&path, format!("#!/bin/sh\necho \"{name} $*\" >> '{}'\n{body}", calls.display())).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        // A freshly written script's first exec can take seconds on a loaded
+        // Mac; run it once (logged as `--version`, a read-only question) so
+        // the listing's bound measures the listing.
+        let _ = std::process::Command::new(&path).arg("--version").output();
+        path
+    };
+    let lms = script("lms", "echo 'LM Studio is not running' >&2\nexit 1\n");
+    let tf = script(
+        "tensorfold-native",
+        "case \"$1\" in\n  --version) echo 'tensorfold-native 1.2.4';;\n  \
+         capabilities) echo '{\"schema\":1,\"serve\":{\"flags\":{}}}';;\n  \
+         models) echo '{\"schema\":1,\"models\":[{\"repo\":\"TF/m\"}]}';;\n  *) exit 9;;\nesac\n",
+    );
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let p = tmp.path().join("profiles.json");
+    fs::write(
+        &p,
+        format!(
+            r#"{{"profiles":{{
+                "a-lms":{{"models":[{{"id":"qwen","n_ctx":8192}}]}},
+                "b-tf":{{"models":[{{"id":"TF/m","n_ctx":8192,"endpoint":"tf"}}]}},
+                "c-api":{{"models":[{{"id":"gpt","endpoint":"api"}}]}}
+            }},"endpoints":{{"tf":{{"managed":"tensorfold","port":{port}}},"api":{{"url":"https://h.example/v1"}}}}}}"#
+        ),
+    )
+    .unwrap();
+    let out = darkmux_cmd()
+        .args(["profile", "list", "--json", "--profiles-file", p.to_str().unwrap()])
+        .env("DARKMUX_LMS_BIN", &lms)
+        .env("DARKMUX_TENSORFOLD_BIN", &tf)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v["registry"]["profiles"]["b-tf"].is_object(), "the registry is printed as before: {v}");
+    let rows = v["availability"].as_array().expect("an availability list");
+    let row = |profile: &str| rows.iter().find(|r| r["profile"] == profile).unwrap_or_else(|| panic!("{profile}: {v}"));
+    assert_eq!(row("a-lms")["state"], "unknown", "{v}");
+    assert!(row("a-lms")["reason"].as_str().unwrap().contains("LM Studio did not answer"), "{v}");
+    assert_eq!((row("a-lms")["engine"].as_str(), row("a-lms")["endpoint"].as_str()), (Some("lmstudio"), None));
+    assert_eq!(row("b-tf")["state"], "startable", "{v}");
+    assert_eq!(row("b-tf")["reason"], serde_json::Value::Null);
+    assert_eq!((row("b-tf")["engine"].as_str(), row("b-tf")["endpoint"].as_str()), (Some("tensorfold"), Some("tf")));
+    assert_eq!(row("b-tf")["model"], "TF/m");
+    assert_eq!(row("c-api")["state"], "external", "{v}");
+    assert_eq!(row("c-api")["engine"], serde_json::Value::Null);
+    let log = fs::read_to_string(&calls).unwrap();
+    for line in log.lines() {
+        let read_only = ["lms ps", "lms ls", "lms --version", "tensorfold-native --version", "tensorfold-native capabilities", "tensorfold-native models"];
+        assert!(read_only.iter().any(|r| line.starts_with(r)), "a listing asks only read-only questions: {line}");
+    }
+}
+
+/// (#3466 review) `profile list --json` reads the dispatch preflight: a
+/// registry it refuses (an `engine_args` flag darkmux sets itself) makes
+/// every model `unavailable`, naming why.
+#[test]
+fn profile_list_json_reads_the_dispatch_preflight() {
+    let tmp = TempDir::new().unwrap();
+    let p = tmp.path().join("profiles.json");
+    fs::write(
+        &p,
+        r#"{"profiles":{"a":{"models":[{"id":"qwen","n_ctx":8192}]},
+            "t":{"models":[{"id":"TF/m","n_ctx":8192,"endpoint":"tf","engine_args":["--port","9"]}]}},
+            "endpoints":{"tf":{"managed":"tensorfold","port":18095}}}"#,
+    )
+    .unwrap();
+    let out = darkmux_cmd()
+        .args(["profile", "list", "--json", "--profiles-file", p.to_str().unwrap()])
+        .env("DARKMUX_LMS_BIN", "/nonexistent/lms")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    for row in v["availability"].as_array().unwrap() {
+        assert_eq!(row["state"], "unavailable", "{row}");
+        assert!(row["reason"].as_str().unwrap().contains("engine_args"), "{row}");
+    }
+}
+
+/// (#3466 review) `profile list --json` leaves no probe behind: an `lms`
+/// that never answers is killed when the listing stops waiting for it, and
+/// the CLI exits only after that, so no child outlives the command.
+#[test]
+fn profile_list_json_leaves_no_probe_running() {
+    let tmp = TempDir::new().unwrap();
+    let pids = tmp.path().join("pids");
+    let lms = tmp.path().join("lms");
+    fs::write(&lms, format!("#!/bin/sh\necho $$ >> '{}'\nexec sleep 37\n", pids.display())).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&lms, fs::Permissions::from_mode(0o755)).unwrap();
+    let p = tmp.path().join("profiles.json");
+    fs::write(&p, r#"{"profiles":{"a":{"models":[{"id":"qwen","n_ctx":8192}]}}}"#).unwrap();
+    // The kill and the exit race, so one run proves little: five do.
+    for _ in 0..5 {
+        let out = darkmux_cmd()
+            .args(["profile", "list", "--json", "--profiles-file", p.to_str().unwrap()])
+            .env("DARKMUX_LMS_BIN", &lms)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["availability"][0]["state"], "unknown", "{v}");
+    }
+    let started: Vec<String> = fs::read_to_string(&pids).unwrap_or_default().lines().map(str::to_string).collect();
+    assert!(!started.is_empty(), "the fake lms ran");
+    for pid in started {
+        let alive = std::process::Command::new("kill").args(["-0", &pid]).status().unwrap().success();
+        assert!(!alive, "lms probe {pid} outlived `profile list --json`");
+    }
+}
+
 // `lab loop` rejects an out-of-range adaptive-trigger ratio before any
 // dispatch, loudly (a trust-the-bench surface). No model is touched.
 #[test]
@@ -1048,6 +1175,7 @@ EOF
         max_context_length: Some(32000),
         trained_for_tool_use: true,
         model_type: "llm".into(),
+        load_names: Vec::new(),
     };
     let moe_compactor = darkmux_heuristics::suggest_profile(&moe, darkmux_heuristics::TaskClass::Long)
         .compactor

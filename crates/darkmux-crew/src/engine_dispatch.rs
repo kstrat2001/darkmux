@@ -246,17 +246,10 @@ fn prepare_in(
 /// or a port alone proves nothing.
 fn refuse_engines_own_server(engine: &dyn ServerEngine, dirs: &Dirs, endpoint: &str) -> Result<(), EngineRefusal> {
     let Some(address) = engine.own_server()? else { return Ok(()) };
-    let ours = server::running(dirs, endpoint).is_some_and(|r| flint::endpoint_port(&address) == Some(r.port) && server::listens(&r));
-    if ours {
+    if flint::own_server_is_darkmuxs(&address, server::running(dirs, endpoint).as_ref()) {
         return Ok(());
     }
-    Err(refuse(
-        "engine_in_use",
-        format!(
-            "rec's own server is up or starting (at {address}), and rec runs one server per machine; darkmux never stops or \
-             takes over a server it did not start. Run `rec stop`, then dispatch again"
-        ),
-    ))
+    Err(refuse("engine_in_use", flint::own_server_refusal(&address)))
 }
 
 

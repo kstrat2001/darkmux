@@ -88,6 +88,7 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     ("src/init.rs", "Lmstudio", 3, "`init` plans the models on LM Studio's catalog when it is the engine (`ModelsEngine::Lmstudio`): an engine named, not an endpoint classified (#316)"),
     ("crates/darkmux-profiles/src/engine/mod.rs", "Lmstudio", 1, "`engine::local()` returns LM Studio when `default_engine` names it (`EngineChoice::Lmstudio`): the engine named, not an endpoint classified (#316)"),
     ("crates/darkmux-types/src/lib.rs", ".endpoint.is_none()", 1, "`ProfileRegistry::apply_default_engine`, THE rule that a model naming no endpoint is on the machine's default engine (#316)"),
+    ("crates/darkmux-profiles/src/engine/availability.rs", "Lmstudio", 3, "availability is asked per engine, and LM Studio is one: its arm in the one match on the backend (`ask`), its listing bound (a cold `lms` takes seconds) and its name in a reason (#3466). Endpoints are classified there through `EndpointKind`"),
     ("crates/darkmux-types/src/default_engine.rs", "Lmstudio", 3, "`default_engine` names a machine's engine, and LM Studio is one: the `EngineChoice::Lmstudio` variant and its two returns. Endpoints are classified there through `EndpointKind`, never by backend (#316)"),
     ("crates/darkmux-types/src/default_engine.rs", "\"lmstudio\"", 1, "the `default_engine` value that names LM Studio, the same spelling as the backend's config token (#316)"),
     ("crates/darkmux-lab/src/lab/scores.rs", "\"lmstudio\"", 1, "the engine label stamped on a score when the engine version is known (a recorded fact)"),

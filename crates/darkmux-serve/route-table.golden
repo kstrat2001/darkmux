@@ -50,6 +50,9 @@ GET /client/workspaces/:name/preview  json PreviewState (client listener: 127.0.
 DELETE /client/workspaces/:name/preview  json StatusWord (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
 
 # client listener response types: Type.field: type, from the JSON schema (every refusal is ClientError)
+Availability.reason?: string | null
+Availability.state: AvailabilityState
+AvailabilityState = "resident" | "startable" | "unavailable" | "external" | "unknown"
 BranchChanges.base: string
 BranchChanges.base_branch: string
 BranchChanges.branch: string
@@ -62,6 +65,7 @@ BranchFile.path: string
 ClientError.error: string
 ClientMachine.id: string
 ClientMachine.name: string
+ClientProfileInfo.availability: Availability
 ClientProfileInfo.description?: string | null
 ClientProfileInfo.endpoint: string
 ClientProfileInfo.error?: string | null

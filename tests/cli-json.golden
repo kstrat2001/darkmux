@@ -51,6 +51,7 @@ ActiveWait
   resumes_in_secs: uint64 | null
   message: string
 Attribution = "per_process" | "estimated" | "unavailable" | "unknown"
+AvailabilityState = "resident" | "startable" | "unavailable" | "external" | "unknown"
 AvailableProfile
   name: string
   address: string
@@ -732,6 +733,13 @@ ModSite
   file: string
   start_line: uint64
   end_line: uint64
+ModelAvailability
+  profile: string
+  model: string
+  endpoint: string | null
+  engine: string | null
+  state: AvailabilityState
+  reason: string | null
 ModelEndpoint
   url?: string | null
   api_version?: string | null
@@ -818,6 +826,7 @@ ProfileDraft = { [key: string]: DraftProfile }
 ProfileList
   registry_path: string
   registry: ProfileRegistry
+  availability: ModelAvailability[]
 ProfileModel
   id: string
   n_ctx?: uint32 | null

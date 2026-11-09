@@ -7978,6 +7978,7 @@ S(("127.0.0.1", port), H).serve_forever()
                 max_context_length: None,
                 trained_for_tool_use: false,
                 model_type: "llm".into(),
+                load_names: Vec::new(),
             };
             Ok(listed.into_iter().map(|model_key| darkmux_profiles::engine::ModelMeta { model_key, ..template.clone() }).collect())
         }

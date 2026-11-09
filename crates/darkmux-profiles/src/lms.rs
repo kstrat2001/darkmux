@@ -399,6 +399,14 @@ fn runtime_installed_at(runtime: &str, backends_dir: &std::path::Path) -> Option
     })
 }
 
+/// (#3466) The names `lms load` resolves for a `lms ls --json` row besides
+/// its `modelKey`: its `path` and each of its `variants` (`<key>@<variant>`).
+fn load_names_of(v: &serde_json::Value) -> Vec<String> {
+    let path = v.get("path").and_then(|s| s.as_str()).map(str::to_string);
+    let variants = v.get("variants").and_then(|a| a.as_array()).into_iter().flatten().filter_map(|s| s.as_str().map(str::to_string));
+    path.into_iter().chain(variants).collect()
+}
+
 fn meta_from_json(v: &serde_json::Value) -> Option<ModelMeta> {
     let model_key = v.get("modelKey").and_then(|s| s.as_str())?.to_string();
     Some(ModelMeta {
@@ -435,6 +443,7 @@ fn meta_from_json(v: &serde_json::Value) -> Option<ModelMeta> {
             .and_then(|s| s.as_str())
             .unwrap_or("llm")
             .to_string(),
+        load_names: load_names_of(v),
     })
 }
 

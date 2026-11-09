@@ -5,7 +5,7 @@
 
 use crate::{Check, Status};
 use darkmux_profiles::engine::flint::{Rec, VERIFIED_RELEASE};
-use darkmux_profiles::engine::tensorfold::{ServeFlags, Tensorfold, Version, VERIFIED_RELEASES};
+use darkmux_profiles::engine::tensorfold::{TensorfoldProbe, ServeFlags, Tensorfold, Version, VERIFIED_RELEASES};
 use darkmux_types::config_access::Source;
 use darkmux_types::{EndpointKind, ManagedBackend, ProfileRegistry};
 
@@ -24,15 +24,9 @@ pub(crate) struct TensorfoldFacts {
 impl TensorfoldFacts {
     fn probe() -> Self {
         let (bin, source) = darkmux_types::config_access::tensorfold_bin_with_source();
-        let tf = Tensorfold::at(bin.clone());
-        let msg = |e: anyhow::Error| format!("{e:#}");
-        TensorfoldFacts {
-            bin,
-            source,
-            version: tf.version().map_err(msg),
-            flags: tf.serve_flags().map_err(msg),
-            models: tf.models().map(|ms| ms.into_iter().map(|m| m.repo).collect()).map_err(msg),
-        }
+        // The same facts a profile listing's availability reads (#3466).
+        let TensorfoldProbe { version, flags, models } = TensorfoldProbe::probe(&Tensorfold::at(bin.clone()));
+        TensorfoldFacts { bin, source, version, flags, models }
     }
 }
 
@@ -118,18 +112,20 @@ fn verified(facts: &TensorfoldFacts, via: &str) -> Result<Version, Check> {
 }
 
 /// Every Tensorfold model the engine does not have, and every `engine_args`
-/// it does not accept.
+/// it does not accept: the per-model checks a listing's availability makes
+/// too ([`TensorfoldProbe::has_model`], [`TensorfoldProbe::args_problem`]).
 fn model_problems(models: &[TfModel], facts: &TensorfoldFacts) -> Vec<String> {
+    let shared = TensorfoldProbe { version: facts.version.clone(), flags: facts.flags.clone(), models: facts.models.clone() };
     let mut problems = Vec::new();
     match &facts.models {
-        Ok(have) => problems.extend(models.iter().filter(|(_, _, m)| !have.iter().any(|r| r == &m.id)).map(|(p, i, m)| {
+        Ok(_) => problems.extend(models.iter().filter(|(_, _, m)| shared.has_model(m) == Ok(false)).map(|(p, i, m)| {
             format!("profiles.{p}.models[{i}] names `{}`, which `tensorfold-native models` does not list", m.id)
         })),
         Err(e) => problems.push(format!("could not list its models: {e}")),
     }
     match &facts.flags {
-        Ok(flags) => problems.extend(models.iter().filter(|(_, _, m)| !m.engine_args.is_empty()).filter_map(|(p, i, m)| {
-            flags.check(&m.engine_args).err().map(|why| format!("profiles.{p}.models[{i}].engine_args: {why}"))
+        Ok(_) => problems.extend(models.iter().filter_map(|(p, i, m)| {
+            shared.args_problem(m).ok().flatten().map(|why| format!("profiles.{p}.models[{i}].engine_args: {why}"))
         })),
         Err(e) => problems.push(format!("could not read its serve flags: {e}")),
     }

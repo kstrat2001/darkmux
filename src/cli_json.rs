@@ -68,11 +68,54 @@ pub(crate) struct CorrectionList {
     pub corrections: Vec<Correction>,
 }
 
-/// `profile list --json`: the registry and the path it was read from.
+/// `profile list --json`: the registry and the path it was read from, and
+/// (#3466) whether darkmux can make each profile model resident.
 #[derive(Serialize, JsonSchema)]
 pub(crate) struct ProfileList<'a> {
     pub registry_path: String,
     pub registry: &'a ProfileRegistry,
+    pub availability: Vec<ModelAvailability>,
+}
+
+/// One profile model's availability (DESIGN.md, "What an app reads").
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct ModelAvailability {
+    pub profile: String,
+    pub model: String,
+    /// The model's `endpoints` id; `null` for a model that names none.
+    pub endpoint: Option<String>,
+    /// The managed engine (`lmstudio`, `tensorfold`); `null` for an endpoint
+    /// darkmux only sends requests to, or one it cannot resolve.
+    pub engine: Option<String>,
+    pub state: darkmux_profiles::engine::availability::AvailabilityState,
+    /// Why, for `unavailable` and `unknown`.
+    pub reason: Option<String>,
+}
+
+impl ModelAvailability {
+    /// Every profile model in `registry` (read from `profiles_file`), each
+    /// engine asked once.
+    pub(crate) fn of(registry: &ProfileRegistry, profiles_file: Option<&str>) -> Vec<Self> {
+        use darkmux_types::config_enum::ConfigEnum;
+        let rows: Vec<(&String, &darkmux_types::ProfileModel)> =
+            registry.profiles.iter().flat_map(|(name, p)| p.models.iter().map(move |m| (name, m))).collect();
+        let models: Vec<darkmux_types::ProfileModel> = rows.iter().map(|(_, m)| (*m).clone()).collect();
+        let listing = darkmux_profiles::engine::availability::list(&models, darkmux_crew::user_files::dispatch_refusal(profiles_file));
+        rows.into_iter()
+            .zip(listing.each)
+            .map(|((profile, m), a)| ModelAvailability {
+                profile: profile.clone(),
+                model: m.id.clone(),
+                endpoint: m.endpoint.as_ref().and_then(|e| e.named_id()).map(str::to_string),
+                engine: match m.endpoint_kind() {
+                    Ok(darkmux_types::EndpointKind::Managed(b)) => Some(b.token().to_string()),
+                    _ => None,
+                },
+                state: a.state,
+                reason: a.reason,
+            })
+            .collect()
+    }
 }
 
 /// `machine status --json`, for this machine or a roster peer.

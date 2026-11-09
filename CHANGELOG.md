@@ -16,6 +16,22 @@ darkmux release.
 
 ### Added
 
+- **Listings say whether darkmux can make each model resident (#3466).** `darkmux profile list --json`
+  gains an `availability` list (one row per profile model: `profile`, `model`, `endpoint`, `engine`,
+  `state`, `reason`), and each profile in `GET /client/profiles` an `availability` object
+  (`state`, `reason`). The state is `resident`, `startable` (a stopped Tensorfold or Flint server whose engine
+  is verified, has the model and has its port free reads this, so an app keeps it among its choices),
+  `unavailable` (with why), `external` (an endpoint darkmux only sends to) or `unknown` (a probe failed
+  or timed out; never read as `unavailable`). Anything the dispatch preflight refuses (config, registry,
+  a role or skill file) makes every model `unavailable` with the refusal as its reason. Each engine is
+  asked once per listing, all at once, within 10 s for LM Studio and 3 s for an engine binary (a probe
+  still running then is killed with its process group), and the listing loads and starts nothing.
+  Both shapes are additive; the client's `reachable` and `loaded` stay. A managed profile (LM Studio,
+  Tensorfold or Flint) is now `reachable` only when it is `resident` or `startable`, so an app picking the
+  first that answers never picks one whose dispatch would fail (LM Studio answering for a model it has
+  not downloaded used to read reachable); an engine server's `loaded` follows its availability. rec's own server running reads
+  `unavailable`, naming `rec stop`.
+
 - **rec's Flint is a second engine whose servers darkmux starts (#3453).** An endpoint declares
   `"managed": "flint"` with a `port`; a profile model on it names the revision rec has installed
   (`"id": "flint-int4"`) and its `n_ctx`. A dispatch to it starts rec's own server,

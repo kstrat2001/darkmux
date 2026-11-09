@@ -13,8 +13,9 @@
 //! (`https://localhost:x@api.example.com/v1`) is hosted, and an endpoint id
 //! the registry does not define refuses.
 
+use darkmux_profiles::engine::availability::{self, Availability, AvailabilityState};
 use darkmux_types::config_enum::ConfigEnum;
-use darkmux_types::endpoint::EndpointKind;
+use darkmux_types::endpoint::{EndpointKind, ManagedBackend};
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -30,13 +31,21 @@ pub struct ClientProfileInfo {
     /// `url` (an unmanaged server darkmux only sends to) or the managed
     /// backend's name (`lmstudio`).
     pub endpoint: String,
-    /// Its server answered just now.
+    /// For a managed model (LM Studio, a server darkmux starts), darkmux can
+    /// make it resident now: its `availability` is `resident` or
+    /// `startable`. For a URL server, it answered just now.
     pub reachable: bool,
     /// The model is loaded and serving (`None`: couldn't tell).
     pub loaded: Option<bool>,
     /// Why it couldn't be described (e.g. not in the registry).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// (#3466) Whether darkmux can make the model resident: `resident`,
+    /// `startable` (a stopped engine server darkmux would start),
+    /// `unavailable`, `external` (a server darkmux only sends to) or
+    /// `unknown` (a probe failed or ran out of time), with a reason for the
+    /// last two. `reachable` and `loaded` stay for older apps.
+    pub availability: Availability,
 }
 
 impl ClientProfileInfo {
@@ -49,6 +58,7 @@ impl ClientProfileInfo {
             endpoint: "unknown".into(),
             reachable: false,
             loaded: None,
+            availability: Availability::unknown(error.clone()),
             error: Some(error),
         }
     }
@@ -108,21 +118,24 @@ struct Selected {
     name: String,
     description: Option<String>,
     model: String,
-    /// The managed backend's name, or `None` for an unmanaged endpoint.
-    managed: Option<&'static str>,
+    /// The model as the profile declares it, endpoint and all.
+    declared: darkmux_types::ProfileModel,
+    /// The managed backend, or `None` for an unmanaged endpoint.
+    managed: Option<ManagedBackend>,
     /// The unmanaged endpoint's URL.
     url: Option<String>,
 }
 
 fn selected(target: darkmux_crew::target::Target) -> Selected {
     let managed = match target.kind {
-        EndpointKind::Managed(backend) => Some(backend.token()),
+        EndpointKind::Managed(backend) => Some(backend),
         EndpointKind::Unmanaged => None,
     };
     Selected {
         name: target.profile_name,
         description: target.profile.description,
-        model: target.model.id,
+        model: target.model.id.clone(),
+        declared: target.model,
         url: managed.map_or(target.endpoint.url, |_| None),
         managed,
     }
@@ -148,22 +161,39 @@ fn probe_servers(entries: &[Result<Selected, String>]) -> HashMap<String, bool> 
     })
 }
 
-/// What one selected profile reports, given the probes.
+/// What one selected profile reports, given the probes and its availability.
 fn describe(
     s: Selected,
     up: &HashMap<String, bool>,
-    managed_loaded: Option<&Vec<darkmux_types::LoadedModel>>,
+    lmstudio_loaded: Option<&Vec<darkmux_types::LoadedModel>>,
+    availability: Availability,
 ) -> ClientProfileInfo {
+    // A managed model is reachable only when darkmux can make it resident
+    // now, one rule for every engine: an app that picks the first profile
+    // that answers must not pick one a dispatch would refuse (an engine
+    // that answered but lacks the model, an unverified engine).
+    let can_run = matches!(
+        availability.state,
+        AvailabilityState::Resident | AvailabilityState::Startable
+    );
     let (endpoint, reachable, loaded) = match (s.managed, &s.url) {
-        (Some(backend), _) => match managed_loaded {
-            Some(models) => {
-                let here = models
+        // An engine server darkmux starts: `loaded` is its availability.
+        (Some(backend), _) if EndpointKind::Managed(backend).starts_servers() => {
+            let state = availability.state;
+            let here = (state != AvailabilityState::Unknown)
+                .then_some(state == AvailabilityState::Resident);
+            (backend.token(), can_run, here)
+        }
+        // The managed backend that reports its residents (LM Studio): its
+        // `loaded` keeps its older reading of them.
+        (Some(backend), _) => {
+            let here = lmstudio_loaded.map(|models| {
+                models
                     .iter()
-                    .any(|m| m.model == s.model || m.identifier.ends_with(&s.model));
-                (backend, true, Some(here))
-            }
-            None => (backend, false, None),
-        },
+                    .any(|m| m.model == s.model || m.identifier.ends_with(&s.model))
+            });
+            (backend.token(), can_run, here)
+        }
         (None, url) => {
             let answered = url
                 .as_ref()
@@ -181,15 +211,17 @@ fn describe(
         reachable,
         loaded,
         error: None,
+        availability,
     }
 }
 
 /// The production `ClientServerState::profile_info`: the registry read once,
 /// each profile resolved for `role` as dispatch would (the model it reports
 /// is the one the work would run on), each distinct server probed once and
-/// all at the same time (about 1 s at most), and the managed backend's
-/// listing asked for once. Looked at per profile, 30-odd local profiles took
-/// longer than an app waits.
+/// all at the same time (about 1 s at most), and each managed engine asked
+/// its availability once, at the same time as the servers, within
+/// `availability::LISTING_BOUND`. Looked at per profile, 30-odd local
+/// profiles took longer than an app waits.
 pub fn describe_profiles(
     role_id: &str,
     names: &[String],
@@ -207,16 +239,34 @@ pub fn describe_profiles(
         .iter()
         .map(|name| target_of(&loaded, &role, name).map(selected))
         .collect();
-    let up = probe_servers(&entries);
-    let needs_managed = entries
+    let declared: Vec<darkmux_types::ProfileModel> = entries
         .iter()
-        .any(|e| e.as_ref().is_ok_and(|s| s.managed.is_some()));
-    let managed_loaded = needs_managed
-        .then(|| darkmux_profiles::engine::lmstudio().loaded().ok())
-        .flatten();
+        .filter_map(|e| e.as_ref().ok().map(|s| s.declared.clone()))
+        .collect();
+    let (up, listing) = std::thread::scope(|s| {
+        let listing = s.spawn(|| {
+            availability::list(&declared, darkmux_crew::user_files::dispatch_refusal(None))
+        });
+        let up = probe_servers(&entries);
+        let listing = listing.join().unwrap_or_else(|_| availability::Listing {
+            each: declared
+                .iter()
+                .map(|_| Availability::unknown("the availability probe panicked"))
+                .collect(),
+            lmstudio_residents: None,
+        });
+        (up, listing)
+    });
+    let lmstudio_loaded = listing.lmstudio_residents;
+    let mut each = listing.each.into_iter();
     entries
         .into_iter()
-        .map(|e| e.map(|s| describe(s, &up, managed_loaded.as_ref())))
+        .map(|e| {
+            e.map(|s| {
+                let a = each.next().expect("one availability per described profile");
+                describe(s, &up, lmstudio_loaded.as_ref(), a)
+            })
+        })
         .collect()
 }
 

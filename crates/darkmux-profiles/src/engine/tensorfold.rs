@@ -271,22 +271,76 @@ impl Tensorfold {
     }
 }
 
+/// What the installed binary says about itself, each answer kept apart so
+/// one failed probe does not hide the others. `darkmux doctor`'s Tensorfold
+/// row and a profile listing's availability read the same facts, asked the
+/// same way.
+#[derive(Debug, Clone)]
+pub struct TensorfoldProbe {
+    pub version: Result<Version, String>,
+    pub flags: Result<ServeFlags, String>,
+    /// The repos `models --json` lists.
+    pub models: Result<Vec<String>, String>,
+}
+
+impl TensorfoldProbe {
+    /// Ask `tf` its three read-only questions, all at once: each is bounded
+    /// by [`PROBE_BOUND`], so the whole probe is too.
+    pub fn probe(tf: &Tensorfold) -> Self {
+        let msg = |e: anyhow::Error| format!("{e:#}");
+        // A caller's cap on its probes (a listing's bound) holds on each
+        // probe's own thread too.
+        let cap = crate::gestalt_host::lms_host::deadline_cap();
+        std::thread::scope(|s| {
+            let version = s.spawn(|| crate::gestalt_host::lms_host::with_deadline_cap(cap, || tf.version().map_err(msg)));
+            let flags = s.spawn(|| crate::gestalt_host::lms_host::with_deadline_cap(cap, || tf.serve_flags().map_err(msg)));
+            let models = s.spawn(|| {
+                crate::gestalt_host::lms_host::with_deadline_cap(cap, || {
+                    tf.models().map(|ms| ms.into_iter().map(|m| m.repo).collect()).map_err(msg)
+                })
+            });
+            let gone = |what: &str| format!("the `{what}` probe panicked");
+            TensorfoldProbe {
+                version: version.join().unwrap_or_else(|_| Err(gone("--version"))),
+                flags: flags.join().unwrap_or_else(|_| Err(gone("capabilities --json"))),
+                models: models.join().unwrap_or_else(|_| Err(gone("models --json"))),
+            }
+        })
+    }
+
+    /// Whether the engine has `model` (`models --json` lists it); `Err` when
+    /// it could not list its models.
+    pub fn has_model(&self, model: &darkmux_types::ProfileModel) -> std::result::Result<bool, String> {
+        match &self.models {
+            Ok(have) => Ok(have.iter().any(|r| r == &model.id)),
+            Err(e) => Err(format!("could not list its models: {e}")),
+        }
+    }
+
+    /// Why the engine would not take `model`'s `engine_args` (`None`: it
+    /// takes them, or there are none); `Err` when it could not say which
+    /// flags it accepts.
+    pub fn args_problem(&self, model: &darkmux_types::ProfileModel) -> std::result::Result<Option<String>, String> {
+        if model.engine_args.is_empty() {
+            return Ok(None);
+        }
+        match &self.flags {
+            Ok(flags) => Ok(flags.check(&model.engine_args).err()),
+            Err(e) => Err(format!("could not read its serve flags: {e}")),
+        }
+    }
+}
+
 impl Tensorfold {
-    /// The server darkmux runs for `model` on `endpoint`: `tensorfold-native
-    /// serve <id>` with the model's `engine_args` first and darkmux's own
-    /// flags after them (loopback, the endpoint's `port`, the model's `n_ctx`
-    /// as `--context`, its `darkmux:` name, `host.docker.internal` allowed as
-    /// a Host so a dispatch container can reach it, no update check), so darkmux's
-    /// win wherever the engine takes the last of a repeated flag. The
-    /// `engine_args` darkmux sets are refused before this is reached
-    /// (`ProfileModel::engine_args_problem`).
-    pub fn serve_spec(
-        &self,
-        endpoint: &str,
-        port: u16,
-        model: &darkmux_types::ProfileModel,
-        version: Version,
-    ) -> Result<super::server::ServerSpec> {
+    /// The command darkmux runs for `model` on `port`, and the name it serves
+    /// the model under: `tensorfold-native serve <id>` with the model's
+    /// `engine_args` first and darkmux's own flags after them (loopback,
+    /// `port`, the model's `n_ctx` as `--context`, its `darkmux:` name,
+    /// `host.docker.internal` allowed as a Host so a dispatch container can
+    /// reach it, no update check), so darkmux's win wherever the engine takes
+    /// the last of a repeated flag. The `engine_args` darkmux sets are
+    /// refused before this is reached (`ProfileModel::engine_args_problem`).
+    pub fn serve_argv(&self, port: u16, model: &darkmux_types::ProfileModel) -> Result<(Vec<String>, String)> {
         let n_ctx = model.require_n_ctx()?;
         let served_name = crate::ownership::namespaced_identifier(model);
         let mut argv = vec![self.bin.clone(), "serve".to_string(), model.id.clone()];
@@ -305,6 +359,20 @@ impl Tensorfold {
             argv.push(value);
         }
         argv.push("--no-update-check".to_string());
+        Ok((argv, served_name))
+    }
+
+    /// The server darkmux runs for `model` on `endpoint`: [`Self::serve_argv`]
+    /// and what the record says about it.
+    pub fn serve_spec(
+        &self,
+        endpoint: &str,
+        port: u16,
+        model: &darkmux_types::ProfileModel,
+        version: Version,
+    ) -> Result<super::server::ServerSpec> {
+        let n_ctx = model.require_n_ctx()?;
+        let (argv, served_name) = self.serve_argv(port, model)?;
         Ok(super::server::ServerSpec {
             endpoint: endpoint.to_string(),
             engine: "tensorfold".to_string(),

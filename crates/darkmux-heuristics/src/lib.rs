@@ -596,6 +596,7 @@ mod tests {
             max_context_length: Some(max_ctx),
             trained_for_tool_use: true,
             model_type: "llm".into(),
+            load_names: Vec::new(),
         }
     }
 
