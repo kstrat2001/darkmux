@@ -3281,17 +3281,21 @@ fn route_dispatch(opts: &DispatchOpts) -> Result<Option<DispatchRoute>> {
                 target: Box::new(target),
             }
         }
-        // (#3448) The managed route loads through LM Studio, which never
-        // holds a Tensorfold model. Every dispatching preflight already
-        // refuses the endpoint (`config_enum::undispatchable_engine_endpoints`);
-        // this refuses it again for a caller that skipped preflight, so its
-        // model is never loaded into LM Studio by mistake.
-        darkmux_types::EndpointKind::Managed(darkmux_types::ManagedBackend::Tensorfold) => anyhow::bail!(
-            "darkmux dispatch: profile `{}` runs `{}` on a `tensorfold` endpoint, whose server darkmux cannot \
-             start yet (#3448); point a `url` endpoint at a server you started instead",
-            target.profile_name,
-            target.model.id
-        ),
+        // (#3448) A server darkmux starts takes the request path of an
+        // endpoint it sends to (its `chat_url` is the server's loopback
+        // port), local for the data boundary since it is a managed kind; the
+        // dispatch makes the model resident after its `dispatch.start`
+        // (`engine_dispatch::prepare`). Never the LM Studio route.
+        darkmux_types::EndpointKind::Managed(darkmux_types::ManagedBackend::Tensorfold) => {
+            let (system_prompt, provenance) =
+                hosted_system_prompt(opts, &resolved, brain_leaves_this_machine(&target))?;
+            DispatchRoute::Unmanaged {
+                role: Box::new(resolved.role),
+                system_prompt,
+                provenance: Box::new(provenance),
+                target: Box::new(target),
+            }
+        }
         darkmux_types::EndpointKind::Managed(_) => DispatchRoute::Managed(Box::new(target)),
     }))
 }
@@ -4605,6 +4609,35 @@ fn dispatch_unmanaged(
         "dispatch",
         build_unmanaged_record(&opts.role_id, session, execution, &pm.id, phase, darkmux_flow::Payload::DispatchStart(start)),
     );
+    // (#3448) A model on a server darkmux starts is made resident now,
+    // between `dispatch.start` and the call, with its `dispatch.model.*`
+    // records; a refusal is this execution's `dispatch.error`, with its code.
+    let resident = engine_resident(target, |p| {
+        let _ = darkmux_flow::record(build_unmanaged_record(&opts.role_id, session, execution, &pm.id, phase, p));
+    });
+    let _engine = match resident {
+        Ok(ready) => ready,
+        Err(refusal) => {
+            finish_single_call(
+                    &mut session_emitter,
+                    &mut bookend,
+                    build_unmanaged_record(
+                        &opts.role_id,
+                        session,
+                        execution,
+                        &pm.id,
+                        phase,
+                        darkmux_flow::Payload::DispatchError(DispatchEndPayload {
+                            endpoint: Some(label.clone()),
+                            error: Some(refusal.message.clone()),
+                            code: Some(refusal.code.to_string()),
+                            ..DispatchEndPayload::new(0)
+                        }),
+                    ),
+                );
+            return Err(refusal.into());
+        }
+    };
 
     // (#3211) The turn's live evidence, as a container turn has it: the
     // opener now (PROMPT), coalesced heartbeats while a streamed reply
@@ -4619,7 +4652,7 @@ fn dispatch_unmanaged(
     );
     let plain_body = single_shot_body(
         target.dialect,
-        &pm.id,
+        &target.wire_model(),
         system_prompt,
         &opts.message,
         opts.max_completion_tokens,
@@ -6314,6 +6347,44 @@ type SplitRoute = (Option<HostedRoute>, Option<crate::target::Target>);
 type HostedRoute = (crate::types::Role, String, crate::target::Target, crate::role_inputs::PromptProvenance);
 
 /// [`DispatchRoute`] as its hosted and managed halves (at most one is set).
+/// (#3448) Make `target`'s model resident when it runs on a server darkmux
+/// starts, recording each `dispatch.model.*` step through `record`; `None`
+/// for any other target.
+fn engine_resident(
+    target: &crate::target::Target,
+    mut record: impl FnMut(darkmux_flow::Payload),
+) -> Result<Option<crate::engine_dispatch::EngineReady>, crate::engine_dispatch::EngineRefusal> {
+    if !crate::engine_dispatch::is_engine_server(target) {
+        return Ok(None);
+    }
+    crate::engine_dispatch::prepare(target, &mut |n, p| record(model_record(n, p))).map(Some)
+}
+
+/// (#3448) The `dispatch.error` payload of a container dispatch whose model
+/// could not be made resident, carrying the refusal's code.
+fn refusal_terminal(
+    refusal: &crate::engine_dispatch::EngineRefusal,
+    wall_ms: u64,
+    endpoint: Option<&str>,
+    resume_from: Option<&std::path::Path>,
+) -> darkmux_flow::Payload {
+    let (mut payload, _) = ended_mid_run_terminal(&refusal.message, wall_ms, &TrajectorySummary::default(), endpoint, resume_from);
+    if let darkmux_flow::Payload::DispatchError(p) = &mut payload {
+        p.code = Some(refusal.code.to_string());
+    }
+    payload
+}
+
+/// (#3448) The flow payload of one `engine_dispatch` note.
+fn model_record(note: crate::engine_dispatch::Note, p: darkmux_flow::payload::DispatchModelPayload) -> darkmux_flow::Payload {
+    use crate::engine_dispatch::Note;
+    match note {
+        Note::Start => darkmux_flow::Payload::DispatchModelStart(p),
+        Note::Loading => darkmux_flow::Payload::DispatchModelLoading(p),
+        Note::Ready => darkmux_flow::Payload::DispatchModelReady(p),
+    }
+}
+
 fn split_route(route: Option<DispatchRoute>) -> SplitRoute {
     // (#316) Every dispatch is split here once, so a model on an engine that
     // loads on request is announced once.
@@ -6915,7 +6986,9 @@ fn resolve_container_model(
     // skip the local-probe/pin resolution entirely; there's no LMStudio
     // instance to probe when the brain is remote.
     let (model, resolved_profile) = if let Some(t) = agentic_pm {
-        (t.model.id.clone(), t.profile_name.clone())
+        // (#3448) The name the server answers to: the id as written on an
+        // endpoint darkmux only sends to, `darkmux:<id>` on a server it starts.
+        (t.wire_model(), t.profile_name.clone())
     } else {
         let r = resolve_dispatch_internal(
             role,
@@ -7241,6 +7314,44 @@ fn run_container(opts: &DispatchOpts, execution: &ExecutionId, mut run: Containe
                 payload,
             ));
         };
+
+    // (#3448) A model on a server darkmux starts is made resident now,
+    // between `dispatch.start` and the container, with its `dispatch.model.*`
+    // records; a refusal is this execution's `dispatch.error`, with its code.
+    let record_model = |p: darkmux_flow::Payload| {
+        let _ = darkmux_flow::record(crate::dispatch::build_dispatch_record(
+            darkmux_flow::Level::Info,
+            &opts.role_id,
+            &session,
+            execution,
+            Some(&model),
+            phase_id.as_deref(),
+            p,
+        ));
+    };
+    let resident = run.brain.agentic_pm.as_ref().map_or(Ok(None), |t| engine_resident(t, record_model));
+    let _engine = match resident {
+        Ok(ready) => ready,
+        Err(refusal) => {
+            let mut payload = refusal_terminal(
+                &refusal,
+                dispatch_start_instant.elapsed().as_millis() as u64,
+                run.unmanaged_endpoint_raw_label.as_deref(),
+                opts.resume_from.as_deref(),
+            );
+            merge_record_context(&mut payload, &opts.record_context);
+            bookend.close(crate::dispatch::build_dispatch_record(
+                darkmux_flow::Level::Error,
+                &opts.role_id,
+                &session,
+                execution,
+                Some(&model),
+                phase_id.as_deref(),
+                payload,
+            ));
+            return Err(refusal.into());
+        }
+    };
 
     let remote_auth = run.remote_auth.take();
     let mut launched = launch_container(opts, execution, &run, remote_auth)?;

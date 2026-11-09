@@ -302,6 +302,14 @@ flow_actions! {
     DispatchDegeneracyWarning => Dispatch, "dispatch.degeneracy.warning", Execution;
     DispatchWorkdirGitUnavailable => Dispatch, "dispatch.workdir_git_unavailable", Execution;
     DispatchRoute => Dispatch, "dispatch.route";
+    /// (#3448) A dispatch is making its model resident: starting the
+    /// engine server darkmux runs for it, after evicting any of darkmux's
+    /// own residents it needs the memory of.
+    DispatchModelStart => Dispatch, "dispatch.model.start", Execution;
+    /// (#3448) Still starting: every 10 s while the model loads.
+    DispatchModelLoading => Dispatch, "dispatch.model.loading", Execution;
+    /// (#3448) The model answers; the dispatch's first turn follows.
+    DispatchModelReady => Dispatch, "dispatch.model.ready", Execution;
     GhVerbExecuted => Gh, "gh.verb.executed";
     HookFired => Hook, "hook.fired";
     HookFailed => Hook, "hook.failed";

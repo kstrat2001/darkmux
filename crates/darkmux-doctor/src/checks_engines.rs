@@ -92,7 +92,7 @@ pub(crate) fn tensorfold_engine_status(registry: &ProfileRegistry, probe: impl F
     }
     pass(format!(
         "Tensorfold {version} (`{}`{via}): {} model(s) on {endpoints} endpoint(s), each one the engine has, every \
-         `engine_args` flag accepted. darkmux does not start its servers yet, so dispatch refuses them (#3448)",
+         `engine_args` flag accepted; darkmux starts each server when a dispatch needs it",
         facts.bin,
         models.len()
     ))
@@ -172,7 +172,7 @@ mod tests {
     fn a_verified_engine_that_has_the_model_and_accepts_the_args_passes() {
         let c = tensorfold_engine_status(&registry(REG), || facts("tensorfold-native 1.2.4", &["TensorFold/Qwen3.8-27B-MLX-4bit"]));
         assert_eq!(c.status, Status::Pass, "{}", c.message);
-        assert!(c.message.contains("1.2.4") && c.message.contains("#3448"), "{}", c.message);
+        assert!(c.message.contains("1.2.4") && c.message.contains("starts each server"), "{}", c.message);
     }
 
     #[test]

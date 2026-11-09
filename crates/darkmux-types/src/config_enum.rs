@@ -589,26 +589,24 @@ pub fn invalid_engine_args(reg: &crate::ProfileRegistry) -> Vec<InvalidSetting> 
     out
 }
 
-/// (#3448) Every endpoint darkmux would have to start a server for, which no
-/// dispatch path does yet. Refused at every dispatching preflight, so a
-/// Tensorfold model is never taken for an LM Studio load; `darkmux doctor`
-/// reports it on the endpoint's line instead of failing it. Goes away when
-/// dispatch starts the server.
-pub fn undispatchable_engine_endpoints(reg: &crate::ProfileRegistry) -> Vec<InvalidSetting> {
+/// (#3448) The utility binding (`internal.utility`) on a server darkmux
+/// starts: the utility jobs (compaction, radio routing) send to LM Studio or
+/// to an endpoint darkmux only sends to, and do not start servers. Refused at
+/// every dispatching preflight, naming the binding, rather than sent to LM
+/// Studio under the Tensorfold model's name.
+pub fn utility_on_engine_server(reg: &crate::ProfileRegistry) -> Vec<InvalidSetting> {
     use crate::endpoint::{EndpointKind, ManagedBackend};
-    reg.endpoints
-        .iter()
-        .filter(|(_, ep)| matches!(ep.kind(), Ok(EndpointKind::Managed(ManagedBackend::Tensorfold))))
-        .map(|(id, _)| InvalidSetting {
-            set_in: SetIn::Profiles(format!("endpoints.{id}.managed")),
-            problem: "this darkmux reads a `tensorfold` endpoint but cannot start its server yet, so no dispatch \
-                      can use it (#3448)"
-                .to_string(),
-            valid: "until it can, a server you start yourself as a `url` endpoint: \
-                    `{\"url\": \"http://127.0.0.1:<port>/v1\", \"hardware\": \"submitting-machine\"}`"
-                .to_string(),
-        })
-        .collect()
+    let on_server = reg.utility_endpoint().is_some_and(|ep| matches!(ep.kind(), Ok(EndpointKind::Managed(ManagedBackend::Tensorfold))));
+    if !on_server {
+        return Vec::new();
+    }
+    vec![InvalidSetting {
+        set_in: SetIn::Profiles("internal.utility.endpoint".to_string()),
+        problem: "the utility model is bound to a `tensorfold` endpoint, and darkmux's utility jobs do not start \
+                  engine servers (#3448)"
+            .to_string(),
+        valid: "a utility model on LM Studio (no `endpoint`) or on an endpoint darkmux only sends to (a `url`)".to_string(),
+    }]
 }
 
 /// (#2902 step 5) The valid shape of an endpoint's `limits`, for a refusal.

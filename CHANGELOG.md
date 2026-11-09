@@ -16,6 +16,17 @@ darkmux release.
 
 ### Added
 
+- **A dispatch to a Tensorfold profile starts its server (#3448).** darkmux makes the model resident
+  between `dispatch.start` and the first request on every dispatch path that runs a role (single-shot, the
+  container path, CLI `dispatch`, a mission's `dispatch` steps), reusing its server when it already runs the profile's
+  command. Short of memory, it first stops its own idle engine servers and unloads its own idle LM
+  Studio `darkmux:` loads, never one a running dispatch holds. The new `dispatch.model.start`,
+  `.loading` (every 10 s) and `.ready` records say so, and a refusal is a `dispatch.error` with a
+  stable `code`: `busy`, `wont_fit`, `model_start_failed`, `port_in_use` or `engine_unavailable`.
+  The model is sent under its `darkmux:` name. A utility binding on a Tensorfold endpoint is refused at
+  preflight, and a `dispatch.single_shot` / `dispatch.map` step naming one in `config.endpoint` is
+  refused by name: those steps call an endpoint directly and start no server. `FLOW_SCHEMA_VERSION` 2.6.0 -> 2.7.0, additive.
+
 - **Tensorfold endpoints are read and checked, not yet dispatched (#3448, part 1).** An endpoint
   can declare `"managed": "tensorfold"` with the `port` darkmux will serve it on, and a profile
   model on it can carry `engine_args` (extra `tensorfold-native serve` flags). `darkmux doctor`

@@ -18,8 +18,18 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const FLOW_SCHEMA_VERSION: &str = "2.6.0";
+pub const FLOW_SCHEMA_VERSION: &str = "2.7.0";
 // Version history:
+//   2.7.0 (#3448): three actions, `dispatch.model.start`, `.loading` and
+//           `.ready` (payload `DispatchModelPayload`: `engine`, `endpoint`,
+//           `model`, and `replacing`, `evicted` on start, `elapsed_ms` on
+//           loading and ready), written between `dispatch.start` and the
+//           first turn when a dispatch starts the engine server its model
+//           runs on; and `payload.code` on `dispatch.error` (`busy`,
+//           `wont_fit`, `model_start_failed`, `port_in_use`,
+//           `engine_unavailable`). ADDITIVE: a reader that does not know
+//           the actions keeps them as unknown records, and `code` is absent
+//           on every record before 2.7.0.
 //   2.6.0 (#3363): `dispatch.start` gains `payload.system_sha256` (SHA-256 of
 //           the assembled system prompt, taken where `system_chars` is) and
 //           `payload.prompt_additions` (`{identity, workspace_notes,
