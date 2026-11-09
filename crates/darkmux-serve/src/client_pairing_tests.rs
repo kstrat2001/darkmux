@@ -3550,3 +3550,81 @@ fn describing_many_profiles_looks_at_each_server_once() {
         .contains("not in this machine's profiles.json"));
 }
 
+// ---- template workspaces (a new project from a template) -------------------
+
+#[tokio::test]
+async fn a_template_becomes_a_fresh_local_project_named_for_the_bot() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"repo_url": HCR, "ref": "dev", "template": true, "bot": "Bakery"}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 201, "{v}");
+    assert_eq!(v["workspace"], "bakery");
+    assert_eq!(v["branch"], "main", "a fresh repo on main, runs commit there");
+    assert_eq!(v["repo"], Value::Null, "no remote: it's local until it goes to GitHub");
+    assert_eq!(v["from"], "github.com/kstrat2001/hcr@dev");
+    let dir = h.base.join("bakery");
+    assert!(dir.join("README.md").exists());
+    assert_eq!(run_git(Some(&dir), &["rev-list", "--count", "HEAD"]).trim(), "1", "none of the template's history");
+    assert_eq!(
+        run_git(Some(&dir), &["log", "-1", "--format=%s"]).trim(),
+        "Start from github.com/kstrat2001/hcr@dev"
+    );
+    assert!(run_git(Some(&dir), &["remote"]).trim().is_empty());
+    assert!(run_git(Some(&dir), &["status", "--porcelain"]).trim().is_empty(), "everything is in the first commit");
+    assert!(!h.base.join(".bakery.partial").exists());
+}
+
+#[tokio::test]
+async fn a_template_is_never_reused() {
+    let h = harness();
+    let token = paired(&h).await;
+    let body = serde_json::json!({"repo_url": HCR, "ref": "dev", "template": true, "bot": "Bakery"});
+    let (first, a) = call(&h, post("/client/workspaces", Some(&token), body.clone())).await;
+    let (second, b) = call(&h, post("/client/workspaces", Some(&token), body)).await;
+    assert_eq!((first, second), (201, 201), "{a} {b}");
+    assert_eq!(b["workspace"], "bakery-2", "a second project, never the first one's files");
+    assert_eq!(h.cloned.lock().unwrap().len(), 2);
+    // And a plain clone of the same repo never picks up a template project.
+    let (code, c) = call(&h, post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR}))).await;
+    assert_eq!(code, 201, "{c}");
+    assert_eq!(c["workspace"], "hcr");
+}
+
+#[tokio::test]
+async fn a_template_needs_a_repo_url_and_nothing_else() {
+    let h = harness();
+    let token = paired(&h).await;
+    for body in [
+        serde_json::json!({"template": true, "bot": "Bakery"}),
+        serde_json::json!({"source_path": "/tmp/x", "template": true}),
+    ] {
+        let (code, v) = call(&h, post("/client/workspaces", Some(&token), body.clone())).await;
+        assert_eq!(code, 400, "{body}: {v}");
+    }
+    assert!(h.cloned.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_template_clone_leaves_nothing_behind() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"repo_url": "https://github.com/kstrat2001/fail", "template": true, "bot": "Bakery"}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 502, "{v}");
+    assert!(!h.base.join("bakery").exists() && !h.base.join(".bakery.partial").exists());
+}

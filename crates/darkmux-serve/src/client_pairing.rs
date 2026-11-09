@@ -1752,6 +1752,44 @@ struct WorkspaceBody {
     /// The asking bot's name, for the workspace and branch names.
     #[serde(default)]
     bot: Option<String>,
+    /// `repo_url` is a template: make a new project from it (at `ref`) with
+    /// none of its history and no remote, named for the bot; never reuse a
+    /// workspace.
+    #[serde(default)]
+    template: bool,
+}
+
+/// What a workspace request asks for.
+enum WorkspaceAsk {
+    Clone { url: String, normalized: String },
+    Template { url: String, normalized: String },
+    Worktree { path: String },
+}
+
+fn workspace_ask(req: &WorkspaceBody) -> Result<WorkspaceAsk, Refused> {
+    use crate::client_workspace as ws;
+    match (&req.repo_url, &req.source_path) {
+        (Some(url), None) => {
+            let Some(normalized) = ws::normalize_repo_url(url) else {
+                return Err(refuse(
+                    StatusCode::BAD_REQUEST,
+                    "repo_url must be https://host/owner/repo or git@host:owner/repo",
+                ));
+            };
+            let url = url.clone();
+            Ok(if req.template {
+                WorkspaceAsk::Template { url, normalized }
+            } else {
+                WorkspaceAsk::Clone { url, normalized }
+            })
+        }
+        (None, Some(path)) if !req.template => Ok(WorkspaceAsk::Worktree { path: path.clone() }),
+        (None, Some(_)) => Err(refuse(StatusCode::BAD_REQUEST, "a template needs `repo_url`, not `source_path`")),
+        _ => Err(refuse(
+            StatusCode::BAD_REQUEST,
+            "send `repo_url` or `source_path`, not both or neither",
+        )),
+    }
 }
 
 /// `POST /client/workspaces`: `{repo_url}` reuses the workspace whose origin
@@ -1772,48 +1810,41 @@ async fn workspace_create_handler(
         Ok(r) => r,
         Err(r) => return r,
     };
-    if let Some(r) = &req.git_ref {
-        if !ws::valid_ref(r) {
-            return err(
-                StatusCode::BAD_REQUEST,
-                format!("{r:?} is not a branch name"),
-            );
-        }
+    if let Some(r) = req.git_ref.as_deref().filter(|r| !ws::valid_ref(r)) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!("{r:?} is not a branch name"),
+        );
     }
-    let bot = ws::slug(req.bot.as_deref().unwrap_or("app"));
-    let bot = if bot.is_empty() {
-        "app".to_string()
-    } else {
-        bot
+    let bot = bot_slug(req.bot.as_deref());
+    let ask = match workspace_ask(&req) {
+        Ok(ask) => ask,
+        Err(r) => return *r,
     };
     let st = state.clone();
-    let made = match (req.repo_url, req.source_path) {
-        (Some(url), None) => {
-            let Some(normalized) = ws::normalize_repo_url(&url) else {
-                return err(
-                    StatusCode::BAD_REQUEST,
-                    "repo_url must be https://host/owner/repo or git@host:owner/repo",
-                );
-            };
-            tokio::task::spawn_blocking(move || {
-                clone_workspace(&st, &url, &normalized, req.git_ref.as_deref())
-            })
-            .await
-        }
-        (None, Some(path)) => {
-            tokio::task::spawn_blocking(move || {
-                worktree_workspace(&st, Path::new(&path), req.git_ref.as_deref(), &bot)
-            })
-            .await
-        }
-        _ => {
-            return err(
-                StatusCode::BAD_REQUEST,
-                "send `repo_url` or `source_path`, not both or neither",
-            )
-        }
-    };
-    made.unwrap_or_else(|e| internal(anyhow!("workspace setup panicked: {e}")))
+    let git_ref = req.git_ref;
+    tokio::task::spawn_blocking(move || make_workspace(&st, ask, git_ref.as_deref(), &bot))
+        .await
+        .unwrap_or_else(|e| internal(anyhow!("workspace setup panicked: {e}")))
+}
+
+/// The bot's name as it goes into workspace and branch names ("app" when
+/// it has none).
+fn bot_slug(bot: Option<&str>) -> String {
+    let slug = crate::client_workspace::slug(bot.unwrap_or("app"));
+    if slug.is_empty() {
+        "app".to_string()
+    } else {
+        slug
+    }
+}
+
+fn make_workspace(state: &ClientServerState, ask: WorkspaceAsk, git_ref: Option<&str>, bot: &str) -> Response {
+    match ask {
+        WorkspaceAsk::Clone { url, normalized } => clone_workspace(state, &url, &normalized, git_ref),
+        WorkspaceAsk::Template { url, normalized } => template_workspace(state, &url, &normalized, git_ref, bot),
+        WorkspaceAsk::Worktree { path } => worktree_workspace(state, Path::new(&path), git_ref, bot),
+    }
 }
 
 fn clone_workspace(
@@ -1845,6 +1876,75 @@ fn clone_workspace(
         Ok(dir) => (StatusCode::CREATED, Json(workspace_json(&name, &dir, true))).into_response(),
         Err(r) => *r,
     }
+}
+
+/// A new project from a template: cloned at `git_ref` beside its final
+/// name, its history and remote dropped, and started over as a fresh repo
+/// on `main` with one commit, so runs commit to it and nothing points back
+/// at the template. Named for the bot, never reused.
+fn template_workspace(
+    state: &ClientServerState,
+    url: &str,
+    normalized: &str,
+    git_ref: Option<&str>,
+    bot: &str,
+) -> Response {
+    let base = match (state.worktrees_base)() {
+        Ok(b) => b,
+        Err(e) => return internal(anyhow!(e)),
+    };
+    let _one_at_a_time = state.workspace_lock.lock().unwrap();
+    let Some(name) = free_project_name(&base, bot) else {
+        return err(StatusCode::CONFLICT, "no free workspace name for this project");
+    };
+    if let Err(r) = place_clone(state, url, normalized, git_ref, &base, &name) {
+        return *r;
+    }
+    let dir = base.join(&name);
+    let from = match git_ref {
+        Some(r) => format!("{normalized}@{r}"),
+        None => normalized.to_string(),
+    };
+    if let Err(e) = start_fresh(&dir, &format!("Start from {from}")) {
+        let _ = std::fs::remove_dir_all(&dir);
+        return internal(anyhow!("starting {name} from the template: {e}"));
+    }
+    match workspace_dir(state, &name) {
+        Ok(dir) => {
+            let mut v = workspace_json(&name, &dir, true);
+            v["from"] = from.into();
+            (StatusCode::CREATED, Json(v)).into_response()
+        }
+        Err(r) => *r,
+    }
+}
+
+/// `<bot>`, or with a number after it, free under the base (a partial
+/// clone's name counts as taken).
+fn free_project_name(base: &Path, bot: &str) -> Option<String> {
+    use crate::client_workspace as ws;
+    let taken = |n: &str| {
+        std::fs::symlink_metadata(base.join(n)).is_ok()
+            || std::fs::symlink_metadata(base.join(format!(".{n}.partial"))).is_ok()
+    };
+    std::iter::once(bot.to_string())
+        .chain((2..100).map(|n| format!("{bot}-{n}")))
+        .find(|n| ws::valid_name(n) && !taken(n))
+}
+
+/// Drops the clone's history and remote and makes it a new repo on `main`
+/// with everything in one commit.
+fn start_fresh(dir: &Path, message: &str) -> Result<(), String> {
+    std::fs::remove_dir_all(dir.join(".git")).map_err(|e| format!("removing the template's history: {e}"))?;
+    git_quiet(dir, &["init", "--quiet", "--initial-branch=main"])?;
+    // A Mac with no git identity yet can still commit here: this project
+    // gets its own, and the owner's takes over once there is one.
+    if git_line(dir, &["config", "user.email"]).unwrap_or_default().is_empty() {
+        git_quiet(dir, &["config", "user.name", "darkmux"])?;
+        git_quiet(dir, &["config", "user.email", "darkmux@localhost"])?;
+    }
+    git_quiet(dir, &["add", "-A"])?;
+    git_quiet(dir, &["commit", "--quiet", "-m", message])
 }
 
 /// The repo's workspace already here, its remote-tracking refs fetched.
