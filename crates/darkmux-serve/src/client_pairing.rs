@@ -35,8 +35,10 @@
 //! to another machine (`<p>@<machine>`), and must be allowed by the machine's
 //! `clients.profiles` setting, read fresh from `config.json` on every request
 //! (unset: any local profile, one that runs on this machine; a hosted one
-//! must be granted by name). A `workdir` must lie under
-//! the worktrees base (`validate_remote_workdir`).
+//! must be granted by name). A `workdir` must be exactly one workspace
+//! directly under the worktrees base (#3451 review): never the base itself,
+//! a dot entry beside the workspaces (darkmux's held repositories and
+//! records) or a path inside a workspace.
 //! `GET /client/recipe?workspace=` returns a workspace's preview recipe, for
 //! an app that cannot read the disk itself.
 //!
@@ -1495,7 +1497,14 @@ fn admitted_workdir(state: &ClientServerState, req: &WorkBody) -> Result<Option<
             StatusCode::BAD_REQUEST,
             "send `workdir` or `workspace`, not both",
         )),
-        (Some(w), None) => Ok(Some(checked_workdir(state, w)?)),
+        // (#3451 review) A raw `workdir` must be exactly one workspace
+        // directly under the base: not the base, not a dot entry beside the
+        // workspaces (darkmux's held repositories and records), not a path
+        // inside one. It is then admitted as that workspace by name.
+        (Some(w), None) => {
+            let name = workspace_of_workdir(state, w)?;
+            Ok(Some(workspace_dir(state, &name)?))
+        }
         (None, Some(name)) => Ok(Some(workspace_dir(state, name)?)),
         (None, None) => Ok(None),
     }

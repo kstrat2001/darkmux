@@ -498,6 +498,31 @@ pub fn validate_remote_workdir_in(path: &Path, canon_base: &Path) -> Result<Path
         );
     }
 
+    // 4. (#3451 review) Not the base itself, and nothing under a dot entry:
+    // beside the workspaces darkmux keeps the repositories it holds for them
+    // (`.<name>.git`) and its records (`.<name>.source`, `.gitdir`,
+    // `.template`), which a run handed them could rewrite.
+    if resolved == canon_base {
+        bail!(
+            "--workdir {} is the worktrees base itself, not a worktree under it",
+            resolved.display()
+        );
+    }
+    let dotted = resolved
+        .strip_prefix(canon_base)
+        .map(|rel| {
+            rel.components()
+                .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
+        })
+        .unwrap_or(true);
+    if dotted {
+        bail!(
+            "--workdir {} is under a dot entry of the worktrees base, which holds darkmux's own \
+             repositories and records, never a workdir",
+            resolved.display()
+        );
+    }
+
     Ok(resolved)
 }
 
@@ -1116,6 +1141,36 @@ mod tests {
         let sub = canon_base.join("my_worktree");
         std::fs::create_dir(&sub).unwrap();
         (tmp, canon_base, sub)
+    }
+
+    /// (#3451 review) The worktrees base itself, and any dot entry under it
+    /// (`.<name>.git`, a held repository; the `.source`/`.gitdir`/`.template`
+    /// records), are darkmux's own bookkeeping, never a workdir; a nested
+    /// coder-phase worktree (`<repo>/<phase>`) still is.
+    #[test]
+    fn validate_remote_workdir_in_refuses_the_base_and_dot_entries() {
+        let (_tmp, base, sub) = base_and_sub();
+        let err = validate_remote_workdir_in(&base, &base)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("the worktrees base itself"), "{err}");
+        for dot in [
+            base.join(".p.git"),
+            sub.join(".hidden"),
+            base.join(".p.git").join("objects"),
+        ] {
+            std::fs::create_dir_all(&dot).unwrap();
+            let err = validate_remote_workdir_in(&dot, &base)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("darkmux's own"), "{}: {err}", dot.display());
+        }
+        let nested = base.join("repo").join("phase-1");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert!(
+            validate_remote_workdir_in(&nested, &base).is_ok(),
+            "a coder-phase worktree"
+        );
     }
 
     #[test]

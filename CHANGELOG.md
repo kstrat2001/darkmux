@@ -91,6 +91,15 @@ darkmux release.
 
 ### Fixed
 
+- **A paired app's `workdir` is exactly one workspace (#3451 review).** `POST /client/work` checked a
+  raw `workdir` only for lying under the worktrees base, so it admitted the base itself and the dot
+  entries beside the workspaces: the repositories darkmux holds for them (`.<name>.git`) and its
+  `.source`, `.gitdir` and `.template` records. A run handed one of those could rewrite what host git
+  and the preview recipe trust. A client `workdir` must now be a workspace directly under the base,
+  admitted by its name. The shared check every queued or fleet workdir goes through also refuses the
+  base itself and anything under a dot entry; nested coder-phase worktrees (`<repo>/<phase>`) are
+  still admitted there.
+
 - **Host git never runs what a dispatch wrote into a git directory (#3457).** A dispatch mounts its
   workdir read-write, so a run could replace a coder-phase worktree's `.git` pointer with a
   directory whose config runs a command (`core.fsmonitor`, a clean filter, a `textconv`) or whose
