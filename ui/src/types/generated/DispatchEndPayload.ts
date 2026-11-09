@@ -58,7 +58,9 @@ stop_reason?: string,
  * beside `error` for a person: `busy` (the memory is held by a running
  * dispatch; retry later), `wont_fit` (the model does not fit even with
  * every darkmux resident evicted), `model_start_failed`, `port_in_use`,
- * `engine_unavailable`. Absent when the failure has no code.
+ * `engine_unavailable`, `engine_in_use` (#3453: the engine's own server,
+ * one darkmux did not start, is running, as rec's can be). Absent when
+ * the failure has no code.
  */
 code?: string, 
 /**

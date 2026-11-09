@@ -3596,6 +3596,164 @@ S(("127.0.0.1", port), H).serve_forever()
         assert_eq!((model.as_str(), profile.as_str()), ("darkmux:TensorFold/m", "p"));
     }
 
+    /// (#3453) A model on a Flint endpoint takes the request path, as a
+    /// Tensorfold one does, and routing alone starts nothing.
+    #[test]
+    #[serial]
+    fn a_flint_target_takes_the_request_path_and_routing_starts_nothing() {
+        let home = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+        let tmp = TempDir::new().unwrap();
+        let pf = tmp.path().join("profiles.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{"fl":{"models":[{"id":"flint-int4","n_ctx":32768,"endpoint":"fl"}]}},
+                "endpoints":{"fl":{"managed":"flint","port":8092}},
+                "default_profile":"fl"}"#,
+        )
+        .unwrap();
+        let mut o = dispatch_preflight_probe_opts();
+        o.role_id = "pr-reviewer".to_string();
+        o.config_path = Some(pf.to_str().unwrap().to_string());
+        let routed = one_call_context(&o);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        let ctx = routed.unwrap().expect("a tool-less role on a Flint endpoint is one call");
+        assert_eq!(ctx.model, "flint-int4");
+        assert!(
+            darkmux_types::engine_record::list_in(&home.path().join("run").join("engines")).0.is_empty(),
+            "routing starts no server"
+        );
+    }
+
+    /// (#3453) The single-shot path end to end against a stand-in rec
+    /// install (temp `DARKMUX_HOME` and `XDG_DATA_HOME`, a fake `rec` named by
+    /// `DARKMUX_FLINT_BIN`): the first dispatch starts rec's `rec-mlx serve
+    /// flint` between `dispatch.start` and its call and sends the model as
+    /// `flint`; the second reuses it; with rec's own server up, a dispatch
+    /// ends `dispatch.error` with `code: engine_in_use`.
+    #[test]
+    #[serial]
+    fn a_flint_dispatch_starts_recs_server_then_reuses_it_and_refuses_recs_own() {
+        let home = TempDir::new().unwrap();
+        let flows = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let rec = crate::engine_dispatch::tests::fake_rec(root.path(), "0.1.0");
+        let requests = root.path().join("requests.jsonl");
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let pm: darkmux_types::ProfileModel = {
+            let mut reg: darkmux_types::ProfileRegistry = serde_json::from_value(serde_json::json!({
+                "profiles": {"p": {"models": [{"id": "flint-int4", "n_ctx": 8192, "endpoint": "fl"}]}},
+                "endpoints": {"fl": {"managed": "flint", "port": port}}
+            }))
+            .unwrap();
+            reg.materialize_endpoints();
+            reg.profiles["p"].models[0].clone()
+        };
+        let target = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
+        let keys = ["DARKMUX_HOME", "DARKMUX_FLOWS_DIR", "DARKMUX_FLINT_BIN", "XDG_DATA_HOME"];
+        let saved: Vec<(&str, Option<String>)> = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", home.path());
+            std::env::set_var("DARKMUX_FLOWS_DIR", flows.path());
+            std::env::set_var("DARKMUX_FLINT_BIN", root.path().join("rec"));
+            std::env::set_var("XDG_DATA_HOME", root.path().join("share"));
+        }
+        let _ = rec;
+        /// Every server the dispatch started is killed when the test ends,
+        /// pass or fail.
+        struct Reap(std::path::PathBuf);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                for rec in darkmux_types::engine_record::list_in(&self.0).0 {
+                    use darkmux_types::child_registry::{kill_group, kill_pid, SIGKILL};
+                    let _ = kill_group(rec.pid, SIGKILL).or_else(|_| kill_pid(rec.pid, SIGKILL));
+                }
+            }
+        }
+        let _reap = Reap(home.path().join("run").join("engines"));
+        let run = |name: &str| {
+            let mut opts = dispatch_preflight_probe_opts();
+            opts.role_id = "pr-reviewer".to_string();
+            opts.session = crate::mission_test_session("m-3453", &format!("fl-{name}-{}", std::process::id()));
+            opts.json = false;
+            let session = opts.session.wire();
+            let result = dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), "s", &Default::default(), &target, true);
+            (result, session)
+        };
+        let (first, first_session) = run("first");
+        let (second, second_session) = run("second");
+        std::fs::write(root.path().join("status.json"), r#"{"ready":true,"endpoint":"http://127.0.0.1:11500/v1"}"#).unwrap();
+        let (refused, refused_session) = run("refused");
+        unsafe {
+            for (k, v) in &saved {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        let actions = |session: &str| -> Vec<serde_json::Value> {
+            let mut out = Vec::new();
+            for entry in std::fs::read_dir(flows.path()).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                for line in std::fs::read_to_string(&path).unwrap().lines() {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                        if v.get("session_id").and_then(|s| s.as_str()) == Some(session) {
+                            out.push(v);
+                        }
+                    }
+                }
+            }
+            out
+        };
+        let names = |recs: &[serde_json::Value]| -> Vec<String> {
+            recs.iter().filter_map(|r| r.get("action").and_then(|a| a.as_str()).map(str::to_string)).collect()
+        };
+        first.expect("the first dispatch succeeds against the started server");
+        let first_actions = names(&actions(&first_session));
+        let at = |a: &str| first_actions.iter().position(|x| x == a).unwrap_or_else(|| panic!("{a} in {first_actions:?}"));
+        assert!(at("dispatch.start") < at("dispatch.model.start"), "{first_actions:?}");
+        assert!(at("dispatch.model.ready") < at("dispatch.complete"), "{first_actions:?}");
+        second.expect("the second dispatch succeeds against the same server");
+        assert!(names(&actions(&second_session)).iter().all(|a| !a.starts_with("dispatch.model.")));
+        let sent: Vec<serde_json::Value> =
+            std::fs::read_to_string(&requests).unwrap().lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+        assert_eq!(sent.len(), 2, "one request per dispatch");
+        assert!(sent.iter().all(|b| b["model"] == "flint"), "`flint` on the wire: {sent:?}");
+        let err = refused.expect_err("rec's own server refuses the dispatch");
+        assert_eq!(crate::engine_dispatch::refusal_code(&err), Some("engine_in_use"));
+        let terminal = actions(&refused_session).into_iter().find(|r| r["action"] == "dispatch.error").expect("a dispatch.error");
+        assert_eq!(terminal["payload"]["code"], "engine_in_use", "{terminal}");
+    }
+
+    /// (#3453) The container path names a Flint model `flint`, the name
+    /// rec's server answers to.
+    #[test]
+    fn the_container_path_sends_a_flint_model_as_flint() {
+        let pm: darkmux_types::ProfileModel = {
+            let mut reg: darkmux_types::ProfileRegistry = serde_json::from_value(serde_json::json!({
+                "profiles": {"p": {"models": [{"id": "flint-int4", "n_ctx": 8192, "endpoint": "fl"}]}},
+                "endpoints": {"fl": {"managed": "flint", "port": 8092}}
+            }))
+            .unwrap();
+            reg.materialize_endpoints();
+            reg.profiles["p"].models[0].clone()
+        };
+        let target = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
+        let role = crate::loader::load_roles().unwrap().into_iter().find(|r| r.id == "coder").expect("the coder role");
+        let (model, profile, _) = resolve_container_model(&role, &dispatch_preflight_probe_opts(), Some(&target)).unwrap();
+        assert_eq!((model.as_str(), profile.as_str()), ("flint", "p"));
+    }
+
     /// (#3448 PR 4 review) The container path makes a Tensorfold model
     /// resident before it launches the container. Its body needs Docker to
     /// run, so this reads the source: `run_container` calls

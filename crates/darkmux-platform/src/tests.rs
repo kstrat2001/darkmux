@@ -876,3 +876,34 @@ fn the_fake_answers_only_the_footprints_the_test_set() {
     assert_eq!(fake.process_footprint(7), Some(7_000));
     assert_eq!(fake.process_footprint(8), None);
 }
+
+/// (#3453) Where an XDG-layout tool keeps per-user data: `$XDG_DATA_HOME`
+/// when it is an absolute path, else `~/.local/share`; a relative or empty
+/// `XDG_DATA_HOME` is ignored, as the base-directory spec says.
+#[test]
+fn xdg_data_home_is_the_env_when_absolute_else_local_share() {
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+    let home = Some(OsString::from("/Users/me"));
+    assert_eq!(xdg_data_home_from(None, home.clone()), Some(PathBuf::from("/Users/me/.local/share")));
+    assert_eq!(xdg_data_home_from(Some("/x/data".into()), home.clone()), Some(PathBuf::from("/x/data")));
+    assert_eq!(xdg_data_home_from(Some("rel/data".into()), home.clone()), Some(PathBuf::from("/Users/me/.local/share")));
+    assert_eq!(xdg_data_home_from(Some("".into()), home), Some(PathBuf::from("/Users/me/.local/share")));
+    assert_eq!(xdg_data_home_from(None, None), None);
+    assert_eq!(xdg_data_home_from(None, Some("".into())), None);
+}
+
+/// (#3453) macOS and Linux both answer the XDG location from this process's
+/// environment (rec keeps its install there on both); an OS with no strategy
+/// answers none; the fake answers what the test set.
+#[test]
+fn each_strategy_answers_the_xdg_data_home() {
+    let env = xdg_data_home_from(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"));
+    assert!(env.is_some(), "a test host has a home");
+    assert_eq!(MacPlatform.xdg_data_home(), env);
+    assert_eq!(LinuxPlatform.xdg_data_home(), env);
+    assert_eq!(OtherPlatform.xdg_data_home(), None);
+    let fake = FakePlatform { xdg_data_home: Some("/fake/share".into()), ..Default::default() };
+    assert_eq!(fake.xdg_data_home(), Some(std::path::PathBuf::from("/fake/share")));
+    assert_eq!(FakePlatform::default().xdg_data_home(), None);
+}

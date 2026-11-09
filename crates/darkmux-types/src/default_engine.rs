@@ -63,9 +63,11 @@ pub fn resolve(
         )));
     };
     match (ep.kind(), ep.resolved_dialect()) {
-        (Ok(EndpointKind::Managed(crate::endpoint::ManagedBackend::Tensorfold)), _) => Err(refuse(format!(
-            "endpoint `{value}` is a Tensorfold server darkmux starts for the profiles that name it, not a \
-             machine's engine; name `{LMSTUDIO}` or an endpoint darkmux only sends requests to"
+        // (#3448, #3453) A server darkmux starts per profile (Tensorfold, Flint).
+        (Ok(EndpointKind::Managed(backend)), _) if backend.starts_servers() => Err(refuse(format!(
+            "endpoint `{value}` is a {} server darkmux starts for the profiles that name it, not a \
+             machine's engine; name `{LMSTUDIO}` or an endpoint darkmux only sends requests to",
+            backend.display()
         ))),
         (Ok(EndpointKind::Managed(_)), _) => Err(refuse(format!(
             "endpoint `{value}` is managed by LM Studio; name that engine `{LMSTUDIO}`"
@@ -165,6 +167,7 @@ mod tests {
                 "mlx": {"url": "http://127.0.0.1:8080/v1"},
                 "lms": {"managed": "lmstudio"},
                 "tf": {"managed": "tensorfold", "port": 8091},
+                "fl": {"managed": "flint", "port": 8092},
                 "claude": {"url": "https://api.anthropic.com/v1"},
                 "odd": {"url": "http://127.0.0.1:9/v1", "dialect": "smoke-signals"},
             },
@@ -234,6 +237,9 @@ mod tests {
         // than calling it LM Studio.
         let tf = problem("tf");
         assert!(tf.contains("Tensorfold") && !tf.contains("LM Studio"), "{tf}");
+        // (#3453) So is a Flint one.
+        let fl = problem("fl");
+        assert!(fl.contains("Flint server darkmux starts") && !fl.contains("LM Studio"), "{fl}");
         assert!(
             problem("claude").contains("Messages API"),
             "{}",

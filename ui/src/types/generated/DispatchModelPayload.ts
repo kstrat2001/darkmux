@@ -9,7 +9,7 @@ import type { RecordContext } from "./RecordContext";
  */
 export type DispatchModelPayload = { 
 /**
- * The `managed` token (`tensorfold`).
+ * The `managed` token (`tensorfold`, `flint`).
  */
 engine: string, 
 /**

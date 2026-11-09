@@ -101,6 +101,7 @@ const KEYS: &[(&str, Ty)] = &[
     ("machine_id", Ty::Str),
     ("lms_bin", Ty::Str),
     ("engines.tensorfold.bin", Ty::Str),
+    ("engines.flint.bin", Ty::Str),
     ("default_engine", Ty::Str),
     ("lmstudio_url", Ty::Str),
     ("redis.enabled", Ty::Bool),

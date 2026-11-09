@@ -157,6 +157,11 @@ impl Platform for LinuxPlatform {
         }
     }
 
+    /// (#3453) The XDG layout, read from this process's environment.
+    fn xdg_data_home(&self) -> Option<std::path::PathBuf> {
+        crate::xdg_data_home_from(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))
+    }
+
     fn secret_store(&self) -> crate::SecretStore {
         crate::SecretStore::PrivateFile
     }

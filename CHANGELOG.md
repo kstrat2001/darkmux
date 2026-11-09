@@ -16,6 +16,25 @@ darkmux release.
 
 ### Added
 
+- **rec's Flint is a second engine whose servers darkmux starts (#3453).** An endpoint declares
+  `"managed": "flint"` with a `port`; a profile model on it names the revision rec has installed
+  (`"id": "flint-int4"`) and its `n_ctx`. A dispatch to it starts rec's own server,
+  `rec-mlx serve flint`, from rec's install (`$XDG_DATA_HOME/rec`, else `~/.local/share/rec`, read
+  only from rec 0.1.0, the release whose layout darkmux was verified against) on loopback with no
+  API key, and reuses, evicts and stops it exactly as it does a Tensorfold server. The model is
+  sent as `flint`, the one name rec's server answers to. `engine_args` take the `rec-mlx serve
+  flint` flags darkmux does not set itself (`--grammar`, `--enforce-tool-schemas`, `--metrics`,
+  `--temperature`, `--top-p`, `--top-k`, `--max-tokens`, `--fast-sync`/`--no-fast-sync`), checked
+  at load. rec runs one server per machine, so a second Flint endpoint is refused by every
+  dispatching preflight and failed by `darkmux doctor`, and a dispatch while rec's own server runs
+  is refused with the new code `engine_in_use`, naming `rec stop`: darkmux never stops or takes
+  over a server it did not start. `darkmux doctor` gains a `flint engine` row (rec's version, its
+  runtime and each Flint model's directory, and whether rec's own server is up).
+  `darkmux config set engines.flint.bin <path>` (or `DARKMUX_FLINT_BIN`) names `rec` when it is not
+  on `PATH`. No schema version moves: `flint` joins `PROFILES_SCHEMA_VERSION` 2.3,
+  `engines.flint.bin` joins `CONFIG_SCHEMA_VERSION` 2.8 and `engine_in_use` joins
+  `FLOW_SCHEMA_VERSION` 2.7.0, all unreleased.
+
 - **A dispatch to a Tensorfold profile starts its server (#3448).** darkmux makes the model resident
   between `dispatch.start` and the first request on every dispatch path that runs a role (single-shot, the
   container path, CLI `dispatch`, a mission's `dispatch` steps), reusing its server when it already runs the profile's

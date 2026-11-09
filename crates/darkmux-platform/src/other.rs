@@ -86,6 +86,10 @@ impl Platform for OtherPlatform {
         crate::MachineConfig::default()
     }
 
+    fn xdg_data_home(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
     fn secret_store(&self) -> crate::SecretStore {
         crate::SecretStore::PrivateFile
     }

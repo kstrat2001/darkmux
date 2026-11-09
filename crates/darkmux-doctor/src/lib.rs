@@ -144,6 +144,8 @@ pub fn run() -> DoctorReport {
         check_lms_binary(),
         // (#3448) Only asks the binary when an endpoint declares Tensorfold.
         checks_engines::check_tensorfold_engine(),
+        // (#3453) Only asks rec when an endpoint declares Flint.
+        checks_engines::check_flint_engine(),
         check_docker_runtime(),
         check_models_loaded(),
         check_profile_loaded_match(),
@@ -4183,6 +4185,8 @@ fn endpoints_status(
     invalid.extend(darkmux_types::config_enum::invalid_endpoint_hosts(registry));
     invalid.extend(darkmux_types::config_enum::misplaced_endpoint_hardware(registry));
     invalid.extend(darkmux_types::config_enum::invalid_engine_args(registry));
+    // (#3453) rec runs one Flint server per machine.
+    invalid.extend(darkmux_types::config_enum::extra_flint_endpoints(registry));
     if !bad.is_empty() || !invalid.is_empty() {
         let mut problems: Vec<String> = bad.iter().map(|b| format!("{}; {}", b.summary(), b.valid_line())).collect();
         problems.extend(invalid.iter().map(|v| format!("{}: {}", v.set_in, v.problem)));
@@ -4237,6 +4241,11 @@ fn endpoint_kind_label(ep: &darkmux_types::ModelEndpoint) -> String {
         // (#3448) darkmux starts its server when a dispatch needs it.
         Ok(darkmux_types::EndpointKind::Managed(darkmux_types::ManagedBackend::Tensorfold)) => format!(
             "managed (tensorfold, port {}; darkmux starts its server when a dispatch needs it)",
+            ep.port.unwrap_or_default()
+        ),
+        // (#3453) rec's server, started from rec's own install.
+        Ok(darkmux_types::EndpointKind::Managed(darkmux_types::ManagedBackend::Flint)) => format!(
+            "managed (flint, port {}; darkmux starts rec's server when a dispatch needs it)",
             ep.port.unwrap_or_default()
         ),
         Ok(darkmux_types::EndpointKind::Unmanaged) => {
@@ -12196,6 +12205,27 @@ mod tests {
         assert!(c.message.contains("profiles.p.models[0].engine_args") && c.message.contains("--host"), "{}", c.message);
     }
 
+    /// (#3453) A Flint endpoint is labeled as a server darkmux starts, and a
+    /// second Flint endpoint, which every preflight refuses, is Fail here
+    /// too, naming its path.
+    #[test]
+    fn a_flint_endpoint_is_labeled_and_a_second_one_fails() {
+        let one = materialized(
+            r#"{"profiles":{"p":{"models":[{"id":"flint-int4","n_ctx":8,"endpoint":"fl"}]}},
+                "endpoints":{"fl":{"managed":"flint","port":8092}}}"#,
+        );
+        let c = endpoints_status(&one, &mut no_spend, REGISTRY);
+        assert_eq!(c.status, Status::Pass, "{}", c.message);
+        assert!(c.message.contains("`fl`: managed (flint, port 8092; darkmux starts rec's server"), "{}", c.message);
+        let two = materialized(
+            r#"{"profiles":{"p":{"models":[{"id":"flint-int4","n_ctx":8,"endpoint":"fl"}]}},
+                "endpoints":{"fl":{"managed":"flint","port":8092},"fl2":{"managed":"flint","port":8093}}}"#,
+        );
+        let c = endpoints_status(&two, &mut no_spend, REGISTRY);
+        assert_eq!(c.status, Status::Fail, "{}", c.message);
+        assert!(c.message.contains("endpoints.fl2.managed") && c.message.contains("single-instance"), "{}", c.message);
+    }
+
     /// (#3397, #3399 review) `hardware` where darkmux already knows the
     /// answer, and an endpoint whose host it cannot read unambiguously, are
     /// Fail: every dispatching preflight refuses them. The URL (it may carry
@@ -12651,8 +12681,10 @@ mod tests {
         //
         // (#3448) 72: `checks_engines::check_tensorfold_engine` joined beside
         // the lms binary row.
+        //
+        // (#3453) 73: `checks_engines::check_flint_engine` joined beside it.
         let expected =
-            72 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            73 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

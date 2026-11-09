@@ -17,6 +17,7 @@ pub struct FakePlatform {
     pub secret_store: crate::SecretStore,
     pub machine_config: crate::MachineConfig,
     pub identifying_strings: Vec<String>,
+    pub xdg_data_home: Option<std::path::PathBuf>,
 }
 
 /// Every answer at its "nothing to report" value, so a test sets only the
@@ -36,6 +37,7 @@ impl Default for FakePlatform {
             secret_store: crate::SecretStore::PrivateFile,
             machine_config: crate::MachineConfig::default(),
             identifying_strings: Vec::new(),
+            xdg_data_home: None,
         }
     }
 }
@@ -124,6 +126,10 @@ impl Platform for FakePlatform {
 
     fn identifying_strings(&self) -> Vec<String> {
         self.identifying_strings.clone()
+    }
+
+    fn xdg_data_home(&self) -> Option<std::path::PathBuf> {
+        self.xdg_data_home.clone()
     }
 
     fn secret_store(&self) -> crate::SecretStore {

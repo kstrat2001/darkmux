@@ -659,7 +659,7 @@ MachineTotals
   projected_total_bytes: uint64 | null
   state: LedgerState
   shrink_hint?: string | null
-ManagedBackend = "lmstudio" | "tensorfold"
+ManagedBackend = "lmstudio" | "tensorfold" | "flint"
 MetricStats
   peak_pct: uint64 | null
   mean_pct: double | null

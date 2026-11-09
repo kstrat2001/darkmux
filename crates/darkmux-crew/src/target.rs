@@ -51,8 +51,14 @@ impl Target {
     /// The model id on the wire: darkmux's own namespaced instance on a
     /// managed endpoint (#2240: `darkmux:<key>`, or the profile's explicit
     /// `identifier` opt-out), the model id as written on an unmanaged one.
+    /// (#3453) On Flint it is `flint`, the one name rec's server answers to
+    /// (it has no `--name`); that server is darkmux's by its record, not its
+    /// name.
     pub fn wire_model(&self) -> String {
         match self.kind {
+            EndpointKind::Managed(darkmux_types::ManagedBackend::Flint) => {
+                darkmux_profiles::engine::flint::SERVED_NAME.to_string()
+            }
             EndpointKind::Managed(_) => crate::dispatch_internal::managed_wire_model(&self.model),
             EndpointKind::Unmanaged => self.model.id.clone(),
         }
@@ -64,9 +70,9 @@ impl Target {
     pub fn route_label(&self) -> Option<String> {
         match self.kind {
             EndpointKind::Unmanaged => Some(endpoint_route_label(&self.endpoint, &self.model.id)),
-            // (#3448) A server darkmux starts is labeled by where it serves,
-            // never left to read as the LM Studio default.
-            EndpointKind::Managed(darkmux_types::ManagedBackend::Tensorfold) => Some(darkmux_flow::unmanaged_route_label(
+            // (#3448, #3453) A server darkmux starts is labeled by where it
+            // serves, never left to read as the LM Studio default.
+            EndpointKind::Managed(backend) if backend.starts_servers() => Some(darkmux_flow::unmanaged_route_label(
                 &format!("127.0.0.1:{}", self.endpoint.port.unwrap_or_default()),
                 &self.model.id,
             )),
@@ -324,14 +330,18 @@ fn step_endpoint_of_any_kind(
         EndpointRef::Inline(inline) => (**inline).clone(),
     };
     let kind = ep.kind()?;
-    // (#3448) A step that names its own model and endpoint calls the endpoint
-    // directly and starts no server: on a Tensorfold endpoint it would fall
-    // through to an LM Studio load. Refused by name instead.
-    if kind == EndpointKind::Managed(darkmux_types::ManagedBackend::Tensorfold) {
-        anyhow::bail!(
-            "a step's `config.endpoint` names a `tensorfold` endpoint, and `dispatch.single_shot` / `dispatch.map` do \
-             not start engine servers (#3448); run it through a role and a `dispatch` step, which does"
-        );
+    // (#3448, #3453) A step that names its own model and endpoint calls the
+    // endpoint directly and starts no server: on a server darkmux starts
+    // (Tensorfold, Flint) it would fall through to an LM Studio load.
+    // Refused by name instead.
+    if let EndpointKind::Managed(backend) = kind {
+        if backend.starts_servers() {
+            anyhow::bail!(
+                "a step's `config.endpoint` names a `{}` endpoint, and `dispatch.single_shot` / `dispatch.map` do \
+                 not start engine servers (#3448); run it through a role and a `dispatch` step, which does",
+                darkmux_types::config_enum::ConfigEnum::token(backend)
+            );
+        }
     }
     Ok(Some((ep, kind)))
 }
@@ -435,6 +445,43 @@ mod resolve_tests {
             let msg = format!("{err:#}");
             assert!(msg.contains("tensorfold") && msg.contains("#3448"), "{msg}");
         }
+    }
+
+    /// (#3453) A step naming a Flint endpoint directly is refused by name,
+    /// as a Tensorfold one is.
+    #[test]
+    fn a_step_endpoint_on_flint_is_refused_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let pf = dir.path().join("profiles.json");
+        std::fs::write(&pf, r#"{"profiles":{"p":{"models":[{"id":"m","n_ctx":8}]}},"endpoints":{"fl":{"managed":"flint","port":8092}}}"#).unwrap();
+        let cfg = Some(pf.to_str().unwrap());
+        let fl = crate::step_config::EndpointRef::Id("fl".into());
+        for err in [super::step_unmanaged_endpoint(Some(&fl), cfg).unwrap_err(), super::step_managed_endpoint(Some(&fl), cfg).unwrap_err()] {
+            let msg = format!("{err:#}");
+            assert!(msg.contains("names a `flint` endpoint"), "{msg}");
+        }
+    }
+
+    /// (#3453) The wire model is per backend: rec has no `--name`, so a Flint
+    /// target is sent as `flint`; a Tensorfold one keeps its `darkmux:` name
+    /// and an LM Studio one its namespaced identifier. A Flint target's
+    /// records name where it serves, never the LM Studio default.
+    #[test]
+    fn the_wire_model_is_flint_on_a_flint_endpoint_and_darkmux_named_elsewhere() {
+        let target = |managed: &str| {
+            let mut reg: darkmux_types::ProfileRegistry = serde_json::from_value(serde_json::json!({
+                "profiles": {"p": {"models": [{"id": "flint-int4", "n_ctx": 8192, "endpoint": "e"}]}},
+                "endpoints": {"e": {"managed": managed, "port": 8092}}
+            }))
+            .unwrap();
+            reg.materialize_endpoints();
+            let profile = reg.profiles["p"].clone();
+            super::target_for("p".into(), profile.clone(), profile.models[0].clone()).unwrap()
+        };
+        let fl = target("flint");
+        assert_eq!(fl.wire_model(), "flint");
+        assert_eq!(fl.route_label().as_deref(), Some(darkmux_flow::unmanaged_route_label("127.0.0.1:8092", "flint-int4").as_str()));
+        assert_eq!(target("tensorfold").wire_model(), "darkmux:flint-int4");
     }
 
     /// A selected model whose endpoint id is undefined is an ERROR naming
