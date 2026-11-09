@@ -330,3 +330,59 @@ fn a_stale_hook_rule_stops_neither_the_sink_nor_the_dispatch() {
     let sink = darkmux_flow::hooks::HookSink::new(&rules, state.join("outbox"), std::sync::Arc::new(darkmux_flow::LocalFileSink));
     assert!(sink.is_ok(), "the sink loads: the rule just matches nothing");
 }
+
+/// (#3466 review) What a profile listing's availability reads: the preflight
+/// every dispatch runs (this module's [`preflight_with`], roles and skills
+/// included), on one line. Each of these refuses every dispatch, so every
+/// listed model reads `unavailable` with it: an `engine_args` flag darkmux
+/// sets itself, a utility binding on an engine server, and a role file
+/// with a key its schema does not know. Isolated: no host config is read.
+#[test]
+#[serial_test::serial]
+fn a_listing_reads_the_preflight_dispatch_runs() {
+    use darkmux_profiles::engine::availability::{list, AvailabilityState};
+    let state = IsolatedState::new();
+    let registry = |name: &str, json: &str| {
+        let path = state.join(format!("{name}.json"));
+        std::fs::write(&path, json).unwrap();
+        path.to_string_lossy().into_owned()
+    };
+    const LMS: &str = r#""lms":{"models":[{"id":"qwen","n_ctx":8192}]}"#;
+    let clean = registry("clean", &format!(r#"{{"profiles":{{{LMS}}}}}"#));
+    let port = registry(
+        "port",
+        &format!(
+            r#"{{"profiles":{{{LMS},"tf":{{"models":[{{"id":"TF/m","n_ctx":8192,"endpoint":"tf","engine_args":["--port","9"]}}]}}}},
+                "endpoints":{{"tf":{{"managed":"tensorfold","port":18093}}}}}}"#
+        ),
+    );
+    let utility = registry(
+        "utility",
+        &format!(
+            r#"{{"profiles":{{{LMS},"tf":{{"models":[{{"id":"TF/m","n_ctx":8192,"endpoint":"tf"}}]}}}},
+                "internal":{{"utility":{{"id":"TF/m","n_ctx":8192,"endpoint":"tf"}}}},
+                "endpoints":{{"tf":{{"managed":"tensorfold","port":18094}}}}}}"#
+        ),
+    );
+    assert_eq!(dispatch_refusal(Some(&clean)), None, "a clean setup passes");
+    let check = |file: &str, names: &str| {
+        let why = dispatch_refusal(Some(file)).unwrap_or_else(|| panic!("{file}: refused"));
+        assert!(why.contains(names) && !why.contains('\n'), "one line naming {names}: {why}");
+        let models: Vec<_> = darkmux_profiles::profiles::load_registry_quiet(Some(file))
+            .unwrap()
+            .registry
+            .profiles
+            .into_values()
+            .flat_map(|p| p.models)
+            .collect();
+        for a in list(&models, Some(why.clone())).each {
+            assert_eq!((a.state, a.reason.as_deref()), (AvailabilityState::Unavailable, Some(why.as_str())));
+        }
+    };
+    check(&port, "engine_args");
+    check(&utility, "internal.utility");
+    std::fs::create_dir_all(state.join("roles")).unwrap();
+    let role = with_key(embedded(crate::loader::BUILTIN_ROLES, "code-reviewer"), "", "zzz_bogus");
+    std::fs::write(state.join("roles/code-reviewer.json"), role.to_string()).unwrap();
+    check(&clean, "zzz_bogus");
+}

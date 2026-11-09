@@ -129,6 +129,7 @@ impl Engine for OpenAiCompatible {
                 max_context_length: None,
                 trained_for_tool_use: false,
                 model_type: "llm".to_string(),
+                load_names: Vec::new(),
             })
             .collect())
     }

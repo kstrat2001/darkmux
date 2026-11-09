@@ -1817,6 +1817,7 @@ fn cmd_profile(sub: ProfileCmd) -> Result<i32> {
                         max_context_length: max_ctx,
                         trained_for_tool_use: true,
                         model_type: "llm".into(),
+                        load_names: Vec::new(),
                     }
                 }
             };
@@ -2068,6 +2069,7 @@ fn cmd_profiles(config: Option<&str>, json: bool) -> Result<i32> {
         cli_json::emit(&cli_json::ProfileList {
             registry_path: loaded.path.display().to_string(),
             registry: &loaded.registry,
+            availability: cli_json::ModelAvailability::of(&loaded.registry, config),
         })?;
         return Ok(0);
     }

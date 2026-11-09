@@ -200,6 +200,19 @@ pub fn running(dirs: &Dirs, endpoint: &str) -> Option<EngineRecord> {
     None
 }
 
+/// darkmux's live server on `endpoint`, read only: a stale record is left
+/// for [`running`] (a dispatch) to clear, so a listing changes nothing.
+pub fn running_now(dirs: &Dirs, endpoint: &str) -> Option<EngineRecord> {
+    engine_record::read_in(&dirs.records, endpoint).ok().flatten().filter(alive)
+}
+
+/// The reuse rule [`ensure`] applies, and a listing's `resident`: darkmux's
+/// server `rec` runs exactly `argv`, answers under `served_name` on `port`,
+/// and is what listens there (never a server darkmux did not start).
+pub fn serves(rec: &EngineRecord, argv: &[String], port: u16, served_name: &str) -> bool {
+    rec.argv == argv && answers(port, served_name) && listens(rec)
+}
+
 /// Make `spec`'s server the one running on its endpoint, and wait until it
 /// answers. See the module doc for the steps.
 pub fn ensure(spec: &ServerSpec, dirs: &Dirs, bounds: Bounds, progress: &mut dyn FnMut(Progress)) -> Result<Ensured, ServerError> {
@@ -241,7 +254,7 @@ fn reuse_or_stop(
     progress: &mut dyn FnMut(Progress),
 ) -> Result<Option<EngineRecord>, ServerError> {
     let Some(rec) = running(dirs, &spec.endpoint) else { return Ok(None) };
-    if rec.argv == spec.argv && answers(spec.port, &spec.served_name) && listens(&rec) {
+    if serves(&rec, &spec.argv, spec.port, &spec.served_name) {
         return Ok(Some(rec));
     }
     progress(Progress::Replacing { model: rec.model.clone() });
@@ -435,7 +448,7 @@ fn gone_within(rec: &EngineRecord, bounds: Bounds) -> bool {
 }
 
 /// Whether anything accepts a connection on loopback `port`.
-fn port_taken(port: u16) -> bool {
+pub fn port_taken(port: u16) -> bool {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
 }

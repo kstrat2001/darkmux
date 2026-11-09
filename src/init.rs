@@ -497,6 +497,7 @@ pub fn choose_server_utility(current: &str, models: &[String]) -> Option<String>
             max_context_length: None,
             trained_for_tool_use: false,
             model_type: "llm".to_string(),
+            load_names: Vec::new(),
         })
         .collect();
     choose_utility_model(current, &metas)
@@ -1781,6 +1782,7 @@ mod tests {
             max_context_length: Some(32_768),
             trained_for_tool_use: true,
             model_type: kind.to_string(),
+            load_names: Vec::new(),
         }
     }
 

@@ -68,6 +68,24 @@ pub fn parse_status(stdout: &str, listening: &dyn Fn(u16) -> bool) -> Option<Str
     (ready || bound).then(|| endpoint.unwrap_or("an endpoint it did not name").to_string())
 }
 
+/// (#3453) Whether the server rec reports at `address` is darkmux's own, not
+/// rec's: darkmux's recorded server on the endpoint has that port and is what
+/// listens there (`server::listens`). A name or a port alone proves nothing.
+/// Dispatch refuses `engine_in_use` when it is not; a listing reads
+/// `unavailable`.
+pub fn own_server_is_darkmuxs(address: &str, darkmuxs: Option<&darkmux_types::engine_record::EngineRecord>) -> bool {
+    darkmuxs.is_some_and(|r| endpoint_port(address) == Some(r.port) && super::server::listens(r))
+}
+
+/// Why darkmux will not serve Flint while rec's own server at `address` is
+/// up: what a dispatch refuses with (`engine_in_use`) and a listing reads.
+pub fn own_server_refusal(address: &str) -> String {
+    format!(
+        "rec's own server is up or starting (at {address}), and rec runs one server per machine; darkmux never stops or \
+         takes over a server it did not start. Run `rec stop`, then dispatch again"
+    )
+}
+
 /// The port of `http://host:port/...`.
 pub fn endpoint_port(address: &str) -> Option<u16> {
     let rest = address.split_once("://").map_or(address, |(_, r)| r);

@@ -18,6 +18,7 @@
 //! `darkmux:` namespace (contract 4) stays the LM Studio backend's mechanism,
 //! in `crate::ownership`.
 
+pub mod availability;
 mod lmstudio;
 mod openai_compat;
 pub mod flint;
@@ -53,6 +54,18 @@ pub struct ModelMeta {
     /// Type per LMStudio: "llm", "embedding", etc. We typically filter to
     /// `"llm"` since profiles are for chat/agentic dispatch.
     pub model_type: String,
+    /// (#3466) Every other name the engine loads this model by: LM Studio's
+    /// `path` and each of its `variants` (`<key>@<variant>`), which `lms
+    /// load` resolves as it resolves the key.
+    pub load_names: Vec<String>,
+}
+
+impl ModelMeta {
+    /// Whether the engine loads this model when asked for `name`: its key,
+    /// or another name it gives it ([`ModelMeta::load_names`]).
+    pub fn answers_to(&self, name: &str) -> bool {
+        self.model_key == name || self.load_names.iter().any(|n| n == name)
+    }
 }
 
 /// What [`Engine::provenance`] reports. A fact LM Studio does not say is `None`.

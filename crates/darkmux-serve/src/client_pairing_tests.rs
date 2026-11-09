@@ -4247,6 +4247,7 @@ fn test_profile_info(name: &str) -> Result<ClientProfileInfo, String> {
             reachable: true,
             loaded: Some(true),
             error: None,
+            availability: darkmux_profiles::engine::availability::Availability::external(),
         }),
         "deep" => Ok(ClientProfileInfo {
             name: "deep".into(),
@@ -4256,6 +4257,7 @@ fn test_profile_info(name: &str) -> Result<ClientProfileInfo, String> {
             reachable: false,
             loaded: Some(false),
             error: None,
+            availability: darkmux_profiles::engine::availability::Availability::startable(),
         }),
         other => Err(format!("profile {other} is not in the registry")),
     }
@@ -4346,6 +4348,164 @@ fn describe_profile_reads_the_registry_and_probes_its_server() {
         .contains("not in this machine's profiles.json"));
 }
 
+/// An executable shell script `name` in `dir` running `body`.
+fn script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // A freshly written script's first exec can take seconds on a loaded
+    // Mac; run it once so a bounded probe measures the probe, not that.
+    let _ = std::process::Command::new(&path).arg("--version").output();
+    path
+}
+
+/// (#3466) Each listed profile carries its availability: a stopped
+/// Tensorfold server whose engine is verified and has the model is
+/// `startable` (so Auto mode keeps it), LM Studio not answering is
+/// `unknown`, and an unmanaged server is `external`. The older `reachable`
+/// and `loaded` fields read as before for LM Studio and the URL server.
+#[test]
+#[serial_test::serial]
+fn describe_profiles_reports_each_profiles_availability() {
+    let tmp = tempfile::tempdir().unwrap();
+    let lms = script(tmp.path(), "lms", "exit 1\n");
+    let tf = script(
+        tmp.path(),
+        "tensorfold-native",
+        "case \"$1\" in\n  --version) echo 'tensorfold-native 1.2.4';;\n  \
+         capabilities) echo '{\"schema\":1,\"serve\":{\"flags\":{}}}';;\n  \
+         models) echo '{\"schema\":1,\"models\":[{\"repo\":\"TF/m\"}]}';;\n  *) exit 9;;\nesac\n",
+    );
+    let up = answering_401();
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let registry = tmp.path().join("profiles.json");
+    std::fs::write(
+        &registry,
+        format!(
+            r#"{{"profiles":{{
+                "lms":{{"models":[{{"id":"qwen","n_ctx":32000}}]}},
+                "tf":{{"models":[{{"id":"TF/m","n_ctx":32000,"endpoint":"tf"}}]}},
+                "url":{{"models":[{{"id":"flint","n_ctx":32000,"endpoint":"up"}}]}}
+            }},"endpoints":{{
+                "tf":{{"managed":"tensorfold","port":{port}}},
+                "up":{{"url":"http://127.0.0.1:{up}/v1"}}
+            }}}}"#
+        ),
+    )
+    .unwrap();
+    let names = ["lms", "tf", "url"].map(String::from);
+    let got = with_env_vars(
+        &[
+            ("DARKMUX_PROFILES", registry.as_os_str()),
+            ("DARKMUX_LMS_BIN", lms.as_os_str()),
+            ("DARKMUX_TENSORFOLD_BIN", tf.as_os_str()),
+        ],
+        || describe_profiles("coder", &names),
+    );
+    let [lms, tf, url] = [0, 1, 2].map(|i| got[i].clone().unwrap());
+    use darkmux_profiles::engine::availability::AvailabilityState as S;
+    assert_eq!(lms.availability.state, S::Unknown, "{lms:?}");
+    assert!(lms.availability.reason.as_deref().unwrap().contains("LM Studio did not answer"), "{lms:?}");
+    assert_eq!((lms.reachable, lms.loaded), (false, None), "LM Studio's older fields as before");
+    assert_eq!(tf.availability.state, S::Startable, "{tf:?}");
+    assert_eq!(tf.endpoint, "tensorfold");
+    assert_eq!((tf.reachable, tf.loaded), (true, Some(false)), "a Tensorfold profile's older fields follow its availability");
+    assert_eq!(url.availability.state, S::External, "{url:?}");
+    assert!(url.reachable, "the URL server is still probed: {url:?}");
+}
+
+/// (#3466 review) An engine-server profile is `reachable` only when darkmux
+/// can make it resident now (`resident` or `startable`): an app that picks
+/// "the first that answers" must not pick one whose dispatch would fail
+/// `engine_unavailable`. An unverified Tensorfold, with LM Studio down too.
+#[test]
+#[serial_test::serial]
+fn an_unavailable_engine_server_is_not_reachable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let lms = script(tmp.path(), "lms", "exit 1\n");
+    let tf = script(
+        tmp.path(),
+        "tensorfold-native",
+        "case \"$1\" in\n  --version) echo 'tensorfold-native 1.3.0';;\n  \
+         capabilities) echo '{\"schema\":1,\"serve\":{\"flags\":{}}}';;\n  \
+         models) echo '{\"schema\":1,\"models\":[{\"repo\":\"TF/m\"}]}';;\n  *) exit 9;;\nesac\n",
+    );
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let registry = tmp.path().join("profiles.json");
+    std::fs::write(
+        &registry,
+        format!(r#"{{"profiles":{{"tf":{{"models":[{{"id":"TF/m","n_ctx":32000,"endpoint":"tf"}}]}}}},
+            "endpoints":{{"tf":{{"managed":"tensorfold","port":{port}}}}}}}"#),
+    )
+    .unwrap();
+    let got = with_env_vars(
+        &[
+            ("DARKMUX_PROFILES", registry.as_os_str()),
+            ("DARKMUX_LMS_BIN", lms.as_os_str()),
+            ("DARKMUX_TENSORFOLD_BIN", tf.as_os_str()),
+        ],
+        || describe_profiles("coder", &["tf".to_string()]),
+    );
+    let tf = got[0].clone().unwrap();
+    use darkmux_profiles::engine::availability::AvailabilityState as S;
+    assert_eq!(tf.availability.state, S::Unavailable, "{tf:?}");
+    assert_eq!((tf.reachable, tf.loaded), (false, Some(false)), "{tf:?}");
+}
+
+/// (#3466 review) One rule for every managed engine: an LM Studio profile is
+/// `reachable` only when darkmux can make it resident now. LM Studio
+/// answering is not enough when the model is not downloaded (its dispatch
+/// would fail); a downloaded one is.
+#[test]
+#[serial_test::serial]
+fn an_lm_studio_model_that_is_not_downloaded_is_not_reachable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let lms = script(
+        tmp.path(),
+        "lms",
+        "case \"$1\" in\n  ps) echo '[]';;\n  ls) echo '[{\"modelKey\":\"have\",\"type\":\"llm\"}]';;\n  *) exit 1;;\nesac\n",
+    );
+    let registry = tmp.path().join("profiles.json");
+    std::fs::write(
+        &registry,
+        r#"{"profiles":{"have":{"models":[{"id":"have","n_ctx":8192}]},"missing":{"models":[{"id":"missing","n_ctx":8192}]}}}"#,
+    )
+    .unwrap();
+    let got = with_env_vars(
+        &[("DARKMUX_PROFILES", registry.as_os_str()), ("DARKMUX_LMS_BIN", lms.as_os_str())],
+        || describe_profiles("coder", &["have".to_string(), "missing".to_string()]),
+    );
+    let [have, missing] = [0, 1].map(|i| got[i].clone().unwrap());
+    use darkmux_profiles::engine::availability::AvailabilityState as S;
+    assert_eq!(have.availability.state, S::Startable, "{have:?}");
+    assert_eq!((have.reachable, have.loaded), (true, Some(false)), "{have:?}");
+    assert_eq!(missing.availability.state, S::Unavailable, "{missing:?}");
+    assert_eq!((missing.reachable, missing.loaded), (false, Some(false)), "LM Studio answered, but the model is not there: {missing:?}");
+}
+
+/// (#3466 review) The client listing reads the dispatch preflight: a role
+/// file with a key its schema does not know refuses every dispatch, so
+/// every listed profile is `unavailable` (and not reachable).
+#[test]
+#[serial_test::serial]
+fn a_dispatch_the_preflight_refuses_lists_unavailable() {
+    let state = darkmux_types::test_isolation::IsolatedState::new();
+    std::fs::create_dir_all(state.join("roles")).unwrap();
+    std::fs::write(state.join("roles/coder.json"), r#"{"id":"coder","zzz_bogus":1}"#).unwrap();
+    let registry = state.join("profiles.json");
+    std::fs::write(&registry, r#"{"profiles":{"lms":{"models":[{"id":"qwen","n_ctx":8192}]}}}"#).unwrap();
+    let got = with_env_vars(
+        &[("DARKMUX_PROFILES", registry.as_os_str()), ("DARKMUX_LMS_BIN", std::ffi::OsStr::new("/nonexistent/lms"))],
+        || describe_profiles("coder", &["lms".to_string()]),
+    );
+    let lms = got[0].clone().unwrap();
+    use darkmux_profiles::engine::availability::AvailabilityState as S;
+    assert_eq!(lms.availability.state, S::Unavailable, "{lms:?}");
+    assert!(lms.availability.reason.as_deref().unwrap().contains("zzz_bogus"), "{lms:?}");
+    assert!(!lms.reachable);
+}
+
 /// (review) Whether a role's work on a profile stays on this machine is the
 /// resolved target's own classification, the one dispatch routes on
 /// (`brain_leaves_this_machine`): LM Studio stays; an unmanaged endpoint stays
@@ -4408,6 +4568,25 @@ async fn profiles_name_the_machine_they_run_on() {
         v["machine"],
         serde_json::json!({"id": "m-0123456789abcdef", "name": "studio"})
     );
+}
+
+/// (#3466) On the wire each profile's availability is `{state, reason}`,
+/// beside the older `reachable` and `loaded`; an undescribable one is
+/// `unknown`, its reason the error.
+#[tokio::test]
+async fn profiles_carry_their_availability_on_the_wire() {
+    let h = harness();
+    let t = paired(&h).await;
+    let (code, v) = call(&h, get("/client/profiles?role=coder", &[("authorization", &bearer(&t))])).await;
+    assert_eq!(code, 200, "{v}");
+    let by = |n: &str| v["profiles"].as_array().unwrap().iter().find(|p| p["name"] == n).cloned();
+    let fast = by("fast").unwrap_or_else(|| panic!("{v}"));
+    assert_eq!(fast["availability"], serde_json::json!({"state": "external", "reason": null}));
+    assert_eq!(fast["reachable"], true, "the older field stays");
+    assert_eq!(by("deep").unwrap()["availability"]["state"], "startable");
+    let unknown = ClientProfileInfo::unknown("gone", "profile gone is not in the registry".into());
+    let wire = serde_json::to_value(&unknown).unwrap();
+    assert_eq!(wire["availability"], serde_json::json!({"state": "unknown", "reason": "profile gone is not in the registry"}));
 }
 
 #[test]
