@@ -2646,16 +2646,26 @@ pub(crate) fn work_activity_in(
     role: &str,
     work_id: &str,
 ) -> (Option<crate::runs::RunActivity>, Option<u64>) {
-    let suffix = format!(".adhoc.{role}.{work_id}");
     let yesterday = crate::runs::day_string_from_epoch_ms(unix_now().saturating_sub(86_400) * 1_000);
     let records = store.read(flows_dir, &yesterday);
     crate::runs::running_session_activity(|fold| {
         records.for_each(|v| {
-            if v.get("session_id").and_then(Value::as_str).is_some_and(|s| s.ends_with(&suffix)) {
+            if is_work_session(v, role, work_id) {
                 fold(v);
             }
         })
     })
+}
+
+/// Whether record `v` is of `role`'s work `work_id`: its session is the
+/// crew-of-one dispatch session `darkmux dispatch <role> --name <work_id>`
+/// made. Read through the session id's own grammar (`SessionId::parse`),
+/// which unescapes the role and nonce, so a role id with a byte outside
+/// `[A-Za-z0-9-]` (escaped on the wire) is found too.
+pub(crate) fn is_work_session(v: &Value, role: &str, work_id: &str) -> bool {
+    use darkmux_types::session_id::{SessionId, SessionKind};
+    let Some(wire) = v.get("session_id").and_then(Value::as_str) else { return false };
+    SessionId::parse(wire).is_ok_and(|s| matches!(s.kind(), SessionKind::Adhoc { role: r, nonce } if r == role && nonce == work_id))
 }
 
 /// A work item as its client polls it.
@@ -3318,15 +3328,14 @@ fn records_in(dir: &Path) -> impl Iterator<Item = Value> {
 }
 
 /// The `dispatch.start` of the crew-of-one run `darkmux dispatch <role> --name
-/// <work_id>` made: its session ends `.adhoc.<role>.<work_id>`.
+/// <work_id>` made ([`is_work_session`]).
 pub(crate) fn find_start_in(dir: &Path, spec: &WorkSpec) -> Option<StartedRun> {
-    let suffix = format!(".adhoc.{}.{}", spec.role, spec.work_id);
     records_in(dir).find_map(|r| {
         if darkmux_flow::reader::action_of(&r) != Some(darkmux_flow::FlowAction::DispatchStart) {
             return None;
         }
         let session = r.get("session_id")?.as_str()?;
-        if !session.ends_with(&suffix) {
+        if !is_work_session(&r, &spec.role, &spec.work_id) {
             return None;
         }
         Some(StartedRun {

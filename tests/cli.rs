@@ -7385,24 +7385,6 @@ impl Drop for EnvVarGuard {
     }
 }
 
-/// (#1905) End-to-end conformance for `runs.rs`'s "Two callers, one union"
-/// contract: the `darkmux run list` BINARY and a direct
-/// `darkmux_serve::build_runs` call must report the same runs for the same
-/// on-disk state.
-///
-/// This is the half `crates/darkmux-serve/src/lib_tests.rs`'s
-/// `run_list_verb_and_runs_handler_agree_on_the_same_fixture` explicitly
-/// cannot cover: that test proves the HTTP handler does not transform rows
-/// on the way out, but it never invokes the verb, so it stays green if the
-/// verb stops calling the shared union and starts computing its own. This
-/// test spawns the real binary, so a verb that grew a private aggregation,
-/// a private filter, or a different input triple fails HERE.
-///
-/// Every input is pinned by env so both sides read the SAME state: the
-/// subprocess gets them as env vars, and the in-process side gets them via
-/// `set_var` (hence `#[serial]` — this mutates process-global env).
-/// `DARKMUX_HOME` isolates config.json, and `DARKMUX_REDIS_URL` is removed
-/// on both sides so the fleet input is an empty slice for each.
 /// (#3467) `run list --json` shows a dispatch that is starting its model as
 /// running with `activity: "starting_model"` and the latest `.loading`'s
 /// elapsed time, the reading `GET /runs` takes (one union, one lifecycle).
@@ -7440,6 +7422,24 @@ fn run_list_json_shows_a_dispatch_starting_its_model() {
     assert_eq!(row["activity_elapsed_ms"], 20_000, "{row}");
 }
 
+/// (#1905) End-to-end conformance for `runs.rs`'s "Two callers, one union"
+/// contract: the `darkmux run list` BINARY and a direct
+/// `darkmux_serve::build_runs` call must report the same runs for the same
+/// on-disk state.
+///
+/// This is the half `crates/darkmux-serve/src/lib_tests.rs`'s
+/// `run_list_verb_and_runs_handler_agree_on_the_same_fixture` explicitly
+/// cannot cover: that test proves the HTTP handler does not transform rows
+/// on the way out, but it never invokes the verb, so it stays green if the
+/// verb stops calling the shared union and starts computing its own. This
+/// test spawns the real binary, so a verb that grew a private aggregation,
+/// a private filter, or a different input triple fails HERE.
+///
+/// Every input is pinned by env so both sides read the SAME state: the
+/// subprocess gets them as env vars, and the in-process side gets them via
+/// `set_var` (hence `#[serial]` — this mutates process-global env).
+/// `DARKMUX_HOME` isolates config.json, and `DARKMUX_REDIS_URL` is removed
+/// on both sides so the fleet input is an empty slice for each.
 #[test]
 #[serial_test::serial]
 fn run_list_binary_agrees_with_the_shared_union_it_calls() {

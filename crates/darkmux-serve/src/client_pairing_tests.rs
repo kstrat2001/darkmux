@@ -1782,6 +1782,18 @@ fn the_work_activity_reader_follows_the_dispatchs_records() {
     assert_eq!(read(), (Some(crate::runs::RunActivity::StartingModel), Some(30_000)));
     append(&[rec(ours, "dispatch.model.ready", model(31_000))]);
     assert_eq!(read(), (None, None), "ready: running as usual");
+
+    // (#3467 review) A role id outside `[A-Za-z0-9-]` is escaped on the
+    // wire; its work is still found.
+    let escaped = darkmux_types::session_id::SessionId::adhoc(
+        darkmux_types::session_id::RunId::mission("dispatch-code-1-a-0").unwrap(),
+        "code_writer",
+        "w-7",
+    )
+    .wire();
+    append(&[rec(&escaped, "dispatch.start", serde_json::json!({})), rec(&escaped, "dispatch.model.start", model(0))]);
+    let got = crate::client_pairing::work_activity_in(&store, dir.path(), "code_writer", "w-7");
+    assert_eq!(got, (Some(crate::runs::RunActivity::StartingModel), Some(0)));
 }
 
 #[tokio::test]
@@ -2028,6 +2040,20 @@ fn the_start_is_found_by_its_work_id_in_the_flow_day_files() {
         !terminal_in(dir.path(), "exec-b"),
         "a start is not a terminal"
     );
+
+    // (#3467 review) A role id outside `[A-Za-z0-9-]` is escaped in the
+    // session id (`code_writer` is `code_5Fwriter` on the wire): found all
+    // the same.
+    let escaped = darkmux_types::session_id::SessionId::adhoc(
+        darkmux_types::session_id::RunId::mission("dispatch-code-1-a-0").unwrap(),
+        "code_writer",
+        "w-1",
+    )
+    .wire();
+    assert!(!escaped.contains("code_writer"), "the wire escapes it: {escaped}");
+    std::fs::write(dir.path().join("2026-11-08.jsonl"), line("dispatch.start", &escaped, "exec-u")).unwrap();
+    let spec = WorkSpec { role: "code_writer".into(), ..spec_w1() };
+    assert_eq!(find_start_in(dir.path(), &spec).map(|r| r.execution).as_deref(), Some("exec-u"));
 }
 
 #[test]
