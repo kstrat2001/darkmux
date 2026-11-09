@@ -6,6 +6,15 @@
 
 use super::*;
 use crate::client_profiles::{describe_profile, describe_profiles, work_stays_here};
+use crate::client_git::WorkCopy;
+
+/// A test repository at `dir` as host git sees it (its own `.git`).
+fn wc(dir: &Path) -> WorkCopy {
+    WorkCopy {
+        work_tree: dir.to_path_buf(),
+        git_dir: dir.join(".git"),
+    }
+}
 use axum::body::Body;
 use axum::http::Request;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -156,6 +165,15 @@ fn harness() -> Harness {
                     std::fs::write(w.join("other.txt"), "tweak\n").unwrap();
                 }
             }
+            // A hostile run: it plants git config the host would obey (an
+            // fsmonitor hook, or a clean filter its .gitattributes selects)
+            // in a fresh `.git` where the work copy's was, then edits a file.
+            if let Some(kind) = spec.message.strip_prefix("plant-") {
+                if let Some(w) = &spec.workdir {
+                    plant_git_config(w, kind);
+                    std::fs::write(w.join("made-by-run.txt"), "one\ntwo\n").unwrap();
+                }
+            }
             Ok(
                 serde_json::json!({"result": "stop", "final_assistant": format!("ran {}", spec.role)}),
             )
@@ -165,13 +183,14 @@ fn harness() -> Harness {
         // Every "remote" is the fixture; origin is then set to the URL asked
         // for, as a real clone would leave it. A URL naming "fail" fails
         // after leaving a partial directory behind, as an interrupted clone can.
-        clone_repo: Arc::new(move |url, git_ref, dest| {
+        clone_repo: Arc::new(move |url, git_ref, dest, git_dir| {
             cl.lock().unwrap().push(url.to_string());
             if url.contains("fail") {
                 std::fs::create_dir_all(dest.join("half")).unwrap();
                 return Err("authentication failed".into());
             }
-            let mut args = vec!["clone", "--quiet"];
+            let gd = git_dir.to_str().unwrap().to_string();
+            let mut args = vec!["clone", "--quiet", "--separate-git-dir", gd.as_str()];
             if let Some(r) = git_ref {
                 args.extend(["--branch", r]);
             }
@@ -1326,6 +1345,9 @@ fn write_recipe(wt: &Path, text: &str) {
 async fn checkout_workspace(h: &Harness, token: &str) -> (PathBuf, String, PathBuf) {
     let mine = h.dir.path().join("site");
     fixture_repo(&mine);
+    // The owner's checkout has the owner's identity, as a real one does.
+    run_git(Some(&mine), &["config", "user.name", "Owner"]);
+    run_git(Some(&mine), &["config", "user.email", "owner@example.com"]);
     let (code, v) = call(
         h,
         post(
@@ -1897,14 +1919,14 @@ fn changes_exclude_what_the_work_copy_held_before_the_run() {
     git_repo(dir.path());
     std::fs::write(dir.path().join("pre.txt"), "already here\n").unwrap();
     std::fs::write(dir.path().join("untouched.txt"), "left alone\n").unwrap();
-    let before = snapshot_tree(dir.path()).expect("a git work copy snapshots");
+    let before = snapshot_tree(&wc(dir.path())).expect("a git work copy snapshots");
     std::fs::write(
         dir.path().join("pre.txt"),
         "already here\nadded by the run\n",
     )
     .unwrap();
     std::fs::write(dir.path().join("new.txt"), "a\nb\n").unwrap();
-    let c = serde_json::to_value(changes_since(dir.path(), &before).unwrap()).unwrap();
+    let c = serde_json::to_value(changes_since(&wc(dir.path()), &before).unwrap()).unwrap();
     assert_eq!(
         c["files"],
         serde_json::json!([{"path": "new.txt", "added": 2, "removed": 0}, {"path": "pre.txt", "added": 1, "removed": 0}])
@@ -1927,9 +1949,9 @@ fn an_unchanged_work_copy_reports_no_changes() {
     let dir = tempfile::tempdir().unwrap();
     git_repo(dir.path());
     std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
-    let before = snapshot_tree(dir.path()).unwrap();
+    let before = snapshot_tree(&wc(dir.path())).unwrap();
     assert_eq!(
-        serde_json::to_value(changes_since(dir.path(), &before).unwrap()).unwrap(),
+        serde_json::to_value(changes_since(&wc(dir.path()), &before).unwrap()).unwrap(),
         serde_json::json!({"files": [], "diff": ""})
     );
 }
@@ -1938,12 +1960,12 @@ fn an_unchanged_work_copy_reports_no_changes() {
 fn a_large_diff_is_capped_with_a_marker() {
     let dir = tempfile::tempdir().unwrap();
     git_repo(dir.path());
-    let before = snapshot_tree(dir.path()).unwrap();
+    let before = snapshot_tree(&wc(dir.path())).unwrap();
     let big: String = (0..5000)
         .map(|i| format!("line number {i} of a long file\n"))
         .collect();
     std::fs::write(dir.path().join("big.txt"), &big).unwrap();
-    let c = serde_json::to_value(changes_since(dir.path(), &before).unwrap()).unwrap();
+    let c = serde_json::to_value(changes_since(&wc(dir.path()), &before).unwrap()).unwrap();
     let diff = c["diff"].as_str().unwrap();
     assert!(
         diff.len() <= MAX_DIFF_BYTES + DIFF_TRUNCATED_MARKER.len(),
@@ -1962,7 +1984,7 @@ fn a_large_diff_is_capped_with_a_marker() {
 fn a_workdir_that_is_not_a_git_repo_has_no_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
-    assert_eq!(snapshot_tree(dir.path()), None);
+    assert_eq!(snapshot_tree(&wc(dir.path())), None);
 }
 
 #[tokio::test]
@@ -1978,6 +2000,10 @@ async fn a_done_run_reports_its_changes_and_null_outside_git() {
     assert_eq!(done["changes"], Value::Null, "not a git repo");
 
     git_repo(&wt);
+    let (_, v) = call(&h, post("/client/work", Some(&token), body.clone())).await;
+    let done = wait_done(&h, &token, v["work_id"].as_str().unwrap()).await;
+    assert_eq!(done["changes"], Value::Null, "a repository darkmux did not make: host git never reads it");
+    hold(&h, "wt1");
     std::fs::remove_file(wt.join("made-by-run.txt")).unwrap();
     std::fs::write(wt.join("mine.txt"), "uncommitted, the user's\n").unwrap();
     let (_, v) = call(&h, post("/client/work", Some(&token), body)).await;
@@ -2031,6 +2057,47 @@ fn run_git(dir: Option<&Path>, args: &[&str]) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Where a planted git hook would leave its mark if the host ran it: beside
+/// the worktrees base, outside every work copy.
+fn host_ran_marker(work_copy: &Path) -> PathBuf {
+    work_copy.parent().unwrap().parent().unwrap().join("host-ran-the-runs-git-config")
+}
+
+/// What a hostile run does to its work copy's git: replaces `.git` (a file
+/// or a directory) with a fresh repository whose config makes git run a
+/// command, by `core.fsmonitor` or by a clean filter `.gitattributes` names.
+fn plant_git_config(w: &Path, kind: &str) {
+    let marker = host_ran_marker(w);
+    let dot_git = w.join(".git");
+    if dot_git.is_dir() {
+        std::fs::remove_dir_all(&dot_git).unwrap();
+    } else {
+        let _ = std::fs::remove_file(&dot_git);
+    }
+    let ok = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .arg(w)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok);
+    let config = match kind {
+        "fsmonitor" => format!("[core]\n\tfsmonitor = \"touch {}; false\"\n", marker.display()),
+        "filter" => {
+            std::fs::write(w.join(".gitattributes"), "*.txt filter=evil\n").unwrap();
+            format!("[filter \"evil\"]\n\tclean = \"touch {}; cat\"\n", marker.display())
+        }
+        other => panic!("no plant {other}"),
+    };
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(dot_git.join("config"))
+        .unwrap()
+        .write_all(config.as_bytes())
+        .unwrap();
 }
 
 /// A repo with one commit on `main` and a `dev` branch.
@@ -2144,6 +2211,7 @@ async fn an_existing_checkout_of_the_repo_is_reused_whatever_its_name() {
             "git@github.com:kstrat2001/hcr.git",
         ],
     );
+    hold(&h, "hcr-preview");
     let (code, v) = call(
         &h,
         post(
@@ -2588,11 +2656,22 @@ async fn a_local_checkout_worktree_starts_from_the_freshly_fetched_default_branc
 
 // ─── Keep and Discard ────────────────────────────────────────────────────
 
+/// Makes the git checkout at `<base>/<name>` a workspace as darkmux makes
+/// one: its repository moved outside the work tree, and recorded.
+fn hold(h: &Harness, name: &str) {
+    let wt = h.base.join(name);
+    let held = crate::client_git::clone_git_dir(&h.base, name);
+    std::fs::rename(wt.join(".git"), &held).unwrap();
+    std::fs::write(wt.join(".git"), format!("gitdir: {}\n", held.display())).unwrap();
+    crate::client_git::record_git_dir(&h.base, name, &held).unwrap();
+}
+
 /// A git workspace under the base with an uncommitted edit of the owner's
 /// own (`notes.txt`), which Keep and Discard must never touch.
 fn git_workspace(h: &Harness, name: &str) -> PathBuf {
     let wt = h.base.join(name);
     fixture_repo(&wt);
+    hold(h, name);
     run_git(Some(&wt), &["config", "user.name", "Owner"]);
     run_git(Some(&wt), &["config", "user.email", "owner@example.com"]);
     run_git(Some(&wt), &["checkout", "--quiet", "-b", "mux/test-abc123"]);
@@ -2650,7 +2729,7 @@ async fn a_runs_paths_are_committed_literally_never_as_globs() {
     std::fs::write(wt.join("b.txt"), "the owner's, uncommitted\n").unwrap();
     std::fs::write(wt.join("a.txt"), "the owner's, untracked\n").unwrap();
     std::fs::write(wt.join("[ab].txt"), "made by the run\n").unwrap();
-    let (sha, _) = commit_run(&wt, &["[ab].txt".to_string()], "coder: glob (work w-1)").unwrap();
+    let (sha, _) = commit_run(&crate::client_git::work_copy_of(&h.base, "glob", &wt).unwrap(), &["[ab].txt".to_string()], "coder: glob (work w-1)").unwrap();
     let files = run_git(Some(&wt), &["show", "--name-only", "--format=", &sha]);
     assert_eq!(files.lines().collect::<Vec<_>>(), ["[ab].txt"], "{files}");
     let status = run_git(Some(&wt), &["status", "--porcelain", "--", "a.txt", "b.txt"]);
@@ -2658,6 +2737,51 @@ async fn a_runs_paths_are_committed_literally_never_as_globs() {
         status.contains("?? a.txt") && status.contains("M b.txt"),
         "a.txt and b.txt stay the owner's, uncommitted: {status}"
     );
+}
+
+/// (review, critical) After a run, the host's git never reads git config
+/// the run could write: a run that plants an fsmonitor hook or a clean
+/// filter in the work copy's `.git` gets none of it run on the host, and its
+/// change is still committed to the workspace's own repository.
+#[tokio::test]
+async fn host_git_never_runs_config_a_run_planted() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (code, v) = call(&h, post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR}))).await;
+    assert_eq!(code, 201, "{v}");
+    let (_mine, checkout_ws, _) = checkout_workspace(&h, &token).await;
+    for (workspace, plant, files) in [
+        ("hcr", "plant-fsmonitor", vec!["made-by-run.txt"]),
+        ("hcr", "plant-filter", vec![".gitattributes", "made-by-run.txt"]),
+        (checkout_ws.as_str(), "plant-fsmonitor", vec!["made-by-run.txt"]),
+    ] {
+        let id = run_in(&h, &token, workspace, plant).await;
+        let v = status(&h, &token, &id).await;
+        let marker = host_ran_marker(&h.base.join(workspace));
+        assert!(!marker.exists(), "{workspace} {plant}: the host ran the run's git config");
+        assert_eq!(v["status"], "done", "{v}");
+        assert!(v["commit"].is_string(), "{workspace} {plant}: the run's change was committed: {v}");
+        let committed: Vec<&str> = v["changes"]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(committed, files, "{workspace} {plant}: {v}");
+        // The workspace's repository (not the planted one) holds the commit.
+        let (code, info) = call(
+            &h,
+            get(&format!("/client/workspaces/{workspace}"), &[("authorization", &bearer(&token))]),
+        )
+        .await;
+        assert_eq!(code, 200, "{info}");
+        assert!(v["commit"].as_str().unwrap().starts_with(info["head"].as_str().unwrap()), "{workspace}: {info} {v}");
+        assert!(!marker.exists(), "{workspace}: reading its status ran the planted config");
+        // Undo it so the next plant starts clean.
+        let (code, u) = call(&h, post(&format!("/client/work/{id}/undo"), Some(&token), serde_json::json!({}))).await;
+        assert_eq!(code, 200, "{u}");
+        assert!(!marker.exists());
+    }
 }
 
 #[tokio::test]
@@ -3141,9 +3265,19 @@ async fn a_preview_needs_the_workspace_to_still_be_a_worktree_of_the_checkout() 
     let token = paired(&h).await;
     let (mine, name, ws) = served_workspace(&h, &token).await;
     recipe(&mine, serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}));
-    // A run rewrites the workspace's `.git` to a repository of its own.
+    // A run rewrites the workspace's `.git`: host git never reads it, so the
+    // preview is unaffected.
     std::fs::remove_file(ws.join(".git")).unwrap();
     run_git(Some(&ws), &["init", "--quiet"]);
+    let (code, v) = start_preview(&h, &token, &name).await;
+    assert_eq!(code, 202, "{v}");
+    h.state.previews.stop(&name);
+    // The checkout drops the worktree (`git worktree prune` after its admin
+    // dir went): the workspace is no longer a worktree of it.
+    let admin: Vec<_> = std::fs::read_dir(mine.join(".git/worktrees")).unwrap().collect();
+    for a in admin {
+        std::fs::remove_dir_all(a.unwrap().path()).unwrap();
+    }
     let (code, v) = start_preview(&h, &token, &name).await;
     assert_eq!(code, 404, "{v}");
     assert!(v["error"].as_str().unwrap().contains("no longer a worktree"), "{v}");
@@ -3469,6 +3603,7 @@ async fn changes_lists_the_branchs_commits_against_origins_default_branch() {
     run_git(Some(&wt), &["config", "user.name", "Owner"]);
     run_git(Some(&wt), &["config", "user.email", "owner@example.com"]);
     run_git(Some(&wt), &["checkout", "--quiet", "-b", "mux/site-abc123"]);
+    hold(&h, "site");
     let base = run_git(Some(&wt), &["rev-parse", "origin/main"]);
     std::fs::write(wt.join("README.md"), "changed\n").unwrap();
     std::fs::create_dir_all(wt.join("img")).unwrap();

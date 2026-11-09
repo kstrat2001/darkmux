@@ -34,6 +34,12 @@ darkmux release.
   `default_engine` on loopback); the role's own profile is checked the same way. Its 17 routes
   and their response types are in `route-table.golden` (a new contract surface; nothing changes
   for the viewer daemon's routes).
+- Host git never reads git config a run can write: a client workspace's repository is held by
+  darkmux outside the work tree the run is given (a clone's `--separate-git-dir`, a worktree's own
+  admin directory in your checkout), and every host git call in a workspace names it, with
+  `core.fsmonitor`, hooks, signing, `core.sshCommand`, `credential.helper` and external diffs off
+  and no system config. A run that rewrites its workspace's `.git` changes nothing on the host. A
+  run inside a client workspace's container no longer has a usable `.git` there.
 - Previews trust only your own checkout: a workspace's dev-server recipe, `.darkmux/preview.json`
   (`schema_version` `1.0`, unknown keys refused), is read only from the checkout the workspace was
   made from, never from the workspace a run edits. A workspace cloned from a URL gets no preview;

@@ -50,6 +50,15 @@
 //! `.darkmux/preview.json` to your own checkout of the repo
 //! ([`crate::client_preview`]).
 //!
+//! **Host git never reads what a run can write.** A workspace is mounted
+//! read-write into the run's container, so its `.git` and config are the
+//! run's. Every host git call (snapshot, diff, commit, Undo, `/changes`,
+//! status, fetch) names the repository darkmux holds for the workspace,
+//! outside it and recorded when darkmux made it, with every program-running
+//! setting off ([`crate::client_git`]). A clone's repository is its
+//! `--separate-git-dir`; a worktree's is its admin directory in the user's
+//! checkout. A folder under the base that darkmux did not make gets no git.
+//!
 //! **State.** `~/.darkmux/clients.json` (0600), every read-modify-write under
 //! an exclusive `flock` on the file itself, so `client approve` in one process
 //! and this listener in another never lose a write. It is darkmux-written
@@ -68,6 +77,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::client_git::WorkCopy;
 use crate::client_wire::*;
 use std::collections::HashMap;
 use std::io::{Read, Seek, Write};
@@ -480,6 +490,9 @@ pub struct WorkEntry {
     pub cancel: Arc<CancelFlag>,
     /// The canonical work copy, when the run has one.
     pub workdir: Option<PathBuf>,
+    /// The work copy as host git may touch it: the repository darkmux holds
+    /// for it, outside it (`None`: no workspace darkmux made, so no git).
+    pub git: Option<WorkCopy>,
     /// The work copy as a tree before the run (or before the first run of a
     /// chain of tweaks): what Keep commits against and Discard restores to.
     pub baseline: Option<String>,
@@ -499,7 +512,9 @@ pub struct WorkEntry {
 }
 
 /// (url, ref, dest) -> cloned, or why not.
-pub type CloneRepo = dyn Fn(&str, Option<&str>, &Path) -> Result<(), String> + Send + Sync;
+/// (url, ref, work tree, git dir) -> cloned, the repository in `git dir`
+/// (`--separate-git-dir`), outside the work tree a run is given; or why not.
+pub type CloneRepo = dyn Fn(&str, Option<&str>, &Path, &Path) -> Result<(), String> + Send + Sync;
 
 /// Everything the listener needs, injectable so tests drive the real router
 /// with a fake clock and a fake executor.
@@ -1252,18 +1267,19 @@ fn run_work(
     cancel: &Arc<CancelFlag>,
 ) {
     let id = spec.work_id.clone();
-    let workdir = spec.workdir.clone();
+    // Host git touches only the repository darkmux holds for the work copy.
+    let git = works.lock().unwrap().get(&id).and_then(|e| e.git.clone());
     // The work copy as it is before the run, so what it held already is
     // never reported as the run's change. A run in the same work copy
     // as this client's undecided finished run continues it (a tweak):
     // it inherits that run's baseline, and that run is folded into this.
-    let baseline = workdir.as_deref().and_then(snapshot_tree);
+    let baseline = git.as_ref().and_then(snapshot_tree);
     if let Some(e) = works.lock().unwrap().get_mut(&id) {
         e.baseline = baseline.clone();
     }
     let flag = cancel.clone();
     let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| execute(spec, flag)));
-    let status = run_status(ran, cancel, workdir.as_deref(), baseline.as_ref());
+    let status = run_status(ran, cancel, git.as_ref(), baseline.as_ref());
     // A finished run's changes become one commit on the work copy's
     // branch: a checkpoint Undo can revert.
     let changed = changed_paths(&status);
@@ -1273,7 +1289,7 @@ fn run_work(
         .get(&id)
         .map(|e| (e.title.clone(), e.role.clone()))
         .unwrap_or_default();
-    let committed = match (&workdir, changed.is_empty()) {
+    let committed = match (&git, changed.is_empty()) {
         (Some(w), false) => Some(commit_run(
             w,
             &changed,
@@ -1300,14 +1316,14 @@ fn run_work(
 fn run_status(
     ran: std::thread::Result<Result<Value, RunError>>,
     cancel: &CancelFlag,
-    workdir: Option<&Path>,
+    git: Option<&WorkCopy>,
     baseline: Option<&String>,
 ) -> WorkStatus {
     match ran {
         Ok(r) if cancel.requested() => WorkStatus::Cancelled(r.err()),
         Err(_) if cancel.requested() => WorkStatus::Cancelled(None),
         Ok(Ok(result)) => {
-            let changes = match (workdir, baseline) {
+            let changes = match (git, baseline) {
                 (Some(w), Some(before)) => changes_since(w, before),
                 _ => None,
             };
@@ -1353,6 +1369,7 @@ fn admit(
             created: now,
             status: WorkStatus::Running,
             cancel: Arc::new(CancelFlag::default()),
+            git: workdir.as_deref().and_then(|w| work_copy_for(state, w)),
             workdir: workdir.clone(),
             baseline: None,
             decided: None,
@@ -1372,6 +1389,17 @@ fn admit(
         workdir,
         message: req.message,
     })
+}
+
+/// The work copy host git may touch for a canonical workdir: a workspace
+/// directly under the worktrees base whose repository darkmux recorded.
+fn work_copy_for(state: &ClientServerState, dir: &Path) -> Option<WorkCopy> {
+    let base = (state.worktrees_base)().ok()?;
+    let name = dir.file_name()?.to_str()?;
+    if dir.parent()? != base {
+        return None;
+    }
+    crate::client_git::work_copy_of(&base, name, dir)
 }
 
 /// The role must be defined on this machine.
@@ -1620,13 +1648,17 @@ fn workspace_dir(state: &ClientServerState, name: &str) -> Result<PathBuf, Refus
     (state.check_workdir)(&dir).map_err(|e| refuse(StatusCode::FORBIDDEN, e))
 }
 
-fn workspace_json(name: &str, dir: &Path, created: bool) -> WorkspaceInfo {
-    let (branch, head) = crate::client_workspace::status_of(dir).unwrap_or_default();
+fn workspace_json(state: &ClientServerState, name: &str, dir: &Path, created: bool) -> WorkspaceInfo {
+    let wc = work_copy_for(state, dir);
+    let (branch, head) = wc
+        .as_ref()
+        .and_then(crate::client_workspace::status_of)
+        .unwrap_or_default();
     WorkspaceInfo {
         workspace: name.to_string(),
         branch,
         head,
-        repo: crate::client_workspace::origin_of(dir),
+        repo: wc.as_ref().and_then(crate::client_workspace::origin_of),
         created,
         from: None,
         fetch_error: None,
@@ -1768,7 +1800,7 @@ fn clone_workspace(
         return *r;
     }
     match workspace_dir(state, &name) {
-        Ok(dir) => (StatusCode::CREATED, Json(workspace_json(&name, &dir, true))).into_response(),
+        Ok(dir) => (StatusCode::CREATED, Json(workspace_json(state, &name, &dir, true))).into_response(),
         Err(r) => *r,
     }
 }
@@ -1800,13 +1832,15 @@ fn template_workspace(
         Some(r) => format!("{normalized}@{r}"),
         None => normalized.to_string(),
     };
-    if let Err(e) = start_fresh(&dir, &format!("Start from {from}")) {
+    if let Err(e) = start_fresh(&base, &name, &format!("Start from {from}")) {
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(crate::client_git::clone_git_dir(&base, &name));
+        crate::client_git::forget_git_dir(&base, &name);
         return internal(anyhow!("starting {name} from the template: {e}"));
     }
     match workspace_dir(state, &name) {
         Ok(dir) => {
-            let mut v = workspace_json(&name, &dir, true);
+            let mut v = workspace_json(state, &name, &dir, true);
             v.from = Some(from);
             (StatusCode::CREATED, Json(v)).into_response()
         }
@@ -1828,10 +1862,29 @@ fn free_project_name(base: &Path, bot: &str) -> Option<String> {
 }
 
 /// Drops the clone's history and remote and makes it a new repo on `main`
-/// with everything in one commit.
-fn start_fresh(dir: &Path, message: &str) -> Result<(), String> {
-    std::fs::remove_dir_all(dir.join(".git")).map_err(|e| format!("removing the template's history: {e}"))?;
-    git_quiet(dir, &["init", "--quiet", "--initial-branch=main"])?;
+/// with everything in one commit, its repository again held by darkmux
+/// outside the work tree.
+fn start_fresh(base: &Path, name: &str, message: &str) -> Result<(), String> {
+    let dir = base.join(name);
+    let git_dir = crate::client_git::clone_git_dir(base, name);
+    std::fs::remove_dir_all(&git_dir).map_err(|e| format!("removing the template's history: {e}"))?;
+    let _ = std::fs::remove_file(dir.join(".git"));
+    let init = std::process::Command::new("git")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(["init", "--quiet", "--initial-branch=main", "--separate-git-dir"])
+        .arg(&git_dir)
+        .arg(&dir)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("running git: {e}"))?;
+    if !init.status.success() {
+        return Err(String::from_utf8_lossy(&init.stderr).trim().to_string());
+    }
+    let canon = |p: &Path| p.canonicalize().map_err(|e| format!("{}: {e}", p.display()));
+    let dir = &WorkCopy {
+        work_tree: canon(&dir)?,
+        git_dir: canon(&git_dir)?,
+    };
     // A Mac with no git identity yet can still commit here: this project
     // gets its own, and the owner's takes over once there is one.
     if git_line(dir, &["config", "user.email"]).unwrap_or_default().is_empty() {
@@ -1848,8 +1901,9 @@ fn existing_clone(state: &ClientServerState, name: &str) -> Response {
         Ok(d) => d,
         Err(r) => return *r,
     };
-    let mut v = workspace_json(name, &dir, false);
-    if let Err(e) = (state.fetch_repo)(&dir) {
+    let mut v = workspace_json(state, name, &dir, false);
+    let held = work_copy_for(state, &dir).map(|wc| wc.git_dir);
+    if let Err(e) = held.ok_or_else(|| "darkmux holds no repository for it".to_string()).and_then(|g| (state.fetch_repo)(&g)) {
         v.fetch_error = Some(e);
     }
     Json(v).into_response()
@@ -1865,9 +1919,14 @@ fn place_clone(
     base: &Path,
     name: &str,
 ) -> Result<(), Refused> {
+    use crate::client_git as cg;
     let partial = base.join(format!(".{name}.partial"));
-    if let Err(e) = (state.clone_repo)(url, git_ref, &partial) {
+    let git_dir = cg::clone_git_dir(base, name);
+    // A repository left by an earlier workspace of this name is not this one's.
+    let _ = std::fs::remove_dir_all(&git_dir);
+    if let Err(e) = (state.clone_repo)(url, git_ref, &partial, &git_dir) {
         let _ = std::fs::remove_dir_all(&partial);
+        let _ = std::fs::remove_dir_all(&git_dir);
         return Err(refuse(
             StatusCode::BAD_GATEWAY,
             format!("cloning {normalized}: {e}"),
@@ -1875,12 +1934,14 @@ fn place_clone(
     }
     if let Err(e) = std::fs::rename(&partial, base.join(name)) {
         let _ = std::fs::remove_dir_all(&partial);
+        let _ = std::fs::remove_dir_all(&git_dir);
         return Err(Box::new(internal(anyhow!("placing workspace {name}: {e}"))));
     }
     // A clone (or a template's fresh project) is no checkout of the user's:
-    // no record, whatever an earlier workspace of this name had.
+    // no source record, whatever an earlier workspace of this name had. Its
+    // repository is the one darkmux cloned it into, outside the work tree.
     crate::client_workspace::forget_source(base, name);
-    Ok(())
+    cg::record_git_dir(base, name, &git_dir).map_err(|e| Box::new(internal(anyhow!(e))))
 }
 
 fn worktree_workspace(
@@ -1909,12 +1970,21 @@ fn worktree_workspace(
         );
     };
     match add_bot_worktree(state, &source, git_ref, bot, &base.join(&name)) {
-        Ok(added) => match ws::record_source(&base, &name, &source) {
+        Ok(added) => match record_worktree(&base, &name, &source, &common) {
             Ok(()) => created_worktree(state, &name, added.0, added.1),
             Err(e) => internal(anyhow!(e)),
         },
         Err(r) => *r,
     }
+}
+
+/// Records a new worktree workspace: the user's checkout it was made from,
+/// and its repository (the worktree's admin directory under that checkout's
+/// `.git/worktrees/`), read once now, before any run has been in it.
+fn record_worktree(base: &Path, name: &str, source: &Path, common: &Path) -> Result<(), String> {
+    let admin = crate::client_git::worktree_admin_dir(&base.join(name), common)?;
+    crate::client_git::record_git_dir(base, name, &admin)?;
+    crate::client_workspace::record_source(base, name, source)
 }
 
 /// This bot's existing worktree of the checkout, its checkout recorded again
@@ -1924,7 +1994,7 @@ fn reused_worktree(state: &ClientServerState, base: &Path, name: &str, source: &
         return internal(anyhow!(e));
     }
     match workspace_dir(state, name) {
-        Ok(dir) => Json(workspace_json(name, &dir, false)).into_response(),
+        Ok(dir) => Json(workspace_json(state, name, &dir, false)).into_response(),
         Err(r) => *r,
     }
 }
@@ -1961,7 +2031,7 @@ fn add_bot_worktree(
 fn created_worktree(state: &ClientServerState, name: &str, start: String, fetch_error: Option<String>) -> Response {
     match workspace_dir(state, name) {
         Ok(dir) => {
-            let mut v = workspace_json(name, &dir, true);
+            let mut v = workspace_json(state, name, &dir, true);
             v.from = Some(start);
             if let Some(e) = fetch_error {
                 v.fetch_error = Some(e);
@@ -2033,7 +2103,8 @@ fn no_recipe_in(
     use crate::client_preview::RecipeRefusal as R;
     match r {
         R::NotFound(_) => {
-            let repo = crate::client_workspace::origin_of(dir).unwrap_or_else(|| "this repo".to_string());
+            let _ = dir;
+            let repo = crate::client_workspace::checkout_origin(checkout).unwrap_or_else(|| "this repo".to_string());
             R::NotFound(format!(
                 "no .darkmux/preview.json in your checkout {}: add .darkmux/preview.json to your own \
                  checkout of {repo} (a copy in the workspace is never read)",
@@ -2177,7 +2248,10 @@ pub(crate) async fn workspace_changes_handler(
             Ok(d) => d,
             Err(r) => return *r,
         };
-        let Some(default) = ws::remote_default(&dir) else {
+        let Some(dir) = work_copy_for(&st, &dir) else {
+            return err(StatusCode::CONFLICT, "darkmux holds no repository for this workspace");
+        };
+        let Some(default) = ws::remote_default_of(&dir) else {
             return err(StatusCode::CONFLICT, "this work copy has no origin default branch to compare with");
         };
         let branch = git_line(&dir, &["branch", "--show-current"]).unwrap_or_default();
@@ -2249,7 +2323,7 @@ pub(crate) async fn workspace_status_handler(
     }
     let st = state.clone();
     tokio::task::spawn_blocking(move || match workspace_dir(&st, &name) {
-        Ok(dir) => Json(workspace_json(&name, &dir, false)).into_response(),
+        Ok(dir) => Json(workspace_json(&st, &name, &dir, false)).into_response(),
         Err(r) => *r,
     })
     .await
@@ -2333,32 +2407,15 @@ fn short(sha: &str) -> String {
     sha.chars().take(7).collect()
 }
 
-fn git_line(wd: &Path, args: &[&str]) -> Option<String> {
-    git(wd, None, args).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+fn git_line(wc: &WorkCopy, args: &[&str]) -> Option<String> {
+    crate::client_git::line(wc, args)
 }
 
-/// Runs git with the repo's hooks off (an app asked, not the owner at a
-/// terminal); the last stderr line on failure.
-fn git_quiet(wd: &Path, args: &[&str]) -> Result<(), String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(wd)
-        .args(["-c", "core.hooksPath=/dev/null"])
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| format!("running git: {e}"))?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        let err = String::from_utf8_lossy(&out.stderr);
-        Err(err
-            .lines()
-            .last()
-            .unwrap_or("git failed")
-            .trim()
-            .to_string())
-    }
+/// Runs host git in the work copy ([`crate::client_git`]: the repository
+/// darkmux holds, never one the run could write; hooks and every
+/// program-running setting off); the last stderr line on failure.
+fn git_quiet(wc: &WorkCopy, args: &[&str]) -> Result<(), String> {
+    crate::client_git::quiet(wc, args)
 }
 
 /// Commits exactly `paths` to the work copy's branch. Anything else in the
@@ -2367,7 +2424,7 @@ fn git_quiet(wd: &Path, args: &[&str]) -> Result<(), String> {
 /// is that file, never a glob that also takes the owner's `b.txt`. Returns
 /// (full id, branch).
 pub(crate) fn commit_run(
-    wd: &Path,
+    wd: &WorkCopy,
     paths: &[String],
     message: &str,
 ) -> Result<(String, String), String> {
@@ -2430,7 +2487,7 @@ pub(crate) async fn undo_handler(
             Ok(w) => w,
             Err(r) => return *r,
         };
-        let (Some(wd), Some(commit)) = (w.workdir.clone(), w.commit.clone()) else {
+        let (Some(wd), Some(commit)) = (w.git.clone(), w.commit.clone()) else {
             return err(StatusCode::CONFLICT, "the run has no git work copy");
         };
         let mut log = vec![
@@ -2746,17 +2803,8 @@ pub const MAX_DIFF_BYTES: usize = 32 * 1024;
 /// Appended to a diff cut at [`MAX_DIFF_BYTES`].
 pub const DIFF_TRUNCATED_MARKER: &str = "\n[diff truncated at 32 KiB]\n";
 
-fn git(wd: &Path, index: Option<&Path>, args: &[&str]) -> Option<std::process::Output> {
-    let mut cmd = std::process::Command::new("git");
-    cmd.arg("-C")
-        .arg(wd)
-        .args(args)
-        .stdin(std::process::Stdio::null());
-    if let Some(i) = index {
-        cmd.env("GIT_INDEX_FILE", i);
-    }
-    let out = cmd.output().ok()?;
-    out.status.success().then_some(out)
+fn git(wd: &WorkCopy, index: Option<&Path>, args: &[&str]) -> Option<std::process::Output> {
+    crate::client_git::run(wd, index, args)
 }
 
 /// The whole work copy as a git tree id: tracked AND untracked files (not
@@ -2764,7 +2812,7 @@ fn git(wd: &Path, index: Option<&Path>, args: &[&str]) -> Option<std::process::O
 /// work copy's own index, branch and files are never touched (only blob and
 /// tree objects are added to its object store). `None` when `wd` is not in
 /// a git work copy.
-pub(crate) fn snapshot_tree(wd: &Path) -> Option<String> {
+pub(crate) fn snapshot_tree(wd: &WorkCopy) -> Option<String> {
     // Outside a git work copy `git add` fails, which is the `None`.
     let scratch = tempfile::tempdir().ok()?;
     let index = scratch.path().join("index");
@@ -2777,7 +2825,7 @@ pub(crate) fn snapshot_tree(wd: &Path) -> Option<String> {
 /// `{"files": [{"path","added","removed"}], "diff": "<unified diff>"}`, the
 /// diff capped at [`MAX_DIFF_BYTES`]. `added`/`removed` are null for a
 /// binary file. `None` when the work copy can no longer be read.
-pub(crate) fn changes_since(wd: &Path, before: &str) -> Option<RunChanges> {
+pub(crate) fn changes_since(wd: &WorkCopy, before: &str) -> Option<RunChanges> {
     let after = snapshot_tree(wd)?;
     let numstat = git(
         wd,
@@ -2786,6 +2834,7 @@ pub(crate) fn changes_since(wd: &Path, before: &str) -> Option<RunChanges> {
             "diff",
             "--no-renames",
             "--no-ext-diff",
+            "--no-textconv",
             "--numstat",
             "-z",
             before,
@@ -2813,6 +2862,7 @@ pub(crate) fn changes_since(wd: &Path, before: &str) -> Option<RunChanges> {
             "diff",
             "--no-renames",
             "--no-ext-diff",
+            "--no-textconv",
             "--no-color",
             before,
             &after,

@@ -112,16 +112,25 @@ fn git_out(wd: &Path, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// The normalized origin of a checkout, if it has one darkmux would accept.
-pub fn origin_of(dir: &Path) -> Option<String> {
-    git_out(dir, &["remote", "get-url", "origin"]).and_then(|u| normalize_repo_url(&u))
+/// The normalized origin of a workspace, read from the repository darkmux
+/// holds for it, if it has one darkmux would accept.
+pub fn origin_of(wc: &crate::client_git::WorkCopy) -> Option<String> {
+    crate::client_git::line(wc, &["remote", "get-url", "origin"]).and_then(|u| normalize_repo_url(&u))
 }
 
-/// The workspace under `base` whose origin is `normalized`: plain
-/// directories only, never a symlink.
-pub fn find_by_origin(base: &Path, normalized: &str) -> Option<String> {
-    let mut names: Vec<String> = std::fs::read_dir(base)
-        .ok()?
+/// The normalized origin of the user's own checkout (its own config, which
+/// no run writes).
+pub fn checkout_origin(checkout: &Path) -> Option<String> {
+    git_out(checkout, &["remote", "get-url", "origin"]).and_then(|u| normalize_repo_url(&u))
+}
+
+/// The workspaces under `base` that darkmux holds a repository for, by
+/// name, sorted: plain directories only, never a symlink.
+fn held_workspaces(base: &Path) -> Vec<(String, crate::client_git::WorkCopy)> {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
         .filter_map(|e| e.file_name().into_string().ok())
@@ -130,13 +139,23 @@ pub fn find_by_origin(base: &Path, normalized: &str) -> Option<String> {
     names.sort();
     names
         .into_iter()
-        .find(|n| origin_of(&base.join(n)).as_deref() == Some(normalized))
+        .filter_map(|n| crate::client_git::work_copy_of(base, &n, &base.join(&n)).map(|wc| (n, wc)))
+        .collect()
 }
 
-/// Branch (empty when detached) and short head of a checkout.
-pub fn status_of(dir: &Path) -> Option<(String, String)> {
-    let head = git_out(dir, &["rev-parse", "--short", "HEAD"])?;
-    let branch = git_out(dir, &["branch", "--show-current"]).unwrap_or_default();
+/// The workspace under `base` whose origin is `normalized`, among those
+/// darkmux holds a repository for.
+pub fn find_by_origin(base: &Path, normalized: &str) -> Option<String> {
+    held_workspaces(base)
+        .into_iter()
+        .find(|(_, wc)| origin_of(wc).as_deref() == Some(normalized))
+        .map(|(n, _)| n)
+}
+
+/// Branch (empty when detached) and short head of a workspace.
+pub fn status_of(wc: &crate::client_git::WorkCopy) -> Option<(String, String)> {
+    let head = crate::client_git::line(wc, &["rev-parse", "--short", "HEAD"])?;
+    let branch = crate::client_git::line(wc, &["branch", "--show-current"]).unwrap_or_default();
     Some((branch, head))
 }
 
@@ -194,9 +213,16 @@ fn last_stderr_line(child: &mut std::process::Child) -> String {
     err.lines().last().unwrap_or("").trim().to_string()
 }
 
-/// Production clone: `git clone [--branch <ref>] -- <url> <dest>`.
-pub fn clone_with_git(url: &str, git_ref: Option<&str>, dest: &Path) -> Result<(), String> {
-    let mut args: Vec<&std::ffi::OsStr> = vec!["clone".as_ref(), "--quiet".as_ref()];
+/// Production clone: `git clone --separate-git-dir <git_dir> [--branch
+/// <ref>] -- <url> <dest>`: the repository lives in `git_dir`, outside the
+/// work tree a run is given.
+pub fn clone_with_git(url: &str, git_ref: Option<&str>, dest: &Path, git_dir: &Path) -> Result<(), String> {
+    let mut args: Vec<&std::ffi::OsStr> = vec![
+        "clone".as_ref(),
+        "--quiet".as_ref(),
+        "--separate-git-dir".as_ref(),
+        git_dir.as_os_str(),
+    ];
     if let Some(r) = git_ref {
         args.push("--branch".as_ref());
         args.push(r.as_ref());
@@ -312,44 +338,39 @@ pub fn common_dir(dir: &Path) -> Option<PathBuf> {
 }
 
 /// The workspace under `base` that is a worktree of the repo whose shared
-/// `.git` is `common`, on one of this bot's `mux/<bot>-` branches.
+/// `.git` is `common`, on one of this bot's `mux/<bot>-` branches, judged
+/// by the repository darkmux recorded for it (never its own `.git`).
 pub fn find_worktree_of(base: &Path, common: &Path, bot: &str) -> Option<String> {
     let prefix = format!("mux/{bot}-");
-    let mut names: Vec<String> = std::fs::read_dir(base)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|n| valid_name(n))
-        .collect();
-    names.sort();
-    names.into_iter().find(|n| {
-        let dir = base.join(n);
-        common_dir(&dir).as_deref() == Some(common)
-            && status_of(&dir).is_some_and(|(branch, _)| branch.starts_with(&prefix))
-    })
+    held_workspaces(base)
+        .into_iter()
+        .find(|(_, wc)| {
+            crate::client_git::common_of(&wc.git_dir).as_deref() == Some(common)
+                && status_of(wc).is_some_and(|(branch, _)| branch.starts_with(&prefix))
+        })
+        .map(|(n, _)| n)
 }
 
 /// The remote default branch to start new work from, as a ref that
 /// exists in the checkout: `origin/HEAD`, else `origin/main`, else
 /// `origin/master`; `None` when the checkout has no remote branches.
 pub fn remote_default(dir: &Path) -> Option<String> {
-    if let Some(r) = git_out(dir, &["rev-parse", "--abbrev-ref", "origin/HEAD"]) {
+    remote_default_with(|args| git_out(dir, args))
+}
+
+/// [`remote_default`] for a workspace, through the repository darkmux holds.
+pub fn remote_default_of(wc: &crate::client_git::WorkCopy) -> Option<String> {
+    remote_default_with(|args| crate::client_git::line(wc, args))
+}
+
+fn remote_default_with(git: impl Fn(&[&str]) -> Option<String>) -> Option<String> {
+    if let Some(r) = git(&["rev-parse", "--abbrev-ref", "origin/HEAD"]) {
         if r.starts_with("origin/") && r != "origin/HEAD" {
             return Some(r);
         }
     }
     ["origin/main", "origin/master"].into_iter().find_map(|r| {
-        git_out(
-            dir,
-            &[
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("refs/remotes/{r}"),
-            ],
-        )
-        .map(|_| r.to_string())
+        git(&["rev-parse", "--verify", "--quiet", &format!("refs/remotes/{r}")]).map(|_| r.to_string())
     })
 }
 
@@ -418,7 +439,8 @@ fn recorded_source(base: &Path, name: &str) -> Option<PathBuf> {
 /// worktree of. `Err` says why not, and what to do. This is the only place
 /// a preview recipe is read from: never the workspace, which a run writes.
 pub fn own_checkout_of(base: &Path, name: &str, dir: &Path) -> Result<PathBuf, String> {
-    let repo = origin_of(dir).unwrap_or_else(|| "this repo".to_string());
+    let held = crate::client_git::work_copy_of(base, name, dir);
+    let repo = held.as_ref().and_then(origin_of).unwrap_or_else(|| "this repo".to_string());
     let Some(source) = recorded_source(base, name) else {
         return Err(format!(
             "workspace {name} was not made from a checkout of yours (it was cloned), so it has no \
@@ -430,7 +452,8 @@ pub fn own_checkout_of(base: &Path, name: &str, dir: &Path) -> Result<PathBuf, S
     let source = check_source(&source, base).map_err(|e| {
         format!("workspace {name}'s checkout {}: {e}; refusing its preview", source.display())
     })?;
-    if common_dir(dir).is_none() || common_dir(dir) != common_dir(&source) {
+    let held_common = held.and_then(|wc| crate::client_git::common_of(&wc.git_dir));
+    if held_common.is_none() || held_common != common_dir(&source) {
         return Err(format!(
             "workspace {name} is no longer a worktree of your checkout {}; refusing its preview",
             source.display()
