@@ -171,6 +171,11 @@ darkmux release.
 
 ### Fixed
 
+- **The bundled SQLite is patched (RUSTSEC-2026-0459).** `rusqlite` 0.31 -> 0.41, which bundles
+  `libsqlite3-sys` 0.39 and with it a SQLite past the CVE the advisory names. `rusqlite` 0.41 needs
+  Rust 1.89, so the minimum supported Rust for the `darkmux` binary and the crates that reach SQLite
+  (`darkmux-crew`, `-doctor`, `-fleet`, `-lab`, `-serve`) rises to 1.89 (from 1.88 and 1.86).
+
 - **A paired app's `workdir` is exactly one workspace (#3451 review).** `POST /client/work` checked a
   raw `workdir` only for lying under the worktrees base, so it admitted the base itself and the dot
   entries beside the workspaces: the repositories darkmux holds for them (`.<name>.git`) and its
