@@ -246,7 +246,7 @@ fn prepare_in(
 /// or a port alone proves nothing.
 fn refuse_engines_own_server(engine: &dyn ServerEngine, dirs: &Dirs, endpoint: &str) -> Result<(), EngineRefusal> {
     let Some(address) = engine.own_server()? else { return Ok(()) };
-    let ours = server::running(dirs, endpoint).is_some_and(|r| address_port(&address) == Some(r.port) && server::listens(&r));
+    let ours = server::running(dirs, endpoint).is_some_and(|r| flint::endpoint_port(&address) == Some(r.port) && server::listens(&r));
     if ours {
         return Ok(());
     }
@@ -259,12 +259,6 @@ fn refuse_engines_own_server(engine: &dyn ServerEngine, dirs: &Dirs, endpoint: &
     ))
 }
 
-/// The port of `http://host:port/...`.
-fn address_port(address: &str) -> Option<u16> {
-    let rest = address.split_once("://").map_or(address, |(_, r)| r);
-    let authority = rest.split('/').next()?;
-    authority.rsplit_once(':')?.1.parse().ok()
-}
 
 /// One of darkmux's own residents that could be evicted to make room.
 enum Resident {

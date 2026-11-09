@@ -27,7 +27,7 @@ darkmux release.
   `--temperature`, `--top-p`, `--top-k`, `--max-tokens`, `--fast-sync`/`--no-fast-sync`), checked
   at load. rec runs one server per machine, so a second Flint endpoint is refused by every
   dispatching preflight and failed by `darkmux doctor`, and a dispatch while rec's own server runs
-  (even one still starting) is refused with the new code `engine_in_use`, naming `rec stop`: darkmux never stops or takes
+  (ready, or still loading with its port bound) is refused with the new code `engine_in_use`, naming `rec stop`: darkmux never stops or takes
   over a server it did not start. `darkmux doctor` gains a `flint engine` row (rec's version, its
   runtime and each Flint model's directory, and whether rec's own server is up).
   `darkmux config set engines.flint.bin <path>` (or `DARKMUX_FLINT_BIN`) names `rec` when it is not

@@ -447,10 +447,17 @@ fn port_taken(port: u16) -> bool {
 /// this is what makes an answer on the port darkmux's. Nothing listening,
 /// or a platform that cannot say, is not darkmux's.
 pub fn listens(rec: &EngineRecord) -> bool {
-    let host = darkmux_platform::current();
+    listens_by(rec, darkmux_platform::current())
+}
+
+/// [`listens`], asked of `host`.
+pub fn listens_by(rec: &EngineRecord, host: &dyn darkmux_platform::Platform) -> bool {
     match host.tcp_listeners(rec.port) {
         Some(pids) if !pids.is_empty() => pids.iter().all(|&pid| pid == rec.pid || host.process_group(pid) == Some(rec.pid)),
-        _ => false,
+        // Nothing listening is not darkmux's server; nor is a host that
+        // cannot say who listens (#3453 re-review).
+        Some(_) => false,
+        None => false,
     }
 }
 
@@ -922,6 +929,41 @@ S(("127.0.0.1", port), H).serve_forever()
         assert!(!listens(&EngineRecord { port: other_port, ..rec.clone() }), "a foreign listener is not darkmux's");
         assert!(!listens(&EngineRecord { port: free_port(), ..rec.clone() }), "nothing listening is not darkmux's");
         stop(&f.dirs, &rec, quick()).unwrap();
+    }
+
+    /// (#3453 re-review) `listens_by` against a fake host: the recorded pid or
+    /// a process in its group is darkmux's; a foreign listener, nothing
+    /// listening, or a host that cannot say (`None`) is not.
+    #[test]
+    fn listens_is_false_when_the_host_cannot_say() {
+        use darkmux_platform::FakePlatform;
+        let f = fixture();
+        let rec = EngineRecord {
+            schema: ENGINE_RECORD_SCHEMA,
+            endpoint: "fl".into(),
+            engine: "flint".into(),
+            model: "m".into(),
+            n_ctx: 8,
+            port: 9100,
+            pid: 40,
+            start_stamp: 1,
+            owner_pid: 1,
+            argv: vec![],
+            log: f.dirs.log_for("fl"),
+            started_at_ms: 0,
+            engine_version: String::new(),
+        };
+        let host = |listeners: Vec<u32>| FakePlatform {
+            tcp_listeners: vec![(9100, listeners)],
+            process_groups: vec![(41, 40), (99, 99)],
+            ..Default::default()
+        };
+        assert!(listens_by(&rec, &host(vec![40])), "the server itself");
+        assert!(listens_by(&rec, &host(vec![41])), "a worker in its group");
+        assert!(!listens_by(&rec, &host(vec![41, 99])), "a foreign listener beside it");
+        assert!(!listens_by(&rec, &host(vec![])), "nothing listening");
+        let cannot_say = FakePlatform { tcp_listeners_unreadable: true, ..host(vec![40]) };
+        assert!(!listens_by(&rec, &cannot_say), "a host that cannot say is not darkmux's");
     }
 
     /// (#3458 re-review) A server that left its group while a worker stayed

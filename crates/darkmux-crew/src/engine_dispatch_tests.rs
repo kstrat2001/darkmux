@@ -694,20 +694,28 @@ fn rec_status_naming_darkmuxs_port_held_by_a_foreign_listener_is_refused() {
     assert_eq!(result.err().map(|e| e.code), Some("engine_in_use"));
 }
 
-/// (#3453 review) Fail closed: any JSON object `rec status` prints, a server
-/// still starting (`ready: false`) included, is rec's own server present.
+/// (#3453 re-review) `rec status` saying `ready: false`: rec's own server is
+/// still starting when something listens on the endpoint it names (refused,
+/// nothing started), and stopped when nothing does (the dispatch starts
+/// darkmux's server).
 #[test]
 #[serial_test::serial]
-fn rec_status_ready_false_is_still_recs_server_and_refused() {
+fn rec_status_ready_false_is_recs_server_only_while_its_port_is_bound() {
     let r = rig();
     let rec = fake_rec(r.dir.path(), "0.1.0");
-    std::fs::write(r.dir.path().join("status.json"), r#"{"ready":false,"endpoint":"http://127.0.0.1:11500/v1"}"#).unwrap();
     let machine = FakeMachine { reclaimable: RefCell::new(Some(64 * GIB)), ..Default::default() };
+    let bound = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let rec_port = bound.local_addr().unwrap().port();
+    let status = format!(r#"{{"ready":false,"endpoint":"http://127.0.0.1:{rec_port}/v1"}}"#);
+    std::fs::write(r.dir.path().join("status.json"), &status).unwrap();
     let err = prepare_in(&flint_target("flint-int4", free_port()), &r.dirs, &rec, quick(), &machine, &mut |_, _| {})
         .err()
         .expect("refused");
     assert_eq!(err.code, "engine_in_use");
     assert!(engine_record::list_in(&r.dirs.records).0.is_empty(), "nothing started");
+    drop(bound);
+    let ready = prepare_in(&flint_target("flint-int4", free_port()), &r.dirs, &rec, quick(), &machine, &mut |_, _| {}).unwrap();
+    assert!(ready.started, "a stopped rec (`ready: false`, nothing on its port) leaves the engine free");
 }
 
 /// (#3453 review) Tensorfold's `serve_spec` failing (here a model with no

@@ -48,16 +48,31 @@ pub fn parse_version(text: &str) -> Result<String> {
 }
 
 /// Whether rec's own server is present, from what `rec status` printed (on a
-/// zero exit): any JSON object is (fail closed, #3453 review), `"ready":
-/// false` included, since a server still loading holds rec's lock and its
-/// memory as surely as a ready one; its `endpoint` names it. Only output
-/// that is not a JSON object reads as no server. rec 0.1.0's output with its
-/// server stopped was never observed (its server was running whenever this
-/// was checked), so "not running" is inferred from anything else.
-pub fn parse_status(stdout: &str) -> Option<String> {
+/// zero exit), naming its endpoint: when it says `"ready": true`, or when it
+/// names an `endpoint` whose port something listens on (`listening`), a
+/// server still loading. rec prints `ready` on every status (its field has no
+/// `omitempty`), so a stopped rec says `false`; `ready: false` with nothing
+/// on its port is free, as is output that is not a JSON object.
+///
+/// rec 0.1.0's output with its server stopped was never observed (its server
+/// was running whenever this was checked); the rule above is read from its
+/// binary. Accepted window: a server so early in its start that it has not
+/// bound its port reads as free, and darkmux may start its own beside it;
+/// the memory check still applies to that start.
+pub fn parse_status(stdout: &str, listening: &dyn Fn(u16) -> bool) -> Option<String> {
     let doc: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
     let obj = doc.as_object()?;
-    Some(obj.get("endpoint").and_then(|e| e.as_str()).unwrap_or("an endpoint it did not name").to_string())
+    let endpoint = obj.get("endpoint").and_then(|e| e.as_str());
+    let ready = obj.get("ready").and_then(|r| r.as_bool()) == Some(true);
+    let bound = endpoint.and_then(endpoint_port).is_some_and(listening);
+    (ready || bound).then(|| endpoint.unwrap_or("an endpoint it did not name").to_string())
+}
+
+/// The port of `http://host:port/...`.
+pub fn endpoint_port(address: &str) -> Option<u16> {
+    let rest = address.split_once("://").map_or(address, |(_, r)| r);
+    let authority = rest.split('/').next()?;
+    authority.rsplit_once(':')?.1.parse().ok()
 }
 
 /// The bytes of a model's weights on disk (its `*.safetensors`): the floor a
@@ -135,7 +150,10 @@ impl Rec {
     /// An error only when `rec status` could not be run at all.
     pub fn own_server(&self) -> Result<Option<String>> {
         let run = self.call(&["status"])?;
-        Ok(if run.status.success() { parse_status(&run.stdout) } else { None })
+        let host = darkmux_platform::current();
+        // A host that cannot say who listens counts as someone listening.
+        let listening = |port: u16| host.tcp_listeners(port).is_none_or(|pids| !pids.is_empty());
+        Ok(if run.status.success() { parse_status(&run.stdout, &listening) } else { None })
     }
 
     fn data(&self) -> Result<&Path> {
@@ -299,19 +317,27 @@ mod tests {
         assert!(err.contains("rec 0.2.0 is installed") && err.contains("rec 0.1.0"), "{err}");
     }
 
-    /// (#3453 review) Fail closed: any JSON object `rec status` prints is
-    /// rec's server present, a starting `ready: false` included; only output
-    /// that is not a JSON object reads as none.
+    /// (#3453 re-review) rec's server is present when `rec status` says
+    /// `ready: true`, or names an endpoint whose port something listens on
+    /// (a server still loading). `ready: false` with nothing on its port is
+    /// free (rec prints `ready` on every status, so a stopped rec says
+    /// `false`); output that is not a JSON object is free.
     #[test]
-    fn rec_status_reads_any_json_object_as_recs_server() {
-        assert_eq!(parse_status(RUNNING).as_deref(), Some("http://127.0.0.1:11500/v1"));
-        assert_eq!(parse_status(r#"{"ready":true}"#).as_deref(), Some("an endpoint it did not name"));
-        let starting = r#"{"ready":false,"endpoint":"http://127.0.0.1:11500/v1"}"#;
-        assert_eq!(parse_status(starting).as_deref(), Some("http://127.0.0.1:11500/v1"));
-        assert!(parse_status(r#"{"ready":false}"#).is_some(), "an object with no endpoint is still a server");
-        for stopped in ["", "rec is not running", "[]", "\"stopped\""] {
-            assert_eq!(parse_status(stopped), None, "{stopped:?}");
+    fn rec_status_is_ready_true_or_a_listener_on_its_endpoint() {
+        let listening = |port: u16| port == 11500;
+        let nobody = |_: u16| false;
+        let parse = |out: &str, l: &dyn Fn(u16) -> bool| parse_status(out, l);
+        assert_eq!(parse(RUNNING, &nobody).as_deref(), Some("http://127.0.0.1:11500/v1"), "ready:true, whatever listens");
+        assert_eq!(parse(r#"{"ready":true}"#, &nobody).as_deref(), Some("an endpoint it did not name"));
+        let not_ready = r#"{"ready":false,"endpoint":"http://127.0.0.1:11500/v1"}"#;
+        assert_eq!(parse(not_ready, &listening).as_deref(), Some("http://127.0.0.1:11500/v1"), "starting: its port is bound");
+        assert_eq!(parse(not_ready, &nobody), None, "stopped: nothing on its port");
+        assert_eq!(parse(r#"{"ready":false}"#, &listening), None, "no endpoint, not ready");
+        for free in ["", "rec is not running", "[]", "\"stopped\""] {
+            assert_eq!(parse(free, &listening), None, "{free:?}");
         }
+        assert_eq!(endpoint_port("http://127.0.0.1:11500/v1"), Some(11500));
+        assert_eq!(endpoint_port("http://127.0.0.1/v1"), None);
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(fake_install(dir.path(), "0.1.0", RUNNING).own_server().unwrap().as_deref(), Some("http://127.0.0.1:11500/v1"));
         // A non-zero exit is no server, whatever it printed.
