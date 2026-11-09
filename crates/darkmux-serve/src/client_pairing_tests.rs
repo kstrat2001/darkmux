@@ -1904,7 +1904,7 @@ fn changes_exclude_what_the_work_copy_held_before_the_run() {
     )
     .unwrap();
     std::fs::write(dir.path().join("new.txt"), "a\nb\n").unwrap();
-    let c = changes_since(dir.path(), &before).unwrap();
+    let c = serde_json::to_value(changes_since(dir.path(), &before).unwrap()).unwrap();
     assert_eq!(
         c["files"],
         serde_json::json!([{"path": "new.txt", "added": 2, "removed": 0}, {"path": "pre.txt", "added": 1, "removed": 0}])
@@ -1929,7 +1929,7 @@ fn an_unchanged_work_copy_reports_no_changes() {
     std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
     let before = snapshot_tree(dir.path()).unwrap();
     assert_eq!(
-        changes_since(dir.path(), &before).unwrap(),
+        serde_json::to_value(changes_since(dir.path(), &before).unwrap()).unwrap(),
         serde_json::json!({"files": [], "diff": ""})
     );
 }
@@ -1943,7 +1943,7 @@ fn a_large_diff_is_capped_with_a_marker() {
         .map(|i| format!("line number {i} of a long file\n"))
         .collect();
     std::fs::write(dir.path().join("big.txt"), &big).unwrap();
-    let c = changes_since(dir.path(), &before).unwrap();
+    let c = serde_json::to_value(changes_since(dir.path(), &before).unwrap()).unwrap();
     let diff = c["diff"].as_str().unwrap();
     assert!(
         diff.len() <= MAX_DIFF_BYTES + DIFF_TRUNCATED_MARKER.len(),
@@ -3353,7 +3353,7 @@ async fn a_preview_ends_when_darkmux_does() {
         .unwrap();
     let previews = crate::client_preview::Previews::new(dir.path().join("p"), stand_in.id());
     let (v, _) = previews.start("w", &wt, &checkout).unwrap();
-    let port = v["port"].as_u64().unwrap();
+    let port = u64::from(v.port);
     let mut up = false;
     for _ in 0..100 {
         if answers(port) {

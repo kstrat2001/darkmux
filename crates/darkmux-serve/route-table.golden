@@ -31,6 +31,95 @@ GET /lab/run/detail  json LabRunDetailResponse
 GET /lab/run/events  json LabRunEventsResponse
 POST /fleet/work  ndjson (darkmux_fleet submission; fleet listener, not the viewer daemon)
 GET /fleet/card  json ListenerCard (fleet listener, not the viewer daemon; the caller's own grant rides with the card)
+POST /client/pair  json PairAccepted (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
+GET /client/pair/:request_id  json PairPoll (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
+GET /client/whoami  json Whoami (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
+GET /client/profiles  json ClientProfiles (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
+POST /client/work  json WorkAccepted (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
+GET /client/work/:work_id  json WorkState (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
+POST /client/work/:work_id/cancel  json StatusWord (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
+POST /client/work/:work_id/keep  json KeepReply (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
+POST /client/work/:work_id/discard  json DiscardReply (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
+POST /client/work/:work_id/undo  json UndoReply (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
+GET /client/recipe  json RecipeReply (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
+POST /client/workspaces  json WorkspaceInfo (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
+GET /client/workspaces/:name  json WorkspaceInfo (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
+GET /client/workspaces/:name/changes  json BranchChanges (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
+POST /client/workspaces/:name/preview  json PreviewState (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
+GET /client/workspaces/:name/preview  json PreviewState (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
+DELETE /client/workspaces/:name/preview  json StatusWord (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
+
+# client listener response types: Type.field: type, from the JSON schema (every refusal is ClientError)
+BranchChanges.base: string
+BranchChanges.base_branch: string
+BranchChanges.branch: string
+BranchChanges.files: Array<BranchFile>
+BranchChanges.head: string
+BranchFile.content?: string | null
+BranchFile.deleted?: boolean | null
+BranchFile.mode?: string | null
+BranchFile.path: string
+ClientError.error: string
+ClientMachine.id: string
+ClientMachine.name: string
+ClientProfileInfo.description?: string | null
+ClientProfileInfo.endpoint: string
+ClientProfileInfo.error?: string | null
+ClientProfileInfo.loaded?: boolean | null
+ClientProfileInfo.model?: string | null
+ClientProfileInfo.name: string
+ClientProfileInfo.reachable: boolean
+ClientProfiles.machine: ClientMachine
+ClientProfiles.profiles: Array<ClientProfileInfo>
+ClientProfiles.role: string
+ClientScopes.profiles: ProfilesGrant
+ClientScopes.workspace: boolean
+DiscardReply.removed: Array<string>
+DiscardReply.restored: Array<string>
+FileChange.added?: integer | null
+FileChange.path: string
+FileChange.removed?: integer | null
+Install.command: string
+Install.unless_exists?: string | null
+KeepReply.branch?: string | null
+KeepReply.commit?: string | null
+KeepReply.files: Array<string>
+PairAccepted.request_id: string
+PairPoll = { status: "pending" } | { status: "denied" } | { status: "expired" } | { client_name: string, token: string, scopes: ClientScopes, status: "approved" }
+PreviewState.error?: string | null
+PreviewState.hmr_port: integer
+PreviewState.log_tail?: string | null
+PreviewState.port: integer
+PreviewState.status: string
+PreviewState.url: string
+PreviewState.workspace: string
+ProfilesGrant = Array<string> | string
+Ready.http?: string | null
+Recipe.command: string
+Recipe.env?: Record<string, string>
+Recipe.env_from_source?: Array<string>
+Recipe.install?: Install | null
+Recipe.ready?: Ready | null
+Recipe.schema_version: string
+RecipeReply.recipe: Recipe
+RunChanges.diff: string
+RunChanges.files: Array<FileChange>
+StatusWord.status: string
+UndoReply.files: Array<string>
+UndoReply.revert: string
+Whoami.client_name: string
+Whoami.machine: ClientMachine
+Whoami.scopes: ClientScopes
+WorkAccepted.profile: string
+WorkAccepted.work_id: string
+WorkState = { status: "running" } | { status: "cancelling" } | { result: any, changes?: RunChanges | null, commit?: string | null, branch?: string | null, commit_error?: string | null, undone: boolean, status: "done" } | { error: string, reason: string, status: "error" } | { reason: string, error?: string | null, status: "cancelled" }
+WorkspaceInfo.branch: string
+WorkspaceInfo.created: boolean
+WorkspaceInfo.fetch_error?: string | null
+WorkspaceInfo.from?: string | null
+WorkspaceInfo.head: string
+WorkspaceInfo.repo?: string | null
+WorkspaceInfo.workspace: string
 
 # response types: Type.field: type, from the generated TypeScript twins
 HealthResponse.darkmux_version: string

@@ -1539,12 +1539,12 @@ mod tests {
     }
 
     /// A route registered anywhere but the route table escapes the layer. The
-    /// daemon's router is built from `routes::table()`. Two listeners have
-    /// their own routers and are not the daemon's reads: the fleet listener's
-    /// token-gated execution surface, and `darkmux client serve`'s
-    /// (client_pairing.rs), which binds 127.0.0.1 only and answers only a
-    /// paired app's token. Mounting either in the table would put it on the
-    /// daemon's address.
+    /// daemon's router is built from `routes::table()`; the fleet listener's
+    /// own router is the token-gated execution surface, not a read. `darkmux
+    /// client serve`'s router is built in routes.rs too, from
+    /// `routes::client_table()` (its own listener, 127.0.0.1 only and behind
+    /// its own gate, so never mounted on the daemon), so no other file may
+    /// register a route.
     #[test]
     fn every_route_is_registered_through_the_route_table() {
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -1552,7 +1552,7 @@ mod tests {
         for entry in std::fs::read_dir(&dir).unwrap() {
             let path = entry.unwrap().path();
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
-            if !name.ends_with(".rs") || name.ends_with("_tests.rs") || ["routes.rs", "fleet_listener.rs", "client_pairing.rs", "redaction.rs"].contains(&name.as_str()) {
+            if !name.ends_with(".rs") || name.ends_with("_tests.rs") || ["routes.rs", "fleet_listener.rs", "redaction.rs"].contains(&name.as_str()) {
                 continue;
             }
             let text = std::fs::read_to_string(&path).unwrap();

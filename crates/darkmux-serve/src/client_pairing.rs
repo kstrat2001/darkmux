@@ -63,11 +63,12 @@ use axum::{
     extract::{Path as UrlPath, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::client_wire::*;
 use std::collections::HashMap;
 use std::io::{Read, Seek, Write};
 use std::net::SocketAddr;
@@ -441,7 +442,7 @@ pub enum WorkStatus {
     /// workdir (`None`: no workdir, or not a git work copy).
     Done {
         result: Value,
-        changes: Option<Value>,
+        changes: Option<RunChanges>,
     },
     Error(RunError),
     /// Its owner cancelled it and it has ended; how its child ended, if it
@@ -735,40 +736,20 @@ pub fn run(port: u16) -> Result<()> {
     })
 }
 
+/// The listener's router, built from the client route table
+/// (`routes::client_table`), behind [`only_this_machines_apps`].
 pub fn router(state: ClientServerState) -> Router {
-    Router::new()
-        .route("/client/pair", post(pair_handler))
-        .route("/client/pair/:request_id", get(poll_handler))
-        .route("/client/whoami", get(whoami_handler))
-        .route("/client/profiles", get(profiles_handler))
-        .route("/client/work", post(work_handler))
-        .route("/client/work/:work_id", get(work_status_handler))
-        .route("/client/work/:work_id/cancel", post(cancel_handler))
-        .route("/client/work/:work_id/keep", post(keep_handler))
-        .route("/client/work/:work_id/discard", post(discard_handler))
-        .route("/client/work/:work_id/undo", post(undo_handler))
-        .route("/client/recipe", get(recipe_handler))
-        .route("/client/workspaces", post(workspace_create_handler))
-        .route("/client/workspaces/:name", get(workspace_status_handler))
-        .route(
-            "/client/workspaces/:name/changes",
-            get(workspace_changes_handler),
-        )
-        .route(
-            "/client/workspaces/:name/preview",
-            post(preview_start_handler)
-                .get(preview_status_handler)
-                .delete(preview_stop_handler),
-        )
-        .fallback(|| async { err(StatusCode::NOT_FOUND, "no such route") })
-        .method_not_allowed_fallback(|| async {
-            err(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
-        })
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            only_this_machines_apps,
-        ))
-        .with_state(state)
+    crate::routes::client_router(state)
+}
+
+/// A JSON 404 for a path the table does not list.
+pub(crate) async fn no_such_route() -> Response {
+    err(StatusCode::NOT_FOUND, "no such route")
+}
+
+/// A JSON 405 for a method a listed path does not take.
+pub(crate) async fn method_not_allowed() -> Response {
+    err(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
 }
 
 /// The gate in front of every route: the request must come from this machine
@@ -778,7 +759,7 @@ pub fn router(state: ClientServerState) -> Router {
 /// and every browser sends one on a cross-site POST), and a POST with a body
 /// must say `Content-Type: application/json` (a form post a page can send
 /// without asking is `text/plain` or `application/x-www-form-urlencoded`).
-async fn only_this_machines_apps(
+pub(crate) async fn only_this_machines_apps(
     State(state): State<ClientServerState>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
@@ -837,7 +818,7 @@ fn is_json(req: &axum::extract::Request) -> bool {
 }
 
 fn err(code: StatusCode, msg: impl Into<String>) -> Response {
-    (code, Json(serde_json::json!({"error": msg.into()}))).into_response()
+    (code, Json(ClientError { error: msg.into() })).into_response()
 }
 
 /// A refusal on its way back to a handler, boxed: a `Response` is large, and
@@ -898,7 +879,7 @@ struct PairBody {
     scopes: Option<serde::de::IgnoredAny>,
 }
 
-async fn pair_handler(State(state): State<ClientServerState>, body: Body) -> Response {
+pub(crate) async fn pair_handler(State(state): State<ClientServerState>, body: Body) -> Response {
     let req: PairBody = match json_body(body).await {
         Ok(r) => r,
         Err(r) => return r,
@@ -936,7 +917,7 @@ async fn pair_handler(State(state): State<ClientServerState>, body: Body) -> Res
     match added {
         Ok(true) => (
             StatusCode::ACCEPTED,
-            Json(serde_json::json!({"request_id": request_id})),
+            Json(PairAccepted { request_id }),
         )
             .into_response(),
         Ok(false) => err(
@@ -960,13 +941,13 @@ fn poll_pending(f: &mut ClientsFile, request_id: &str, secret: &str, now: u64) -
     }
     let p = f.pending[i].clone();
     if p.status == PendingStatus::Denied {
-        return Ok(PollOutcome::Status("denied"));
+        return Ok(PollOutcome::Status(PairPoll::Denied));
     }
     if p.expired(now) {
-        return Ok(PollOutcome::Status("expired"));
+        return Ok(PollOutcome::Status(PairPoll::Expired));
     }
     if p.status == PendingStatus::Pending {
-        return Ok(PollOutcome::Status("pending"));
+        return Ok(PollOutcome::Status(PairPoll::Pending));
     }
     // Approved: mint the token, store only its hash, and drop the
     // request so no later poll can collect it again.
@@ -986,28 +967,15 @@ fn poll_pending(f: &mut ClientsFile, request_id: &str, secret: &str, now: u64) -
 
 enum PollOutcome {
     NotFound,
-    Status(&'static str),
+    Status(PairPoll),
     Approved { client_name: String, token: String },
-}
-
-/// What a paired client may run, as it reads it: `{"profiles": [..] |
-/// "local", "workspace": true}`. `profiles` is this machine's
-/// `clients.profiles`, or `"local"` when it is unset: any profile whose work
-/// stays on this machine (the role's own included, judged the same way).
-/// `workspace` is always true: a `workdir` under the worktrees base is
-/// allowed to every paired client.
-fn scopes_json(policy: &Option<Vec<String>>) -> Value {
-    match policy {
-        Some(list) => serde_json::json!({"profiles": list, "workspace": true}),
-        None => serde_json::json!({"profiles": "local", "workspace": true}),
-    }
 }
 
 fn policy_or_503(state: &ClientServerState) -> Result<Option<Vec<String>>, Refused> {
     (state.profiles_policy)().map_err(|e| refuse(StatusCode::SERVICE_UNAVAILABLE, e))
 }
 
-async fn poll_handler(
+pub(crate) async fn poll_handler(
     State(state): State<ClientServerState>,
     UrlPath(request_id): UrlPath<String>,
     headers: HeaderMap,
@@ -1025,10 +993,12 @@ async fn poll_handler(
     let outcome = state.store.update(|f| poll_pending(f, &request_id, secret, now));
     match outcome {
         Ok(PollOutcome::NotFound) => not_found(),
-        Ok(PollOutcome::Status(s)) => Json(serde_json::json!({"status": s})).into_response(),
-        Ok(PollOutcome::Approved { client_name, token }) => Json(serde_json::json!({
-            "status": "approved", "client_name": client_name, "token": token, "scopes": scopes_json(&policy),
-        }))
+        Ok(PollOutcome::Status(s)) => Json(s).into_response(),
+        Ok(PollOutcome::Approved { client_name, token }) => Json(PairPoll::Approved {
+            client_name,
+            token,
+            scopes: ClientScopes::of(&policy),
+        })
         .into_response(),
         Err(e) => internal(e),
     }
@@ -1061,7 +1031,7 @@ fn authenticate(
 }
 
 /// This machine, as `/client/whoami` and `/client/profiles` name it.
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, schemars::JsonSchema)]
 pub struct ClientMachine {
     /// `m-` and 16 hex digits of a hash of the hardware uuid (never the
     /// uuid itself): stable across renames and every device that pairs.
@@ -1094,7 +1064,7 @@ impl ClientMachine {
 pub use crate::client_profiles::ClientProfileInfo;
 
 #[derive(Deserialize)]
-struct ProfilesQuery {
+pub(crate) struct ProfilesQuery {
     role: Option<String>,
 }
 
@@ -1103,7 +1073,7 @@ struct ProfilesQuery {
 /// role's own first, then every other local one), each with its model and
 /// whether it answers now. Read-only;
 /// an app picks among these per run.
-async fn profiles_handler(
+pub(crate) async fn profiles_handler(
     State(state): State<ClientServerState>,
     query: axum::extract::Query<ProfilesQuery>,
     headers: HeaderMap,
@@ -1121,8 +1091,12 @@ async fn profiles_handler(
     let profiles = tokio::task::spawn_blocking(move || describe_listed(&st, &asked, &names))
         .await
         .unwrap_or_default();
-    Json(serde_json::json!({ "role": role, "profiles": profiles, "machine": state.machine }))
-        .into_response()
+    Json(ClientProfiles {
+        role,
+        profiles,
+        machine: state.machine.clone(),
+    })
+    .into_response()
 }
 
 /// The profiles this app may run `role`'s work on here, in the order
@@ -1173,15 +1147,19 @@ fn describe_listed(state: &ClientServerState, role: &str, names: &[String]) -> V
         .collect()
 }
 
-async fn whoami_handler(State(state): State<ClientServerState>, headers: HeaderMap) -> Response {
+pub(crate) async fn whoami_handler(State(state): State<ClientServerState>, headers: HeaderMap) -> Response {
     let client = match authenticate(&state, &headers) {
         Ok(c) => c,
         Err(r) => return *r,
     };
     match policy_or_503(&state) {
         Ok(policy) => {
-            Json(serde_json::json!({"client_name": client.name, "scopes": scopes_json(&policy), "machine": state.machine}))
-                .into_response()
+            Json(Whoami {
+                client_name: client.name,
+                scopes: ClientScopes::of(&policy),
+                machine: state.machine.clone(),
+            })
+            .into_response()
         }
         Err(r) => *r,
     }
@@ -1217,7 +1195,7 @@ struct WorkBody {
     title: Option<String>,
 }
 
-async fn work_handler(
+pub(crate) async fn work_handler(
     State(state): State<ClientServerState>,
     headers: HeaderMap,
     body: Body,
@@ -1241,7 +1219,7 @@ async fn work_handler(
     tokio::task::spawn_blocking(move || run_work(&execute, &works, spec, &cancel));
     (
         StatusCode::ACCEPTED,
-        Json(serde_json::json!({"work_id": work_id, "profile": profile})),
+        Json(WorkAccepted { work_id, profile }),
     )
         .into_response()
 }
@@ -1348,14 +1326,7 @@ fn changed_paths(status: &WorkStatus) -> Vec<String> {
     match status {
         WorkStatus::Done {
             changes: Some(c), ..
-        } => c["files"]
-            .as_array()
-            .map(|f| {
-                f.iter()
-                    .filter_map(|x| x["path"].as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default(),
+        } => c.files.iter().map(|f| f.path.clone()).collect(),
         _ => Vec::new(),
     }
 }
@@ -1559,7 +1530,7 @@ fn work_title(req: &WorkBody) -> String {
 pub use crate::client_preview::MAX_RECIPE_BYTES;
 
 #[derive(Deserialize)]
-struct RecipeQuery {
+pub(crate) struct RecipeQuery {
     #[serde(default)]
     workdir: Option<String>,
     #[serde(default)]
@@ -1570,7 +1541,7 @@ struct RecipeQuery {
 /// directory>`): the workspace's preview recipe, read and checked exactly as
 /// a preview start reads it: from the user's own checkout the workspace was
 /// made from, never from the workspace.
-async fn recipe_handler(
+pub(crate) async fn recipe_handler(
     State(state): State<ClientServerState>,
     headers: HeaderMap,
     query: Result<axum::extract::Query<RecipeQuery>, axum::extract::rejection::QueryRejection>,
@@ -1620,7 +1591,7 @@ fn workspace_of_workdir(state: &ClientServerState, w: &str) -> Result<String, Re
 /// The recipe in the user's `checkout`, checked, as `{"recipe": {..}}`.
 fn read_recipe(dir: &Path, checkout: &Path) -> Response {
     match crate::client_preview::load_recipe(checkout) {
-        Ok(recipe) => Json(serde_json::json!({ "recipe": recipe })).into_response(),
+        Ok(recipe) => Json(RecipeReply { recipe }).into_response(),
         Err(e) => recipe_refusal(&no_recipe_in(checkout, dir, e)),
     }
 }
@@ -1649,15 +1620,17 @@ fn workspace_dir(state: &ClientServerState, name: &str) -> Result<PathBuf, Refus
     (state.check_workdir)(&dir).map_err(|e| refuse(StatusCode::FORBIDDEN, e))
 }
 
-fn workspace_json(name: &str, dir: &Path, created: bool) -> Value {
+fn workspace_json(name: &str, dir: &Path, created: bool) -> WorkspaceInfo {
     let (branch, head) = crate::client_workspace::status_of(dir).unwrap_or_default();
-    serde_json::json!({
-        "workspace": name,
-        "branch": branch,
-        "head": head,
-        "repo": crate::client_workspace::origin_of(dir),
-        "created": created,
-    })
+    WorkspaceInfo {
+        workspace: name.to_string(),
+        branch,
+        head,
+        repo: crate::client_workspace::origin_of(dir),
+        created,
+        from: None,
+        fetch_error: None,
+    }
 }
 
 #[derive(Deserialize)]
@@ -1719,7 +1692,7 @@ fn workspace_ask(req: &WorkspaceBody) -> Result<WorkspaceAsk, Refused> {
 /// worktree of that checkout or adds one on a new `mux/<bot>-<id>` branch, so
 /// the owner's own working tree is never touched. 201 when created, 200 when
 /// reused.
-async fn workspace_create_handler(
+pub(crate) async fn workspace_create_handler(
     State(state): State<ClientServerState>,
     headers: HeaderMap,
     body: Body,
@@ -1834,7 +1807,7 @@ fn template_workspace(
     match workspace_dir(state, &name) {
         Ok(dir) => {
             let mut v = workspace_json(&name, &dir, true);
-            v["from"] = from.into();
+            v.from = Some(from);
             (StatusCode::CREATED, Json(v)).into_response()
         }
         Err(r) => *r,
@@ -1877,7 +1850,7 @@ fn existing_clone(state: &ClientServerState, name: &str) -> Response {
     };
     let mut v = workspace_json(name, &dir, false);
     if let Err(e) = (state.fetch_repo)(&dir) {
-        v["fetch_error"] = e.into();
+        v.fetch_error = Some(e);
     }
     Json(v).into_response()
 }
@@ -1989,9 +1962,9 @@ fn created_worktree(state: &ClientServerState, name: &str, start: String, fetch_
     match workspace_dir(state, name) {
         Ok(dir) => {
             let mut v = workspace_json(name, &dir, true);
-            v["from"] = start.into();
+            v.from = Some(start);
             if let Some(e) = fetch_error {
-                v["fetch_error"] = e.into();
+                v.fetch_error = Some(e);
             }
             (StatusCode::CREATED, Json(v)).into_response()
         }
@@ -2076,7 +2049,7 @@ fn no_recipe_in(
 /// workspace was made from, on free ports. 202 while it starts, 200 when it
 /// was already running; poll GET for `ready` and `url`. 404 when there is no
 /// recipe to run (a cloned workspace, or none in the checkout).
-async fn preview_start_handler(
+pub(crate) async fn preview_start_handler(
     State(state): State<ClientServerState>,
     UrlPath(name): UrlPath<String>,
     headers: HeaderMap,
@@ -2112,7 +2085,7 @@ fn start_preview(state: &ClientServerState, name: &str) -> Response {
     }
 }
 
-async fn preview_status_handler(
+pub(crate) async fn preview_status_handler(
     State(state): State<ClientServerState>,
     UrlPath(name): UrlPath<String>,
     headers: HeaderMap,
@@ -2123,7 +2096,7 @@ async fn preview_status_handler(
     let status = state.previews.status(&name);
     let now = status
         .as_ref()
-        .map(|v| v["status"].as_str().unwrap_or("?").to_string())
+        .map(|v| v.status.clone())
         .unwrap_or_else(|| "none running (404)".to_string());
     // The app polls every second: log a status only when it changes.
     if PREVIEW_LOG_SEEN.changed(&name, &now) {
@@ -2159,7 +2132,7 @@ impl PreviewLogSeen {
 static PREVIEW_LOG_SEEN: std::sync::LazyLock<PreviewLogSeen> =
     std::sync::LazyLock::new(PreviewLogSeen::default);
 
-async fn preview_stop_handler(
+pub(crate) async fn preview_stop_handler(
     State(state): State<ClientServerState>,
     UrlPath(name): UrlPath<String>,
     headers: HeaderMap,
@@ -2172,7 +2145,10 @@ async fn preview_stop_handler(
         .await
         .unwrap_or(false);
     if stopped {
-        Json(serde_json::json!({"status": "stopped"})).into_response()
+        Json(StatusWord {
+            status: "stopped".to_string(),
+        })
+        .into_response()
     } else {
         not_found()
     }
@@ -2186,7 +2162,7 @@ pub const MAX_CHANGES_BYTES: usize = 25 * 1024 * 1024;
 /// open a PR with its own GitHub sign-in (darkmux doesn't author PRs). Only
 /// committed changes: {base, base_branch, head, branch, files: [{path,
 /// content (base64), mode} | {path, deleted: true}]}.
-async fn workspace_changes_handler(
+pub(crate) async fn workspace_changes_handler(
     State(state): State<ClientServerState>,
     UrlPath(name): UrlPath<String>,
     headers: HeaderMap,
@@ -2224,7 +2200,12 @@ async fn workspace_changes_handler(
         for pair in fields.chunks(2) {
             let [status, path] = pair else { continue };
             if status.starts_with('D') {
-                files.push(serde_json::json!({"path": path, "deleted": true}));
+                files.push(BranchFile {
+                    path: path.clone(),
+                    deleted: Some(true),
+                    mode: None,
+                    content: None,
+                });
                 continue;
             }
             let Some(blob) = git(&dir, None, &["show", &format!("{head}:{path}")]) else {
@@ -2237,15 +2218,20 @@ async fn workspace_changes_handler(
             let mode = git_line(&dir, &["--literal-pathspecs", "ls-tree", &head, "--", path])
                 .and_then(|l| l.split_whitespace().next().map(str::to_string))
                 .unwrap_or_else(|| "100644".to_string());
-            files.push(serde_json::json!({"path": path, "mode": mode, "content": ws::base64_encode(&blob.stdout)}));
+            files.push(BranchFile {
+                path: path.clone(),
+                deleted: None,
+                mode: Some(mode),
+                content: Some(ws::base64_encode(&blob.stdout)),
+            });
         }
-        Json(serde_json::json!({
-            "base": base,
-            "base_branch": default.trim_start_matches("origin/"),
-            "head": head,
-            "branch": branch,
-            "files": files,
-        }))
+        Json(BranchChanges {
+            base,
+            base_branch: default.trim_start_matches("origin/").to_string(),
+            head,
+            branch,
+            files,
+        })
         .into_response()
     })
     .await
@@ -2253,7 +2239,7 @@ async fn workspace_changes_handler(
 }
 
 /// `GET /client/workspaces/{name}`: branch, head and repo of one workspace.
-async fn workspace_status_handler(
+pub(crate) async fn workspace_status_handler(
     State(state): State<ClientServerState>,
     UrlPath(name): UrlPath<String>,
     headers: HeaderMap,
@@ -2270,7 +2256,7 @@ async fn workspace_status_handler(
     .unwrap_or_else(|e| internal(anyhow!("workspace status panicked: {e}")))
 }
 
-async fn work_status_handler(
+pub(crate) async fn work_status_handler(
     State(state): State<ClientServerState>,
     UrlPath(work_id): UrlPath<String>,
     headers: HeaderMap,
@@ -2287,32 +2273,33 @@ async fn work_status_handler(
 }
 
 /// A work item as its client polls it.
-fn work_status_json(w: WorkEntry) -> Value {
+fn work_status_json(w: WorkEntry) -> WorkState {
     match w.status {
-            WorkStatus::Running if w.cancel.requested() => serde_json::json!({"status": "cancelling"}),
-            WorkStatus::Running => serde_json::json!({"status": "running"}),
-            WorkStatus::Done { result, changes } => serde_json::json!({
-                "status": "done",
-                "result": result,
-                "changes": changes,
-                "commit": w.commit.as_deref().map(short),
-                "branch": w.branch,
-                "commit_error": w.commit_error,
-                "undone": w.decided.is_some(),
-            }),
-            WorkStatus::Error(e) => serde_json::json!({"status": "error", "error": e.error, "reason": e.reason}),
-            WorkStatus::Cancelled(e) => serde_json::json!({
-                "status": "cancelled",
-                "reason": "cancelled",
-                "error": e.map(|e| e.error),
-            }),
+        WorkStatus::Running if w.cancel.requested() => WorkState::Cancelling,
+        WorkStatus::Running => WorkState::Running,
+        WorkStatus::Done { result, changes } => WorkState::Done {
+            result,
+            changes,
+            commit: w.commit.as_deref().map(short),
+            branch: w.branch,
+            commit_error: w.commit_error,
+            undone: w.decided.is_some(),
+        },
+        WorkStatus::Error(e) => WorkState::Error {
+            error: e.error,
+            reason: e.reason,
+        },
+        WorkStatus::Cancelled(e) => WorkState::Cancelled {
+            reason: "cancelled".to_string(),
+            error: e.map(|e| e.error),
+        },
     }
 }
 
 /// `POST /client/work/{id}/cancel`: only the client that started the run may
 /// stop it (anyone else's id reads as unknown). The stop itself is the
 /// executor's: SIGTERM, then SIGKILL after [`CANCEL_GRACE`].
-async fn cancel_handler(
+pub(crate) async fn cancel_handler(
     State(state): State<ClientServerState>,
     UrlPath(work_id): UrlPath<String>,
     headers: HeaderMap,
@@ -2328,7 +2315,9 @@ async fn cancel_handler(
                 w.cancel.request();
                 (
                     StatusCode::ACCEPTED,
-                    Json(serde_json::json!({"status": "cancelling"})),
+                    Json(StatusWord {
+                        status: "cancelling".to_string(),
+                    }),
                 )
                     .into_response()
             }
@@ -2430,7 +2419,7 @@ fn committed_run(
 /// `POST /client/work/{id}/undo`: reverts the run's commit (a new commit;
 /// history is never rewritten). Refused while a later commit changed the
 /// same files, naming the run that made it. 200 {revert, files}.
-async fn undo_handler(
+pub(crate) async fn undo_handler(
     State(state): State<ClientServerState>,
     UrlPath(work_id): UrlPath<String>,
     headers: HeaderMap,
@@ -2505,32 +2494,36 @@ async fn undo_handler(
         if let Some(e) = st.works.lock().unwrap().get_mut(&work_id) {
             e.decided = Some(format!("undone by {revert}"));
         }
-        Json(serde_json::json!({"revert": short(&revert), "files": w.files})).into_response()
+        Json(UndoReply {
+            revert: short(&revert),
+            files: w.files,
+        })
+        .into_response()
     })
     .await
     .unwrap_or_else(|e| internal(anyhow!("undo panicked: {e}")))
 }
 
 /// Old clients' Keep: the run is already committed; this reports it.
-async fn keep_handler(
+pub(crate) async fn keep_handler(
     State(state): State<ClientServerState>,
     UrlPath(work_id): UrlPath<String>,
     headers: HeaderMap,
     _body: Body,
 ) -> Response {
     match committed_run(&state, &headers, &work_id) {
-        Ok(w) => Json(serde_json::json!({
-            "commit": w.commit.as_deref().map(short),
-            "branch": w.branch,
-            "files": w.files,
-        }))
+        Ok(w) => Json(KeepReply {
+            commit: w.commit.as_deref().map(short),
+            branch: w.branch,
+            files: w.files,
+        })
         .into_response(),
         Err(r) => *r,
     }
 }
 
 /// Old clients' Discard: an Undo.
-async fn discard_handler(
+pub(crate) async fn discard_handler(
     state: State<ClientServerState>,
     work_id: UrlPath<String>,
     headers: HeaderMap,
@@ -2543,7 +2536,15 @@ async fn discard_handler(
         .await
         .unwrap_or_default();
     let v: Value = serde_json::from_slice(&bytes).unwrap_or_default();
-    Json(serde_json::json!({"restored": v["files"], "removed": []})).into_response()
+    let restored = v["files"]
+        .as_array()
+        .map(|f| f.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    Json(DiscardReply {
+        restored,
+        removed: Vec::new(),
+    })
+    .into_response()
 }
 
 // ─── The production executor ─────────────────────────────────────────────
@@ -2776,7 +2777,7 @@ pub(crate) fn snapshot_tree(wd: &Path) -> Option<String> {
 /// `{"files": [{"path","added","removed"}], "diff": "<unified diff>"}`, the
 /// diff capped at [`MAX_DIFF_BYTES`]. `added`/`removed` are null for a
 /// binary file. `None` when the work copy can no longer be read.
-pub(crate) fn changes_since(wd: &Path, before: &str) -> Option<Value> {
+pub(crate) fn changes_since(wd: &Path, before: &str) -> Option<RunChanges> {
     let after = snapshot_tree(wd)?;
     let numstat = git(
         wd,
@@ -2791,14 +2792,18 @@ pub(crate) fn changes_since(wd: &Path, before: &str) -> Option<Value> {
             &after,
         ],
     )?;
-    let files: Vec<Value> = String::from_utf8_lossy(&numstat.stdout)
+    let files: Vec<FileChange> = String::from_utf8_lossy(&numstat.stdout)
         .split('\0')
         .filter(|l| !l.is_empty())
         .filter_map(|l| {
             let mut parts = l.splitn(3, '\t');
             let (added, removed, path) = (parts.next()?, parts.next()?, parts.next()?);
             let n = |s: &str| s.parse::<u64>().ok();
-            Some(serde_json::json!({"path": path, "added": n(added), "removed": n(removed)}))
+            Some(FileChange {
+                path: path.to_string(),
+                added: n(added),
+                removed: n(removed),
+            })
         })
         .collect();
     let patch = git(
@@ -2813,9 +2818,10 @@ pub(crate) fn changes_since(wd: &Path, before: &str) -> Option<Value> {
             &after,
         ],
     )?;
-    Some(
-        serde_json::json!({"files": files, "diff": capped_diff(&String::from_utf8_lossy(&patch.stdout))}),
-    )
+    Some(RunChanges {
+        files,
+        diff: capped_diff(&String::from_utf8_lossy(&patch.stdout)),
+    })
 }
 
 fn capped_diff(diff: &str) -> String {

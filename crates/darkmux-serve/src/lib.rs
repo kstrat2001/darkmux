@@ -51,6 +51,7 @@ pub mod mission_graph;
 pub mod client_pairing;
 pub mod client_preview;
 pub mod client_profiles;
+pub mod client_wire;
 pub mod client_workspace;
 mod fleet_listener;
 /// The fleet view: one row per roster machine, each with its own card.

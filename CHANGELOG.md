@@ -21,7 +21,9 @@ darkmux release.
   apps: a loopback connection naming the listener, through no proxy, with no `Origin` header (a web
   page cannot drive it), and JSON request bodies. With `clients.profiles` unset an app may run on
   any profile whose work stays on this machine, judged as dispatch judges it (LM Studio, or the
-  `default_engine` on loopback); the role's own profile is checked the same way.
+  `default_engine` on loopback); the role's own profile is checked the same way. Its 17 routes
+  and their response types are in `route-table.golden` (a new contract surface; nothing changes
+  for the viewer daemon's routes).
 - Previews trust only your own checkout: a workspace's dev-server recipe, `.darkmux/preview.json`
   (`schema_version` `1.0`, unknown keys refused), is read only from the checkout the workspace was
   made from, never from the workspace a run edits. A workspace cloned from a URL gets no preview;

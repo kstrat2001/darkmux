@@ -33,6 +33,7 @@
 //! server runs in its own process group with a watchdog: it stops when
 //! darkmux stops, when it is stopped, or when it exits on its own.
 
+use crate::client_wire::PreviewState;
 use darkmux_types::data_version::PREVIEW_RECIPE_SCHEMA_VERSION;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -347,19 +348,20 @@ impl Previews {
         Self::new(dir, std::process::id())
     }
 
-    fn snapshot(name: &str, e: &Entry) -> serde_json::Value {
-        let mut v = serde_json::json!({
-            "workspace": name,
-            "status": e.status.word(),
-            "url": format!("http://127.0.0.1:{}/", e.port),
-            "port": e.port,
-            "hmr_port": e.hmr_port,
-        });
-        if let Status::Failed(why) = &e.status {
-            v["error"] = why.clone().into();
-            v["log_tail"] = tail(&e.log, 20).into();
+    fn snapshot(name: &str, e: &Entry) -> PreviewState {
+        let failed = match &e.status {
+            Status::Failed(why) => Some(why.clone()),
+            _ => None,
+        };
+        PreviewState {
+            workspace: name.to_string(),
+            status: e.status.word().to_string(),
+            url: format!("http://127.0.0.1:{}/", e.port),
+            port: e.port,
+            hmr_port: e.hmr_port,
+            log_tail: failed.as_ref().map(|_| tail(&e.log, 20)),
+            error: failed,
         }
-        v
     }
 
     /// Starts the workspace's preview (or returns the running one) from the
@@ -371,7 +373,7 @@ impl Previews {
         name: &str,
         workdir: &Path,
         checkout: &Path,
-    ) -> Result<(serde_json::Value, bool), RecipeRefusal> {
+    ) -> Result<(PreviewState, bool), RecipeRefusal> {
         let mut entries = self.entries.lock().unwrap();
         if let Some(e) = entries.get(name) {
             let e = e.lock().unwrap();
@@ -412,7 +414,7 @@ impl Previews {
         Ok((snap, false))
     }
 
-    pub fn status(&self, name: &str) -> Option<serde_json::Value> {
+    pub fn status(&self, name: &str) -> Option<PreviewState> {
         let entries = self.entries.lock().unwrap();
         let e = entries.get(name)?.lock().unwrap();
         Some(Self::snapshot(name, &e))
@@ -723,7 +725,7 @@ mod tests {
         previews.start("w", &wt, &wt).unwrap();
         let mut v = serde_json::Value::Null;
         for _ in 0..200 {
-            v = previews.status("w").unwrap();
+            v = serde_json::to_value(previews.status("w").unwrap()).unwrap();
             if v["status"] == "failed" {
                 break;
             }

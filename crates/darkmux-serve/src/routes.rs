@@ -115,6 +115,202 @@ pub(crate) fn table() -> Vec<Route> {
     ]
 }
 
+// ─── The client listener (`darkmux client serve`) ─────────────────────────
+
+/// One route of `darkmux client serve`: its method, path, response type and
+/// handler. The client listener is its own listener (127.0.0.1 only, behind
+/// its own gate, `client_pairing::only_this_machines_apps`), so this table is
+/// never mounted on the daemon; it is a table so its routes are declared in
+/// one place and pinned by the same golden.
+pub(crate) struct ClientRoute {
+    pub(crate) method: &'static str,
+    pub(crate) path: &'static str,
+    /// The JSON body a success answers with.
+    pub(crate) reply: &'static str,
+    handler: MethodRouter<crate::client_pairing::ClientServerState>,
+}
+
+/// A client route: the type is checked to exist, and named in the golden.
+macro_rules! client_json {
+    ($method:ident, $ty:ty, $path:literal, $handler:expr) => {{
+        let _: Option<$ty> = None;
+        ClientRoute { method: stringify!($method), path: $path, reply: stringify!($ty), handler: axum::routing::$method($handler) }
+    }};
+}
+
+/// Every route the client listener serves. Every refusal on any of them is
+/// a `ClientError`.
+pub(crate) fn client_table() -> Vec<ClientRoute> {
+    use crate::client_pairing::*;
+    use crate::client_wire::*;
+    vec![
+        client_json!(post, PairAccepted, "/client/pair", pair_handler),
+        client_json!(get, PairPoll, "/client/pair/:request_id", poll_handler),
+        client_json!(get, Whoami, "/client/whoami", whoami_handler),
+        client_json!(get, ClientProfiles, "/client/profiles", profiles_handler),
+        client_json!(post, WorkAccepted, "/client/work", work_handler),
+        client_json!(get, WorkState, "/client/work/:work_id", work_status_handler),
+        client_json!(post, StatusWord, "/client/work/:work_id/cancel", cancel_handler),
+        client_json!(post, KeepReply, "/client/work/:work_id/keep", keep_handler),
+        client_json!(post, DiscardReply, "/client/work/:work_id/discard", discard_handler),
+        client_json!(post, UndoReply, "/client/work/:work_id/undo", undo_handler),
+        client_json!(get, RecipeReply, "/client/recipe", recipe_handler),
+        client_json!(post, WorkspaceInfo, "/client/workspaces", workspace_create_handler),
+        client_json!(get, WorkspaceInfo, "/client/workspaces/:name", workspace_status_handler),
+        client_json!(get, BranchChanges, "/client/workspaces/:name/changes", workspace_changes_handler),
+        client_json!(post, PreviewState, "/client/workspaces/:name/preview", preview_start_handler),
+        client_json!(get, PreviewState, "/client/workspaces/:name/preview", preview_status_handler),
+        client_json!(delete, StatusWord, "/client/workspaces/:name/preview", preview_stop_handler),
+    ]
+}
+
+/// The client listener's router: every table route (a path listed twice
+/// takes both methods), JSON for an unlisted path or method, and the
+/// listener's gate in front of all of it.
+pub(crate) fn client_router(state: crate::client_pairing::ClientServerState) -> Router {
+    use crate::client_pairing as cp;
+    let mut by_path: Vec<(&'static str, MethodRouter<cp::ClientServerState>)> = Vec::new();
+    for r in client_table() {
+        match by_path.iter_mut().find(|(p, _)| *p == r.path) {
+            Some((_, m)) => *m = std::mem::take(m).merge(r.handler),
+            None => by_path.push((r.path, r.handler)),
+        }
+    }
+    by_path
+        .into_iter()
+        .fold(Router::new(), |router, (path, handler)| router.route(path, handler))
+        .fallback(cp::no_such_route)
+        .method_not_allowed_fallback(cp::method_not_allowed)
+        .layer(axum::middleware::from_fn_with_state(state.clone(), cp::only_this_machines_apps))
+        .with_state(state)
+}
+
+/// The client listener's routes and the shape of every type they answer
+/// with, read from each type's JSON schema (no TypeScript twin exists for
+/// them: the viewer imports none).
+#[cfg(test)]
+fn render_client_table() -> String {
+    let mut out = String::new();
+    for r in client_table() {
+        out.push_str(&format!(
+            "{} {}  json {} (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)\n",
+            r.method.to_uppercase(),
+            r.path,
+            bare(r.reply)
+        ));
+    }
+    out.push_str("\n# client listener response types: Type.field: type, from the JSON schema (every refusal is ClientError)\n");
+    let mut lines = std::collections::BTreeSet::new();
+    for schema in client_schemas() {
+        schema_lines(&schema, &mut lines);
+    }
+    for l in lines {
+        out.push_str(&l);
+        out.push('\n');
+    }
+    out
+}
+
+/// The JSON schema of every client response type.
+#[cfg(test)]
+fn client_schemas() -> Vec<serde_json::Value> {
+    use crate::client_wire::*;
+    fn of<T: schemars::JsonSchema>() -> serde_json::Value {
+        schemars::schema_for!(T).as_value().clone()
+    }
+    vec![
+        of::<ClientError>(), of::<PairAccepted>(), of::<PairPoll>(), of::<Whoami>(), of::<ClientProfiles>(),
+        of::<WorkAccepted>(), of::<WorkState>(), of::<StatusWord>(), of::<KeepReply>(), of::<DiscardReply>(),
+        of::<UndoReply>(), of::<RecipeReply>(), of::<WorkspaceInfo>(), of::<BranchChanges>(), of::<PreviewState>(),
+    ]
+}
+
+/// One `Type.field: type` line per field of a schema's root type and of
+/// every type it defines.
+#[cfg(test)]
+fn schema_lines(schema: &serde_json::Value, out: &mut std::collections::BTreeSet<String>) {
+    let root = schema.get("title").and_then(|t| t.as_str()).unwrap_or("?");
+    type_lines(root, schema, out);
+    if let Some(defs) = schema.get("$defs").and_then(|d| d.as_object()) {
+        for (name, def) in defs {
+            type_lines(name, def, out);
+        }
+    }
+}
+
+#[cfg(test)]
+fn type_lines(name: &str, schema: &serde_json::Value, out: &mut std::collections::BTreeSet<String>) {
+    match schema.get("properties").and_then(|p| p.as_object()) {
+        Some(_) => {
+            for member in object_members(schema) {
+                out.insert(format!("{name}.{member}"));
+            }
+        }
+        None => {
+            out.insert(format!("{name} = {}", schema_type(schema)));
+        }
+    }
+}
+
+/// `name: type` (`name?: type` when not required) for each property.
+#[cfg(test)]
+fn object_members(schema: &serde_json::Value) -> Vec<String> {
+    let required: Vec<&str> =
+        schema.get("required").and_then(|r| r.as_array()).map(|r| r.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+    let props = schema.get("properties").and_then(|p| p.as_object()).cloned().unwrap_or_default();
+    props
+        .iter()
+        .map(|(k, v)| format!("{k}{}: {}", if required.contains(&k.as_str()) { "" } else { "?" }, schema_type(v)))
+        .collect()
+}
+
+/// A schema as a short type: a referenced type's name, a constant, a union,
+/// an array of its items, an inline object's members, or its JSON type.
+#[cfg(test)]
+fn schema_type(v: &serde_json::Value) -> String {
+    composite_type(v).unwrap_or_else(|| json_type(v))
+}
+
+/// A reference, constant, enum, union or inline object, if `v` is one.
+#[cfg(test)]
+fn composite_type(v: &serde_json::Value) -> Option<String> {
+    if let Some(r) = v.get("$ref").and_then(|r| r.as_str()) {
+        return Some(r.rsplit('/').next().unwrap_or(r).to_string());
+    }
+    if let Some(c) = v.get("const") {
+        return Some(c.to_string());
+    }
+    if let Some(e) = v.get("enum").and_then(|e| e.as_array()) {
+        return Some(e.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" | "));
+    }
+    let alts = v.get("oneOf").or_else(|| v.get("anyOf")).and_then(|a| a.as_array());
+    if let Some(alts) = alts {
+        return Some(alts.iter().map(schema_type).collect::<Vec<_>>().join(" | "));
+    }
+    v.get("properties").map(|_| format!("{{ {} }}", object_members(v).join(", ")))
+}
+
+/// The schema's JSON `type` (one or a union of several).
+#[cfg(test)]
+fn json_type(v: &serde_json::Value) -> String {
+    let types: Vec<&str> = match v.get("type") {
+        Some(serde_json::Value::String(t)) => vec![t.as_str()],
+        Some(serde_json::Value::Array(ts)) => ts.iter().filter_map(|t| t.as_str()).collect(),
+        _ => return "any".to_string(),
+    };
+    types.iter().map(|t| one_json_type(t, v)).collect::<Vec<_>>().join(" | ")
+}
+
+/// One JSON type, with an array's items and a map's values.
+#[cfg(test)]
+fn one_json_type(t: &str, v: &serde_json::Value) -> String {
+    match (t, v.get("additionalProperties")) {
+        ("array", _) => format!("Array<{}>", v.get("items").map_or_else(|| "any".to_string(), schema_type)),
+        ("object", Some(a)) if a.is_object() => format!("Record<string, {}>", schema_type(a)),
+        (other, _) => other.to_string(),
+    }
+}
+
 /// How a route keeps host facts from a remote reader. Every route has one, and
 /// [`Route::redaction`] matches exhaustively on [`Reply`], so a new kind of
 /// reply cannot be added without choosing.
@@ -218,6 +414,7 @@ pub(crate) fn render_table() -> String {
         "GET {}  json ListenerCard (fleet listener, not the viewer daemon; the caller's own grant rides with the card)\n",
         darkmux_fleet::CARD_PATH
     ));
+    out.push_str(&render_client_table());
     out.push_str("\n# response types: Type.field: type, from the generated TypeScript twins\n");
     let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../ui/src/types/generated");
     let mut seen = std::collections::BTreeSet::new();
@@ -346,6 +543,57 @@ mod tests {
         }
         let (status, _) = answer("/not-in-the-table".to_string()).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// No two client routes share a method and path.
+    #[test]
+    fn client_routes_are_unique() {
+        let mut seen = std::collections::BTreeSet::new();
+        for r in client_table() {
+            assert!(seen.insert((r.method, r.path)), "{} {} is registered twice", r.method, r.path);
+        }
+    }
+
+    /// The client router answers every client-table route with that route's
+    /// handler (an authenticated route refuses a stranger with a JSON 401,
+    /// never the router's 404 or 405), and an unlisted path is the router's
+    /// JSON 404.
+    #[tokio::test]
+    async fn the_client_router_serves_exactly_the_client_table() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+        let state = crate::client_pairing::ClientServerState::production().unwrap();
+        let state = crate::client_pairing::ClientServerState {
+            store: std::sync::Arc::new(crate::client_pairing::ClientStore::at(
+                tempfile::tempdir().unwrap().keep().join("clients.json"),
+            )),
+            ..state
+        };
+        let answer = |method: &str, uri: String| {
+            let app = client_router(state.clone());
+            let mut req = Request::builder().method(method).uri(uri).header("host", "localhost").body(Body::empty()).unwrap();
+            req.extensions_mut().insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 5555))));
+            async move {
+                let res = app.oneshot(req).await.unwrap();
+                let status = res.status();
+                (status, axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap())
+            }
+        };
+        for r in client_table() {
+            let uri = r.path.replace(":request_id", "r-x").replace(":work_id", "w-x").replace(":name", "nope");
+            let (status, body) = answer(&r.method.to_uppercase(), uri).await;
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(
+                status != StatusCode::METHOD_NOT_ALLOWED && v["error"] != "no such route",
+                "{} {} is in the client table but the router does not serve it: {status} {v}",
+                r.method,
+                r.path
+            );
+        }
+        let (status, body) = answer("GET", "/client/not-in-the-table".to_string()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"], "no such route");
     }
 
     /// Routes retired for the major release answer 404, not a redirect: a
