@@ -1002,3 +1002,24 @@ fn a_dispatch_refuses_engine_args_the_engine_does_not_take_before_starting() {
     let ok = prepare_in(&target_with_args("TensorFold/m", free_port(), &["--keep-warm", "30"]), &r.dirs, &tf, quick(), &roomy, &mut |_, _| {});
     assert!(ok.is_ok_and(|ready| ready.started), "flags the engine takes start the server");
 }
+
+/// A lease that cannot be written refuses the dispatch before anything
+/// starts: without it, another darkmux process would read the server as
+/// idle and could stop it under the dispatch.
+#[test]
+#[serial_test::serial]
+fn a_lease_that_cannot_be_written_refuses_the_dispatch() {
+    let r = rig();
+    let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 2.0).to_string_lossy().into_owned());
+    // The lease directory's own name is a file, so the lease cannot be written.
+    std::fs::create_dir_all(r.dir.path().join("home")).unwrap();
+    std::fs::write(r.dir.path().join("home").join("residency"), "").unwrap();
+    let roomy = FakeMachine { reclaimable: RefCell::new(Some(64 * GIB)), ..Default::default() };
+    let err = prepare_in(&target("TensorFold/m", free_port()), &r.dirs, &tf, quick(), &roomy, &mut |_, _| {})
+        .err()
+        .expect("refused");
+    assert_eq!(err.code, "model_start_failed", "{err}");
+    assert!(err.message.contains("lease"), "{err}");
+    assert!(engine_record::list_in(&r.dirs.records).0.is_empty(), "nothing started");
+}
+

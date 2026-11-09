@@ -502,13 +502,20 @@ impl EngineAnswer for TensorfoldAnswer {
         if let Some(problem) = self.model_problem(model) {
             return problem;
         }
-        if live.is_none() && server::port_taken(port) {
+        if live.is_none() && foreign_on_port(&self.dirs, id, port) {
             return Availability::unavailable(format!(
                 "something darkmux did not start answers on 127.0.0.1:{port}, the port of endpoint `{id}`"
             ));
         }
         Availability::startable()
     }
+}
+
+/// Whether something darkmux did not start answers on `port`, with no live
+/// server of darkmux's on endpoint `id`: workers darkmux's exited server
+/// left there are darkmux's, which a dispatch clears or reuses.
+fn foreign_on_port(dirs: &Dirs, id: &str, port: u16) -> bool {
+    server::port_taken(port) && server::left_behind(dirs, id).is_none()
 }
 
 // ─── Flint (#3453) ───────────────────────────────────────────────────────
@@ -613,7 +620,7 @@ impl EngineAnswer for FlintAnswer {
         {
             return Availability::resident();
         }
-        if live.is_none() && server::port_taken(port) {
+        if live.is_none() && foreign_on_port(&self.dirs, id, port) {
             return Availability::unavailable(format!(
                 "something darkmux did not start answers on 127.0.0.1:{port}, the port of endpoint `{id}`"
             ));

@@ -165,6 +165,59 @@ fn darkmuxs_server_up_is_not_resident_when_a_dispatch_would_refuse_the_engine() 
     }
 }
 
+/// darkmux's own Tensorfold server whose leader exited while a worker in
+/// its group still serves the port is darkmux's, not "something darkmux did
+/// not start": a dispatch clears or reuses it, so the model is not
+/// `unavailable` for its port.
+#[test]
+fn darkmuxs_server_with_a_gone_leader_is_not_read_as_someone_elses() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let script = format!(
+        "import os, socket, time\nif os.fork() == 0:\n    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n    s.bind(('127.0.0.1', {port})); s.listen(8)\n    time.sleep(30); os._exit(0)\ntime.sleep(1)\n"
+    );
+    let mut cmd = std::process::Command::new("python3");
+    cmd.args(["-c", &script]);
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let mut leader = cmd.spawn().unwrap();
+    let pid = leader.id();
+    let stamp = darkmux_platform::current().process_start_stamp(pid).expect("the leader's start stamp");
+    leader.wait().unwrap();
+    struct KillGroup(u32);
+    impl Drop for KillGroup {
+        fn drop(&mut self) {
+            let _ = darkmux_types::child_registry::kill_group(self.0, darkmux_types::child_registry::SIGKILL);
+        }
+    }
+    let _guard = KillGroup(pid);
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    while !server::port_taken(port) && std::time::Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let model = tf_model(port, "[]");
+    let answer = tf_answer(facts("tensorfold-native 1.2.4", &[TF_MODEL]), &dir);
+    let (argv, _) = answer.tf.serve_argv(port, &model).unwrap();
+    let rec = EngineRecord {
+        schema: ENGINE_RECORD_SCHEMA,
+        endpoint: "tf".into(),
+        engine: "tensorfold".into(),
+        model: TF_MODEL.into(),
+        n_ctx: 8192,
+        port,
+        pid,
+        start_stamp: stamp,
+        owner_pid: std::process::id(),
+        argv,
+        log: answer.dirs.logs.join("tf.log"),
+        started_at_ms: 0,
+        engine_version: "tensorfold-native 1.2.4".into(),
+    };
+    engine_record::write_in(&answer.dirs.records, &rec).unwrap();
+    let a = answer.judge(&model);
+    assert_ne!(a.state, AvailabilityState::Unavailable, "{a:?}");
+    assert!(!a.reason.as_deref().unwrap_or_default().contains("did not start"), "{a:?}");
+}
+
 /// A server that answers `GET /v1/models` with `name`, forever.
 fn serving(name: &str) -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

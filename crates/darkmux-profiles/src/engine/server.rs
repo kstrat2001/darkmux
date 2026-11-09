@@ -11,7 +11,8 @@
 //!   darkmux started it under. A server a running dispatch holds (the
 //!   caller's `held`, asked under the same lock) is never stopped: the same
 //!   command still listening is reused however slowly it answers, and any
-//!   other is refused `busy`. A name proves nothing on its own (every Flint
+//!   other is refused `busy`. That holds for workers an exited leader left
+//!   on the port too. A name proves nothing on its own (every Flint
 //!   server answers `flint`, #3453 review): a server is reused, and a start
 //!   is ready, only when darkmux's own server is what listens on the port
 //!   ([`listens`]); a start answered by anything else fails `port_in_use`.
@@ -247,6 +248,13 @@ pub fn running(dirs: &Dirs, endpoint: &str) -> Option<EngineRecord> {
     None
 }
 
+/// darkmux's server on `endpoint` whose leader exited while workers in its
+/// group still serve the port ([`left_workers`]), read only: a dispatch
+/// clears it, or reuses it when a running dispatch holds it.
+pub fn left_behind(dirs: &Dirs, endpoint: &str) -> Option<EngineRecord> {
+    engine_record::read_in(&dirs.records, endpoint).ok().flatten().filter(|r| !alive(r) && left_workers(r))
+}
+
 /// Whether darkmux's exited server `rec` left workers in the group it led
 /// still listening on its port. Never when its pid now names another
 /// process: that pid's group could be the new process's. A group outlives
@@ -327,8 +335,7 @@ fn reuse_or_stop(
 ) -> Result<Option<EngineRecord>, ServerError> {
     let Some(rec) = engine_record::read_in(&dirs.records, &spec.endpoint).ok().flatten() else { return Ok(None) };
     if !alive(&rec) {
-        stop_locked(dirs, &rec, bounds)?;
-        return Ok(None);
+        return keep_or_clear_left(spec, dirs, bounds, held, rec);
     }
     let same = rec.argv == spec.argv;
     if same && answers(spec.port, &spec.served_name) && listens(&rec) {
@@ -341,6 +348,28 @@ fn reuse_or_stop(
         return Err(ServerError::Busy { endpoint: spec.endpoint.clone(), model: rec.model.clone() });
     }
     progress(Progress::Replacing { model: rec.model.clone() });
+    stop_locked(dirs, &rec, bounds)?;
+    Ok(None)
+}
+
+/// [`reuse_or_stop`] for a record whose leader exited: the workers it left
+/// on the port are a dispatch's when it holds them, kept as it would keep
+/// the leader (reused for the same command, else `busy`); otherwise they are
+/// cleared with the record.
+fn keep_or_clear_left(
+    spec: &ServerSpec,
+    dirs: &Dirs,
+    bounds: Bounds,
+    held: Held<'_>,
+    rec: EngineRecord,
+) -> Result<Option<EngineRecord>, ServerError> {
+    if left_workers(&rec) && held(&rec) {
+        return if rec.argv == spec.argv {
+            Ok(Some(rec))
+        } else {
+            Err(ServerError::Busy { endpoint: spec.endpoint.clone(), model: rec.model.clone() })
+        };
+    }
     stop_locked(dirs, &rec, bounds)?;
     Ok(None)
 }
@@ -1335,5 +1364,28 @@ S(("127.0.0.1", port), H).serve_forever()
         engine_record::write_in(&f.dirs.records, &rec).unwrap();
         stop(&f.dirs, &rec, quick()).unwrap();
         assert!(port_taken(port), "the other process's server still answers: never signaled");
+    }
+
+    /// A held server whose leader exited while its worker still serves the
+    /// port is the dispatch's server all the same: another command on the
+    /// endpoint is refused `busy` (asked under the lock), never started in
+    /// its place; the same command is reused.
+    #[test]
+    fn a_held_server_whose_leader_is_gone_is_never_replaced() {
+        let f = fixture();
+        let port = free_port();
+        let (rec, _guard) = leader_gone_worker_serving(&f, "tf", port);
+        let before = darkmux_platform::current().tcp_listeners(port);
+        let asked = std::cell::Cell::new(0);
+        let held = |_: &EngineRecord| {
+            asked.set(asked.get() + 1);
+            true
+        };
+        let other = ensure(&spec(&f, "tf", "m/b", port, &[]), &f.dirs, quick(), &held, &mut no_progress());
+        assert!(asked.get() > 0, "the lease was asked");
+        assert_eq!(darkmux_platform::current().tcp_listeners(port), before, "the worker still serves the port");
+        assert_eq!(other.map_err(|e| e.code()), Err("busy"));
+        let same = ensure(&spec(&f, "tf", "m/a", port, &["--daemonize"]), &f.dirs, quick(), &held, &mut no_progress());
+        assert_eq!(same, Ok(Ensured::Reused(rec)));
     }
 }

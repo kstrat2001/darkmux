@@ -217,7 +217,18 @@ fn prepare_in(
     let spec = engine.plan(&endpoint, port, &target.model)?;
     refuse_engines_own_server(engine, dirs, &endpoint)?;
     let lease = LeaseGuard::acquire();
-    let _ = lease.write(std::slice::from_ref(&spec.served_name));
+    // Without its lease, another darkmux process reads the server as idle
+    // and may stop it under this dispatch: refuse rather than run unguarded.
+    lease.write(std::slice::from_ref(&spec.served_name)).map_err(|e| {
+        refuse(
+            "model_start_failed",
+            format!(
+                "could not record this dispatch's lease on `{}` ({e:#}), so another darkmux process could stop its \
+                 server mid-run; check that darkmux's home is writable",
+                spec.served_name
+            ),
+        )
+    })?;
     let base = DispatchModelPayload {
         engine: spec.engine.clone(),
         endpoint: endpoint.clone(),

@@ -749,7 +749,7 @@ darkmux doctor                                                           # check
 1. Preflight, as for every dispatch.
 2. When the endpoint's server is running with the profile's model and context, send the request.
 3. Otherwise make room: stop or unload darkmux's own least recently used residents, on any engine (LM Studio `darkmux:` loads and servers darkmux started), until the model fits the machine's memory budget. Nothing darkmux did not start is touched, and nothing a running dispatch holds: the leases are read again before each eviction, a server's under its endpoint's lock, where it is stopped.
-4. Start the server, `tensorfold-native serve <id> --host 127.0.0.1 --port <port> --context <n_ctx> --name darkmux:<id> --no-update-check <engine_args>`, in its own process group with its output in a log file, and wait for it to answer. The dispatch's live records show it starting, so a long start never looks like a stall. Whether a running dispatch holds darkmux's server on the endpoint is decided under the endpoint's lock, with the decision to stop it: a held server running the same command is reused even when it is too busy to answer in time, and one running another model or context is never replaced under its dispatch (the new dispatch is `busy`). A server whose leader exited while workers in its group still hold the port is darkmux's to clear: they are stopped with it.
+4. Start the server, `tensorfold-native serve <id> --host 127.0.0.1 --port <port> --context <n_ctx> --name darkmux:<id> --no-update-check <engine_args>`, in its own process group with its output in a log file, and wait for it to answer. The dispatch's live records show it starting, so a long start never looks like a stall. Whether a running dispatch holds darkmux's server on the endpoint is decided under the endpoint's lock, with the decision to stop it: a held server running the same command is reused even when it is too busy to answer in time, and one running another model or context is never replaced under its dispatch (the new dispatch is `busy`). A server whose leader exited while workers in its group still hold the port is darkmux's: held by a running dispatch, it is kept as the leader would be; otherwise it is cleared, and a listing never reads it as a server darkmux did not start.
 5. Send the request, naming the model `darkmux:<id>` on the wire.
 6. Leave the model resident when the dispatch ends. The next dispatch to the same profile pays no start; a dispatch that needs the memory evicts it (step 3).
 
@@ -761,6 +761,7 @@ The dispatch envelope, the flow records and the exit codes are unchanged. The fi
 
 - something darkmux did not start already holds the endpoint's port (the message says which check found it: the port answered before the start, or which process listens on it);
 - the endpoint's server runs another model or context for a dispatch that is still running (`busy`);
+- darkmux cannot write the dispatch's residency lease (its home is not writable): without it another darkmux process would read the server as idle (`model_start_failed`);
 - the server fails to start or exits early (the message names its log file);
 - the model does not fit even after darkmux evicts everything it owns;
 - the engine binary is missing, or its version is one darkmux has not verified;
