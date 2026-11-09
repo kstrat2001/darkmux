@@ -1199,7 +1199,7 @@ mod tests {
         std::fs::write(
             &global,
             format!(
-                "[credential]\n\thelper = {}\n[credential \"https://gh.invalid\"]\n\thelper =\n\thelper = {}\n\
+                "[credential]\n\thelper = {}\n[credential \"https://forge.example.invalid\"]\n\thelper =\n\thelper = {}\n\
                  [credential \"https://other.invalid\"]\n\thelper = {}\n",
                 quoted("global"),
                 quoted("gh"),
@@ -1233,7 +1233,7 @@ mod tests {
         ];
         let (plain, gh) = with_env(&env, || {
             let args = global_network_config(&src);
-            (fill(&args, "plain.invalid"), fill(&args, "gh.invalid"))
+            (fill(&args, "plain.invalid"), fill(&args, "forge.example.invalid"))
         });
         assert_eq!(plain, ["system", "global"], "the system and global helpers, never the checkout's");
         assert_eq!(gh, ["gh"], "a per-URL reset and helper apply to their host as they do for the operator");
