@@ -2111,7 +2111,11 @@ fn cmd_profiles(config: Option<&str>, json: bool) -> Result<i32> {
 /// `profile list`'s line for one endpoint: what kind it is and where it is.
 fn endpoint_label(ep: &darkmux_types::ModelEndpoint) -> String {
     match ep.kind() {
-        Ok(darkmux_types::EndpointKind::Managed(_)) => "managed (lmstudio)".to_string(),
+        // (#3448) Named by the backend's own token, so a Tensorfold endpoint
+        // never reads as LM Studio.
+        Ok(darkmux_types::EndpointKind::Managed(backend)) => {
+            format!("managed ({})", darkmux_types::config_enum::ConfigEnum::token(backend))
+        }
         // (5.0) A remote console viewer is not shown where requests
         // go: the host is an address whatever it is spelled like.
         Ok(darkmux_types::EndpointKind::Unmanaged) if darkmux_types::panel_audience::remote() => {

@@ -63,6 +63,10 @@ pub fn resolve(
         )));
     };
     match (ep.kind(), ep.resolved_dialect()) {
+        (Ok(EndpointKind::Managed(crate::endpoint::ManagedBackend::Tensorfold)), _) => Err(refuse(format!(
+            "endpoint `{value}` is a Tensorfold server darkmux starts for the profiles that name it, not a \
+             machine's engine; name `{LMSTUDIO}` or an endpoint darkmux only sends requests to"
+        ))),
         (Ok(EndpointKind::Managed(_)), _) => Err(refuse(format!(
             "endpoint `{value}` is managed by LM Studio; name that engine `{LMSTUDIO}`"
         ))),
@@ -160,6 +164,7 @@ mod tests {
             "endpoints": {
                 "mlx": {"url": "http://127.0.0.1:8080/v1"},
                 "lms": {"managed": "lmstudio"},
+                "tf": {"managed": "tensorfold", "port": 8091},
                 "claude": {"url": "https://api.anthropic.com/v1"},
                 "odd": {"url": "http://127.0.0.1:9/v1", "dialect": "smoke-signals"},
             },
@@ -224,6 +229,11 @@ mod tests {
             problem("lms"),
             "endpoint `lms` is managed by LM Studio; name that engine `lmstudio`"
         );
+        // (#3448) A Tensorfold endpoint is a server darkmux starts per
+        // profile, not a machine's engine, and the refusal says so rather
+        // than calling it LM Studio.
+        let tf = problem("tf");
+        assert!(tf.contains("Tensorfold") && !tf.contains("LM Studio"), "{tf}");
         assert!(
             problem("claude").contains("Messages API"),
             "{}",

@@ -425,13 +425,20 @@ use std::path::Path;
 //           suites, which run model-written tests, run on the host as the
 //           user instead of in a locked-down container. An older binary
 //           refuses a config carrying it.
-//   2.7 (client pairing, local prototype): additive `clients.profiles`
-//           (string list; `DARKMUX_CLIENTS_PROFILES`, comma-separated): the
-//           profiles a paired client app may run on. Absent = any local
-//           profile (one whose work stays on this machine, as dispatch judges
-//           it); a hosted one only when listed. An older binary refuses a
-//           config carrying it.
-pub const CONFIG_SCHEMA_VERSION: &str = "2.7";
+//   2.7 (#3448): additive `engines.tensorfold.bin` (`DARKMUX_TENSORFOLD_BIN`),
+//           where the Tensorfold server binary is installed. Absent =
+//           `tensorfold-native` on `PATH`. An older binary refuses a config
+//           carrying it.
+//   2.8 (client pairing, local prototype, #3447): additive `clients` block:
+//           `clients.profiles` (string list; `DARKMUX_CLIENTS_PROFILES`,
+//           comma-separated), the profiles a paired client app may run on
+//           (absent = any local profile, one whose work stays on this machine
+//           as dispatch judges it; a hosted one only when listed), and
+//           `clients.preview.enabled` (bool, default false), whether a paired
+//           app may start a workspace's live preview (it runs the workspace's
+//           own code on this machine, outside the sandbox). An older binary
+//           refuses a config carrying either.
+pub const CONFIG_SCHEMA_VERSION: &str = "2.8";
 
 /// A `config.json` key an older darkmux read (and `init` may have written)
 /// that this one does not. The unknown-key gate (`user_files`) names it with
@@ -800,6 +807,10 @@ pub struct DarkmuxConfig {
     pub lms_bin: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lmstudio_url: Option<String>,
+    /// (#3448) Where each engine darkmux starts servers for is installed.
+    /// Absent = each engine's binary looked up on `PATH` by its usual name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engines: Option<EnginesConfig>,
     /// (#316) The engine `engine::local()` answers with on this machine:
     /// `lmstudio`, or the id of an OpenAI-compatible endpoint in
     /// `profiles.json`. Absent = `lmstudio`. Checked against the profile
@@ -1621,6 +1632,26 @@ pub struct FleetIdentityConfig {
     #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
+/// (#3448) The engines darkmux starts servers for, one block per engine.
+/// Each holds only where the engine is installed: the commands darkmux runs
+/// are built into darkmux, never configured.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+pub struct EnginesConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub tensorfold: Option<EngineInstall>,
+    #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+/// (#3448) Where one engine is installed. Not written by `init`: a literal
+/// would be wrong on most machines.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+pub struct EngineInstall {
+    /// The engine's server binary (`tensorfold-native` for Tensorfold), when
+    /// it is not on `PATH` under that name. A relative path is anchored to
+    /// the working directory of the process that reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub bin: Option<String>,
+    #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
 /// (#2916) The dedicated work-submission listener `darkmux serve` opens
 /// beside its viewer port. It binds only to the address the identity
 /// provider reports for this machine (never `0.0.0.0`, never a LAN address),
@@ -2243,6 +2274,8 @@ impl DarkmuxConfig {
             machine_id: Some("my-machine".to_string()),
             lms_bin: Some("lms".to_string()),
             lmstudio_url: Some("http://localhost:1234".to_string()),
+            // (#3448) Not written: a literal install path would be wrong on most machines.
+            engines: None,
             default_engine: Some(crate::default_engine::LMSTUDIO.to_string()),
             dirs: None,
             redis: Some(RedisConfig {

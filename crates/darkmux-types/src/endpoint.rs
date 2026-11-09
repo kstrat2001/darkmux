@@ -47,6 +47,9 @@ impl EndpointKind {
     pub fn default_dialect(self) -> Dialect {
         match self {
             EndpointKind::Managed(ManagedBackend::Lmstudio) => Dialect::ChatCompletionsMaxTokens,
+            // (#3448) What `tensorfold-native serve` answered on this machine
+            // as a plain `url` endpoint before darkmux managed it.
+            EndpointKind::Managed(ManagedBackend::Tensorfold) => Dialect::ChatCompletions,
             EndpointKind::Unmanaged => Dialect::ChatCompletions,
         }
     }
@@ -59,6 +62,28 @@ impl EndpointKind {
 pub enum ManagedBackend {
     /// LM Studio, loaded and unloaded through `lms`.
     Lmstudio,
+    /// (#3448) Tensorfold: one model per server process, so darkmux loads a
+    /// model by starting `tensorfold-native serve` on the endpoint's `port`
+    /// and unloads it by stopping the server it started.
+    Tensorfold,
+}
+
+impl ManagedBackend {
+    /// Where this backend's endpoint is served, for a refusal that names it.
+    fn address_rule(self) -> &'static str {
+        match self {
+            ManagedBackend::Lmstudio => "darkmux sends to the machine's LM Studio at `lmstudio_url`",
+            ManagedBackend::Tensorfold => "darkmux serves it on this machine at its `port`",
+        }
+    }
+
+    /// The backend's name in an operator message.
+    fn display(self) -> &'static str {
+        match self {
+            ManagedBackend::Lmstudio => "LM Studio",
+            ManagedBackend::Tensorfold => "Tensorfold",
+        }
+    }
 }
 
 /// The request shape an endpoint accepts. Both are OpenAI-compatible chat
@@ -116,6 +141,7 @@ fn quoted_tokens<T: crate::config_enum::ConfigEnum>() -> String {
 // pins that `serde`'s spelling and the table cannot drift apart.
 crate::config_enum!(ManagedBackend, "managed backend", [
     Lmstudio = "lmstudio" => "LM Studio, loaded and unloaded through `lms`",
+    Tensorfold = "tensorfold" => "Tensorfold: darkmux starts and stops `tensorfold-native serve` on the endpoint's `port`",
 ]);
 crate::config_enum!(Dialect, "endpoint dialect", [
     ChatCompletions = "chat-completions" =>
@@ -607,6 +633,11 @@ pub struct ModelEndpoint {
     /// unknown value is kept and refused by name at preflight (contract 9).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hardware: Option<Lenient<Hardware>>,
+    /// (#3448) The loopback port darkmux serves a Tensorfold endpoint on.
+    /// Required there and refused on every other endpoint: an LM Studio
+    /// endpoint's address is `lmstudio_url`, an unmanaged one's its `url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
     /// How this value was written. Runtime-only.
     #[serde(skip)]
     pub source: EndpointSource,
@@ -692,45 +723,93 @@ impl ModelEndpoint {
             }
             (None, Some(_)) => EndpointKind::Unmanaged,
         };
-        // (#2902 review M3, C5) A managed endpoint's address is the machine's
-        // `lmstudio_url` and its request shape is LM Studio's. Declaring
-        // either otherwise is refused here, at use, rather than silently
-        // sent to the local LM Studio. Only an EXPLICIT `managed` refuses a
-        // `url`/`api_version` (without one, a `url` means unmanaged).
-        if kind.is_managed() {
-            let explicit = self.managed.is_some();
-            if explicit && self.url.is_some() {
-                return Err(EndpointError(format!(
-                    "darkmux: a managed endpoint has no `url` of its own; darkmux sends to the \
-                     machine's LM Studio at `lmstudio_url`. Drop `url` (and set \
-                     `darkmux config set lmstudio_url <url>` if the server moved), or drop `managed` \
-                     if darkmux should only send requests to {}. (#2902)",
-                    self.url.as_deref().unwrap_or_default()
-                )));
-            }
-            if explicit && self.api_version.is_some() {
-                return Err(EndpointError(
-                    "darkmux: `api_version` belongs to an unmanaged endpoint's URL; a managed \
-                     endpoint never sends it. Drop `api_version`, or drop `managed`. (#2902)"
-                        .to_string(),
-                ));
-            }
-            match &self.dialect {
-                None | Some(Lenient::Known(Dialect::ChatCompletionsMaxTokens)) => {}
-                Some(d) => {
-                    let named = match d {
-                        Lenient::Known(k) => format!("\"{}\"", k.as_str()),
-                        Lenient::Unrecognized(raw) => raw.to_string(),
-                    };
-                    return Err(EndpointError(format!(
-                        "darkmux: a managed (LM Studio) endpoint speaks \"{}\"; its declared \
-                         `dialect` {named} would not be honored. Drop `dialect`. (#2902)",
-                        Dialect::ChatCompletionsMaxTokens.as_str()
-                    )));
-                }
-            }
+        self.port_applies(kind)?;
+        // (#2902 review M3, C5) A managed endpoint's address is the backend's
+        // own (`lmstudio_url`, or a Tensorfold endpoint's `port`) and its
+        // request shape is the backend's. Declaring either otherwise is
+        // refused here, at use, rather than silently sent elsewhere. Only an
+        // EXPLICIT `managed` refuses a `url`/`api_version` (without one, a
+        // `url` means unmanaged).
+        if let EndpointKind::Managed(backend) = kind {
+            self.managed_fields_apply(backend)?;
         }
         Ok(kind)
+    }
+
+    /// (#2902 review M3, C5) The fields a managed endpoint may not declare:
+    /// a `url` or `api_version` of its own (only with an EXPLICIT `managed`)
+    /// and a dialect other than its backend's.
+    fn managed_fields_apply(&self, backend: ManagedBackend) -> Result<(), EndpointError> {
+        let explicit = self.managed.is_some();
+        if explicit && self.url.is_some() {
+            let moved = match backend {
+                ManagedBackend::Lmstudio => " (and set `darkmux config set lmstudio_url <url>` if the server moved)",
+                ManagedBackend::Tensorfold => " (its address is `http://127.0.0.1:<port>/v1`, set by `port`)",
+            };
+            return Err(EndpointError(format!(
+                "darkmux: a managed endpoint has no `url` of its own; {}. Drop `url`{moved}, \
+                 or drop `managed` if darkmux should only send requests to {}. (#2902)",
+                backend.address_rule(),
+                self.url.as_deref().unwrap_or_default()
+            )));
+        }
+        if explicit && self.api_version.is_some() {
+            return Err(EndpointError(
+                "darkmux: `api_version` belongs to an unmanaged endpoint's URL; a managed \
+                 endpoint never sends it. Drop `api_version`, or drop `managed`. (#2902)"
+                    .to_string(),
+            ));
+        }
+        self.managed_dialect_applies(backend)
+    }
+
+    /// A managed endpoint speaks its backend's dialect; a declared other one
+    /// would not be honored.
+    fn managed_dialect_applies(&self, backend: ManagedBackend) -> Result<(), EndpointError> {
+        let speaks = EndpointKind::Managed(backend).default_dialect();
+        match &self.dialect {
+            None => {}
+            Some(Lenient::Known(d)) if *d == speaks => {}
+            Some(d) => {
+                let named = match d {
+                    Lenient::Known(k) => format!("\"{}\"", k.as_str()),
+                    Lenient::Unrecognized(raw) => raw.to_string(),
+                };
+                return Err(EndpointError(format!(
+                    "darkmux: a managed ({}) endpoint speaks \"{}\"; its declared \
+                     `dialect` {named} would not be honored. Drop `dialect`. (#2902)",
+                    backend.display(),
+                    speaks.as_str()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// (#3448) `port` is a Tensorfold endpoint's address and nothing else's:
+    /// required there (darkmux starts the server on it), refused elsewhere
+    /// rather than silently ignored.
+    fn port_applies(&self, kind: EndpointKind) -> Result<(), EndpointError> {
+        let refuse = |why: String| Err(EndpointError(format!("darkmux: {why}. (#3448)")));
+        match (kind, self.port) {
+            (EndpointKind::Managed(ManagedBackend::Tensorfold), None) => refuse(
+                "a `tensorfold` endpoint declares the `port` darkmux serves it on, e.g. `\"port\": 8091`".to_string(),
+            ),
+            (EndpointKind::Managed(ManagedBackend::Tensorfold), Some(0)) => {
+                refuse("`port` is 0; a `tensorfold` endpoint needs a port from 1 to 65535".to_string())
+            }
+            (EndpointKind::Managed(ManagedBackend::Tensorfold), Some(_)) | (_, None) => Ok(()),
+            (EndpointKind::Managed(ManagedBackend::Lmstudio), Some(_)) => refuse(
+                "`port` is for a `tensorfold` endpoint; an LM Studio endpoint's address is the machine's \
+                 `lmstudio_url`. Drop `port` (and set `darkmux config set lmstudio_url <url>` if LM Studio moved)"
+                    .to_string(),
+            ),
+            (EndpointKind::Unmanaged, Some(_)) => refuse(
+                "`port` is for a `tensorfold` endpoint; an endpoint darkmux only sends requests to is addressed by \
+                 its `url`, port included. Drop `port`"
+                    .to_string(),
+            ),
+        }
     }
 
     /// The request shape: declared, else `messages` for an Anthropic host
@@ -805,6 +884,11 @@ impl ModelEndpoint {
         match self.kind()? {
             EndpointKind::Managed(ManagedBackend::Lmstudio) => {
                 Ok(lmstudio_chat_url(&crate::config_access::lmstudio_url()))
+            }
+            // `kind()` is Tensorfold only with a nonzero `port`. Loopback by
+            // construction: darkmux starts the server bound there (#3448).
+            EndpointKind::Managed(ManagedBackend::Tensorfold) => {
+                Ok(lmstudio_chat_url(&format!("http://127.0.0.1:{}", self.port.unwrap_or_default())))
             }
             EndpointKind::Unmanaged => {
                 // `kind()` is Unmanaged only when a url is set.
@@ -1918,5 +2002,122 @@ mod tests {
         assert_eq!(readable_host("https://tok@[::1]:/v1").as_deref(), Ok("[::1]"));
         assert_eq!(readable_host("http://studio.local:8080/v1").as_deref(), Ok("studio.local:8080"));
         assert_eq!(ModelEndpoint::managed_lmstudio().host_problem(), None);
+    }
+
+    /// (#3448) A Tensorfold endpoint is managed (darkmux starts the server and
+    /// chooses its model) and is served on this machine at its own `port`:
+    /// no `url`, no provider, the submitting machine's hardware, and the
+    /// dialect proven against `tensorfold-native serve` on this machine.
+    #[test]
+    fn a_tensorfold_endpoint_is_managed_and_served_on_its_port() {
+        let tf = ep(r#"{"managed":"tensorfold","port":8091}"#);
+        assert_eq!(tf.kind().unwrap(), EndpointKind::Managed(ManagedBackend::Tensorfold));
+        assert!(tf.kind().unwrap().is_managed());
+        assert_eq!(tf.chat_url().unwrap(), "http://127.0.0.1:8091/v1/chat/completions");
+        assert_eq!(tf.resolved_dialect().unwrap(), Dialect::ChatCompletions);
+        assert_eq!(tf.host(), None);
+        assert_eq!(tf.provider(), None);
+        assert_eq!(tf.hardware_basis(), HardwareBasis::Managed);
+        assert!(tf.validate().is_ok(), "{:?}", tf.validate());
+        assert_eq!(serde_json::to_value(&tf).unwrap(), serde_json::json!({"managed": "tensorfold", "port": 8091}));
+    }
+
+    /// (#3448) `port` is where darkmux serves a Tensorfold endpoint, and only
+    /// that: a Tensorfold endpoint without one, or with a `url`, `api_version`
+    /// or another dialect, is refused at use; a `port` anywhere else is
+    /// refused rather than silently ignored (an LM Studio endpoint's address
+    /// is `lmstudio_url`, an unmanaged one's is its `url`).
+    #[test]
+    fn port_belongs_to_a_tensorfold_endpoint_and_nothing_else() {
+        for (json, needles) in [
+            (r#"{"managed":"tensorfold"}"#, &["`port`", "tensorfold"][..]),
+            (r#"{"managed":"tensorfold","port":0}"#, &["`port`", "1"][..]),
+            (r#"{"managed":"tensorfold","port":8091,"url":"http://127.0.0.1:8091/v1"}"#, &["`url`", "`port`"][..]),
+            (r#"{"managed":"tensorfold","port":8091,"api_version":"v1"}"#, &["api_version"][..]),
+            (r#"{"managed":"tensorfold","port":8091,"dialect":"chat-completions-max-tokens"}"#, &["dialect", "chat-completions"][..]),
+            (r#"{"managed":"lmstudio","port":1234}"#, &["`port`", "lmstudio_url"][..]),
+            (r#"{"url":"http://127.0.0.1:8090/v1","port":8090}"#, &["`port`", "`url`"][..]),
+        ] {
+            let e = ep(json);
+            let err = e.kind().unwrap_err().to_string();
+            for n in needles {
+                assert!(err.contains(n), "{json}: expected {n:?} in: {err}");
+            }
+            assert!(e.chat_url().is_err(), "{json}");
+            assert!(e.validate().is_err(), "{json}");
+        }
+        let lms_dialect_msg = ep(r#"{"managed":"lmstudio","dialect":"chat-completions"}"#).kind().unwrap_err().to_string();
+        assert!(lms_dialect_msg.contains("LM Studio"), "the LM Studio refusal still names LM Studio: {lms_dialect_msg}");
+    }
+
+    /// (#3448) `engine_args` are extra flags for the server darkmux starts,
+    /// so they belong only to a model on a Tensorfold endpoint, and never
+    /// name a flag darkmux sets itself or a secret. Refused at every
+    /// dispatching preflight, naming the model's path.
+    #[test]
+    fn engine_args_belong_to_a_tensorfold_model_and_never_set_what_darkmux_sets() {
+        let r = registry(
+            r#"{"profiles":{"p":{"models":[
+                    {"id":"ok","n_ctx":8192,"endpoint":"tf","engine_args":["--drafter","z/d","--keep-warm"]},
+                    {"id":"lms","n_ctx":8192,"engine_args":["--drafter","z/d"]},
+                    {"id":"hosted","endpoint":"hosted","engine_args":["--x"]},
+                    {"id":"port","n_ctx":8192,"endpoint":"tf","engine_args":["--port","9000"]},
+                    {"id":"eq","n_ctx":8192,"endpoint":"tf","engine_args":["--context=4096"]},
+                    {"id":"key","n_ctx":8192,"endpoint":"tf","engine_args":["--api-key","s3cret"]},
+                    {"id":"blank","n_ctx":8192,"endpoint":"tf","engine_args":[""]},
+                    {"id":"host","n_ctx":8192,"endpoint":"tf","engine_args":["--host","0.0.0.0"]},
+                    {"id":"name","n_ctx":8192,"endpoint":"tf","engine_args":["--name=x"]},
+                    {"id":"short","n_ctx":8192,"endpoint":"tf","engine_args":["-p","9000"]},
+                    {"id":"negative","n_ctx":8192,"endpoint":"tf","engine_args":["--seed","-1"]}]}},
+                "endpoints":{"tf":{"managed":"tensorfold","port":8091},
+                             "hosted":{"url":"https://h.example/v1"}}}"#,
+        );
+        let models = &r.profiles["p"].models;
+        assert_eq!(models[0].engine_args, ["--drafter", "z/d", "--keep-warm"]);
+        assert_eq!(models[0].engine_args_problem(), None);
+        for (i, needles) in [
+            (1, &["engine_args", "tensorfold", "`lmstudio`"][..]),
+            (2, &["engine_args", "tensorfold"][..]),
+            (3, &["--port", "darkmux sets"][..]),
+            (4, &["--context", "n_ctx"][..]),
+            (5, &["--api-key", "secret"][..]),
+            (6, &["empty"][..]),
+            (7, &["--host", "loopback"][..]),
+            (8, &["--name", "darkmux:"][..]),
+            (9, &["short flag", "`-p`", "long"][..]),
+        ] {
+            let why = models[i].engine_args_problem().unwrap_or_else(|| panic!("model {i}: refused"));
+            for n in needles {
+                assert!(why.contains(n), "model {i}: expected {n:?} in: {why}");
+            }
+            assert!(!why.contains("s3cret"), "a refusal never echoes a flag's value");
+        }
+        let invalid = crate::config_enum::invalid_engine_args(&r);
+        let paths: Vec<String> = invalid.iter().map(|v| v.set_in.to_string()).collect();
+        assert_eq!(models[10].engine_args_problem(), None, "a negative value is not a short flag");
+        assert_eq!(paths.len(), 9, "{paths:?}");
+        assert!(paths.iter().all(|p| p.contains("engine_args")), "{paths:?}");
+        assert!(paths[0].contains("models[1]"), "{paths:?}");
+        assert!(invalid.iter().all(|v| !v.to_string().contains("s3cret")));
+        assert_eq!(serde_json::to_value(&models[1]).unwrap()["engine_args"], serde_json::json!(["--drafter", "z/d"]));
+        assert!(serde_json::to_value(pm(r#"{"id":"m"}"#)).unwrap().get("engine_args").is_none(), "absent stays absent");
+    }
+
+    /// (#3448) Until darkmux starts Tensorfold servers, an endpoint declaring
+    /// one is refused at every dispatching preflight, so no path can treat
+    /// its model as an LM Studio load; the refusal names the `url` form
+    /// that works today.
+    #[test]
+    fn a_tensorfold_endpoint_is_refused_for_dispatch_until_darkmux_starts_servers() {
+        let r = registry(
+            r#"{"profiles":{"p":{"models":[{"id":"m","n_ctx":8192,"endpoint":"tf"}]}},
+                "endpoints":{"tf":{"managed":"tensorfold","port":8091},
+                             "lms":{"managed":"lmstudio"},
+                             "hosted":{"url":"http://127.0.0.1:8090/v1"}}}"#,
+        );
+        let refused = crate::config_enum::undispatchable_engine_endpoints(&r);
+        assert_eq!(refused.len(), 1, "only the Tensorfold endpoint: {refused:?}");
+        let line = refused[0].to_string();
+        assert!(line.contains("endpoints.tf") && line.contains("#3448") && line.contains("\"url\""), "{line}");
     }
 }

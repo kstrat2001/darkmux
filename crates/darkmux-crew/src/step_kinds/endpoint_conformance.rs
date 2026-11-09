@@ -79,7 +79,7 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     ("crates/darkmux-crew/src/single_shot.rs", "insert(\"max_tokens\"", 1, "THE body builder, chat-completions-max-tokens dialect"),
     ("crates/darkmux-lab/src/providers/prompt.rs", "insert(\"max_completion_tokens\"", 1, "records in a prompt run's manifest the reply cap its dispatch sent (`replyRoom`); a recorded fact, not a request body"),
     ("crates/darkmux-crew/src/messages_wire.rs", "insert(\"max_tokens\"", 1, "THE body builder, messages dialect: chat_body's Messages branch, called only from there (#3162)"),
-    ("crates/darkmux-types/src/endpoint.rs", "Lmstudio", 5, "the backend's own facts: the enum variant and its config_enum entry, its default dialect, the `managed: lmstudio` constructor, and its chat URL (the configured LM Studio address)"),
+    ("crates/darkmux-types/src/endpoint.rs", "Lmstudio", 9, "the backend's own facts: the enum variant and its config_enum entry, its default dialect, the `managed: lmstudio` constructor, and its chat URL (the configured LM Studio address); and (#3448) the per-backend operator wording a refusal names: where the backend is served (`address_rule`), its name (`display`), the `url` remedy, and the `port` refusal"),
     ("crates/darkmux-types/src/endpoint.rs", "\"lmstudio\"", 1, "the backend's serde/config spelling (the config_enum token)"),
     ("crates/darkmux-types/src/lib.rs", "Lmstudio", 1, "a model that names no endpoint is on the one managed backend darkmux has"),
     ("crates/darkmux-types/src/lib.rs", "\"lmstudio\"", 1, "the fallback endpoint-key label for a host-less (managed) endpoint, a name not a test"),

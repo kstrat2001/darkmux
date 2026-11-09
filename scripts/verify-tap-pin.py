@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """Verify the Homebrew tap actually serves the tag that was just released.
 
-Why this exists (#2825): merging the formula pin fires `sync-homebrew-tap.yml`,
-which opens a PR on the tap. On 2026-09-19 that workflow failed with `Bad
-credentials` and opened nothing, so v3.8.0 was tagged, released and had its
-GHCR image published while the tap kept serving **v3.7.1**. Every other signal
+Why this exists (#2825): merging the formula pin used to fire
+`sync-homebrew-tap.yml`, which pushed a PR to the tap. On 2026-09-19 that
+workflow failed with `Bad credentials` and opened nothing, so v3.8.0 was
+tagged, released and had its GHCR image published while the tap kept serving **v3.7.1**. Every other signal
 read healthy. A user running `brew upgrade darkmux` in that window silently
 stayed on the previous version.
 
 The failure mode is what makes it dangerous: nothing goes red. This check turns
 "the tap fell behind" into a loud, answerable question, and it is the same
 one-line comparison used to verify the manual fix.
+
+The tap now pulls the formula itself (`sync-from-upstream.yml` in
+kstrat2001/homebrew-tap, dispatched by the release skill and polled every 6
+hours), so no credential can expire, but a pull can still fail or lag, and this
+check is still the one that says whether the tap serves the tag.
 
 Pure-logic half is `tap_pin_problems()`, exercised by `--self-test` (this
 repo's convention for script-level guards, per `engagement-sentinel-guard.py`).

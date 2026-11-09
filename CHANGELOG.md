@@ -16,6 +16,16 @@ darkmux release.
 
 ### Added
 
+- **Tensorfold endpoints are read and checked, not yet dispatched (#3448, part 1).** An endpoint
+  can declare `"managed": "tensorfold"` with the `port` darkmux will serve it on, and a profile
+  model on it can carry `engine_args` (extra `tensorfold-native serve` flags). `darkmux doctor`
+  gains a `tensorfold engine` row that asks the installed binary its version (darkmux supports
+  Tensorfold 1.2.x), its models and its serve flags, and checks each Tensorfold profile model
+  against them. `darkmux config set engines.tensorfold.bin <path>` (or `DARKMUX_TENSORFOLD_BIN`)
+  names the binary when it is not on `PATH`. darkmux does not start Tensorfold servers yet, so
+  every dispatching preflight refuses a Tensorfold endpoint, naming the `url` form that works
+  today. `PROFILES_SCHEMA_VERSION` 2.2 -> 2.3 and `CONFIG_SCHEMA_VERSION` 2.6 -> 2.7, both
+  additive; an older binary refuses the new keys and value.
 - `darkmux client serve` (local prototype, #3447): a loopback-only endpoint an app on this machine
   pairs with (`darkmux client approve`), then runs work through. It answers only this machine's
   apps: a loopback connection naming the listener, through no proxy, with no `Origin` header (a web
