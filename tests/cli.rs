@@ -964,7 +964,9 @@ fn profile_list_json_reports_each_models_availability() {
     let log = fs::read_to_string(&calls).unwrap();
     for line in log.lines() {
         let read_only = ["lms ps", "lms ls", "lms --version", "tensorfold-native --version", "tensorfold-native capabilities", "tensorfold-native models"];
-        assert!(read_only.iter().any(|r| line.starts_with(r)), "a listing asks only read-only questions: {line}");
+        // `serve --help` prints the usage and exits; `serve <model>` would start a server.
+        let usage = line.trim_end() == "tensorfold-native serve --help";
+        assert!(usage || read_only.iter().any(|r| line.starts_with(r)), "a listing asks only read-only questions: {line}");
     }
 }
 

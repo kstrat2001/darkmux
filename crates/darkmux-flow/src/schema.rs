@@ -26,9 +26,9 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.7.0";
 //           loading and ready), written between `dispatch.start` and the
 //           first turn when a dispatch starts the engine server its model
 //           runs on; and `payload.code` on `dispatch.error` (`busy`,
-//           `wont_fit`, `model_start_failed`, `port_in_use`,
-//           `engine_unavailable`, and `engine_in_use` from #3453, unreleased
-//           with it). Also `payload.workdir_git` on `dispatch.start`
+//           `wont_fit`, `model_start_failed`, `model_stop_failed`,
+//           `port_in_use`, `engine_unavailable`, and `engine_in_use` from
+//           #3453, unreleased with it). Also `payload.workdir_git` on `dispatch.start`
 //           (`"read_only"` | `"read_write"`, from #3461, unreleased with
 //           it): how a `--workdir` checkout's own `.git` directory was
 //           mounted, read-only unless `--workdir-git-writable` (or a step's

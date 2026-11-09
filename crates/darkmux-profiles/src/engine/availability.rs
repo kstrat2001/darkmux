@@ -15,15 +15,22 @@
 //! engine once ([`list`]), every engine at the same time, and waits for each
 //! at most its [`listing_bound`]: 10 s for LM Studio (a cold `lms` takes
 //! seconds) and 3 s for a server binary darkmux runs (Tensorfold, rec's
-//! Flint), a local binary's read-only probes. An engine that has not answered by then reads
-//! `unknown`, and a probe still running then is killed with its process
-//! group and reaped before the listing returns (the bounded runner's
-//! deadline is capped at the engine's), so no child outlives the caller.
+//! Flint), a local binary's read-only probes. A probe still running then is
+//! killed with its process group and reaped before the listing returns (the
+//! bounded runner's deadline is capped at the engine's), so no child
+//! outlives the caller; the engine's answer, which then comes just past the
+//! bound, keeps what its other probes got (the killed one reads `unknown`
+//! where it matters). An engine with no answer within its bound and the
+//! reap grace reads `unknown`.
 //! It loads and starts nothing: the
 //! only questions are an engine's own read-only ones (LM Studio's residents
 //! and downloaded models, the Tensorfold binary's `--version`,
-//! `capabilities --json` and `models --json`), darkmux's server records, and
-//! whether a port answers.
+//! `capabilities --json`, `serve --help` and `models --json`), darkmux's
+//! server records, and whether a port answers.
+//!
+//! A model reads `resident` only when a dispatch would reuse it: what a
+//! dispatch refuses before it looks for a server (`engine_unavailable`,
+//! `engine_in_use`, `engine_args` the engine does not take) is judged first.
 //!
 //! Flint is `startable` only when rec is the verified release with exactly
 //! one runtime and one model directory for the revision (the adapter's own
@@ -60,7 +67,8 @@ pub fn listing_bound(backend: ManagedBackend) -> Duration {
 
 /// How long past an engine's bound a listing waits for its thread to
 /// report: its probes are killed at the bound, so it reports within a poll,
-/// and waiting is what keeps a killed probe from outliving the listing.
+/// and waiting is what keeps a killed probe from outliving the listing. An
+/// answer within it is kept.
 const REAP_GRACE: Duration = Duration::from_secs(1);
 
 /// Whether darkmux can make a model resident.
@@ -191,17 +199,12 @@ pub fn list_with(
         else {
             break;
         };
-        // An answer past its engine's bound stays `unknown`: it was received
-        // only so its killed probes are reaped before the listing returns.
-        if deadlines
-            .iter()
-            .any(|(b, d)| *b == backend && std::time::Instant::now() <= *d)
-        {
-            accept(&mut each, &by_engine, backend, judged);
-            // Only LM Studio's answer reports residents (`EngineAnswer::residents`).
-            if residents.is_some() {
-                lmstudio_residents = residents;
-            }
+        // An answer just past its engine's bound is one whose probe was
+        // killed there: what its other probes got still stands.
+        accept(&mut each, &by_engine, backend, judged);
+        // Only LM Studio's answer reports residents (`EngineAnswer::residents`).
+        if residents.is_some() {
+            lmstudio_residents = residents;
         }
     }
     Listing {
@@ -291,6 +294,12 @@ fn ask_each(
         });
     }
     rx
+}
+
+/// Whether a probe's error is its call running out of time (killed at the
+/// listing's bound, say): that is `unknown`, never `unavailable`.
+fn ran_out_of_time(error: &str) -> bool {
+    error.contains(darkmux_gestalt::HostError::TIMED_OUT)
 }
 
 /// The engine, as a reason names it.
@@ -413,29 +422,33 @@ impl TensorfoldAnswer {
 }
 
 impl TensorfoldAnswer {
-    /// Why the engine itself could not serve `model` (`None`: it could):
-    /// an unverified or silent binary, a model it does not have, or
-    /// `engine_args` it does not take, `unavailable`; a listing that failed
-    /// once the binary answered, `unknown`.
-    fn engine_problem(&self, model: &ProfileModel) -> Option<Availability> {
+    /// Why a dispatch would refuse `model` before it looks for a server
+    /// (`None`: it would not): an unverified or silent binary, or
+    /// `engine_args` it does not take, `unavailable`; flags it could not
+    /// list, `unknown`.
+    fn dispatch_problem(&self, model: &ProfileModel) -> Option<Availability> {
         if let Some(problem) = self.version_problem() {
             return Some(problem);
-        }
-        match self.facts.has_model(model) {
-            Err(e) => return Some(Availability::unknown(format!("Tensorfold {e}"))),
-            Ok(false) => {
-                return Some(Availability::unavailable(format!(
-                    "`{} models` does not list `{}`",
-                    self.tf.label(),
-                    model.id
-                )))
-            }
-            Ok(true) => {}
         }
         match self.facts.args_problem(model) {
             Err(e) => Some(Availability::unknown(format!("Tensorfold {e}"))),
             Ok(Some(why)) => Some(Availability::unavailable(format!("engine_args: {why}"))),
             Ok(None) => None,
+        }
+    }
+
+    /// Why the engine could not start a server for `model` (`None`: it
+    /// could): a model it does not have, `unavailable`; a listing that
+    /// failed once the binary answered, `unknown`.
+    fn model_problem(&self, model: &ProfileModel) -> Option<Availability> {
+        match self.facts.has_model(model) {
+            Err(e) => Some(Availability::unknown(format!("Tensorfold {e}"))),
+            Ok(false) => Some(Availability::unavailable(format!(
+                "`{} models` does not list `{}`",
+                self.tf.label(),
+                model.id
+            ))),
+            Ok(true) => None,
         }
     }
 }
@@ -445,6 +458,9 @@ impl TensorfoldAnswer {
     /// verified against: `unavailable`, naming which.
     fn version_problem(&self) -> Option<Availability> {
         match &self.facts.version {
+            Err(e) if ran_out_of_time(e) => Some(Availability::unknown(format!(
+                "the Tensorfold binary did not answer in time: {e}"
+            ))),
             Err(e) => Some(Availability::unavailable(format!(
                 "the Tensorfold binary did not answer: {e}"
             ))),
@@ -457,11 +473,12 @@ impl TensorfoldAnswer {
 }
 
 impl EngineAnswer for TensorfoldAnswer {
-    /// `resident` when darkmux's server on the endpoint runs this model's
-    /// exact command and answers (the rule a dispatch reuses it by);
-    /// `startable` when the engine is installed at a verified version, has
-    /// the model, takes its `engine_args`, and the port is free or held by
-    /// darkmux's own server.
+    /// `resident` when a dispatch would reuse darkmux's server on the
+    /// endpoint: the engine is a verified release that takes the model's
+    /// `engine_args` (what a dispatch checks first), and the server runs
+    /// this model's exact command and answers; `startable` when the engine
+    /// also has the model, and the port is free or held by darkmux's own
+    /// server.
     fn judge(&self, model: &ProfileModel) -> Availability {
         let endpoint = model.endpoint.as_ref();
         let id = endpoint.and_then(|e| e.named_id()).unwrap_or_default();
@@ -472,6 +489,9 @@ impl EngineAnswer for TensorfoldAnswer {
             Ok(a) => a,
             Err(e) => return Availability::unavailable(format!("{e:#}")),
         };
+        if let Some(problem) = self.dispatch_problem(model) {
+            return problem;
+        }
         let live = server::running_now(&self.dirs, id);
         if live
             .as_ref()
@@ -479,16 +499,23 @@ impl EngineAnswer for TensorfoldAnswer {
         {
             return Availability::resident();
         }
-        if let Some(problem) = self.engine_problem(model) {
+        if let Some(problem) = self.model_problem(model) {
             return problem;
         }
-        if live.is_none() && server::port_taken(port) {
+        if live.is_none() && foreign_on_port(&self.dirs, id, port) {
             return Availability::unavailable(format!(
                 "something darkmux did not start answers on 127.0.0.1:{port}, the port of endpoint `{id}`"
             ));
         }
         Availability::startable()
     }
+}
+
+/// Whether something darkmux did not start answers on `port`, with no live
+/// server of darkmux's on endpoint `id`: workers darkmux's exited server
+/// left there are darkmux's, which a dispatch clears or reuses.
+fn foreign_on_port(dirs: &Dirs, id: &str, port: u16) -> bool {
+    server::port_taken(port) && server::left_behind(dirs, id).is_none()
 }
 
 // ─── Flint (#3453) ───────────────────────────────────────────────────────
@@ -545,8 +572,10 @@ impl FlintAnswer {
         &self,
         darkmuxs: Option<&darkmux_types::engine_record::EngineRecord>,
     ) -> Option<Availability> {
-        if let Err(e) = &self.version {
-            return Some(Availability::unavailable(e.clone()));
+        match &self.version {
+            Err(e) if ran_out_of_time(e) => return Some(Availability::unknown(format!("rec did not answer in time: {e}"))),
+            Err(e) => return Some(Availability::unavailable(e.clone())),
+            Ok(_) => {}
         }
         match &self.own_server {
             Err(e) => Some(Availability::unknown(format!(
@@ -561,11 +590,12 @@ impl FlintAnswer {
 }
 
 impl EngineAnswer for FlintAnswer {
-    /// `resident` when darkmux's server on the endpoint runs this model's
-    /// command, answers and listens (the rule a dispatch reuses it by);
-    /// `startable` when rec is the verified release with exactly one runtime
-    /// and one model directory for the revision, rec's own server is not
-    /// running, and the port is free or darkmux's.
+    /// `resident` when a dispatch would reuse darkmux's server on the
+    /// endpoint: rec is the verified release, its own server is not running
+    /// (what a dispatch checks first), and darkmux's server runs this
+    /// model's command, answers and listens; `startable` when rec also has
+    /// exactly one runtime and one model directory for the revision, and the
+    /// port is free or darkmux's.
     fn judge(&self, model: &ProfileModel) -> Availability {
         let endpoint = model.endpoint.as_ref();
         let id = endpoint.and_then(|e| e.named_id()).unwrap_or_default();
@@ -581,16 +611,16 @@ impl EngineAnswer for FlintAnswer {
             Err(e) => return Availability::unavailable(format!("{e:#}")),
         };
         let live = server::running_now(&self.dirs, id);
+        if let Some(problem) = self.rec_problem(live.as_ref()) {
+            return problem;
+        }
         if live
             .as_ref()
             .is_some_and(|r| server::serves(r, &spec.argv, port, &spec.served_name))
         {
             return Availability::resident();
         }
-        if let Some(problem) = self.rec_problem(live.as_ref()) {
-            return problem;
-        }
-        if live.is_none() && server::port_taken(port) {
+        if live.is_none() && foreign_on_port(&self.dirs, id, port) {
             return Availability::unavailable(format!(
                 "something darkmux did not start answers on 127.0.0.1:{port}, the port of endpoint `{id}`"
             ));

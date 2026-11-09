@@ -6,8 +6,9 @@
 //! `darkmux dispatch <role> --profile <p>` resolves it
 //! (`darkmux_crew::target::resolve_in`), and whether its work leaves this
 //! machine is the one data-boundary predicate dispatch routes on
-//! (`darkmux_types::endpoint::brain_leaves_this_machine`): LM Studio stays,
-//! an unmanaged endpoint stays only when it is this machine's
+//! (`darkmux_types::endpoint::brain_leaves_this_machine`): a managed engine
+//! (LM Studio, or a Tensorfold or Flint server darkmux starts) stays, an
+//! unmanaged endpoint stays only when it is this machine's
 //! `default_engine` reached on loopback, and anything that cannot be read
 //! fails closed. So a URL whose userinfo says `localhost`
 //! (`https://localhost:x@api.example.com/v1`) is hosted, and an endpoint id
@@ -29,7 +30,7 @@ pub struct ClientProfileInfo {
     /// The model the role's work would run on (the resolved selection).
     pub model: Option<String>,
     /// `url` (an unmanaged server darkmux only sends to) or the managed
-    /// backend's name (`lmstudio`).
+    /// backend's name (`lmstudio`, `tensorfold`, `flint`).
     pub endpoint: String,
     /// For a managed model (LM Studio, a server darkmux starts), darkmux can
     /// make it resident now: its `availability` is `resident` or
@@ -220,7 +221,7 @@ fn describe(
 /// is the one the work would run on), each distinct server probed once and
 /// all at the same time (about 1 s at most), and each managed engine asked
 /// its availability once, at the same time as the servers, within
-/// `availability::LISTING_BOUND`. Looked at per profile, 30-odd local
+/// `availability::listing_bound`. Looked at per profile, 30-odd local
 /// profiles took longer than an app waits.
 pub fn describe_profiles(
     role_id: &str,

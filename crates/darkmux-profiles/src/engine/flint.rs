@@ -54,9 +54,10 @@ pub fn parse_version(text: &str) -> Result<String> {
 /// `omitempty`), so a stopped rec says `false`; `ready: false` with nothing
 /// on its port is free, as is output that is not a JSON object.
 ///
-/// rec 0.1.0's output with its server stopped was never observed (its server
-/// was running whenever this was checked); the rule above is read from its
-/// binary. Accepted window: a server so early in its start that it has not
+/// With its server stopped, rec 0.1.0's `rec status` prints nothing on
+/// stdout, says no instance is reachable on stderr and exits 1, which
+/// [`Rec::own_server`] reads as no server before this is reached. Accepted
+/// window: a server so early in its start that it has not
 /// bound its port reads as free, and darkmux may start its own beside it;
 /// the memory check still applies to that start.
 pub fn parse_status(stdout: &str, listening: &dyn Fn(u16) -> bool) -> Option<String> {

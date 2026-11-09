@@ -2278,17 +2278,12 @@ edit loop detected on src/widget.rs in an earlier dispatch
     // ── (#1463 CONSIDER 6) branch force-delete guard (pure) ──────────────────
 
     #[test]
-    fn should_force_delete_branch_only_for_real_worktrees() {
-        // A branch reported by a LIVE worktree, or one whose worktree exists on
-        // disk, is real → deletable. A never-launched phase's DERIVED name (no
-        // live branch, no worktree) is NOT force-deleted.
-        assert!(should_force_delete_branch(true, true), "live branch + worktree present");
-        assert!(should_force_delete_branch(true, false), "a live worktree reported the branch");
-        assert!(should_force_delete_branch(false, true), "the worktree existed on disk");
-        assert!(
-            !should_force_delete_branch(false, false),
-            "derived name, no worktree ever → never force-delete"
-        );
+    fn should_force_delete_branch_only_for_a_confirmed_branch() {
+        // A branch darkmux recorded, or the one the main repository says the
+        // worktree had checked out, is deletable. A DERIVED name is not, even
+        // when the worktree exists: it may be an unrelated branch.
+        assert!(should_force_delete_branch(true), "a recorded or checked-out branch");
+        assert!(!should_force_delete_branch(false), "a derived name is never force-deleted");
     }
 
     // ── (#1463 CONSIDER 3) unsaved-work guard (real temp git repo) ───────────
@@ -2550,6 +2545,106 @@ edit loop detected on src/widget.rs in an earlier dispatch
         assert!(!f.branch_exists("phase"), "the recorded branch is the one to delete");
         assert!(!f.wt.exists(), "the worktree is torn down");
         assert!(!f.anything_ran(), "a planted command ran on the host");
+    }
+
+    /// A worktree task an older darkmux wrote (no `Task.branch`), aborted
+    /// under a conventions template that names an unrelated branch of the
+    /// user's: abort deletes the branch the main repository says the
+    /// worktree has checked out (`phase`), never the derived `feat/ABC-1`.
+    #[test]
+    #[serial_test::serial]
+    fn abort_of_an_unrecorded_branch_never_deletes_the_name_conventions_derive() {
+        let _g = CrewEnvGuard::new();
+        let f = PlantedWorktree::new();
+        darkmux_types::host_git::fixture::git(&f.repo, &["branch", "feat/ABC-1"]);
+        let mid = "unrecorded-conv";
+        seed_finalize_mission(mid, &[("p1", PhaseStatus::Running)]);
+        let mut t = test_task("p1-worktree");
+        t.phase_id = "p1".to_string();
+        t.workdir = Some(f.wt.clone());
+        t.repo_root = Some(f.repo.clone());
+        crew::lifecycle::save_task(mid, &t).unwrap();
+
+        let mut m = crew::loader::load_missions().unwrap().into_iter().find(|m| m.id == mid).unwrap();
+        m.ticket = Some("ABC-1".to_string());
+        let conv: crate::conventions::Conventions = serde_json::from_str(r#"{"branch_template":"feat/{ticket}"}"#).unwrap();
+        let p = phase("p1", mid, PhaseStatus::Running);
+        teardown_and_terminate_phase(Some(&f.repo), &m, &p, Some(&conv), MissionTerminal::Abort);
+
+        assert!(f.branch_exists("feat/ABC-1"), "an unrelated branch matching the template was deleted");
+        assert!(!f.branch_exists("phase"), "the worktree's own branch is left behind");
+        assert!(!f.wt.exists(), "the worktree is torn down");
+    }
+
+    /// The same older task with no conventions: the derived default name is
+    /// not the worktree's branch, so abort reads the branch from the main
+    /// repository's record of the worktree, never from the HEAD a run planted.
+    #[test]
+    #[serial_test::serial]
+    fn abort_of_an_unrecorded_branch_deletes_the_branch_the_worktree_has_checked_out() {
+        let _g = CrewEnvGuard::new();
+        let f = PlantedWorktree::new();
+        let mid = "unrecorded-default";
+        seed_finalize_mission(mid, &[("p1", PhaseStatus::Running)]);
+        let mut t = test_task("p1-worktree");
+        t.phase_id = "p1".to_string();
+        t.workdir = Some(f.wt.clone());
+        t.repo_root = Some(f.repo.clone());
+        crew::lifecycle::save_task(mid, &t).unwrap();
+        f.plant(TreeChange::Content);
+
+        let m = crew::loader::load_missions().unwrap().into_iter().find(|m| m.id == mid).unwrap();
+        let p = phase("p1", mid, PhaseStatus::Running);
+        teardown_and_terminate_phase(Some(&f.repo), &m, &p, None, MissionTerminal::Abort);
+
+        assert!(!f.branch_exists("phase"), "the worktree's own branch is left behind");
+        assert!(f.branch_exists("keep-me"), "the planted HEAD chose the branch abort deleted");
+        assert!(!f.wt.exists(), "the worktree is torn down");
+        assert!(!f.anything_ran(), "a planted command ran on the host");
+    }
+
+    /// When the main repository's record of the worktree names no branch
+    /// (a detached HEAD), an unrecorded branch cannot be confirmed: abort
+    /// deletes no branch at all, and says which commands clean up.
+    #[test]
+    #[serial_test::serial]
+    fn abort_deletes_no_branch_it_cannot_confirm() {
+        let _g = CrewEnvGuard::new();
+        let f = PlantedWorktree::new();
+        darkmux_types::host_git::fixture::git(&f.wt, &["checkout", "-q", "--detach"]);
+        let mid = "unrecorded-detached";
+        seed_finalize_mission(mid, &[("p1", PhaseStatus::Running)]);
+        let mut t = test_task("p1-worktree");
+        t.phase_id = "p1".to_string();
+        t.workdir = Some(f.wt.clone());
+        t.repo_root = Some(f.repo.clone());
+        crew::lifecycle::save_task(mid, &t).unwrap();
+        let derived = branch_name("p1");
+        darkmux_types::host_git::fixture::git(&f.repo, &["branch", &derived]);
+
+        let m = crew::loader::load_missions().unwrap().into_iter().find(|m| m.id == mid).unwrap();
+        let p = phase("p1", mid, PhaseStatus::Running);
+        teardown_and_terminate_phase(Some(&f.repo), &m, &p, None, MissionTerminal::Abort);
+
+        assert!(f.branch_exists(&derived), "a derived name was force-deleted");
+        assert!(f.branch_exists("phase") && f.branch_exists("keep-me"));
+        assert!(!f.wt.exists(), "the worktree is still torn down");
+    }
+
+    /// The branch an unrecorded teardown may delete is the one the main
+    /// repository's admin record says is checked out, and only a real one.
+    #[test]
+    fn checked_out_branch_reads_only_a_real_branch_from_the_admin_record() {
+        let f = PlantedWorktree::new();
+        assert_eq!(checked_out_branch(&f.repo, &f.admin).as_deref(), Some("phase"));
+        std::fs::write(f.admin.join("HEAD"), "ref: refs/heads/no-such-branch\n").unwrap();
+        assert_eq!(checked_out_branch(&f.repo, &f.admin), None, "a branch that does not exist");
+        darkmux_types::host_git::fixture::git(&f.repo, &["update-ref", "refs/heads/-D", "HEAD"]);
+        std::fs::write(f.admin.join("HEAD"), "ref: refs/heads/-D\n").unwrap();
+        assert_eq!(checked_out_branch(&f.repo, &f.admin), None, "an option-like name, though the ref exists");
+        let sha = darkmux_types::host_git::fixture::git(&f.repo, &["rev-parse", "HEAD"]);
+        std::fs::write(f.admin.join("HEAD"), sha).unwrap();
+        assert_eq!(checked_out_branch(&f.repo, &f.admin), None, "a detached HEAD");
     }
 
     /// (#2869) The workspace is model-writable: a caution's file that the

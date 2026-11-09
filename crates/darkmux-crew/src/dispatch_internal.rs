@@ -4529,8 +4529,21 @@ fn hosted_cap_remedy(opts: &DispatchOpts) -> &'static str {
     }
 }
 
-/// The hosted single-shot dispatch (#1177). Precondition: `target` is an
-/// unmanaged endpoint (`try_resolve_unmanaged_target`).
+/// A direct single-shot dispatch's route label and what serves it: a server
+/// darkmux starts is labeled by where it serves (its loopback port), as
+/// every other path labels it; an unmanaged endpoint by its host.
+fn direct_route(target: &crate::target::Target) -> (String, &'static str) {
+    match target.route_label() {
+        Some(label) if crate::engine_dispatch::is_engine_server(target) => (label, "engine server"),
+        Some(label) => (label, "hosted"),
+        None => (crate::target::endpoint_route_label(&target.endpoint, &target.model.id), "hosted"),
+    }
+}
+
+/// The direct single-shot dispatch (#1177). Precondition: `target` is one
+/// `try_resolve_unmanaged_target` routes here: an unmanaged endpoint, or a
+/// server darkmux starts (#3448, made resident between `dispatch.start` and
+/// the call).
 fn dispatch_unmanaged(
     opts: &DispatchOpts,
     execution: &ExecutionId,
@@ -4542,9 +4555,9 @@ fn dispatch_unmanaged(
     let ep = &target.endpoint;
     let pm = &target.model;
     let session = &opts.session;
-    let label = crate::target::endpoint_route_label(ep, &pm.id);
+    let (label, served_by) = direct_route(target);
     darkmux_types::diag_eprintln!(
-        "darkmux dispatch: runtime=direct (hosted), endpoint: {label}, model={}",
+        "darkmux dispatch: runtime=direct ({served_by}), endpoint: {label}, model={}",
         pm.id
     );
 

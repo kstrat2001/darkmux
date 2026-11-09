@@ -579,8 +579,9 @@ pub fn invalid_engine_args(reg: &crate::ProfileRegistry) -> Vec<InvalidSetting> 
                 out.push(InvalidSetting {
                     set_in: SetIn::Profiles(format!("profiles.{pname}.models[{i}].engine_args")),
                     problem: why,
-                    valid: "flags of `tensorfold-native serve` other than `--port`, `--host`, `--context`, `--name` \
-                            and `--api-key`, on a model whose endpoint is `\"managed\": \"tensorfold\"`; or flags of \
+                    valid: "flags of `tensorfold-native serve` other than `--port`, `--host`, `--context`, `--name`, \
+                            `--alias`, `--api-key` and `--api-key-file` (or an abbreviation of one), on a model whose \
+                            endpoint is `\"managed\": \"tensorfold\"`; or flags of \
                             rec's `rec-mlx serve flint` other than `--model-dir`, `--manifest`, `--context-limit`, \
                             `--port` and `--api-key-file`, on a model whose endpoint is `\"managed\": \"flint\"`"
                         .to_string(),
@@ -632,6 +633,87 @@ pub fn extra_flint_endpoints(reg: &crate::ProfileRegistry) -> Vec<InvalidSetting
             valid: "one `\"managed\": \"flint\"` endpoint per profiles.json; every profile that runs Flint names it".to_string(),
         })
         .collect()
+}
+
+/// A port something on this machine other than darkmux's engine servers
+/// listens on, and whose it is (`"LM Studio's (`lmstudio_url`)"`), for
+/// [`engine_port_collisions`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortOwner {
+    pub port: u16,
+    pub owner: String,
+}
+
+/// The ports LM Studio and darkmux's own daemon listen on here, as resolved
+/// now: LM Studio's from `lmstudio_url` when it names this machine, the
+/// daemon's `serve.port`, and a running daemon's own port when it differs
+/// (one started with `--port`).
+pub fn machine_port_owners() -> Vec<PortOwner> {
+    let mut owners = Vec::new();
+    let lms = crate::config_access::lmstudio_url();
+    if crate::endpoint::url_names_this_machine(&lms) {
+        if let Some(port) = url_port(&lms) {
+            owners.push(PortOwner { port, owner: "LM Studio's (`lmstudio_url`)".to_string() });
+        }
+    }
+    let serve = crate::config_access::serve_port();
+    owners.push(PortOwner { port: serve, owner: "darkmux's daemon's (`serve.port`)".to_string() });
+    if let Some(rec) = crate::daemon_record::live().filter(|r| r.port != serve) {
+        owners.push(PortOwner { port: rec.port, owner: format!("the running darkmux daemon's (pid {})", rec.pid) });
+    }
+    owners
+}
+
+/// The port `url` is dialed on: the one it names, else its scheme's.
+fn url_port(url: &str) -> Option<u16> {
+    let hostport = crate::endpoint::url_host(url)?;
+    let after_host = match hostport.strip_prefix('[') {
+        Some(v6) => v6.split_once(']')?.1,
+        None => hostport.find(':').map_or("", |i| &hostport[i..]),
+    };
+    match after_host.strip_prefix(':').filter(|p| !p.is_empty()) {
+        Some(port) => port.parse().ok(),
+        None => scheme_port(url.split_once("://")?.0),
+    }
+}
+
+/// The port a URL scheme dials when the URL names none.
+fn scheme_port(scheme: &str) -> Option<u16> {
+    match scheme.to_ascii_lowercase().as_str() {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    }
+}
+
+/// Every engine endpoint (a server darkmux starts) whose `port` something
+/// else already uses: an engine endpoint before it (by id), or one of
+/// `owners` ([`machine_port_owners`]). Two servers cannot listen on one
+/// port, and darkmux would read the other's answer as a server it did not
+/// start. Refused at every dispatching preflight and Fail in doctor, naming
+/// `endpoints.<id>.port` and the other owner.
+pub fn engine_port_collisions(reg: &crate::ProfileRegistry, owners: &[PortOwner]) -> Vec<InvalidSetting> {
+    use crate::endpoint::EndpointKind;
+    let mut seen: Vec<(u16, &str)> = Vec::new();
+    let mut out = Vec::new();
+    for (id, ep) in &reg.endpoints {
+        let Ok(EndpointKind::Managed(backend)) = ep.kind() else { continue };
+        let Some(port) = ep.port.filter(|_| backend.starts_servers()) else { continue };
+        let other = seen
+            .iter()
+            .find(|(p, _)| *p == port)
+            .map(|(_, first)| format!("`endpoints.{first}`'s"))
+            .or_else(|| owners.iter().find(|o| o.port == port).map(|o| o.owner.clone()));
+        if let Some(other) = other {
+            out.push(InvalidSetting {
+                set_in: SetIn::Profiles(format!("endpoints.{id}.port")),
+                problem: format!("port {port} is already {other}, and two servers cannot listen on one port"),
+                valid: "a `port` no other engine endpoint, LM Studio or darkmux's daemon on this machine uses".to_string(),
+            });
+        }
+        seen.push((port, id));
+    }
+    out
 }
 
 /// (#2902 step 5) The valid shape of an endpoint's `limits`, for a refusal.
@@ -919,6 +1001,21 @@ pub fn config_path_of(setting: &EnumSetting) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The port a URL is dialed on: the one it names, else its scheme's.
+    #[test]
+    fn a_urls_port_is_the_one_it_names_else_its_schemes() {
+        for (url, port) in [
+            ("http://localhost:1234", Some(1234)),
+            ("http://127.0.0.1:1234/v1", Some(1234)),
+            ("http://[::1]:8080", Some(8080)),
+            ("http://localhost", Some(80)),
+            ("https://[::1]/v1", Some(443)),
+            ("ftp://localhost", None),
+        ] {
+            assert_eq!(super::url_port(url), port, "{url}");
+        }
+    }
+
     use super::*;
     use crate::config::{DetectionPolicy, FleetMode, HookCategory, HookLevel, IdentityProvider, ThermalState};
 

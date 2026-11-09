@@ -3727,6 +3727,11 @@ S(("127.0.0.1", port), H).serve_forever()
         assert!(at("dispatch.start") < at("dispatch.model.start"), "{first_actions:?}");
         assert!(at("dispatch.model.start") < at("dispatch.model.ready"), "{first_actions:?}");
         assert!(at("dispatch.model.ready") < at("dispatch.complete"), "{first_actions:?}");
+        // Labeled by where the server darkmux started serves, as every
+        // other path labels it, never as a remote host.
+        let start = actions(&first_session).into_iter().find(|r| r["action"] == "dispatch.start").expect("dispatch.start");
+        let label = darkmux_flow::unmanaged_route_label(&format!("127.0.0.1:{port}"), "TensorFold/m");
+        assert_eq!(start["payload"]["endpoint"], label, "{start}");
         second.expect("the second dispatch succeeds against the same server");
         let second_actions = names(&actions(&second_session));
         assert!(second_actions.iter().all(|a| !a.starts_with("dispatch.model.")), "{second_actions:?}");

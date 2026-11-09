@@ -40,7 +40,9 @@ pub mod profiles;
 /// a utility binding on a server darkmux starts (Tensorfold, Flint), whose jobs
 /// do not start servers (`config_enum::utility_on_engine_server`), a second
 /// Flint endpoint (`config_enum::extra_flint_endpoints`, #3453: rec runs one
-/// server per machine), and every key its schema does not
+/// server per machine), an engine endpoint's `port` another engine endpoint,
+/// LM Studio or darkmux's daemon already uses
+/// (`config_enum::engine_port_collisions`), and every key its schema does not
 /// know (`darkmux_types::user_files`), and `default_engine`, whose values
 /// are endpoint ids (`darkmux_types::default_engine`). `profiles.json` is a file
 /// `darkmux-types` cannot locate on its own, so this crate (the registry's
@@ -77,6 +79,9 @@ pub fn preflight_with(
                 refusal.invalid.extend(config_enum::invalid_engine_args(&loaded.registry));
                 refusal.invalid.extend(config_enum::utility_on_engine_server(&loaded.registry));
                 refusal.invalid.extend(config_enum::extra_flint_endpoints(&loaded.registry));
+                refusal
+                    .invalid
+                    .extend(config_enum::engine_port_collisions(&loaded.registry, &config_enum::machine_port_owners()));
                 refusal.invalid.extend(darkmux_types::default_engine::invalid(&loaded.registry));
                 refusal.files.extend(profiles::user_file_problem(&loaded.path));
             }
@@ -418,3 +423,62 @@ mod flint_preflight_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod port_collision_tests {
+    use darkmux_types::config_enum::Scope;
+
+    /// Two servers cannot listen on one port: an engine endpoint whose
+    /// `port` another engine endpoint, LM Studio (`lmstudio_url` on this
+    /// machine) or darkmux's daemon (`serve.port`) already uses is refused
+    /// by every dispatching preflight, naming both owners.
+    #[test]
+    #[serial_test::serial] // it sets DARKMUX_LMSTUDIO_URL and DARKMUX_SERVE_PORT
+    fn an_engine_port_another_server_uses_is_refused_naming_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let file = path.to_str().unwrap();
+        std::fs::write(
+            &path,
+            r#"{"profiles":{"p":{"models":[{"id":"TensorFold/m","n_ctx":8192,"endpoint":"a"}]}},
+                "endpoints":{"a":{"managed":"tensorfold","port":8091},"b":{"managed":"tensorfold","port":8091},
+                             "c":{"managed":"tensorfold","port":1234},"d":{"managed":"flint","port":8799},
+                             "e":{"managed":"tensorfold","port":8092}}}"#,
+        )
+        .unwrap();
+        let saved: Vec<(&str, Option<String>)> =
+            ["DARKMUX_LMSTUDIO_URL", "DARKMUX_SERVE_PORT"].iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        unsafe {
+            std::env::set_var("DARKMUX_LMSTUDIO_URL", "http://127.0.0.1:1234");
+            std::env::set_var("DARKMUX_SERVE_PORT", "8799");
+        }
+        let results: Vec<_> = [Scope::Dispatch, Scope::MissionLaunch, Scope::LabRun]
+            .into_iter()
+            .map(|scope| (scope, super::preflight_with(scope, Some(file))))
+            .collect();
+        unsafe {
+            std::env::set_var("DARKMUX_LMSTUDIO_URL", "https://lms.example.com:1234");
+        }
+        let remote_lms = super::preflight_with(Scope::Dispatch, Some(file));
+        unsafe {
+            for (k, v) in &saved {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        for (scope, result) in results {
+            let refusal = result.expect_err("refused");
+            let msg = refusal.to_string();
+            for (path, other) in [("endpoints.b.port", "`endpoints.a`"), ("endpoints.c.port", "LM Studio"), ("endpoints.d.port", "daemon")] {
+                let line = msg.lines().find(|l| l.contains(path)).unwrap_or_else(|| panic!("{scope:?}: {path} in {msg}"));
+                assert!(line.contains(other), "{scope:?}: {path} names {other}: {line}");
+            }
+            assert!(!msg.contains("endpoints.a.port") && !msg.contains("endpoints.e.port"), "{scope:?}: {msg}");
+        }
+        let msg = remote_lms.expect_err("still refused").to_string();
+        assert!(!msg.contains("endpoints.c.port"), "LM Studio on another machine holds no port here: {msg}");
+    }
+}
+

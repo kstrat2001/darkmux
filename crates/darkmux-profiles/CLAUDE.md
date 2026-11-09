@@ -11,6 +11,9 @@ When darkmux maintains state in a system other consumers also use — LMStudio l
 | System | Form | Example |
 |---|---|---|
 | LMStudio loaded identifier (visible in `lms ps`) | `darkmux:<model-id>` | `darkmux:qwen3.6-35b-a3b` |
+| Model name a Tensorfold server darkmux starts serves (`--name`) | `darkmux:<model-id>` | `darkmux:TensorFold/Qwen3.8-27B-MLX-4bit` |
+
+rec's Flint takes no name: every Flint server answers `flint`, darkmux's included, so there the name proves nothing. An engine server is darkmux's by its record under `~/.darkmux/run/engines/` (pid, process start stamp, command line, port), for Tensorfold and Flint alike (contract 4 in `docs/agents/CONTRACTS.md`).
 
 (A previous namespace, `darkmux/<role>` for openclaw agent ids, was retired along with the openclaw shell-out path in #1405.)
 
