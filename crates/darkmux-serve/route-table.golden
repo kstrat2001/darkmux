@@ -62,6 +62,8 @@ BranchFile.content?: string | null
 BranchFile.deleted?: boolean | null
 BranchFile.mode?: string | null
 BranchFile.path: string
+ClientCode = "unsupported_media_type" | "bad_request" | "payload_too_large" | "method_not_allowed" | "not_local" | "not_found" | "unauthorized" | "forbidden" | "conflict" | "unprocessable" | "too_many_requests" | "unavailable" | "internal" | "preview_disabled" | "no_source_checkout" | "template_no_recipe" | "no_recipe" | "recipe_invalid" | "filter_in_repo_config" | "network_key_in_repo_config" | "fetch_failed" | "clone_failed" | "busy" | "wont_fit" | "model_start_failed" | "model_stop_failed" | "port_in_use" | "engine_unavailable" | "engine_in_use" | "dispatch_failed"
+ClientError.code: ClientCode
 ClientError.error: string
 ClientMachine.id: string
 ClientMachine.name: string
@@ -118,10 +120,11 @@ Whoami.machine: ClientMachine
 Whoami.scopes: ClientScopes
 WorkAccepted.profile: string
 WorkAccepted.work_id: string
-WorkState = { activity?: RunActivity | null, activity_elapsed_ms?: integer | null, status: "running" } | { status: "cancelling" } | { result: any, changes?: RunChanges | null, commit?: string | null, branch?: string | null, commit_error?: string | null, changes_error?: string | null, undone: boolean, status: "done" } | { error: string, reason: string, status: "error" } | { reason: string, error?: string | null, status: "cancelled" }
+WorkState = { activity?: RunActivity | null, activity_elapsed_ms?: integer | null, status: "running" } | { status: "cancelling" } | { result: any, changes?: RunChanges | null, commit?: string | null, branch?: string | null, commit_error?: string | null, changes_error?: string | null, undone: boolean, status: "done" } | { error: string, reason: string, code: ClientCode, status: "error" } | { reason: string, error?: string | null, status: "cancelled" }
 WorkspaceInfo.branch: string
 WorkspaceInfo.created: boolean
 WorkspaceInfo.fetch_error?: string | null
+WorkspaceInfo.fetch_error_code?: ClientCode | null
 WorkspaceInfo.from?: string | null
 WorkspaceInfo.head: string
 WorkspaceInfo.repo?: string | null

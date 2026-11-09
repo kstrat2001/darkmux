@@ -88,6 +88,7 @@ use serde_json::Value;
 
 use crate::client_git::WorkCopy;
 use crate::client_wire::*;
+use darkmux_types::client_code::ClientCode;
 use std::collections::HashMap;
 use std::io::{Read, Seek, Write};
 use std::net::SocketAddr;
@@ -479,6 +480,9 @@ pub enum WorkStatus {
 pub struct RunError {
     pub reason: String,
     pub error: String,
+    /// (#3468) The `code` its run's `dispatch.error` named, as written
+    /// (`busy`, `wont_fit`, ...): read from the flow, never from `error`.
+    pub code: Option<String>,
 }
 
 /// A request to stop one running work item, read by its executor.
@@ -548,7 +552,7 @@ pub type PathCheck = Arc<dyn Fn(&Path) -> Result<PathBuf, String> + Send + Sync>
 /// A path this machine knows (the worktrees base).
 pub type PathSource = Arc<dyn Fn() -> Result<PathBuf, String> + Send + Sync>;
 /// Something done to a path (a fetch).
-pub type PathAction = Arc<dyn Fn(&Path) -> Result<(), String> + Send + Sync>;
+pub type PathAction = Arc<dyn Fn(&Path) -> Result<(), crate::client_workspace::Coded> + Send + Sync>;
 /// `clients.preview.enabled`, read per request.
 pub type PreviewSwitch = Arc<dyn Fn() -> Result<bool, String> + Send + Sync>;
 /// `clients.preview.idle_minutes`, read per idle check.
@@ -858,12 +862,12 @@ pub fn router(state: ClientServerState) -> Router {
 
 /// A JSON 404 for a path the table does not list.
 pub(crate) async fn no_such_route() -> Response {
-    err(StatusCode::NOT_FOUND, "no such route")
+    err(StatusCode::NOT_FOUND, ClientCode::NotFound, "no such route")
 }
 
 /// A JSON 405 for a method a listed path does not take.
 pub(crate) async fn method_not_allowed() -> Response {
-    err(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
+    err(StatusCode::METHOD_NOT_ALLOWED, ClientCode::MethodNotAllowed, "method not allowed")
 }
 
 /// The gate in front of every route: the request must come from this machine
@@ -879,7 +883,7 @@ pub(crate) async fn only_this_machines_apps(
     next: axum::middleware::Next,
 ) -> Response {
     match foreign_request(&req, state.bound) {
-        Some((code, why)) => err(code, why),
+        Some((status, code, why)) => err(status, code, why),
         None => next.run(req).await,
     }
 }
@@ -888,7 +892,7 @@ pub(crate) async fn only_this_machines_apps(
 fn foreign_request(
     req: &axum::extract::Request,
     bound: Option<SocketAddr>,
-) -> Option<(StatusCode, &'static str)> {
+) -> Option<(StatusCode, ClientCode, &'static str)> {
     use axum::http::header::ORIGIN;
     let peer = req
         .extensions()
@@ -897,18 +901,21 @@ fn foreign_request(
     if !crate::is_local_at(peer, req.headers(), bound) {
         return Some((
             StatusCode::FORBIDDEN,
+            ClientCode::NotLocal,
             "darkmux client serve answers only apps on this machine (a loopback connection naming this listener, through no proxy)",
         ));
     }
     if req.headers().contains_key(ORIGIN) {
         return Some((
             StatusCode::FORBIDDEN,
+            ClientCode::NotLocal,
             "a request from a web page (it carries an Origin header) is refused: only an app on this machine may use darkmux client serve",
         ));
     }
     if req.method() == axum::http::Method::POST && has_body(req) && !is_json(req) {
         return Some((
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ClientCode::UnsupportedMediaType,
             "a request body must be Content-Type: application/json",
         ));
     }
@@ -931,26 +938,26 @@ fn is_json(req: &axum::extract::Request) -> bool {
         .is_some_and(|t| t.trim().eq_ignore_ascii_case("application/json"))
 }
 
-fn err(code: StatusCode, msg: impl Into<String>) -> Response {
-    (code, Json(ClientError { error: msg.into() })).into_response()
+fn err(status: StatusCode, code: ClientCode, msg: impl Into<String>) -> Response {
+    (status, Json(ClientError { error: msg.into(), code })).into_response()
 }
 
 /// A refusal on its way back to a handler, boxed: a `Response` is large, and
 /// these travel through `Result`s.
 type Refused = Box<Response>;
 
-fn refuse(code: StatusCode, msg: impl Into<String>) -> Refused {
-    Box::new(err(code, msg))
+fn refuse(status: StatusCode, code: ClientCode, msg: impl Into<String>) -> Refused {
+    Box::new(err(status, code, msg))
 }
 
 fn not_found() -> Response {
-    err(StatusCode::NOT_FOUND, "not found")
+    err(StatusCode::NOT_FOUND, ClientCode::NotFound, "not found")
 }
 
 fn internal(e: anyhow::Error) -> Response {
     eprintln!("darkmux client serve: {e:#}");
     err(
-        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::INTERNAL_SERVER_ERROR, ClientCode::Internal,
         "internal error; see the darkmux client serve log",
     )
 }
@@ -961,19 +968,19 @@ async fn json_body<T: serde::de::DeserializeOwned>(body: Body) -> Result<T, Resp
         .await
         .map_err(|_| {
             err(
-                StatusCode::PAYLOAD_TOO_LARGE,
+                StatusCode::PAYLOAD_TOO_LARGE, ClientCode::PayloadTooLarge,
                 format!("body larger than {MAX_BODY_BYTES} bytes"),
             )
         })?;
     serde_json::from_slice(&bytes)
-        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("bad JSON body: {e}")))
+        .map_err(|e| err(StatusCode::BAD_REQUEST, ClientCode::BadRequest, format!("bad JSON body: {e}")))
 }
 
 fn clean_text(s: &str, field: &str, min: usize, max: usize) -> Result<(), Refused> {
     let n = s.chars().count();
     if n < min || n > max || s.chars().any(char::is_control) {
         return Err(refuse(
-            StatusCode::BAD_REQUEST,
+            StatusCode::BAD_REQUEST, ClientCode::BadRequest,
             format!("`{field}` must be {min}-{max} characters with no control characters"),
         ));
     }
@@ -1035,7 +1042,7 @@ pub(crate) async fn pair_handler(State(state): State<ClientServerState>, body: B
         )
             .into_response(),
         Ok(false) => err(
-            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::TOO_MANY_REQUESTS, ClientCode::TooManyRequests,
             "too many pairing requests are waiting; try again later",
         ),
         Err(e) => internal(e),
@@ -1086,7 +1093,7 @@ enum PollOutcome {
 }
 
 fn policy_or_503(state: &ClientServerState) -> Result<Option<Vec<String>>, Refused> {
-    (state.profiles_policy)().map_err(|e| refuse(StatusCode::SERVICE_UNAVAILABLE, e))
+    (state.profiles_policy)().map_err(|e| refuse(StatusCode::SERVICE_UNAVAILABLE, ClientCode::Unavailable, e))
 }
 
 pub(crate) async fn poll_handler(
@@ -1124,7 +1131,7 @@ fn authenticate(
     state: &ClientServerState,
     headers: &HeaderMap,
 ) -> Result<ApprovedClient, Refused> {
-    let unauthorized = || err(StatusCode::UNAUTHORIZED, "missing or unknown bearer token");
+    let unauthorized = || err(StatusCode::UNAUTHORIZED, ClientCode::Unauthorized, "missing or unknown bearer token");
     let token = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -1221,7 +1228,7 @@ fn listable_profiles(state: &ClientServerState, role: &str) -> Result<Vec<String
         Ok(true) => {}
         Ok(false) => {
             return Err(refuse(
-                StatusCode::BAD_REQUEST,
+                StatusCode::BAD_REQUEST, ClientCode::BadRequest,
                 format!("no role {role} on this machine"),
             ))
         }
@@ -1283,7 +1290,7 @@ pub(crate) async fn whoami_handler(State(state): State<ClientServerState>, heade
 /// ([`ClientServerState::check_workdir`], which canonicalizes, so a relative
 /// path is judged by where it really lands); the canonical path, or a 403.
 fn checked_workdir(state: &ClientServerState, w: &str) -> Result<PathBuf, Refused> {
-    (state.check_workdir)(Path::new(w)).map_err(|e| refuse(StatusCode::FORBIDDEN, e))
+    (state.check_workdir)(Path::new(w)).map_err(|e| refuse(StatusCode::FORBIDDEN, ClientCode::Forbidden, e))
 }
 
 #[derive(Deserialize)]
@@ -1349,7 +1356,7 @@ async fn admitted_work(
     let client = authenticate(state, headers)?;
     let req: WorkBody = json_body(body).await.map_err(Box::new)?;
     if req.message.trim().is_empty() {
-        return Err(refuse(StatusCode::BAD_REQUEST, "`message` is empty"));
+        return Err(refuse(StatusCode::BAD_REQUEST, ClientCode::BadRequest, "`message` is empty"));
     }
     let st = state.clone();
     match tokio::task::spawn_blocking(move || admit(&st, &client, req)).await {
@@ -1449,6 +1456,7 @@ fn run_status(
         Err(_) => WorkStatus::Error(RunError {
             reason: "panic".to_string(),
             error: "the dispatch runner panicked".to_string(),
+            code: None,
         }),
     }
 }
@@ -1523,7 +1531,7 @@ fn check_role(state: &ClientServerState, role: &str) -> Result<(), Refused> {
     match (state.role_known)(role) {
         Ok(true) => Ok(()),
         Ok(false) => Err(refuse(
-            StatusCode::BAD_REQUEST,
+            StatusCode::BAD_REQUEST, ClientCode::BadRequest,
             format!("role {role} is not defined on this machine"),
         )),
         Err(e) => Err(Box::new(internal(anyhow!(e)))),
@@ -1534,7 +1542,7 @@ fn check_role(state: &ClientServerState, role: &str) -> Result<(), Refused> {
 fn admitted_workdir(state: &ClientServerState, req: &WorkBody) -> Result<Option<PathBuf>, Refused> {
     match (&req.workdir, &req.workspace) {
         (Some(_), Some(_)) => Err(refuse(
-            StatusCode::BAD_REQUEST,
+            StatusCode::BAD_REQUEST, ClientCode::BadRequest,
             "send `workdir` or `workspace`, not both",
         )),
         // (#3451 review) A raw `workdir` must be exactly one workspace
@@ -1551,7 +1559,7 @@ fn admitted_workdir(state: &ClientServerState, req: &WorkBody) -> Result<Option<
 }
 
 fn forbidden(e: impl Into<String>) -> Refused {
-    refuse(StatusCode::FORBIDDEN, e)
+    refuse(StatusCode::FORBIDDEN, ClientCode::Forbidden, e)
 }
 
 /// The profile that would run, if this machine lets a paired app use it:
@@ -1616,7 +1624,7 @@ fn check_capacity(
         .count();
     if running >= MAX_RUNNING_PER_CLIENT {
         return Err(refuse(
-            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::TOO_MANY_REQUESTS, ClientCode::TooManyRequests,
             format!(
                 "client {} already has {running} work items running",
                 client.name
@@ -1639,7 +1647,7 @@ fn check_work_copy(
     let Some(w) = workdir else {
         return match continues {
             Some(_) => Err(refuse(
-                StatusCode::CONFLICT,
+                StatusCode::CONFLICT, ClientCode::Conflict,
                 "only a run in a work copy can continue another",
             )),
             None => Ok(()),
@@ -1650,7 +1658,7 @@ fn check_work_copy(
         .find(|(_, e)| e.workdir.as_ref() == Some(w) && matches!(e.status, WorkStatus::Running))
     {
         return Err(refuse(
-            StatusCode::CONFLICT,
+            StatusCode::CONFLICT, ClientCode::Conflict,
             format!("run {id} is already working in this work copy"),
         ));
     }
@@ -1662,7 +1670,7 @@ fn check_work_copy(
         });
         if !ok {
             return Err(refuse(
-                StatusCode::CONFLICT,
+                StatusCode::CONFLICT, ClientCode::Conflict,
                 format!("run {c} isn't a finished run of yours in this work copy"),
             ));
         }
@@ -1704,7 +1712,7 @@ pub(crate) async fn recipe_handler(
         Ok(axum::extract::Query(q)) if q.workdir.is_some() != q.workspace.is_some() => q,
         _ => {
             return err(
-                StatusCode::BAD_REQUEST,
+                StatusCode::BAD_REQUEST, ClientCode::BadRequest,
                 "one of the `workdir` or `workspace` query parameters is required",
             )
         }
@@ -1733,7 +1741,7 @@ fn workspace_of_workdir(state: &ClientServerState, w: &str) -> Result<String, Re
     match (dir.parent(), dir.file_name().and_then(|n| n.to_str())) {
         (Some(parent), Some(name)) if parent == base => Ok(name.to_string()),
         _ => Err(refuse(
-            StatusCode::NOT_FOUND,
+            StatusCode::NOT_FOUND, ClientCode::NotFound,
             format!("{} is not a workspace, so it has no recipe", dir.display()),
         )),
     }
@@ -1756,7 +1764,7 @@ fn workspace_dir(state: &ClientServerState, name: &str) -> Result<PathBuf, Refus
     use crate::client_workspace::valid_name;
     if !valid_name(name) {
         return Err(refuse(
-            StatusCode::BAD_REQUEST,
+            StatusCode::BAD_REQUEST, ClientCode::BadRequest,
             format!("{name:?} is not a workspace name"),
         ));
     }
@@ -1764,11 +1772,11 @@ fn workspace_dir(state: &ClientServerState, name: &str) -> Result<PathBuf, Refus
     let dir = base.join(name);
     if std::fs::symlink_metadata(&dir).is_err() {
         return Err(refuse(
-            StatusCode::NOT_FOUND,
+            StatusCode::NOT_FOUND, ClientCode::NotFound,
             format!("no workspace named {name}"),
         ));
     }
-    (state.check_workdir)(&dir).map_err(|e| refuse(StatusCode::FORBIDDEN, e))
+    (state.check_workdir)(&dir).map_err(|e| refuse(StatusCode::FORBIDDEN, ClientCode::Forbidden, e))
 }
 
 fn workspace_json(state: &ClientServerState, name: &str, dir: &Path, created: bool) -> WorkspaceInfo {
@@ -1785,6 +1793,7 @@ fn workspace_json(state: &ClientServerState, name: &str, dir: &Path, created: bo
         created,
         from: None,
         fetch_error: None,
+        fetch_error_code: None,
     }
 }
 
@@ -1822,7 +1831,7 @@ fn workspace_ask(req: &WorkspaceBody) -> Result<WorkspaceAsk, Refused> {
         (Some(url), None) => {
             let Some(normalized) = ws::normalize_repo_url(url) else {
                 return Err(refuse(
-                    StatusCode::BAD_REQUEST,
+                    StatusCode::BAD_REQUEST, ClientCode::BadRequest,
                     "repo_url must be https://host/owner/repo or git@host:owner/repo",
                 ));
             };
@@ -1834,9 +1843,9 @@ fn workspace_ask(req: &WorkspaceBody) -> Result<WorkspaceAsk, Refused> {
             })
         }
         (None, Some(path)) if !req.template => Ok(WorkspaceAsk::Worktree { path: path.clone() }),
-        (None, Some(_)) => Err(refuse(StatusCode::BAD_REQUEST, "a template needs `repo_url`, not `source_path`")),
+        (None, Some(_)) => Err(refuse(StatusCode::BAD_REQUEST, ClientCode::BadRequest, "a template needs `repo_url`, not `source_path`")),
         _ => Err(refuse(
-            StatusCode::BAD_REQUEST,
+            StatusCode::BAD_REQUEST, ClientCode::BadRequest,
             "send `repo_url` or `source_path`, not both or neither",
         )),
     }
@@ -1862,7 +1871,7 @@ pub(crate) async fn workspace_create_handler(
     };
     if let Some(r) = req.git_ref.as_deref().filter(|r| !ws::valid_ref(r)) {
         return err(
-            StatusCode::BAD_REQUEST,
+            StatusCode::BAD_REQUEST, ClientCode::BadRequest,
             format!("{r:?} is not a branch name"),
         );
     }
@@ -1917,7 +1926,7 @@ fn clone_workspace(
             || std::fs::symlink_metadata(base.join(format!(".{n}.partial"))).is_ok()
     };
     let Some(name) = ws::name_for(normalized, taken) else {
-        return err(StatusCode::CONFLICT, "no free workspace name for this repo");
+        return err(StatusCode::CONFLICT, ClientCode::Conflict, "no free workspace name for this repo");
     };
     if let Err(r) = place_clone(state, url, normalized, git_ref, &base, &name) {
         return *r;
@@ -1945,10 +1954,13 @@ fn template_workspace(
     };
     let _one_at_a_time = state.workspace_lock.lock().unwrap();
     let Some(name) = free_project_name(&base, bot) else {
-        return err(StatusCode::CONFLICT, "no free workspace name for this project");
+        return err(StatusCode::CONFLICT, ClientCode::Conflict, "no free workspace name for this project");
     };
     if let Err(r) = place_clone(state, url, normalized, git_ref, &base, &name) {
         return *r;
+    }
+    if let Err(e) = crate::client_workspace::record_template(&base, &name) {
+        return internal(anyhow!(e));
     }
     let dir = base.join(&name);
     let from = match git_ref {
@@ -2043,8 +2055,10 @@ fn existing_clone(state: &ClientServerState, name: &str) -> Response {
     };
     let mut v = workspace_json(state, name, &dir, false);
     let held = work_copy_for(state, &dir).map(|wc| wc.git_dir);
-    if let Err(e) = held.ok_or_else(|| "darkmux holds no repository for it".to_string()).and_then(|g| (state.fetch_repo)(&g)) {
-        v.fetch_error = Some(e);
+    let no_repo = || crate::client_workspace::Coded::new(ClientCode::FetchFailed, "darkmux holds no repository for it");
+    if let Err(e) = held.ok_or_else(no_repo).and_then(|g| (state.fetch_repo)(&g)) {
+        v.fetch_error_code = Some(e.code());
+        v.fetch_error = Some(e.message);
     }
     Json(v).into_response()
 }
@@ -2068,7 +2082,7 @@ fn place_clone(
         let _ = std::fs::remove_dir_all(&partial);
         let _ = std::fs::remove_dir_all(&git_dir);
         return Err(refuse(
-            StatusCode::BAD_GATEWAY,
+            StatusCode::BAD_GATEWAY, ClientCode::CloneFailed,
             format!("cloning {normalized}: {e}"),
         ));
     }
@@ -2106,7 +2120,7 @@ fn worktree_workspace(
     }
     let Some(name) = free_worktree_name(&base, &source, bot) else {
         return err(
-            StatusCode::CONFLICT,
+            StatusCode::CONFLICT, ClientCode::Conflict,
             "no free workspace name for this checkout",
         );
     };
@@ -2170,7 +2184,7 @@ fn add_bot_worktree(
     git_ref: Option<&str>,
     bot: &str,
     dest: &Path,
-) -> Result<(String, Option<String>, String), Refused> {
+) -> Result<(String, Option<crate::client_workspace::Coded>, String), Refused> {
     use crate::client_workspace as ws;
     let short = random_hex(3).map_err(|e| Box::new(internal(e)))?;
     let branch = format!("mux/{bot}-{short}");
@@ -2182,19 +2196,26 @@ fn add_bot_worktree(
     ws::add_worktree(source, &branch, dest, &start).map_err(|e| {
         refuse(
             StatusCode::UNPROCESSABLE_ENTITY,
+            e.code(),
             format!("adding a worktree of {}: {e}", source.display()),
         )
     })?;
     Ok((start, fetch_error, branch))
 }
 
-fn created_worktree(state: &ClientServerState, name: &str, start: String, fetch_error: Option<String>) -> Response {
+fn created_worktree(
+    state: &ClientServerState,
+    name: &str,
+    start: String,
+    fetch_error: Option<crate::client_workspace::Coded>,
+) -> Response {
     match workspace_dir(state, name) {
         Ok(dir) => {
             let mut v = workspace_json(state, name, &dir, true);
             v.from = Some(start);
             if let Some(e) = fetch_error {
-                v.fetch_error = Some(e);
+                v.fetch_error_code = Some(e.code());
+                v.fetch_error = Some(e.message);
             }
             (StatusCode::CREATED, Json(v)).into_response()
         }
@@ -2234,14 +2255,14 @@ fn free_worktree_name(base: &Path, source: &Path, bot: &str) -> Option<String> {
 /// The status a recipe refusal answers with.
 fn recipe_refusal(r: &crate::client_preview::RecipeRefusal) -> Response {
     use crate::client_preview::RecipeRefusal as R;
-    let code = match r {
-        R::NotFound(_) => StatusCode::NOT_FOUND,
-        R::Symlink(_) => StatusCode::FORBIDDEN,
-        R::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
-        R::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
-        R::Unreadable(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    let (status, code) = match r {
+        R::NotFound(_) => (StatusCode::NOT_FOUND, ClientCode::NoRecipe),
+        R::Symlink(_) => (StatusCode::FORBIDDEN, ClientCode::RecipeInvalid),
+        R::TooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, ClientCode::RecipeInvalid),
+        R::Invalid(_) => (StatusCode::UNPROCESSABLE_ENTITY, ClientCode::RecipeInvalid),
+        R::Unreadable(_) => (StatusCode::INTERNAL_SERVER_ERROR, ClientCode::Internal),
     };
-    err(code, r.message())
+    err(status, code, r.message())
 }
 
 /// Workspace `name`'s directory and where its recipe is trusted from: the
@@ -2267,7 +2288,7 @@ fn workspace_and_recipe_source(
         return Ok((dir, RecipeSource::TemplateCommit { git_dir, commit }));
     }
     let checkout = crate::client_workspace::own_checkout_of(&base, name, &dir)
-        .map_err(|e| refuse(StatusCode::NOT_FOUND, e))?;
+        .map_err(|e| refuse(StatusCode::NOT_FOUND, e.code(), e.to_string()))?;
     Ok((dir, RecipeSource::Checkout(checkout)))
 }
 
@@ -2329,14 +2350,14 @@ fn previews_allowed(state: &ClientServerState) -> Result<(), Refused> {
     match (state.preview_enabled)() {
         Ok(true) => Ok(()),
         Ok(false) => Err(refuse(
-            StatusCode::FORBIDDEN,
+            StatusCode::FORBIDDEN, ClientCode::PreviewDisabled,
             "previews are off on this machine: a preview runs the workspace's own code (its \
              package.json scripts and whatever they call, which a model may have written) in a \
              container with network access, the workspace mounted read-write and its ports \
              published on 127.0.0.1. To allow it: \
              `darkmux config set clients.preview.enabled true`",
         )),
-        Err(e) => Err(refuse(StatusCode::SERVICE_UNAVAILABLE, e)),
+        Err(e) => Err(refuse(StatusCode::SERVICE_UNAVAILABLE, ClientCode::Unavailable, e)),
     }
 }
 
@@ -2375,7 +2396,7 @@ pub(crate) async fn preview_status_handler(
     }
     match status {
         Some(v) => Json(v).into_response(),
-        None => err(StatusCode::NOT_FOUND, format!("no preview for {name}")),
+        None => err(StatusCode::NOT_FOUND, ClientCode::NotFound, format!("no preview for {name}")),
     }
 }
 
@@ -2515,17 +2536,17 @@ pub(crate) async fn workspace_changes_handler(
             Err(r) => return *r,
         };
         let Some(dir) = work_copy_for(&st, &dir) else {
-            return err(StatusCode::CONFLICT, "darkmux holds no repository for this workspace");
+            return err(StatusCode::CONFLICT, ClientCode::Conflict, "darkmux holds no repository for this workspace");
         };
         let Some(default) = ws::remote_default_of(&dir) else {
-            return err(StatusCode::CONFLICT, "this work copy has no origin default branch to compare with");
+            return err(StatusCode::CONFLICT, ClientCode::Conflict, "this work copy has no origin default branch to compare with");
         };
         let branch = git_line(&dir, &["branch", "--show-current"]).unwrap_or_default();
         if branch.is_empty() {
-            return err(StatusCode::CONFLICT, "the work copy isn't on a branch");
+            return err(StatusCode::CONFLICT, ClientCode::Conflict, "the work copy isn't on a branch");
         }
         let (Some(base), Some(head)) = (git_line(&dir, &["merge-base", "HEAD", &default]), git_line(&dir, &["rev-parse", "HEAD"])) else {
-            return err(StatusCode::CONFLICT, "couldn't find where this branch left the default branch");
+            return err(StatusCode::CONFLICT, ClientCode::Conflict, "couldn't find where this branch left the default branch");
         };
         let Some(listing) = git(&dir, None, &["diff", "--no-renames", "--name-status", "-z", &base, &head]) else {
             return internal(anyhow!("listing the branch's changes failed"));
@@ -2553,7 +2574,7 @@ pub(crate) async fn workspace_changes_handler(
             };
             total += blob.stdout.len();
             if total > MAX_CHANGES_BYTES {
-                return err(StatusCode::PAYLOAD_TOO_LARGE, "the branch's changes are too large to send");
+                return err(StatusCode::PAYLOAD_TOO_LARGE, ClientCode::PayloadTooLarge, "the branch's changes are too large to send");
             }
             let mode = git_line(&dir, &["--literal-pathspecs", "ls-tree", &head, "--", path])
                 .and_then(|l| l.split_whitespace().next().map(str::to_string))
@@ -2668,6 +2689,26 @@ pub(crate) fn is_work_session(v: &Value, role: &str, work_id: &str) -> bool {
     SessionId::parse(wire).is_ok_and(|s| matches!(s.kind(), SessionKind::Adhoc { role: r, nonce } if r == role && nonce == work_id))
 }
 
+/// (#3468) The `code` the `dispatch.error` of `role`'s work `work_id` names
+/// ([`is_work_session`]), from today's and
+/// yesterday's day files; `None` when it names none or wrote no terminal.
+pub(crate) fn dispatch_error_code_in(
+    store: &crate::flow_window::FlowRecordStore,
+    flows_dir: &Path,
+    role: &str,
+    work_id: &str,
+) -> Option<String> {
+    let yesterday = crate::runs::day_string_from_epoch_ms(unix_now().saturating_sub(86_400) * 1_000);
+    let mut code = None;
+    store.read(flows_dir, &yesterday).for_each(|v| {
+        let ours = is_work_session(v, role, work_id);
+        if ours && darkmux_flow::reader::action_of(v) == Some(darkmux_flow::FlowAction::DispatchError) {
+            code = v.pointer("/payload/code").and_then(Value::as_str).map(str::to_string);
+        }
+    });
+    code
+}
+
 /// A work item as its client polls it.
 fn work_status_json(state: &ClientServerState, work_id: &str, w: WorkEntry) -> WorkState {
     match w.status {
@@ -2690,6 +2731,7 @@ fn work_status_json(state: &ClientServerState, work_id: &str, w: WorkEntry) -> W
             undone: w.decided.is_some(),
         },
         WorkStatus::Error(e) => WorkState::Error {
+            code: ClientCode::of_dispatch(e.code.as_deref()),
             error: e.error,
             reason: e.reason,
         },
@@ -2725,7 +2767,7 @@ pub(crate) async fn cancel_handler(
                 )
                     .into_response()
             }
-            _ => err(StatusCode::CONFLICT, "not running"),
+            _ => err(StatusCode::CONFLICT, ClientCode::Conflict, "not running"),
         },
         _ => not_found(),
     }
@@ -2785,7 +2827,7 @@ fn committed_run(
         return Err(Box::new(not_found()));
     };
     if !matches!(w.status, WorkStatus::Done { .. }) {
-        return Err(refuse(StatusCode::CONFLICT, "the run hasn't finished"));
+        return Err(refuse(StatusCode::CONFLICT, ClientCode::Conflict, "the run hasn't finished"));
     }
     if w.commit.is_none() {
         let why = w
@@ -2793,12 +2835,12 @@ fn committed_run(
             .clone()
             .unwrap_or_else(|| "the run changed nothing".to_string());
         return Err(refuse(
-            StatusCode::CONFLICT,
+            StatusCode::CONFLICT, ClientCode::Conflict,
             format!("{why}; there's nothing to undo"),
         ));
     }
     if w.decided.is_some() {
-        return Err(refuse(StatusCode::CONFLICT, "already undone"));
+        return Err(refuse(StatusCode::CONFLICT, ClientCode::Conflict, "already undone"));
     }
     Ok(w)
 }
@@ -2818,7 +2860,7 @@ pub(crate) async fn undo_handler(
             Err(r) => return *r,
         };
         let (Some(wd), Some(commit)) = (w.git.clone(), w.commit.clone()) else {
-            return err(StatusCode::CONFLICT, "the run has no git work copy");
+            return err(StatusCode::CONFLICT, ClientCode::Conflict, "the run has no git work copy");
         };
         let mut log = vec![
             "--literal-pathspecs".to_string(),
@@ -2869,13 +2911,13 @@ pub(crate) async fn undo_handler(
                 .map(|(id, _)| format!("run {id}"))
                 .unwrap_or_else(|| format!("commit {}", short(sha)));
             return err(
-                StatusCode::CONFLICT,
+                StatusCode::CONFLICT, ClientCode::Conflict,
                 format!("{by} changed the same files later; undo that first"),
             );
         }
         if let Err(e) = git_quiet(&wd, &["revert", "--no-edit", &commit]) {
             let _ = git_quiet(&wd, &["revert", "--abort"]);
-            return err(StatusCode::CONFLICT, format!("couldn't undo it: {e}"));
+            return err(StatusCode::CONFLICT, ClientCode::Conflict, format!("couldn't undo it: {e}"));
         }
         let revert = git_line(&wd, &["rev-parse", "HEAD"]).unwrap_or_default();
         if let Some(e) = st.works.lock().unwrap().get_mut(&work_id) {
@@ -2984,6 +3026,7 @@ pub(crate) fn run_dispatch_child(
     let failed = |reason: &str, error: String| RunError {
         reason: reason.to_string(),
         error,
+        code: None,
     };
     use std::process::{Command, Stdio};
     let mut child = Command::new(exe)
@@ -3052,7 +3095,9 @@ pub(crate) fn run_dispatch_child(
     let signal = std::os::unix::process::ExitStatusExt::signal(&status);
     #[cfg(not(unix))]
     let signal: Option<i32> = None;
-    Err(failed(&exit_reason(status.code(), signal), tail))
+    let mut e = failed(&exit_reason(status.code(), signal), tail);
+    e.code = teardown.dispatch_error_code(spec);
+    Err(e)
 }
 
 /// The most of a failed child's stderr a status keeps.
@@ -3250,6 +3295,9 @@ pub trait HardKillTeardown: Send + Sync {
     fn has_terminal(&self, run: &StartedRun) -> bool;
     /// Write the execution's `dispatch.error` naming the cancel.
     fn emit_cancelled(&self, run: &StartedRun);
+    /// (#3468) The `code` the work's `dispatch.error` named, when the child
+    /// failed: what an app branches on, read from the flow.
+    fn dispatch_error_code(&self, spec: &WorkSpec) -> Option<String>;
 }
 
 /// Do for a SIGKILLed dispatch child what its own TERM handling would have
@@ -3298,6 +3346,9 @@ impl HardKillTeardown for ProductionTeardown {
             }
             Err(e) => eprintln!("darkmux client serve: {e}"),
         }
+    }
+    fn dispatch_error_code(&self, spec: &WorkSpec) -> Option<String> {
+        dispatch_error_code_in(&WORK_ACTIVITY_RECORDS, &darkmux_flow::flows_dir(), &spec.role, &spec.work_id)
     }
 }
 
