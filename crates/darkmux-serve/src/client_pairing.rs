@@ -2031,17 +2031,21 @@ fn free_project_name(base: &Path, bot: &str) -> Option<String> {
         .find(|n| ws::valid_name(n) && !taken(n))
 }
 
-/// Drops the clone's history and remote and makes it a new repo on `main`
-/// with everything in one commit, its repository again held by darkmux
-/// outside the work tree. Returns that commit's SHA.
+/// The branch a project made from a template starts on.
+const TEMPLATE_BRANCH: &str = "main";
+
+/// Drops the clone's history and remote and makes it a new repo on
+/// [`TEMPLATE_BRANCH`] with everything in one commit, its repository again
+/// held by darkmux outside the work tree. Returns that commit's SHA.
 fn start_fresh(base: &Path, name: &str, message: &str) -> Result<String, String> {
     let dir = base.join(name);
     let git_dir = crate::client_git::clone_git_dir(base, name);
     std::fs::remove_dir_all(&git_dir).map_err(|e| format!("removing the template's history: {e}"))?;
     let _ = std::fs::remove_file(dir.join(".git"));
     let (gd, wd) = (git_dir.to_string_lossy(), dir.to_string_lossy());
+    let initial = format!("--initial-branch={TEMPLATE_BRANCH}");
     let init = darkmux_types::host_git::HostGit::trusted(base)
-        .command(&["init", "--quiet", "--initial-branch=main", "--separate-git-dir", &gd, &wd])
+        .command(&["init", "--quiet", &initial, "--separate-git-dir", &gd, &wd])
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|e| format!("running git: {e}"))?;
@@ -2575,8 +2579,9 @@ pub(crate) async fn workspace_changes_handler(
         let Some(dir) = work_copy_for(&st, &dir) else {
             return err(StatusCode::CONFLICT, ClientCode::Conflict, "darkmux holds no repository for this workspace");
         };
-        let Some(default) = ws::remote_default_of(&dir) else {
-            return err(StatusCode::CONFLICT, ClientCode::Conflict, "this work copy has no origin default branch to compare with");
+        let (default, base_branch) = match changes_base(&st, &dir, &name) {
+            Ok(b) => b,
+            Err(r) => return *r,
         };
         let branch = git_line(&dir, &["branch", "--show-current"]).unwrap_or_default();
         if branch.is_empty() {
@@ -2625,7 +2630,7 @@ pub(crate) async fn workspace_changes_handler(
         }
         Json(BranchChanges {
             base,
-            base_branch: default.trim_start_matches("origin/").to_string(),
+            base_branch,
             head,
             branch,
             files,
@@ -2634,6 +2639,22 @@ pub(crate) async fn workspace_changes_handler(
     })
     .await
     .unwrap_or_else(|e| internal(anyhow!("changes panicked: {e}")))
+}
+
+/// What `/changes` compares the work copy's branch with, and that base's
+/// branch name: origin's default branch; or, for a project darkmux made
+/// from a template, which has no origin (#3480), darkmux's own recorded
+/// first commit on the branch it started. Any other work copy with no
+/// origin is a 409.
+fn changes_base(state: &ClientServerState, dir: &WorkCopy, name: &str) -> Result<(String, String), Refused> {
+    if let Some(d) = crate::client_workspace::remote_default_of(dir) {
+        let branch = d.trim_start_matches("origin/").to_string();
+        return Ok((d, branch));
+    }
+    let base = (state.worktrees_base)().map_err(|e| Box::new(internal(anyhow!(e))))?;
+    crate::client_workspace::template_commit_of(&base, name)
+        .map(|first| (first, TEMPLATE_BRANCH.to_string()))
+        .ok_or_else(|| refuse(StatusCode::CONFLICT, ClientCode::Conflict, "this work copy has no origin default branch to compare with"))
 }
 
 /// `GET /client/workspaces/{name}`: branch, head and repo of one workspace.

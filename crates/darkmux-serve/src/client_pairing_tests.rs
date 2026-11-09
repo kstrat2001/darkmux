@@ -4232,6 +4232,48 @@ async fn changes_lists_the_branchs_commits_against_origins_default_branch() {
     assert_eq!(files.len(), 3);
 }
 
+/// (#3480) A project darkmux made from a template has no origin: its
+/// changes are what the branch holds since darkmux's first commit, on the
+/// `main` that commit started. A work copy with no origin that isn't one
+/// is still refused.
+#[tokio::test]
+async fn a_template_project_compares_with_its_first_commit() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = h.base.join("book");
+    fixture_repo(&wt);
+    hold(&h, "book");
+    run_git(Some(&wt), &["config", "user.name", "Owner"]);
+    run_git(Some(&wt), &["config", "user.email", "owner@example.com"]);
+    let first = run_git(Some(&wt), &["rev-parse", "HEAD"]);
+    std::fs::write(wt.join("README.md"), "a run's change\n").unwrap();
+    std::fs::write(wt.join("chapter.md"), "# One\n").unwrap();
+    run_git(Some(&wt), &["add", "-A"]);
+    run_git(Some(&wt), &["commit", "--quiet", "-m", "run"]);
+    let head = run_git(Some(&wt), &["rev-parse", "HEAD"]);
+    let auth = bearer(&token);
+    let changes = || get("/client/workspaces/book/changes", &[("authorization", &auth)]);
+
+    let (code, v) = call(&h, changes()).await;
+    assert_eq!(code, 409, "not recorded as a template project: {v}");
+
+    crate::client_workspace::record_template_commit(&h.base, "book", &first).unwrap();
+    let (code, v) = call(&h, changes()).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["base"], first.as_str());
+    assert_eq!(v["base_branch"], "main");
+    assert_eq!(v["head"], head.as_str());
+    assert_eq!(v["branch"], "main");
+    let mut paths: Vec<&str> = v["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
+    paths.sort();
+    assert_eq!(paths, ["README.md", "chapter.md"]);
+}
+
 #[tokio::test]
 async fn changes_needs_a_token_and_a_workspace_with_a_remote_default() {
     let h = harness();
