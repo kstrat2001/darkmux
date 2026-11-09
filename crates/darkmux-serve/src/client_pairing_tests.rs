@@ -83,9 +83,12 @@ fn harness() -> Harness {
         }),
         profiles_policy: Arc::new(move || pol.lock().unwrap().clone()),
         // `fast` and `deep` run on this machine; `hosted` sends work to a
-        // hosted API, so it isn't local.
+        // hosted API, so it isn't local. `utility` (LM Studio, but only the
+        // utility model) and `fast@studio` "are local" on purpose, so the
+        // listing's resolve and `@` filters are the only things that keep
+        // them out.
         profile_is_local: Arc::new(|_role, name| match name {
-            "fast" | "deep" => Ok(true),
+            "fast" | "deep" | "utility" | "fast@studio" => Ok(true),
             "hosted" => Ok(false),
             other => Err(format!("profile {other} is not in the registry")),
         }),
@@ -95,6 +98,7 @@ fn harness() -> Harness {
                 "fast".into(),
                 "hosted".into(),
                 "utility".into(),
+                "fast@studio".into(),
             ])
         }),
         machine: ClientMachine {
@@ -3177,6 +3181,34 @@ async fn a_failing_dev_server_says_why() {
             .contains("boom-from-the-server"),
         "{v}"
     );
+}
+
+/// Reading and stopping a preview need the token, like starting one: a
+/// caller without it learns nothing and stops nothing.
+#[tokio::test]
+async fn preview_status_and_stop_need_a_token() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (mine, name, _ws) = served_workspace(&h, &token).await;
+    recipe(&mine, serde_json::json!({"command": SERVE, "env": {"PORT": "{port}"}}));
+    let (code, v) = start_preview(&h, &token, &name).await;
+    assert_eq!(code, 202, "{v}");
+    let ready = preview_until(&h, &token, &name, &["ready", "failed"]).await;
+    let path = format!("/client/workspaces/{name}/preview");
+    for auth in [None, Some(bearer(&"0".repeat(64)))] {
+        let headers: Vec<(&str, &str)> = auth.iter().map(|a| ("authorization", a.as_str())).collect();
+        let (code, v) = call(&h, get(&path, &headers)).await;
+        assert_eq!(code, 401, "status: {v}");
+        assert!(v.get("port").is_none(), "{v}");
+        let mut b = Request::builder().method("DELETE").uri(&path);
+        for (k, val) in &headers {
+            b = b.header(*k, *val);
+        }
+        let (code, v) = call(&h, b.body(Body::empty()).unwrap()).await;
+        assert_eq!(code, 401, "stop: {v}");
+    }
+    assert!(answers(ready["port"].as_u64().unwrap()), "still running");
+    h.state.previews.stop(&name);
 }
 
 #[tokio::test]
