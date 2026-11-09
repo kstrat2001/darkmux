@@ -141,6 +141,23 @@ pub enum BriefRefKind {
     Unknown,
 }
 
+/// (#3461, flow 2.7.0) How a `--workdir` checkout's own `.git` directory
+/// was mounted into the dispatch container. Recorded only when the workdir's
+/// `.git` is a real directory on a read-write workspace mount: read-only by
+/// default, read-write only when the dispatch opted in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
+pub enum WorkdirGitMount {
+    /// The default: the run can change the work tree but not the repository.
+    ReadOnly,
+    /// `--workdir-git-writable` (or a step's `workdir_git_writable`): the run
+    /// can write the repository's config and hooks, which git run on the host
+    /// afterwards honors.
+    ReadWrite,
+}
+
 /// What a checkout's `.git` pointer is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -463,6 +480,14 @@ pub struct DispatchStartPayload {
     #[serde(default, deserialize_with = "super::context::lenient", skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub role: Option<DispatchRoleInputs>,
+    /// (#3461, flow 2.7.0) How the `--workdir` checkout's own `.git`
+    /// directory was mounted. Absent when the workdir has none (no
+    /// `--workdir`, a plain folder, a worktree's pointer file) or the whole
+    /// workspace is read-only, and on every record before 2.7.0 (when such a
+    /// `.git` was always read-write).
+    #[serde(default, deserialize_with = "super::context::lenient", skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub workdir_git: Option<WorkdirGitMount>,
 }
 
 impl Attribution for DispatchStartPayload {

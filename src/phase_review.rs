@@ -314,6 +314,7 @@ fn phase_review_abort_record(
 /// under the review's own `session_id`.
 fn review_dispatch_opts(prompt: String, session_id: &SessionId) -> crate::crew::dispatch::DispatchOpts {
     crate::crew::dispatch::DispatchOpts {
+        workdir_git_writable: false,
         finding_sites: None,
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,

@@ -149,6 +149,7 @@ fn container_free_single_shot_dispatch_round_trips_through_a_real_http_mock_serv
     let session = darkmux_types::session_id::SessionId::adhoc(darkmux_types::session_id::RunId::standalone("test").unwrap(), "coder", format!("mock-single-shot-proof-{}", std::process::id()));
     let session_id = session.wire();
     let opts = DispatchOpts {
+        workdir_git_writable: false,
         finding_sites: None,
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,
@@ -321,6 +322,7 @@ fn a_refused_local_single_shot_ends_in_an_error_terminal_with_its_context() {
     );
     let session_id = session.wire();
     let opts = DispatchOpts {
+        workdir_git_writable: false,
         finding_sites: None,
         allow_utility_model: false,
         remote_origin: None,
@@ -434,6 +436,7 @@ fn container_free_single_shot_dispatch_stamps_mission_id_resolved_from_phase() {
     );
     let session_id = session.wire();
     let opts = DispatchOpts {
+        workdir_git_writable: false,
         finding_sites: None,
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,
@@ -550,6 +553,7 @@ fn a_local_single_shot_promises_its_beat_exactly_when_the_first_beat_landed() {
             format!("beats-3125-local-{landed}-{}", std::process::id()),
         );
         let opts = DispatchOpts {
+            workdir_git_writable: false,
             finding_sites: None,
             allow_utility_model: false,
             remote_origin: None,

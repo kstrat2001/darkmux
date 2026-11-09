@@ -687,6 +687,7 @@ fn dispatch_opts(
     let lab_inputs = crate::providers::lab_inputs(loaded)?;
     let image = loaded.manifest.workload.image.as_deref();
     Ok(darkmux_crew::dispatch::DispatchOpts {
+        workdir_git_writable: false,
         finding_sites: None,
         // (#2914) The lab benchmarks candidate utility models.
         allow_utility_model: true,

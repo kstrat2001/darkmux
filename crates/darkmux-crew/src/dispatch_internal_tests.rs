@@ -2799,12 +2799,13 @@
         );
     }
 
-    /// (#3457) A read-write workdir whose `.git` is a real directory hands
-    /// the run that repository's config and hooks; `dispatch()` says so at
-    /// the call site, and stays quiet when the mount is read-only.
+    /// (#3457, #3461) A workdir whose `.git` is a real directory: `dispatch()`
+    /// says at the call site how that `.git` was mounted (read-only by
+    /// default; read-write, and what that hands the run, with the opt-in),
+    /// and stays quiet when the whole workspace is read-only.
     #[test]
     #[serial]
-    fn dispatch_notes_a_read_write_mount_of_a_checkouts_git_dir() {
+    fn dispatch_notes_how_a_checkouts_git_dir_was_mounted() {
         let tmp = TempDir::new().unwrap();
         let checkout = tmp.path().join("checkout");
         std::fs::create_dir(&checkout).unwrap();
@@ -2814,18 +2815,20 @@
         let prev = std::env::var("DARKMUX_HOME").ok();
         unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
 
-        let run = |read_only: bool| {
+        let run = |read_only: bool, git_writable: bool| {
             let mut opts = dispatch_preflight_probe_opts();
             opts.workdir = Some(checkout.clone());
             opts.workspace_read_only = read_only;
+            opts.workdir_git_writable = git_writable;
             capture_preflight_warnings(|| {
                 let _ = dispatch(opts);
             })
         };
         // Read-only FIRST: the note is printed once per message per process,
         // so asking second would pass whatever the read-only branch did.
-        let read_only = run(true);
-        let writable = run(false);
+        let read_only = run(true, true);
+        let default = run(false, false);
+        let writable = run(false, true);
 
         unsafe {
             match prev {
@@ -2838,19 +2841,181 @@
             .find(|m| m.contains("mounted read-write"))
             .unwrap_or_else(|| panic!("dispatch() must note the writable `.git`; got {writable:?}"));
         assert!(note.contains(&checkout.display().to_string()), "{note}");
-        assert!(!read_only.iter().any(|m| m.contains("mounted read-write")), "{read_only:?}");
+        let note = default
+            .iter()
+            .find(|m| m.contains("mounted read-only"))
+            .unwrap_or_else(|| panic!("dispatch() must note the read-only `.git`; got {default:?}"));
+        assert!(note.contains(&checkout.display().to_string()), "{note}");
+        assert!(!default.iter().any(|m| m.contains("mounted read-write")), "{default:?}");
+        assert!(!read_only.iter().any(|m| m.contains("`.git`")), "{read_only:?}");
     }
 
+    /// (#3461) Which mount a workdir's `.git` gets: read-only when it is a
+    /// real directory on a writable workspace, read-write only with the
+    /// opt-in, and none of darkmux's business otherwise (no `--workdir`, no
+    /// `.git`, a worktree's pointer file, a symlink, a read-only workspace).
     #[test]
-    fn writable_git_dir_note_only_for_a_real_git_dir_on_a_writable_mount() {
+    fn workdir_git_mount_is_read_only_for_a_real_git_dir_unless_opted_in() {
+        use darkmux_flow::payload::WorkdirGitMount as M;
         let tmp = TempDir::new().unwrap();
-        assert_eq!(writable_git_dir_note(tmp.path(), false), None, "no .git");
+        let w = Some(tmp.path());
+        assert_eq!(workdir_git_mount(None, false, false), None, "no --workdir");
+        assert_eq!(workdir_git_mount(w, false, false), None, "no .git");
         std::fs::write(tmp.path().join(".git"), "gitdir: /elsewhere\n").unwrap();
-        assert_eq!(writable_git_dir_note(tmp.path(), false), None, "a worktree's pointer file");
+        assert_eq!(workdir_git_mount(w, false, false), None, "a worktree's pointer file");
+        assert_eq!(workdir_git_mount(w, false, true), None, "a pointer file, opted in");
         std::fs::remove_file(tmp.path().join(".git")).unwrap();
         std::fs::create_dir(tmp.path().join(".git")).unwrap();
-        assert_eq!(writable_git_dir_note(tmp.path(), true), None, "read-only mount");
-        assert!(writable_git_dir_note(tmp.path(), false).is_some_and(|m| m.contains("mounted read-write")));
+        assert_eq!(workdir_git_mount(w, false, false), Some(M::ReadOnly), "the default");
+        assert_eq!(workdir_git_mount(w, false, true), Some(M::ReadWrite), "the opt-in");
+        assert_eq!(workdir_git_mount(w, true, false), None, "the whole workspace is read-only");
+        #[cfg(unix)]
+        {
+            let linked = TempDir::new().unwrap();
+            std::os::unix::fs::symlink(tmp.path().join(".git"), linked.path().join(".git")).unwrap();
+            assert_eq!(workdir_git_mount(Some(linked.path()), false, false), None, "a link is not its own .git");
+        }
+    }
+
+    /// (#3461) The coder phase's own worktrees are unaffected: a real `git
+    /// worktree add` workdir has a pointer file, so it gets no `.git` mount
+    /// and no note, exactly as before.
+    #[test]
+    fn a_coder_phase_worktree_gets_no_git_mount() {
+        // Its own git calls, with the identity as `-c`: no `GIT_AUTHOR_*`
+        // in the environment for a commit guard to refuse.
+        let tmp = TempDir::new().unwrap();
+        let (main_repo, worktree) = (tmp.path().join("main-repo"), tmp.path().join("the-worktree"));
+        std::fs::create_dir(&main_repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(&main_repo)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(&["worktree", "add", "-q", worktree.to_str().unwrap(), "-b", "wt"]);
+        assert!(std::fs::symlink_metadata(worktree.join(".git")).unwrap().is_file(), "a pointer file");
+        let mount = workdir_git_mount(Some(&worktree), false, false);
+        assert_eq!(mount, None);
+        assert_eq!(read_only_git_dir(&worktree, mount), None);
+        assert_eq!(writable_git_dir_note(&worktree, mount), None);
+    }
+
+    /// (#3461) The note says how `.git` was mounted: read-only by default,
+    /// naming the opt-in; read-write with it, saying what that hands the run.
+    #[test]
+    fn the_git_dir_note_says_how_it_was_mounted() {
+        use darkmux_flow::payload::WorkdirGitMount as M;
+        let w = Path::new("/tmp/checkout");
+        assert_eq!(writable_git_dir_note(w, None), None);
+        let ro = writable_git_dir_note(w, Some(M::ReadOnly)).unwrap();
+        assert!(ro.contains("`.git` was mounted read-only") && ro.contains("--workdir-git-writable"), "{ro}");
+        let rw = writable_git_dir_note(w, Some(M::ReadWrite)).unwrap();
+        assert!(rw.contains("`.git` was mounted read-write") && rw.contains("--workdir-git-writable"), "{rw}");
+        assert!(rw.contains("hooks"), "{rw}");
+        for note in [&ro, &rw] {
+            assert!(note.contains("nested or bare") && note.contains("subdirectory of a repository"), "{note}");
+        }
+        assert!(ro.contains("`git checkout -- <file>`"), "{ro}");
+    }
+
+    /// (#3461) A read-only `.git` is a second bind, after the workspace's,
+    /// at the same path inside it, so it shadows that part of the writable
+    /// mount; none is added without one.
+    #[test]
+    fn a_read_only_git_dir_is_mounted_over_the_workspace() {
+        use darkmux_flow::payload::WorkdirGitMount as M;
+        assert_eq!(read_only_git_dir(Path::new("/tmp/ws"), Some(M::ReadOnly)), Some(PathBuf::from("/tmp/ws/.git")));
+        assert_eq!(read_only_git_dir(Path::new("/tmp/ws"), Some(M::ReadWrite)), None);
+        assert_eq!(read_only_git_dir(Path::new("/tmp/ws"), None), None);
+        let mut config = base_argv_config();
+        config.workdir_git_read_only = Some(PathBuf::from("/tmp/ws/.git"));
+        let argv = build_docker_run_argv(&config);
+        let mounts: Vec<&String> = argv.windows(2).filter(|w| w[0] == "-v").map(|w| &w[1]).collect();
+        let ws = mounts.iter().position(|m| *m == "/tmp/ws:/workspace").expect("workspace mount");
+        let git = mounts
+            .iter()
+            .position(|m| *m == "/tmp/ws/.git:/workspace/.git:ro")
+            .unwrap_or_else(|| panic!("{argv:?}"));
+        assert!(ws < git, "the .git bind must come after the workspace's: {argv:?}");
+        let fence = argv.iter().position(|a| a == "--").unwrap();
+        assert!(argv.iter().position(|a| a == "/tmp/ws/.git:/workspace/.git:ro").unwrap() < fence);
+        let plain = build_docker_run_argv(&base_argv_config());
+        assert!(!plain.iter().any(|a| a.contains("/.git")), "{plain:?}");
+    }
+
+    /// (#3461 review F3) A failure to record the mount is said, naming the
+    /// file, not swallowed: an origin record that is not there, or not JSON.
+    #[test]
+    fn a_failed_git_mount_record_names_the_file() {
+        let none = TempDir::new().unwrap();
+        let err = record_origin_git_mount(none.path(), false).unwrap_err();
+        assert!(err.contains(&resume_origin_path(none.path()).display().to_string()), "{err}");
+        let bad = TempDir::new().unwrap();
+        std::fs::write(resume_origin_path(bad.path()), "not json").unwrap();
+        let err = record_origin_git_mount(bad.path(), true).unwrap_err();
+        assert!(err.contains(&resume_origin_path(bad.path()).display().to_string()), "{err}");
+    }
+
+    /// (#3461) `dispatch.start` names how the workdir's `.git` was mounted,
+    /// as `read_only` / `read_write` on the wire, and nothing when there was
+    /// no such directory.
+    #[test]
+    fn dispatch_start_names_the_workdir_git_mount() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        let mut opts = dispatch_preflight_probe_opts();
+        let mut payload = DispatchStartPayload::default();
+        stamp_workdir_git(&mut payload, &opts);
+        assert_eq!(payload.workdir_git, None, "no --workdir");
+        opts.workdir = Some(tmp.path().to_path_buf());
+        stamp_workdir_git(&mut payload, &opts);
+        assert_eq!(serde_json::to_value(&payload).unwrap()["workdir_git"], "read_only");
+        opts.workdir_git_writable = true;
+        stamp_workdir_git(&mut payload, &opts);
+        assert_eq!(serde_json::to_value(&payload).unwrap()["workdir_git"], "read_write");
+    }
+
+    /// (#3461) A resume hint for a run that had a writable `.git` carries the
+    /// opt-in, or the resume would mount it read-only; one that did not,
+    /// does not.
+    #[test]
+    fn the_resume_hint_carries_the_git_opt_in_when_the_origin_had_it() {
+        let ws = TempDir::new().unwrap();
+        let prior = TempDir::new().unwrap();
+        std::fs::write(prior.path().join(CHECKPOINT_FILENAME), sample_checkpoint_json()).unwrap();
+        write_resume_origin_meta(prior.path(), ws.path(), false, None, &ExecutionId::mint());
+        record_origin_git_mount(prior.path(), false).unwrap();
+        let hint = resume_hint_from_origin(prior.path(), "coder");
+        assert!(!parse_hint_args(&hint).iter().any(|a| a == "--workdir-git-writable"), "{hint}");
+        record_origin_git_mount(prior.path(), true).unwrap();
+        let hint = resume_hint_from_origin(prior.path(), "coder");
+        assert!(parse_hint_args(&hint).iter().any(|a| a == "--workdir-git-writable"), "{hint}");
+    }
+
+    /// (#3461) A resume may not grant a writable `.git` the run that wrote
+    /// the checkpoint did not have. (review F3) It fails closed: an origin
+    /// with no record of the mount reads as read-only.
+    #[test]
+    fn a_resume_never_escalates_the_git_mount() {
+        let ws = TempDir::new().unwrap();
+        let prior = TempDir::new().unwrap();
+        write_resume_origin_meta(prior.path(), ws.path(), false, None, &ExecutionId::mint());
+        check_resume_git_mount(prior.path(), false).expect("no record, read-only asked: fine");
+        let err = check_resume_git_mount(prior.path(), true).unwrap_err().to_string();
+        assert!(err.contains("RESUME GIT MOUNT ESCALATION"), "no record reads as read-only: {err}");
+        record_origin_git_mount(prior.path(), false).unwrap();
+        check_resume_git_mount(prior.path(), false).expect("read-only to read-only");
+        let err = check_resume_git_mount(prior.path(), true).unwrap_err().to_string();
+        assert!(err.contains("RESUME GIT MOUNT ESCALATION"), "{err}");
+        record_origin_git_mount(prior.path(), true).unwrap();
+        check_resume_git_mount(prior.path(), false).expect("read-write to read-only is no escalation");
+        check_resume_git_mount(prior.path(), true).expect("read-write to read-write");
     }
 
     /// The negative half of the call site: an ordinary directory workdir
@@ -3214,6 +3379,7 @@
             live_channel: true,
             brief_refs: Vec::new(),
             workspace_read_only: false,
+            workdir_git_writable: false,
             record_context: None,
             resume_from: None,
             host_out: None,
@@ -5855,6 +6021,7 @@ S(("127.0.0.1", port), H).serve_forever()
             dialect: None,
             base_url_override: None,
             workspace_read_only: false,
+            workdir_git_read_only: None,
             resume_checkpoint: false,
             container_host_access: darkmux_platform::ContainerHostAccess::Builtin,
             container_user: darkmux_platform::ContainerUser::Image,
@@ -6097,6 +6264,7 @@ S(("127.0.0.1", port), H).serve_forever()
             dialect: None,
             base_url_override: base_url,
             workspace_read_only: false,
+            workdir_git_read_only: None,
             resume_checkpoint: false,
             container_host_access: darkmux_platform::ContainerHostAccess::Builtin,
             container_user: darkmux_platform::ContainerUser::Image,
@@ -6393,6 +6561,7 @@ S(("127.0.0.1", port), H).serve_forever()
             dialect: None,
             base_url_override: None,
             workspace_read_only: false,
+            workdir_git_read_only: None,
             resume_checkpoint: false,
             container_host_access: darkmux_platform::ContainerHostAccess::Builtin,
             container_user: darkmux_platform::ContainerUser::Image,
@@ -6522,6 +6691,7 @@ S(("127.0.0.1", port), H).serve_forever()
             dialect: None,
             base_url_override: None,
             workspace_read_only: false,
+            workdir_git_read_only: None,
             resume_checkpoint: false,
             container_host_access: darkmux_platform::ContainerHostAccess::Builtin,
             container_user: darkmux_platform::ContainerUser::Image,
@@ -6585,6 +6755,7 @@ S(("127.0.0.1", port), H).serve_forever()
             dialect: None,
             base_url_override: None,
             workspace_read_only: false,
+            workdir_git_read_only: None,
             resume_checkpoint: false,
             container_host_access: darkmux_platform::ContainerHostAccess::Builtin,
             container_user: darkmux_platform::ContainerUser::Image,
@@ -8440,6 +8611,7 @@ S(("127.0.0.1", port), H).serve_forever()
             dialect: None,
             base_url_override: None,
             workspace_read_only: false,
+            workdir_git_read_only: None,
             resume_checkpoint: false,
             container_host_access: darkmux_platform::ContainerHostAccess::Builtin,
             container_user: darkmux_platform::ContainerUser::Image,
@@ -15612,6 +15784,7 @@ S(("127.0.0.1", port), H).serve_forever()
             dialect: None,
             base_url_override: None,
             workspace_read_only: false,
+            workdir_git_read_only: None,
             resume_checkpoint: false,
             container_host_access: darkmux_platform::ContainerHostAccess::Builtin,
             container_user: darkmux_platform::ContainerUser::Image,

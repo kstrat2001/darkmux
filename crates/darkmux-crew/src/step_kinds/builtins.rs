@@ -599,6 +599,9 @@ pub(crate) fn dispatch_opts_for(
     .with_context(|| format!("step `{}`: resolving the brief's records", step.id))?;
 
     let opts = DispatchOpts {
+        // (#3461) Read back like `workspace_read_only`: a step that names no
+        // key gets the read-only `.git` every dispatch gets by default.
+        workdir_git_writable: cfg.workdir_git_writable.is_some_and(|f| f.0),
         finding_sites: None,
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,

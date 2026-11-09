@@ -522,6 +522,12 @@ When deciding what to add to the internal runtime, the filter is **workflow-fit*
 
 The filter for any proposed internal-runtime feature: **does this reinforce mission-as-contract, the utility/specialist split, and frontier-as-strategic-layer, or does it blur them?** Features that reinforce land cleanly even when they're small. Features that blur produce "works technically but feels wrong" outcomes that surface as bugs months later.
 
+## A `--workdir` checkout's `.git` is read-only (#3461)
+
+A dispatch's workspace is mounted read-write, and a checkout's `.git` holds the hooks and config the operator's own git obeys afterwards, so darkmux binds a `--workdir` checkout's `.git` directory read-only over it (`apply_workdir_git_mount`). The run edits files; it cannot commit, stash, check out or restore (so it cannot undo its own edit with `git checkout -- <file>` either), nor change the repository's config or hooks. `--workdir-git-writable`, or a step's `workdir_git_writable`, is the one opt-in, for a role meant to commit in place; `dispatch.start` records which (`workdir_git`), and a resume may not escalate it (a missing record reads as read-only). The coder phase's own worktrees are unaffected: their `.git` is a pointer file, and darkmux reads their repository only through the main one.
+
+What this mount cannot cover, stated in the dispatch note as well: a repository the run creates inside the work tree (nested or bare, with config that runs a command when someone uses git in that folder, invisible to a top-level `git status`), and a `--workdir` that is a subdirectory of a repository or a worktree (its `.git` a pointer file or a symlink), which gets no read-only mount and whose pointer a run can rewrite to a git dir it planted. The advice in both cases: inspect the work tree before running git in it, or work in darkmux's own worktrees.
+
 ## Compaction: tiers, structured slots, and graceful degradation
 
 Compaction is the harness lever with the largest measured wall-clock impact (Articles 1–2), so it gets the most defensive engineering. Two strategies coexist behind one config knob (`profile.runtime.compaction.strategy`):

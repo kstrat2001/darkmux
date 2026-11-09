@@ -133,6 +133,27 @@ darkmux release.
   made from, never from the workspace a run edits. A workspace cloned from a URL gets no preview;
   add `.darkmux/preview.json` to your own checkout of the repo and make the workspace from it.
 
+### Changed
+
+- **A `--workdir` checkout's `.git` is mounted read-only by default (#3461).** When the workdir's
+  `.git` is a real directory, the work tree is still mounted read-write and `.git` is bound
+  read-only over it, so a run can edit files but cannot commit, stash, check out or rewrite the
+  repository's config and hooks, which git you run afterwards would honor. `git status`, `log` and
+  `diff` still work. **Behavior change:** a role that commits in a plain `--workdir` checkout now
+  needs `darkmux dispatch --workdir-git-writable` (a mission step: `workdir_git_writable`). No
+  built-in role or mission config does that: `coder` commits only when asked, the reviewers and
+  the crawler only read, and the coder phase works in its own worktrees, whose `.git` is a pointer
+  file and is unaffected. The preflight note says how `.git` was mounted, `dispatch.start` records
+  it (`workdir_git`: `read_only` | `read_write`, which joins `FLOW_SCHEMA_VERSION` 2.7.0, unreleased),
+  and a resume may not mount a writable `.git` its checkpoint's run did not have (a record that
+  is missing reads as read-only). Inside the run, `git checkout -- <file>` and `git restore` fail
+  too, so a coder cannot undo its own edit that way. **Not covered:** a repository the run creates
+  inside the work tree (a nested or bare one, whose config can run a command when you use git in
+  that folder, while your top-level `git status` shows nothing), and a `--workdir` that is a
+  subdirectory of a repository or a worktree (a `.git` pointer file or symlink), which gets no
+  read-only mount and whose pointer a run can rewrite. Inspect the work tree before running git in
+  it, or use darkmux's own worktrees.
+
 ### Fixed
 
 - **A paired app's `workdir` is exactly one workspace (#3451 review).** `POST /client/work` checked a

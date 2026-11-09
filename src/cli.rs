@@ -234,6 +234,19 @@ pub(crate) enum Cmd {
         /// stays read-write either way.
         #[arg(long = "workspace-read-only")]
         workspace_read_only: bool,
+        /// Mount the `--workdir` checkout's own `.git` directory READ-WRITE
+        /// (#3461). By default a checkout whose `.git` is a real directory
+        /// gets it mounted read-only over the writable work tree: the run can
+        /// edit files but cannot commit, stash, check out or change the
+        /// repository's config and hooks, which git you run afterwards would
+        /// honor. That includes `git checkout -- <file>` and `git restore`, so
+        /// a run cannot undo its own edit that way. Give this to a role meant
+        /// to commit in place. A worktree, or a subdirectory of a repository,
+        /// gets no read-only `.git` either way, and a repository the run
+        /// creates inside the work tree is not covered: inspect the tree
+        /// before running git there.
+        #[arg(long = "workdir-git-writable")]
+        workdir_git_writable: bool,
         /// Skip the pre-flight checks. Use only for debugging.
         #[arg(long, hide = true)]
         skip_preflight: bool,

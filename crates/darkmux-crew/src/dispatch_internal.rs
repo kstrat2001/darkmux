@@ -19,7 +19,7 @@ use darkmux_flow::payload::{
     BatteryPauseUnsupportedPayload, BoundRef, CheckpointVerdict, DetectorArea, DetectorKind, DetectorSeverity,
     DispatchCheckpointPayload, DispatchCompactionPayload, DispatchDegeneracyWarningPayload, DispatchEndPayload,
     DispatchFeedbackPayload, DispatchHeartbeatPayload, DispatchReasoningPayload, DispatchRestPayload, DispatchStartPayload,
-    DispatchToolPayload, DispatchTurnPayload, DispatchWorkdirGitUnavailablePayload, EjectFailure, EjectedModel, GitCheckout,
+    DispatchToolPayload, DispatchTurnPayload, DispatchWorkdirGitUnavailablePayload, EjectFailure, WorkdirGitMount, EjectedModel, GitCheckout,
     GitdirKind, HostWindow, Knob, KnobSource, KnobValue, LmsRole, MetricWindow, ResultClass, RuntimeBounds, StreamPhase,
     TelemetryCompactionPayload, TelemetryContextPayload, TelemetryDetectorPayload, TelemetryLmsPayload, TelemetryRuntimePayload,
     ThermalStopUnresolvedPayload, ThermalTier5EjectFailedPayload, ThermalTier5EjectPayload, ToolOutcome, TurnUsage, UsagePayload,
@@ -189,6 +189,15 @@ pub(crate) fn apply_volume_mounts(args: &mut Vec<String>, workspace: &Path, host
     args.push(format!("{}:/workspace{suffix}", workspace.display()));
     args.push("-v".to_string());
     args.push(format!("{}:/darkmux-out", host_out.display()));
+}
+
+/// (#3461) A `--workdir` checkout's own `.git`, read-only, bound after (so
+/// over) the read-write workspace mount at the same path inside it.
+pub(crate) fn apply_workdir_git_mount(args: &mut Vec<String>, git_dir: Option<&Path>) {
+    if let Some(git) = git_dir {
+        args.push("-v".to_string());
+        args.push(format!("{}:/workspace/.git:ro", git.display()));
+    }
 }
 
 /// One checkout whose `.git` points outside the workdir, as the
@@ -1307,13 +1316,21 @@ fn record_origin_container(host_out: &Path, container_name: &str, resume_from: O
 
 /// Set one key in `out_dir`'s host-only origin record, keeping the rest.
 fn update_origin_field(out_dir: &Path, key: &str, value: serde_json::Value) {
-    let Ok(raw) = read_resume_origin(out_dir) else { return };
-    let Ok(mut origin) = serde_json::from_str::<serde_json::Value>(&raw) else { return };
-    let Some(obj) = origin.as_object_mut() else { return };
+    let _ = set_origin_field(out_dir, key, value);
+}
+
+/// [`update_origin_field`], saying why when the field could not be written,
+/// naming the record.
+fn set_origin_field(out_dir: &Path, key: &str, value: serde_json::Value) -> Result<(), String> {
+    let path = resume_origin_path(out_dir);
+    let failed = |why: String| format!("could not record `{key}` in {}: {why}", path.display());
+    let raw = read_resume_origin(out_dir).map_err(|e| failed(e.to_string()))?;
+    let mut origin: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| failed(e.to_string()))?;
+    let obj = origin.as_object_mut().ok_or_else(|| failed("not a JSON object".into()))?;
     obj.insert(key.to_string(), value);
-    if let Ok(bytes) = serde_json::to_vec_pretty(&origin) {
-        let _ = write_private_no_follow(&resume_origin_path(out_dir), &bytes);
-    }
+    let bytes = serde_json::to_vec_pretty(&origin).map_err(|e| failed(e.to_string()))?;
+    write_private_no_follow(&path, &bytes).map_err(|e| failed(e.to_string()))
 }
 
 /// Holds one execution's exclusive lock for as long as it lives (released
@@ -1513,6 +1530,10 @@ pub(crate) fn resume_hint_from_origin(
     );
     if read_only {
         cmd.push_str(" --workspace-read-only");
+    }
+    // (#3461) A run whose `.git` was writable resumes with it writable.
+    if origin.get("workdir_git_writable").and_then(|v| v.as_bool()) == Some(true) {
+        cmd.push_str(" --workdir-git-writable");
     }
     // The held dispatch still owns the execution lock, so this command is
     // refused ("still running") until that dispatch is stopped: say so.
@@ -2431,6 +2452,10 @@ pub struct DockerRunConfig {
     /// preserves the existing read-write mount for every caller that
     /// doesn't set it.
     pub workspace_read_only: bool,
+    /// (#3461) The host `.git` directory to bind read-only at
+    /// `/workspace/.git`, over the read-write workspace mount; `None` mounts
+    /// none ([`read_only_git_dir`]).
+    pub workdir_git_read_only: Option<PathBuf>,
     /// (#2114 finding 3) When true, pass `--resume
     /// <RESUME_CHECKPOINT_CONTAINER_PATH>` to the runtime — this dispatch
     /// reloads a `checkpoint.json` (written by a prior, interrupted
@@ -2562,6 +2587,7 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
 
     // Workspace + out-dir volume mounts
     apply_volume_mounts(&mut args, &config.workspace, &config.host_out, config.workspace_read_only);
+    apply_workdir_git_mount(&mut args, config.workdir_git_read_only.as_deref());
 
     // (#2295) Each briefed mod's attachments, read-only — the files the mod
     // block in the brief tells the model to read.
@@ -6717,41 +6743,134 @@ fn warn_split_gitdirs(opts: &DispatchOpts) -> Vec<darkmux_types::workdir::SplitG
     workdir_split_gitdirs
 }
 
-/// (#3457) PREFLIGHT: is the workdir a checkout whose `.git` is a real
-/// directory, mounted read-write? Then the run can write that repository's
-/// config and hooks. darkmux's own later git calls there go through
-/// `darkmux_types::host_git` (the settings that run a command are switched
-/// off), but a clean or smudge filter the repo's own config names still runs
-/// under any git that reads the work tree, and git the operator runs by hand
-/// reads all of it. darkmux cannot fix that side, so it says so.
-///
-/// Deliberately a note, not a refusal and not a read-only `.git` mount: a
-/// plain `dispatch --workdir <checkout>` is ordinary work, and a role may be
-/// asked to commit there. A worktree workdir (the coder phase's shape) has a
-/// pointer file, not a directory, and is not noted: its git dir is outside
-/// the mount, and darkmux reads it only through the main repository.
+/// (#3457, #3461) PREFLIGHT: is the workdir a checkout whose `.git` is a
+/// real directory? Then say how it was mounted. By default (#3461) it is
+/// bound read-only over the writable work tree, so the run can edit files
+/// but not the repository; the note names the opt-in for a role meant to
+/// commit in place. With `--workdir-git-writable` it is read-write, and the
+/// run can write that repository's config and hooks: darkmux's own later
+/// git calls there go through `darkmux_types::host_git` (the settings that
+/// run a command are switched off), but a clean or smudge filter the repo's
+/// own config names still runs under any git that reads the work tree, and
+/// git the operator runs by hand reads all of it, so the note says so. A
+/// worktree workdir (the coder phase's shape) has a pointer file, not a
+/// directory, and is not noted: its git dir is outside the mount, and
+/// darkmux reads it only through the main repository.
 fn warn_writable_git_dir(opts: &DispatchOpts) {
     let Some(workdir) = opts.workdir.as_deref() else { return };
-    if let Some(msg) = writable_git_dir_note(workdir, opts.workspace_read_only) {
+    let mount = workdir_git_mount(Some(workdir), opts.workspace_read_only, opts.workdir_git_writable);
+    if let Some(msg) = writable_git_dir_note(workdir, mount) {
         emit_preflight_warning_once(&msg);
     }
 }
 
-/// The [`warn_writable_git_dir`] note, or `None` when there is nothing to
-/// say (a read-only mount, or no `.git` directory at the workdir).
-pub(crate) fn writable_git_dir_note(workdir: &Path, read_only: bool) -> Option<String> {
-    if read_only || !std::fs::symlink_metadata(workdir.join(".git")).is_ok_and(|m| m.is_dir()) {
+/// (#3461) How a `--workdir` checkout's own `.git` directory is mounted:
+/// read-only by default, read-write only when the dispatch opted in
+/// (`--workdir-git-writable`, a step's `workdir_git_writable`). `None` when
+/// there is no such directory to decide about: no `--workdir`, no `.git`, a
+/// worktree's or submodule's pointer file (its git dir is outside the mount;
+/// the coder phase's shape), a `.git` that is a symlink, or a workspace
+/// mounted read-only as a whole.
+pub(crate) fn workdir_git_mount(
+    workdir: Option<&Path>,
+    workspace_read_only: bool,
+    git_writable: bool,
+) -> Option<WorkdirGitMount> {
+    let git = workdir?.join(".git");
+    let is_own_dir = std::fs::symlink_metadata(git).is_ok_and(|m| m.is_dir());
+    if workspace_read_only || !is_own_dir {
         return None;
     }
-    Some(format!(
-        "darkmux dispatch: note: workdir {} is a git checkout mounted read-write, so this run can \
-         change its `.git` (config, hooks). darkmux's own git calls there afterwards switch off the \
-         settings that run a command, but a filter the repo's config names still runs, and git you \
-         run yourself reads all of it: check `git config --local --list` and `.git/hooks` after the \
-         run, or dispatch into a worktree or a copy instead.",
-        workdir.display()
-    ))
+    Some(if git_writable {
+        WorkdirGitMount::ReadWrite
+    } else {
+        WorkdirGitMount::ReadOnly
+    })
 }
+
+/// (#3461) The host `.git` directory to bind read-only over the workspace
+/// mount, for a [`WorkdirGitMount::ReadOnly`] workdir.
+pub(crate) fn read_only_git_dir(
+    workspace: &Path,
+    mount: Option<WorkdirGitMount>,
+) -> Option<PathBuf> {
+    (mount == Some(WorkdirGitMount::ReadOnly)).then(|| workspace.join(".git"))
+}
+
+/// (#3461) `dispatch.start`'s `workdir_git`: how the `--workdir`
+/// checkout's own `.git` was mounted, the opt-in named by `read_write`.
+pub(crate) fn stamp_workdir_git(payload: &mut DispatchStartPayload, opts: &DispatchOpts) {
+    payload.workdir_git =
+        workdir_git_mount(opts.workdir.as_deref(), opts.workspace_read_only, opts.workdir_git_writable);
+}
+
+/// (#3461) Record in this dispatch's host-only resume-origin record whether
+/// its `.git` was writable, so a resume can refuse to escalate it.
+pub(crate) fn record_origin_git_mount(host_out: &Path, git_writable: bool) -> Result<(), String> {
+    set_origin_field(host_out, "workdir_git_writable", serde_json::Value::Bool(git_writable))
+}
+
+/// (#3461) A resume may not mount a writable `.git` when the run that wrote
+/// the checkpoint had a read-only one. (review F3) It fails closed: an origin
+/// with no record of the mount (one from before #3461, or whose record could
+/// not be written) reads as read-only, so resuming it read-write needs a
+/// fresh dispatch instead.
+pub(crate) fn check_resume_git_mount(resume_from: &Path, git_writable: bool) -> Result<()> {
+    let origin: Option<serde_json::Value> =
+        read_resume_origin(resume_from).ok().and_then(|text| serde_json::from_str(&text).ok());
+    let origin_writable = origin
+        .as_ref()
+        .and_then(|o| o.get("workdir_git_writable"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if git_writable && !origin_writable {
+        bail_resume!(
+            "darkmux dispatch: RESUME GIT MOUNT ESCALATION — the checkpoint at {} was written \
+             with the workdir's `.git` mounted READ-ONLY, but this dispatch asks for \
+             `--workdir-git-writable`; refusing to grant a resumed dispatch write access to the \
+             repository the run that wrote the checkpoint never had",
+            resume_from.display()
+        );
+    }
+    Ok(())
+}
+
+/// The [`warn_writable_git_dir`] note, or `None` when there is nothing to
+/// say (a read-only mount, or no `.git` directory at the workdir).
+pub(crate) fn writable_git_dir_note(
+    workdir: &Path,
+    mount: Option<WorkdirGitMount>,
+) -> Option<String> {
+    match mount? {
+        WorkdirGitMount::ReadOnly => Some(format!(
+            "darkmux dispatch: note: workdir {} is a git checkout; its `.git` was mounted read-only, \
+             so this run can change the work tree but not the repository: a git commit, stash, \
+             checkout or restore inside it fails (so does `git checkout -- <file>` to undo an \
+             edit). To let a role commit in place, dispatch with `--workdir-git-writable` (a \
+             mission step: `workdir_git_writable`). {GIT_MOUNT_LIMITS}",
+            workdir.display()
+        )),
+        WorkdirGitMount::ReadWrite => Some(format!(
+            "darkmux dispatch: note: workdir {} is a git checkout; its `.git` was mounted read-write \
+             (`--workdir-git-writable`), so this run can change the repository's config and hooks. \
+             darkmux's own git calls there afterwards switch off the settings that run a command, \
+             but a filter the repo's config names still runs, and git you run yourself reads all \
+             of it: check `git config --local --list` and `.git/hooks` after the run, or dispatch \
+             into a worktree or a copy instead. {GIT_MOUNT_LIMITS}",
+            workdir.display()
+        )),
+    }
+}
+
+/// (#3461 review) What a read-only `.git` mount cannot cover, said in both
+/// notes: a repository the run creates inside the work tree, and a workdir
+/// whose repository's git dir is not its own `.git` directory.
+const GIT_MOUNT_LIMITS: &str = "Not covered either way: a repository the run creates inside the \
+     work tree (a nested or bare one, whose config can run a command when you use git in that \
+     folder, while your top-level `git status` shows nothing), and a workdir that is a \
+     subdirectory of a repository or a worktree (a `.git` pointer file or symlink), which gets no \
+     read-only mount and whose pointer a run can rewrite. Inspect the work tree before running git \
+     in it, or dispatch into darkmux's own worktrees.";
 
 /// The image a container dispatch runs, checked before any role-load,
 /// model-probe or workspace work.
@@ -6994,6 +7113,9 @@ fn plan_workspace(opts: &DispatchOpts, unix_micros: u128) -> Result<WorkspacePla
                 &intended_workspace,
                 opts.workspace_read_only,
             )
+            .and_then(|contents| {
+                check_resume_git_mount(resume_from, opts.workdir_git_writable).map(|()| contents)
+            })
             .context("darkmux dispatch --resume-from")?,
         ),
         None => None,
@@ -7242,6 +7364,12 @@ fn prepare_host_out(
         (workspace, opts.workspace_read_only, image_arg),
         execution,
     )?;
+    // (#3461) And whether its `.git` was writable, so a resume of it can
+    // neither escalate that nor forget the opt-in. A failure is said: a
+    // resume then reads the mount as read-only (it fails closed).
+    if let Err(e) = record_origin_git_mount(&host_out, opts.workdir_git_writable) {
+        eprintln!("darkmux dispatch: ⚠ {e}");
+    }
 
     // (#2114 follow-up / #2162) `--resume-from <dir>` trigger: the checkpoint
     // was already validated — see the `validate_resume_checkpoint` call
@@ -7556,6 +7684,8 @@ fn container_dispatch_start_payload(
         &opts.brief_refs,
         &run.provenance,
     )?;
+    let mut dispatch_start_payload = dispatch_start_payload;
+    stamp_workdir_git(&mut dispatch_start_payload, opts);
     Ok(container_start_payload(
         dispatch_start_payload,
         run.unmanaged_endpoint_raw_label.as_deref(),
@@ -8036,6 +8166,14 @@ fn container_run_config(
         compactor_needs_auth,
         base_url_override: container_lmstudio_base_url(opts.model_base_url_override.as_deref()),
         workspace_read_only: opts.workspace_read_only,
+        workdir_git_read_only: read_only_git_dir(
+            &run.workspace,
+            workdir_git_mount(
+                opts.workdir.as_deref(),
+                opts.workspace_read_only,
+                opts.workdir_git_writable,
+            ),
+        ),
     })
 }
 

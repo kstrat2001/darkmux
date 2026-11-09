@@ -1458,6 +1458,7 @@ fn dispatch_task(
     // (#3363) The role `lab run` read from the eval before the run.
     let lab_inputs = crate::providers::lab_inputs(loaded)?;
     let opts = DispatchOpts {
+        workdir_git_writable: false,
         finding_sites: None,
         // (#2914) The lab benchmarks candidate utility models.
         allow_utility_model: true,

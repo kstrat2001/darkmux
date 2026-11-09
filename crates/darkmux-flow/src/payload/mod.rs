@@ -46,7 +46,7 @@ pub use dispatch::{
     DispatchDegeneracyWarningPayload, DispatchEndPayload, DispatchFeedbackPayload, DispatchHeartbeatPayload,
     DispatchReasoningPayload, DispatchRestPayload, DispatchRoleInputs, DispatchRoutePayload, DispatchStartPayload,
     DispatchToolPayload, PromptAdditions, RoleInputSource,
-    DispatchModelPayload, DispatchTurnPayload, DispatchWorkdirGitUnavailablePayload, GitCheckout, GitdirKind, HostWindow, Knob, KnobSource, KnobValue,
+    DispatchModelPayload, DispatchTurnPayload, DispatchWorkdirGitUnavailablePayload, GitCheckout, GitdirKind, WorkdirGitMount, HostWindow, Knob, KnobSource, KnobValue,
     LiveSummary, ResultClass, RouteDecision, RuntimeBounds, StreamPhase, ToolOutcome, TurnUsage,
 };
 pub use lifecycle::{

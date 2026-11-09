@@ -2009,6 +2009,7 @@ fn answerer_opts(
     system_prompt_override: Option<String>,
 ) -> crate::crew::dispatch::DispatchOpts {
     crate::crew::dispatch::DispatchOpts {
+        workdir_git_writable: false,
         finding_sites: None,
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,

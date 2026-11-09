@@ -334,6 +334,7 @@ mod tests {
 
     fn test_opts(role: &str) -> DispatchOpts {
         DispatchOpts {
+            workdir_git_writable: false,
             finding_sites: None,
             // (#2914) Work never runs on the utility model.
             allow_utility_model: false,
