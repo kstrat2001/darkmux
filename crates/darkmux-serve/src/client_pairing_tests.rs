@@ -5123,10 +5123,11 @@ async fn a_failed_work_item_carries_its_dispatch_code() {
     assert_eq!((v["status"].as_str(), v["code"].as_str()), (Some("error"), Some("busy")), "{v}");
 }
 
-/// (#3468) A template project's preview is refused with its own code (until
-/// #3460), told apart from a cloned workspace's.
+/// (#3468) A template project previews from its first commit's recipe
+/// (#3460); when that commit has none, the refusal is `template_no_recipe`,
+/// told apart from a checkout with none (`no_recipe`).
 #[tokio::test]
-async fn a_template_projects_preview_is_template_no_recipe() {
+async fn a_template_whose_first_commit_has_no_recipe_is_template_no_recipe() {
     let h = harness();
     let token = paired(&h).await;
     let (code, v) = call(

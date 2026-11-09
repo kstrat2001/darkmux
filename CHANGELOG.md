@@ -17,8 +17,8 @@ darkmux release.
 ### Added
 
 - **Every client API refusal and failed run carries a code (#3468).** `darkmux client serve`'s refusal
-  bodies gain `code` beside `error` (`preview_disabled`, `no_source_checkout`, `template_no_recipe`,
-  `no_recipe`, `recipe_invalid`, `filter_in_repo_config`, `clone_failed`, and a class code for every
+  bodies gain `code` beside `error` (`preview_disabled`, `no_source_checkout`, `template_no_recipe` (a template project whose
+  first commit has no recipe), `no_recipe`, `recipe_invalid`, `filter_in_repo_config`, `clone_failed`, and a class code for every
   other refusal), a failed work item's status gains `code` (read from its run's `dispatch.error`:
   `busy`, `wont_fit`, `model_start_failed`, `model_stop_failed`, `port_in_use`, `engine_unavailable`,
   `engine_in_use`, else `dispatch_failed`), and a workspace's `fetch_error` gains `fetch_error_code`

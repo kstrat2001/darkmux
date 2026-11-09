@@ -1751,7 +1751,7 @@ fn workspace_of_workdir(state: &ClientServerState, w: &str) -> Result<String, Re
 fn read_recipe(source: &crate::client_preview::RecipeSource) -> Response {
     match source.load() {
         Ok(recipe) => Json(RecipeReply { recipe }).into_response(),
-        Err(e) => recipe_refusal(&no_recipe_in(source, e)),
+        Err(e) => recipe_refusal(source, &no_recipe_in(source, e)),
     }
 }
 
@@ -1958,9 +1958,6 @@ fn template_workspace(
     };
     if let Err(r) = place_clone(state, url, normalized, git_ref, &base, &name) {
         return *r;
-    }
-    if let Err(e) = crate::client_workspace::record_template(&base, &name) {
-        return internal(anyhow!(e));
     }
     let dir = base.join(&name);
     let from = match git_ref {
@@ -2252,11 +2249,17 @@ fn free_worktree_name(base: &Path, source: &Path, bot: &str) -> Option<String> {
         .find(|n| ws::valid_name(n) && std::fs::symlink_metadata(base.join(n)).is_err())
 }
 
-/// The status a recipe refusal answers with.
-fn recipe_refusal(r: &crate::client_preview::RecipeRefusal) -> Response {
-    use crate::client_preview::RecipeRefusal as R;
+/// The status and code a recipe refusal answers with. A recipe the trusted
+/// `source` lacks is `template_no_recipe` when that is a template project's
+/// first commit (#3460), `no_recipe` when it is the user's checkout.
+fn recipe_refusal(source: &crate::client_preview::RecipeSource, r: &crate::client_preview::RecipeRefusal) -> Response {
+    use crate::client_preview::{RecipeRefusal as R, RecipeSource};
+    let missing = match source {
+        RecipeSource::TemplateCommit { .. } => ClientCode::TemplateNoRecipe,
+        RecipeSource::Checkout(_) => ClientCode::NoRecipe,
+    };
     let (status, code) = match r {
-        R::NotFound(_) => (StatusCode::NOT_FOUND, ClientCode::NoRecipe),
+        R::NotFound(_) => (StatusCode::NOT_FOUND, missing),
         R::Symlink(_) => (StatusCode::FORBIDDEN, ClientCode::RecipeInvalid),
         R::TooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, ClientCode::RecipeInvalid),
         R::Invalid(_) => (StatusCode::UNPROCESSABLE_ENTITY, ClientCode::RecipeInvalid),
@@ -2279,6 +2282,7 @@ fn workspace_and_recipe_source(
         let held = crate::client_git::work_copy_of(&base, name, &dir).ok_or_else(|| {
             refuse(
                 StatusCode::NOT_FOUND,
+                ClientCode::NotFound,
                 format!(
                     "darkmux holds no repository for template project {name}, so it has no preview"
                 ),
@@ -2373,7 +2377,7 @@ fn start_preview(state: &ClientServerState, name: &str) -> Response {
     match state.previews.start(name, &dir, &source) {
         Ok((v, true)) => Json(v).into_response(),
         Ok((v, false)) => (StatusCode::ACCEPTED, Json(v)).into_response(),
-        Err(e) => recipe_refusal(&no_recipe_in(&source, e)),
+        Err(e) => recipe_refusal(&source, &no_recipe_in(&source, e)),
     }
 }
 

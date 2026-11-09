@@ -44,8 +44,8 @@ pub enum ClientCode {
     /// The workspace was cloned, or is no longer a worktree of the user's
     /// checkout: no checkout of theirs to read a recipe from (404).
     NoSourceCheckout,
-    /// The workspace was made from a template, which has no preview yet
-    /// (404, until #3460).
+    /// A template project whose first commit, the recipe a preview of it
+    /// trusts (#3460), has no `.darkmux/preview.json` (404).
     TemplateNoRecipe,
     /// No `.darkmux/preview.json` in the user's checkout (404).
     NoRecipe,

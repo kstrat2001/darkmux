@@ -620,32 +620,6 @@ pub fn forget_source(base: &Path, name: &str) {
     let _ = std::fs::remove_file(template_record(base, name));
 }
 
-/// (#3468) Where darkmux records that workspace `name` was made from a
-/// template: beside it under the base, like its source record.
-fn template_record(base: &Path, name: &str) -> PathBuf {
-    base.join(format!(".{name}.template"))
-}
-
-/// (#3468) Record that workspace `name` is a project made from a template
-/// (a template has no preview yet, #3460, and an app says so apart from a
-/// clone's).
-pub fn record_template(base: &Path, name: &str) -> Result<(), String> {
-    let path = template_record(base, name);
-    let _ = std::fs::remove_file(&path);
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .map(|_| ())
-        .map_err(|e| format!("recording that {name} is a template project: {e}"))
-}
-
-/// Whether workspace `name` was recorded as a template project (a record
-/// that is a link is no record).
-fn is_template(base: &Path, name: &str) -> bool {
-    std::fs::symlink_metadata(template_record(base, name)).is_ok_and(|m| m.is_file())
-}
-
 /// (#3460) Where darkmux records the first commit of a project it made from
 /// a template: beside the workspace, like [`source_record`], outside
 /// anything a run can write.
@@ -709,15 +683,6 @@ pub fn own_checkout_of(base: &Path, name: &str, dir: &Path) -> Result<PathBuf, C
     let held = crate::client_git::work_copy_of(base, name, dir);
     let repo = held.as_ref().and_then(origin_of).unwrap_or_else(|| "this repo".to_string());
     let gone = |message: String| Coded::new(ClientCode::NoSourceCheckout, message);
-    if recorded_source(base, name).is_none() && is_template(base, name) {
-        return Err(Coded::new(
-            ClientCode::TemplateNoRecipe,
-            format!(
-                "workspace {name} is a new project made from a template, and a template project has no preview yet: \
-                 a preview runs only from .darkmux/preview.json in your own checkout of a repo"
-            ),
-        ));
-    }
     let Some(source) = recorded_source(base, name) else {
         return Err(gone(format!(
             "workspace {name} was not made from a checkout of yours (it was cloned), so it has no \
