@@ -254,11 +254,7 @@ pub fn lab_test_image(workload_image: Option<&str>) -> anyhow::Result<String> {
 /// the platform's), so files the tests write into a bind-mounted tree belong
 /// to whoever owns the tree.
 pub fn lab_test_user() -> anyhow::Result<Option<String>> {
-    let user = crate::dispatch_internal::resolve_container_user(
-        darkmux_types::config_access::container_user_override().as_deref(),
-        darkmux_platform::current(),
-    )?;
-    Ok(user.docker_user())
+    crate::dispatch_internal::runtime_container_user()
 }
 
 #[cfg(test)]

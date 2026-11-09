@@ -122,6 +122,55 @@ fn the_reap_rule_table() {
     }
 }
 
+/// (#3456) A client preview container is judged by the same rule under its
+/// own name prefix, and each reaper touches only its own kind: the
+/// dispatch reaper never removes a preview, nor the preview reaper a
+/// dispatch.
+#[test]
+fn each_prefix_reaps_only_its_own_containers() {
+    let listed = [
+        labeled("darkmux-dispatch-dead", 200, 1000, MACHINE),
+        labeled("darkmux-preview-site-4100", 200, 1000, MACHINE),
+        labeled("darkmux-preview-alive-4200", 100, 1000, MACHINE),
+    ];
+    let names = |prefix| {
+        orphaned_containers_named(&listed, prefix, Some(&local()), liveness)
+            .into_iter()
+            .map(|o| o.name)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(DISPATCH_CONTAINER_PREFIX), ["darkmux-dispatch-dead"]);
+    assert_eq!(
+        names(PREVIEW_CONTAINER_PREFIX),
+        ["darkmux-preview-site-4100"]
+    );
+    assert_eq!(
+        orphaned_dispatch_containers(&listed, Some(&local()), liveness).len(),
+        1,
+        "the dispatch reaper's rule is unchanged"
+    );
+    let args = docker_ps_args_named(PREVIEW_CONTAINER_PREFIX);
+    assert_eq!(args[..3], ["ps", "--filter", "name=^darkmux-preview-"]);
+}
+
+/// (#3456) The host labels as `key=value`, the form a container spec
+/// carries them in.
+#[test]
+fn host_labels_are_the_label_args_values() {
+    let host = HostIdentity {
+        pid: 7,
+        start: 70,
+        machine: "M".into(),
+        pid_ns: "N".into(),
+    };
+    let values: Vec<String> = host_label_args(&host)
+        .into_iter()
+        .skip(1)
+        .step_by(2)
+        .collect();
+    assert_eq!(host_labels(&host), values);
+}
+
 /// The reaper cannot read its own machine or namespace: nothing is reaped.
 #[test]
 fn an_unknown_machine_identity_reaps_nothing() {

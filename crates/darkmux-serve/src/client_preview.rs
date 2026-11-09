@@ -1,17 +1,41 @@
 //! Live previews for paired apps: darkmux runs a workspace's dev server from
-//! a `.darkmux/preview.json` recipe and tells the app its URL.
+//! a `.darkmux/preview.json` recipe, in a container, and tells the app its
+//! URL.
 //!
-//! **Off by default.** Even with the recipe read only from the user's own
-//! checkout, a preview runs the WORKSPACE's code: its `package.json`
-//! scripts, its dev server and whatever they load, which a model may have
-//! written. That code runs on this machine as the user, outside the
-//! dispatch sandbox. So a paired app can start a preview only when this
-//! machine says so (`darkmux config set clients.preview.enabled true`). A
-//! preview in its own sandboxed container is planned as separate work.
-//! Known gap: a file a running preview writes in the workspace while a run
-//! is working there (a build output, a cache the repo does not ignore) is
-//! indistinguishable from the run's own change and can be committed as the
-//! run's.
+//! **In a container (#3456).** A preview runs the WORKSPACE's code: its
+//! `package.json` scripts, its dev server and whatever they load, which a
+//! model may have written. So each running preview gets one long-lived
+//! container of its own, separate from dispatch containers, from the darkmux
+//! runtime image resolved the way a dispatch resolves it (it has node and
+//! python). The workspace is its only mount (read-write, at
+//! [`WORKSPACE_AT`]), so a recipe cannot read a host path outside it. Only
+//! the preview's app port and HMR port are published, each on 127.0.0.1 at
+//! the same number inside; reaching a preview from a phone stays `tailscale
+//! serve`, never Funnel. Its environment is exactly the recipe's `env`, the
+//! port variables and [`POLLING_ENV`], so nothing `client serve` was started
+//! with (an exported API key) reaches the workspace's code. It has the
+//! dispatch container's hardening and the default network (an install step
+//! fetches packages). It stays up across the dispatches that edit the
+//! workspace, so edits hot-reload into it; a stop, the idle check (#3459)
+//! and `client serve`'s shutdown remove it, and one a `client serve` that
+//! died left behind is removed when the next one starts (it carries its
+//! host's labels, like a dispatch container). No preview process runs on the
+//! host.
+//!
+//! The workspace holds the persistent state (code, `node_modules`, caches);
+//! the container is disposable. `node_modules` installed in the container
+//! holds Linux binaries, which is fine: the workspace is darkmux's worktree,
+//! not the user's checkout. A dev server must listen on `0.0.0.0` inside the
+//! container (the published port is still loopback-only on the host), and
+//! file watching crosses the bind mount by polling: Chokidar and Watchpack
+//! read [`POLLING_ENV`]; a Vite project sets `server.watch.usePolling: true`
+//! in its own config.
+//!
+//! Previews are still **off by default** (`darkmux config set
+//! clients.preview.enabled true`). Known gap: a file a running preview
+//! writes in the workspace while a run is working there (a build output, a
+//! cache the repo does not ignore) is indistinguishable from the run's own
+//! change and can be committed as the run's.
 //!
 //! **Trust.** The recipe is a command darkmux runs, so it is read ONLY from
 //! the user's own checkout: the `source_path` checkout the workspace's
@@ -24,13 +48,13 @@
 //! `.darkmux/preview.json` to your own checkout of the repo.
 //!
 //! Recipe shape (contract 7 and 5: an unknown key is refused naming it, and
-//! `schema_version` is required):
+//! `schema_version` is required; each `env` key is a variable name):
 //!
 //! ```json
 //! {
 //!   "schema_version": "1.0",
 //!   "command": "npm run dev",
-//!   "env": {"PORT": "{port}", "HOST": "127.0.0.1", "VITE_HMR_PORT": "{hmrPort}"},
+//!   "env": {"PORT": "{port}", "HOST": "0.0.0.0", "VITE_HMR_PORT": "{hmrPort}"},
 //!   "ready": {"http": "/"},
 //!   "install": {"command": "npm ci", "unless_exists": "node_modules"},
 //!   "env_from_source": [".env"]
@@ -38,15 +62,11 @@
 //! ```
 //!
 //! Each preview gets its own free app port and HMR port, substituted into
-//! `env` (`{port}`, `{hmrPort}`), so two previews never collide. The command
-//! runs in the workspace. `install` runs first when its `unless_exists` path
-//! is missing there. `env_from_source` copies untracked files (like `.env`)
-//! from that same checkout into the workspace, never overwriting. The dev
-//! server runs in its own process group with a watchdog: it stops when
-//! darkmux stops, when it is stopped, or when it exits on its own. It and
-//! its install step get a stripped environment ([`PREVIEW_ENV_KEPT`] plus
-//! the recipe's `env` and the ports), so nothing else `client serve` was
-//! started with (an exported API key) reaches the workspace's code.
+//! `env` (`{port}`, `{hmrPort}`), so two previews never collide. `install`
+//! runs first, in the container, when its `unless_exists` path is missing in
+//! the workspace. `env_from_source` copies untracked files (like `.env`) from
+//! that same checkout into the workspace, never overwriting and never
+//! through a symlink.
 
 use crate::client_wire::PreviewState;
 use darkmux_types::data_version::PREVIEW_RECIPE_SCHEMA_VERSION;
@@ -142,11 +162,13 @@ fn exists_unlinked(p: &Path, checkout: &Path) -> Result<(), RecipeRefusal> {
             p.display()
         ))),
         Ok(_) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(RecipeRefusal::NotFound(format!(
-            "no {RECIPE_PATH} in {}",
-            checkout.display()
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(RecipeRefusal::NotFound(
+            format!("no {RECIPE_PATH} in {}", checkout.display()),
+        )),
+        Err(e) => Err(RecipeRefusal::Unreadable(format!(
+            "reading {}: {e}",
+            p.display()
         ))),
-        Err(e) => Err(RecipeRefusal::Unreadable(format!("reading {}: {e}", p.display()))),
     }
 }
 
@@ -178,7 +200,11 @@ fn check_version(doc: &serde_json::Value) -> Result<(), RecipeRefusal> {
     if let Some(v) = darkmux_types::data_version::newer(doc, PREVIEW_RECIPE_SCHEMA_VERSION) {
         return Err(RecipeRefusal::Invalid(format!(
             "{RECIPE_PATH}: {}",
-            darkmux_types::data_version::newer_refusal("preview recipe", &v, PREVIEW_RECIPE_SCHEMA_VERSION)
+            darkmux_types::data_version::newer_refusal(
+                "preview recipe",
+                &v,
+                PREVIEW_RECIPE_SCHEMA_VERSION
+            )
         )));
     }
     match doc.get("schema_version").and_then(serde_json::Value::as_str) {
@@ -192,7 +218,10 @@ fn check_version(doc: &serde_json::Value) -> Result<(), RecipeRefusal> {
 
 /// Paths the recipe names inside the work copy: plain relative ones only.
 fn check_recipe_paths(recipe: &Recipe) -> Result<(), RecipeRefusal> {
-    let unless = recipe.install.as_ref().and_then(|i| i.unless_exists.as_ref());
+    let unless = recipe
+        .install
+        .as_ref()
+        .and_then(|i| i.unless_exists.as_ref());
     let named = recipe
         .env_from_source
         .iter()
@@ -200,7 +229,9 @@ fn check_recipe_paths(recipe: &Recipe) -> Result<(), RecipeRefusal> {
         .chain(unless.map(|u| ("install.unless_exists", u)));
     for (key, p) in named {
         if !plain_relative(p) {
-            return Err(RecipeRefusal::Invalid(format!("{key}: {p:?} must be a plain relative path")));
+            return Err(RecipeRefusal::Invalid(format!(
+                "{key}: {p:?} must be a plain relative path"
+            )));
         }
     }
     Ok(())
@@ -214,18 +245,46 @@ pub fn parse_recipe(text: &str) -> Result<Recipe, RecipeRefusal> {
     let doc: serde_json::Value = serde_json::from_str(text)
         .map_err(|e| RecipeRefusal::Invalid(format!("{RECIPE_PATH} is not JSON: {e}")))?;
     if !doc.is_object() {
-        return Err(RecipeRefusal::Invalid(format!("{RECIPE_PATH} is not a JSON object")));
+        return Err(RecipeRefusal::Invalid(format!(
+            "{RECIPE_PATH} is not a JSON object"
+        )));
     }
     check_version(&doc)?;
-    let issues = darkmux_types::user_files::key_issues::<Recipe>(&doc, &darkmux_types::user_files::no_retired);
+    let issues = darkmux_types::user_files::key_issues::<Recipe>(
+        &doc,
+        &darkmux_types::user_files::no_retired,
+    );
     if !issues.is_empty() {
         let lines: Vec<String> = issues.iter().map(ToString::to_string).collect();
-        return Err(RecipeRefusal::Invalid(format!("{RECIPE_PATH}: {}", lines.join("; "))));
+        return Err(RecipeRefusal::Invalid(format!(
+            "{RECIPE_PATH}: {}",
+            lines.join("; ")
+        )));
     }
-    let recipe: Recipe =
-        serde_json::from_value(doc).map_err(|e| RecipeRefusal::Invalid(format!("{RECIPE_PATH}: {e}")))?;
+    let recipe: Recipe = serde_json::from_value(doc)
+        .map_err(|e| RecipeRefusal::Invalid(format!("{RECIPE_PATH}: {e}")))?;
     check_recipe_paths(&recipe)?;
+    check_env_names(&recipe)?;
     Ok(recipe)
+}
+
+/// (#3456) Each `env` key is a plain variable name (`[A-Za-z_][A-Za-z0-9_]*`):
+/// it reaches the preview container as `-e KEY=value`.
+fn check_env_names(recipe: &Recipe) -> Result<(), RecipeRefusal> {
+    let is_name = |k: &str| {
+        k.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    let mut keys: Vec<&String> = recipe.env.keys().collect();
+    keys.sort();
+    match keys.into_iter().find(|k| !is_name(k)) {
+        Some(bad) => Err(RecipeRefusal::Invalid(format!(
+            "{RECIPE_PATH}: env: {bad:?} is not a variable name (letters, digits and `_`, not starting with a digit)"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// The recipe in the user's own `checkout`, read and checked.
@@ -262,7 +321,9 @@ struct Entry {
     port: u16,
     hmr_port: u16,
     status: Status,
-    pgid: Option<i32>,
+    /// The preview's container, once its `docker run` has started; taken
+    /// by whoever stops it.
+    container: Option<String>,
     log: PathBuf,
     /// When an app last asked about it (a start or a status), in the
     /// [`Previews`] clock's seconds.
@@ -276,8 +337,7 @@ pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 /// All previews this darkmux runs, by workspace name.
 pub struct Previews {
     dir: PathBuf,
-    /// The process whose exit stops every preview (darkmux itself).
-    watch_pid: u32,
+    containers: Arc<dyn PreviewContainers>,
     entries: Mutex<HashMap<String, Arc<Mutex<Entry>>>>,
     clock: Clock,
 }
@@ -332,33 +392,253 @@ fn tail(log: &Path, lines: usize) -> String {
     all[all.len().saturating_sub(lines)..].join("\n")
 }
 
-#[cfg(unix)]
-fn kill_group(pgid: i32, sig: i32) {
-    unsafe {
-        libc::kill(-pgid, sig);
-    }
+// ─── The preview container ──────────────────────────────────────────────
+
+/// Every preview container's name starts with this (contract 4: darkmux
+/// removes only containers it names this way).
+pub use darkmux_crew::orphan_reaper::PREVIEW_CONTAINER_PREFIX;
+
+/// Where the workspace is mounted in a preview container.
+pub const WORKSPACE_AT: &str = "/workspace";
+
+/// The label naming the workspace a preview container serves.
+pub const WORKSPACE_LABEL: &str = "darkmux.preview.workspace";
+
+/// What a preview container gets in its environment before the recipe's
+/// own `env` (which may override them): file watchers poll, because change
+/// events do not cross a Docker Desktop bind mount reliably. Chokidar (most
+/// node dev servers) and Watchpack (webpack, Next.js) read these; Vite
+/// needs `server.watch.usePolling` in its own config.
+pub const POLLING_ENV: &[(&str, &str)] = &[
+    ("CHOKIDAR_USEPOLLING", "true"),
+    ("WATCHPACK_POLLING", "true"),
+];
+
+/// The first line a preview container prints: without it, its exit is
+/// Docker's (no image, a bad mount), not the recipe's.
+const STARTED_LINE: &str = "darkmux-preview: container started";
+/// Printed after the install step, before the dev server starts.
+const SERVING_LINE: &str = "darkmux-preview: starting the dev server";
+/// Printed when the install step fails, followed by its exit code.
+const INSTALL_FAILED_LINE: &str = "darkmux-preview: install exited with";
+
+/// One preview container: everything `docker run` is told. Nothing of
+/// `client serve`'s own environment is in it: `env` is the whole of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerSpec {
+    pub name: String,
+    pub image: String,
+    /// The workspace, mounted read-write at [`WORKSPACE_AT`]; the only host
+    /// path the container sees.
+    pub workspace: PathBuf,
+    /// The app port and the HMR port, each published on 127.0.0.1 only, at
+    /// the same number inside.
+    pub ports: [u16; 2],
+    /// `--user`; `None` keeps the image's user.
+    pub user: Option<String>,
+    /// `key=value` labels: the host identity the orphan reaper reads, and
+    /// the workspace.
+    pub labels: Vec<String>,
+    /// The container's environment, in order (a later key wins).
+    pub env: Vec<(String, String)>,
+    /// The `sh -c` script: the install step when it is due, then the dev
+    /// server.
+    pub script: String,
 }
 
-#[cfg(not(unix))]
-fn kill_group(_pgid: i32, _sig: i32) {}
-
-fn group_alive(pgid: i32) -> bool {
-    #[cfg(unix)]
-    unsafe {
-        libc::kill(-pgid, 0) == 0
+/// `docker run` arguments for a preview container: the dispatch
+/// container's hardening (no capabilities, no new privileges, its pid and
+/// memory limits, `--init`), removed when it exits, the workspace the only
+/// mount, only the preview's two ports published and only on loopback, and
+/// an environment of exactly `spec.env`. It keeps the default network: an
+/// install step fetches packages.
+pub fn docker_run_args(spec: &ContainerSpec) -> Vec<String> {
+    use darkmux_crew::dispatch_internal::{
+        DOCKER_CAP_DROP, DOCKER_MEMORY, DOCKER_PIDS_LIMIT, DOCKER_SECURITY_OPT,
+    };
+    let mut args: Vec<String> = ["run", "--rm", "--init", "--name", &spec.name]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    args.extend([
+        format!("--cap-drop={DOCKER_CAP_DROP}"),
+        format!("--security-opt={DOCKER_SECURITY_OPT}"),
+        format!("--pids-limit={DOCKER_PIDS_LIMIT}"),
+        format!("--memory={DOCKER_MEMORY}"),
+    ]);
+    for label in &spec.labels {
+        args.extend(["--label".to_string(), label.clone()]);
     }
-    #[cfg(not(unix))]
-    {
-        let _ = pgid;
-        false
+    args.extend([
+        "-v".to_string(),
+        format!("{}:{WORKSPACE_AT}", spec.workspace.display()),
+        "-w".to_string(),
+        WORKSPACE_AT.to_string(),
+    ]);
+    for port in spec.ports {
+        args.extend(["-p".to_string(), format!("127.0.0.1:{port}:{port}")]);
+    }
+    if let Some(user) = &spec.user {
+        // The image's home belongs to the image's own user.
+        args.extend([
+            format!("--user={user}"),
+            "-e".to_string(),
+            "HOME=/tmp".to_string(),
+        ]);
+    }
+    for (k, v) in &spec.env {
+        // Always `KEY=value`: a bare `-e KEY` would copy the host's value.
+        args.extend(["-e".to_string(), format!("{k}={v}")]);
+    }
+    args.extend([
+        // The runtime image's own entrypoint never wraps the script.
+        "--entrypoint".to_string(),
+        "sh".to_string(),
+        spec.image.clone(),
+        "-c".to_string(),
+        spec.script.clone(),
+    ]);
+    args
+}
+
+/// The container's script: a start line, the install step when it is due
+/// (in a subshell, so its own `exit` ends only it), then the dev server.
+fn container_script(recipe: &Recipe, install_due: bool) -> String {
+    let mut script = format!("echo '{STARTED_LINE}'\n");
+    if let (true, Some(install)) = (install_due, &recipe.install) {
+        script.push_str(&format!(
+            "(\n{}\n) || {{ s=$?; echo \"{INSTALL_FAILED_LINE} $s\"; exit $s; }}\n",
+            install.command
+        ));
+    }
+    script.push_str(&format!("echo '{SERVING_LINE}'\n{}\n", recipe.command));
+    script
+}
+
+/// The container's environment: polling first, the recipe's `env` with
+/// its ports filled in, then the port variables, which the recipe cannot
+/// override.
+fn container_env(recipe: &Recipe, port: u16, hmr_port: u16) -> Vec<(String, String)> {
+    let mut recipe_env: Vec<(&String, &String)> = recipe.env.iter().collect();
+    recipe_env.sort();
+    POLLING_ENV
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .chain(
+            recipe_env
+                .into_iter()
+                .map(|(k, v)| (k.clone(), substitute(v, port, hmr_port))),
+        )
+        .chain([
+            ("DARKMUX_PREVIEW_PORT".to_string(), port.to_string()),
+            ("DARKMUX_PREVIEW_HMR_PORT".to_string(), hmr_port.to_string()),
+        ])
+        .collect()
+}
+
+/// What runs preview containers: Docker in production. A seam so the
+/// preview lifecycle is testable without Docker.
+pub trait PreviewContainers: Send + Sync {
+    /// The image and `--user` a preview container runs with, resolved as a
+    /// dispatch resolves them. May pull the version-pinned runtime image.
+    fn image_and_user(&self) -> Result<(String, Option<String>), String>;
+    /// The labels naming the darkmux process that starts a container.
+    fn host_labels(&self) -> Vec<String>;
+    /// Starts the container, attached: its output goes to `log`, and the
+    /// child ends when the container does.
+    fn run(&self, spec: &ContainerSpec, log: &Path) -> Result<std::process::Child, String>;
+    /// Stops and removes the container: TERM, KILL after five seconds.
+    /// Best effort; a container already gone is the goal.
+    fn remove(&self, name: &str);
+    /// Removes preview containers whose `client serve` died without
+    /// removing them.
+    fn reap_orphans(&self) -> Vec<String>;
+}
+
+/// The production [`PreviewContainers`]: the `docker` CLI, the darkmux
+/// runtime image.
+pub struct Docker {
+    /// An image to use instead of resolving the runtime image (the opt-in
+    /// Docker test names one already present, so it never pulls).
+    pub image: Option<String>,
+}
+
+/// How long one `docker stop` or `docker rm` may take.
+const DOCKER_CALL_BOUND: Duration = Duration::from_secs(30);
+
+impl PreviewContainers for Docker {
+    fn image_and_user(&self) -> Result<(String, Option<String>), String> {
+        let image = match &self.image {
+            Some(image) => image.clone(),
+            None => darkmux_crew::dispatch_internal::resolved_runtime_image()
+                .map_err(|e| format!("{e:#}"))?,
+        };
+        let user = darkmux_crew::dispatch_internal::runtime_container_user()
+            .map_err(|e| format!("{e:#}"))?;
+        Ok((image, user))
+    }
+
+    fn host_labels(&self) -> Vec<String> {
+        darkmux_crew::orphan_reaper::HostIdentity::this_process()
+            .map(|h| darkmux_crew::orphan_reaper::host_labels(&h))
+            .unwrap_or_default()
+    }
+
+    fn run(&self, spec: &ContainerSpec, log: &Path) -> Result<std::process::Child, String> {
+        let out = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(log)
+            .map_err(|e| format!("opening {}: {e}", log.display()))?;
+        let err = out
+            .try_clone()
+            .map_err(|e| format!("opening {}: {e}", log.display()))?;
+        let mut cmd = std::process::Command::new("docker");
+        cmd.args(docker_run_args(spec))
+            .stdin(std::process::Stdio::null())
+            .stdout(out)
+            .stderr(err);
+        // Its own process group: a Ctrl-C at `client serve` reaches darkmux,
+        // which removes every preview container itself.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        cmd.spawn().map_err(|e| format!("starting docker: {e}"))
+    }
+
+    fn remove(&self, name: &str) {
+        use darkmux_crew::bounded_command::run_bounded;
+        let quiet = |args: &[&str]| {
+            let mut c = std::process::Command::new("docker");
+            c.args(args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            c
+        };
+        let _ = run_bounded(quiet(&["stop", "-t", "5", name]), DOCKER_CALL_BOUND);
+        let _ = run_bounded(quiet(&["rm", "-f", name]), DOCKER_CALL_BOUND);
+    }
+
+    fn reap_orphans(&self) -> Vec<String> {
+        use darkmux_crew::orphan_reaper::{host_liveness, reap_tick_named, LocalHost, ReapTick};
+        match reap_tick_named(
+            PREVIEW_CONTAINER_PREFIX,
+            LocalHost::this_host().as_ref(),
+            host_liveness,
+        ) {
+            ReapTick::Listed { reaped } => reaped.into_iter().map(|(o, _)| o.name).collect(),
+            ReapTick::DockerUnavailable => Vec::new(),
+        }
     }
 }
 
 impl Previews {
-    pub fn new(dir: PathBuf, watch_pid: u32) -> Self {
+    pub fn new(dir: PathBuf, containers: Arc<dyn PreviewContainers>) -> Self {
         Self {
             dir,
-            watch_pid,
+            containers,
             entries: Mutex::new(HashMap::new()),
             clock: Arc::new(unix_seconds),
         }
@@ -375,7 +655,7 @@ impl Previews {
             .parent()
             .map(|p| p.join("previews"))
             .unwrap_or_else(|| PathBuf::from("previews"));
-        Self::new(dir, std::process::id())
+        Self::new(dir, Arc::new(Docker { image: None }))
     }
 
     fn snapshot(name: &str, e: &Entry) -> PreviewState {
@@ -396,8 +676,9 @@ impl Previews {
 
     /// Starts the workspace's preview (or returns the running one) from the
     /// recipe in `checkout`, the user's own checkout the workspace was made
-    /// from: the recipe is read there, never in `workdir`, where the dev
-    /// server runs. The boolean says whether it was already running.
+    /// from: the recipe is read there, never in `workdir`, which is what
+    /// the preview's container mounts. The boolean says whether it was
+    /// already running.
     pub fn start(
         &self,
         name: &str,
@@ -426,7 +707,7 @@ impl Previews {
             port,
             hmr_port,
             status: Status::Starting,
-            pgid: None,
+            container: None,
             log: log.clone(),
             last_asked: (self.clock)(),
         }));
@@ -435,14 +716,15 @@ impl Previews {
         drop(entries);
 
         let at = RunIn {
+            name: name.to_string(),
             workdir: workdir.to_path_buf(),
             checkout: checkout.to_path_buf(),
             log,
             port,
             hmr_port,
-            watch: self.watch_pid,
         };
-        std::thread::spawn(move || run(entry, recipe, at));
+        let containers = self.containers.clone();
+        std::thread::spawn(move || run(entry, recipe, at, &*containers));
         Ok((snap, false))
     }
 
@@ -455,19 +737,27 @@ impl Previews {
         Some(Self::snapshot(name, &e))
     }
 
-    /// Stops it: TERM to its process group, KILL after five seconds.
+    /// Stops it: its container gets TERM, then KILL after five seconds, and
+    /// is removed.
     pub fn stop(&self, name: &str) -> bool {
         let entry = self.entries.lock().unwrap().get(name).cloned();
         let Some(entry) = entry else { return false };
-        let pgid = {
+        let container = {
             let mut e = entry.lock().unwrap();
             e.status = Status::Stopped;
-            e.pgid.take()
+            e.container.take()
         };
-        if let Some(pgid) = pgid {
-            end_group(pgid);
+        if let Some(container) = container {
+            self.containers.remove(&container);
         }
         true
+    }
+
+    /// Stops every preview, live or not, and removes its container: what
+    /// `client serve` does as it shuts down. Returns the workspaces whose
+    /// container it removed.
+    pub fn stop_all(&self) -> Vec<String> {
+        self.stop_where(|_| true)
     }
 
     /// (#3459) Stops every live preview nobody has asked about (a start or
@@ -483,36 +773,32 @@ impl Previews {
         }
         let now = (self.clock)();
         let idle_after = idle_minutes.saturating_mul(60);
+        self.stop_where(|e| e.status.live() && now.saturating_sub(e.last_asked) >= idle_after)
+    }
+
+    /// Marks every preview `pick` chooses stopped, under its own lock, then
+    /// removes their containers. Returns their workspaces, sorted.
+    fn stop_where(&self, pick: impl Fn(&Entry) -> bool) -> Vec<String> {
         let mut ended = Vec::new();
         for (name, entry) in self.entries.lock().unwrap().iter() {
             let mut e = entry.lock().unwrap();
-            if e.status.live() && now.saturating_sub(e.last_asked) >= idle_after {
+            if pick(&e) {
                 e.status = Status::Stopped;
-                ended.push((name.clone(), e.pgid.take()));
+                ended.push((name.clone(), e.container.take()));
             }
         }
-        for (_, pgid) in &ended {
-            if let Some(pgid) = pgid {
-                end_group(*pgid);
-            }
+        for container in ended.iter().filter_map(|(_, c)| c.as_ref()) {
+            self.containers.remove(container);
         }
         let mut names: Vec<String> = ended.into_iter().map(|(n, _)| n).collect();
         names.sort();
         names
     }
-}
 
-/// TERM to a process group, KILL after five seconds.
-fn end_group(pgid: i32) {
-    #[cfg(unix)]
-    kill_group(pgid, libc::SIGTERM);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while group_alive(pgid) && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    #[cfg(unix)]
-    if group_alive(pgid) {
-        kill_group(pgid, libc::SIGKILL);
+    /// Removes preview containers a `client serve` that died left behind
+    /// (their labeled host process is gone). Returns their names.
+    pub fn reap_orphans(&self) -> Vec<String> {
+        self.containers.reap_orphans()
     }
 }
 
@@ -530,37 +816,6 @@ fn set(entry: &Arc<Mutex<Entry>>, status: Status) -> bool {
     }
     e.status = status;
     true
-}
-
-/// The only variables of `client serve`'s own environment a preview's
-/// processes get: what a dev server needs to find its tools and a home.
-/// Everything else (an API key exported where `client serve` started, a
-/// token) stays out of code the workspace holds, which a run may have
-/// written. The recipe's own `env` and the port variables are added on top.
-pub const PREVIEW_ENV_KEPT: &[&str] = &["PATH", "HOME", "USER", "LANG", "TMPDIR", "TERM"];
-
-fn sh(command: &str, workdir: &Path, log: &Path) -> std::process::Command {
-    let out = std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(log);
-    let mut cmd = std::process::Command::new("/bin/sh");
-    cmd.env_clear();
-    for key in PREVIEW_ENV_KEPT {
-        if let Some(v) = std::env::var_os(key) {
-            cmd.env(key, v);
-        }
-    }
-    cmd.arg("-c")
-        .arg(command)
-        .current_dir(workdir)
-        .stdin(std::process::Stdio::null());
-    if let Ok(f) = out {
-        if let Ok(f2) = f.try_clone() {
-            cmd.stdout(f).stderr(f2);
-        }
-    }
-    cmd
 }
 
 /// Why a preview's run ended before its dev server did: it was stopped (say
@@ -585,48 +840,43 @@ fn advance(entry: &Arc<Mutex<Entry>>, status: Status) -> Result<(), Halt> {
     }
 }
 
-/// Where one preview runs: its work copy, the user's own checkout its recipe
-/// and env files come from, its log, its ports, and the process whose exit
-/// ends it.
+/// Where one preview runs: its workspace, the user's own checkout its
+/// recipe and env files come from, its log and its ports.
 struct RunIn {
+    name: String,
     workdir: PathBuf,
     checkout: PathBuf,
     log: PathBuf,
     port: u16,
     hmr_port: u16,
-    watch: u32,
 }
 
-fn run(entry: Arc<Mutex<Entry>>, recipe: Recipe, at: RunIn) {
-    let RunIn {
-        workdir,
-        checkout,
-        log,
-        port,
-        hmr_port,
-        watch,
-    } = at;
-    let ended = prepare(&entry, &recipe, &workdir, &checkout, &log)
-        .and_then(|()| serve(&entry, &recipe, &workdir, &log, port, hmr_port, watch));
+fn run(entry: Arc<Mutex<Entry>>, recipe: Recipe, at: RunIn, containers: &dyn PreviewContainers) {
+    let ended = prepare(&entry, &recipe, &at)
+        .and_then(|install_due| serve(&entry, &recipe, &at, install_due, containers));
     // A stop is already recorded; `set` never overwrites it with a failure.
     if let Err(Halt::Failed(why)) = ended {
         set(&entry, Status::Failed(why));
     }
 }
 
-/// Everything before the dev server: env files, then the install step.
-fn prepare(
-    entry: &Arc<Mutex<Entry>>,
-    recipe: &Recipe,
-    workdir: &Path,
-    checkout: &Path,
-    log: &Path,
-) -> Result<(), Halt> {
-    copy_env_from_source(recipe, workdir, checkout)?;
-    if let Some(install) = &recipe.install {
-        install_deps(entry, install, workdir, log)?;
+/// Everything before the container, on the host: env files into the
+/// workspace, and whether the install step is due (its `unless_exists`
+/// path is missing). Returns that.
+fn prepare(entry: &Arc<Mutex<Entry>>, recipe: &Recipe, at: &RunIn) -> Result<bool, Halt> {
+    copy_env_from_source(recipe, &at.workdir, &at.checkout)?;
+    let Some(install) = &recipe.install else {
+        return Ok(false);
+    };
+    let due = install
+        .unless_exists
+        .as_ref()
+        .map(|p| std::fs::symlink_metadata(at.workdir.join(p)).is_err())
+        .unwrap_or(true);
+    if due {
+        advance(entry, Status::Installing)?;
     }
-    Ok(())
+    Ok(due)
 }
 
 /// Untracked files the dev server needs, from the user's own checkout (the
@@ -659,7 +909,11 @@ fn check_unlinked_inside(workdir: &Path, rel: &str) -> Result<(), String> {
             ));
         }
     }
-    let parent = workdir.join(rel).parent().map(Path::to_path_buf).unwrap_or_default();
+    let parent = workdir
+        .join(rel)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
     let inside = match (parent.canonicalize(), workdir.canonicalize()) {
         (Ok(p), Ok(w)) => p.starts_with(w),
         // A folder that isn't there yet: the copy fails on its own.
@@ -669,105 +923,109 @@ fn check_unlinked_inside(workdir: &Path, rel: &str) -> Result<(), String> {
     if inside {
         Ok(())
     } else {
-        Err(format!("env_from_source: {rel} would land outside the workspace; refusing"))
+        Err(format!(
+            "env_from_source: {rel} would land outside the workspace; refusing"
+        ))
     }
 }
 
-/// Runs the recipe's install command unless its `unless_exists` path is
-/// already there.
-fn install_deps(
-    entry: &Arc<Mutex<Entry>>,
-    install: &Install,
-    workdir: &Path,
-    log: &Path,
-) -> Result<(), Halt> {
-    let needed = install
-        .unless_exists
-        .as_ref()
-        .map(|p| std::fs::symlink_metadata(workdir.join(p)).is_err())
-        .unwrap_or(true);
-    if !needed {
-        return Ok(());
+/// The preview's container spec.
+fn spec_for(
+    recipe: &Recipe,
+    at: &RunIn,
+    install_due: bool,
+    (image, user): (String, Option<String>),
+    host_labels: Vec<String>,
+) -> ContainerSpec {
+    let mut labels = host_labels;
+    labels.push(format!("{WORKSPACE_LABEL}={}", at.name));
+    ContainerSpec {
+        // The app port makes it unique: a restarted preview never collides
+        // with its predecessor while that one is still being removed.
+        name: format!("{PREVIEW_CONTAINER_PREFIX}{}-{}", at.name, at.port),
+        image,
+        workspace: at.workdir.clone(),
+        ports: [at.port, at.hmr_port],
+        user,
+        labels,
+        env: container_env(recipe, at.port, at.hmr_port),
+        script: container_script(recipe, install_due),
     }
-    advance(entry, Status::Installing)?;
-    match sh(&install.command, workdir, log).status() {
-        Ok(s) if s.success() => {}
-        Ok(s) => return Err(format!("install ({}) exited with {s}", install.command).into()),
-        Err(e) => return Err(format!("install: {e}").into()),
-    }
-    advance(entry, Status::Starting)
 }
 
-/// Starts the dev server, waits for it to answer, then waits for it to end.
-/// It only ever returns a halt: a dev server is never expected to exit, so
-/// an exit after ready is a failure unless it was stopped.
+/// Starts the container, waits for the dev server to answer, then waits
+/// for it to end. It only ever returns a halt: a dev server is never
+/// expected to exit, so an exit after ready is a failure unless it was
+/// stopped.
 fn serve(
     entry: &Arc<Mutex<Entry>>,
     recipe: &Recipe,
-    workdir: &Path,
-    log: &Path,
-    port: u16,
-    hmr_port: u16,
-    watch: u32,
+    at: &RunIn,
+    install_due: bool,
+    containers: &dyn PreviewContainers,
 ) -> Result<(), Halt> {
-    let mut child = spawn_server(recipe, workdir, log, port, hmr_port, watch)?;
-    let pgid = adopt(entry, &mut child)?;
-    wait_ready(entry, &mut child, pgid, port, &ready_path(recipe))?;
-    // Ready: wait for it to end, and say so unless it was stopped.
+    let resolved = containers
+        .image_and_user()
+        .map_err(|e| format!("a preview runs in a container: {e}"))?;
+    let spec = spec_for(recipe, at, install_due, resolved, containers.host_labels());
+    let mut child = containers.run(&spec, &at.log)?;
+    adopt(entry, &mut child, &spec.name, containers)?;
+    wait_ready(entry, &mut child, &spec.name, containers, at, recipe)?;
+    // Ready: wait for it to end, and say why unless it was stopped.
     let status = child.wait();
-    Err(Halt::Failed(format!(
-        "the dev server exited ({})",
-        status.map(|s| s.to_string()).unwrap_or_default()
-    )))
+    Err(Halt::Failed(exit_reason(recipe, &at.log, status)))
 }
 
-/// The dev server in its own process group, under a watchdog: the group
-/// ends when the server exits, or when darkmux (`watch`) is gone.
-fn spawn_server(
+/// Why the container ended, from what it printed: Docker never started it,
+/// the install step failed, or the dev server exited.
+fn exit_reason(
     recipe: &Recipe,
-    workdir: &Path,
     log: &Path,
-    port: u16,
-    hmr_port: u16,
-    watch: u32,
-) -> Result<std::process::Child, String> {
-    let wrapper = format!(
-        "trap 'kill 0' EXIT; ( {} ) & server=$!; while kill -0 {watch} 2>/dev/null && kill -0 $server 2>/dev/null; do sleep 1; done; if kill -0 $server 2>/dev/null; then exit 0; fi; wait $server",
-        recipe.command
-    );
-    let mut cmd = sh(&wrapper, workdir, log);
-    for (k, v) in &recipe.env {
-        cmd.env(k, substitute(v, port, hmr_port));
+    status: std::io::Result<std::process::ExitStatus>,
+) -> String {
+    let text = std::fs::read_to_string(log).unwrap_or_default();
+    let status = status.map(|s| s.to_string()).unwrap_or_default();
+    if !text.lines().any(|l| l == STARTED_LINE) {
+        let said = text
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .trim();
+        return format!("the preview container did not start ({status}): {said}");
     }
-    cmd.env("DARKMUX_PREVIEW_PORT", port.to_string())
-        .env("DARKMUX_PREVIEW_HMR_PORT", hmr_port.to_string());
-    #[cfg(unix)]
-    unsafe {
-        use std::os::unix::process::CommandExt;
-        cmd.pre_exec(|| {
-            if libc::setpgid(0, 0) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+    let install_code = text
+        .lines()
+        .find_map(|l| l.strip_prefix(INSTALL_FAILED_LINE))
+        .map(str::trim);
+    match (install_code, &recipe.install) {
+        (Some(code), Some(install)) => {
+            format!(
+                "install ({}) exited with exit status: {code}",
+                install.command
+            )
+        }
+        _ => format!("the dev server exited ({status})"),
     }
-    cmd.spawn()
-        .map_err(|e| format!("starting {}: {e}", recipe.command))
 }
 
-/// Records the server's process group so `stop` can reach it; if the
-/// preview was stopped while it spawned, ends it instead.
-fn adopt(entry: &Arc<Mutex<Entry>>, child: &mut std::process::Child) -> Result<i32, Halt> {
-    let pgid = child.id() as i32;
+/// Records the container so `stop` can reach it; if the preview was
+/// stopped while it started, removes it instead.
+fn adopt(
+    entry: &Arc<Mutex<Entry>>,
+    child: &mut std::process::Child,
+    name: &str,
+    containers: &dyn PreviewContainers,
+) -> Result<(), Halt> {
     let mut e = entry.lock().unwrap();
     if e.status == Status::Stopped {
         drop(e);
-        kill_group(pgid, 15);
+        containers.remove(name);
         let _ = child.wait();
         return Err(Halt::Stopped);
     }
-    e.pgid = Some(pgid);
-    Ok(pgid)
+    e.container = Some(name.to_string());
+    Ok(())
 }
 
 /// The path the readiness probe asks for: the recipe's `ready.http`, else `/`.
@@ -779,35 +1037,156 @@ fn ready_path(recipe: &Recipe) -> String {
         .unwrap_or_else(|| "/".to_string())
 }
 
-/// Polls until the server answers on `path`; halts if it exits, is
-/// stopped, or stays silent for 3 minutes.
+/// How long a started dev server may take to answer.
+const READY_WITHIN: Duration = Duration::from_secs(180);
+
+/// Polls until the dev server answers on its published port; halts if the
+/// container exits, the preview is stopped, or the server stays silent for
+/// [`READY_WITHIN`] after the install step. The install step itself is not
+/// bounded (a first `npm ci` can be slow).
 fn wait_ready(
     entry: &Arc<Mutex<Entry>>,
     child: &mut std::process::Child,
-    pgid: i32,
-    port: u16,
-    path: &str,
+    name: &str,
+    containers: &dyn PreviewContainers,
+    at: &RunIn,
+    recipe: &Recipe,
 ) -> Result<(), Halt> {
-    let deadline = Instant::now() + Duration::from_secs(180);
+    let path = ready_path(recipe);
+    let mut serving_since = None;
     loop {
         if let Ok(Some(status)) = child.try_wait() {
-            return Err(format!("the dev server exited ({status})").into());
+            return Err(Halt::Failed(exit_reason(recipe, &at.log, Ok(status))));
         }
         if entry.lock().unwrap().status == Status::Stopped {
             let _ = child.wait();
             return Err(Halt::Stopped);
         }
-        if http_ok(port, path) {
+        if serving_since.is_none() && log_has(&at.log, SERVING_LINE) {
+            serving_since = Some(Instant::now());
+            advance(entry, Status::Starting)?;
+        }
+        if serving_since.is_some() && http_ok(at.port, &path) {
             set(entry, Status::Ready);
             return Ok(());
         }
-        if Instant::now() > deadline {
-            kill_group(pgid, 15);
-            return Err(Halt::Failed(
-                "the dev server didn't answer within 3 minutes".into(),
-            ));
+        if serving_since.is_some_and(|t| t.elapsed() > READY_WITHIN) {
+            containers.remove(name);
+            return Err(Halt::Failed(format!(
+                "the dev server didn't answer on port {} within 3 minutes; in its container it \
+                 must listen on 0.0.0.0 (the port is published on 127.0.0.1 only)",
+                at.port
+            )));
         }
         std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// Whether `log` holds the line `line`.
+fn log_has(log: &Path, line: &str) -> bool {
+    std::fs::read_to_string(log).is_ok_and(|t| t.lines().any(|l| l == line))
+}
+
+/// TEST ONLY: a [`PreviewContainers`] that plays a container's part
+/// without Docker, so the preview lifecycle (ports, readiness, the install
+/// step, stop, the HTTP routes) is testable on any machine. It runs the
+/// spec's script with `sh` in the workspace, with exactly the spec's
+/// environment plus `PATH` (an image has its own), in its own process
+/// group under a watchdog that ends it with the test process. Production
+/// never runs a preview on the host: [`Docker`] is the only production
+/// implementation. The shape a real container gets is asserted on
+/// [`docker_run_args`] directly.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct HostEmulator {
+    /// Every spec it was asked to run.
+    pub specs: Mutex<Vec<ContainerSpec>>,
+    /// Every container it was asked to remove.
+    pub removed: Mutex<Vec<String>>,
+    /// Set: resolving the image fails with this.
+    pub image_error: Mutex<Option<String>>,
+    groups: Mutex<HashMap<String, i32>>,
+}
+
+#[cfg(test)]
+impl PreviewContainers for HostEmulator {
+    fn image_and_user(&self) -> Result<(String, Option<String>), String> {
+        match self.image_error.lock().unwrap().clone() {
+            Some(e) => Err(e),
+            None => Ok(("emulated-runtime-image".to_string(), None)),
+        }
+    }
+
+    fn host_labels(&self) -> Vec<String> {
+        vec![format!("darkmux.dispatch.host-pid={}", std::process::id())]
+    }
+
+    fn run(&self, spec: &ContainerSpec, log: &Path) -> Result<std::process::Child, String> {
+        use std::os::unix::process::CommandExt;
+        self.specs.lock().unwrap().push(spec.clone());
+        let out = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(log)
+            .map_err(|e| e.to_string())?;
+        let err = out.try_clone().map_err(|e| e.to_string())?;
+        let watchdog = format!(
+            "trap 'kill 0' EXIT; ( {} ) & c=$!; while kill -0 {} 2>/dev/null && kill -0 $c 2>/dev/null; do sleep 1; done; \
+             if kill -0 $c 2>/dev/null; then exit 0; fi; wait $c",
+            spec.script,
+            std::process::id()
+        );
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.env_clear();
+        if let Some(path) = std::env::var_os("PATH") {
+            cmd.env("PATH", path);
+        }
+        cmd.envs(spec.env.iter().map(|(k, v)| (k, v)))
+            .arg("-c")
+            .arg(watchdog)
+            .current_dir(&spec.workspace)
+            .stdin(std::process::Stdio::null())
+            .stdout(out)
+            .stderr(err)
+            .process_group(0);
+        let child = cmd.spawn().map_err(|e| e.to_string())?;
+        self.groups
+            .lock()
+            .unwrap()
+            .insert(spec.name.clone(), child.id() as i32);
+        Ok(child)
+    }
+
+    fn remove(&self, name: &str) {
+        self.removed.lock().unwrap().push(name.to_string());
+        let Some(pgid) = self.groups.lock().unwrap().remove(name) else {
+            return;
+        };
+        let alive = || unsafe { libc::kill(-pgid, 0) == 0 };
+        unsafe { libc::kill(-pgid, libc::SIGTERM) };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while alive() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if alive() {
+            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        }
+    }
+
+    fn reap_orphans(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+#[cfg(test)]
+impl HostEmulator {
+    /// Whether the emulated container `name` still has a live process.
+    pub fn running(&self, name: &str) -> bool {
+        self.groups
+            .lock()
+            .unwrap()
+            .get(name)
+            .is_some_and(|g| unsafe { libc::kill(-g, 0) == 0 })
     }
 }
 
@@ -844,39 +1223,244 @@ mod tests {
         v
     }
 
-    /// (review) The dev server and its install step get a stripped
-    /// environment: the few variables a dev server needs, the recipe's own
-    /// `env` and the ports, and nothing else `client serve` was started
-    /// with, so an API key exported there never reaches code a run wrote.
+    /// Previews on a [`HostEmulator`]; returns both.
+    fn emulated(dir: &Path) -> (Previews, Arc<HostEmulator>) {
+        let emu = Arc::new(HostEmulator::default());
+        (Previews::new(dir.join("p"), emu.clone()), emu)
+    }
+
+    fn a_recipe(v: serde_json::Value) -> Recipe {
+        parse_recipe(&v.to_string()).unwrap()
+    }
+
+    /// A spec as a start builds it, for a workspace at `/tmp/ws/site`.
+    fn a_spec(recipe: &Recipe, user: Option<String>) -> ContainerSpec {
+        let at = RunIn {
+            name: "site".into(),
+            workdir: PathBuf::from("/tmp/ws/site"),
+            checkout: PathBuf::from("/tmp/mine"),
+            log: PathBuf::from("/tmp/p/site.log"),
+            port: 4100,
+            hmr_port: 4200,
+        };
+        let labels = vec!["darkmux.dispatch.host-pid=7".to_string()];
+        spec_for(recipe, &at, true, ("sha256:runtime".into(), user), labels)
+    }
+
+    /// The values `docker run` is given for `flag` (`-v`, `-p`, `-e`, ...).
+    fn values_of(args: &[String], flag: &str) -> Vec<String> {
+        args.windows(2)
+            .filter(|w| w[0] == flag)
+            .map(|w| w[1].clone())
+            .collect()
+    }
+
+    /// (#3456) A preview container sees the workspace and nothing else of
+    /// the host, publishes only its two ports and only on 127.0.0.1, runs
+    /// with the dispatch container's hardening, and carries the labels the
+    /// orphan reaper reads.
+    #[test]
+    fn a_preview_container_mounts_only_the_workspace_and_publishes_only_its_ports_on_loopback() {
+        let recipe =
+            a_recipe(serde_json::json!({"schema_version": "1.0", "command": "npm run dev"}));
+        let args = docker_run_args(&a_spec(&recipe, None));
+        assert_eq!(
+            args[..5],
+            [
+                "run",
+                "--rm",
+                "--init",
+                "--name",
+                "darkmux-preview-site-4100"
+            ]
+        );
+        assert_eq!(
+            values_of(&args, "-v"),
+            ["/tmp/ws/site:/workspace"],
+            "the only mount"
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.starts_with("--mount") || a.starts_with("--volume")),
+            "{args:?}"
+        );
+        assert_eq!(
+            values_of(&args, "-p"),
+            ["127.0.0.1:4100:4100", "127.0.0.1:4200:4200"]
+        );
+        assert!(
+            !args.iter().any(|a| a == "-P" || a.starts_with("--publish")),
+            "{args:?}"
+        );
+        for flag in [
+            "--network",
+            "--privileged",
+            "--pid",
+            "--ipc",
+            "--cap-add",
+            "--device",
+        ] {
+            let named = |a: &String| a == flag || a.starts_with(&format!("{flag}="));
+            assert!(!args.iter().any(named), "{flag} in {args:?}");
+        }
+        for want in [
+            "--cap-drop=ALL",
+            "--security-opt=no-new-privileges",
+            "--pids-limit=512",
+            "--memory=4g",
+        ] {
+            assert!(args.contains(&want.to_string()), "{want} missing: {args:?}");
+        }
+        assert_eq!(
+            values_of(&args, "--label"),
+            [
+                "darkmux.dispatch.host-pid=7",
+                "darkmux.preview.workspace=site"
+            ]
+        );
+        assert_eq!(values_of(&args, "-w"), ["/workspace"]);
+        let image_at = args.iter().position(|a| a == "sha256:runtime").unwrap();
+        assert_eq!(args[image_at - 2..image_at], ["--entrypoint", "sh"]);
+        assert_eq!(args[image_at + 1], "-c");
+        assert_eq!(args.len(), image_at + 3, "the script is the last argument");
+    }
+
+    /// (#3456) No host environment reaches the container: its environment
+    /// is polling for file watchers, the recipe's `env` with its ports
+    /// filled in, and the port variables, each as `KEY=value` (a bare `-e
+    /// KEY` would copy the host's value). A key exported where `client
+    /// serve` runs appears nowhere in the arguments.
     #[test]
     #[serial_test::serial]
-    fn a_preview_gets_only_a_minimal_environment() {
+    fn a_preview_container_gets_no_host_environment() {
+        unsafe { std::env::set_var("SOME_PROVIDER_API_KEY", "must-not-leak") };
+        let recipe = a_recipe(serde_json::json!({
+            "schema_version": "1.0", "command": "npm run dev",
+            "env": {"PORT": "{port}", "VITE_HMR_PORT": "{hmrPort}", "CHOKIDAR_USEPOLLING": "false"}
+        }));
+        let args = docker_run_args(&a_spec(&recipe, None));
+        unsafe { std::env::remove_var("SOME_PROVIDER_API_KEY") };
+        let joined = args.join(" ");
+        assert!(
+            !joined.contains("must-not-leak") && !joined.contains("SOME_PROVIDER_API_KEY"),
+            "{joined}"
+        );
+        assert!(
+            !args.iter().any(|a| a.starts_with("--env-file")),
+            "{joined}"
+        );
+        assert_eq!(
+            values_of(&args, "-e"),
+            [
+                "CHOKIDAR_USEPOLLING=true",
+                "WATCHPACK_POLLING=true",
+                "CHOKIDAR_USEPOLLING=false",
+                "PORT=4100",
+                "VITE_HMR_PORT=4200",
+                "DARKMUX_PREVIEW_PORT=4100",
+                "DARKMUX_PREVIEW_HMR_PORT=4200",
+            ],
+            "polling first (the recipe may turn it off), the ports last"
+        );
+        // With a container user, its home is one it owns.
+        let args = docker_run_args(&a_spec(&recipe, Some("501:20".into())));
+        assert!(
+            args.join(" ").contains("--user=501:20 -e HOME=/tmp"),
+            "{args:?}"
+        );
+    }
+
+    /// (#3456) The container runs the install step only when it is due, in
+    /// a subshell so its own `exit` ends only it, and an install failure
+    /// stops before the dev server, saying its exit code.
+    #[test]
+    fn the_container_script_installs_only_when_due() {
+        let recipe = a_recipe(serde_json::json!({
+            "schema_version": "1.0", "command": "echo serving",
+            "install": {"command": "echo installing; exit 4", "unless_exists": "node_modules"}
+        }));
+        let not_due = container_script(&recipe, false);
+        assert!(!not_due.contains("installing"), "{not_due}");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(container_script(&recipe, true))
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(4), "{text}");
+        assert!(text.starts_with(STARTED_LINE), "{text}");
+        assert!(
+            text.contains(&format!("{INSTALL_FAILED_LINE} 4")) && !text.contains("serving"),
+            "{text}"
+        );
+    }
+
+    /// (#3456) Why a container ended, from what it printed.
+    #[test]
+    fn an_ended_container_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("l.log");
+        let recipe = a_recipe(serde_json::json!({
+            "schema_version": "1.0", "command": "x", "install": {"command": "npm ci"}
+        }));
+        let why = |text: &str| {
+            std::fs::write(&log, text).unwrap();
+            exit_reason(&recipe, &log, Err(std::io::Error::other("gone")))
+        };
+        let never = why("docker: Error response from daemon: No such image\n");
+        assert!(
+            never.contains("did not start") && never.contains("No such image"),
+            "{never}"
+        );
+        assert_eq!(
+            why(&format!(
+                "{STARTED_LINE}\nnpm ERR!\n{INSTALL_FAILED_LINE} 1\n"
+            )),
+            "install (npm ci) exited with exit status: 1"
+        );
+        assert!(why(&format!("{STARTED_LINE}\n{SERVING_LINE}\nboom\n"))
+            .starts_with("the dev server exited"));
+    }
+
+    /// (#3456) A machine that cannot run the preview's container (no
+    /// Docker, no image) fails the preview saying so, and runs nothing.
+    #[test]
+    fn a_preview_that_cannot_get_its_container_fails_saying_so() {
         let dir = tempfile::tempdir().unwrap();
         let wt = dir.path().join("w");
-        std::fs::create_dir_all(&wt).unwrap();
-        let recipe = serde_json::json!({
-            "schema_version": "1.0",
-            "command": "env > server-env.txt; exit 3",
-            "env": {"FROM_RECIPE": "yes {port}"},
-            "install": {"command": "env > install-env.txt", "unless_exists": "deps"}
-        });
         std::fs::create_dir_all(wt.join(".darkmux")).unwrap();
+        let recipe = serde_json::json!({"schema_version": "1.0", "command": "touch ran"});
         std::fs::write(wt.join(".darkmux/preview.json"), recipe.to_string()).unwrap();
-        unsafe { std::env::set_var("SOME_PROVIDER_API_KEY", "must-not-leak") };
-        let previews = Previews::new(dir.path().join("p"), std::process::id());
-        let (state, _) = previews.start("w", &wt, &wt).unwrap();
+        let (previews, emu) = emulated(dir.path());
+        *emu.image_error.lock().unwrap() = Some("darkmux's runtime requires Docker".into());
+        previews.start("w", &wt, &wt).unwrap();
         let v = until_failed(&previews, "w");
-        unsafe { std::env::remove_var("SOME_PROVIDER_API_KEY") };
         assert_eq!(v["status"], "failed", "{v}");
-        for file in ["server-env.txt", "install-env.txt"] {
-            let env = std::fs::read_to_string(wt.join(file)).unwrap();
-            assert!(!env.contains("must-not-leak") && !env.contains("SOME_PROVIDER_API_KEY"), "{file}: {env}");
-            assert!(env.lines().any(|l| l.starts_with("PATH=")), "{file} keeps PATH: {env}");
-            assert!(env.lines().any(|l| l.starts_with("HOME=")), "{file} keeps HOME: {env}");
-        }
-        let server = std::fs::read_to_string(wt.join("server-env.txt")).unwrap();
-        assert!(server.contains(&format!("FROM_RECIPE=yes {}", state.port)), "{server}");
-        assert!(server.contains(&format!("DARKMUX_PREVIEW_PORT={}", state.port)), "{server}");
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap()
+                .contains("a preview runs in a container: darkmux's runtime requires Docker"),
+            "{v}"
+        );
+        assert!(emu.specs.lock().unwrap().is_empty() && !wt.join("ran").exists());
+    }
+
+    /// (#3456) Stopping a preview, and `client serve` shutting down, remove
+    /// its container; the shutdown removes every one.
+    #[test]
+    fn stop_and_shutdown_remove_the_container() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_t, clock) = frozen_clock();
+        let (previews, emu, name) = a_live_preview(dir.path(), clock);
+        assert!(previews.stop("w"));
+        assert_eq!(*emu.removed.lock().unwrap(), std::slice::from_ref(&name));
+        assert!(!emu.running(&name));
+        let (previews, emu, name) = a_live_preview(&dir.path().join("2"), frozen_clock().1);
+        assert_eq!(previews.stop_all(), ["w"]);
+        assert_eq!(*emu.removed.lock().unwrap(), std::slice::from_ref(&name));
+        assert!(!emu.running(&name));
     }
 
     /// (review) `env_from_source` never writes through a link a run
@@ -886,7 +1470,11 @@ mod tests {
     #[test]
     fn env_from_source_never_writes_through_a_planted_symlink() {
         let dir = tempfile::tempdir().unwrap();
-        let (wt, checkout, outside) = (dir.path().join("w"), dir.path().join("mine"), dir.path().join("outside"));
+        let (wt, checkout, outside) = (
+            dir.path().join("w"),
+            dir.path().join("mine"),
+            dir.path().join("outside"),
+        );
         for d in [&wt, &checkout.join("config"), &outside] {
             std::fs::create_dir_all(d).unwrap();
         }
@@ -897,12 +1485,15 @@ mod tests {
         });
         std::fs::create_dir_all(checkout.join(".darkmux")).unwrap();
         std::fs::write(checkout.join(".darkmux/preview.json"), recipe.to_string()).unwrap();
-        let previews = Previews::new(dir.path().join("p"), std::process::id());
+        let (previews, _emu) = emulated(dir.path());
         previews.start("w", &wt, &checkout).unwrap();
         let v = until_failed(&previews, "w");
         assert_eq!(v["status"], "failed", "{v}");
         assert!(v["error"].as_str().unwrap().contains("symlink"), "{v}");
-        assert!(!outside.join(".env").exists(), "wrote through the planted link");
+        assert!(
+            !outside.join(".env").exists(),
+            "wrote through the planted link"
+        );
         assert!(!wt.join("server-ran").exists(), "the server never ran");
     }
 
@@ -917,7 +1508,7 @@ mod tests {
             "install": {"command": "exit 4", "unless_exists": "deps"}
         });
         std::fs::write(wt.join(".darkmux/preview.json"), recipe.to_string()).unwrap();
-        let previews = Previews::new(dir.path().join("p"), std::process::id());
+        let (previews, _emu) = emulated(dir.path());
         previews.start("w", &wt, &wt).unwrap();
         let mut v = serde_json::Value::Null;
         for _ in 0..200 {
@@ -951,34 +1542,39 @@ mod tests {
     }
 
     /// A preview whose server never answers (so it stays `starting`, live)
-    /// on a frozen clock; returns the previews and the server's process
-    /// group once it has one.
-    fn a_live_preview(dir: &Path, clock: Clock) -> (Previews, i32) {
+    /// on a frozen clock and a [`HostEmulator`]; returns the previews, the
+    /// emulator and the container's name once it runs.
+    fn a_live_preview(dir: &Path, clock: Clock) -> (Previews, Arc<HostEmulator>, String) {
         let wt = dir.join("w");
         std::fs::create_dir_all(wt.join(".darkmux")).unwrap();
         let recipe = serde_json::json!({"schema_version": "1.0", "command": "sleep 30"});
         std::fs::write(wt.join(".darkmux/preview.json"), recipe.to_string()).unwrap();
-        let previews = Previews::new(dir.join("p"), std::process::id()).with_clock(clock);
+        let (previews, emu) = emulated(dir);
+        let previews = previews.with_clock(clock);
         previews.start("w", &wt, &wt).unwrap();
         for _ in 0..200 {
-            let pgid = previews.entries.lock().unwrap()["w"].lock().unwrap().pgid;
-            if let Some(pgid) = pgid {
-                return (previews, pgid);
+            let container = previews.entries.lock().unwrap()["w"]
+                .lock()
+                .unwrap()
+                .container
+                .clone();
+            if let Some(name) = container {
+                return (previews, emu, name);
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        panic!("the preview's server never started");
+        panic!("the preview's container never started");
     }
 
     /// (#3459) A preview nobody has asked about for `idle_minutes` is
-    /// stopped, and its process group with it; asking (a status) restarts
+    /// stopped, and its container removed; asking (a status) restarts
     /// the count.
     #[cfg(unix)]
     #[test]
     fn an_idle_preview_is_stopped_once_nobody_asked_for_idle_minutes() {
         let dir = tempfile::tempdir().unwrap();
         let (t, clock) = frozen_clock();
-        let (previews, pgid) = a_live_preview(dir.path(), clock);
+        let (previews, emu, container) = a_live_preview(dir.path(), clock);
         advance_minutes(&t, 14);
         assert!(previews.stop_idle(15).is_empty(), "14 minutes: not idle");
         let asked = previews.status("w").unwrap();
@@ -994,7 +1590,12 @@ mod tests {
         assert_eq!(previews.stop_idle(15), vec!["w".to_string()], "15 since");
         let entry = previews.entries.lock().unwrap()["w"].clone();
         assert_eq!(entry.lock().unwrap().status, Status::Stopped);
-        assert!(!group_alive(pgid), "its process group is gone");
+        assert_eq!(
+            *emu.removed.lock().unwrap(),
+            std::slice::from_ref(&container),
+            "its container is removed"
+        );
+        assert!(!emu.running(&container));
         assert!(previews.stop_idle(15).is_empty(), "stopped once only");
     }
 
@@ -1005,7 +1606,7 @@ mod tests {
     fn zero_idle_minutes_never_stops_and_a_repeated_start_is_an_ask() {
         let dir = tempfile::tempdir().unwrap();
         let (t, clock) = frozen_clock();
-        let (previews, _pgid) = a_live_preview(dir.path(), clock);
+        let (previews, _emu, _container) = a_live_preview(dir.path(), clock);
         advance_minutes(&t, 60 * 24 * 365);
         assert!(previews.stop_idle(0).is_empty(), "0 is never");
         let wt = dir.path().join("w");
@@ -1015,6 +1616,108 @@ mod tests {
         assert!(previews.stop_idle(15).is_empty(), "the 2nd start asked");
         advance_minutes(&t, 5);
         assert_eq!(previews.stop_idle(15), vec!["w".to_string()]);
+    }
+
+    /// (#3456, opt-in) A real preview in the darkmux runtime image: it
+    /// serves the workspace on its published port, its environment holds
+    /// nothing `client serve` was started with, it cannot read a host path
+    /// beside the workspace, and a stop removes the container. Needs Docker
+    /// and this darkmux's version-pinned runtime image already present; it
+    /// never pulls. Run it with
+    /// `cargo nextest run -p darkmux-serve --run-ignored only a_preview_runs_in_the_runtime_image`.
+    #[test]
+    #[ignore]
+    #[serial_test::serial]
+    fn a_preview_runs_in_the_runtime_image_and_reaches_nothing_else_of_the_host() {
+        let image = darkmux_crew::runtime_image::pinned_runtime_image(env!("CARGO_PKG_VERSION"));
+        let inspect = std::process::Command::new("docker")
+            .args(["image", "inspect", &image])
+            .output();
+        assert!(
+            inspect.is_ok_and(|o| o.status.success()),
+            "needs {image} present locally; this test never pulls it"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let (wt, outside) = (dir.path().join("ws"), dir.path().join("outside"));
+        std::fs::create_dir_all(wt.join(".darkmux")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(wt.join("index.html"), "hello from the container").unwrap();
+        std::fs::write(outside.join("secret.txt"), "host-secret").unwrap();
+        let command = format!(
+            "env > env.txt; cat '{}' > leak.txt 2>&1; exec python3 -m http.server \"$PORT\" --bind 0.0.0.0",
+            outside.join("secret.txt").display()
+        );
+        let recipe = serde_json::json!({"schema_version": "1.0", "command": command, "env": {"PORT": "{port}"}});
+        std::fs::write(wt.join(".darkmux/preview.json"), recipe.to_string()).unwrap();
+        unsafe { std::env::set_var("DARKMUX_TEST_HOST_SECRET", "must-not-leak") };
+        let previews = Previews::new(
+            dir.path().join("p"),
+            Arc::new(Docker { image: Some(image) }),
+        );
+        let (state, _) = previews.start("ws", &wt, &wt).unwrap();
+        unsafe { std::env::remove_var("DARKMUX_TEST_HOST_SECRET") };
+        let mut v = serde_json::Value::Null;
+        for _ in 0..600 {
+            v = serde_json::to_value(previews.status("ws").unwrap()).unwrap();
+            if v["status"] == "ready" || v["status"] == "failed" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let container = previews.entries.lock().unwrap()["ws"]
+            .lock()
+            .unwrap()
+            .container
+            .clone();
+        assert_eq!(
+            v["status"],
+            "ready",
+            "{v} {}",
+            tail(&dir.path().join("p/ws.log"), 20)
+        );
+        let body = {
+            use std::io::{Read, Write};
+            let mut s = std::net::TcpStream::connect(("127.0.0.1", state.port)).unwrap();
+            s.write_all(b"GET /index.html HTTP/1.0\r\n\r\n").unwrap();
+            let mut out = String::new();
+            s.read_to_string(&mut out).unwrap();
+            out
+        };
+        assert!(body.contains("hello from the container"), "{body}");
+        let env = std::fs::read_to_string(wt.join("env.txt")).unwrap();
+        assert!(
+            !env.contains("must-not-leak") && !env.contains("DARKMUX_TEST_HOST_SECRET"),
+            "{env}"
+        );
+        assert!(
+            env.contains("CHOKIDAR_USEPOLLING=true")
+                && env.contains(&format!("PORT={}", state.port)),
+            "{env}"
+        );
+        let leak = std::fs::read_to_string(wt.join("leak.txt")).unwrap();
+        assert!(
+            !leak.contains("host-secret"),
+            "read a host path outside the workspace: {leak}"
+        );
+        let name = container.expect("the container was adopted");
+        assert!(previews.stop("ws"));
+        let listed = std::process::Command::new("docker")
+            .args([
+                "ps",
+                "-a",
+                "--filter",
+                &format!("name=^{name}$"),
+                "--format",
+                "{{.Names}}",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&listed.stdout).trim(),
+            "",
+            "the container is removed"
+        );
+        assert!(!http_ok(state.port, "/"), "nothing answers any more");
     }
 
     fn parsed(v: serde_json::Value) -> Result<Recipe, RecipeRefusal> {
@@ -1028,16 +1731,29 @@ mod tests {
         let ok = serde_json::json!({"schema_version": "1.0", "command": "npm run dev", "env": {"PORT": "{port}"}});
         assert_eq!(parsed(ok.clone()).unwrap().command, "npm run dev");
         for (doc, key) in [
-            (serde_json::json!({"schema_version": "1.0", "command": "x", "comand": "y"}), "`comand`"),
-            (serde_json::json!({"schema_version": "1.0", "command": "x", "port": 3333}), "`port`"),
-            (serde_json::json!({"schema_version": "1.0", "command": "x", "ready": {"htp": "/"}}), "`ready.htp`"),
-            (serde_json::json!({"schema_version": "1.0", "command": "x", "install": {"command": "i", "unless": "n"}}), "`install.unless`"),
+            (
+                serde_json::json!({"schema_version": "1.0", "command": "x", "comand": "y"}),
+                "`comand`",
+            ),
+            (
+                serde_json::json!({"schema_version": "1.0", "command": "x", "port": 3333}),
+                "`port`",
+            ),
+            (
+                serde_json::json!({"schema_version": "1.0", "command": "x", "ready": {"htp": "/"}}),
+                "`ready.htp`",
+            ),
+            (
+                serde_json::json!({"schema_version": "1.0", "command": "x", "install": {"command": "i", "unless": "n"}}),
+                "`install.unless`",
+            ),
         ] {
             let e = parsed(doc).unwrap_err();
             assert!(matches!(e, RecipeRefusal::Invalid(_)), "{e:?}");
             assert!(e.message().contains(&format!("unknown key {key}")), "{e:?}");
         }
-        let e = parsed(serde_json::json!({"schema_version": "1.0", "command": "x", "comand": "y"})).unwrap_err();
+        let e = parsed(serde_json::json!({"schema_version": "1.0", "command": "x", "comand": "y"}))
+            .unwrap_err();
         assert!(e.message().contains("did you mean `command`?"), "{e:?}");
     }
 
@@ -1046,19 +1762,60 @@ mod tests {
     #[test]
     fn a_recipe_needs_a_schema_version_this_darkmux_reads() {
         let missing = parsed(serde_json::json!({"command": "x"})).unwrap_err();
-        assert!(missing.message().contains("`schema_version`") && missing.message().contains("missing"), "{missing:?}");
-        let unknown = parsed(serde_json::json!({"schema_version": "0.9", "command": "x"})).unwrap_err();
-        assert!(unknown.message().contains("`schema_version` \"0.9\""), "{unknown:?}");
-        let newer = parsed(serde_json::json!({"schema_version": "2.0", "command": "x"})).unwrap_err();
+        assert!(
+            missing.message().contains("`schema_version`") && missing.message().contains("missing"),
+            "{missing:?}"
+        );
+        let unknown =
+            parsed(serde_json::json!({"schema_version": "0.9", "command": "x"})).unwrap_err();
+        assert!(
+            unknown.message().contains("`schema_version` \"0.9\""),
+            "{unknown:?}"
+        );
+        let newer =
+            parsed(serde_json::json!({"schema_version": "2.0", "command": "x"})).unwrap_err();
         assert!(newer.message().contains("newer darkmux"), "{newer:?}");
         let typed = parsed(serde_json::json!({"schema_version": 1, "command": "x"})).unwrap_err();
         assert!(typed.message().contains("`schema_version`"), "{typed:?}");
     }
 
+    /// (#3456) Each `env` key reaches the container as `-e KEY=value`, so
+    /// it must be a plain variable name: one with `=` would set another
+    /// variable, and an empty one is no variable.
+    #[test]
+    fn a_recipe_env_key_is_a_variable_name() {
+        for bad in ["", "A=B", "1A", "A B", "A-B"] {
+            let e = parsed(
+                serde_json::json!({"schema_version": "1.0", "command": "x", "env": {bad: "v"}}),
+            )
+            .unwrap_err();
+            assert!(matches!(e, RecipeRefusal::Invalid(_)), "{bad:?}: {e:?}");
+            assert!(
+                e.message().contains("env:") && e.message().contains("variable name"),
+                "{bad:?}: {e:?}"
+            );
+        }
+        for good in ["PORT", "_X", "VITE_HMR_PORT", "a1"] {
+            assert!(
+                parsed(
+                    serde_json::json!({"schema_version": "1.0", "command": "x", "env": {good: "v"}})
+                )
+                .is_ok(),
+                "{good}"
+            );
+        }
+    }
+
     #[test]
     fn a_recipe_is_a_json_object_with_paths_inside_the_work_copy() {
-        assert!(matches!(parse_recipe("[1]"), Err(RecipeRefusal::Invalid(_))));
-        assert!(matches!(parse_recipe("{nope"), Err(RecipeRefusal::Invalid(_))));
+        assert!(matches!(
+            parse_recipe("[1]"),
+            Err(RecipeRefusal::Invalid(_))
+        ));
+        assert!(matches!(
+            parse_recipe("{nope"),
+            Err(RecipeRefusal::Invalid(_))
+        ));
         let e = parsed(serde_json::json!({"schema_version": "1.0", "command": "x", "env_from_source": ["../.env"]})).unwrap_err();
         assert!(e.message().contains("env_from_source"), "{e:?}");
         let e = parsed(serde_json::json!({"schema_version": "1.0", "command": "x", "install": {"command": "i", "unless_exists": "/etc"}})).unwrap_err();

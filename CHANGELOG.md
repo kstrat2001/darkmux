@@ -70,14 +70,24 @@ darkmux release.
   `core.fsmonitor`, hooks, signing, `core.sshCommand`, `credential.helper` and external diffs off
   and no system config. A run that rewrites its workspace's `.git` changes nothing on the host. A
   run inside a client workspace's container no longer has a usable `.git` there.
+- Previews run in a container, not on the host (#3456). Each running preview gets one
+  long-lived container of its own from the darkmux runtime image (resolved as a dispatch resolves
+  it), with the dispatch container's hardening. The workspace is its only mount, so a recipe
+  cannot read a host path outside it; only the preview's app and HMR ports are published, on
+  127.0.0.1; and its environment is the recipe's `env`, the port variables and
+  `CHOKIDAR_USEPOLLING=true` / `WATCHPACK_POLLING=true` (file watching across the bind mount), with
+  nothing from the shell `client serve` started in. It stays up across dispatches, so edits
+  hot-reload. A stop, the idle check and `client serve`'s shutdown remove it, and one left behind
+  by a `client serve` that died is removed when the next starts. A dev server must listen on
+  `0.0.0.0` in its container; a Vite project sets `server.watch.usePolling: true`. `node_modules`
+  installed there holds Linux binaries (the workspace is darkmux's worktree, not your checkout).
+  A recipe's `env` keys must be variable names. Previews need Docker now.
 - Previews are off by default (`clients.preview.enabled`, CONFIG 2.8, default `false`). Even
   with its recipe read only from your own checkout, a preview runs the workspace's code (its
-  `package.json` scripts and whatever they load, which a model may have written) on this machine
-  as you, outside the dispatch sandbox. `darkmux config set clients.preview.enabled true` turns
-  it on. A running preview gets a stripped environment (`PATH`, `HOME`, `USER`, `LANG`, `TMPDIR`,
-  `TERM`, the recipe's `env` and its ports), and `env_from_source` never copies through a
-  symlink. Known gap: a file a running preview writes in the workspace during a run can be
-  committed as the run's.
+  `package.json` scripts and whatever they load, which a model may have written), in a container
+  with network access. `darkmux config set clients.preview.enabled true` turns it on.
+  `env_from_source` never copies through a symlink. Known gap: a file a running preview writes in
+  the workspace during a run can be committed as the run's.
 - A preview no app asks about stops on its own (#3459). An app that quit or crashed never stopped
   its preview, so its dev server ran until `client serve` did. Once a minute `client serve` stops
   every preview no app has asked about (a start or a status) for `clients.preview.idle_minutes`

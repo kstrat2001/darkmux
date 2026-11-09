@@ -479,6 +479,12 @@ The daemon's routes and response shapes are semver contracts, the same as the CL
 
 Known gap: a route's *behavior* (a filter, a status code on an error) is pinned only where a test asserts it; the golden pins the shape.
 
+## Client previews run in their own container
+
+A paired app's live preview (`darkmux client serve`, `crates/darkmux-serve/src/client_preview.rs`) runs a workspace's dev server, which is the workspace's own code: its `package.json` scripts and whatever they load, which a model may have written. Reading the recipe only from the user's own checkout (#3451) fixes where the commands come from; it cannot fix what they execute. So (#3456) a preview never runs on the host. Each running preview is one long-lived container, separate from dispatch containers, from the darkmux runtime image resolved the way a dispatch resolves it, with the dispatch container's hardening. Its only mount is the workspace; only its app and HMR ports are published, on 127.0.0.1, at the same numbers inside (so the HMR client finds them); and its environment is exactly the recipe's `env`, the port variables and the file-watcher polling switches, each passed as `-e KEY=value` so nothing of the host's environment can be copied in. It keeps the default network, because an install step fetches packages; that is why previews stay off by default (`clients.preview.enabled`).
+
+The workspace holds the state (code, `node_modules`, caches) and the container is disposable: it stays up across the dispatches that edit the workspace, so edits hot-reload, and a stop, the idle check (#3459) and `client serve`'s shutdown remove it. It carries its host's labels like a dispatch container, so one a `client serve` that died left behind is removed by the same reaper rule, under its own name prefix, when the next one starts. The shape `docker run` gets is one pure function (`docker_run_args`), asserted directly; the preview lifecycle runs against a test-only stand-in for Docker, and one opt-in test runs a real preview in the runtime image.
+
 ## CLI `--json` is a contract
 
 A script or an orchestrator binds to what a verb prints under `--json`, so from this release that shape is a semver contract, the same as the daemon's HTTP responses (`crates/darkmux-serve/route-table.golden` pins those). Three things hold it, and each fails a test when it slips.

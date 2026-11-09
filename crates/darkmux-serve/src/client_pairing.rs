@@ -40,6 +40,12 @@
 //! `GET /client/recipe?workspace=` returns a workspace's preview recipe, for
 //! an app that cannot read the disk itself.
 //!
+//! **Previews run in a container** ([`crate::client_preview`]): one per
+//! running preview, from the darkmux runtime image, the workspace its only
+//! mount, its two ports published on 127.0.0.1 only, and no host
+//! environment beyond the recipe's `env`. Stop, the idle check and
+//! `client serve`'s own shutdown remove it.
+//!
 //! **Previews trust only the user's own checkout.** A preview's recipe
 //! (`.darkmux/preview.json`) is a command darkmux runs, so it is read only
 //! from the checkout the workspace's worktree was made from (`source_path`),
@@ -787,6 +793,14 @@ pub fn run(port: u16) -> Result<()> {
         );
         let mut state = state;
         state.bound = Some(listener.local_addr()?);
+        let shutdown_previews = state.previews.clone();
+        // (#3456) Preview containers a `client serve` that died left behind.
+        let reaper = state.previews.clone();
+        std::thread::spawn(move || {
+            for name in reaper.reap_orphans() {
+                eprintln!("darkmux client serve: removed orphaned preview container {name} (its darkmux host is gone)");
+            }
+        });
         // (#3459) Previews no app asks about any more are stopped.
         let idle_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let _idle_check = spawn_preview_idle_check(
@@ -804,6 +818,14 @@ pub fn run(port: u16) -> Result<()> {
         .await
         .context("serving");
         idle_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        // (#3456) Shutting down removes every preview container.
+        let previews = shutdown_previews.clone();
+        let removed = tokio::task::spawn_blocking(move || previews.stop_all())
+            .await
+            .unwrap_or_default();
+        for name in removed {
+            eprintln!("{}", preview_log_line(&name, "shutdown", "stopped"));
+        }
         served
     })
 }
@@ -2243,8 +2265,9 @@ fn previews_allowed(state: &ClientServerState) -> Result<(), Refused> {
         Ok(false) => Err(refuse(
             StatusCode::FORBIDDEN,
             "previews are off on this machine: a preview runs the workspace's own code (its \
-             package.json scripts and whatever they call, which a model may have written) on this \
-             machine as you, outside the sandbox. To allow it: \
+             package.json scripts and whatever they call, which a model may have written) in a \
+             container with network access, the workspace mounted read-write and its ports \
+             published on 127.0.0.1. To allow it: \
              `darkmux config set clients.preview.enabled true`",
         )),
         Err(e) => Err(refuse(StatusCode::SERVICE_UNAVAILABLE, e)),
