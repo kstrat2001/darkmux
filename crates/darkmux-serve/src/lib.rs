@@ -50,6 +50,7 @@ pub mod mission_graph;
 /// scoped work through `darkmux dispatch` (local prototype).
 pub mod client_pairing;
 pub mod client_preview;
+pub mod client_profiles;
 pub mod client_workspace;
 mod fleet_listener;
 /// The fleet view: one row per roster machine, each with its own card.

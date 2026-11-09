@@ -5,6 +5,7 @@
 //! reads a real `config.json`.
 
 use super::*;
+use crate::client_profiles::{describe_profile, describe_profiles, work_stays_here};
 use axum::body::Body;
 use axum::http::Request;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -62,7 +63,7 @@ fn harness() -> Harness {
     let state = ClientServerState {
         store: store.clone(),
         now: Arc::new(move || c.load(Ordering::SeqCst)),
-        role_known: Arc::new(|role| Ok(role == "coder" || role == "radio-host")),
+        role_known: Arc::new(|role| Ok(["coder", "radio-host", "researcher"].contains(&role))),
         // A requested profile resolves to itself when defined here; an
         // omitted one resolves through the role's binding, as `darkmux
         // dispatch <role>` would: `coder` is bound to `fast`, `radio-host` to
@@ -76,12 +77,14 @@ fn harness() -> Harness {
             Some(p) => Err(format!("profile {p} is not defined on this machine")),
             None if role == "coder" => Ok("fast".to_string()),
             None if role == "radio-host" => Ok("deep".to_string()),
+            // `researcher` is bound to the hosted profile.
+            None if role == "researcher" => Ok("hosted".to_string()),
             None => Err("no profile resolves".to_string()),
         }),
         profiles_policy: Arc::new(move || pol.lock().unwrap().clone()),
         // `fast` and `deep` run on this machine; `hosted` sends work to a
         // hosted API, so it isn't local.
-        profile_is_local: Arc::new(|name| match name {
+        profile_is_local: Arc::new(|_role, name| match name {
             "fast" | "deep" => Ok(true),
             "hosted" => Ok(false),
             other => Err(format!("profile {other} is not in the registry")),
@@ -98,7 +101,7 @@ fn harness() -> Harness {
             id: "m-0123456789abcdef".into(),
             name: "studio".into(),
         },
-        profile_info: Arc::new(|names| names.iter().map(|n| test_profile_info(n)).collect()),
+        profile_info: Arc::new(|_role, names| names.iter().map(|n| test_profile_info(n)).collect()),
         check_workdir: Arc::new(move |p| {
             darkmux_types::workdir::validate_remote_workdir_in(p, &canon_base)
                 .map_err(|e| format!("{e:#}"))
@@ -972,6 +975,44 @@ async fn with_the_setting_unset_a_hosted_profile_is_403() {
         e.contains("isn't local") && e.contains("clients.profiles"),
         "says why and names the setting: {v}"
     );
+    assert!(h.ran.lock().unwrap().is_empty());
+}
+
+/// (review) With the setting unset, an omitted profile is checked like a
+/// named one: a role bound to a hosted profile does not run on it.
+#[tokio::test]
+async fn with_the_setting_unset_an_omitted_profile_that_is_hosted_is_403() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (code, v) = call(
+        &h,
+        post("/client/work", Some(&token), work_for("researcher")),
+    )
+    .await;
+    assert_eq!(code, 403, "{v}");
+    let e = v["error"].as_str().unwrap();
+    assert!(e.contains("hosted") && e.contains("isn't local"), "{v}");
+    assert!(h.ran.lock().unwrap().is_empty());
+    // Granted by name, it runs.
+    h.allow(&["hosted"]);
+    let (code, v) = call(
+        &h,
+        post("/client/work", Some(&token), work_for("researcher")),
+    )
+    .await;
+    assert_eq!(code, 202, "{v}");
+}
+
+/// (review) A locality check that cannot answer refuses, also for an
+/// omitted profile.
+#[tokio::test]
+async fn an_unanswerable_locality_check_refuses_an_omitted_profile() {
+    let mut h = harness();
+    h.state.profile_is_local = Arc::new(|_, _| Err("the registry did not load".to_string()));
+    let token = paired(&h).await;
+    let (code, v) = call(&h, post("/client/work", Some(&token), work_for("coder"))).await;
+    assert_eq!(code, 403, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("did not load"), "{v}");
     assert!(h.ran.lock().unwrap().is_empty());
 }
 
@@ -3387,6 +3428,31 @@ async fn profiles_for_another_role() {
     assert_eq!(v["profiles"][0]["name"], "deep");
 }
 
+/// (review) With the setting unset, the role's own profile is listed only
+/// when it runs here: a role bound to a hosted profile sees just the local
+/// ones.
+#[tokio::test]
+async fn profiles_never_list_a_roles_own_profile_that_is_hosted() {
+    let h = harness();
+    let t = paired(&h).await;
+    let (code, v) = call(
+        &h,
+        get(
+            "/client/profiles?role=researcher",
+            &[("authorization", &bearer(&t))],
+        ),
+    )
+    .await;
+    assert_eq!(code, 200, "{v}");
+    let names: Vec<&str> = v["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["deep", "fast"], "{v}");
+}
+
 #[tokio::test]
 async fn profiles_refuse_an_unknown_role() {
     let h = harness();
@@ -3496,9 +3562,9 @@ fn describe_profile_reads_the_registry_and_probes_its_server() {
     let (quick, gone, missing) =
         with_env_vars(&[("DARKMUX_PROFILES", registry.as_os_str())], || {
             (
-                describe_profile("quick"),
-                describe_profile("gone"),
-                describe_profile("nope"),
+                describe_profile("coder", "quick"),
+                describe_profile("coder", "gone"),
+                describe_profile("coder", "nope"),
             )
         });
     let quick = quick.unwrap();
@@ -3513,33 +3579,52 @@ fn describe_profile_reads_the_registry_and_probes_its_server() {
         .contains("not in this machine's profiles.json"));
 }
 
+/// (review) Whether a role's work on a profile stays on this machine is the
+/// resolved target's own classification, the one dispatch routes on
+/// (`brain_leaves_this_machine`): LM Studio stays; an unmanaged endpoint stays
+/// only when it is the machine's `default_engine` reached on loopback. A URL
+/// whose userinfo says `localhost` but whose host is elsewhere is hosted, and
+/// an endpoint id the registry does not define refuses.
 #[test]
 #[serial_test::serial]
-fn a_profile_is_local_when_every_model_runs_on_this_machine() {
+fn a_profile_is_local_only_when_its_selected_model_stays_on_this_machine() {
     let tmp = tempfile::tempdir().unwrap();
     let registry = tmp.path().join("profiles.json");
     std::fs::write(
         &registry,
         r#"{"profiles":{
             "managed":{"models":[{"id":"q","n_ctx":32000}]},
-            "loop4":{"models":[{"id":"f","n_ctx":32000,"endpoint":"l4"}]},
+            "engine":{"models":[{"id":"f","n_ctx":32000,"endpoint":"mlx"}]},
             "loop6":{"models":[{"id":"f","n_ctx":32000,"endpoint":"l6"}]},
-            "named":{"models":[{"id":"f","n_ctx":32000,"endpoint":"ln"}]},
             "hosted":{"models":[{"id":"c","n_ctx":32000,"endpoint":"api"}]},
-            "mixed":{"models":[{"id":"q","n_ctx":32000},{"id":"c","n_ctx":32000,"endpoint":"api"}]}
+            "userinfo":{"models":[{"id":"c","n_ctx":32000,"endpoint":"sneaky"}]},
+            "unresolved":{"models":[{"id":"c","n_ctx":32000,"endpoint":"nope"}]}
         },"endpoints":{
-            "l4":{"url":"http://127.0.0.1:11500/v1"},
+            "mlx":{"url":"http://127.0.0.1:11500/v1"},
             "l6":{"url":"http://[::1]:8090/v1"},
-            "ln":{"url":"http://localhost:8000/v1"},
-            "api":{"url":"https://api.example.com/v1"}
+            "api":{"url":"https://api.example.com/v1"},
+            "sneaky":{"url":"https://localhost:x@api.example.com/v1"}
         }}"#,
     )
     .unwrap();
-    let got = with_env_vars(&[("DARKMUX_PROFILES", registry.as_os_str())], || {
-        ["managed", "loop4", "loop6", "named", "hosted", "mixed"]
-            .map(|n| profile_runs_here(n).unwrap())
-    });
-    assert_eq!(got, [true, true, true, true, false, false]);
+    let got = with_env_vars(
+        &[
+            ("DARKMUX_PROFILES", registry.as_os_str()),
+            ("DARKMUX_DEFAULT_ENGINE", std::ffi::OsStr::new("mlx")),
+        ],
+        || {
+            ["managed", "engine", "loop6", "hosted", "userinfo", "unresolved", "absent"]
+                .map(|n| work_stays_here("coder", n))
+        },
+    );
+    let [managed, engine, loop6, hosted, userinfo, unresolved, absent] = got;
+    assert_eq!(managed, Ok(true), "LM Studio stays");
+    assert_eq!(engine, Ok(true), "the default engine on loopback stays");
+    assert_eq!(loop6, Ok(false), "a loopback server that is not the default engine is not this machine's");
+    assert_eq!(hosted, Ok(false));
+    assert_eq!(userinfo, Ok(false), "the host is api.example.com, whatever the userinfo says");
+    assert!(unresolved.as_ref().is_err_and(|e| e.contains("nope")), "{unresolved:?}");
+    assert!(absent.as_ref().is_err_and(|e| e.contains("not in this machine's profiles.json")), "{absent:?}");
 }
 
 #[tokio::test]
@@ -3620,7 +3705,7 @@ fn describing_many_profiles_looks_at_each_server_once() {
     names.push("nope".into());
     let started = std::time::Instant::now();
     let got = with_env_vars(&[("DARKMUX_PROFILES", registry.as_os_str())], || {
-        describe_profiles(&names)
+        describe_profiles("coder", &names)
     });
     let took = started.elapsed();
     assert!(
