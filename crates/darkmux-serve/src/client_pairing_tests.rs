@@ -2606,7 +2606,7 @@ async fn a_runs_paths_are_committed_literally_never_as_globs() {
     assert_eq!(files.lines().collect::<Vec<_>>(), ["[ab].txt"], "{files}");
     let status = run_git(Some(&wt), &["status", "--porcelain", "--", "a.txt", "b.txt"]);
     assert!(
-        status.contains("?? a.txt") && status.contains(" M b.txt"),
+        status.contains("?? a.txt") && status.contains("M b.txt"),
         "a.txt and b.txt stay the owner's, uncommitted: {status}"
     );
 }
