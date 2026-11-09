@@ -24,7 +24,12 @@ class H(BaseHTTPRequestHandler):
         body = json.dumps({"object": "list", "data": [{"id": name}]}).encode()
         self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(body)
     def log_message(self, *args): pass
-HTTPServer(("127.0.0.1", port), H).serve_forever()
+class S(HTTPServer):
+    def server_bind(self):
+        import socketserver
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = "localhost", self.server_address[1]
+S(("127.0.0.1", port), H).serve_forever()
 "#,
     )
     .unwrap();

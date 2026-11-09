@@ -3412,7 +3412,12 @@ class H(BaseHTTPRequestHandler):
         open({requests:?}, "ab").write(req + b"\n")
         self.reply({{"choices": [{{"message": {{"content": "ok"}}}}], "usage": {{"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}}})
     def log_message(self, *args): pass
-HTTPServer(("127.0.0.1", port), H).serve_forever()
+class S(HTTPServer):
+    def server_bind(self):
+        import socketserver
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = "localhost", self.server_address[1]
+S(("127.0.0.1", port), H).serve_forever()
 "#,
                 requests = requests.to_string_lossy()
             ),
