@@ -2593,13 +2593,22 @@ async fn status(h: &Harness, token: &str, id: &str) -> Value {
 async fn a_runs_paths_are_committed_literally_never_as_globs() {
     let h = harness();
     let wt = git_workspace(&h, "glob");
-    std::fs::write(wt.join("[ab].txt"), "made by the run\n").unwrap();
+    // `b.txt` is tracked and the owner has changed it; `a.txt` is new and
+    // the owner's too. The glob `[ab].txt` would match both.
+    std::fs::write(wt.join("b.txt"), "committed\n").unwrap();
+    run_git(Some(&wt), &["add", "b.txt"]);
+    run_git(Some(&wt), &["commit", "--quiet", "-m", "b"]);
     std::fs::write(wt.join("b.txt"), "the owner's, uncommitted\n").unwrap();
+    std::fs::write(wt.join("a.txt"), "the owner's, untracked\n").unwrap();
+    std::fs::write(wt.join("[ab].txt"), "made by the run\n").unwrap();
     let (sha, _) = commit_run(&wt, &["[ab].txt".to_string()], "coder: glob (work w-1)").unwrap();
     let files = run_git(Some(&wt), &["show", "--name-only", "--format=", &sha]);
     assert_eq!(files.lines().collect::<Vec<_>>(), ["[ab].txt"], "{files}");
-    let status = run_git(Some(&wt), &["status", "--porcelain", "--", "b.txt"]);
-    assert!(status.contains("?? b.txt"), "b.txt stays the owner's, uncommitted: {status}");
+    let status = run_git(Some(&wt), &["status", "--porcelain", "--", "a.txt", "b.txt"]);
+    assert!(
+        status.contains("?? a.txt") && status.contains(" M b.txt"),
+        "a.txt and b.txt stay the owner's, uncommitted: {status}"
+    );
 }
 
 #[tokio::test]
