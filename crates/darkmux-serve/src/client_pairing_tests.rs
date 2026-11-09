@@ -94,6 +94,10 @@ fn harness() -> Harness {
                 "utility".into(),
             ])
         }),
+        machine: ClientMachine {
+            id: "m-0123456789abcdef".into(),
+            name: "studio".into(),
+        },
         // `fast` is served and loaded; `deep` is declared but its server is
         // down; anything else isn't in the registry.
         profile_info: Arc::new(|name| match name {
@@ -344,7 +348,8 @@ async fn pairing_happy_path_delivers_a_token_that_whoami_accepts() {
     assert_eq!(code, 200, "{who}");
     assert_eq!(
         who,
-        serde_json::json!({"client_name": name, "scopes": {"profiles": "local", "workspace": true}})
+        serde_json::json!({"client_name": name, "scopes": {"profiles": "local", "workspace": true},
+                           "machine": {"id": "m-0123456789abcdef", "name": "studio"}})
     );
 }
 
@@ -3408,4 +3413,39 @@ fn a_profile_is_local_when_every_model_runs_on_this_machine() {
             .map(|n| profile_runs_here(n).unwrap())
     });
     assert_eq!(got, [true, true, true, true, false, false]);
+}
+
+#[tokio::test]
+async fn profiles_name_the_machine_they_run_on() {
+    let h = harness();
+    let t = paired(&h).await;
+    let (code, v) = call(
+        &h,
+        get("/client/profiles", &[("authorization", &bearer(&t))]),
+    )
+    .await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(
+        v["machine"],
+        serde_json::json!({"id": "m-0123456789abcdef", "name": "studio"})
+    );
+}
+
+#[test]
+fn the_machine_id_is_stable_and_never_the_raw_hardware_uuid() {
+    let a = ClientMachine::from_parts(Some("00000000-0000-4000-8000-ABCDEF000001"), "MacBook-Pro");
+    let b = ClientMachine::from_parts(Some("00000000-0000-4000-8000-ABCDEF000001"), "renamed");
+    assert_eq!(a.id, b.id, "a rename keeps the id");
+    assert!(a.id.starts_with("m-") && a.id.len() == 18, "{}", a.id);
+    assert!(
+        !a.id.to_lowercase().contains("abcdef000001"),
+        "a hash, not the uuid"
+    );
+    assert_eq!(a.name, "MacBook-Pro");
+    let other =
+        ClientMachine::from_parts(Some("00000000-0000-4000-8000-ABCDEF000002"), "MacBook-Pro");
+    assert_ne!(a.id, other.id);
+    // No hardware uuid (some platforms): still an id, from the name.
+    let unknown = ClientMachine::from_parts(None, "box");
+    assert!(unknown.id.starts_with("m-"));
 }

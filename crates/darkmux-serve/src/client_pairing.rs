@@ -506,6 +506,9 @@ pub struct ClientServerState {
     pub profile_is_local: Arc<dyn Fn(&str) -> Result<bool, String> + Send + Sync>,
     /// Every profile name in this machine's registry.
     pub registry_profiles: Arc<dyn Fn() -> Result<Vec<String>, String> + Send + Sync>,
+    /// This machine, as a paired app keys its per-machine settings: a stable
+    /// id (the same from the Mac app and the phone) and a display name.
+    pub machine: ClientMachine,
     /// The workdir containment check; returns the canonical path.
     pub check_workdir: Arc<dyn Fn(&Path) -> Result<PathBuf, String> + Send + Sync>,
     /// Runs one role execution, blocking; `Ok` is the dispatch's `--json` envelope.
@@ -560,6 +563,7 @@ impl ClientServerState {
                     .map(|l| l.registry.profiles.keys().cloned().collect())
                     .map_err(|e| format!("{e:#}"))
             }),
+            machine: ClientMachine::this_one(),
             check_workdir: Arc::new(|p| {
                 darkmux_types::workdir::validate_remote_workdir(p).map_err(|e| format!("{e:#}"))
             }),
@@ -898,6 +902,37 @@ fn authenticate(
     found.ok_or_else(unauthorized)
 }
 
+/// This machine, as `/client/whoami` and `/client/profiles` name it.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ClientMachine {
+    /// `m-` and 16 hex digits of a hash of the hardware uuid (never the
+    /// uuid itself): stable across renames and every device that pairs.
+    pub id: String,
+    /// The fleet name (`DARKMUX_MACHINE_ID`, else the hostname).
+    pub name: String,
+}
+
+impl ClientMachine {
+    pub fn from_parts(hardware_uid: Option<&str>, name: &str) -> ClientMachine {
+        let basis = hardware_uid
+            .map(|u| format!("uid:{u}"))
+            .unwrap_or_else(|| format!("name:{name}"));
+        let hash = blake3::hash(format!("darkmux client machine {basis}").as_bytes())
+            .to_hex()
+            .to_string();
+        ClientMachine {
+            id: format!("m-{}", &hash[..16]),
+            name: name.to_string(),
+        }
+    }
+
+    /// This process's machine.
+    pub fn this_one() -> ClientMachine {
+        let name = darkmux_flow::resolve_machine_id().unwrap_or_else(|| "this machine".to_string());
+        ClientMachine::from_parts(darkmux_hardware::machine_uid(), &name)
+    }
+}
+
 /// One profile an app may run on this machine, as `GET /client/profiles`
 /// reports it. Read-only: what the registry declares and whether its server
 /// answers right now.
@@ -993,7 +1028,8 @@ async fn profiles_handler(
     })
     .await
     .unwrap_or_default();
-    Json(serde_json::json!({ "role": role, "profiles": profiles })).into_response()
+    Json(serde_json::json!({ "role": role, "profiles": profiles, "machine": state.machine }))
+        .into_response()
 }
 
 /// The production [`ClientServerState::profile_is_local`]: every model of the
@@ -1082,7 +1118,7 @@ async fn whoami_handler(State(state): State<ClientServerState>, headers: HeaderM
     };
     match policy_or_503(&state) {
         Ok(policy) => {
-            Json(serde_json::json!({"client_name": client.name, "scopes": scopes_json(&policy)}))
+            Json(serde_json::json!({"client_name": client.name, "scopes": scopes_json(&policy), "machine": state.machine}))
                 .into_response()
         }
         Err(r) => r,
