@@ -3321,6 +3321,35 @@ async fn a_recorded_checkout_that_became_a_symlink_gets_no_preview() {
     assert!(v["error"].as_str().unwrap().contains("symlink"), "{v}");
 }
 
+/// (review) darkmux's records beside a workspace count only as plain files:
+/// a record that is a symlink (to a file naming the user's checkout, or a
+/// repository) is no record.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_record_that_is_a_symlink_is_no_record() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (mine, _name, _ws) = checkout_workspace(&h, &token).await;
+    recipe(&mine, serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}));
+    let (code, v) = call(&h, post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR}))).await;
+    assert_eq!(code, 201, "{v}");
+    let base = h.base.canonicalize().unwrap();
+    let named = h.dir.path().join("names-mine.txt");
+    std::fs::write(&named, format!("{}\n", mine.canonicalize().unwrap().display())).unwrap();
+    std::os::unix::fs::symlink(&named, base.join(".hcr.source")).unwrap();
+    let (code, v) = start_preview(&h, &token, "hcr").await;
+    assert_eq!(code, 404, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("not made from a checkout of yours"), "{v}");
+    // The repository record too: linked, host git has no repository there.
+    let held = base.join(".hcr.gitdir");
+    let real = h.dir.path().join("hcr-gitdir-record");
+    std::fs::rename(&held, &real).unwrap();
+    std::os::unix::fs::symlink(&real, &held).unwrap();
+    let (code, v) = call(&h, get("/client/workspaces/hcr", &[("authorization", &bearer(&token))])).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["head"], "", "no repository read through a linked record: {v}");
+}
+
 #[tokio::test]
 async fn install_runs_only_when_its_marker_is_missing() {
     let h = harness();
