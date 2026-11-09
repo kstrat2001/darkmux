@@ -97,46 +97,86 @@ pub(crate) fn approve_interactive(
     input: &mut dyn BufRead,
     out: &mut dyn Write,
 ) -> Result<i32> {
-    if let Some(code) = code {
-        let p = match cp::find_by_code(store, code, now) {
-            Ok(p) => p,
-            Err(e) => {
-                writeln!(out, "{e}")?;
-                return Ok(1);
-            }
-        };
-        writeln!(out, "pairing request:\n{}", describe(&p, now))?;
-        if ask(input, out, "approve? [y/N] ")? == "y" {
-            let name = cp::approve(store, &p.request_id, now)?;
-            writeln!(
-                out,
-                "approved as client {name}; the app collects its token on its next poll"
-            )?;
-            return Ok(0);
-        }
-        writeln!(out, "not approved")?;
-        return Ok(1);
+    match code {
+        Some(code) => approve_by_code(store, now, code, input, out),
+        None => approve_each_pending(store, now, input, out),
     }
+}
+
+/// `--code`: the one request showing it, approved only on an explicit `y`.
+fn approve_by_code(
+    store: &ClientStore,
+    now: u64,
+    code: &str,
+    input: &mut dyn BufRead,
+    out: &mut dyn Write,
+) -> Result<i32> {
+    let p = match cp::find_by_code(store, code, now) {
+        Ok(p) => p,
+        Err(e) => {
+            writeln!(out, "{e}")?;
+            return Ok(1);
+        }
+    };
+    writeln!(out, "pairing request:\n{}", describe(&p, now))?;
+    if ask(input, out, "approve? [y/N] ")? == "y" {
+        let name = cp::approve(store, &p.request_id, now)?;
+        writeln!(
+            out,
+            "approved as client {name}; the app collects its token on its next poll"
+        )?;
+        return Ok(0);
+    }
+    writeln!(out, "not approved")?;
+    Ok(1)
+}
+
+/// No `--code`: every live request in turn.
+fn approve_each_pending(
+    store: &ClientStore,
+    now: u64,
+    input: &mut dyn BufRead,
+    out: &mut dyn Write,
+) -> Result<i32> {
     let pending = cp::list_pending(store, now)?;
     if pending.is_empty() {
         writeln!(out, "no pending pairing requests")?;
         return Ok(0);
     }
     for p in pending {
-        writeln!(out, "pairing request:\n{}", describe(&p, now))?;
-        match ask(input, out, "approve? [y/N, d = deny] ")?.as_str() {
-            "y" | "yes" => {
-                let name = cp::approve(store, &p.request_id, now)?;
-                writeln!(out, "approved as client {name}")?;
-            }
-            "d" | "deny" => {
-                cp::deny(store, &p.request_id, now)?;
-                writeln!(out, "denied")?;
-            }
-            _ => writeln!(out, "left pending")?,
-        }
+        offer(store, now, &p, input, out)?;
     }
     Ok(0)
+}
+
+/// One request: `y` approves, `d` denies, anything else leaves it pending.
+fn offer(
+    store: &ClientStore,
+    now: u64,
+    p: &PendingRequest,
+    input: &mut dyn BufRead,
+    out: &mut dyn Write,
+) -> Result<()> {
+    writeln!(out, "pairing request:\n{}", describe(p, now))?;
+    let reply = ask(input, out, "approve? [y/N, d = deny] ")?;
+    let outcome = act_on(store, now, p, &reply)?;
+    writeln!(out, "{outcome}")?;
+    Ok(())
+}
+
+/// Carries out one reply to a request and says what happened.
+fn act_on(store: &ClientStore, now: u64, p: &PendingRequest, reply: &str) -> Result<String> {
+    Ok(match reply {
+        "y" | "yes" => {
+            let name = cp::approve(store, &p.request_id, now)?;
+            format!("approved as client {name}")
+        }
+        "d" | "deny" => {
+            cp::deny(store, &p.request_id, now)?;
+            "denied".to_string()
+        }
+        _ => "left pending".to_string(),
+    })
 }
 
 fn list(store: &ClientStore, now: u64) -> Result<i32> {

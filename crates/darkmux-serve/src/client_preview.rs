@@ -177,6 +177,46 @@ fn group_alive(pgid: i32) -> bool {
     }
 }
 
+/// The workspace's `.darkmux/preview.json`, parsed and checked. The caller
+/// matches on "no .darkmux/preview.json", so that wording is load-bearing.
+fn load_recipe(workdir: &Path) -> Result<Recipe, String> {
+    let recipe_path = workdir.join(".darkmux/preview.json");
+    if std::fs::symlink_metadata(&recipe_path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err("the preview recipe is a symlink; refusing".into());
+    }
+    let text = std::fs::read_to_string(&recipe_path)
+        .map_err(|_| "this workspace has no .darkmux/preview.json".to_string())?;
+    let recipe: Recipe = serde_json::from_str(&text).map_err(|e| format!("preview.json: {e}"))?;
+    check_recipe_paths(&recipe)?;
+    Ok(recipe)
+}
+
+/// Every path a recipe names stays inside the work copy.
+fn check_recipe_paths(recipe: &Recipe) -> Result<(), String> {
+    for f in &recipe.env_from_source {
+        if !plain_relative(f) {
+            return Err(format!(
+                "env_from_source: {f:?} must be a plain relative path"
+            ));
+        }
+    }
+    if let Some(u) = recipe
+        .install
+        .as_ref()
+        .and_then(|i| i.unless_exists.as_ref())
+    {
+        if !plain_relative(u) {
+            return Err(format!(
+                "install.unless_exists: {u:?} must be a plain relative path"
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl Previews {
     pub fn new(dir: PathBuf, watch_pid: u32) -> Self {
         Self {
@@ -219,35 +259,7 @@ impl Previews {
                 return Ok((Self::snapshot(name, &e), true));
             }
         }
-        let recipe_path = workdir.join(".darkmux/preview.json");
-        if std::fs::symlink_metadata(&recipe_path)
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(false)
-        {
-            return Err("the preview recipe is a symlink; refusing".into());
-        }
-        let text = std::fs::read_to_string(&recipe_path)
-            .map_err(|_| "this workspace has no .darkmux/preview.json".to_string())?;
-        let recipe: Recipe =
-            serde_json::from_str(&text).map_err(|e| format!("preview.json: {e}"))?;
-        for f in &recipe.env_from_source {
-            if !plain_relative(f) {
-                return Err(format!(
-                    "env_from_source: {f:?} must be a plain relative path"
-                ));
-            }
-        }
-        if let Some(u) = recipe
-            .install
-            .as_ref()
-            .and_then(|i| i.unless_exists.as_ref())
-        {
-            if !plain_relative(u) {
-                return Err(format!(
-                    "install.unless_exists: {u:?} must be a plain relative path"
-                ));
-            }
-        }
+        let recipe = load_recipe(workdir)?;
         std::fs::create_dir_all(&self.dir).map_err(|e| format!("{}: {e}", self.dir.display()))?;
         let (port, hmr_port) = (free_port()?, free_port()?);
         let log = self.dir.join(format!("{name}.log"));
@@ -327,6 +339,28 @@ fn sh(command: &str, workdir: &Path, log: &Path) -> std::process::Command {
     cmd
 }
 
+/// Why a preview's run ended before its dev server did: it was stopped (say
+/// nothing), or it failed (say why).
+enum Halt {
+    Stopped,
+    Failed(String),
+}
+
+impl From<String> for Halt {
+    fn from(why: String) -> Self {
+        Halt::Failed(why)
+    }
+}
+
+/// Moves the preview to `status`, or halts if it was stopped meanwhile.
+fn advance(entry: &Arc<Mutex<Entry>>, status: Status) -> Result<(), Halt> {
+    if set(entry, status) {
+        Ok(())
+    } else {
+        Err(Halt::Stopped)
+    }
+}
+
 fn run(
     entry: Arc<Mutex<Entry>>,
     recipe: Recipe,
@@ -336,48 +370,108 @@ fn run(
     hmr_port: u16,
     watch: u32,
 ) {
-    let fail = |why: String| {
+    let ended = prepare(&entry, &recipe, &workdir, &log)
+        .and_then(|()| serve(&entry, &recipe, &workdir, &log, port, hmr_port, watch));
+    // A stop is already recorded; `set` never overwrites it with a failure.
+    if let Err(Halt::Failed(why)) = ended {
         set(&entry, Status::Failed(why));
-    };
-    // Untracked files the dev server needs, from the checkout this worktree
-    // came from; never overwritten.
-    if let Some(source) = source_of(&workdir) {
-        for f in &recipe.env_from_source {
-            let (from, to) = (source.join(f), workdir.join(f));
-            if from.is_file() && std::fs::symlink_metadata(&to).is_err() {
-                if let Err(e) = std::fs::copy(&from, &to) {
-                    return fail(format!("copying {f} from {}: {e}", source.display()));
-                }
-            }
-        }
     }
+}
+
+/// Everything before the dev server: env files, then the install step.
+fn prepare(
+    entry: &Arc<Mutex<Entry>>,
+    recipe: &Recipe,
+    workdir: &Path,
+    log: &Path,
+) -> Result<(), Halt> {
+    copy_env_from_source(recipe, workdir)?;
     if let Some(install) = &recipe.install {
-        let needed = install
-            .unless_exists
-            .as_ref()
-            .map(|p| std::fs::symlink_metadata(workdir.join(p)).is_err())
-            .unwrap_or(true);
-        if needed {
-            if !set(&entry, Status::Installing) {
-                return;
-            }
-            match sh(&install.command, &workdir, &log).status() {
-                Ok(s) if s.success() => {}
-                Ok(s) => return fail(format!("install ({}) exited with {s}", install.command)),
-                Err(e) => return fail(format!("install: {e}")),
-            }
-            if !set(&entry, Status::Starting) {
-                return;
+        install_deps(entry, install, workdir, log)?;
+    }
+    Ok(())
+}
+
+/// Untracked files the dev server needs, from the checkout this worktree
+/// came from; never overwritten.
+fn copy_env_from_source(recipe: &Recipe, workdir: &Path) -> Result<(), String> {
+    let Some(source) = source_of(workdir) else {
+        return Ok(());
+    };
+    for f in &recipe.env_from_source {
+        let (from, to) = (source.join(f), workdir.join(f));
+        if from.is_file() && std::fs::symlink_metadata(&to).is_err() {
+            if let Err(e) = std::fs::copy(&from, &to) {
+                return Err(format!("copying {f} from {}: {e}", source.display()));
             }
         }
     }
-    // The dev server in its own process group, under a watchdog: the group
-    // ends when the server exits, or when darkmux (`watch`) is gone.
+    Ok(())
+}
+
+/// Runs the recipe's install command unless its `unless_exists` path is
+/// already there.
+fn install_deps(
+    entry: &Arc<Mutex<Entry>>,
+    install: &Install,
+    workdir: &Path,
+    log: &Path,
+) -> Result<(), Halt> {
+    let needed = install
+        .unless_exists
+        .as_ref()
+        .map(|p| std::fs::symlink_metadata(workdir.join(p)).is_err())
+        .unwrap_or(true);
+    if !needed {
+        return Ok(());
+    }
+    advance(entry, Status::Installing)?;
+    match sh(&install.command, workdir, log).status() {
+        Ok(s) if s.success() => {}
+        Ok(s) => return Err(format!("install ({}) exited with {s}", install.command).into()),
+        Err(e) => return Err(format!("install: {e}").into()),
+    }
+    advance(entry, Status::Starting)
+}
+
+/// Starts the dev server, waits for it to answer, then waits for it to end.
+/// It only ever returns a halt: a dev server is never expected to exit, so
+/// an exit after ready is a failure unless it was stopped.
+fn serve(
+    entry: &Arc<Mutex<Entry>>,
+    recipe: &Recipe,
+    workdir: &Path,
+    log: &Path,
+    port: u16,
+    hmr_port: u16,
+    watch: u32,
+) -> Result<(), Halt> {
+    let mut child = spawn_server(recipe, workdir, log, port, hmr_port, watch)?;
+    let pgid = adopt(entry, &mut child)?;
+    wait_ready(entry, &mut child, pgid, port, &ready_path(recipe))?;
+    // Ready: wait for it to end, and say so unless it was stopped.
+    let status = child.wait();
+    Err(Halt::Failed(format!(
+        "the dev server exited ({})",
+        status.map(|s| s.to_string()).unwrap_or_default()
+    )))
+}
+
+/// The dev server in its own process group, under a watchdog: the group
+/// ends when the server exits, or when darkmux (`watch`) is gone.
+fn spawn_server(
+    recipe: &Recipe,
+    workdir: &Path,
+    log: &Path,
+    port: u16,
+    hmr_port: u16,
+    watch: u32,
+) -> Result<std::process::Child, String> {
     let wrapper = format!(
         "trap 'kill 0' EXIT; ( {} ) & server=$!; while kill -0 {watch} 2>/dev/null && kill -0 $server 2>/dev/null; do sleep 1; done; if kill -0 $server 2>/dev/null; then exit 0; fi; wait $server",
         recipe.command
     );
-    let mut cmd = sh(&wrapper, &workdir, &log);
+    let mut cmd = sh(&wrapper, workdir, log);
     for (k, v) in &recipe.env {
         cmd.env(k, substitute(v, port, hmr_port));
     }
@@ -393,53 +487,63 @@ fn run(
             Ok(())
         });
     }
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => return fail(format!("starting {}: {e}", recipe.command)),
-    };
+    cmd.spawn()
+        .map_err(|e| format!("starting {}: {e}", recipe.command))
+}
+
+/// Records the server's process group so `stop` can reach it; if the
+/// preview was stopped while it spawned, ends it instead.
+fn adopt(entry: &Arc<Mutex<Entry>>, child: &mut std::process::Child) -> Result<i32, Halt> {
     let pgid = child.id() as i32;
-    {
-        let mut e = entry.lock().unwrap();
-        if e.status == Status::Stopped {
-            drop(e);
-            kill_group(pgid, 15);
-            let _ = child.wait();
-            return;
-        }
-        e.pgid = Some(pgid);
+    let mut e = entry.lock().unwrap();
+    if e.status == Status::Stopped {
+        drop(e);
+        kill_group(pgid, 15);
+        let _ = child.wait();
+        return Err(Halt::Stopped);
     }
-    let path = recipe
+    e.pgid = Some(pgid);
+    Ok(pgid)
+}
+
+/// The path the readiness probe asks for: the recipe's `ready.http`, else `/`.
+fn ready_path(recipe: &Recipe) -> String {
+    recipe
         .ready
         .as_ref()
         .and_then(|r| r.http.clone())
-        .unwrap_or_else(|| "/".to_string());
+        .unwrap_or_else(|| "/".to_string())
+}
+
+/// Polls until the server answers on `path`; halts if it exits, is
+/// stopped, or stays silent for 3 minutes.
+fn wait_ready(
+    entry: &Arc<Mutex<Entry>>,
+    child: &mut std::process::Child,
+    pgid: i32,
+    port: u16,
+    path: &str,
+) -> Result<(), Halt> {
     let deadline = Instant::now() + Duration::from_secs(180);
     loop {
         if let Ok(Some(status)) = child.try_wait() {
-            return fail(format!("the dev server exited ({status})"));
+            return Err(format!("the dev server exited ({status})").into());
         }
         if entry.lock().unwrap().status == Status::Stopped {
             let _ = child.wait();
-            return;
+            return Err(Halt::Stopped);
         }
-        if http_ok(port, &path) {
-            set(&entry, Status::Ready);
-            break;
+        if http_ok(port, path) {
+            set(entry, Status::Ready);
+            return Ok(());
         }
         if Instant::now() > deadline {
             kill_group(pgid, 15);
-            return fail("the dev server didn't answer within 3 minutes".into());
+            return Err(Halt::Failed(
+                "the dev server didn't answer within 3 minutes".into(),
+            ));
         }
         std::thread::sleep(Duration::from_millis(300));
-    }
-    // Ready: wait for it to end, and say so unless it was stopped.
-    let status = child.wait();
-    let mut e = entry.lock().unwrap();
-    if e.status != Status::Stopped {
-        e.status = Status::Failed(format!(
-            "the dev server exited ({})",
-            status.map(|s| s.to_string()).unwrap_or_default()
-        ));
     }
 }
 
@@ -461,6 +565,37 @@ mod tests {
     fn ports_are_substituted() {
         assert_eq!(substitute("{port}:{hmrPort}", 4100, 4200), "4100:4200");
         assert_eq!(substitute("127.0.0.1", 1, 2), "127.0.0.1");
+    }
+
+    #[test]
+    fn a_failed_install_says_so_and_never_starts_the_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().join("w");
+        std::fs::create_dir_all(wt.join(".darkmux")).unwrap();
+        let recipe = serde_json::json!({
+            "command": "touch server-ran",
+            "install": {"command": "exit 4", "unless_exists": "deps"}
+        });
+        std::fs::write(wt.join(".darkmux/preview.json"), recipe.to_string()).unwrap();
+        let previews = Previews::new(dir.path().join("p"), std::process::id());
+        previews.start("w", &wt).unwrap();
+        let mut v = serde_json::Value::Null;
+        for _ in 0..200 {
+            v = previews.status("w").unwrap();
+            if v["status"] == "failed" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(v["status"], "failed", "{v}");
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("install (exit 4) exited with"),
+            "{v}"
+        );
+        assert!(!wt.join("server-ran").exists(), "the server never ran");
     }
 
     #[test]
