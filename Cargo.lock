@@ -910,6 +910,7 @@ dependencies = [
  "darkmux-flow",
  "darkmux-hardware",
  "darkmux-lab",
+ "darkmux-platform",
  "darkmux-profiles",
  "darkmux-types",
  "futures",

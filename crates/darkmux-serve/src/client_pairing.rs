@@ -14,14 +14,20 @@
 //! **Pairing.** The app `POST`s `/client/pair` with a device name, a code it
 //! shows its user and a random `pair_secret` (a `scopes` field is accepted
 //! and ignored: what an app may run is machine policy, not the app's ask). The
-//! operator runs `darkmux client approve` here, sees the device, code and age,
-//! and approves (or denies). A pairing records identity only. The app polls `/client/pair/{id}` with
+//! operator runs `darkmux client approve --code <CODE>` here with the code the
+//! app shows, sees the device, code and age, and approves (or denies). A
+//! pairing records identity only. The app polls `/client/pair/{id}` with
 //! `X-Pair-Secret`; on the first poll after approval this listener mints the
 //! token (32 random bytes, hex), stores ONLY its BLAKE3 hash as an approved
 //! client, deletes the pending record and returns the token. A later poll is
 //! a 404: the token is delivered exactly once and is never on disk. A wrong
 //! secret is a 404 too, so a request id alone reveals nothing. A request
-//! expires ten minutes after it was made, approved or not.
+//! expires ten minutes after it was made, approved or not; until the app
+//! collects it, `client revoke <name>` (or a deny) takes an approval back.
+//! A container reaches this listener through Docker's one forwarding
+//! process, with any `Host` it likes, so no one process on this machine may
+//! have more than [`PAIR_REQUESTS_PER_PROCESS`] requests waiting: its next
+//! replaces its oldest, and it can never fill the queue ([`make_room`]).
 //!
 //! **Work.** `POST /client/work` with `Authorization: Bearer <token>` runs one
 //! role execution through the existing dispatch path: this binary is spawned
@@ -38,9 +44,22 @@
 //! must be granted by name). A `workdir` must be exactly one workspace
 //! directly under the worktrees base (#3451 review): never the base itself,
 //! a dot entry beside the workspaces (darkmux's held repositories and
-//! records) or a path inside a workspace.
+//! records) or a path inside a workspace. And it must be one darkmux made
+//! for this client: every workspace records the client it was made for
+//! (`.<name>.client` beside it), and every route that names a workspace
+//! refuses another app's, a mission's worktrees, or any folder no app asked
+//! darkmux for ([`owned_workspace`]). One made before workspaces had an
+//! owner is claimed by the first client a workspace request hands it to.
 //! `GET /client/recipe?workspace=` returns a workspace's preview recipe, for
 //! an app that cannot read the disk itself.
+//!
+//! **A work copy's history is the runs'.** Whatever a run changed in its
+//! work copy becomes one commit of its own however it ended (a failed or
+//! cancelled run's commit message says so), so the next run's commit never
+//! carries it and Undo can revert it. A run that produced its result is
+//! done, even when a cancel lands after it finished. Undo waits while
+//! another run works in the same copy, and no run starts there while an
+//! Undo reverts.
 //!
 //! **Previews run in a container** ([`crate::client_preview`]): one per
 //! running preview, from the darkmux runtime image, the workspace its only
@@ -106,6 +125,9 @@ pub const PENDING_TTL_SECS: u64 = 600;
 const KEEP_FINISHED_SECS: u64 = 3600;
 /// Live (unexpired, undecided) requests at once; more is a 429.
 pub const MAX_PENDING: usize = 16;
+/// Live requests one process on this machine may have waiting at once; its
+/// next replaces its oldest.
+pub const PAIR_REQUESTS_PER_PROCESS: usize = 2;
 /// The largest request body any route reads.
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
 /// Work a single client may have running at once.
@@ -388,7 +410,8 @@ pub fn approve(store: &ClientStore, request_id: &str, now: u64) -> Result<String
     })
 }
 
-/// Deny a live request.
+/// Deny a live request, or take back an approval its app has not collected
+/// yet: its token is then never minted, and the app hears `denied`.
 pub fn deny(store: &ClientStore, request_id: &str, now: u64) -> Result<()> {
     store.update(|f| {
         let p = f
@@ -396,10 +419,11 @@ pub fn deny(store: &ClientStore, request_id: &str, now: u64) -> Result<()> {
             .iter_mut()
             .find(|p| p.request_id == request_id)
             .ok_or_else(|| anyhow!("no pairing request {request_id}"))?;
-        if !p.live(now) {
-            bail!("pairing request {request_id} is no longer pending (expired or already decided)");
+        if p.expired(now) || p.status == PendingStatus::Denied {
+            bail!("pairing request {request_id} is no longer pending (expired or already denied)");
         }
         p.status = PendingStatus::Denied;
+        p.client_name = None;
         Ok(())
     })
 }
@@ -408,12 +432,36 @@ pub fn list_clients(store: &ClientStore) -> Result<Vec<ApprovedClient>> {
     Ok(store.read()?.clients)
 }
 
-/// Remove a client by name; `false` when there is none.
+/// Approvals whose app has not collected its token yet (unexpired), oldest
+/// first: each will be a client by its `client_name`, and `revoke` of that
+/// name takes it back.
+pub fn list_uncollected(store: &ClientStore, now: u64) -> Result<Vec<PendingRequest>> {
+    let mut out: Vec<PendingRequest> = store
+        .read()?
+        .pending
+        .into_iter()
+        .filter(|p| p.status == PendingStatus::Approved && !p.expired(now))
+        .collect();
+    out.sort_by_key(|p| p.created);
+    Ok(out)
+}
+
+/// Remove a client by name, and take back an approval its app has not
+/// collected yet under that name (denied, so its token is never minted);
+/// `false` when there is neither.
 pub fn revoke(store: &ClientStore, name: &str) -> Result<bool> {
     store.update(|f| {
         let before = f.clients.len();
         f.clients.retain(|c| c.name != name);
-        Ok(f.clients.len() != before)
+        let mut found = f.clients.len() != before;
+        for p in f.pending.iter_mut().filter(|p| p.status == PendingStatus::Approved) {
+            if p.client_name.as_deref() == Some(name) {
+                p.status = PendingStatus::Denied;
+                p.client_name = None;
+                found = true;
+            }
+        }
+        Ok(found)
     })
 }
 
@@ -514,6 +562,8 @@ pub struct WorkEntry {
     pub baseline: Option<String>,
     /// Undone (its commit reverted): decided once.
     pub decided: Option<String>,
+    /// Its Undo is reverting now: no run starts in its work copy meanwhile.
+    pub undoing: bool,
     /// The run this one follows up on (a Tweak).
     pub continues: Option<String>,
     /// The commit message's title.
@@ -560,6 +610,9 @@ pub type PreviewMinutes = Arc<dyn Fn() -> Result<u64, String> + Send + Sync>;
 /// (role, work id) -> what that running work's dispatch is doing besides its
 /// turns, as the run lifecycle decides it ([`work_activity_in`]).
 pub type WorkActivity = Arc<dyn Fn(&str, &str) -> (Option<crate::runs::RunActivity>, Option<u64>) + Send + Sync>;
+/// (peer, the listener's address) -> the process on this machine that sent
+/// a request from `peer`; `None` when that cannot be told.
+pub type PeerProcess = Arc<dyn Fn(SocketAddr, Option<SocketAddr>) -> Option<u32> + Send + Sync>;
 /// Runs one role execution, blocking.
 pub type Execute = Arc<dyn Fn(WorkSpec, Arc<CancelFlag>) -> Result<Value, RunError> + Send + Sync>;
 
@@ -624,6 +677,13 @@ pub struct ClientServerState {
     /// This machine's `clients.preview.idle_minutes`, read at every idle
     /// check (`Err`: unreadable, so that check stops nothing).
     pub preview_idle_minutes: PreviewMinutes,
+    /// Which process on this machine sent a pairing request.
+    pub peer_process: PeerProcess,
+    /// The process each waiting pairing request came from, by request id,
+    /// when it could be told: no process holds more than
+    /// [`PAIR_REQUESTS_PER_PROCESS`] of them. In memory only; a restart
+    /// forgets it (those requests then count only toward [`MAX_PENDING`]).
+    pub pair_peers: Arc<Mutex<HashMap<String, u32>>>,
 }
 
 impl ClientServerState {
@@ -686,6 +746,8 @@ impl ClientServerState {
             bound: None,
             preview_enabled: Arc::new(read_preview_enabled),
             preview_idle_minutes: Arc::new(read_preview_idle_minutes),
+            peer_process: Arc::new(|peer, bound| darkmux_platform::current().tcp_peer_pid(bound?, peer)),
+            pair_peers: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 }
@@ -1033,7 +1095,11 @@ struct PairBody {
     scopes: Option<serde::de::IgnoredAny>,
 }
 
-pub(crate) async fn pair_handler(State(state): State<ClientServerState>, body: Body) -> Response {
+pub(crate) async fn pair_handler(
+    State(state): State<ClientServerState>,
+    peer: Option<axum::extract::ConnectInfo<SocketAddr>>,
+    body: Body,
+) -> Response {
     let req: PairBody = match json_body(body).await {
         Ok(r) => r,
         Err(r) => return r,
@@ -1051,6 +1117,7 @@ pub(crate) async fn pair_handler(State(state): State<ClientServerState>, body: B
         Ok(h) => format!("r-{h}"),
         Err(e) => return internal(e),
     };
+    let from = peer_process_of(&state, peer).await;
     let record = PendingRequest {
         request_id: request_id.clone(),
         device_name: req.device_name,
@@ -1060,15 +1127,7 @@ pub(crate) async fn pair_handler(State(state): State<ClientServerState>, body: B
         status: PendingStatus::Pending,
         client_name: None,
     };
-    let added = state.store.update(|f| {
-        prune(f, now);
-        if f.pending.iter().filter(|p| p.live(now)).count() >= MAX_PENDING {
-            return Ok(false);
-        }
-        f.pending.push(record);
-        Ok(true)
-    });
-    match added {
+    match add_pending(&state, record, from, now) {
         Ok(true) => (
             StatusCode::ACCEPTED,
             Json(PairAccepted { request_id }),
@@ -1079,6 +1138,54 @@ pub(crate) async fn pair_handler(State(state): State<ClientServerState>, body: B
             "too many pairing requests are waiting; try again later",
         ),
         Err(e) => internal(e),
+    }
+}
+
+/// The process on this machine a pairing request came from, when that can
+/// be told (off the async workers: it may ask the OS).
+async fn peer_process_of(state: &ClientServerState, peer: Option<axum::extract::ConnectInfo<SocketAddr>>) -> Option<u32> {
+    let axum::extract::ConnectInfo(p) = peer?;
+    let st = state.clone();
+    tokio::task::spawn_blocking(move || (st.peer_process)(p, st.bound)).await.unwrap_or(None)
+}
+
+/// Stores a new pairing request from process `from` under the bounds
+/// ([`make_room`], then [`MAX_PENDING`]); `false` when the queue is full.
+fn add_pending(state: &ClientServerState, record: PendingRequest, from: Option<u32>, now: u64) -> Result<bool> {
+    state.store.update(|f| {
+        prune(f, now);
+        let mut peers = state.pair_peers.lock().unwrap();
+        make_room(f, &mut peers, from, now);
+        if f.pending.iter().filter(|p| p.live(now)).count() >= MAX_PENDING {
+            return Ok(false);
+        }
+        if let Some(pid) = from {
+            peers.insert(record.request_id.clone(), pid);
+        }
+        f.pending.push(record);
+        Ok(true)
+    })
+}
+
+/// Forgets the processes of requests no longer waiting; then, when process
+/// `from` already has [`PAIR_REQUESTS_PER_PROCESS`] requests waiting, drops
+/// its oldest (in the order they were made), so no one process on this
+/// machine can fill the queue. Every container's connection arrives from
+/// Docker's one forwarding process, with any `Host` it forges; the app on
+/// this machine is a process of its own.
+fn make_room(f: &mut ClientsFile, peers: &mut HashMap<String, u32>, from: Option<u32>, now: u64) {
+    peers.retain(|id, _| f.pending.iter().any(|p| &p.request_id == id && p.live(now)));
+    let Some(pid) = from else { return };
+    let mut mine: Vec<String> = f
+        .pending
+        .iter()
+        .filter(|p| p.live(now) && peers.get(&p.request_id) == Some(&pid))
+        .map(|p| p.request_id.clone())
+        .collect();
+    while mine.len() >= PAIR_REQUESTS_PER_PROCESS {
+        let oldest = mine.remove(0);
+        f.pending.retain(|p| p.request_id != oldest);
+        peers.remove(&oldest);
     }
 }
 
@@ -1419,9 +1526,10 @@ fn run_work(
     let flag = cancel.clone();
     let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| execute(spec, flag)));
     let status = run_status(ran, cancel, git.as_ref(), baseline.as_ref());
-    // A finished run's changes become one commit on the work copy's
-    // branch: a checkpoint Undo can revert.
-    let changed = changed_paths(&status);
+    // What the run changed becomes one commit on the work copy's branch,
+    // however it ended: a checkpoint Undo can revert, and never left
+    // uncommitted for the next run's commit to carry.
+    let (changed, unread) = run_files(&status, git.as_ref(), baseline.as_ref());
     let (title, role) = works
         .lock()
         .unwrap()
@@ -1429,16 +1537,13 @@ fn run_work(
         .map(|e| (e.title.clone(), e.role.clone()))
         .unwrap_or_default();
     let committed = match (&git, changed.is_empty()) {
-        (Some(w), false) => Some(commit_run(
-            w,
-            &changed,
-            &format!("{role}: {title} (work {id})"),
-        )),
+        (Some(w), false) => Some(commit_run(w, &changed, &commit_message(&role, &title, &id, &status))),
         _ => None,
     };
     if let Some(w) = works.lock().unwrap().get_mut(&id) {
         w.status = status;
         w.files = changed;
+        w.commit_error = unread;
         match committed {
             Some(Ok((sha, branch))) => {
                 w.commit = Some(sha);
@@ -1448,6 +1553,35 @@ fn run_work(
             None => {}
         }
     }
+}
+
+/// The paths an ended run changed, and (for a run that failed or was
+/// cancelled) why they could not be read. A finished run's changes are in
+/// its status already; one that failed or was cancelled is read now, so
+/// what it left is committed as its own.
+fn run_files(
+    status: &WorkStatus,
+    git: Option<&WorkCopy>,
+    baseline: Option<&Result<Snapshot, String>>,
+) -> (Vec<String>, Option<String>) {
+    match status {
+        WorkStatus::Error(_) | WorkStatus::Cancelled(_) => match run_changes(git, baseline) {
+            (Some(c), _) => (c.files.into_iter().map(|f| f.path).collect(), None),
+            (None, why) => (Vec::new(), why),
+        },
+        _ => (changed_paths(status), None),
+    }
+}
+
+/// A run's commit message: its role and title, and how it ended when it did
+/// not finish.
+fn commit_message(role: &str, title: &str, id: &str, status: &WorkStatus) -> String {
+    let ended = match status {
+        WorkStatus::Error(_) => ", failed",
+        WorkStatus::Cancelled(_) => ", cancelled",
+        _ => "",
+    };
+    format!("{role}: {title} (work {id}{ended})")
 }
 
 /// What a finished run changed, or why that could not be read. No work
@@ -1466,8 +1600,9 @@ fn run_changes(
     }
 }
 
-/// How a run ended. A cancelled run ends as cancelled, however its child
-/// reported.
+/// How a run ended. A run that produced its result finished, whenever a
+/// cancel landed (one after `dispatch.complete` stops nothing); one that
+/// did not and was cancelled ends as cancelled, however its child reported.
 fn run_status(
     ran: std::thread::Result<Result<Value, RunError>>,
     cancel: &CancelFlag,
@@ -1475,7 +1610,7 @@ fn run_status(
     baseline: Option<&Result<Snapshot, String>>,
 ) -> WorkStatus {
     match ran {
-        Ok(r) if cancel.requested() => WorkStatus::Cancelled(r.err()),
+        Ok(Err(e)) if cancel.requested() => WorkStatus::Cancelled(Some(e)),
         Err(_) if cancel.requested() => WorkStatus::Cancelled(None),
         Ok(Ok(result)) => {
             let (changes, changes_error) = run_changes(git, baseline);
@@ -1512,7 +1647,7 @@ fn admit(
     req: WorkBody,
 ) -> Result<WorkSpec, Refused> {
     check_role(state, &req.role)?;
-    let workdir = admitted_workdir(state, &req)?;
+    let workdir = admitted_workdir(state, client, &req)?;
     let profile = admitted_profile(state, &req)?;
     let work_id = format!("w-{}", random_hex(8).map_err(internal)?);
     let now = (state.now)();
@@ -1530,6 +1665,7 @@ fn admit(
             workdir: workdir.clone(),
             baseline: None,
             decided: None,
+            undoing: false,
             continues: req.continues.clone(),
             title: work_title(&req),
             role: req.role.clone(),
@@ -1571,8 +1707,13 @@ fn check_role(state: &ClientServerState, role: &str) -> Result<(), Refused> {
     }
 }
 
-/// Where the run works: a client-named workdir or a workspace, never both.
-fn admitted_workdir(state: &ClientServerState, req: &WorkBody) -> Result<Option<PathBuf>, Refused> {
+/// Where the run works: a client-named workdir or a workspace, never both,
+/// and always one darkmux made for this client ([`owned_workspace`]).
+fn admitted_workdir(
+    state: &ClientServerState,
+    client: &ApprovedClient,
+    req: &WorkBody,
+) -> Result<Option<PathBuf>, Refused> {
     match (&req.workdir, &req.workspace) {
         (Some(_), Some(_)) => Err(refuse(
             StatusCode::BAD_REQUEST, ClientCode::BadRequest,
@@ -1584,9 +1725,9 @@ fn admitted_workdir(state: &ClientServerState, req: &WorkBody) -> Result<Option<
         // inside one. It is then admitted as that workspace by name.
         (Some(w), None) => {
             let name = workspace_of_workdir(state, w)?;
-            Ok(Some(workspace_dir(state, &name)?))
+            Ok(Some(owned_workspace(state, client, &name)?))
         }
-        (None, Some(name)) => Ok(Some(workspace_dir(state, name)?)),
+        (None, Some(name)) => Ok(Some(owned_workspace(state, client, name)?)),
         (None, None) => Ok(None),
     }
 }
@@ -1686,14 +1827,8 @@ fn check_work_copy(
             None => Ok(()),
         };
     };
-    if let Some((id, _)) = works
-        .iter()
-        .find(|(_, e)| e.workdir.as_ref() == Some(w) && matches!(e.status, WorkStatus::Running))
-    {
-        return Err(refuse(
-            StatusCode::CONFLICT, ClientCode::Conflict,
-            format!("run {id} is already working in this work copy"),
-        ));
+    if let Some(r) = busy_copy(works, w) {
+        return Err(r);
     }
     if let Some(c) = continues {
         let ok = works.get(c).is_some_and(|e| {
@@ -1709,6 +1844,54 @@ fn check_work_copy(
         }
     }
     Ok(())
+}
+
+/// Why nothing may start in work copy `w` now, if something is using it:
+/// a run working in it, or an Undo reverting in it.
+fn busy_copy(works: &HashMap<String, WorkEntry>, w: &PathBuf) -> Option<Refused> {
+    let mut here = works.iter().filter(|(_, e)| e.workdir.as_ref() == Some(w));
+    let (id, e) = here.find(|(_, e)| e.undoing || matches!(e.status, WorkStatus::Running))?;
+    let why = if e.undoing {
+        format!("run {id} is being undone in this work copy")
+    } else {
+        format!("run {id} is already working in this work copy")
+    };
+    Some(refuse(StatusCode::CONFLICT, ClientCode::Conflict, why))
+}
+
+/// Holds a work copy for one Undo: while held, no run starts there and no
+/// other Undo reverts there ([`busy_copy`]). Released when dropped.
+struct UndoHold {
+    works: Arc<Mutex<HashMap<String, WorkEntry>>>,
+    id: String,
+}
+
+impl UndoHold {
+    /// Holds run `id`'s work copy, or says what is using it (or that an
+    /// Undo that ran meanwhile already undid the run).
+    fn take(works: &Arc<Mutex<HashMap<String, WorkEntry>>>, id: &str) -> Result<UndoHold, Refused> {
+        let mut all = works.lock().unwrap();
+        let entry = all.get(id).ok_or_else(|| Box::new(not_found()))?;
+        if entry.decided.is_some() {
+            return Err(refuse(StatusCode::CONFLICT, ClientCode::Conflict, "already undone"));
+        }
+        let w = entry.workdir.clone().ok_or_else(|| Box::new(not_found()))?;
+        if let Some(r) = busy_copy(&all, &w) {
+            return Err(r);
+        }
+        if let Some(e) = all.get_mut(id) {
+            e.undoing = true;
+        }
+        Ok(UndoHold { works: works.clone(), id: id.to_string() })
+    }
+}
+
+impl Drop for UndoHold {
+    fn drop(&mut self) {
+        if let Some(e) = self.works.lock().unwrap().get_mut(&self.id) {
+            e.undoing = false;
+        }
+    }
 }
 
 /// The run's title: the one sent, else the message's first line (72 chars).
@@ -1738,9 +1921,10 @@ pub(crate) async fn recipe_handler(
     headers: HeaderMap,
     query: Result<axum::extract::Query<RecipeQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
-    if let Err(r) = authenticate(&state, &headers) {
-        return *r;
-    }
+    let client = match authenticate(&state, &headers) {
+        Ok(c) => c,
+        Err(r) => return *r,
+    };
     let q = match query {
         Ok(axum::extract::Query(q)) if q.workdir.is_some() != q.workspace.is_some() => q,
         _ => {
@@ -1751,19 +1935,24 @@ pub(crate) async fn recipe_handler(
         }
     };
     let st = state.clone();
-    tokio::task::spawn_blocking(move || {
-        let name = match (&q.workdir, &q.workspace) {
-            (Some(w), _) => workspace_of_workdir(&st, w),
-            (_, Some(n)) => Ok(n.clone()),
-            _ => unreachable!("checked above"),
-        };
-        match name.and_then(|n| workspace_and_recipe_source(&st, &n)) {
-            Ok((_dir, source)) => read_recipe(&source),
-            Err(r) => *r,
-        }
-    })
-    .await
-    .unwrap_or_else(|e| internal(anyhow!("recipe read panicked: {e}")))
+    tokio::task::spawn_blocking(move || recipe_of(&st, &client, &q))
+        .await
+        .unwrap_or_else(|e| internal(anyhow!("recipe read panicked: {e}")))
+}
+
+/// The recipe of the workspace `q` names (by name or by its directory),
+/// when it is `client`'s.
+fn recipe_of(state: &ClientServerState, client: &ApprovedClient, q: &RecipeQuery) -> Response {
+    let name = match (&q.workdir, &q.workspace) {
+        (Some(w), _) => workspace_of_workdir(state, w),
+        (_, Some(n)) => Ok(n.clone()),
+        _ => unreachable!("checked above"),
+    };
+    let owned = name.and_then(|n| owned_workspace(state, client, &n).map(|_| n));
+    match owned.and_then(|n| workspace_and_recipe_source(state, &n)) {
+        Ok((_dir, source)) => read_recipe(&source),
+        Err(r) => *r,
+    }
 }
 
 /// The workspace a client-named workdir is: a directory directly under the
@@ -1810,6 +1999,22 @@ fn workspace_dir(state: &ClientServerState, name: &str) -> Result<PathBuf, Refus
         ));
     }
     (state.check_workdir)(&dir).map_err(|e| refuse(StatusCode::FORBIDDEN, ClientCode::Forbidden, e))
+}
+
+/// [`workspace_dir`], and only when darkmux made that workspace for
+/// `client` (its owner record, written when the workspace was made or first
+/// handed to it): a 403 for another app's workspace, a mission's worktrees
+/// or any folder no app asked darkmux for.
+fn owned_workspace(state: &ClientServerState, client: &ApprovedClient, name: &str) -> Result<PathBuf, Refused> {
+    let dir = workspace_dir(state, name)?;
+    let base = (state.worktrees_base)().map_err(|e| internal(anyhow!(e)))?;
+    if crate::client_workspace::owner_of(&base, name).as_deref() != Some(client.name.as_str()) {
+        return Err(forbidden(format!(
+            "workspace {name} was not made for this app: an app works only in a workspace darkmux \
+             made for it (POST /client/workspaces)"
+        )));
+    }
+    Ok(dir)
 }
 
 fn workspace_json(state: &ClientServerState, name: &str, dir: &Path, created: bool) -> WorkspaceInfo {
@@ -1895,9 +2100,10 @@ pub(crate) async fn workspace_create_handler(
     body: Body,
 ) -> Response {
     use crate::client_workspace as ws;
-    if let Err(r) = authenticate(&state, &headers) {
-        return *r;
-    }
+    let client = match authenticate(&state, &headers) {
+        Ok(c) => c.name,
+        Err(r) => return *r,
+    };
     let req: WorkspaceBody = match json_body(body).await {
         Ok(r) => r,
         Err(r) => return r,
@@ -1915,7 +2121,7 @@ pub(crate) async fn workspace_create_handler(
     };
     let st = state.clone();
     let git_ref = req.git_ref;
-    tokio::task::spawn_blocking(move || make_workspace(&st, ask, git_ref.as_deref(), &bot))
+    tokio::task::spawn_blocking(move || make_workspace(&st, ask, git_ref.as_deref(), &bot, &client))
         .await
         .unwrap_or_else(|e| internal(anyhow!("workspace setup panicked: {e}")))
 }
@@ -1931,27 +2137,36 @@ fn bot_slug(bot: Option<&str>) -> String {
     }
 }
 
-fn make_workspace(state: &ClientServerState, ask: WorkspaceAsk, git_ref: Option<&str>, bot: &str) -> Response {
+/// Makes (or hands back) a workspace for paired client `client`: every
+/// workspace darkmux makes records the client it was made for, and only
+/// that client may use it ([`owned_workspace`]).
+fn make_workspace(state: &ClientServerState, ask: WorkspaceAsk, git_ref: Option<&str>, bot: &str, client: &str) -> Response {
+    let made = Made { git_ref, client };
     match ask {
-        WorkspaceAsk::Clone { url, normalized } => clone_workspace(state, &url, &normalized, git_ref),
-        WorkspaceAsk::Template { url, normalized } => template_workspace(state, &url, &normalized, git_ref, bot),
-        WorkspaceAsk::Worktree { path } => worktree_workspace(state, Path::new(&path), git_ref, bot),
+        WorkspaceAsk::Clone { url, normalized } => clone_workspace(state, &url, &normalized, &made),
+        WorkspaceAsk::Template { url, normalized } => template_workspace(state, &url, &normalized, &made, bot),
+        WorkspaceAsk::Worktree { path } => worktree_workspace(state, Path::new(&path), &made, bot),
     }
 }
 
-fn clone_workspace(
-    state: &ClientServerState,
-    url: &str,
-    normalized: &str,
-    git_ref: Option<&str>,
-) -> Response {
+/// What every way of making a workspace is asked with: the branch to start
+/// on, and the paired client it is for.
+struct Made<'a> {
+    git_ref: Option<&'a str>,
+    client: &'a str,
+}
+
+fn clone_workspace(state: &ClientServerState, url: &str, normalized: &str, made: &Made) -> Response {
     use crate::client_workspace as ws;
     let base = match (state.worktrees_base)() {
         Ok(b) => b,
         Err(e) => return internal(anyhow!(e)),
     };
     let _one_at_a_time = state.workspace_lock.lock().unwrap();
-    if let Some(name) = ws::find_by_origin(&base, normalized) {
+    if let Some(name) = ws::find_by_origin(&base, normalized, made.client) {
+        if let Err(e) = ws::record_owner(&base, &name, made.client) {
+            return internal(anyhow!(e));
+        }
         return existing_clone(state, &name);
     }
     let taken = |n: &str| {
@@ -1961,7 +2176,7 @@ fn clone_workspace(
     let Some(name) = ws::name_for(normalized, taken) else {
         return err(StatusCode::CONFLICT, ClientCode::Conflict, "no free workspace name for this repo");
     };
-    if let Err(r) = place_clone(state, url, normalized, git_ref, &base, &name) {
+    if let Err(r) = place_clone(state, url, normalized, made, &base, &name) {
         return *r;
     }
     match workspace_dir(state, &name) {
@@ -1978,9 +2193,10 @@ fn template_workspace(
     state: &ClientServerState,
     url: &str,
     normalized: &str,
-    git_ref: Option<&str>,
+    made: &Made,
     bot: &str,
 ) -> Response {
+    let git_ref = made.git_ref;
     let base = match (state.worktrees_base)() {
         Ok(b) => b,
         Err(e) => return internal(anyhow!(e)),
@@ -1989,7 +2205,7 @@ fn template_workspace(
     let Some(name) = free_project_name(&base, bot) else {
         return err(StatusCode::CONFLICT, ClientCode::Conflict, "no free workspace name for this project");
     };
-    if let Err(r) = place_clone(state, url, normalized, git_ref, &base, &name) {
+    if let Err(r) = place_clone(state, url, normalized, made, &base, &name) {
         return *r;
     }
     let dir = base.join(&name);
@@ -2006,6 +2222,7 @@ fn template_workspace(
         let _ = std::fs::remove_dir_all(crate::client_git::clone_git_dir(&base, &name));
         crate::client_git::forget_git_dir(&base, &name);
         crate::client_workspace::forget_template_commit(&base, &name);
+        crate::client_workspace::forget_owner(&base, &name);
         return internal(anyhow!("starting {name} from the template: {e}"));
     }
     match workspace_dir(state, &name) {
@@ -2103,11 +2320,12 @@ fn place_clone(
     state: &ClientServerState,
     url: &str,
     normalized: &str,
-    git_ref: Option<&str>,
+    made: &Made,
     base: &Path,
     name: &str,
 ) -> Result<(), Refused> {
     use crate::client_git as cg;
+    let git_ref = made.git_ref;
     let partial = base.join(format!(".{name}.partial"));
     let git_dir = cg::clone_git_dir(base, name);
     // A repository left by an earlier workspace of this name is not this one's.
@@ -2130,15 +2348,12 @@ fn place_clone(
     // repository is the one darkmux cloned it into, outside the work tree.
     crate::client_workspace::forget_source(base, name);
     crate::client_workspace::forget_template_commit(base, name);
-    cg::record_git_dir(base, name, &git_dir).map_err(|e| Box::new(internal(anyhow!(e))))
+    cg::record_git_dir(base, name, &git_dir)
+        .and_then(|()| crate::client_workspace::record_owner(base, name, made.client))
+        .map_err(|e| Box::new(internal(anyhow!(e))))
 }
 
-fn worktree_workspace(
-    state: &ClientServerState,
-    source: &Path,
-    git_ref: Option<&str>,
-    bot: &str,
-) -> Response {
+fn worktree_workspace(state: &ClientServerState, source: &Path, made: &Made, bot: &str) -> Response {
     use crate::client_workspace as ws;
     let base = match (state.worktrees_base)() {
         Ok(b) => b,
@@ -2149,8 +2364,8 @@ fn worktree_workspace(
         Err(r) => return *r,
     };
     let _one_at_a_time = state.workspace_lock.lock().unwrap();
-    if let Some(name) = ws::find_worktree_of(&base, &common, bot) {
-        return reused_worktree(state, &base, &name, &source);
+    if let Some(name) = ws::find_worktree_of(&base, &common, bot, made.client) {
+        return reused_worktree(state, &base, &name, &source, made.client);
     }
     let Some(name) = free_worktree_name(&base, &source, bot) else {
         return err(
@@ -2158,8 +2373,8 @@ fn worktree_workspace(
             "no free workspace name for this checkout",
         );
     };
-    match add_bot_worktree(state, &source, git_ref, bot, &base.join(&name)) {
-        Ok(added) => match record_worktree(&base, &name, &source, &common) {
+    match add_bot_worktree(state, &source, made.git_ref, bot, &base.join(&name)) {
+        Ok(added) => match record_worktree(&base, &name, &source, &common, made.client) {
             Ok(()) => created_worktree(state, &name, added.0, added.1),
             Err(e) => {
                 remove_worktree(&source, &base.join(&name), &added.2);
@@ -2187,18 +2402,22 @@ fn remove_worktree(source: &Path, dest: &Path, branch: &str) {
 }
 
 /// Records a new worktree workspace: the user's checkout it was made from,
-/// and its repository (the worktree's admin directory under that checkout's
-/// `.git/worktrees/`), read once now, before any run has been in it.
-fn record_worktree(base: &Path, name: &str, source: &Path, common: &Path) -> Result<(), String> {
+/// its repository (the worktree's admin directory under that checkout's
+/// `.git/worktrees/`), read once now, before any run has been in it, and
+/// the paired client it is for.
+fn record_worktree(base: &Path, name: &str, source: &Path, common: &Path, client: &str) -> Result<(), String> {
     let admin = crate::client_git::worktree_admin_dir(&base.join(name), common)?;
     crate::client_git::record_git_dir(base, name, &admin)?;
-    crate::client_workspace::record_source(base, name, source)
+    crate::client_workspace::record_source(base, name, source)?;
+    crate::client_workspace::record_owner(base, name, client)
 }
 
 /// This bot's existing worktree of the checkout, its checkout recorded again
-/// (the one previews read their recipe from).
-fn reused_worktree(state: &ClientServerState, base: &Path, name: &str, source: &Path) -> Response {
-    if let Err(e) = crate::client_workspace::record_source(base, name, source) {
+/// (the one previews read their recipe from), and this client's.
+fn reused_worktree(state: &ClientServerState, base: &Path, name: &str, source: &Path, client: &str) -> Response {
+    let recorded = crate::client_workspace::record_source(base, name, source)
+        .and_then(|()| crate::client_workspace::record_owner(base, name, client));
+    if let Err(e) = recorded {
         return internal(anyhow!(e));
     }
     match workspace_dir(state, name) {
@@ -2367,16 +2586,17 @@ pub(crate) async fn preview_start_handler(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    if let Err(r) = authenticate(&state, &headers) {
-        return *r;
-    }
+    let client = match authenticate(&state, &headers) {
+        Ok(c) => c,
+        Err(r) => return *r,
+    };
     let ask = match preview_start_body(body).await {
         Ok(ask) => ask,
         Err(r) => return r,
     };
     let st = state.clone();
     tokio::task::spawn_blocking(move || {
-        let reply = start_preview(&st, &name, ask.clean);
+        let reply = start_preview(&st, &client, &name, ask.clean);
         let outcome = match reply.status() {
             StatusCode::OK => "already running (200)".to_string(),
             StatusCode::ACCEPTED => "starting (202)".to_string(),
@@ -2436,8 +2656,8 @@ async fn preview_start_body(body: Body) -> Result<PreviewStartBody, Response> {
 
 /// Starts workspace `name`'s preview from its trusted recipe; with `clean`,
 /// first stops it and clears its install ([`crate::client_preview::Previews::clean`]).
-fn start_preview(state: &ClientServerState, name: &str, clean: bool) -> Response {
-    if let Err(r) = previews_allowed(state) {
+fn start_preview(state: &ClientServerState, client: &ApprovedClient, name: &str, clean: bool) -> Response {
+    if let Err(r) = previews_allowed(state).and_then(|()| owned_workspace(state, client, name).map(|_| ())) {
         return *r;
     }
     let (dir, source) = match workspace_and_recipe_source(state, name) {
@@ -2461,7 +2681,10 @@ pub(crate) async fn preview_status_handler(
     ClientPath(name): ClientPath<String>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(r) = authenticate(&state, &headers).and_then(|_| previews_allowed(&state)) {
+    let owned = authenticate(&state, &headers)
+        .and_then(|client| previews_allowed(&state).map(|()| client))
+        .and_then(|client| owned_workspace(&state, &client, &name));
+    if let Err(r) = owned {
         return *r;
     }
     let status = state.previews.status(&name);
@@ -2574,7 +2797,7 @@ pub(crate) async fn preview_stop_handler(
     ClientPath(name): ClientPath<String>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(r) = authenticate(&state, &headers) {
+    if let Err(r) = authenticate(&state, &headers).and_then(|c| owned_workspace(&state, &c, &name)) {
         return *r;
     }
     let st = state.clone();
@@ -2604,79 +2827,83 @@ pub(crate) async fn workspace_changes_handler(
     ClientPath(name): ClientPath<String>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(r) = authenticate(&state, &headers) {
-        return *r;
-    }
+    let client = match authenticate(&state, &headers) {
+        Ok(c) => c,
+        Err(r) => return *r,
+    };
     let st = state.clone();
-    tokio::task::spawn_blocking(move || {
-        use crate::client_workspace as ws;
-        let dir = match workspace_dir(&st, &name) {
-            Ok(d) => d,
-            Err(r) => return *r,
-        };
-        let Some(dir) = work_copy_for(&st, &dir) else {
-            return err(StatusCode::CONFLICT, ClientCode::Conflict, "darkmux holds no repository for this workspace");
-        };
-        let (default, base_branch) = match changes_base(&st, &dir, &name) {
-            Ok(b) => b,
-            Err(r) => return *r,
-        };
-        let branch = git_line(&dir, &["branch", "--show-current"]).unwrap_or_default();
-        if branch.is_empty() {
-            return err(StatusCode::CONFLICT, ClientCode::Conflict, "the work copy isn't on a branch");
-        }
-        let (Some(base), Some(head)) = (git_line(&dir, &["merge-base", "HEAD", &default]), git_line(&dir, &["rev-parse", "HEAD"])) else {
-            return err(StatusCode::CONFLICT, ClientCode::Conflict, "couldn't find where this branch left the default branch");
-        };
-        let Some(listing) = git(&dir, None, &["diff", "--no-renames", "--name-status", "-z", &base, &head]) else {
-            return internal(anyhow!("listing the branch's changes failed"));
-        };
-        let fields: Vec<String> = String::from_utf8_lossy(&listing.stdout)
-            .split('\0')
-            .filter(|f| !f.is_empty())
-            .map(str::to_string)
-            .collect();
-        let mut files = Vec::new();
-        let mut total = 0usize;
-        for pair in fields.chunks(2) {
-            let [status, path] = pair else { continue };
-            if status.starts_with('D') {
-                files.push(BranchFile {
-                    path: path.clone(),
-                    deleted: Some(true),
-                    mode: None,
-                    content: None,
-                });
-                continue;
-            }
-            let Some(blob) = git(&dir, None, &["show", &format!("{head}:{path}")]) else {
-                return internal(anyhow!("reading {path} failed"));
-            };
-            total += blob.stdout.len();
-            if total > MAX_CHANGES_BYTES {
-                return err(StatusCode::PAYLOAD_TOO_LARGE, ClientCode::PayloadTooLarge, "the branch's changes are too large to send");
-            }
-            let mode = git_line(&dir, &["--literal-pathspecs", "ls-tree", &head, "--", path])
-                .and_then(|l| l.split_whitespace().next().map(str::to_string))
-                .unwrap_or_else(|| "100644".to_string());
+    tokio::task::spawn_blocking(move || branch_changes(&st, &client, &name))
+        .await
+        .unwrap_or_else(|e| internal(anyhow!("changes panicked: {e}")))
+}
+
+/// `/changes`, blocking, for `client`'s workspace `name`.
+fn branch_changes(st: &ClientServerState, client: &ApprovedClient, name: &str) -> Response {
+    use crate::client_workspace as ws;
+    let dir = match owned_workspace(st, client, name) {
+        Ok(d) => d,
+        Err(r) => return *r,
+    };
+    let Some(dir) = work_copy_for(st, &dir) else {
+        return err(StatusCode::CONFLICT, ClientCode::Conflict, "darkmux holds no repository for this workspace");
+    };
+    let (default, base_branch) = match changes_base(st, &dir, name) {
+        Ok(b) => b,
+        Err(r) => return *r,
+    };
+    let branch = git_line(&dir, &["branch", "--show-current"]).unwrap_or_default();
+    if branch.is_empty() {
+        return err(StatusCode::CONFLICT, ClientCode::Conflict, "the work copy isn't on a branch");
+    }
+    let (Some(base), Some(head)) = (git_line(&dir, &["merge-base", "HEAD", &default]), git_line(&dir, &["rev-parse", "HEAD"])) else {
+        return err(StatusCode::CONFLICT, ClientCode::Conflict, "couldn't find where this branch left the default branch");
+    };
+    let Some(listing) = git(&dir, None, &["diff", "--no-renames", "--name-status", "-z", &base, &head]) else {
+        return internal(anyhow!("listing the branch's changes failed"));
+    };
+    let fields: Vec<String> = String::from_utf8_lossy(&listing.stdout)
+        .split('\0')
+        .filter(|f| !f.is_empty())
+        .map(str::to_string)
+        .collect();
+    let mut files = Vec::new();
+    let mut total = 0usize;
+    for pair in fields.chunks(2) {
+        let [status, path] = pair else { continue };
+        if status.starts_with('D') {
             files.push(BranchFile {
                 path: path.clone(),
-                deleted: None,
-                mode: Some(mode),
-                content: Some(ws::base64_encode(&blob.stdout)),
+                deleted: Some(true),
+                mode: None,
+                content: None,
             });
+            continue;
         }
-        Json(BranchChanges {
-            base,
-            base_branch,
-            head,
-            branch,
-            files,
-        })
-        .into_response()
+        let Some(blob) = git(&dir, None, &["show", &format!("{head}:{path}")]) else {
+            return internal(anyhow!("reading {path} failed"));
+        };
+        total += blob.stdout.len();
+        if total > MAX_CHANGES_BYTES {
+            return err(StatusCode::PAYLOAD_TOO_LARGE, ClientCode::PayloadTooLarge, "the branch's changes are too large to send");
+        }
+        let mode = git_line(&dir, &["--literal-pathspecs", "ls-tree", &head, "--", path])
+            .and_then(|l| l.split_whitespace().next().map(str::to_string))
+            .unwrap_or_else(|| "100644".to_string());
+        files.push(BranchFile {
+            path: path.clone(),
+            deleted: None,
+            mode: Some(mode),
+            content: Some(ws::base64_encode(&blob.stdout)),
+        });
+    }
+    Json(BranchChanges {
+        base,
+        base_branch,
+        head,
+        branch,
+        files,
     })
-    .await
-    .unwrap_or_else(|e| internal(anyhow!("changes panicked: {e}")))
+    .into_response()
 }
 
 /// What `/changes` compares the work copy's branch with, and that base's
@@ -2701,11 +2928,12 @@ pub(crate) async fn workspace_status_handler(
     ClientPath(name): ClientPath<String>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(r) = authenticate(&state, &headers) {
-        return *r;
-    }
+    let client = match authenticate(&state, &headers) {
+        Ok(c) => c,
+        Err(r) => return *r,
+    };
     let st = state.clone();
-    tokio::task::spawn_blocking(move || match workspace_dir(&st, &name) {
+    tokio::task::spawn_blocking(move || match owned_workspace(&st, &client, &name) {
         Ok(dir) => Json(workspace_json(&st, &name, &dir, false)).into_response(),
         Err(r) => *r,
     })
@@ -2807,6 +3035,7 @@ pub(crate) fn dispatch_error_code_in(
 
 /// A work item as its client polls it.
 fn work_status_json(state: &ClientServerState, work_id: &str, w: WorkEntry) -> WorkState {
+    let left = left_behind(&w);
     match w.status {
         WorkStatus::Running if w.cancel.requested() => WorkState::Cancelling,
         WorkStatus::Running => {
@@ -2830,11 +3059,24 @@ fn work_status_json(state: &ClientServerState, work_id: &str, w: WorkEntry) -> W
             code: ClientCode::of_dispatch(e.code.as_deref()),
             error: e.error,
             reason: e.reason,
+            left,
         },
         WorkStatus::Cancelled(e) => WorkState::Cancelled {
             reason: "cancelled".to_string(),
             error: e.map(|e| e.error),
+            left,
         },
+    }
+}
+
+/// What a failed or cancelled run left in its work copy, as its commit.
+fn left_behind(w: &WorkEntry) -> LeftBehind {
+    LeftBehind {
+        commit: w.commit.as_deref().map(short),
+        branch: w.branch.clone(),
+        files: w.files.clone(),
+        commit_error: w.commit_error.clone(),
+        undone: w.decided.is_some(),
     }
 }
 
@@ -2922,7 +3164,7 @@ fn committed_run(
     let Some(w) = entry.filter(|w| w.client_name == client.name) else {
         return Err(Box::new(not_found()));
     };
-    if !matches!(w.status, WorkStatus::Done { .. }) {
+    if matches!(w.status, WorkStatus::Running) {
         return Err(refuse(StatusCode::CONFLICT, ClientCode::Conflict, "the run hasn't finished"));
     }
     if w.commit.is_none() {
@@ -2943,90 +3185,102 @@ fn committed_run(
 
 /// `POST /client/work/{id}/undo`: reverts the run's commit (a new commit;
 /// history is never rewritten). Refused while a later commit changed the
-/// same files, naming the run that made it. 200 {revert, files}.
+/// same files, naming the run that made it, and while another run works in
+/// the same work copy (its changes would be read against the revert).
+/// 200 {revert, files}.
 pub(crate) async fn undo_handler(
     State(state): State<ClientServerState>,
     ClientPath(work_id): ClientPath<String>,
     headers: HeaderMap,
 ) -> Response {
     let st = state.clone();
-    tokio::task::spawn_blocking(move || {
-        let w = match committed_run(&st, &headers, &work_id) {
-            Ok(w) => w,
-            Err(r) => return *r,
-        };
-        let (Some(wd), Some(commit)) = (w.git.clone(), w.commit.clone()) else {
-            return err(StatusCode::CONFLICT, ClientCode::Conflict, "the run has no git work copy");
-        };
-        let mut log = vec![
-            "--literal-pathspecs".to_string(),
-            "log".to_string(),
-            "--format=%H".to_string(),
-            format!("{commit}..HEAD"),
-            "--".to_string(),
-        ];
-        log.extend(w.files.iter().cloned());
-        let later = git(
-            &wd,
-            None,
-            &log.iter().map(String::as_str).collect::<Vec<_>>(),
-        )
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-        // A later run that was itself undone (its commit and the revert of
-        // it) leaves the files as they were: it doesn't count.
-        let settled: std::collections::HashSet<String> = st
-            .works
-            .lock()
-            .unwrap()
-            .values()
-            .filter_map(|e| {
-                Some((
-                    e.commit.clone()?,
-                    e.decided.as_ref()?.strip_prefix("undone by ")?.to_string(),
-                ))
-            })
-            .flat_map(|(c, r)| [c, r])
-            .collect();
-        let later: Vec<String> = later
-            .into_iter()
-            .filter(|sha| !settled.contains(sha))
-            .collect();
-        if let Some(sha) = later.last() {
-            let by = st
-                .works
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|(_, e)| e.commit.as_deref() == Some(sha.as_str()))
-                .map(|(id, _)| format!("run {id}"))
-                .unwrap_or_else(|| format!("commit {}", short(sha)));
-            return err(
-                StatusCode::CONFLICT, ClientCode::Conflict,
-                format!("{by} changed the same files later; undo that first"),
-            );
-        }
-        if let Err(e) = git_quiet(&wd, &["revert", "--no-edit", &commit]) {
-            let _ = git_quiet(&wd, &["revert", "--abort"]);
-            return err(StatusCode::CONFLICT, ClientCode::Conflict, format!("couldn't undo it: {e}"));
-        }
-        let revert = git_line(&wd, &["rev-parse", "HEAD"]).unwrap_or_default();
-        if let Some(e) = st.works.lock().unwrap().get_mut(&work_id) {
-            e.decided = Some(format!("undone by {revert}"));
-        }
-        Json(UndoReply {
-            revert: short(&revert),
-            files: w.files,
-        })
-        .into_response()
+    tokio::task::spawn_blocking(move || undo_run(&st, &headers, &work_id))
+        .await
+        .unwrap_or_else(|e| internal(anyhow!("undo panicked: {e}")))
+}
+
+/// Undo, blocking: the run checked, its work copy held, the revert made.
+fn undo_run(st: &ClientServerState, headers: &HeaderMap, work_id: &str) -> Response {
+    let w = match committed_run(st, headers, work_id) {
+        Ok(w) => w,
+        Err(r) => return *r,
+    };
+    let (Some(wd), Some(commit)) = (w.git.clone(), w.commit.clone()) else {
+        return err(StatusCode::CONFLICT, ClientCode::Conflict, "the run has no git work copy");
+    };
+    let _held = match UndoHold::take(&st.works, work_id) {
+        Ok(h) => h,
+        Err(r) => return *r,
+    };
+    if let Some(by) = changed_later(st, &wd, &commit, &w.files) {
+        return err(
+            StatusCode::CONFLICT, ClientCode::Conflict,
+            format!("{by} changed the same files later; undo that first"),
+        );
+    }
+    if let Err(e) = git_quiet(&wd, &["revert", "--no-edit", &commit]) {
+        let _ = git_quiet(&wd, &["revert", "--abort"]);
+        return err(StatusCode::CONFLICT, ClientCode::Conflict, format!("couldn't undo it: {e}"));
+    }
+    let revert = git_line(&wd, &["rev-parse", "HEAD"]).unwrap_or_default();
+    if let Some(e) = st.works.lock().unwrap().get_mut(work_id) {
+        e.decided = Some(format!("undone by {revert}"));
+    }
+    Json(UndoReply {
+        revert: short(&revert),
+        files: w.files,
     })
-    .await
-    .unwrap_or_else(|e| internal(anyhow!("undo panicked: {e}")))
+    .into_response()
+}
+
+/// What committed to `files` after `commit` and still stands (a run, by
+/// id, else a commit), if anything: Undo waits for that to be undone first.
+fn changed_later(st: &ClientServerState, wd: &WorkCopy, commit: &str, files: &[String]) -> Option<String> {
+    let mut log = vec![
+        "--literal-pathspecs".to_string(),
+        "log".to_string(),
+        "--format=%H".to_string(),
+        format!("{commit}..HEAD"),
+        "--".to_string(),
+    ];
+    log.extend(files.iter().cloned());
+    let later = git(
+        wd,
+        None,
+        &log.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+    .map(|o| {
+        String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    })
+    .unwrap_or_default();
+    // A later run that was itself undone (its commit and the revert of
+    // it) leaves the files as they were: it doesn't count.
+    let settled: std::collections::HashSet<String> = st
+        .works
+        .lock()
+        .unwrap()
+        .values()
+        .filter_map(|e| {
+            Some((
+                e.commit.clone()?,
+                e.decided.as_ref()?.strip_prefix("undone by ")?.to_string(),
+            ))
+        })
+        .flat_map(|(c, r)| [c, r])
+        .collect();
+    let sha = later.into_iter().rfind(|sha| !settled.contains(sha))?;
+    let by = st
+        .works
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(_, e)| e.commit.as_deref() == Some(sha.as_str()))
+        .map(|(id, _)| format!("run {id}"))
+        .unwrap_or_else(|| format!("commit {}", short(&sha)));
+    Some(by)
 }
 
 /// Old clients' Keep: the run is already committed; this reports it.

@@ -454,9 +454,10 @@ pub(crate) enum Cmd {
         lab_dir: Option<std::path::PathBuf>,
     },
     /// Pair an app on this machine and let it run scoped work (local
-    /// prototype). `client serve` listens on 127.0.0.1 only; `client approve`
-    /// approves a pending pairing; `client list` / `client revoke` manage
-    /// paired clients. State: `~/.darkmux/clients.json` (0600).
+    /// prototype). `client serve` listens on 127.0.0.1 only; `client approve
+    /// --code <CODE>` approves the pairing showing the code the app shows;
+    /// `client list` / `client revoke` manage paired clients. State:
+    /// `~/.darkmux/clients.json` (0600).
     Client {
         #[command(subcommand)]
         sub: ClientCmd,
@@ -1720,18 +1721,25 @@ pub enum ClientCmd {
         #[arg(long, default_value_t = darkmux_serve::client_pairing::DEFAULT_PORT)]
         port: u16,
     },
-    /// List pending pairing requests (device, code, age) and ask, per
-    /// request: y approves, d denies, Enter leaves it pending. `--code`
-    /// approves the one request showing that code, after confirmation. What
-    /// a paired app may run is this machine's `clients.profiles` setting.
+    /// Approve the pairing request showing the code your app shows:
+    /// `darkmux client approve --code <CODE>` (or `client approve <CODE>`),
+    /// after confirmation. With no code, lists pending requests (device,
+    /// code, age) and asks, per request: y approves, d denies, Enter leaves
+    /// it pending. What a paired app may run is this machine's
+    /// `clients.profiles` setting.
     Approve {
         /// The code the app shows (e.g. 4F7-K2Q).
         #[arg(long)]
         code: Option<String>,
+        /// The same code, given without `--code`.
+        #[arg(value_name = "CODE", conflicts_with = "code")]
+        code_arg: Option<String>,
     },
-    /// List paired clients and what apps may run here (`clients.profiles`).
+    /// List paired clients, approvals an app has not collected yet, and what
+    /// apps may run here (`clients.profiles`).
     List,
-    /// Remove a paired client; its token stops working at once.
+    /// Remove a paired client; its token stops working at once. An approval
+    /// its app has not collected yet is taken back too.
     Revoke {
         /// The client's name (from `client list`).
         name: String,

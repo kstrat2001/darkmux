@@ -158,6 +158,13 @@ impl Platform for MacPlatform {
         lsof_listen_pids(port).map(|out| crate::pids_from_lsof_fp(&out))
     }
 
+    /// `lsof -nP -iTCP@<peer> -sTCP:ESTABLISHED -Fpn`: the process whose
+    /// end of the connection is `peer` (the listener's own end is this
+    /// process, and is skipped by its direction).
+    fn tcp_peer_pid(&self, local: std::net::SocketAddr, peer: std::net::SocketAddr) -> Option<u32> {
+        lsof_established(peer).and_then(|out| crate::peer_pid_from_lsof_fpn(&out, local, peer))
+    }
+
     fn process_group(&self, pid: u32) -> Option<u32> {
         crate::unix_process_group(pid)
     }
@@ -253,6 +260,26 @@ fn lsof_listen_pids(port: u16) -> Option<String> {
 
 #[cfg(not(target_os = "macos"))]
 fn lsof_listen_pids(_port: u16) -> Option<String> {
+    None
+}
+
+/// `lsof`'s `-Fpn` answer for the established TCP connections at `peer`
+/// (exit 1 with no output is "none").
+#[cfg(target_os = "macos")]
+fn lsof_established(peer: std::net::SocketAddr) -> Option<String> {
+    let out = std::process::Command::new("/usr/sbin/lsof")
+        .args(["-nP", &format!("-iTCP@{peer}"), "-sTCP:ESTABLISHED", "-Fpn"])
+        .current_dir("/")
+        .output()
+        .ok()?;
+    match out.status.code() {
+        Some(0 | 1) => Some(String::from_utf8_lossy(&out.stdout).into_owned()),
+        _ => None,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn lsof_established(_peer: std::net::SocketAddr) -> Option<String> {
     None
 }
 

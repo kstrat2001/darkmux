@@ -143,12 +143,15 @@ fn held_workspaces(base: &Path) -> Vec<(String, crate::client_git::WorkCopy)> {
 }
 
 /// The workspace under `base` whose origin is `normalized`, among those
-/// darkmux holds a repository for.
-pub fn find_by_origin(base: &Path, normalized: &str) -> Option<String> {
-    held_workspaces(base)
+/// darkmux holds a repository for, that paired client `client` may be
+/// handed ([`pick_for`]).
+pub fn find_by_origin(base: &Path, normalized: &str, client: &str) -> Option<String> {
+    let names = held_workspaces(base)
         .into_iter()
-        .find(|(_, wc)| origin_of(wc).as_deref() == Some(normalized))
+        .filter(|(_, wc)| origin_of(wc).as_deref() == Some(normalized))
         .map(|(n, _)| n)
+        .collect();
+    pick_for(base, names, client)
 }
 
 /// Branch (empty when detached) and short head of a workspace.
@@ -522,16 +525,19 @@ pub fn common_dir(dir: &Path) -> Option<PathBuf> {
 
 /// The workspace under `base` that is a worktree of the repo whose shared
 /// `.git` is `common`, on one of this bot's `mux/<bot>-` branches, judged
-/// by the repository darkmux recorded for it (never its own `.git`).
-pub fn find_worktree_of(base: &Path, common: &Path, bot: &str) -> Option<String> {
+/// by the repository darkmux recorded for it (never its own `.git`), that
+/// paired client `client` may be handed ([`pick_for`]).
+pub fn find_worktree_of(base: &Path, common: &Path, bot: &str, client: &str) -> Option<String> {
     let prefix = format!("mux/{bot}-");
-    held_workspaces(base)
+    let names = held_workspaces(base)
         .into_iter()
-        .find(|(_, wc)| {
+        .filter(|(_, wc)| {
             crate::client_git::common_of(&wc.git_dir).as_deref() == Some(common)
                 && status_of(wc).is_some_and(|(branch, _)| branch.starts_with(&prefix))
         })
         .map(|(n, _)| n)
+        .collect();
+    pick_for(base, names, client)
 }
 
 /// The remote default branch to start new work from, as a ref that
@@ -701,6 +707,57 @@ pub fn template_commit_of(base: &Path, name: &str) -> Option<String> {
     let text = std::fs::read_to_string(&path).ok()?;
     let commit = text.trim_end_matches('\n');
     is_commit_sha(commit).then(|| commit.to_string())
+}
+
+/// Where darkmux records the paired client workspace `name` was made for:
+/// beside the workspace, like [`source_record`], outside anything a run can
+/// write.
+fn owner_record(base: &Path, name: &str) -> PathBuf {
+    base.join(format!(".{name}.client"))
+}
+
+/// Record that workspace `name` belongs to paired client `client`.
+/// Replaces any earlier record, never through a link.
+pub fn record_owner(base: &Path, name: &str, client: &str) -> Result<(), String> {
+    use std::io::Write;
+    if !valid_name(name) {
+        return Err(format!("{name:?} is not a workspace name"));
+    }
+    let path = owner_record(base, name);
+    let _ = std::fs::remove_file(&path);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .and_then(|mut f| writeln!(f, "{client}"))
+        .map_err(|e| format!("recording {}'s app: {e}", path.display()))
+}
+
+/// Forget which paired client workspace `name` was made for.
+pub fn forget_owner(base: &Path, name: &str) {
+    let _ = std::fs::remove_file(owner_record(base, name));
+}
+
+/// The paired client workspace `name` was made for, if darkmux recorded one:
+/// a plain file (a link is no record). A folder under the base that no
+/// client asked darkmux for (a mission's worktrees, anything made by hand)
+/// has none.
+pub fn owner_of(base: &Path, name: &str) -> Option<String> {
+    let path = owner_record(base, name);
+    if !valid_name(name) || !std::fs::symlink_metadata(&path).ok()?.is_file() {
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    Some(text.trim_end_matches('\n').to_string()).filter(|t| !t.is_empty())
+}
+
+/// The first of `names` that paired client `client` owns, else the first
+/// darkmux made before workspaces had an owner (no record), which it may
+/// then claim. Another client's never.
+fn pick_for(base: &Path, names: Vec<String>, client: &str) -> Option<String> {
+    let owner = |n: &String| owner_of(base, n);
+    let owned = names.iter().find(|n| owner(n).as_deref() == Some(client)).cloned();
+    owned.or_else(|| names.into_iter().find(|n| owner(n).is_none()))
 }
 
 /// The checkout recorded for workspace `name`, if any (a record that is a

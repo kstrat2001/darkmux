@@ -180,6 +180,18 @@ impl Platform for LinuxPlatform {
         Some(pids)
     }
 
+    /// The ESTABLISHED socket in `/proc/net/tcp` whose own end is `peer`
+    /// and whose other end is `local`, matched to the process whose fds hold
+    /// it. A process this user cannot read is not found.
+    fn tcp_peer_pid(&self, local: std::net::SocketAddr, peer: std::net::SocketAddr) -> Option<u32> {
+        let inode = connected_inode(&read_to_string("/proc/net/tcp")?, peer, local)?;
+        list_dir("/proc").into_iter().filter_map(|name| name.parse::<u32>().ok()).find(|pid| {
+            list_dir(&format!("/proc/{pid}/fd"))
+                .iter()
+                .any(|fd| read_link(&format!("/proc/{pid}/fd/{fd}")).and_then(|l| socket_inode(&l)) == Some(inode))
+        })
+    }
+
     fn process_group(&self, pid: u32) -> Option<u32> {
         crate::unix_process_group(pid)
     }
@@ -256,6 +268,25 @@ pub(crate) fn listening_inodes(table: &str, port: u16) -> Vec<u64> {
             (local_port == port && *f.get(3)? == "0A").then(|| f.get(9)?.parse().ok())?
         })
         .collect()
+}
+
+/// The inode of `/proc/net/tcp`'s ESTABLISHED (`01`) socket whose own end
+/// is `from` and whose other end is `to` (IPv4).
+pub(crate) fn connected_inode(table: &str, from: std::net::SocketAddr, to: std::net::SocketAddr) -> Option<u64> {
+    table.lines().skip(1).find_map(|line| {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let ends = (proc_net_addr(f.get(1)?)?, proc_net_addr(f.get(2)?)?);
+        (ends == (from, to) && *f.get(3)? == "01").then(|| f.get(9)?.parse().ok())?
+    })
+}
+
+/// `/proc/net/tcp`'s `0100007F:1F90`: the address as the kernel's in-memory
+/// bytes printed as one native word, then the port, in hex.
+fn proc_net_addr(s: &str) -> Option<std::net::SocketAddr> {
+    let (ip, port) = s.split_once(':')?;
+    let word = u32::from_str_radix(ip, 16).ok().filter(|_| ip.len() == 8)?;
+    let ip = std::net::Ipv4Addr::from(word.to_ne_bytes());
+    Some(std::net::SocketAddr::from((ip, u16::from_str_radix(port, 16).ok()?)))
 }
 
 /// The inode an fd's link names when it is a socket (`socket:[41231]`).

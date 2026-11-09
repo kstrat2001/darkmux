@@ -23,6 +23,9 @@ pub struct FakePlatform {
     pub tcp_listeners: Vec<(u16, Vec<u32>)>,
     /// `true`: [`Platform::tcp_listeners`] cannot say (`None`) for any port.
     pub tcp_listeners_unreadable: bool,
+    /// `(peer, pid)` pairs [`Platform::tcp_peer_pid`] answers, whatever the
+    /// listener; any other peer cannot be told.
+    pub tcp_peers: Vec<(std::net::SocketAddr, u32)>,
     /// `(pid, group)` pairs [`Platform::process_group`] answers.
     pub process_groups: Vec<(u32, u32)>,
 }
@@ -47,6 +50,7 @@ impl Default for FakePlatform {
             xdg_data_home: None,
             tcp_listeners: Vec::new(),
             tcp_listeners_unreadable: false,
+            tcp_peers: Vec::new(),
             process_groups: Vec::new(),
         }
     }
@@ -147,6 +151,10 @@ impl Platform for FakePlatform {
             return None;
         }
         Some(self.tcp_listeners.iter().find(|(p, _)| *p == port).map(|(_, pids)| pids.clone()).unwrap_or_default())
+    }
+
+    fn tcp_peer_pid(&self, _local: std::net::SocketAddr, peer: std::net::SocketAddr) -> Option<u32> {
+        self.tcp_peers.iter().find(|(p, _)| *p == peer).map(|(_, pid)| *pid)
     }
 
     fn process_group(&self, pid: u32) -> Option<u32> {

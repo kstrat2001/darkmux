@@ -94,6 +94,10 @@ impl Platform for OtherPlatform {
         None
     }
 
+    fn tcp_peer_pid(&self, _local: std::net::SocketAddr, _peer: std::net::SocketAddr) -> Option<u32> {
+        None
+    }
+
     fn process_group(&self, _pid: u32) -> Option<u32> {
         None
     }

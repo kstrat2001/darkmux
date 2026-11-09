@@ -953,3 +953,47 @@ fn the_host_names_a_ports_listener_and_a_process_group() {
     let fake = FakePlatform { tcp_listeners: vec![(port, vec![7])], process_groups: vec![(7, 5)], ..Default::default() };
     assert_eq!((fake.tcp_listeners(port), fake.tcp_listeners(1), fake.process_group(7)), (Some(vec![7]), Some(vec![]), Some(5)));
 }
+
+/// `lsof -Fpn`: the process holding the peer's end of a loopback
+/// connection is the one whose name line runs from the peer to the
+/// listener; the listener's own end (the reverse direction) is not it.
+#[test]
+fn lsof_names_the_process_at_the_peers_end() {
+    let local: std::net::SocketAddr = "127.0.0.1:8767".parse().unwrap();
+    let peer: std::net::SocketAddr = "127.0.0.1:55807".parse().unwrap();
+    let out = "p11936\nf4\nn127.0.0.1:8767->127.0.0.1:55807\np92120\nf390\nn127.0.0.1:55807->127.0.0.1:8767\n";
+    assert_eq!(crate::peer_pid_from_lsof_fpn(out, local, peer), Some(92120));
+    assert_eq!(crate::peer_pid_from_lsof_fpn("p11936\nf4\nn127.0.0.1:8767->127.0.0.1:55807\n", local, peer), None);
+    assert_eq!(crate::peer_pid_from_lsof_fpn("", local, peer), None);
+}
+
+/// `/proc/net/tcp`: the ESTABLISHED socket whose own end is the peer and
+/// whose other end is the listener; the listener's own socket (the reverse)
+/// and a LISTEN socket are not it.
+#[test]
+fn proc_net_tcp_names_the_socket_at_the_peers_end() {
+    let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+   0: 0100007F:223F 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 41231 1 0000000000000000 100 0 0 10 0\n\
+   1: 0100007F:223F 0100007F:D431 01 00000000:00000000 00:00000000 00000000  1000        0 41232 1 0000000000000000 100 0 0 10 0\n\
+   2: 0100007F:D431 0100007F:223F 01 00000000:00000000 00:00000000 00000000  1000        0 41233 1 0000000000000000 100 0 0 10 0\n";
+    let local: std::net::SocketAddr = "127.0.0.1:8767".parse().unwrap();
+    let peer: std::net::SocketAddr = "127.0.0.1:54321".parse().unwrap();
+    assert_eq!(crate::linux::connected_inode(table, peer, local), Some(41233));
+    assert_eq!(crate::linux::connected_inode(table, peer, "127.0.0.1:1".parse().unwrap()), None);
+}
+
+/// This host's strategy names the process at the other end of a loopback
+/// connection: here, this test's own process on both ends. An OS with no
+/// strategy cannot say; the fake answers what the test set.
+#[test]
+fn the_host_names_the_process_at_a_loopback_connections_other_end() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let local = listener.local_addr().unwrap();
+    let client = std::net::TcpStream::connect(local).unwrap();
+    let (_server_end, peer) = listener.accept().unwrap();
+    assert_eq!(peer, client.local_addr().unwrap());
+    assert_eq!(current().tcp_peer_pid(local, peer), Some(std::process::id()));
+    assert_eq!(OtherPlatform.tcp_peer_pid(local, peer), None);
+    let fake = FakePlatform { tcp_peers: vec![(peer, 7)], ..Default::default() };
+    assert_eq!((fake.tcp_peer_pid(local, peer), fake.tcp_peer_pid(local, local)), (Some(7), None));
+}

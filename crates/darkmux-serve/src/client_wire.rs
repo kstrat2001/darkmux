@@ -159,12 +159,38 @@ pub enum WorkState {
         /// `dispatch.error` named (`busy`, `wont_fit`, ...), else
         /// `dispatch_failed`.
         code: darkmux_types::client_code::ClientCode,
+        #[serde(flatten)]
+        left: LeftBehind,
     },
     Cancelled {
         /// Always `cancelled`.
         reason: String,
         error: Option<String>,
+        #[serde(flatten)]
+        left: LeftBehind,
     },
+}
+
+/// What a run that failed or was cancelled had already changed in its work
+/// copy. It is committed as that run's own commit, so the next run's commit
+/// never carries it and Undo can revert it. Every field is absent when the
+/// run changed nothing.
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+pub struct LeftBehind {
+    /// The commit (short id) holding what the run left.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// The files it holds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+    /// Why what the run left could not be read or committed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_error: Option<String>,
+    /// Undone (its commit reverted).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub undone: bool,
 }
 
 /// `POST /client/work/{id}/cancel` (202) and `DELETE
