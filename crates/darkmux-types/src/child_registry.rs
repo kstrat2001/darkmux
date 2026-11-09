@@ -62,6 +62,11 @@ pub const SIGTERM: i32 = libc::SIGTERM;
 /// `libc` dependency (or a hardcoded `3`).
 pub const ESRCH: i32 = libc::ESRCH;
 
+/// `kill(2)`'s "not permitted" errno, re-exported for the same reason as
+/// [`ESRCH`]. macOS answers it for a process group whose only member is a
+/// zombie.
+pub const EPERM: i32 = libc::EPERM;
+
 /// Send `sig` to ONE pid the caller owns. Returns `Ok(())` if the kernel
 /// accepted the request, `Err(std::io::Error)` otherwise (`ESRCH` when the
 /// pid is gone, `EPERM` when it is not ours to signal) — unlike

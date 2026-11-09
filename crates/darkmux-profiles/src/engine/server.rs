@@ -356,7 +356,9 @@ fn stop_locked(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds) -> Result<(), Se
         // may have ignored it: SIGKILL the group. Its id cannot be reused
         // while any member is left, and with none left this is a no-op.
         let _ = darkmux_types::child_registry::kill_group(rec.pid, SIGKILL);
-        if !exited {
+        // That SIGKILL may already have ended the server; signal it only if
+        // it is still alive.
+        if !exited && alive(rec) {
             signal_server(rec.pid, SIGKILL).map_err(|e| failed(format!("SIGKILL: {e}")))?;
             gone_within(rec, bounds);
         }
@@ -379,8 +381,11 @@ fn stop_locked(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds) -> Result<(), Se
 /// not an error (it already exited, or it leads no group).
 fn signal_server(pid: u32, sig: i32) -> std::io::Result<()> {
     use darkmux_types::child_registry::{kill_group, kill_pid, ESRCH};
+    // macOS answers EPERM, not ESRCH, for a group whose only member is a
+    // zombie (exited, not yet reaped): that server is gone too.
     let ok_if_gone = |r: std::io::Result<()>| match r {
         Err(e) if e.raw_os_error() == Some(ESRCH) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(darkmux_types::child_registry::EPERM) && is_zombie(pid) => Ok(()),
         other => other,
     };
     ok_if_gone(kill_group(pid, sig))?;
