@@ -20,6 +20,7 @@
 
 mod lmstudio;
 mod openai_compat;
+pub mod flint;
 pub mod server;
 pub mod tensorfold;
 mod unresolved;

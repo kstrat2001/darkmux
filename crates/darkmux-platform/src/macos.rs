@@ -152,6 +152,21 @@ impl Platform for MacPlatform {
         }
     }
 
+    /// (#3453 review) `lsof -nP -iTCP:<port> -sTCP:LISTEN -Fp` (always in
+    /// macOS's base system).
+    fn tcp_listeners(&self, port: u16) -> Option<Vec<u32>> {
+        lsof_listen_pids(port).map(|out| crate::pids_from_lsof_fp(&out))
+    }
+
+    fn process_group(&self, pid: u32) -> Option<u32> {
+        crate::unix_process_group(pid)
+    }
+
+    /// (#3453) The XDG layout, read from this process's environment.
+    fn xdg_data_home(&self) -> Option<std::path::PathBuf> {
+        crate::xdg_data_home_from(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))
+    }
+
     fn secret_store(&self) -> crate::SecretStore {
         crate::SecretStore::Keychain
     }
@@ -216,6 +231,28 @@ fn command_stdout(cmd: &str, args: &[&str]) -> Option<String> {
 
 #[cfg(not(target_os = "macos"))]
 fn command_stdout(_cmd: &str, _args: &[&str]) -> Option<String> {
+    None
+}
+
+/// `lsof`'s `-Fp` answer for the listeners on `port`. It exits 1 with no
+/// output when nothing listens: that is an empty answer, not a failure.
+#[cfg(target_os = "macos")]
+fn lsof_listen_pids(port: u16) -> Option<String> {
+    let out = std::process::Command::new("/usr/sbin/lsof")
+        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fp"])
+        .current_dir("/")
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    match out.status.code() {
+        Some(0) => Some(stdout),
+        Some(1) if stdout.trim().is_empty() && out.stderr.is_empty() => Some(String::new()),
+        _ => None,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn lsof_listen_pids(_port: u16) -> Option<String> {
     None
 }
 

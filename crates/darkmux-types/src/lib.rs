@@ -17,6 +17,7 @@ pub mod default_engine;
 pub mod diagnostics;
 pub mod dispatch_liveness;
 pub mod endpoint;
+mod engine_args;
 pub mod provider;
 #[cfg(any(test, feature = "test-support"))]
 pub mod env_audit;
@@ -352,11 +353,13 @@ pub struct ProfileModel {
     #[serde(default, skip_serializing_if = "Option::is_none", with = "endpoint::endpoint_field")]
     #[schemars(with = "Option<endpoint::EndpointFieldSchema>")]
     pub endpoint: Option<ModelEndpoint>,
-    /// (#3448) Extra flags for the server darkmux starts for this model
-    /// (`tensorfold-native serve`), e.g. `["--drafter", "<repo>"]`. Only on a
-    /// model whose endpoint is `"managed": "tensorfold"`; never a flag darkmux
-    /// sets itself ([`ProfileModel::engine_args_problem`]). `darkmux doctor`
-    /// checks each flag against the installed engine.
+    /// (#3448, #3453) Extra flags for the server darkmux starts for this
+    /// model (`tensorfold-native serve`, or rec's `rec-mlx serve flint`), e.g.
+    /// `["--drafter", "<repo>"]`. Only on a model whose endpoint is
+    /// `"managed": "tensorfold"` or `"flint"`; never a flag darkmux sets
+    /// itself ([`ProfileModel::engine_args_problem`]). `darkmux doctor`
+    /// checks each Tensorfold flag against the installed engine; Flint's are
+    /// checked here against the fixed set rec 0.1.0 accepts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub engine_args: Vec<String>,
     /// Forward-compat overflow — unknown keys land here and
@@ -370,7 +373,7 @@ pub struct ProfileModel {
 /// `None`: an empty argument, a flag darkmux sets itself, or a secret.
 /// (#3448) An `engine_args` entry no check can read safely: empty, a bare
 /// `--`, or a short flag.
-fn malformed_engine_arg(arg: &str) -> Option<String> {
+pub(crate) fn malformed_engine_arg(arg: &str) -> Option<String> {
     if arg.trim().is_empty() {
         return Some("`engine_args` holds an empty argument; remove it".to_string());
     }
@@ -446,17 +449,21 @@ impl ProfileModel {
         }
         match self.endpoint_kind() {
             Ok(EndpointKind::Managed(ManagedBackend::Tensorfold)) => {}
+            // (#3453) rec has no `capabilities` command, so Flint's whole flag
+            // set is checked here, at load.
+            Ok(EndpointKind::Managed(ManagedBackend::Flint)) => return engine_args::flint_problem(&self.engine_args),
             Ok(EndpointKind::Managed(other)) => {
                 return Some(format!(
                     "`engine_args` are flags for a server darkmux starts, which needs an endpoint with \
-                     `\"managed\": \"tensorfold\"`; this model is loaded into `{}`, which takes none. Remove them",
+                     `\"managed\": \"tensorfold\"` or `\"managed\": \"flint\"`; this model is loaded into `{}`, which \
+                     takes none. Remove them",
                     crate::config_enum::ConfigEnum::token(other)
                 ));
             }
             Ok(EndpointKind::Unmanaged) => {
                 return Some("`engine_args` are flags for a server darkmux starts, which needs an endpoint with \
-                     `\"managed\": \"tensorfold\"`; this model's endpoint is one darkmux only sends requests to. \
-                     Remove them"
+                     `\"managed\": \"tensorfold\"` or `\"managed\": \"flint\"`; this model's endpoint is one darkmux \
+                     only sends requests to. Remove them"
                     .to_string());
             }
             Err(_) => return None, // the endpoint's own refusal names it
@@ -844,6 +851,10 @@ impl Profile {
 // elsewhere) and `engine_args` on a profile model (flags for the server
 // darkmux starts). Minor bump: every 2.2 registry reads unchanged. A 2.2
 // binary given any of them refuses it at preflight (contracts 7 and 9).
+// Also in 2.3 (#3453, unreleased with it, so no bump of its own): the
+// `"managed": "flint"` value (rec's Flint, a server darkmux starts; `port`
+// required as on Tensorfold, at most one such endpoint per file) and
+// `engine_args` on a model there.
 pub const PROFILES_SCHEMA_VERSION: &str = "2.3";
 
 /// Scopes a review probe seat's draws to a subset of fact families, and
@@ -1017,10 +1028,10 @@ impl ProfileRegistry {
     /// assumed away), and so does a registry declaring no model and no
     /// binding at all (no evidence either way).
     pub fn needs_lmstudio(&self) -> bool {
-        // (#3448) What LM Studio does not serve: an endpoint darkmux only
-        // sends to, and a Tensorfold server darkmux starts itself.
+        // (#3448, #3453) What LM Studio does not serve: an endpoint darkmux
+        // only sends to, and a server darkmux starts itself.
         let elsewhere = |kind: Result<EndpointKind, EndpointError>| {
-            matches!(kind, Ok(EndpointKind::Unmanaged | EndpointKind::Managed(ManagedBackend::Tensorfold)))
+            kind.is_ok_and(|k| k == EndpointKind::Unmanaged || k.starts_servers())
         };
         let mut declared = false;
         for m in self.profiles.values().flat_map(|p| p.models.iter()) {

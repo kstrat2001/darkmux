@@ -92,6 +92,7 @@ impl Kind {
 pub const CONFIG_WITHHELD: &[(&str, Kind)] = &[
     ("lms_bin", Kind::Path),
     ("engines.tensorfold.bin", Kind::Path),
+    ("engines.flint.bin", Kind::Path),
     ("lmstudio_url", Kind::Url),
     ("dirs", Kind::Path),
     ("dirs.audit", Kind::Path),

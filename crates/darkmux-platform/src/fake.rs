@@ -17,6 +17,14 @@ pub struct FakePlatform {
     pub secret_store: crate::SecretStore,
     pub machine_config: crate::MachineConfig,
     pub identifying_strings: Vec<String>,
+    pub xdg_data_home: Option<std::path::PathBuf>,
+    /// `(port, pids)` [`Platform::tcp_listeners`] answers; any other port
+    /// has no listener.
+    pub tcp_listeners: Vec<(u16, Vec<u32>)>,
+    /// `true`: [`Platform::tcp_listeners`] cannot say (`None`) for any port.
+    pub tcp_listeners_unreadable: bool,
+    /// `(pid, group)` pairs [`Platform::process_group`] answers.
+    pub process_groups: Vec<(u32, u32)>,
 }
 
 /// Every answer at its "nothing to report" value, so a test sets only the
@@ -36,6 +44,10 @@ impl Default for FakePlatform {
             secret_store: crate::SecretStore::PrivateFile,
             machine_config: crate::MachineConfig::default(),
             identifying_strings: Vec::new(),
+            xdg_data_home: None,
+            tcp_listeners: Vec::new(),
+            tcp_listeners_unreadable: false,
+            process_groups: Vec::new(),
         }
     }
 }
@@ -124,6 +136,21 @@ impl Platform for FakePlatform {
 
     fn identifying_strings(&self) -> Vec<String> {
         self.identifying_strings.clone()
+    }
+
+    fn xdg_data_home(&self) -> Option<std::path::PathBuf> {
+        self.xdg_data_home.clone()
+    }
+
+    fn tcp_listeners(&self, port: u16) -> Option<Vec<u32>> {
+        if self.tcp_listeners_unreadable {
+            return None;
+        }
+        Some(self.tcp_listeners.iter().find(|(p, _)| *p == port).map(|(_, pids)| pids.clone()).unwrap_or_default())
+    }
+
+    fn process_group(&self, pid: u32) -> Option<u32> {
+        self.process_groups.iter().find(|(p, _)| *p == pid).map(|(_, g)| *g)
     }
 
     fn secret_store(&self) -> crate::SecretStore {

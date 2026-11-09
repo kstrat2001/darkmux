@@ -441,6 +441,10 @@ use std::path::Path;
 //           `0` = never; `DARKMUX_CLIENTS_PREVIEW_IDLE_MINUTES`, #3459), how
 //           long a preview no app asks about runs before it is stopped. An
 //           older binary refuses a config carrying any of them.
+//           Also ADDED (#3453, unreleased with 2.8, so folded into it):
+//           `engines.flint.bin` (`DARKMUX_FLINT_BIN`), the `rec` command for
+//           a `"managed": "flint"` endpoint. Absent = `rec` on `PATH`. An
+//           older binary refuses a config carrying it.
 pub const CONFIG_SCHEMA_VERSION: &str = "2.8";
 
 /// A `config.json` key an older darkmux read (and `init` may have written)
@@ -1641,6 +1645,8 @@ pub struct FleetIdentityConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct EnginesConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub tensorfold: Option<EngineInstall>,
+    /// (#3453) rec, for the Flint engine: `bin` names the `rec` command.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub flint: Option<EngineInstall>,
     #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -1648,8 +1654,8 @@ pub struct EnginesConfig {
 /// would be wrong on most machines.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct EngineInstall {
-    /// The engine's server binary (`tensorfold-native` for Tensorfold), when
-    /// it is not on `PATH` under that name. A relative path is anchored to
+    /// The engine's command (`tensorfold-native` for Tensorfold, `rec` for
+    /// Flint), when it is not on `PATH` under that name. A relative path is anchored to
     /// the working directory of the process that reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub bin: Option<String>,
     #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,

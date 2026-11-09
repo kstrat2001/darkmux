@@ -580,7 +580,9 @@ pub fn invalid_engine_args(reg: &crate::ProfileRegistry) -> Vec<InvalidSetting> 
                     set_in: SetIn::Profiles(format!("profiles.{pname}.models[{i}].engine_args")),
                     problem: why,
                     valid: "flags of `tensorfold-native serve` other than `--port`, `--host`, `--context`, `--name` \
-                            and `--api-key`, on a model whose endpoint is `\"managed\": \"tensorfold\"`"
+                            and `--api-key`, on a model whose endpoint is `\"managed\": \"tensorfold\"`; or flags of \
+                            rec's `rec-mlx serve flint` other than `--model-dir`, `--manifest`, `--context-limit`, \
+                            `--port` and `--api-key-file`, on a model whose endpoint is `\"managed\": \"flint\"`"
                         .to_string(),
                 });
             }
@@ -589,24 +591,47 @@ pub fn invalid_engine_args(reg: &crate::ProfileRegistry) -> Vec<InvalidSetting> 
     out
 }
 
-/// (#3448) The utility binding (`internal.utility`) on a server darkmux
-/// starts: the utility jobs (compaction, radio routing) send to LM Studio or
-/// to an endpoint darkmux only sends to, and do not start servers. Refused at
-/// every dispatching preflight, naming the binding, rather than sent to LM
-/// Studio under the Tensorfold model's name.
+/// (#3448, #3453) The utility binding (`internal.utility`) on a server
+/// darkmux starts (Tensorfold, Flint): the utility jobs (compaction, radio
+/// routing) send to LM Studio or to an endpoint darkmux only sends to, and do
+/// not start servers. Refused at every dispatching preflight, naming the
+/// binding and its backend, rather than sent to LM Studio under that model's
+/// name.
 pub fn utility_on_engine_server(reg: &crate::ProfileRegistry) -> Vec<InvalidSetting> {
-    use crate::endpoint::{EndpointKind, ManagedBackend};
-    let on_server = reg.utility_endpoint().is_some_and(|ep| matches!(ep.kind(), Ok(EndpointKind::Managed(ManagedBackend::Tensorfold))));
-    if !on_server {
+    use crate::endpoint::EndpointKind;
+    let Some(Ok(EndpointKind::Managed(backend))) = reg.utility_endpoint().map(|ep| ep.kind()) else { return Vec::new() };
+    if !backend.starts_servers() {
         return Vec::new();
     }
     vec![InvalidSetting {
         set_in: SetIn::Profiles("internal.utility.endpoint".to_string()),
-        problem: "the utility model is bound to a `tensorfold` endpoint, and darkmux's utility jobs do not start \
-                  engine servers (#3448)"
-            .to_string(),
+        problem: format!(
+            "the utility model is bound to a `{}` endpoint, and darkmux's utility jobs do not start engine servers (#3448)",
+            backend.token()
+        ),
         valid: "a utility model on LM Studio (no `endpoint`) or on an endpoint darkmux only sends to (a `url`)".to_string(),
     }]
+}
+
+/// (#3453) Every `"managed": "flint"` endpoint after the first (by id): rec
+/// holds a single-instance lock, so a machine runs one Flint server. Refused
+/// at every dispatching preflight and Fail in doctor, naming
+/// `endpoints.<id>.managed` and the endpoint already declared.
+pub fn extra_flint_endpoints(reg: &crate::ProfileRegistry) -> Vec<InvalidSetting> {
+    use crate::endpoint::{EndpointKind, ManagedBackend};
+    // `endpoints` is a BTreeMap, so "the first" is the same on every read.
+    let mut flint = reg.endpoints.iter().filter(|(_, ep)| ep.kind() == Ok(EndpointKind::Managed(ManagedBackend::Flint)));
+    let Some((first, _)) = flint.next() else { return Vec::new() };
+    flint
+        .map(|(id, _)| InvalidSetting {
+            set_in: SetIn::Profiles(format!("endpoints.{id}.managed")),
+            problem: format!(
+                "a second `flint` endpoint: `endpoints.{first}` already declares one, and rec runs one Flint server per \
+                 machine (it holds a single-instance lock) (#3453)"
+            ),
+            valid: "one `\"managed\": \"flint\"` endpoint per profiles.json; every profile that runs Flint names it".to_string(),
+        })
+        .collect()
 }
 
 /// (#2902 step 5) The valid shape of an endpoint's `limits`, for a refusal.
@@ -1192,6 +1217,7 @@ mod tests {
             ("TreeChange", "how a host-git test fixture leaves a file (`host_git::fixture`, test-support only), never a setting"),
             ("AttrPlace", "where a host-git test fixture plants attributes (`host_git::fixture`, test-support only), never a setting"),
             ("ServerState", "what an engine server's record says about its process now (`engine_record`, #3448), never a setting"),
+            ("Takes", "what one of rec's `rec-mlx serve flint` flags takes (`engine_args`, #3453), a fact about rec, never a setting"),
             ("SessionKind", "a session's kind within its run (`session_id`), never a setting"),
             ("SessionScope", "what a step kind declares about its sessions (`session_id`), never a setting"),
             ("WireKind", "a session kind's tag in the session id wire grammar (`session_id`), never a setting"),

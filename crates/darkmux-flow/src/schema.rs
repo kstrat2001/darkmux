@@ -27,7 +27,8 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.7.0";
 //           first turn when a dispatch starts the engine server its model
 //           runs on; and `payload.code` on `dispatch.error` (`busy`,
 //           `wont_fit`, `model_start_failed`, `port_in_use`,
-//           `engine_unavailable`). ADDITIVE: a reader that does not know
+//           `engine_unavailable`, and `engine_in_use` from #3453, unreleased
+//           with it). ADDITIVE: a reader that does not know
 //           the actions keeps them as unknown records, and `code` is absent
 //           on every record before 2.7.0.
 //   2.6.0 (#3363): `dispatch.start` gains `payload.system_sha256` (SHA-256 of

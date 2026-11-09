@@ -3285,8 +3285,11 @@ fn route_dispatch(opts: &DispatchOpts) -> Result<Option<DispatchRoute>> {
         // endpoint it sends to (its `chat_url` is the server's loopback
         // port), local for the data boundary since it is a managed kind; the
         // dispatch makes the model resident after its `dispatch.start`
-        // (`engine_dispatch::prepare`). Never the LM Studio route.
-        darkmux_types::EndpointKind::Managed(darkmux_types::ManagedBackend::Tensorfold) => {
+        // (`engine_dispatch::prepare`). Never the LM Studio route. (#3453)
+        // Flint, rec's server, takes the same path.
+        darkmux_types::EndpointKind::Managed(
+            darkmux_types::ManagedBackend::Tensorfold | darkmux_types::ManagedBackend::Flint,
+        ) => {
             let (system_prompt, provenance) =
                 hosted_system_prompt(opts, &resolved, brain_leaves_this_machine(&target))?;
             DispatchRoute::Unmanaged {

@@ -37,8 +37,10 @@ pub mod profiles;
 /// every unmanaged endpoint whose host it cannot read unambiguously
 /// (`config_enum::invalid_endpoint_hosts`), every profile model's `engine_args`
 /// that cannot be used as written (`config_enum::invalid_engine_args`, #3448),
-/// a utility binding on a Tensorfold endpoint, whose jobs do not start servers
-/// (`config_enum::utility_on_engine_server`), and every key its schema does not
+/// a utility binding on a server darkmux starts (Tensorfold, Flint), whose jobs
+/// do not start servers (`config_enum::utility_on_engine_server`), a second
+/// Flint endpoint (`config_enum::extra_flint_endpoints`, #3453: rec runs one
+/// server per machine), and every key its schema does not
 /// know (`darkmux_types::user_files`), and `default_engine`, whose values
 /// are endpoint ids (`darkmux_types::default_engine`). `profiles.json` is a file
 /// `darkmux-types` cannot locate on its own, so this crate (the registry's
@@ -74,6 +76,7 @@ pub fn preflight_with(
                 refusal.invalid.extend(config_enum::misplaced_endpoint_hardware(&loaded.registry));
                 refusal.invalid.extend(config_enum::invalid_engine_args(&loaded.registry));
                 refusal.invalid.extend(config_enum::utility_on_engine_server(&loaded.registry));
+                refusal.invalid.extend(config_enum::extra_flint_endpoints(&loaded.registry));
                 refusal.invalid.extend(darkmux_types::default_engine::invalid(&loaded.registry));
                 refusal.files.extend(profiles::user_file_problem(&loaded.path));
             }
@@ -368,6 +371,50 @@ mod tensorfold_preflight_tests {
             let paths: Vec<String> = refusal.invalid.iter().map(|v| v.set_in.to_string()).collect();
             assert!(paths.iter().any(|p| p.contains("internal.utility.endpoint")), "{scope:?}: {paths:?}");
             assert!(paths.iter().any(|p| p.contains("profiles.tf.models[0].engine_args")), "{scope:?}: {paths:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod flint_preflight_tests {
+    use darkmux_types::config_enum::Scope;
+
+    /// (#3453) Every dispatching preflight accepts a Flint profile (the
+    /// dispatch starts rec's server), and refuses a second Flint endpoint
+    /// (rec runs one server per machine), unusable `engine_args` and a
+    /// utility binding on a Flint endpoint, naming each path and the file.
+    #[test]
+    #[serial_test::serial] // the preflight reads DARKMUX_DEFAULT_ENGINE, which a sibling test sets
+    fn every_dispatching_preflight_checks_flint_endpoints_args_and_the_utility_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let file = path.to_str().unwrap();
+        std::fs::write(
+            &path,
+            r#"{"profiles":{"fl":{"models":[{"id":"flint-int4","n_ctx":262144,"endpoint":"fl","engine_args":["--grammar","flint"]}]}},
+                "endpoints":{"fl":{"managed":"flint","port":8092}}}"#,
+        )
+        .unwrap();
+        for scope in [Scope::Dispatch, Scope::MissionLaunch, Scope::LabRun] {
+            assert_eq!(super::preflight_with(scope, Some(file)), Ok(()), "{scope:?}: a Flint profile is dispatchable");
+        }
+        std::fs::write(
+            &path,
+            r#"{"profiles":{"fl":{"models":[{"id":"flint-int4","n_ctx":262144,"endpoint":"fl","engine_args":["--api-key-file","/k"]}]}},
+                "endpoints":{"fl":{"managed":"flint","port":8092},"fl2":{"managed":"flint","port":8093}},
+                "internal":{"utility":{"id":"u","n_ctx":8192,"endpoint":"fl"}}}"#,
+        )
+        .unwrap();
+        // Loading never crashes on it.
+        crate::profiles::load_registry_quiet(Some(file)).unwrap();
+        for scope in [Scope::Dispatch, Scope::MissionLaunch, Scope::LabRun] {
+            let refusal = super::preflight_with(scope, Some(file)).expect_err("refused");
+            let paths: Vec<String> = refusal.invalid.iter().map(|v| v.set_in.to_string()).collect();
+            for want in ["endpoints.fl2.managed", "internal.utility.endpoint", "profiles.fl.models[0].engine_args"] {
+                assert!(paths.iter().any(|p| p.contains(want)), "{scope:?}: {want} in {paths:?}");
+            }
+            let msg = refusal.to_string();
+            assert!(msg.contains("single-instance") && msg.contains("`endpoints.fl`"), "{msg}");
         }
     }
 }

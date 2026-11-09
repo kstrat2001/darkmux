@@ -226,7 +226,10 @@ fn resolve_local_placement_inner_with(
         // starts as an LM Studio load: the dispatch itself starts the server
         // (`engine_dispatch::prepare`), so placement treats it as a model
         // with no LM Studio residency to plan, as it does an unmanaged one.
-        darkmux_types::EndpointKind::Managed(darkmux_types::ManagedBackend::Tensorfold) => {
+        // (#3453) So is a Flint one.
+        darkmux_types::EndpointKind::Managed(
+            darkmux_types::ManagedBackend::Tensorfold | darkmux_types::ManagedBackend::Flint,
+        ) => {
             return Err(PlacementMiss::Unmanaged(crate::step_kinds::EndpointSlot::of(&target.endpoint)))
         }
         darkmux_types::EndpointKind::Managed(_) => {}
@@ -7914,10 +7917,12 @@ mod tests {
             &reg,
             serde_json::json!({
                 "default_profile": "local",
-                "endpoints": { "hosted": { "url": "https://h.example/v1" }, "tf": { "managed": "tensorfold", "port": 8091 } },
+                "endpoints": { "hosted": { "url": "https://h.example/v1" }, "tf": { "managed": "tensorfold", "port": 8091 },
+                    "fl": { "managed": "flint", "port": 8092 } },
                 "profiles": {
                     "local": {"models": [{"id": "m-local", "n_ctx": 4096}]},
                     "tf": {"models": [{"id": "TensorFold/m", "n_ctx": 4096, "endpoint": "tf"}]},
+                    "fl": {"models": [{"id": "flint-int4", "n_ctx": 4096, "endpoint": "fl"}]},
                     "named": {"models": [{"id": "gpt", "endpoint": "hosted"}]},
                     "dangling": {"models": [{"id": "gpt", "endpoint": "nope"}]}
                 }
@@ -7942,6 +7947,8 @@ mod tests {
         // like an unmanaged one, it has no LM Studio residency to plan, and
         // the dispatch starts its server.
         assert_eq!(pick("tf"), Err("unmanaged".into()));
+        // (#3453) Nor is a Flint one.
+        assert_eq!(pick("fl"), Err("unmanaged".into()));
     }
 
     // ─── (#2902 step 1a) usage conformance: one record per model call ──

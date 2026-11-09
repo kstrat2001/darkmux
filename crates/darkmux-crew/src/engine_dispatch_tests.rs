@@ -11,9 +11,10 @@ use std::time::Duration;
 /// floor the test asks for) and `serve`, which runs a tiny server answering
 /// `GET /v1/models` with its `--name`.
 fn fake_tensorfold(dir: &std::path::Path, version: &str, floor_gib: f64) -> PathBuf {
-    let server = dir.join("serve.py");
-    std::fs::write(
-        &server,
+    // Stable scripts behind a per-test link (see `stable_script`): a freshly
+    // written executable can wait seconds for macOS to assess it.
+    let server = stable_script(
+        "tf_serve.py",
         r#"
 import json, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -31,19 +32,17 @@ class S(HTTPServer):
         self.server_name, self.server_port = "localhost", self.server_address[1]
 S(("127.0.0.1", port), H).serve_forever()
 "#,
-    )
-    .unwrap();
-    let bin = dir.join("tensorfold-native");
-    std::fs::write(
-        &bin,
-        format!(
+    );
+    let stable = stable_script(
+        "tensorfold-native",
+        &format!(
             "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'tensorfold-native {version}' ;;\n  info) printf 'weights: 1.00 GiB (1073741824 bytes)\\nmemory floor: {floor_gib:.2} GiB (weights plus a margin)\\n' ;;\n  serve) shift; exec python3 -u {} serve \"$@\" ;;\nesac\n",
             server.display()
         ),
-    )
-    .unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
+    let bin = dir.join("tensorfold-native");
+    let _ = std::fs::remove_file(&bin);
+    std::os::unix::fs::symlink(&stable, &bin).unwrap();
     bin
 }
 
@@ -120,9 +119,12 @@ impl Drop for Rig {
                 None => std::env::remove_var("DARKMUX_HOME"),
             }
         }
+        // A failed assertion must leave no stand-in server up: kill each
+        // running one's whole group (it leads one), then the pid itself.
         for rec in engine_record::list_in(&self.dirs.records).0 {
             if rec.state_now() == ServerState::Running {
-                let _ = darkmux_types::child_registry::kill_pid(rec.pid, darkmux_types::child_registry::SIGKILL);
+                use darkmux_types::child_registry::{kill_group, kill_pid, SIGKILL};
+                let _ = kill_group(rec.pid, SIGKILL).or_else(|_| kill_pid(rec.pid, SIGKILL));
             }
         }
     }
@@ -420,4 +422,312 @@ fn this_machine_counts_a_sibling_dispatch_in_the_same_process() {
         }
     }
     assert!(leased.contains(&"darkmux:sibling".to_string()), "{leased:?}");
+}
+
+// ─── (#3453) rec's Flint ────────────────────────────────────────────────────
+
+/// A script at a stable path, written once per content: `exec` of a freshly
+/// written file is assessed by macOS one file at a time (about 0.1 s each,
+/// machine-wide), so a parallel run of tests that each write their own
+/// stand-ins can push a 5 s probe past its bound. Each test links to these
+/// instead, and the link's own path (`$0`) says where its state is.
+pub(crate) fn stable_script(name: &str, content: &str) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    use std::os::unix::fs::PermissionsExt;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut h);
+    let dir = std::env::temp_dir().join("darkmux-test-stand-ins");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{:016x}-{name}", h.finish()));
+    if !path.exists() {
+        let tmp = dir.join(format!(".{name}.{}", std::process::id()));
+        std::fs::write(&tmp, content).unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+    }
+    path
+}
+
+/// The stand-in `rec-mlx serve flint ... --port P`: answers `GET /v1/models`
+/// with `flint` (as rec's server does; it has no `--name`) and records each
+/// `POST` body in `$REQUESTS` beside the wrapper's link when that file's
+/// directory exists. Its wrapper `exec`s Python, as rec's does, so the
+/// spawned pid is the server.
+pub(crate) const REC_MLX_PY: &str = r#"
+import json, os, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+a = sys.argv[2:]
+assert a[:2] == ["serve", "flint"], a
+port = int(a[a.index("--port") + 1])
+requests = sys.argv[1]
+class H(BaseHTTPRequestHandler):
+    def reply(self, doc):
+        body = json.dumps(doc).encode()
+        self.send_response(200); self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def do_GET(self):
+        self.reply({"object": "list", "data": [{"id": "flint"}]})
+    def do_POST(self):
+        req = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        open(requests, "ab").write(req + b"\n")
+        self.reply({"choices": [{"message": {"content": "ok"}}], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})
+    def log_message(self, *args): pass
+# HTTPServer's server_bind looks up the host's FQDN, which can stall for
+# tens of seconds on a CI runner; bind without it.
+class S(HTTPServer):
+    def server_bind(self):
+        import socketserver
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = "localhost", self.server_address[1]
+S(("127.0.0.1", port), H).serve_forever()
+"#;
+
+/// A stand-in rec 0.1.0 install under `dir`: `share/rec/runtimes/<sha>/rec-mlx`
+/// (a link to a wrapper that `exec`s [`REC_MLX_PY`], recording requests in
+/// `dir/requests.jsonl`), `share/rec/models/<hash>/flint-int4.json` beside
+/// one small weights file, and a `rec` (a link) whose `--version` prints
+/// `rec <dir/version>` and whose `status` prints `dir/status.json` (absent
+/// prints nothing). Writing those two files changes what `rec` says.
+pub(crate) fn fake_rec(dir: &std::path::Path, version: &str) -> darkmux_profiles::engine::flint::Rec {
+    let data = dir.join("share").join("rec");
+    let runtime = data.join("runtimes").join("0906aa");
+    std::fs::create_dir_all(&runtime).unwrap();
+    let py = stable_script("rec_mlx.py", REC_MLX_PY);
+    let wrapper = stable_script(
+        "rec-mlx",
+        &format!(
+            "#!/bin/sh\nhere=$(dirname \"$0\")\nexec python3 -u {} \"$here/../../../../requests.jsonl\" \"$@\"\n",
+            py.display()
+        ),
+    );
+    let link = runtime.join("rec-mlx");
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(&wrapper, &link).unwrap();
+    let model = data.join("models").join("fdc852");
+    std::fs::create_dir_all(&model).unwrap();
+    std::fs::write(model.join("flint-int4.json"), "{}").unwrap();
+    std::fs::write(model.join("model-00000.safetensors"), vec![0u8; 1024]).unwrap();
+    std::fs::write(dir.join("version"), version).unwrap();
+    let rec = stable_script(
+        "rec",
+        "#!/bin/sh\nhere=$(dirname \"$0\")\ncase \"$1\" in\n  --version) echo \"rec $(cat \"$here/version\")\" ;;\n  status) cat \"$here/status.json\" 2>/dev/null ;;\nesac\n",
+    );
+    let bin = dir.join("rec");
+    let _ = std::fs::remove_file(&bin);
+    std::os::unix::fs::symlink(&rec, &bin).unwrap();
+    darkmux_profiles::engine::flint::Rec::at(bin.to_string_lossy().into_owned(), Some(data))
+}
+
+fn flint_target(id: &str, port: u16) -> crate::target::Target {
+    let mut reg: darkmux_types::ProfileRegistry = serde_json::from_value(serde_json::json!({
+        "profiles": {"p": {"models": [{"id": id, "n_ctx": 8192, "endpoint": "fl"}]}},
+        "endpoints": {"fl": {"managed": "flint", "port": port}}
+    }))
+    .unwrap();
+    reg.materialize_endpoints();
+    let profile = reg.profiles["p"].clone();
+    let m = profile.models[0].clone();
+    crate::target::target_for("p".into(), profile, m).unwrap()
+}
+
+/// A Flint dispatch starts rec's own `rec-mlx serve flint` (never `rec
+/// _supervise`) for the profile's revision, waits until it lists `flint`,
+/// and holds a lease on `flint`; the next dispatch reuses it.
+#[test]
+#[serial_test::serial]
+fn a_flint_dispatch_starts_recs_server_once_and_reuses_it() {
+    let r = rig();
+    let rec = fake_rec(r.dir.path(), "0.1.0");
+    let roomy = FakeMachine { reclaimable: RefCell::new(Some(64 * GIB)), ..Default::default() };
+    let t = flint_target("flint-int4", free_port());
+    let mut notes = Vec::new();
+    let ready = prepare_in(&t, &r.dirs, &rec, quick(), &roomy, &mut |n, p| notes.push((n, p))).unwrap();
+    assert!(ready.started);
+    assert!(ready.record.argv[0].ends_with("runtimes/0906aa/rec-mlx"), "{:?}", ready.record.argv);
+    assert_eq!(&ready.record.argv[1..3], ["serve", "flint"]);
+    assert_eq!((ready.record.engine.as_str(), ready.record.model.as_str()), ("flint", "flint-int4"));
+    assert_eq!(notes.first().map(|(n, p)| (*n, p.engine.as_str())), Some((Note::Start, "flint")));
+    let sibling = LeaseGuard::acquire();
+    assert!(sibling.all_live_leased_models().contains(&"flint".to_string()), "the lease names the served model `flint`");
+    drop(ready);
+    let again = prepare_in(&t, &r.dirs, &rec, quick(), &roomy, &mut |_, _| {}).unwrap();
+    assert!(!again.started, "the same command is reused");
+}
+
+/// rec's own server running (`rec status` says `ready: true`) refuses the
+/// dispatch with `engine_in_use`, naming `rec stop`, and darkmux starts,
+/// stops and records nothing.
+#[test]
+#[serial_test::serial]
+fn recs_own_server_running_refuses_the_dispatch_naming_rec_stop() {
+    let r = rig();
+    let rec = fake_rec(r.dir.path(), "0.1.0");
+    std::fs::write(r.dir.path().join("status.json"), r#"{"ready":true,"endpoint":"http://127.0.0.1:11500/v1"}"#).unwrap();
+    let machine = FakeMachine { reclaimable: RefCell::new(Some(64 * GIB)), ..Default::default() };
+    let err = prepare_in(&flint_target("flint-int4", free_port()), &r.dirs, &rec, quick(), &machine, &mut |_, _| {})
+        .err()
+        .expect("refused");
+    assert_eq!(err.code, "engine_in_use");
+    assert!(err.message.contains("rec stop") && err.message.contains("127.0.0.1:11500"), "{err}");
+    assert!(engine_record::list_in(&r.dirs.records).0.is_empty(), "nothing started");
+}
+
+/// When `rec status` reports the server darkmux itself started (same port),
+/// that is darkmux's own, not rec's: the dispatch reuses it.
+#[test]
+#[serial_test::serial]
+fn rec_status_naming_darkmuxs_own_server_is_not_a_refusal() {
+    let r = rig();
+    let rec = fake_rec(r.dir.path(), "0.1.0");
+    let port = free_port();
+    let roomy = FakeMachine { reclaimable: RefCell::new(Some(64 * GIB)), ..Default::default() };
+    drop(prepare_in(&flint_target("flint-int4", port), &r.dirs, &rec, quick(), &roomy, &mut |_, _| {}).unwrap());
+    std::fs::write(r.dir.path().join("status.json"), format!(r#"{{"ready":true,"endpoint":"http://127.0.0.1:{port}/v1"}}"#)).unwrap();
+    let again = prepare_in(&flint_target("flint-int4", port), &r.dirs, &rec, quick(), &roomy, &mut |_, _| {}).unwrap();
+    assert!(!again.started);
+}
+
+/// An unverified rec, or a revision rec's install does not hold, is
+/// `engine_unavailable` before anything starts; the latter says `rec pull`.
+#[test]
+#[serial_test::serial]
+fn an_unverified_rec_or_a_missing_revision_is_engine_unavailable() {
+    let r = rig();
+    let machine = FakeMachine { reclaimable: RefCell::new(Some(64 * GIB)), ..Default::default() };
+    let newer = fake_rec(r.dir.path(), "0.2.0");
+    let err = prepare_in(&flint_target("flint-int4", free_port()), &r.dirs, &newer, quick(), &machine, &mut |_, _| {})
+        .err()
+        .expect("refused");
+    assert_eq!(err.code, "engine_unavailable");
+    assert!(err.message.contains("rec 0.2.0") && err.message.contains("0.1.0"), "{err}");
+    let rec = fake_rec(r.dir.path(), "0.1.0");
+    let err = prepare_in(&flint_target("flint-int8", free_port()), &r.dirs, &rec, quick(), &machine, &mut |_, _| {})
+        .err()
+        .expect("refused");
+    assert_eq!(err.code, "engine_unavailable");
+    assert!(err.message.contains("flint-int8.json") && err.message.contains("rec pull"), "{err}");
+    assert!(engine_record::list_in(&r.dirs.records).0.is_empty(), "nothing started");
+}
+
+/// A Flint server a running dispatch is using (its lease names `flint`) is
+/// never replaced under it: another revision on the endpoint is `busy`.
+#[test]
+#[serial_test::serial]
+fn a_held_flint_server_is_busy_never_replaced() {
+    let r = rig();
+    let rec = fake_rec(r.dir.path(), "0.1.0");
+    let model = r.dir.path().join("share/rec/models/aa11");
+    std::fs::create_dir_all(&model).unwrap();
+    std::fs::write(model.join("flint-int8.json"), "{}").unwrap();
+    let port = free_port();
+    let roomy = FakeMachine { reclaimable: RefCell::new(Some(64 * GIB)), ..Default::default() };
+    let a = prepare_in(&flint_target("flint-int4", port), &r.dirs, &rec, quick(), &roomy, &mut |_, _| {}).unwrap();
+    let held = FakeMachine { reclaimable: RefCell::new(Some(64 * GIB)), leased: vec!["flint".into()], ..Default::default() };
+    let err = prepare_in(&flint_target("flint-int8", port), &r.dirs, &rec, quick(), &held, &mut |_, _| {})
+        .err()
+        .expect("refused");
+    assert_eq!(err.code, "busy", "{err}");
+    assert!(server::alive(&a.record), "the held server is untouched");
+}
+
+/// (#3453 review) The own-server exemption is for the port darkmux's own
+/// server serves: with darkmux's server up on one port and `rec status`
+/// naming another, rec's own server is up too, and the dispatch is refused.
+#[test]
+#[serial_test::serial]
+fn rec_status_naming_another_port_than_darkmuxs_server_is_refused() {
+    let r = rig();
+    let rec = fake_rec(r.dir.path(), "0.1.0");
+    let port = free_port();
+    let roomy = FakeMachine { reclaimable: RefCell::new(Some(64 * GIB)), ..Default::default() };
+    drop(prepare_in(&flint_target("flint-int4", port), &r.dirs, &rec, quick(), &roomy, &mut |_, _| {}).unwrap());
+    std::fs::write(r.dir.path().join("status.json"), r#"{"ready":true,"endpoint":"http://127.0.0.1:11500/v1"}"#).unwrap();
+    let err = prepare_in(&flint_target("flint-int4", port), &r.dirs, &rec, quick(), &roomy, &mut |_, _| {})
+        .err()
+        .expect("refused");
+    assert_eq!(err.code, "engine_in_use", "{err}");
+}
+
+/// (#3453 review) A live darkmux record on the port `rec status` names does
+/// not exempt the answer when something else is the listener there: the
+/// exemption is gated on darkmux's server being the listener.
+#[test]
+#[serial_test::serial]
+fn rec_status_naming_darkmuxs_port_held_by_a_foreign_listener_is_refused() {
+    let r = rig();
+    let rec = fake_rec(r.dir.path(), "0.1.0");
+    // darkmux's "server": alive, leading its own group, never listening.
+    let mut ours = std::process::Command::new("sleep");
+    ours.arg("30");
+    std::os::unix::process::CommandExt::process_group(&mut ours, 0);
+    let mut ours = ours.spawn().unwrap();
+    // The listener: something darkmux did not start.
+    let foreign = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = foreign.local_addr().unwrap().port();
+    let stamp = (0..50).find_map(|_| {
+        std::thread::sleep(Duration::from_millis(10));
+        darkmux_platform::current().process_start_stamp(ours.id())
+    });
+    let record = EngineRecord {
+        schema: darkmux_types::engine_record::ENGINE_RECORD_SCHEMA,
+        endpoint: "fl".into(),
+        engine: "flint".into(),
+        model: "flint-int4".into(),
+        n_ctx: 8192,
+        port,
+        pid: ours.id(),
+        start_stamp: stamp.expect("a start stamp"),
+        owner_pid: std::process::id(),
+        argv: vec!["rec-mlx".into()],
+        log: r.dirs.log_for("fl"),
+        started_at_ms: 0,
+        engine_version: "rec 0.1.0".into(),
+    };
+    engine_record::write_in(&r.dirs.records, &record).unwrap();
+    assert!(server::running(&r.dirs, "fl").is_some(), "the fixture holds: darkmux's record is live");
+    std::fs::write(r.dir.path().join("status.json"), format!(r#"{{"ready":true,"endpoint":"http://127.0.0.1:{port}/v1"}}"#)).unwrap();
+    let machine = FakeMachine { reclaimable: RefCell::new(Some(64 * GIB)), ..Default::default() };
+    let result = prepare_in(&flint_target("flint-int4", port), &r.dirs, &rec, quick(), &machine, &mut |_, _| {});
+    let _ = ours.kill();
+    let _ = ours.wait();
+    drop(foreign);
+    assert_eq!(result.err().map(|e| e.code), Some("engine_in_use"));
+}
+
+/// (#3453 re-review) `rec status` saying `ready: false`: rec's own server is
+/// still starting when something listens on the endpoint it names (refused,
+/// nothing started), and stopped when nothing does (the dispatch starts
+/// darkmux's server).
+#[test]
+#[serial_test::serial]
+fn rec_status_ready_false_is_recs_server_only_while_its_port_is_bound() {
+    let r = rig();
+    let rec = fake_rec(r.dir.path(), "0.1.0");
+    let machine = FakeMachine { reclaimable: RefCell::new(Some(64 * GIB)), ..Default::default() };
+    let bound = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let rec_port = bound.local_addr().unwrap().port();
+    let status = format!(r#"{{"ready":false,"endpoint":"http://127.0.0.1:{rec_port}/v1"}}"#);
+    std::fs::write(r.dir.path().join("status.json"), &status).unwrap();
+    let err = prepare_in(&flint_target("flint-int4", free_port()), &r.dirs, &rec, quick(), &machine, &mut |_, _| {})
+        .err()
+        .expect("refused");
+    assert_eq!(err.code, "engine_in_use");
+    assert!(engine_record::list_in(&r.dirs.records).0.is_empty(), "nothing started");
+    drop(bound);
+    let ready = prepare_in(&flint_target("flint-int4", free_port()), &r.dirs, &rec, quick(), &machine, &mut |_, _| {}).unwrap();
+    assert!(ready.started, "a stopped rec (`ready: false`, nothing on its port) leaves the engine free");
+}
+
+/// (#3453 review) Tensorfold's `serve_spec` failing (here a model with no
+/// `n_ctx`) is `model_start_failed`, never `engine_unavailable`: the engine
+/// is there, the model's start is what cannot be built.
+#[test]
+#[serial_test::serial]
+fn a_tensorfold_serve_spec_failure_is_model_start_failed() {
+    let r = rig();
+    let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 2.0).to_string_lossy().into_owned());
+    let mut t = target("TensorFold/m", free_port());
+    t.model.n_ctx = None;
+    let err = prepare_in(&t, &r.dirs, &tf, quick(), &FakeMachine::default(), &mut |_, _| {}).err().expect("refused");
+    assert_eq!(err.code, "model_start_failed", "{err}");
 }

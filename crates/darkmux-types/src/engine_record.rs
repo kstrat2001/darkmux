@@ -31,7 +31,7 @@ pub struct EngineRecord {
     pub schema: u32,
     /// The `endpoints` id it serves.
     pub endpoint: String,
-    /// The `managed` token (`tensorfold`).
+    /// The `managed` token (`tensorfold`, `flint`).
     pub engine: String,
     /// The model it was started with (a profile model's `id`).
     pub model: String,

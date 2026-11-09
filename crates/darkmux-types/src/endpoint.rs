@@ -43,6 +43,15 @@ impl EndpointKind {
         matches!(self, EndpointKind::Managed(_))
     }
 
+    /// (#3453) Whether darkmux serves this kind by starting a server of its
+    /// own for the profile's model ([`ManagedBackend::starts_servers`]).
+    pub fn starts_servers(self) -> bool {
+        match self {
+            EndpointKind::Managed(backend) => backend.starts_servers(),
+            EndpointKind::Unmanaged => false,
+        }
+    }
+
     /// The dialect this kind speaks when the endpoint declares none.
     pub fn default_dialect(self) -> Dialect {
         match self {
@@ -50,6 +59,10 @@ impl EndpointKind {
             // (#3448) What `tensorfold-native serve` answered on this machine
             // as a plain `url` endpoint before darkmux managed it.
             EndpointKind::Managed(ManagedBackend::Tensorfold) => Dialect::ChatCompletions,
+            // (#3453) What rec's own server answered as a plain `url`
+            // endpoint (`chat-completions`, the unmanaged default) before
+            // darkmux managed it.
+            EndpointKind::Managed(ManagedBackend::Flint) => Dialect::ChatCompletions,
             EndpointKind::Unmanaged => Dialect::ChatCompletions,
         }
     }
@@ -66,22 +79,38 @@ pub enum ManagedBackend {
     /// model by starting `tensorfold-native serve` on the endpoint's `port`
     /// and unloads it by stopping the server it started.
     Tensorfold,
+    /// (#3453) rec's Flint: one model per server process, so darkmux loads it
+    /// by starting rec's own `rec-mlx serve flint` on the endpoint's `port`
+    /// (paths read from rec's install) and unloads it by stopping that server.
+    Flint,
 }
 
 impl ManagedBackend {
+    /// (#3453) Whether darkmux loads a model here by starting a server of its
+    /// own (one model per server process) rather than asking a running
+    /// server to load one. Every `Managed(_)` decision that differs for such
+    /// an engine asks this, so a new one is named here once.
+    pub fn starts_servers(self) -> bool {
+        match self {
+            ManagedBackend::Lmstudio => false,
+            ManagedBackend::Tensorfold | ManagedBackend::Flint => true,
+        }
+    }
+
     /// Where this backend's endpoint is served, for a refusal that names it.
     fn address_rule(self) -> &'static str {
         match self {
             ManagedBackend::Lmstudio => "darkmux sends to the machine's LM Studio at `lmstudio_url`",
-            ManagedBackend::Tensorfold => "darkmux serves it on this machine at its `port`",
+            ManagedBackend::Tensorfold | ManagedBackend::Flint => "darkmux serves it on this machine at its `port`",
         }
     }
 
     /// The backend's name in an operator message.
-    fn display(self) -> &'static str {
+    pub(crate) fn display(self) -> &'static str {
         match self {
             ManagedBackend::Lmstudio => "LM Studio",
             ManagedBackend::Tensorfold => "Tensorfold",
+            ManagedBackend::Flint => "Flint",
         }
     }
 }
@@ -142,6 +171,7 @@ fn quoted_tokens<T: crate::config_enum::ConfigEnum>() -> String {
 crate::config_enum!(ManagedBackend, "managed backend", [
     Lmstudio = "lmstudio" => "LM Studio, loaded and unloaded through `lms`",
     Tensorfold = "tensorfold" => "Tensorfold: darkmux starts and stops `tensorfold-native serve` on the endpoint's `port`",
+    Flint = "flint" => "rec's Flint: darkmux starts and stops rec's `rec-mlx serve flint` on the endpoint's `port`",
 ]);
 crate::config_enum!(Dialect, "endpoint dialect", [
     ChatCompletions = "chat-completions" =>
@@ -615,7 +645,7 @@ pub struct ModelEndpoint {
     /// single-shot cap default (4096 → 16384); an explicit cap still wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
-    /// What darkmux manages here: `"lmstudio"`, or absent for none (see
+    /// What darkmux manages here: `"lmstudio"`, `"tensorfold"` or `"flint"`, or absent for none (see
     /// [`EndpointKind`]). An endpoint declares `managed` or a `url`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed: Option<Lenient<ManagedBackend>>,
@@ -633,7 +663,7 @@ pub struct ModelEndpoint {
     /// unknown value is kept and refused by name at preflight (contract 9).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hardware: Option<Lenient<Hardware>>,
-    /// (#3448) The loopback port darkmux serves a Tensorfold endpoint on.
+    /// (#3448, #3453) The loopback port darkmux serves a Tensorfold or Flint endpoint on.
     /// Required there and refused on every other endpoint: an LM Studio
     /// endpoint's address is `lmstudio_url`, an unmanaged one's its `url`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -744,7 +774,9 @@ impl ModelEndpoint {
         if explicit && self.url.is_some() {
             let moved = match backend {
                 ManagedBackend::Lmstudio => " (and set `darkmux config set lmstudio_url <url>` if the server moved)",
-                ManagedBackend::Tensorfold => " (its address is `http://127.0.0.1:<port>/v1`, set by `port`)",
+                ManagedBackend::Tensorfold | ManagedBackend::Flint => {
+                    " (its address is `http://127.0.0.1:<port>/v1`, set by `port`)"
+                }
             };
             return Err(EndpointError(format!(
                 "darkmux: a managed endpoint has no `url` of its own; {}. Drop `url`{moved}, \
@@ -786,27 +818,33 @@ impl ModelEndpoint {
         Ok(())
     }
 
-    /// (#3448) `port` is a Tensorfold endpoint's address and nothing else's:
-    /// required there (darkmux starts the server on it), refused elsewhere
-    /// rather than silently ignored.
+    /// (#3448, #3453) `port` is the address of an endpoint darkmux starts a
+    /// server on (Tensorfold, Flint) and nothing else's: required there,
+    /// refused elsewhere rather than silently ignored.
     fn port_applies(&self, kind: EndpointKind) -> Result<(), EndpointError> {
         let refuse = |why: String| Err(EndpointError(format!("darkmux: {why}. (#3448)")));
-        match (kind, self.port) {
-            (EndpointKind::Managed(ManagedBackend::Tensorfold), None) => refuse(
-                "a `tensorfold` endpoint declares the `port` darkmux serves it on, e.g. `\"port\": 8091`".to_string(),
-            ),
-            (EndpointKind::Managed(ManagedBackend::Tensorfold), Some(0)) => {
-                refuse("`port` is 0; a `tensorfold` endpoint needs a port from 1 to 65535".to_string())
-            }
-            (EndpointKind::Managed(ManagedBackend::Tensorfold), Some(_)) | (_, None) => Ok(()),
-            (EndpointKind::Managed(ManagedBackend::Lmstudio), Some(_)) => refuse(
-                "`port` is for a `tensorfold` endpoint; an LM Studio endpoint's address is the machine's \
+        let backend = match kind {
+            EndpointKind::Managed(b) => Some(b),
+            EndpointKind::Unmanaged => None,
+        };
+        match (backend.filter(|b| b.starts_servers()), self.port) {
+            (Some(b), None) => refuse(format!(
+                "a `{}` endpoint declares the `port` darkmux serves it on, e.g. `\"port\": 8091`",
+                crate::config_enum::ConfigEnum::token(b)
+            )),
+            (Some(b), Some(0)) => refuse(format!(
+                "`port` is 0; a `{}` endpoint needs a port from 1 to 65535",
+                crate::config_enum::ConfigEnum::token(b)
+            )),
+            (Some(_), Some(_)) | (None, None) => Ok(()),
+            (None, Some(_)) if kind.is_managed() => refuse(
+                "`port` is for a `tensorfold` or `flint` endpoint; an LM Studio endpoint's address is the machine's \
                  `lmstudio_url`. Drop `port` (and set `darkmux config set lmstudio_url <url>` if LM Studio moved)"
                     .to_string(),
             ),
-            (EndpointKind::Unmanaged, Some(_)) => refuse(
-                "`port` is for a `tensorfold` endpoint; an endpoint darkmux only sends requests to is addressed by \
-                 its `url`, port included. Drop `port`"
+            (None, Some(_)) => refuse(
+                "`port` is for a `tensorfold` or `flint` endpoint; an endpoint darkmux only sends requests to is \
+                 addressed by its `url`, port included. Drop `port`"
                     .to_string(),
             ),
         }
@@ -885,9 +923,10 @@ impl ModelEndpoint {
             EndpointKind::Managed(ManagedBackend::Lmstudio) => {
                 Ok(lmstudio_chat_url(&crate::config_access::lmstudio_url()))
             }
-            // `kind()` is Tensorfold only with a nonzero `port`. Loopback by
-            // construction: darkmux starts the server bound there (#3448).
-            EndpointKind::Managed(ManagedBackend::Tensorfold) => {
+            // `kind()` is Tensorfold or Flint only with a nonzero `port`.
+            // Loopback by construction: darkmux starts the server bound
+            // there (#3448, #3453).
+            EndpointKind::Managed(ManagedBackend::Tensorfold | ManagedBackend::Flint) => {
                 Ok(lmstudio_chat_url(&format!("http://127.0.0.1:{}", self.port.unwrap_or_default())))
             }
             EndpointKind::Unmanaged => {
@@ -2124,5 +2163,127 @@ mod tests {
         assert_eq!(refused.len(), 1);
         let line = refused[0].to_string();
         assert!(line.contains("internal.utility.endpoint") && line.contains("#3448"), "{line}");
+    }
+
+    /// (#3453) A Flint endpoint is managed (darkmux starts rec's own server
+    /// for the profile's model) and is served on this machine at its own
+    /// `port`, exactly as a Tensorfold one: no `url`, no provider, the
+    /// submitting machine's hardware.
+    #[test]
+    fn a_flint_endpoint_is_managed_and_served_on_its_port() {
+        let fl = ep(r#"{"managed":"flint","port":8092}"#);
+        assert_eq!(fl.kind().unwrap(), EndpointKind::Managed(ManagedBackend::Flint));
+        assert_eq!(fl.chat_url().unwrap(), "http://127.0.0.1:8092/v1/chat/completions");
+        assert_eq!(fl.resolved_dialect().unwrap(), Dialect::ChatCompletions);
+        assert_eq!((fl.host(), fl.provider()), (None, None));
+        assert_eq!(fl.hardware_basis(), HardwareBasis::Managed);
+        assert!(fl.validate().is_ok(), "{:?}", fl.validate());
+        assert_eq!(serde_json::to_value(&fl).unwrap(), serde_json::json!({"managed": "flint", "port": 8092}));
+        for (json, needles) in [
+            (r#"{"managed":"flint"}"#, &["`port`", "flint"][..]),
+            (r#"{"managed":"flint","port":0}"#, &["`port`", "1"][..]),
+            (r#"{"managed":"flint","port":8092,"url":"http://127.0.0.1:8092/v1"}"#, &["`url`", "`port`"][..]),
+            (r#"{"managed":"flint","port":8092,"dialect":"chat-completions-max-tokens"}"#, &["dialect", "Flint"][..]),
+        ] {
+            let err = ep(json).kind().unwrap_err().to_string();
+            for n in needles {
+                assert!(err.contains(n), "{json}: expected {n:?} in: {err}");
+            }
+        }
+        assert!(EndpointKind::Managed(ManagedBackend::Flint).starts_servers());
+        assert!(EndpointKind::Managed(ManagedBackend::Tensorfold).starts_servers());
+        assert!(!EndpointKind::Managed(ManagedBackend::Lmstudio).starts_servers());
+        assert!(!EndpointKind::Unmanaged.starts_servers());
+    }
+
+    /// (#3453) A Flint model's `engine_args` are `rec-mlx serve flint` flags
+    /// from the fixed set rec 0.1.0 accepts, checked at load (rec has no
+    /// `capabilities` command to ask): an unknown flag, a value outside a
+    /// listed set, a missing or non-numeric value, a value on a switch, and
+    /// the flags darkmux sets itself are refused, never echoing a value.
+    #[test]
+    fn flint_engine_args_are_the_flags_rec_accepts_and_never_what_darkmux_sets() {
+        let model = |args: &[&str]| {
+            let r = registry(&format!(
+                r#"{{"profiles":{{"p":{{"models":[{{"id":"flint-int4","n_ctx":8192,"endpoint":"fl","engine_args":{}}}]}}}},
+                    "endpoints":{{"fl":{{"managed":"flint","port":8092}}}}}}"#,
+                serde_json::to_string(args).unwrap()
+            ));
+            r.profiles["p"].models[0].clone()
+        };
+        for ok in [
+            &["--grammar", "flint", "--enforce-tool-schemas", "--metrics", "/tmp/flint-metrics.jsonl"][..],
+            &["--metrics=/tmp/m.jsonl", "--fast-sync"][..],
+            &["--temperature", "0.6", "--top-p=0.95", "--top-k", "20", "--max-tokens", "4096"][..],
+            &["--fast-sync"][..],
+            &["--no-fast-sync", "--grammar=none"][..],
+        ] {
+            assert_eq!(model(ok).engine_args_problem(), None, "{ok:?}");
+        }
+        for (args, needles) in [
+            (&["--turbo"][..], &["`--turbo`", "rec-mlx serve flint"][..]),
+            (&["--grammar", "s3cret"][..], &["`--grammar`", "none, flint"][..]),
+            (&["--grammar"][..], &["`--grammar`", "value"][..]),
+            (&["--temperature", "warm"][..], &["`--temperature`", "number"][..]),
+            (&["--top-k", "2.5"][..], &["`--top-k`", "whole number"][..]),
+            (&["--metrics"][..], &["`--metrics`", "takes a value"][..]),
+            (&["--metrics", "--fast-sync"][..], &["`--metrics`", "takes a value"][..]),
+            (&["--fast-sync", "yes"][..], &["`--fast-sync`", "takes no value"][..]),
+            (&["--enforce-tool-schemas=yes"][..], &["`--enforce-tool-schemas`", "takes no value"][..]),
+            (&["--model-dir", "/x"][..], &["`--model-dir`", "darkmux sets"][..]),
+            (&["--manifest=/x.json"][..], &["`--manifest`", "darkmux sets"][..]),
+            (&["--context-limit", "9"][..], &["`--context-limit`", "n_ctx"][..]),
+            (&["--port", "9"][..], &["`--port`", "darkmux sets"][..]),
+            (&["--api-key-file", "/k"][..], &["`--api-key-file`", "loopback"][..]),
+            (&["-p", "9"][..], &["short flag"][..]),
+        ] {
+            let why = model(args).engine_args_problem().unwrap_or_else(|| panic!("{args:?}: refused"));
+            for n in needles {
+                assert!(why.contains(n), "{args:?}: expected {n:?} in: {why}");
+            }
+            assert!(!why.contains("s3cret") && !why.contains("warm"), "never echoes a value: {why}");
+        }
+        let lms = pm(r#"{"id":"m","n_ctx":8,"engine_args":["--fast-sync"]}"#);
+        let why = lms.engine_args_problem().unwrap();
+        assert!(why.contains("tensorfold") && why.contains("flint"), "names both engines that take them: {why}");
+    }
+
+    /// (#3453) rec holds a single-instance lock, so a machine runs one Flint
+    /// server: a second `"managed": "flint"` endpoint is refused by every
+    /// dispatching preflight (contract 7 style: the key path and why),
+    /// naming the one already declared. One is fine.
+    #[test]
+    fn a_second_flint_endpoint_is_refused_naming_the_first() {
+        let one = registry(
+            r#"{"profiles":{"p":{"models":[{"id":"flint-int4","n_ctx":8,"endpoint":"fl"}]}},
+                "endpoints":{"fl":{"managed":"flint","port":8092},"tf":{"managed":"tensorfold","port":8091}}}"#,
+        );
+        assert!(crate::config_enum::extra_flint_endpoints(&one).is_empty());
+        let two = registry(
+            r#"{"profiles":{"p":{"models":[{"id":"flint-int4","n_ctx":8,"endpoint":"fl"}]}},
+                "endpoints":{"fl":{"managed":"flint","port":8092},"fl2":{"managed":"flint","port":8093},
+                             "fl3":{"managed":"flint","port":8094}}}"#,
+        );
+        let refused = crate::config_enum::extra_flint_endpoints(&two);
+        let lines: Vec<String> = refused.iter().map(ToString::to_string).collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("profiles.json key `endpoints.fl2.managed`") && lines[0].contains("`endpoints.fl`"), "{lines:?}");
+        assert!(lines[1].contains("`endpoints.fl3.managed`") && lines[0].contains("single-instance"), "{lines:?}");
+    }
+
+    /// (#3453) A utility binding on a Flint endpoint is refused like one on
+    /// Tensorfold, naming the backend it is bound to; and nothing on a Flint
+    /// endpoint needs LM Studio.
+    #[test]
+    fn the_utility_binding_on_a_flint_endpoint_is_refused_and_flint_needs_no_lm_studio() {
+        let r = registry(
+            r#"{"profiles":{"p":{"models":[{"id":"flint-int4","n_ctx":8192,"endpoint":"fl"}]}},
+                "endpoints":{"fl":{"managed":"flint","port":8092}},
+                "internal":{"utility":{"id":"u","n_ctx":8,"endpoint":"fl"}}}"#,
+        );
+        let refused = crate::config_enum::utility_on_engine_server(&r);
+        assert_eq!(refused.len(), 1);
+        assert!(refused[0].to_string().contains("`flint` endpoint"), "{}", refused[0]);
+        assert!(!r.needs_lmstudio(), "a Flint model and binding need no LM Studio");
     }
 }

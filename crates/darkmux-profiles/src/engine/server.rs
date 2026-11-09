@@ -8,7 +8,10 @@
 //!   answers; otherwise stop darkmux's old server there, refuse a port
 //!   something else holds, spawn the command in its own process group with
 //!   its output in a log file, record it, and wait until it lists the name
-//!   darkmux started it under.
+//!   darkmux started it under. A name proves nothing on its own (every Flint
+//!   server answers `flint`, #3453 review): a server is reused, and a start
+//!   is ready, only when darkmux's own server is what listens on the port
+//!   ([`listens`]); a start answered by anything else fails `port_in_use`.
 //! - **Stop** ([`stop`]): only a server whose record still matches the live
 //!   process (pid and start stamp), `SIGTERM`, then `SIGKILL` after a grace,
 //!   then wait for its port to close.
@@ -210,23 +213,40 @@ pub fn ensure(spec: &ServerSpec, dirs: &Dirs, bounds: Bounds, progress: &mut dyn
     // otherwise block on itself, since flock locks per open file).
     let lock_path = engine_record::path_in(&dirs.records, &spec.endpoint).with_extension("server.lock");
     let _lock = darkmux_types::flock::lock_exclusive(&lock_path).map_err(|e| start_failed(format!("{e:#}")))?;
-    if let Some(rec) = running(dirs, &spec.endpoint) {
-        if rec.argv == spec.argv && answers(spec.port, &spec.served_name) {
-            return Ok(Ensured::Reused(rec));
-        }
-        progress(Progress::Replacing { model: rec.model.clone() });
-        stop_locked(dirs, &rec, bounds)?;
+    if let Some(rec) = reuse_or_stop(spec, dirs, bounds, progress)? {
+        return Ok(Ensured::Reused(rec));
     }
     if port_taken(spec.port) {
         return Err(ServerError::PortInUse { endpoint: spec.endpoint.clone(), port: spec.port });
     }
     progress(Progress::Starting);
     let rec = spawn_and_record(spec, dirs).map_err(start_failed)?;
-    wait_ready(spec, dirs, &rec, bounds, progress).map_err(|detail| {
+    wait_ready(spec, dirs, &rec, bounds, progress).map_err(|fail| {
         let _ = stop_locked(dirs, &rec, bounds);
-        start_failed(detail)
+        match fail {
+            NotReady::Foreign => ServerError::PortInUse { endpoint: spec.endpoint.clone(), port: spec.port },
+            NotReady::Failed(detail) => start_failed(detail),
+        }
     })?;
     Ok(Ensured::Started(rec))
+}
+
+/// darkmux's running server on `spec`'s endpoint when it runs this exact
+/// command, answers under its name and is what listens on the port; any other
+/// server of darkmux's there is stopped, and `None` returned.
+fn reuse_or_stop(
+    spec: &ServerSpec,
+    dirs: &Dirs,
+    bounds: Bounds,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<Option<EngineRecord>, ServerError> {
+    let Some(rec) = running(dirs, &spec.endpoint) else { return Ok(None) };
+    if rec.argv == spec.argv && answers(spec.port, &spec.served_name) && listens(&rec) {
+        return Ok(Some(rec));
+    }
+    progress(Progress::Replacing { model: rec.model.clone() });
+    stop_locked(dirs, &rec, bounds)?;
+    Ok(None)
 }
 
 /// Spawn `spec.argv` detached in its own process group, its output appended
@@ -296,23 +316,34 @@ fn start_stamp_of(pid: u32) -> Option<u64> {
     })
 }
 
-fn wait_ready(spec: &ServerSpec, dirs: &Dirs, rec: &EngineRecord, bounds: Bounds, progress: &mut dyn FnMut(Progress)) -> Result<(), String> {
+/// Why a started server is not ready.
+enum NotReady {
+    /// Something darkmux did not start answers on the port (#3453 review).
+    Foreign,
+    Failed(String),
+}
+
+fn wait_ready(spec: &ServerSpec, dirs: &Dirs, rec: &EngineRecord, bounds: Bounds, progress: &mut dyn FnMut(Progress)) -> Result<(), NotReady> {
     let began = Instant::now();
     let mut last_beat = began;
     loop {
         if !alive(rec) {
-            return Err(format!("it exited during its start{}", log_tail(&dirs.log_for(&spec.endpoint))));
+            return Err(NotReady::Failed(format!("it exited during its start{}", log_tail(&dirs.log_for(&spec.endpoint)))));
         }
         if answers(spec.port, &spec.served_name) {
+            // The answer is darkmux's only when its own server is the listener.
+            if !listens(rec) {
+                return Err(NotReady::Foreign);
+            }
             progress(Progress::Ready { elapsed: began.elapsed() });
             return Ok(());
         }
         if began.elapsed() >= bounds.start {
-            return Err(format!(
+            return Err(NotReady::Failed(format!(
                 "it did not answer within {} s{}",
                 bounds.start.as_secs(),
                 log_tail(&dirs.log_for(&spec.endpoint))
-            ));
+            )));
         }
         if last_beat.elapsed() >= Duration::from_secs(10) {
             last_beat = Instant::now();
@@ -409,6 +440,27 @@ fn port_taken(port: u16) -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
 }
 
+/// (#3453 review) Whether darkmux's server `rec` is what listens on its
+/// port: every listener there is the recorded server or a process in the
+/// group it leads (it is spawned leading its own; Tensorfold may serve from
+/// a worker). A name proves nothing (every Flint server answers `flint`), so
+/// this is what makes an answer on the port darkmux's. Nothing listening,
+/// or a platform that cannot say, is not darkmux's.
+pub fn listens(rec: &EngineRecord) -> bool {
+    listens_by(rec, darkmux_platform::current())
+}
+
+/// [`listens`], asked of `host`.
+pub fn listens_by(rec: &EngineRecord, host: &dyn darkmux_platform::Platform) -> bool {
+    match host.tcp_listeners(rec.port) {
+        Some(pids) if !pids.is_empty() => pids.iter().all(|&pid| pid == rec.pid || host.process_group(pid) == Some(rec.pid)),
+        // Nothing listening is not darkmux's server; nor is a host that
+        // cannot say who listens (#3453 re-review).
+        Some(_) => false,
+        None => false,
+    }
+}
+
 /// Whether the server on `port` lists `served_name` at `GET /v1/models`.
 fn answers(port: u16, served_name: &str) -> bool {
     let agent = ureq::AgentBuilder::new().redirects(0).timeout(Duration::from_secs(2)).build();
@@ -462,6 +514,8 @@ if "--leave-group" in a:
     os.setpgid(0, os.getpgid(os.getppid()))
 if "--silent-name" in a:
     name = "someone-else"
+if "--no-bind" in a:
+    time.sleep(300); sys.exit(0)
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
         body = json.dumps({"object": "list", "data": [{"id": name}]}).encode()
@@ -795,6 +849,121 @@ S(("127.0.0.1", port), H).serve_forever()
         let rec = ensure(&s, &f.dirs, quick(), &mut no_progress()).unwrap().record().clone();
         stop(&f.dirs, &rec, quick()).unwrap();
         assert_eq!(rec.state_now(), ServerState::Exited);
+    }
+
+    /// A process darkmux did not start, serving the stand-in's answer for
+    /// `name` on `port` after `delay` seconds; killed when dropped.
+    struct Foreign(Child);
+
+    impl Drop for Foreign {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn foreign(f: &Fixture, port: u16, name: &str, delay: &str) -> Foreign {
+        let child = Command::new("python3")
+            .args(["-u", f.script.to_str().unwrap(), "serve", "x", "--port", &port.to_string(), "--name", name, "--slow", delay])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        Foreign(child)
+    }
+
+    /// (#3453 review, probe 1) A foreign server that binds the port while
+    /// darkmux's own server is still starting, answering under the very name
+    /// darkmux waits for (every Flint server answers `flint`), is not
+    /// darkmux's: the start fails `port_in_use`, darkmux's server is
+    /// stopped and unrecorded, and the foreign one is untouched.
+    #[test]
+    fn a_foreign_server_that_binds_during_the_start_is_never_taken_as_ready() {
+        let f = fixture();
+        let port = free_port();
+        let s = spec(&f, "fl", "m/a", port, &["--no-bind"]);
+        let mut other = foreign(&f, port, &s.served_name, "0.3");
+        let err = ensure(&s, &f.dirs, quick(), &mut no_progress()).unwrap_err();
+        assert_eq!(err.code(), "port_in_use", "{err}");
+        assert_eq!(engine_record::read_in(&f.dirs.records, "fl").unwrap(), None, "darkmux's server is unrecorded");
+        assert!(matches!(other.0.try_wait(), Ok(None)), "the foreign server is untouched");
+        assert!(answers(port, &s.served_name), "and still serving");
+    }
+
+    /// (#3453 review, probe 2) darkmux's recorded server is alive and runs the
+    /// same command but is not what listens on the port; a foreign server
+    /// answering the same name is. It is never reused: darkmux stops its own
+    /// and refuses the port.
+    #[test]
+    fn a_live_record_behind_a_foreign_listener_is_never_reused() {
+        let f = fixture();
+        let port = free_port();
+        let s = spec(&f, "fl", "m/a", port, &["--no-bind"]);
+        let ours = spawn_and_record(&s, &f.dirs).unwrap();
+        let _other = foreign(&f, port, &s.served_name, "0");
+        let until = Instant::now() + Duration::from_secs(10);
+        while !answers(port, &s.served_name) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(alive(&ours) && answers(port, &s.served_name), "the fixture holds: our record live, a foreign answer");
+        let result = ensure(&s, &f.dirs, quick(), &mut no_progress());
+        assert!(!matches!(result, Ok(Ensured::Reused(_))), "never reused: {result:?}");
+        assert_eq!(result.unwrap_err().code(), "port_in_use");
+        assert!(!alive(&ours), "darkmux's own non-listening server was stopped");
+    }
+
+    /// (#3453 review) `listens` is darkmux's server or a process in the group
+    /// it leads, never another process on the port.
+    #[test]
+    fn listens_is_the_recorded_servers_group_and_nothing_else() {
+        let f = fixture();
+        let s = spec(&f, "fl", "m/a", free_port(), &[]);
+        let rec = ensure(&s, &f.dirs, quick(), &mut no_progress()).unwrap().record().clone();
+        assert!(listens(&rec));
+        let other_port = free_port();
+        let _other = foreign(&f, other_port, "x", "0");
+        let until = Instant::now() + Duration::from_secs(10);
+        while !port_taken(other_port) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!listens(&EngineRecord { port: other_port, ..rec.clone() }), "a foreign listener is not darkmux's");
+        assert!(!listens(&EngineRecord { port: free_port(), ..rec.clone() }), "nothing listening is not darkmux's");
+        stop(&f.dirs, &rec, quick()).unwrap();
+    }
+
+    /// (#3453 re-review) `listens_by` against a fake host: the recorded pid or
+    /// a process in its group is darkmux's; a foreign listener, nothing
+    /// listening, or a host that cannot say (`None`) is not.
+    #[test]
+    fn listens_is_false_when_the_host_cannot_say() {
+        use darkmux_platform::FakePlatform;
+        let f = fixture();
+        let rec = EngineRecord {
+            schema: ENGINE_RECORD_SCHEMA,
+            endpoint: "fl".into(),
+            engine: "flint".into(),
+            model: "m".into(),
+            n_ctx: 8,
+            port: 9100,
+            pid: 40,
+            start_stamp: 1,
+            owner_pid: 1,
+            argv: vec![],
+            log: f.dirs.log_for("fl"),
+            started_at_ms: 0,
+            engine_version: String::new(),
+        };
+        let host = |listeners: Vec<u32>| FakePlatform {
+            tcp_listeners: vec![(9100, listeners)],
+            process_groups: vec![(41, 40), (99, 99)],
+            ..Default::default()
+        };
+        assert!(listens_by(&rec, &host(vec![40])), "the server itself");
+        assert!(listens_by(&rec, &host(vec![41])), "a worker in its group");
+        assert!(!listens_by(&rec, &host(vec![41, 99])), "a foreign listener beside it");
+        assert!(!listens_by(&rec, &host(vec![])), "nothing listening");
+        let cannot_say = FakePlatform { tcp_listeners_unreadable: true, ..host(vec![40]) };
+        assert!(!listens_by(&rec, &cannot_say), "a host that cannot say is not darkmux's");
     }
 
     /// (#3458 re-review) A server that left its group while a worker stayed

@@ -876,3 +876,80 @@ fn the_fake_answers_only_the_footprints_the_test_set() {
     assert_eq!(fake.process_footprint(7), Some(7_000));
     assert_eq!(fake.process_footprint(8), None);
 }
+
+/// (#3453) Where an XDG-layout tool keeps per-user data: `$XDG_DATA_HOME`
+/// when it is an absolute path, else `~/.local/share`; a relative or empty
+/// `XDG_DATA_HOME` is ignored, as the base-directory spec says.
+#[test]
+fn xdg_data_home_is_the_env_when_absolute_else_local_share() {
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+    let home = Some(OsString::from("/Users/me"));
+    assert_eq!(xdg_data_home_from(None, home.clone()), Some(PathBuf::from("/Users/me/.local/share")));
+    assert_eq!(xdg_data_home_from(Some("/x/data".into()), home.clone()), Some(PathBuf::from("/x/data")));
+    assert_eq!(xdg_data_home_from(Some("rel/data".into()), home.clone()), Some(PathBuf::from("/Users/me/.local/share")));
+    assert_eq!(xdg_data_home_from(Some("".into()), home), Some(PathBuf::from("/Users/me/.local/share")));
+    assert_eq!(xdg_data_home_from(None, None), None);
+    assert_eq!(xdg_data_home_from(None, Some("".into())), None);
+}
+
+/// (#3453) macOS and Linux both answer the XDG location from this process's
+/// environment (rec keeps its install there on both); an OS with no strategy
+/// answers none; the fake answers what the test set.
+#[test]
+fn each_strategy_answers_the_xdg_data_home() {
+    let env = xdg_data_home_from(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"));
+    assert!(env.is_some(), "a test host has a home");
+    assert_eq!(MacPlatform.xdg_data_home(), env);
+    assert_eq!(LinuxPlatform.xdg_data_home(), env);
+    assert_eq!(OtherPlatform.xdg_data_home(), None);
+    let fake = FakePlatform { xdg_data_home: Some("/fake/share".into()), ..Default::default() };
+    assert_eq!(fake.xdg_data_home(), Some(std::path::PathBuf::from("/fake/share")));
+    assert_eq!(FakePlatform::default().xdg_data_home(), None);
+}
+
+/// (#3453 review) `lsof -Fp`'s answer is one `p<pid>` line per process
+/// (other field lines ignored); nothing listening is an empty list.
+#[test]
+fn lsof_pid_lines_parse_to_the_listening_pids() {
+    assert_eq!(crate::pids_from_lsof_fp("p42854\nf3\np42855\nf7\n"), vec![42854, 42855]);
+    assert_eq!(crate::pids_from_lsof_fp(""), Vec::<u32>::new());
+    assert_eq!(crate::pids_from_lsof_fp("pnope\nf3\n"), Vec::<u32>::new());
+}
+
+/// (#3453 review) `/proc/net/tcp{,6}`: the inodes of the sockets in LISTEN
+/// (`0A`) on `port`, whatever address they bound; another port or state is
+/// not one. A socket fd's link names its inode.
+#[test]
+fn proc_net_tcp_listeners_on_a_port_are_read_by_inode() {
+    let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 41231 1 0000000000000000 100 0 0 10 0\n\
+   1: 00000000:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 41232 1 0000000000000000 100 0 0 10 0\n\
+   2: 0100007F:1F91 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 41233 1 0000000000000000 100 0 0 10 0\n\
+   3: 0100007F:1F90 0100007F:D431 01 00000000:00000000 00:00000000 00000000  1000        0 41234 1 0000000000000000 100 0 0 10 0\n";
+    assert_eq!(crate::linux::listening_inodes(table, 8080), vec![41231, 41232]);
+    assert_eq!(crate::linux::listening_inodes(table, 9), Vec::<u64>::new());
+    assert_eq!(crate::linux::socket_inode("socket:[41231]"), Some(41231));
+    assert_eq!(crate::linux::socket_inode("pipe:[41231]"), None);
+}
+
+/// (#3453 review) Who listens on a loopback port, and a process's group,
+/// asked of this host's strategy: this test's own listener is this process,
+/// in this process's group; an unbound port has no listener. An OS with no
+/// strategy cannot say; the fake answers what the test set.
+#[test]
+fn the_host_names_a_ports_listener_and_a_process_group() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let me = std::process::id();
+    let host = current();
+    assert_eq!(host.tcp_listeners(port), Some(vec![me]));
+    drop(listener);
+    assert_eq!(host.tcp_listeners(port), Some(vec![]));
+    let own_group = unsafe { libc::getpgid(0) } as u32;
+    assert_eq!(host.process_group(me), Some(own_group));
+    assert_eq!(host.process_group(u32::MAX >> 1), None, "no such process");
+    assert_eq!((OtherPlatform.tcp_listeners(port), OtherPlatform.process_group(me)), (None, None));
+    let fake = FakePlatform { tcp_listeners: vec![(port, vec![7])], process_groups: vec![(7, 5)], ..Default::default() };
+    assert_eq!((fake.tcp_listeners(port), fake.tcp_listeners(1), fake.process_group(7)), (Some(vec![7]), Some(vec![]), Some(5)));
+}

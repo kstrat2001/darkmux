@@ -591,7 +591,9 @@ pub struct DispatchEndPayload {
     /// beside `error` for a person: `busy` (the memory is held by a running
     /// dispatch; retry later), `wont_fit` (the model does not fit even with
     /// every darkmux resident evicted), `model_start_failed`, `port_in_use`,
-    /// `engine_unavailable`. Absent when the failure has no code.
+    /// `engine_unavailable`, `engine_in_use` (#3453: the engine's own server,
+    /// one darkmux did not start, is running, as rec's can be). Absent when
+    /// the failure has no code.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub code: Option<String>,
@@ -1245,7 +1247,7 @@ impl Attribution for DispatchWorkdirGitUnavailablePayload {
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct DispatchModelPayload {
-    /// The `managed` token (`tensorfold`).
+    /// The `managed` token (`tensorfold`, `flint`).
     pub engine: String,
     /// The `endpoints` id.
     pub endpoint: String,

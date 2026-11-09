@@ -522,6 +522,27 @@ pub fn tensorfold_bin() -> String {
 /// The name Tensorfold installs its server binary under.
 const TENSORFOLD_BIN: &str = "tensorfold-native";
 
+/// (#3453) rec, the command darkmux asks about the Flint engine it starts
+/// servers for (`rec --version`, `rec status`),
+/// `env(DARKMUX_FLINT_BIN) > config.engines.flint.bin > "rec"` (a `PATH`
+/// lookup), and which tier resolved it. Anchored like
+/// [`tensorfold_bin_with_source`]. The server darkmux runs is rec's own
+/// `rec-mlx`, found in rec's install, never configured.
+pub fn flint_bin_with_source() -> (String, Source) {
+    let cfg = config().engines.as_ref().and_then(|e| e.flint.as_ref()).and_then(|t| t.bin.as_deref());
+    let (v, s) = pick_string_with_source("DARKMUX_FLINT_BIN", cfg, Some(FLINT_BIN));
+    let cwd = std::env::current_dir().ok();
+    (anchor_program_path(v.unwrap_or_else(|| FLINT_BIN.to_string()), cwd.as_deref()), s)
+}
+
+/// [`flint_bin_with_source`]'s value.
+pub fn flint_bin() -> String {
+    flint_bin_with_source().0
+}
+
+/// The name rec installs its command under.
+const FLINT_BIN: &str = "rec";
+
 /// (#3266) The bare `lms`, looked up: the bare name when it is on `path_var`, else
 /// LM Studio's own install (`~/.lmstudio/bin/lms`, where `lms bootstrap`
 /// puts it) when that exists, else the bare name so the failure names the
@@ -2619,6 +2640,7 @@ macro_rules! location_accessors {
 location_accessors!(
     lms_bin,
     tensorfold_bin,
+    flint_bin,
     lmstudio_url,
     fleet_identity_bin,
     redis_host,
@@ -5509,6 +5531,35 @@ mod tests {
         unsafe { std::env::set_var(k, "8799"); }
         assert_eq!(serve_client_addr(), "127.0.0.1:8799");
         assert_eq!(serve_port(), 8799);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    // ── (#3453) rec, the Flint engine's command: env, then
+    //    `engines.flint.bin`, then the bare name, anchored like `lms_bin`.
+    #[serial_test::serial]
+    #[test]
+    fn flint_bin_resolves_env_then_config_then_the_bare_name() {
+        let k = "DARKMUX_FLINT_BIN";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::remove_var(k) };
+        assert_eq!(flint_bin_with_source(), ("rec".to_string(), Source::BuiltIn));
+        unsafe { std::env::set_var(k, "/opt/rec/bin/rec") };
+        assert_eq!(flint_bin_with_source(), ("/opt/rec/bin/rec".to_string(), Source::Env));
+        unsafe { std::env::set_var(k, "bin/rec") };
+        let (anchored, _) = flint_bin_with_source();
+        assert!(anchored.starts_with('/') && anchored.ends_with("/bin/rec"), "{anchored}");
+        #[cfg(feature = "test-support")]
+        {
+            unsafe { std::env::remove_var(k) };
+            let cfg: DarkmuxConfig = serde_json::from_value(serde_json::json!({"engines": {"flint": {"bin": "/c/rec"}}})).unwrap();
+            let _guard = set_config_for_test(cfg);
+            assert_eq!(flint_bin_with_source(), ("/c/rec".to_string(), Source::Config));
+        }
         unsafe {
             match prev {
                 Some(v) => std::env::set_var(k, v),

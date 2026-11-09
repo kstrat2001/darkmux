@@ -1,11 +1,14 @@
 //! (#3448) A dispatch to a model on an engine darkmux starts servers for
-//! (DESIGN.md, "Engine servers darkmux starts"): Tensorfold first.
+//! (DESIGN.md, "Engine servers darkmux starts"): Tensorfold, and rec's Flint
+//! (#3453).
 //!
 //! Called by each dispatch path after its `dispatch.start` and before its
 //! first request, [`prepare`] makes the model resident:
 //!
 //! 1. The engine is installed at a release darkmux was verified against, or
-//!    the dispatch fails `engine_unavailable`.
+//!    the dispatch fails `engine_unavailable`. A server the engine started
+//!    itself (rec's own, which holds rec's single-instance lock) fails it
+//!    `engine_in_use`: darkmux never stops or takes over one.
 //! 2. When darkmux's server on the endpoint already runs this exact command,
 //!    it is reused and nothing else happens.
 //! 3. Otherwise darkmux makes room: while the machine's reclaimable memory is
@@ -24,7 +27,8 @@
 //! `dispatch.model.*` record.
 
 use darkmux_flow::payload::DispatchModelPayload;
-use darkmux_profiles::engine::server::{self, Dirs, Progress};
+use darkmux_profiles::engine::flint::{self, Rec};
+use darkmux_profiles::engine::server::{self, Dirs, Progress, ServerSpec};
 use darkmux_profiles::engine::tensorfold::Tensorfold;
 use darkmux_types::engine_record::{self, EngineRecord};
 use darkmux_types::residency_lease::LeaseGuard;
@@ -67,7 +71,53 @@ pub struct EngineReady {
 
 /// Whether `target`'s model runs on a server darkmux starts.
 pub fn is_engine_server(target: &crate::target::Target) -> bool {
-    matches!(target.kind, EndpointKind::Managed(ManagedBackend::Tensorfold))
+    target.kind.starts_servers()
+}
+
+/// What [`prepare`] asks of the engine it starts a server for, one
+/// implementation per engine.
+pub(crate) trait ServerEngine {
+    /// The command for `model` on `endpoint`, refused with the code an app
+    /// branches on (`engine_unavailable` for an engine darkmux cannot run).
+    fn plan(&self, endpoint: &str, port: u16, model: &darkmux_types::ProfileModel) -> Result<ServerSpec, EngineRefusal>;
+    /// The memory the model needs, when the engine says.
+    fn memory_need(&self, model: &darkmux_types::ProfileModel) -> Option<u64>;
+    /// The address of a server the engine started itself (not darkmux),
+    /// when one is up and it allows only one.
+    fn own_server(&self) -> Result<Option<String>, EngineRefusal>;
+}
+
+fn unavailable(e: anyhow::Error) -> EngineRefusal {
+    refuse("engine_unavailable", format!("{e:#}"))
+}
+
+impl ServerEngine for Tensorfold {
+    fn plan(&self, endpoint: &str, port: u16, model: &darkmux_types::ProfileModel) -> Result<ServerSpec, EngineRefusal> {
+        let version = self.verified_version().map_err(unavailable)?;
+        self.serve_spec(endpoint, port, model, version).map_err(|e| refuse("model_start_failed", format!("{e:#}")))
+    }
+    fn memory_need(&self, model: &darkmux_types::ProfileModel) -> Option<u64> {
+        self.info(&model.id).map(|i| i.memory_floor_bytes).ok()
+    }
+    /// Tensorfold runs as many servers as it is asked for.
+    fn own_server(&self) -> Result<Option<String>, EngineRefusal> {
+        Ok(None)
+    }
+}
+
+/// (#3453) rec's Flint: paths from rec's own install, verified release only.
+impl ServerEngine for Rec {
+    fn plan(&self, endpoint: &str, port: u16, model: &darkmux_types::ProfileModel) -> Result<ServerSpec, EngineRefusal> {
+        let version = self.verified_version().map_err(unavailable)?;
+        self.serve_spec(endpoint, port, model, &version).map_err(unavailable)
+    }
+    /// The weights on disk: rec says nothing of a model's memory.
+    fn memory_need(&self, model: &darkmux_types::ProfileModel) -> Option<u64> {
+        self.model_dir(&model.id).ok().and_then(|d| flint::weights_bytes(&d))
+    }
+    fn own_server(&self) -> Result<Option<String>, EngineRefusal> {
+        Rec::own_server(self).map_err(unavailable)
+    }
 }
 
 /// The `code` of a dispatch failure that [`prepare`] refused, if it was one.
@@ -80,7 +130,16 @@ pub fn prepare(
     target: &crate::target::Target,
     note: &mut dyn FnMut(Note, DispatchModelPayload),
 ) -> Result<EngineReady, EngineRefusal> {
-    prepare_in(target, &Dirs::under_home(), &Tensorfold::installed(), server::Bounds::default(), &ThisMachine, note)
+    let (dirs, bounds) = (Dirs::under_home(), server::Bounds::default());
+    match target.kind {
+        EndpointKind::Managed(ManagedBackend::Tensorfold) => {
+            prepare_in(target, &dirs, &Tensorfold::installed(), bounds, &ThisMachine, note)
+        }
+        EndpointKind::Managed(ManagedBackend::Flint) => prepare_in(target, &dirs, &Rec::installed(), bounds, &ThisMachine, note),
+        EndpointKind::Managed(_) | EndpointKind::Unmanaged => {
+            Err(refuse("model_start_failed", "darkmux starts no server for this model's endpoint"))
+        }
+    }
 }
 
 /// What [`prepare`] asks of the machine beyond the engine server itself, so
@@ -133,17 +192,15 @@ impl Machine for ThisMachine {
 fn prepare_in(
     target: &crate::target::Target,
     dirs: &Dirs,
-    tf: &Tensorfold,
+    engine: &dyn ServerEngine,
     bounds: server::Bounds,
     machine: &dyn Machine,
     note: &mut dyn FnMut(Note, DispatchModelPayload),
 ) -> Result<EngineReady, EngineRefusal> {
     let endpoint = target.endpoint.named_id().unwrap_or_default().to_string();
     let port = target.endpoint.port.unwrap_or_default();
-    let version = tf.verified_version().map_err(|e| refuse("engine_unavailable", format!("{e:#}")))?;
-    let spec = tf
-        .serve_spec(&endpoint, port, &target.model, version)
-        .map_err(|e| refuse("model_start_failed", format!("{e:#}")))?;
+    let spec = engine.plan(&endpoint, port, &target.model)?;
+    refuse_engines_own_server(engine, dirs, &endpoint)?;
     let lease = LeaseGuard::acquire();
     let _ = lease.write(std::slice::from_ref(&spec.served_name));
     let base = DispatchModelPayload {
@@ -168,7 +225,7 @@ fn prepare_in(
                 ),
             ));
         }
-        let need = tf.info(&target.model.id).map(|i| i.memory_floor_bytes).ok();
+        let need = engine.memory_need(&target.model);
         let freed_by_replacing = current.as_ref().and_then(|r| machine.footprint(r.pid)).unwrap_or(0);
         let room = Room { need, freed_by_replacing, endpoint: &endpoint, leased: &leased };
         evicted = make_room(&room, dirs, bounds, machine)?;
@@ -180,6 +237,28 @@ fn prepare_in(
     let started = matches!(ensured, server::Ensured::Started(_));
     Ok(EngineReady { record: ensured.record().clone(), started, _lease: lease })
 }
+
+/// (#3453) Refuse `engine_in_use` when the engine's own server (one darkmux
+/// did not start) is up: rec holds a single-instance lock, and darkmux never
+/// stops or takes it over. The server darkmux itself runs on this endpoint
+/// is not that one when the engine names its port and darkmux's recorded
+/// server is what listens there (`server::listens`, #3453 review): a name
+/// or a port alone proves nothing.
+fn refuse_engines_own_server(engine: &dyn ServerEngine, dirs: &Dirs, endpoint: &str) -> Result<(), EngineRefusal> {
+    let Some(address) = engine.own_server()? else { return Ok(()) };
+    let ours = server::running(dirs, endpoint).is_some_and(|r| flint::endpoint_port(&address) == Some(r.port) && server::listens(&r));
+    if ours {
+        return Ok(());
+    }
+    Err(refuse(
+        "engine_in_use",
+        format!(
+            "rec's own server is up or starting (at {address}), and rec runs one server per machine; darkmux never stops or \
+             takes over a server it did not start. Run `rec stop`, then dispatch again"
+        ),
+    ))
+}
+
 
 /// One of darkmux's own residents that could be evicted to make room.
 enum Resident {
@@ -281,8 +360,12 @@ fn make_room(room: &Room<'_>, dirs: &Dirs, bounds: server::Bounds, machine: &dyn
     }
 }
 
-/// The model name a recorded server was started under (its `--name`).
+/// The model name a recorded server answers to: `flint` for rec's (it has
+/// no `--name`, #3453), else the `--name` it was started under.
 fn served_name_of(rec: &EngineRecord) -> String {
+    if rec.engine == flint::ENGINE {
+        return flint::SERVED_NAME.to_string();
+    }
     rec.argv.iter().skip_while(|a| *a != "--name").nth(1).cloned().unwrap_or_default()
 }
 
@@ -326,4 +409,4 @@ fn evict(resident: &Resident, dirs: &Dirs, bounds: server::Bounds, machine: &dyn
 
 #[cfg(test)]
 #[path = "engine_dispatch_tests.rs"]
-mod tests;
+pub(crate) mod tests;
