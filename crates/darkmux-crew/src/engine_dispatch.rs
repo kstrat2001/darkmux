@@ -9,17 +9,26 @@
 //!    the dispatch fails `engine_unavailable`. A server the engine started
 //!    itself (rec's own, which holds rec's single-instance lock) fails it
 //!    `engine_in_use`: darkmux never stops or takes over one.
+//!    A Tensorfold model's `engine_args` are checked against the installed
+//!    engine's own flags first, as doctor and a listing check them, and
+//!    refused `model_start_failed` before anything starts.
 //! 2. When darkmux's server on the endpoint already runs this exact command,
 //!    it is reused and nothing else happens.
 //! 3. Otherwise darkmux makes room: while the machine's reclaimable memory is
 //!    below the model's memory floor (the engine's own `info` figure),
 //!    it stops its own idle engine servers on other endpoints, oldest first,
 //!    then unloads its own idle LM Studio `darkmux:` loads. A resident a
-//!    running dispatch holds (a residency lease) is never touched. When
-//!    nothing is left to free, the dispatch fails `busy` (something darkmux
-//!    holds would free it later) or `wont_fit`.
+//!    running dispatch holds (a residency lease) is never touched: the
+//!    leases are read again before each eviction, and a server's under its
+//!    endpoint's lock, where it is stopped. When nothing is left to free,
+//!    the dispatch fails `busy` (something darkmux holds would free it
+//!    later) or `wont_fit`.
 //! 4. It starts the server ([`darkmux_profiles::engine::server::ensure`]) and
 //!    waits until it answers, failing `port_in_use` or `model_start_failed`.
+//!    Whether a running dispatch holds darkmux's server on the endpoint is
+//!    asked under the endpoint's lock, with the decision to stop it: one
+//!    that is held is reused when it runs the same command (however slowly
+//!    it answers) and otherwise refused `busy`, never stopped.
 //!
 //! The dispatch's lease names the served model for as long as the returned
 //! [`EngineReady`] lives, so no other darkmux process evicts it mid-run.
@@ -94,6 +103,12 @@ fn unavailable(e: anyhow::Error) -> EngineRefusal {
 impl ServerEngine for Tensorfold {
     fn plan(&self, endpoint: &str, port: u16, model: &darkmux_types::ProfileModel) -> Result<ServerSpec, EngineRefusal> {
         let version = self.verified_version().map_err(unavailable)?;
+        // The installed engine's own flags, as doctor and a listing check
+        // them: a flag it does not take would only fail the start later.
+        if !model.engine_args.is_empty() {
+            let flags = self.serve_flags().map_err(|e| unavailable(e.context("reading the flags its `serve` takes")))?;
+            flags.check(&model.engine_args).map_err(|why| refuse("model_start_failed", format!("engine_args: {why}")))?;
+        }
         self.serve_spec(endpoint, port, model, version).map_err(|e| refuse("model_start_failed", format!("{e:#}")))
     }
     fn memory_need(&self, model: &darkmux_types::ProfileModel) -> Option<u64> {
@@ -211,11 +226,15 @@ fn prepare_in(
     };
     let current = server::running(dirs, &endpoint);
     let reusable = current.as_ref().is_some_and(|r| r.argv == spec.argv);
+    // What other dispatches hold, read fresh wherever a stop is decided.
+    let held = |r: &EngineRecord| machine.leased(&lease).contains(&served_name_of(r));
     let leased = machine.leased(&lease);
     let mut evicted = Vec::new();
     if !reusable {
         // darkmux's own server on this endpoint runs another model or
-        // context; one a running dispatch is using is never replaced under it.
+        // context; one a running dispatch is using is never replaced under
+        // it. Refused here before anything is evicted for a start that
+        // cannot happen; `ensure` asks again under the endpoint's lock.
         if let Some(cur) = current.as_ref().filter(|r| leased.contains(&served_name_of(r))) {
             return Err(refuse(
                 "busy",
@@ -227,12 +246,12 @@ fn prepare_in(
         }
         let need = engine.memory_need(&target.model);
         let freed_by_replacing = current.as_ref().and_then(|r| machine.footprint(r.pid)).unwrap_or(0);
-        let room = Room { need, freed_by_replacing, endpoint: &endpoint, leased: &leased };
+        let room = Room { need, freed_by_replacing, endpoint: &endpoint, leased: &leased, lease: &lease };
         evicted = make_room(&room, dirs, bounds, machine)?;
     }
     let replacing = current.as_ref().map(|r| r.model.clone());
     let mut progress = |p: Progress| report(p, &base, &replacing, &evicted, note);
-    let ensured = server::ensure(&spec, dirs, bounds, &mut progress).map_err(|e| refuse(e.code(), e.to_string()))?;
+    let ensured = server::ensure(&spec, dirs, bounds, &held, &mut progress).map_err(|e| refuse(e.code(), e.to_string()))?;
     let _ = lease.mark_loaded(std::slice::from_ref(&spec.served_name));
     let started = matches!(ensured, server::Ensured::Started(_));
     Ok(EngineReady { record: ensured.record().clone(), started, _lease: lease })
@@ -309,7 +328,10 @@ struct Room<'a> {
     /// Memory darkmux's own server on this endpoint frees when replaced.
     freed_by_replacing: u64,
     endpoint: &'a str,
+    /// What other dispatches held when the dispatch looked; read again
+    /// (through `lease`) before each eviction.
     leased: &'a [String],
+    lease: &'a LeaseGuard,
 }
 
 fn make_room(room: &Room<'_>, dirs: &Dirs, bounds: server::Bounds, machine: &dyn Machine) -> Result<Vec<String>, EngineRefusal> {
@@ -328,7 +350,7 @@ fn make_room(room: &Room<'_>, dirs: &Dirs, bounds: server::Bounds, machine: &dyn
             format!("the model needs {:.1} GiB and this machine has {:.1} GiB in all", gib(need), gib(total)),
         ));
     }
-    let (mut idle, held) = darkmux_residents(dirs, room.endpoint, room.leased, machine.lmstudio_residents());
+    let (mut idle, mut held) = darkmux_residents(dirs, room.endpoint, room.leased, machine.lmstudio_residents());
     let mut evicted = Vec::new();
     loop {
         let Some(free) = machine.reclaimable() else { return Ok(evicted) };
@@ -348,8 +370,12 @@ fn make_room(room: &Room<'_>, dirs: &Dirs, bounds: server::Bounds, machine: &dyn
                 refuse("busy", format!("{short}; running dispatches hold {}, so retry when they finish", held.join(", ")))
             });
         };
-        evict(&next, dirs, bounds, machine)?;
-        evicted.push(next.name());
+        if evict(&next, dirs, bounds, machine, room.lease)? {
+            evicted.push(next.name());
+        } else {
+            // A dispatch took it up since the list was read.
+            held.push(next.name());
+        }
     }
 }
 
@@ -391,12 +417,24 @@ fn darkmux_residents(dirs: &Dirs, endpoint: &str, leased: &[String], lms: Vec<St
     (idle, held)
 }
 
-fn evict(resident: &Resident, dirs: &Dirs, bounds: server::Bounds, machine: &dyn Machine) -> Result<(), EngineRefusal> {
+/// Evict `resident` unless a running dispatch holds it now: `Ok(false)`
+/// when held. A server's lease is read under its endpoint's lock, where it
+/// is stopped; a load's right before its unload.
+fn evict(resident: &Resident, dirs: &Dirs, bounds: server::Bounds, machine: &dyn Machine, lease: &LeaseGuard) -> Result<bool, EngineRefusal> {
     match resident {
-        Resident::Server(r) => server::stop(dirs, r, bounds).map_err(|e| refuse(e.code(), e.to_string())),
-        Resident::Load(id) => machine
-            .lmstudio_unload(id)
-            .map_err(|e| refuse("model_start_failed", format!("could not unload `{id}` to make room: {e:#}"))),
+        Resident::Server(r) => {
+            let held = |r: &EngineRecord| machine.leased(lease).contains(&served_name_of(r));
+            server::stop_unless_held(dirs, r, bounds, &held).map_err(|e| refuse(e.code(), e.to_string()))
+        }
+        Resident::Load(id) => {
+            if machine.leased(lease).contains(id) {
+                return Ok(false);
+            }
+            machine
+                .lmstudio_unload(id)
+                .map_err(|e| refuse("model_start_failed", format!("could not unload `{id}` to make room: {e:#}")))?;
+            Ok(true)
+        }
     }
 }
 

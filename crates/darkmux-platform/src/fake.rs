@@ -23,6 +23,9 @@ pub struct FakePlatform {
     pub tcp_listeners: Vec<(u16, Vec<u32>)>,
     /// `true`: [`Platform::tcp_listeners`] cannot say (`None`) for any port.
     pub tcp_listeners_unreadable: bool,
+    /// How many [`Platform::tcp_listeners`] reads cannot say (`None`) before
+    /// the reads answer; each read counts one down.
+    pub tcp_listeners_unreadable_reads: std::sync::atomic::AtomicU32,
     /// `(pid, group)` pairs [`Platform::process_group`] answers.
     pub process_groups: Vec<(u32, u32)>,
 }
@@ -47,6 +50,7 @@ impl Default for FakePlatform {
             xdg_data_home: None,
             tcp_listeners: Vec::new(),
             tcp_listeners_unreadable: false,
+            tcp_listeners_unreadable_reads: std::sync::atomic::AtomicU32::new(0),
             process_groups: Vec::new(),
         }
     }
@@ -143,7 +147,9 @@ impl Platform for FakePlatform {
     }
 
     fn tcp_listeners(&self, port: u16) -> Option<Vec<u32>> {
-        if self.tcp_listeners_unreadable {
+        use std::sync::atomic::Ordering;
+        let unreadable_read = self.tcp_listeners_unreadable_reads.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
+        if self.tcp_listeners_unreadable || unreadable_read {
             return None;
         }
         Some(self.tcp_listeners.iter().find(|(p, _)| *p == port).map(|(_, pids)| pids.clone()).unwrap_or_default())

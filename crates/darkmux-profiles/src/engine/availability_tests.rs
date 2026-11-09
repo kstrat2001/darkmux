@@ -139,6 +139,32 @@ fn a_missing_model_bad_args_or_a_foreign_port_is_unavailable() {
     assert!(a.reason.unwrap().contains(&format!("127.0.0.1:{port}")));
 }
 
+/// darkmux's server up and serving this model's command is not `resident`
+/// when a dispatch would refuse it anyway, `engine_unavailable`: the binary
+/// is now a release darkmux was not verified against (after an upgrade), is
+/// missing, or no longer takes the model's `engine_args`. A listing reads
+/// what a dispatch would do.
+#[test]
+fn darkmuxs_server_up_is_not_resident_when_a_dispatch_would_refuse_the_engine() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = serving(&format!("darkmux:{TF_MODEL}"));
+    let model = tf_model(port, r#"["--turbo"]"#);
+    let plain = tf_model(port, "[]");
+    for (version, m, says) in [
+        ("tensorfold-native 1.3.0", &plain, "1.3.0"),
+        ("", &plain, "did not answer"),
+        ("tensorfold-native 1.2.4", &model, "--turbo"),
+    ] {
+        let answer = tf_answer(facts(version, &[TF_MODEL]), &dir);
+        let (argv, _) = answer.tf.serve_argv(port, m).unwrap();
+        let _ = std::fs::remove_dir_all(&answer.dirs.records);
+        record(&answer.dirs, port, argv);
+        let a = answer.judge(m);
+        assert_eq!(a.state, AvailabilityState::Unavailable, "{version:?}: {a:?}");
+        assert!(a.reason.as_deref().unwrap_or_default().contains(says), "{version:?}: {a:?}");
+    }
+}
+
 /// A server that answers `GET /v1/models` with `name`, forever.
 fn serving(name: &str) -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -188,14 +214,15 @@ fn record_for(dirs: &Dirs, endpoint: &str, engine: &str, port: u16, argv: Vec<St
 }
 
 /// darkmux's server running this model's exact command and answering is
-/// `resident`, whatever the binary says now; one running another command
-/// holds the port as darkmux's own, so the model is `startable`.
+/// `resident`, even when the engine no longer lists the model; one running
+/// another command holds the port as darkmux's own, so the model is
+/// `startable`.
 #[test]
 fn darkmuxs_running_server_is_resident_and_its_port_is_no_obstacle() {
     let dir = tempfile::tempdir().unwrap();
     let port = serving(&format!("darkmux:{TF_MODEL}"));
     let model = tf_model(port, "[]");
-    let mut answer = tf_answer(facts("tensorfold-native 1.3.0", &[]), &dir);
+    let mut answer = tf_answer(facts("tensorfold-native 1.2.4", &[]), &dir);
     let (argv, _) = answer.tf.serve_argv(port, &model).unwrap();
     record(&answer.dirs, port, argv.clone());
     assert_eq!(answer.judge(&model), Availability::resident());
@@ -360,10 +387,9 @@ fn an_engine_that_does_not_answer_in_time_is_unknown() {
         &ms,
         None,
         |b| {
-            // Past the 300 ms bound, inside the reap grace: the listing
-            // receives it, and must still read it as not answering in time.
+            // Well past the 300 ms bound and its 1 s reap grace.
             if b == ManagedBackend::Tensorfold {
-                std::thread::sleep(Duration::from_millis(800));
+                std::thread::sleep(Duration::from_millis(3000));
             }
             Box::new(Fixed(Availability::startable()))
         },
@@ -385,6 +411,25 @@ fn an_engine_that_does_not_answer_in_time_is_unknown() {
         "{:?}",
         listing.each[1]
     );
+}
+
+/// An engine one of whose probes ran to the bound (killed there, so its
+/// answer arrives just past it) keeps what its other probes got: a slow
+/// `lms ls` must not turn a model LM Studio lists as loaded `unknown`.
+#[test]
+fn an_answer_whose_probe_was_cut_at_the_bound_keeps_what_it_got() {
+    let ms = models(r#"{"profiles":{"a":{"models":[{"id":"l1","n_ctx":8}]}}}"#);
+    let listing = list_with(
+        &ms,
+        None,
+        |_| {
+            // A probe killed at the 300 ms bound: the answer comes just after.
+            std::thread::sleep(Duration::from_millis(400));
+            Box::new(Fixed(Availability::resident()))
+        },
+        |_| Duration::from_millis(300),
+    );
+    assert_eq!(listing.each[0], Availability::resident());
 }
 
 /// The production Tensorfold answer asks the binary only its read-only
@@ -434,7 +479,7 @@ fn asking_tensorfold_runs_only_its_read_only_commands() {
     calls.sort();
     assert_eq!(
         calls,
-        ["--version", "capabilities --json", "models --json"],
+        ["--version", "capabilities --json", "models --json", "serve --help"],
         "judging asks the binary nothing more"
     );
     assert!(
@@ -783,6 +828,24 @@ fn darkmuxs_running_flint_server_is_resident() {
         .argv;
     record_for(&answer.dirs, "fl", "flint", port, argv);
     assert_eq!(answer.judge(&model), Availability::resident());
+}
+
+/// darkmux's own Flint server resident on its endpoint, while `rec status`
+/// names rec's own server on another port: a dispatch refuses
+/// `engine_in_use` (rec runs one server per machine), so the listing reads
+/// `unavailable` with that refusal, never `resident`.
+#[test]
+fn darkmuxs_flint_server_beside_recs_own_is_unavailable_not_resident() {
+    let dir = tempfile::tempdir().unwrap();
+    rec_install(&dir.path().join("rec"), 1, &["flint-int4"]);
+    let port = serving("flint");
+    let model = flint_model(port);
+    let answer = flint_answer(&dir, Ok("0.1.0"), Ok(Some("http://127.0.0.1:11500/v1")));
+    let argv = answer.rec.serve_spec("fl", port, &model, "0.1.0").unwrap().argv;
+    record_for(&answer.dirs, "fl", "flint", port, argv);
+    let a = answer.judge(&model);
+    assert_eq!(a.state, AvailabilityState::Unavailable, "{a:?}");
+    assert!(a.reason.unwrap().contains("rec stop"));
 }
 
 /// darkmux's own Flint server on the endpoint running another command (a

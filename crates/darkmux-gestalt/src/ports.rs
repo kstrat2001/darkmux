@@ -53,11 +53,17 @@ pub enum HostError {
     CommandFailed { detail: String },
 }
 
+impl HostError {
+    /// How a [`HostError::Timeout`] reads, so a caller that kept only the
+    /// text can still tell a call that ran out of time from one that failed.
+    pub const TIMED_OUT: &'static str = "host call timed out";
+}
+
 impl std::fmt::Display for HostError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             HostError::Timeout { phase, waited } => {
-                write!(f, "host call timed out (phase: {phase}, waited {waited:?})")
+                write!(f, "{} (phase: {phase}, waited {waited:?})", Self::TIMED_OUT)
             }
             HostError::UnknownModel { model_key } => {
                 write!(f, "host does not know model \"{model_key}\"")

@@ -8,7 +8,10 @@
 //!   answers; otherwise stop darkmux's old server there, refuse a port
 //!   something else holds, spawn the command in its own process group with
 //!   its output in a log file, record it, and wait until it lists the name
-//!   darkmux started it under. A name proves nothing on its own (every Flint
+//!   darkmux started it under. A server a running dispatch holds (the
+//!   caller's `held`, asked under the same lock) is never stopped: the same
+//!   command still listening is reused however slowly it answers, and any
+//!   other is refused `busy`. A name proves nothing on its own (every Flint
 //!   server answers `flint`, #3453 review): a server is reused, and a start
 //!   is ready, only when darkmux's own server is what listens on the port
 //!   ([`listens`]); a start answered by anything else fails `port_in_use`.
@@ -100,12 +103,47 @@ pub enum Progress {
     Ready { elapsed: Duration },
 }
 
+/// Which check found the endpoint's port held by something darkmux did not
+/// start, so a refusal says why it was read that way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortHolder {
+    /// The port accepted a connection before darkmux started its server.
+    BeforeStart,
+    /// The port answered, and these processes listen there: none is
+    /// darkmux's server or in the group it leads.
+    Foreign(Vec<u32>),
+    /// The port answered, and no process listened on it when darkmux asked.
+    NoListener,
+    /// The port answered, and this machine could not say who listens on it,
+    /// asked twice.
+    Unreadable,
+}
+
+impl std::fmt::Display for PortHolder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PortHolder::BeforeStart => write!(f, "it accepted a connection before darkmux started its server"),
+            PortHolder::Foreign(pids) => {
+                let list: Vec<String> = pids.iter().map(u32::to_string).collect();
+                let noun = if pids.len() == 1 { "pid" } else { "pids" };
+                write!(f, "{noun} {} listen there, and none is darkmux's server", list.join(", "))
+            }
+            PortHolder::NoListener => write!(f, "it answered, and no process listened on it when darkmux asked"),
+            PortHolder::Unreadable => write!(f, "it answered, and this machine could not say which process listens on it"),
+        }
+    }
+}
+
 /// Why a server could not be started or stopped. Each has the stable
 /// `code` an app branches on (DESIGN.md, "What an app reads").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerError {
-    /// Something darkmux did not start answers on the endpoint's port.
-    PortInUse { endpoint: String, port: u16 },
+    /// Something darkmux did not start answers on the endpoint's port;
+    /// `holder` says which check found it.
+    PortInUse { endpoint: String, port: u16, holder: PortHolder },
+    /// darkmux's server on the endpoint runs another command, and a running
+    /// dispatch is using it.
+    Busy { endpoint: String, model: String },
     /// The server exited, did not answer in time, or could not be spawned
     /// or recorded. `log` holds its output.
     StartFailed { endpoint: String, log: PathBuf, detail: String },
@@ -117,6 +155,7 @@ impl ServerError {
     pub fn code(&self) -> &'static str {
         match self {
             ServerError::PortInUse { .. } => "port_in_use",
+            ServerError::Busy { .. } => "busy",
             ServerError::StartFailed { .. } => "model_start_failed",
             ServerError::StopFailed { .. } => "model_stop_failed",
         }
@@ -126,10 +165,14 @@ impl ServerError {
 impl std::fmt::Display for ServerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ServerError::PortInUse { endpoint, port } => write!(
+            ServerError::PortInUse { endpoint, port, holder } => write!(
                 f,
-                "endpoint `{endpoint}`: something darkmux did not start already answers on 127.0.0.1:{port}, and \
-                 darkmux never takes over a server it did not start. Stop it, or give the endpoint another `port`"
+                "endpoint `{endpoint}`: something darkmux did not start already answers on 127.0.0.1:{port} ({holder}), \
+                 and darkmux never takes over a server it did not start. Stop it, or give the endpoint another `port`"
+            ),
+            ServerError::Busy { endpoint, model } => write!(
+                f,
+                "endpoint `{endpoint}` is serving `{model}` for a running dispatch; retry when it finishes"
             ),
             ServerError::StartFailed { endpoint, log, detail } => {
                 write!(f, "endpoint `{endpoint}`: the server did not start: {detail}. Its output is in {}", log.display())
@@ -189,15 +232,29 @@ fn reap_exited() {
 
 /// darkmux's running server on `endpoint`, if it has one: its record matches
 /// the live process. A stale record (the process exited, or its pid now
-/// belongs to someone else) is removed and reads as none; an unreadable one
-/// claims nothing.
+/// belongs to someone else) is removed and reads as none, unless workers its
+/// exited server left still hold the port ([`left_workers`]): [`ensure`]
+/// clears those under the endpoint's lock. An unreadable record claims
+/// nothing.
 pub fn running(dirs: &Dirs, endpoint: &str) -> Option<EngineRecord> {
     let rec = engine_record::read_in(&dirs.records, endpoint).ok().flatten()?;
     if alive(&rec) {
         return Some(rec);
     }
-    let _ = engine_record::remove_if_in(&dirs.records, &rec);
+    if !left_workers(&rec) {
+        let _ = engine_record::remove_if_in(&dirs.records, &rec);
+    }
     None
+}
+
+/// Whether darkmux's exited server `rec` left workers in the group it led
+/// still listening on its port. Never when its pid now names another
+/// process: that pid's group could be the new process's. A group outlives
+/// its leader, and its id is not reused as a pid while any member is left.
+fn left_workers(rec: &EngineRecord) -> bool {
+    // A closed port answers at once; only a taken one is worth asking the
+    // host who listens (a socket listing is the slow part).
+    rec.state_now() != ServerState::PidReused && port_taken(rec.port) && listener(rec) == Listener::Darkmuxs
 }
 
 /// darkmux's live server on `endpoint`, read only: a stale record is left
@@ -213,9 +270,20 @@ pub fn serves(rec: &EngineRecord, argv: &[String], port: u16, served_name: &str)
     rec.argv == argv && answers(port, served_name) && listens(rec)
 }
 
+/// Whether a running dispatch is using darkmux's server `rec`: asked under
+/// the endpoint's lock, right before a stop it would forbid.
+pub type Held<'a> = &'a dyn Fn(&EngineRecord) -> bool;
+
 /// Make `spec`'s server the one running on its endpoint, and wait until it
-/// answers. See the module doc for the steps.
-pub fn ensure(spec: &ServerSpec, dirs: &Dirs, bounds: Bounds, progress: &mut dyn FnMut(Progress)) -> Result<Ensured, ServerError> {
+/// answers. See the module doc for the steps; `held` is asked under the
+/// endpoint's lock before darkmux's server there is stopped.
+pub fn ensure(
+    spec: &ServerSpec,
+    dirs: &Dirs,
+    bounds: Bounds,
+    held: Held<'_>,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<Ensured, ServerError> {
     let start_failed = |detail: String| ServerError::StartFailed {
         endpoint: spec.endpoint.clone(),
         log: dirs.log_for(&spec.endpoint),
@@ -226,18 +294,18 @@ pub fn ensure(spec: &ServerSpec, dirs: &Dirs, bounds: Bounds, progress: &mut dyn
     // otherwise block on itself, since flock locks per open file).
     let lock_path = engine_record::path_in(&dirs.records, &spec.endpoint).with_extension("server.lock");
     let _lock = darkmux_types::flock::lock_exclusive(&lock_path).map_err(|e| start_failed(format!("{e:#}")))?;
-    if let Some(rec) = reuse_or_stop(spec, dirs, bounds, progress)? {
+    if let Some(rec) = reuse_or_stop(spec, dirs, bounds, held, progress)? {
         return Ok(Ensured::Reused(rec));
     }
     if port_taken(spec.port) {
-        return Err(ServerError::PortInUse { endpoint: spec.endpoint.clone(), port: spec.port });
+        return Err(ServerError::PortInUse { endpoint: spec.endpoint.clone(), port: spec.port, holder: PortHolder::BeforeStart });
     }
     progress(Progress::Starting);
     let rec = spawn_and_record(spec, dirs).map_err(start_failed)?;
     wait_ready(spec, dirs, &rec, bounds, progress).map_err(|fail| {
         let _ = stop_locked(dirs, &rec, bounds);
         match fail {
-            NotReady::Foreign => ServerError::PortInUse { endpoint: spec.endpoint.clone(), port: spec.port },
+            NotReady::Foreign(holder) => ServerError::PortInUse { endpoint: spec.endpoint.clone(), port: spec.port, holder },
             NotReady::Failed(detail) => start_failed(detail),
         }
     })?;
@@ -246,16 +314,31 @@ pub fn ensure(spec: &ServerSpec, dirs: &Dirs, bounds: Bounds, progress: &mut dyn
 
 /// darkmux's running server on `spec`'s endpoint when it runs this exact
 /// command, answers under its name and is what listens on the port; any other
-/// server of darkmux's there is stopped, and `None` returned.
+/// server of darkmux's there is stopped, and `None` returned. One a running
+/// dispatch holds is never stopped: the same command still listening is
+/// reused however slowly it answers (it is busy), and another command is
+/// refused `busy`. A stale record is cleared with any workers it left.
 fn reuse_or_stop(
     spec: &ServerSpec,
     dirs: &Dirs,
     bounds: Bounds,
+    held: Held<'_>,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<Option<EngineRecord>, ServerError> {
-    let Some(rec) = running(dirs, &spec.endpoint) else { return Ok(None) };
-    if serves(&rec, &spec.argv, spec.port, &spec.served_name) {
+    let Some(rec) = engine_record::read_in(&dirs.records, &spec.endpoint).ok().flatten() else { return Ok(None) };
+    if !alive(&rec) {
+        stop_locked(dirs, &rec, bounds)?;
+        return Ok(None);
+    }
+    let same = rec.argv == spec.argv;
+    if same && answers(spec.port, &spec.served_name) && listens(&rec) {
         return Ok(Some(rec));
+    }
+    if held(&rec) {
+        if same && listens(&rec) {
+            return Ok(Some(rec));
+        }
+        return Err(ServerError::Busy { endpoint: spec.endpoint.clone(), model: rec.model.clone() });
     }
     progress(Progress::Replacing { model: rec.model.clone() });
     stop_locked(dirs, &rec, bounds)?;
@@ -332,7 +415,7 @@ fn start_stamp_of(pid: u32) -> Option<u64> {
 /// Why a started server is not ready.
 enum NotReady {
     /// Something darkmux did not start answers on the port (#3453 review).
-    Foreign,
+    Foreign(PortHolder),
     Failed(String),
 }
 
@@ -345,8 +428,8 @@ fn wait_ready(spec: &ServerSpec, dirs: &Dirs, rec: &EngineRecord, bounds: Bounds
         }
         if answers(spec.port, &spec.served_name) {
             // The answer is darkmux's only when its own server is the listener.
-            if !listens(rec) {
-                return Err(NotReady::Foreign);
+            if let Some(holder) = listener(rec).holder() {
+                return Err(NotReady::Foreign(holder));
             }
             progress(Progress::Ready { elapsed: began.elapsed() });
             return Ok(());
@@ -380,20 +463,39 @@ fn log_tail(log: &Path) -> String {
 
 /// Stop darkmux's server `rec`, taking the endpoint's lock.
 pub fn stop(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds) -> Result<(), ServerError> {
-    let lock_path = engine_record::path_in(&dirs.records, &rec.endpoint).with_extension("server.lock");
-    let _lock = darkmux_types::flock::lock_exclusive(&lock_path)
-        .map_err(|e| ServerError::StopFailed { endpoint: rec.endpoint.clone(), pid: rec.pid, detail: format!("{e:#}") })?;
+    let _lock = lock_for_stop(dirs, rec)?;
     stop_locked(dirs, rec, bounds)
 }
 
+/// Stop darkmux's server `rec` to make room, unless `held` says a running
+/// dispatch uses it, asked under the endpoint's lock so a dispatch that took
+/// it up since the caller looked is seen. `Ok(false)`: held, left running.
+pub fn stop_unless_held(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds, held: Held<'_>) -> Result<bool, ServerError> {
+    let _lock = lock_for_stop(dirs, rec)?;
+    if held(rec) {
+        return Ok(false);
+    }
+    stop_locked(dirs, rec, bounds)?;
+    Ok(true)
+}
+
+fn lock_for_stop(dirs: &Dirs, rec: &EngineRecord) -> Result<darkmux_types::flock::FlockGuard, ServerError> {
+    let lock_path = engine_record::path_in(&dirs.records, &rec.endpoint).with_extension("server.lock");
+    darkmux_types::flock::lock_exclusive(&lock_path)
+        .map_err(|e| ServerError::StopFailed { endpoint: rec.endpoint.clone(), pid: rec.pid, detail: format!("{e:#}") })
+}
+
 /// [`stop`] with the lock already held. Signals only a process the record
-/// still matches; a stale record is just removed.
+/// still matches, or the workers its exited server left on the port
+/// ([`left_workers`]); a stale record is then removed.
 fn stop_locked(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds) -> Result<(), ServerError> {
     use darkmux_types::child_registry::{SIGKILL, SIGTERM};
     let failed = |detail: String| ServerError::StopFailed { endpoint: rec.endpoint.clone(), pid: rec.pid, detail };
+    let mut signaled = false;
     // Only a server the record still matches is ever signaled; a stale
     // record names a pid (and so a group) that may be someone else's now.
     if alive(rec) {
+        signaled = true;
         signal_server(rec.pid, SIGTERM).map_err(|e| failed(format!("SIGTERM: {e}")))?;
         let exited = gone_within(rec, bounds);
         // Whether or not the server exited on SIGTERM, a worker in its group
@@ -406,16 +508,30 @@ fn stop_locked(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds) -> Result<(), Se
             signal_server(rec.pid, SIGKILL).map_err(|e| failed(format!("SIGKILL: {e}")))?;
             gone_within(rec, bounds);
         }
+    } else if left_workers(rec) {
+        // Its server exited first (a crash, or a server that daemonized):
+        // the group it led still holds the port, and is darkmux's.
+        signaled = true;
+        let _ = darkmux_types::child_registry::kill_group(rec.pid, SIGTERM);
+        port_closed_within(rec.port, bounds);
+        let _ = darkmux_types::child_registry::kill_group(rec.pid, SIGKILL);
     }
     if alive(rec) {
         return Err(failed("it is still running after SIGKILL".into()));
     }
-    let until = Instant::now() + bounds.stop_grace;
-    while port_taken(rec.port) && Instant::now() < until {
-        std::thread::sleep(bounds.poll);
+    if signaled {
+        port_closed_within(rec.port, bounds);
     }
     let _ = engine_record::remove_if_in(&dirs.records, rec);
     Ok(())
+}
+
+/// Wait up to the stop grace for nothing to accept connections on `port`.
+fn port_closed_within(port: u16, bounds: Bounds) {
+    let until = Instant::now() + bounds.stop_grace;
+    while port_taken(port) && Instant::now() < until {
+        std::thread::sleep(bounds.poll);
+    }
 }
 
 /// Signal the server's process group (it leads one: `spawn_and_record`, so
@@ -453,25 +569,74 @@ pub fn port_taken(port: u16) -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
 }
 
+/// Who listens on the port of darkmux's server `rec`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Listener {
+    /// Every listener is the recorded server or a process in the group it
+    /// leads.
+    Darkmuxs,
+    Nobody,
+    /// These listeners are neither.
+    Foreign(Vec<u32>),
+    /// The host could not say, asked twice.
+    Unknown,
+}
+
+impl Listener {
+    /// The [`PortHolder`] a start reports when the answer on the port is not
+    /// darkmux's server's; `None` when it is.
+    fn holder(self) -> Option<PortHolder> {
+        match self {
+            Listener::Darkmuxs => None,
+            Listener::Nobody => Some(PortHolder::NoListener),
+            Listener::Foreign(pids) => Some(PortHolder::Foreign(pids)),
+            Listener::Unknown => Some(PortHolder::Unreadable),
+        }
+    }
+}
+
+/// How long darkmux waits before asking the host again who listens, when
+/// it could not say: a listing of sockets can fail for a moment.
+const LISTENERS_RETRY: Duration = Duration::from_millis(100);
+
+/// [`Listener`] on `rec`'s port, asked of this machine.
+pub fn listener(rec: &EngineRecord) -> Listener {
+    listener_by(rec, darkmux_platform::current())
+}
+
+/// [`listener`], asked of `host`. A read that cannot say is asked again
+/// once before it reads as [`Listener::Unknown`].
+pub fn listener_by(rec: &EngineRecord, host: &dyn darkmux_platform::Platform) -> Listener {
+    let read = || host.tcp_listeners(rec.port);
+    let pids = read().or_else(|| {
+        std::thread::sleep(LISTENERS_RETRY);
+        read()
+    });
+    let Some(pids) = pids else { return Listener::Unknown };
+    if pids.is_empty() {
+        return Listener::Nobody;
+    }
+    let foreign: Vec<u32> = pids.into_iter().filter(|&pid| pid != rec.pid && host.process_group(pid) != Some(rec.pid)).collect();
+    if foreign.is_empty() {
+        Listener::Darkmuxs
+    } else {
+        Listener::Foreign(foreign)
+    }
+}
+
 /// (#3453 review) Whether darkmux's server `rec` is what listens on its
 /// port: every listener there is the recorded server or a process in the
 /// group it leads (it is spawned leading its own; Tensorfold may serve from
 /// a worker). A name proves nothing (every Flint server answers `flint`), so
 /// this is what makes an answer on the port darkmux's. Nothing listening,
-/// or a platform that cannot say, is not darkmux's.
+/// or a platform that cannot say (asked twice), is not darkmux's.
 pub fn listens(rec: &EngineRecord) -> bool {
     listens_by(rec, darkmux_platform::current())
 }
 
 /// [`listens`], asked of `host`.
 pub fn listens_by(rec: &EngineRecord, host: &dyn darkmux_platform::Platform) -> bool {
-    match host.tcp_listeners(rec.port) {
-        Some(pids) if !pids.is_empty() => pids.iter().all(|&pid| pid == rec.pid || host.process_group(pid) == Some(rec.pid)),
-        // Nothing listening is not darkmux's server; nor is a host that
-        // cannot say who listens (#3453 re-review).
-        Some(_) => false,
-        None => false,
-    }
+    listener_by(rec, host) == Listener::Darkmuxs
 }
 
 /// Whether the server on `port` lists `served_name` at `GET /v1/models`.
@@ -525,6 +690,10 @@ if "--leave-group-keep-worker" in a:
 if "--leave-group" in a:
     import os
     os.setpgid(0, os.getpgid(os.getppid()))
+if "--daemonize" in a:
+    import os
+    if os.fork() > 0:
+        os._exit(0)
 if "--silent-name" in a:
     name = "someone-else"
 if "--no-bind" in a:
@@ -605,6 +774,10 @@ S(("127.0.0.1", port), H).serve_forever()
         |_| {}
     }
 
+    fn not_held(_: &EngineRecord) -> bool {
+        false
+    }
+
     /// Start, reuse, stop: a second ensure of the same command reuses the
     /// server; a stop takes it down, frees the port and removes the record.
     #[test]
@@ -612,12 +785,12 @@ S(("127.0.0.1", port), H).serve_forever()
         let f = fixture();
         let s = spec(&f, "tf", "m/a", free_port(), &[]);
         let mut seen = Vec::new();
-        let first = ensure(&s, &f.dirs, quick(), &mut |p| seen.push(p)).unwrap();
+        let first = ensure(&s, &f.dirs, quick(), &not_held, &mut |p| seen.push(p)).unwrap();
         let Ensured::Started(rec) = first else { panic!("started: {first:?}") };
         assert!(matches!(seen.first(), Some(Progress::Starting)) && matches!(seen.last(), Some(Progress::Ready { .. })), "{seen:?}");
         assert!(answers(s.port, &s.served_name));
         assert_eq!(running(&f.dirs, "tf"), Some(rec.clone()));
-        let again = ensure(&s, &f.dirs, quick(), &mut no_progress()).unwrap();
+        let again = ensure(&s, &f.dirs, quick(), &not_held, &mut no_progress()).unwrap();
         assert_eq!(again, Ensured::Reused(rec.clone()), "the same command is reused, not restarted");
         stop(&f.dirs, &rec, quick()).unwrap();
         assert_eq!(rec.state_now(), ServerState::Exited);
@@ -631,9 +804,9 @@ S(("127.0.0.1", port), H).serve_forever()
     fn another_model_on_the_endpoint_replaces_darkmuxs_server() {
         let f = fixture();
         let port = free_port();
-        let a = ensure(&spec(&f, "tf", "m/a", port, &[]), &f.dirs, quick(), &mut no_progress()).unwrap();
+        let a = ensure(&spec(&f, "tf", "m/a", port, &[]), &f.dirs, quick(), &not_held, &mut no_progress()).unwrap();
         let mut seen = Vec::new();
-        let b = ensure(&spec(&f, "tf", "m/b", port, &[]), &f.dirs, quick(), &mut |p| seen.push(p)).unwrap();
+        let b = ensure(&spec(&f, "tf", "m/b", port, &[]), &f.dirs, quick(), &not_held, &mut |p| seen.push(p)).unwrap();
         assert!(matches!(&b, Ensured::Started(r) if r.model == "m/b" && r.pid != a.record().pid), "{b:?}");
         assert_eq!(seen.first(), Some(&Progress::Replacing { model: "m/a".into() }));
         assert_eq!(a.record().state_now(), ServerState::Exited, "the old server is stopped");
@@ -647,8 +820,8 @@ S(("127.0.0.1", port), H).serve_forever()
     fn a_changed_command_for_the_same_model_restarts_the_server() {
         let f = fixture();
         let port = free_port();
-        let a = ensure(&spec(&f, "tf", "m/a", port, &[]), &f.dirs, quick(), &mut no_progress()).unwrap();
-        let b = ensure(&spec(&f, "tf", "m/a", port, &["--keep-warm"]), &f.dirs, quick(), &mut no_progress()).unwrap();
+        let a = ensure(&spec(&f, "tf", "m/a", port, &[]), &f.dirs, quick(), &not_held, &mut no_progress()).unwrap();
+        let b = ensure(&spec(&f, "tf", "m/a", port, &["--keep-warm"]), &f.dirs, quick(), &not_held, &mut no_progress()).unwrap();
         assert!(matches!(&b, Ensured::Started(r) if r.pid != a.record().pid), "{b:?}");
         assert_eq!(a.record().state_now(), ServerState::Exited);
         stop(&f.dirs, b.record(), quick()).unwrap();
@@ -661,9 +834,10 @@ S(("127.0.0.1", port), H).serve_forever()
         let f = fixture();
         let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = other.local_addr().unwrap().port();
-        let err = ensure(&spec(&f, "tf", "m/a", port, &[]), &f.dirs, quick(), &mut no_progress()).unwrap_err();
+        let err = ensure(&spec(&f, "tf", "m/a", port, &[]), &f.dirs, quick(), &not_held, &mut no_progress()).unwrap_err();
         assert_eq!(err.code(), "port_in_use");
         assert!(err.to_string().contains(&port.to_string()), "{err}");
+        assert!(err.to_string().contains("before darkmux started its server"), "it says which check refused: {err}");
         assert_eq!(engine_record::read_in(&f.dirs.records, "tf").unwrap(), None);
     }
 
@@ -672,7 +846,7 @@ S(("127.0.0.1", port), H).serve_forever()
     #[test]
     fn a_server_that_exits_during_its_start_fails_naming_its_log() {
         let f = fixture();
-        let err = ensure(&spec(&f, "tf", "m/a", free_port(), &["--fail"]), &f.dirs, quick(), &mut no_progress()).unwrap_err();
+        let err = ensure(&spec(&f, "tf", "m/a", free_port(), &["--fail"]), &f.dirs, quick(), &not_held, &mut no_progress()).unwrap_err();
         assert_eq!(err.code(), "model_start_failed");
         let msg = err.to_string();
         assert!(msg.contains("refusing to start") && msg.contains("tf.log"), "{msg}");
@@ -685,7 +859,7 @@ S(("127.0.0.1", port), H).serve_forever()
         let f = fixture();
         let s = spec(&f, "tf", "m/a", free_port(), &["--slow", "30"]);
         let bounds = Bounds { start: Duration::from_millis(600), ..quick() };
-        let err = ensure(&s, &f.dirs, bounds, &mut no_progress()).unwrap_err();
+        let err = ensure(&s, &f.dirs, bounds, &not_held, &mut no_progress()).unwrap_err();
         assert!(err.to_string().contains("did not answer within"), "{err}");
         assert_eq!(engine_record::read_in(&f.dirs.records, "tf").unwrap(), None, "no record survives a failed start");
     }
@@ -695,7 +869,7 @@ S(("127.0.0.1", port), H).serve_forever()
     fn a_server_that_ignores_sigterm_is_killed_after_the_grace() {
         let f = fixture();
         let s = spec(&f, "tf", "m/a", free_port(), &["--ignore-term"]);
-        let rec = ensure(&s, &f.dirs, quick(), &mut no_progress()).unwrap().record().clone();
+        let rec = ensure(&s, &f.dirs, quick(), &not_held, &mut no_progress()).unwrap().record().clone();
         let bounds = Bounds { stop_grace: Duration::from_millis(500), ..quick() };
         stop(&f.dirs, &rec, bounds).unwrap();
         assert_eq!(rec.state_now(), ServerState::Exited);
@@ -745,7 +919,7 @@ S(("127.0.0.1", port), H).serve_forever()
         let f = fixture();
         let child_file = f.dirs.logs.with_extension("child");
         let s = spec(&f, "tf", "m/a", free_port(), &["--fork-child", child_file.to_str().unwrap()]);
-        let rec = ensure(&s, &f.dirs, quick(), &mut no_progress()).unwrap().record().clone();
+        let rec = ensure(&s, &f.dirs, quick(), &not_held, &mut no_progress()).unwrap().record().clone();
         let child: u32 = std::fs::read_to_string(&child_file).unwrap().trim().parse().unwrap();
         assert!(pid_alive(child));
         stop(&f.dirs, &rec, quick()).unwrap();
@@ -770,7 +944,7 @@ S(("127.0.0.1", port), H).serve_forever()
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(alive(&up), "the silent server is up under the same command");
-        let result = ensure(&silent, &f.dirs, Bounds { start: Duration::from_millis(800), ..quick() }, &mut no_progress());
+        let result = ensure(&silent, &f.dirs, Bounds { start: Duration::from_millis(800), ..quick() }, &not_held, &mut no_progress());
         assert!(!matches!(result, Ok(Ensured::Reused(_))), "never reused: {result:?}");
     }
 
@@ -784,7 +958,7 @@ S(("127.0.0.1", port), H).serve_forever()
         // Make the record file's own name a directory, so the rename fails.
         std::fs::create_dir_all(engine_record::path_in(&f.dirs.records, "tf")).unwrap();
         let port = free_port();
-        let err = ensure(&spec(&f, "tf", "m/a", port, &[]), &f.dirs, quick(), &mut no_progress()).unwrap_err();
+        let err = ensure(&spec(&f, "tf", "m/a", port, &[]), &f.dirs, quick(), &not_held, &mut no_progress()).unwrap_err();
         assert_eq!(err.code(), "model_start_failed");
         std::thread::sleep(Duration::from_millis(300));
         assert!(!port_taken(port), "no server survives a failed record write");
@@ -839,7 +1013,7 @@ S(("127.0.0.1", port), H).serve_forever()
         let f = fixture();
         let file = f.dirs.logs.with_extension("worker");
         let s = spec(&f, "tf", "m/a", free_port(), &["--stubborn-worker", file.to_str().unwrap()]);
-        let rec = ensure(&s, &f.dirs, quick(), &mut no_progress()).unwrap().record().clone();
+        let rec = ensure(&s, &f.dirs, quick(), &not_held, &mut no_progress()).unwrap().record().clone();
         let worker: u32 = std::fs::read_to_string(&file).unwrap().trim().parse().unwrap();
         stop(&f.dirs, &rec, Bounds { stop_grace: Duration::from_millis(500), ..quick() }).unwrap();
         let until = Instant::now() + Duration::from_secs(3);
@@ -859,7 +1033,7 @@ S(("127.0.0.1", port), H).serve_forever()
     fn a_server_that_left_its_group_is_still_stopped() {
         let f = fixture();
         let s = spec(&f, "tf", "m/a", free_port(), &["--leave-group"]);
-        let rec = ensure(&s, &f.dirs, quick(), &mut no_progress()).unwrap().record().clone();
+        let rec = ensure(&s, &f.dirs, quick(), &not_held, &mut no_progress()).unwrap().record().clone();
         stop(&f.dirs, &rec, quick()).unwrap();
         assert_eq!(rec.state_now(), ServerState::Exited);
     }
@@ -896,8 +1070,9 @@ S(("127.0.0.1", port), H).serve_forever()
         let port = free_port();
         let s = spec(&f, "fl", "m/a", port, &["--no-bind"]);
         let mut other = foreign(&f, port, &s.served_name, "0.3");
-        let err = ensure(&s, &f.dirs, quick(), &mut no_progress()).unwrap_err();
+        let err = ensure(&s, &f.dirs, quick(), &not_held, &mut no_progress()).unwrap_err();
         assert_eq!(err.code(), "port_in_use", "{err}");
+        assert!(err.to_string().contains(&format!("pid {}", other.0.id())), "it names the listener: {err}");
         assert_eq!(engine_record::read_in(&f.dirs.records, "fl").unwrap(), None, "darkmux's server is unrecorded");
         assert!(matches!(other.0.try_wait(), Ok(None)), "the foreign server is untouched");
         assert!(answers(port, &s.served_name), "and still serving");
@@ -919,7 +1094,7 @@ S(("127.0.0.1", port), H).serve_forever()
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(alive(&ours) && answers(port, &s.served_name), "the fixture holds: our record live, a foreign answer");
-        let result = ensure(&s, &f.dirs, quick(), &mut no_progress());
+        let result = ensure(&s, &f.dirs, quick(), &not_held, &mut no_progress());
         assert!(!matches!(result, Ok(Ensured::Reused(_))), "never reused: {result:?}");
         assert_eq!(result.unwrap_err().code(), "port_in_use");
         assert!(!alive(&ours), "darkmux's own non-listening server was stopped");
@@ -931,7 +1106,7 @@ S(("127.0.0.1", port), H).serve_forever()
     fn listens_is_the_recorded_servers_group_and_nothing_else() {
         let f = fixture();
         let s = spec(&f, "fl", "m/a", free_port(), &[]);
-        let rec = ensure(&s, &f.dirs, quick(), &mut no_progress()).unwrap().record().clone();
+        let rec = ensure(&s, &f.dirs, quick(), &not_held, &mut no_progress()).unwrap().record().clone();
         assert!(listens(&rec));
         let other_port = free_port();
         let _other = foreign(&f, other_port, "x", "0");
@@ -985,8 +1160,180 @@ S(("127.0.0.1", port), H).serve_forever()
     fn a_server_that_left_its_group_behind_a_worker_is_still_stopped() {
         let f = fixture();
         let s = spec(&f, "tf", "m/a", free_port(), &["--leave-group-keep-worker"]);
-        let rec = ensure(&s, &f.dirs, quick(), &mut no_progress()).unwrap().record().clone();
+        let rec = ensure(&s, &f.dirs, quick(), &not_held, &mut no_progress()).unwrap().record().clone();
         stop(&f.dirs, &rec, Bounds { stop_grace: Duration::from_millis(500), ..quick() }).unwrap();
         assert_eq!(rec.state_now(), ServerState::Exited);
+    }
+
+    /// SIGKILLs the process group `0` leads when dropped, so a worker a
+    /// failed assertion left behind does not outlive the test.
+    struct KillGroup(u32);
+
+    impl Drop for KillGroup {
+        fn drop(&mut self) {
+            let _ = darkmux_types::child_registry::kill_group(self.0, darkmux_types::child_registry::SIGKILL);
+        }
+    }
+
+    /// A server whose leader exited while a worker it forked still serves
+    /// its port: spawned and recorded, then waited on until the leader is
+    /// gone and the worker answers.
+    fn leader_gone_worker_serving(f: &Fixture, endpoint: &str, port: u16) -> (EngineRecord, KillGroup) {
+        let rec = spawn_and_record(&spec(f, endpoint, "m/a", port, &["--daemonize"]), &f.dirs).unwrap();
+        let guard = KillGroup(rec.pid);
+        let until = Instant::now() + Duration::from_secs(10);
+        while (alive(&rec) || !port_taken(port)) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!alive(&rec) && port_taken(port), "the fixture holds: the leader is gone and its worker serves");
+        (rec, guard)
+    }
+
+    /// A stop of a server whose leader already exited still takes down the
+    /// workers left in its group: none outlives the stop holding the port.
+    #[test]
+    fn a_stop_takes_down_the_workers_a_gone_leader_left() {
+        let f = fixture();
+        let port = free_port();
+        let (rec, _guard) = leader_gone_worker_serving(&f, "tf", port);
+        stop(&f.dirs, &rec, quick()).unwrap();
+        assert!(!port_taken(port), "the worker its leader left is gone with the stop");
+    }
+
+    /// darkmux's own server whose leader exited, its worker still on the
+    /// port, is darkmux's to clear: a start on the endpoint stops that
+    /// worker and starts, rather than refusing the port as someone else's.
+    #[test]
+    fn a_gone_leaders_worker_is_cleared_not_read_as_someone_elses() {
+        let f = fixture();
+        let port = free_port();
+        let (rec, _guard) = leader_gone_worker_serving(&f, "tf", port);
+        assert_eq!(running(&f.dirs, "tf"), None, "the gone leader is not a running server");
+        assert_eq!(engine_record::read_in(&f.dirs.records, "tf").unwrap(), Some(rec), "its record stays for the start to clear");
+        let started = ensure(&spec(&f, "tf", "m/b", port, &[]), &f.dirs, quick(), &not_held, &mut no_progress());
+        let started = started.unwrap_or_else(|e| panic!("started: {e}"));
+        assert!(matches!(&started, Ensured::Started(r) if r.model == "m/b"), "{started:?}");
+        stop(&f.dirs, started.record(), quick()).unwrap();
+    }
+
+    /// One read that cannot say who listens is asked again once: a host
+    /// that answers on the second read finds darkmux's server; two
+    /// unreadable reads in a row are still not darkmux's.
+    #[test]
+    fn listens_asks_the_host_again_once_when_it_cannot_say() {
+        use darkmux_platform::FakePlatform;
+        let f = fixture();
+        let rec = EngineRecord {
+            schema: ENGINE_RECORD_SCHEMA,
+            endpoint: "fl".into(),
+            engine: "flint".into(),
+            model: "m".into(),
+            n_ctx: 8,
+            port: 9100,
+            pid: 40,
+            start_stamp: 1,
+            owner_pid: 1,
+            argv: vec![],
+            log: f.dirs.log_for("fl"),
+            started_at_ms: 0,
+            engine_version: String::new(),
+        };
+        let host = |unreadable: u32| FakePlatform {
+            tcp_listeners: vec![(9100, vec![40])],
+            tcp_listeners_unreadable_reads: std::sync::atomic::AtomicU32::new(unreadable),
+            ..Default::default()
+        };
+        assert!(listens_by(&rec, &host(1)), "the second read answers");
+        assert!(!listens_by(&rec, &host(2)), "two reads that cannot say are not darkmux's");
+    }
+
+    /// A server a running dispatch holds is never stopped for another
+    /// command on its endpoint: the start is refused `busy`, naming the
+    /// model it serves, and the server is untouched.
+    #[test]
+    fn a_held_server_is_never_replaced_by_another_command() {
+        let f = fixture();
+        let port = free_port();
+        let a = ensure(&spec(&f, "tf", "m/a", port, &[]), &f.dirs, quick(), &not_held, &mut no_progress()).unwrap();
+        let mut seen = Vec::new();
+        let err = ensure(&spec(&f, "tf", "m/b", port, &[]), &f.dirs, quick(), &|_| true, &mut |p| seen.push(p)).unwrap_err();
+        assert_eq!(err.code(), "busy", "{err}");
+        assert!(err.to_string().contains("`m/a`"), "{err}");
+        assert!(alive(a.record()), "the held server is untouched");
+        assert!(seen.is_empty(), "nothing is replaced or started: {seen:?}");
+        stop(&f.dirs, a.record(), quick()).unwrap();
+    }
+
+    /// A held server running the same command that does not answer under
+    /// its name in time (busy) is reused, never stopped under the dispatch
+    /// using it.
+    #[test]
+    fn a_held_server_that_does_not_answer_in_time_is_reused() {
+        let f = fixture();
+        let silent = spec(&f, "tf", "m/a", free_port(), &["--silent-name"]);
+        let up = spawn_and_record(&silent, &f.dirs).unwrap();
+        let until = Instant::now() + Duration::from_secs(10);
+        while !port_taken(silent.port) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let again = ensure(&silent, &f.dirs, quick(), &|_| true, &mut no_progress()).unwrap();
+        assert_eq!(again, Ensured::Reused(up.clone()));
+        assert!(alive(&up));
+        stop(&f.dirs, &up, quick()).unwrap();
+    }
+
+    /// An idle server is stopped to make room; one held by the time the
+    /// endpoint's lock is taken is left running.
+    #[test]
+    fn a_stop_to_make_room_leaves_a_held_server_running() {
+        let f = fixture();
+        let a = ensure(&spec(&f, "tf", "m/a", free_port(), &[]), &f.dirs, quick(), &not_held, &mut no_progress()).unwrap();
+        assert_eq!(stop_unless_held(&f.dirs, a.record(), quick(), &|_| true), Ok(false));
+        assert!(alive(a.record()), "held: left running");
+        assert_eq!(stop_unless_held(&f.dirs, a.record(), quick(), &not_held), Ok(true));
+        assert_eq!(a.record().state_now(), ServerState::Exited);
+    }
+
+    /// A record whose pid now names another process is never read as
+    /// having left workers, even when that process leads a group listening
+    /// on the recorded port: its group is the new process's, and a stop
+    /// signals nothing.
+    #[test]
+    fn a_reused_pids_group_on_the_port_is_never_signaled() {
+        let f = fixture();
+        let port = free_port();
+        let mut other = Command::new("python3");
+        other
+            .args(["-u", f.script.to_str().unwrap(), "serve", "x", "--port", &port.to_string(), "--name", "x"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        std::os::unix::process::CommandExt::process_group(&mut other, 0);
+        let other = Foreign(other.spawn().unwrap());
+        let _guard = KillGroup(other.0.id());
+        let until = Instant::now() + Duration::from_secs(10);
+        while !port_taken(port) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let pid = other.0.id();
+        let stamp = darkmux_platform::current().process_start_stamp(pid).expect("its start stamp");
+        let rec = EngineRecord {
+            schema: ENGINE_RECORD_SCHEMA,
+            endpoint: "tf".into(),
+            engine: "tensorfold".into(),
+            model: "m/a".into(),
+            n_ctx: 8192,
+            port,
+            pid,
+            start_stamp: stamp.wrapping_add(1),
+            owner_pid: pid,
+            argv: vec![],
+            log: f.dirs.log_for("tf"),
+            started_at_ms: 0,
+            engine_version: String::new(),
+        };
+        assert_eq!(rec.state_now(), ServerState::PidReused);
+        engine_record::write_in(&f.dirs.records, &rec).unwrap();
+        stop(&f.dirs, &rec, quick()).unwrap();
+        assert!(port_taken(port), "the other process's server still answers: never signaled");
     }
 }

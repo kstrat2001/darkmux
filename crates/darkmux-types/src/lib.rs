@@ -395,20 +395,32 @@ pub(crate) fn malformed_engine_arg(arg: &str) -> Option<String> {
     None
 }
 
+/// The `tensorfold-native serve` flags darkmux sets or keeps off its
+/// servers, and why each is not the operator's to pass.
+const TENSORFOLD_RESERVED: &[(&str, &str)] = &[
+    ("--port", "darkmux sets it from the endpoint's `port`"),
+    ("--host", "darkmux sets it: the server is bound to loopback"),
+    ("--context", "darkmux sets it from the model's `n_ctx`"),
+    ("--name", "darkmux sets it to the model's `darkmux:` name (contract 4)"),
+    ("--alias", "the server answers only to the model's `darkmux:` name (contract 4)"),
+    ("--api-key", "a secret does not belong in profiles.json"),
+    ("--api-key-file", "a secret's file does not belong in profiles.json; darkmux serves on loopback with no key"),
+];
+
 fn reserved_engine_arg(arg: &str) -> Option<String> {
     if let Some(why) = malformed_engine_arg(arg) {
         return Some(why);
     }
     let flag = arg.split('=').next().unwrap_or(arg);
-    let why = match flag {
-        "--port" => "darkmux sets it from the endpoint's `port`",
-        "--host" => "darkmux sets it: the server is bound to loopback",
-        "--context" => "darkmux sets it from the model's `n_ctx`",
-        "--name" => "darkmux sets it to the model's `darkmux:` name (contract 4)",
-        "--api-key" => "a secret does not belong in profiles.json",
-        _ => return None,
-    };
-    Some(format!("`engine_args` names `{flag}`, which is not yours to pass: {why}. Remove it"))
+    if let Some((_, why)) = TENSORFOLD_RESERVED.iter().find(|(r, _)| *r == flag) {
+        return Some(format!("`engine_args` names `{flag}`, which is not yours to pass: {why}. Remove it"));
+    }
+    // An engine that reads an unambiguous abbreviation as the whole flag
+    // would take `--ho` as `--host`.
+    let (full, why) = TENSORFOLD_RESERVED.iter().find(|(r, _)| flag.len() > 2 && r.starts_with(flag))?;
+    Some(format!(
+        "`engine_args` names `{flag}`, which abbreviates `{full}`, which is not yours to pass: {why}. Remove it"
+    ))
 }
 
 impl ProfileModel {
@@ -442,8 +454,10 @@ impl ProfileModel {
     /// (#3448) Why this model's `engine_args` cannot be used as written, or
     /// `None`. They are flags for a server darkmux starts, so they need a
     /// Tensorfold endpoint; darkmux sets `--port`, `--host`, `--context` and
-    /// `--name` itself, and a secret (`--api-key`) does not belong in
-    /// `profiles.json`. Never echoes a flag's value (it may be a secret).
+    /// `--name` itself (and allows no `--alias` beside the name), a secret
+    /// (`--api-key`, `--api-key-file`) does not belong in `profiles.json`,
+    /// and none of these may be abbreviated. Never echoes a flag's value (it
+    /// may be a secret).
     pub fn engine_args_problem(&self) -> Option<String> {
         if self.engine_args.is_empty() {
             return None;
