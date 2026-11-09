@@ -21,17 +21,32 @@
 //!   `--git-dir` and `--work-tree`, so nothing is discovered from the tree:
 //!   a planted `.git` there is never read, its config never applies.
 //!
-//! Both modes add [`HARDENING_CONFIG`] and `GIT_CONFIG_NOSYSTEM=1`, and every
-//! `diff`/`log`/`show` gets [`DIFF_SAFETY`]. What the flags cannot do is stop
-//! a clean or smudge filter that a TRUSTED-mode repository's own config
-//! defines: a filter driver's name is arbitrary, so no fixed `-c` can switch
-//! it off. That is why a work tree a run wrote uses `run_written` (its config
-//! comes from the git directory darkmux holds), and why a call that only needs
-//! to know whether a trusted tree changed can drop in-tree attributes with
-//! [`HostGit::without_tree_attributes`].
+//! Both modes add [`HARDENING_CONFIG`], `GIT_CONFIG_NOSYSTEM=1` and the
+//! [`CLEARED_ENV`] removals, and the subcommand gets [`DIFF_SAFETY`] and
+//! [`IGNORE_SUBMODULES`] where it takes them.
 //!
-//! `tests/host_git_conformance.rs` fails on any new `Command::new("git")` in
-//! production code outside this module.
+//! **Filter drivers.** A clean/smudge/process filter's name is arbitrary, so
+//! no fixed `-c` switches it off, and attributes can assign one from the work
+//! tree's `.gitattributes`, the git dir's `info/attributes` or a
+//! `core.attributesFile`. So every call first reads the filter drivers the
+//! repository's own config defines (`git config --show-scope --get-regexp
+//! '^filter\.'`, which runs nothing) and passes each one empty
+//! (`clean`/`smudge`/`process` = "", `required` = false; an empty command is
+//! pass-through on git 2.50). A driver defined only in the operator's GLOBAL
+//! config (Git LFS's `git lfs install` default) is left alone: it is the
+//! operator's own program, and keeping it keeps LFS checkouts working. A
+//! driver the repository's config defines or redefines (`git lfs install
+//! --local` included) never runs. The overrides travel as
+//! `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`, so a driver
+//! name holding `=` or a space is still named exactly.
+//!
+//! Textconv and external diff drivers cannot be switched off the same way
+//! (git refuses to run an empty one rather than skipping it), so they are
+//! handled by `--no-textconv --no-ext-diff` on every subcommand that renders
+//! a diff.
+//!
+//! `tests/host_git_conformance.rs` fails on any new `git` spawn in production
+//! code outside this module.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -48,13 +63,10 @@ use std::process::{Command, Output};
 /// - `core.sshCommand=ssh` / `credential.helper=`: a repo's config cannot
 ///   name the program a network operation runs (an empty `credential.helper`
 ///   resets the helper list).
-/// - `diff.ignoreSubmodules=dirty`: `status` and `diff` do not spawn a child
-///   git inside a submodule's work tree. That child discovers the
-///   submodule's own `.git`, which the run can plant, and git clears the
-///   `-c` settings above for it (proven: a planted submodule's
-///   `core.fsmonitor` and clean filter ran through `--git-dir` mode until
-///   this was set). A submodule whose recorded commit changed is still
-///   reported; uncommitted work INSIDE a submodule is not.
+/// - `diff.ignoreSubmodules=dirty`: the default for any diff machinery that
+///   takes no `--ignore-submodules` flag. It is only a default: a
+///   `.gitmodules` the run wrote can set a submodule's own `ignore = none`
+///   over it, which is why [`IGNORE_SUBMODULES`] goes on the command line too.
 pub const HARDENING_CONFIG: [&str; 7] = [
     "core.fsmonitor=false",
     "core.hooksPath=/dev/null",
@@ -65,30 +77,49 @@ pub const HARDENING_CONFIG: [&str; 7] = [
     "diff.ignoreSubmodules=dirty",
 ];
 
-/// Added right after a `diff`, `log` or `show` subcommand: no
-/// `diff.<driver>.textconv` and no external diff driver runs.
+/// Added after a subcommand that renders a diff: no `diff.<driver>.textconv`
+/// and no external diff driver (`diff.<driver>.command`, `diff.external`)
+/// runs.
 pub const DIFF_SAFETY: [&str; 2] = ["--no-textconv", "--no-ext-diff"];
 
-/// The subcommands that render diffs and so get [`DIFF_SAFETY`].
-const DIFF_FAMILY: [&str; 3] = ["diff", "log", "show"];
+/// Added after `status` and every diff-rendering subcommand: git does not
+/// spawn a child git inside a submodule's work tree to check it for changes.
+/// That child discovers the submodule's own `.git`, which the run can plant,
+/// and git clears this process's `-c` settings for it (proven: a planted
+/// submodule's `core.fsmonitor` and clean filter ran through `--git-dir`
+/// mode). On the command line it beats a run-written `.gitmodules`'
+/// `ignore = none`. A submodule whose recorded commit moved is still
+/// reported; uncommitted work INSIDE a submodule is not.
+pub const IGNORE_SUBMODULES: &str = "--ignore-submodules=dirty";
 
-/// Inherited repository-location variables, removed from every call so the
-/// directory (or `--git-dir`) the caller names is the repository git uses.
-/// A darkmux process started from a git hook inherits `GIT_DIR` and
-/// `GIT_INDEX_FILE`; without this, host git would answer about that repo.
-pub const CLEARED_ENV: [&str; 6] = [
+/// The subcommands that render a diff: they take both [`DIFF_SAFETY`] and
+/// [`IGNORE_SUBMODULES`].
+const DIFF_FAMILY: [&str; 7] = ["diff", "diff-index", "diff-files", "diff-tree", "log", "show", "format-patch"];
+
+/// Inherited variables removed from every call. The repository-location ones
+/// make the directory (or `--git-dir`) the caller names the repository git
+/// uses: a darkmux process started from a git hook inherits `GIT_DIR` and
+/// `GIT_INDEX_FILE`. The rest name config or a program for git to run
+/// (`GIT_CONFIG_PARAMETERS` is how an outer `git -c` reaches a child); none
+/// is needed by a call this helper makes, which never fetches or pushes.
+/// `GIT_CONFIG_GLOBAL` is deliberately kept: it is where the operator keeps
+/// their own global config, so clearing it would make darkmux read a
+/// different one than the operator's own git does.
+pub const CLEARED_ENV: [&str; 13] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_INDEX_FILE",
     "GIT_COMMON_DIR",
     "GIT_OBJECT_DIRECTORY",
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_SSH_COMMAND",
+    "GIT_SSH",
+    "GIT_ASKPASS",
+    "GIT_EXEC_PATH",
 ];
-
-/// git's empty tree, by object format: the attribute source
-/// [`HostGit::without_tree_attributes`] points at.
-const EMPTY_TREE_SHA1: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-const EMPTY_TREE_SHA256: &str = "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321";
 
 /// Where a [`HostGit`] runs, and what git may discover there.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,16 +134,13 @@ enum Repo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostGit {
     repo: Repo,
-    /// `Some(tree)`: `--attr-source=<tree>`, so `.gitattributes` in the work
-    /// tree name no filter or diff driver.
-    attr_source: Option<&'static str>,
 }
 
 impl HostGit {
     /// A checkout the operator owns. git runs with `dir` as its working
     /// directory and finds the repository from there.
     pub fn trusted(dir: impl Into<PathBuf>) -> Self {
-        Self { repo: Repo::Trusted { dir: dir.into() }, attr_source: None }
+        Self { repo: Repo::Trusted { dir: dir.into() } }
     }
 
     /// A work tree a run wrote. `git_dir` MUST be a git directory the caller
@@ -122,23 +150,7 @@ impl HostGit {
     /// whatever the run left there. git runs in `work_tree` with
     /// `--git-dir` and `--work-tree` given, so it discovers nothing.
     pub fn run_written(git_dir: impl Into<PathBuf>, work_tree: impl Into<PathBuf>) -> Self {
-        Self { repo: Repo::RunWritten { git_dir: git_dir.into(), work_tree: work_tree.into() }, attr_source: None }
-    }
-
-    /// Read attributes from git's empty tree instead of the work tree, so no
-    /// path has a filter or diff driver: a clean filter the repository's own
-    /// config defines cannot run. For a question like "did anything change"
-    /// in a TRUSTED-mode tree a run may have written. The cost: a file that
-    /// really is filtered (Git LFS) and whose stat changed reads as changed.
-    /// `None` when the object format is unknown (the probe failed), in which
-    /// case the caller has no safe way to ask and should say so.
-    pub fn without_tree_attributes(self) -> Option<Self> {
-        let tree = match self.stdout(&["rev-parse", "--show-object-format"])?.as_str() {
-            "sha1" => EMPTY_TREE_SHA1,
-            "sha256" => EMPTY_TREE_SHA256,
-            _ => return None,
-        };
-        Some(Self { attr_source: Some(tree), ..self })
+        Self { repo: Repo::RunWritten { git_dir: git_dir.into(), work_tree: work_tree.into() } }
     }
 
     /// The directory git runs in: the trusted checkout, or the run's work
@@ -151,39 +163,18 @@ impl HostGit {
     }
 
     /// The hardened `git <args>` command, not yet run. `args[0]` is the
-    /// subcommand. The caller may add stdio or env; it must not add a
-    /// `current_dir` or a `-C`, which would move git away from the
+    /// subcommand. Building it runs one `git config` read (see the module
+    /// doc's "Filter drivers"). The caller may add stdio or env; it must not
+    /// add a `current_dir` or a `-C`, which would move git away from the
     /// directory this was built for.
     pub fn command<S: AsRef<OsStr>>(&self, args: &[S]) -> Command {
-        let mut cmd = Command::new("git");
-        cmd.env("GIT_CONFIG_NOSYSTEM", "1");
-        for var in CLEARED_ENV {
-            cmd.env_remove(var);
-        }
-        for setting in HARDENING_CONFIG {
-            cmd.arg("-c").arg(setting);
-        }
-        if let Some(tree) = self.attr_source {
-            cmd.arg(format!("--attr-source={tree}"));
-        }
-        match &self.repo {
-            Repo::Trusted { dir } => {
-                cmd.current_dir(dir);
-            }
-            Repo::RunWritten { git_dir, work_tree } => {
-                cmd.arg(prefixed("--git-dir=", git_dir));
-                cmd.arg(prefixed("--work-tree=", work_tree));
-                cmd.current_dir(work_tree);
-            }
-        }
-        let mut rest = args.iter();
-        if let Some(sub) = rest.next() {
-            cmd.arg(sub);
-            if sub.as_ref().to_str().is_some_and(|s| DIFF_FAMILY.contains(&s)) {
-                cmd.args(DIFF_SAFETY);
-            }
-        }
-        cmd.args(rest);
+        let mut cmd = self.base();
+        neutralize_filters(&mut cmd, &self.repo_filter_drivers());
+        let args: Vec<&OsStr> = args.iter().map(AsRef::as_ref).collect();
+        let at = subcommand_end(&args);
+        cmd.args(&args[..at]);
+        cmd.args(subcommand_flags(&args[..at]));
+        cmd.args(&args[at..]);
         cmd
     }
 
@@ -197,6 +188,103 @@ impl HostGit {
     pub fn stdout<S: AsRef<OsStr>>(&self, args: &[S]) -> Option<String> {
         let out = self.output(args).ok()?;
         out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    /// `git` with the env, the hardening `-c` settings and the mode's
+    /// location, before any subcommand.
+    fn base(&self) -> Command {
+        let mut cmd = Command::new("git");
+        cmd.env("GIT_CONFIG_NOSYSTEM", "1");
+        for var in CLEARED_ENV {
+            cmd.env_remove(var);
+        }
+        for setting in HARDENING_CONFIG {
+            cmd.arg("-c").arg(setting);
+        }
+        match &self.repo {
+            Repo::Trusted { dir } => {
+                cmd.current_dir(dir);
+            }
+            Repo::RunWritten { git_dir, work_tree } => {
+                cmd.arg(prefixed("--git-dir=", git_dir));
+                cmd.arg(prefixed("--work-tree=", work_tree));
+                cmd.current_dir(work_tree);
+            }
+        }
+        cmd
+    }
+
+    /// The filter driver names any config but the operator's global one
+    /// defines for this repository. Reading config runs nothing. A failed
+    /// read (no repository, no driver) is an empty list.
+    fn repo_filter_drivers(&self) -> Vec<String> {
+        let out = self.base().args(["config", "-z", "--show-scope", "--get-regexp", "^filter\\."]).output();
+        match out {
+            Ok(o) if o.status.success() => repo_defined_drivers(&o.stdout),
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// Parse `git config -z --show-scope --get-regexp '^filter\.'`: entries of
+/// `<scope> NUL <key> LF <value> NUL`. The driver name is the key between
+/// `filter.` and its last `.`; drivers whose every key is GLOBAL are left out.
+fn repo_defined_drivers(raw: &[u8]) -> Vec<String> {
+    let fields: Vec<&[u8]> = raw.split(|b| *b == 0).collect();
+    let mut names: Vec<String> = Vec::new();
+    for pair in fields.chunks_exact(2) {
+        if pair[0] == b"global" {
+            continue;
+        }
+        let key = pair[1].split(|b| *b == b'\n').next().unwrap_or_default();
+        let key = String::from_utf8_lossy(key);
+        let Some(name) = key.strip_prefix("filter.").and_then(|k| k.rsplit_once('.')).map(|(n, _)| n) else {
+            continue;
+        };
+        if !names.iter().any(|n| n == name) {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+/// Pass every driver in `names` empty, through `GIT_CONFIG_COUNT` (exact for
+/// any name, unlike `-c`, which splits at the first `=`).
+fn neutralize_filters(cmd: &mut Command, names: &[String]) {
+    if names.is_empty() {
+        return;
+    }
+    let mut i = 0usize;
+    for name in names {
+        for (key, value) in [("clean", ""), ("smudge", ""), ("process", ""), ("required", "false")] {
+            cmd.env(format!("GIT_CONFIG_KEY_{i}"), format!("filter.{name}.{key}"));
+            cmd.env(format!("GIT_CONFIG_VALUE_{i}"), value);
+            i += 1;
+        }
+    }
+    cmd.env("GIT_CONFIG_COUNT", i.to_string());
+}
+
+/// The index just past the subcommand: past `args[0]`, or past `show` in
+/// `stash show`, so a flag lands where that subcommand reads it.
+fn subcommand_end(args: &[&OsStr]) -> usize {
+    match (args.first().and_then(|a| a.to_str()), args.get(1).and_then(|a| a.to_str())) {
+        (None, _) => 0,
+        (Some("stash"), Some("show")) => 2,
+        _ => 1,
+    }
+}
+
+/// The flags the subcommand that ends `head` takes: [`DIFF_SAFETY`] and
+/// [`IGNORE_SUBMODULES`] for one that renders a diff (and `stash show`),
+/// [`DIFF_SAFETY`] for `blame`, [`IGNORE_SUBMODULES`] for `status`.
+fn subcommand_flags(head: &[&OsStr]) -> Vec<&'static str> {
+    let sub = head.last().and_then(|a| a.to_str()).unwrap_or_default();
+    match sub {
+        _ if DIFF_FAMILY.contains(&sub) => vec![DIFF_SAFETY[0], DIFF_SAFETY[1], IGNORE_SUBMODULES],
+        "blame" => DIFF_SAFETY.to_vec(),
+        "status" => vec![IGNORE_SUBMODULES],
+        _ => Vec::new(),
     }
 }
 

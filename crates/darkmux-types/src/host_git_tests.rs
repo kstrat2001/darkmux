@@ -26,8 +26,21 @@ const EXPECTED_CONFIG: [&str; 7] = [
     "credential.helper=",
     "diff.ignoreSubmodules=dirty",
 ];
-const EXPECTED_CLEARED: [&str; 6] =
-    ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"];
+const EXPECTED_CLEARED: [&str; 13] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_SSH_COMMAND",
+    "GIT_SSH",
+    "GIT_ASKPASS",
+    "GIT_EXEC_PATH",
+];
 
 /// Every hardening `-c` pair before the subcommand.
 fn assert_hardened(args: &[String], subcommand: &str) {
@@ -47,7 +60,7 @@ fn trusted_command_carries_every_flag_and_runs_in_its_dir() {
     assert_eq!(cmd.get_program(), "git");
     let args = args_of(&cmd);
     assert_hardened(&args, "status");
-    assert_eq!(&args[args.len() - 2..], ["status", "--porcelain"]);
+    assert_eq!(&args[args.len() - 3..], ["status", "--ignore-submodules=dirty", "--porcelain"]);
     assert!(!args.iter().any(|a| a.starts_with("--git-dir") || a.starts_with("--work-tree")), "{args:?}");
     assert_eq!(cmd.get_current_dir(), Some(Path::new("/repo")));
     assert_eq!(env_of(&cmd, "GIT_CONFIG_NOSYSTEM"), Some(Some("1".to_string())));
@@ -73,21 +86,55 @@ fn run_written_command_names_the_held_git_dir_and_work_tree() {
 }
 
 #[test]
-fn diff_family_gets_no_textconv_and_no_ext_diff_right_after_the_subcommand() {
-    for sub in ["diff", "log", "show"] {
+fn each_subcommand_gets_its_flags_right_after_it() {
+    const ALL: [&str; 3] = ["--no-textconv", "--no-ext-diff", "--ignore-submodules=dirty"];
+    for sub in ["diff", "diff-index", "diff-files", "diff-tree", "log", "show", "format-patch"] {
         for git in [HostGit::trusted("/r"), HostGit::run_written("/g", "/w")] {
             let args = args_of(&git.command(&[sub, "main"]));
             let at = args.iter().position(|a| a == sub).unwrap();
-            assert_eq!(&args[at + 1..], ["--no-textconv", "--no-ext-diff", "main"], "{sub}: {args:?}");
+            assert_eq!(&args[at + 1..], [ALL[0], ALL[1], ALL[2], "main"], "{sub}: {args:?}");
         }
     }
+    let args = args_of(&HostGit::trusted("/r").command(&["stash", "show", "-p"]));
+    assert!(args.ends_with(&["stash".into(), "show".into(), ALL[0].into(), ALL[1].into(), ALL[2].into(), "-p".into()]), "{args:?}");
+    let args = args_of(&HostGit::trusted("/r").command(&["blame", "a.txt"]));
+    assert!(args.ends_with(&["blame".into(), ALL[0].into(), ALL[1].into(), "a.txt".into()]), "{args:?}");
     let args = args_of(&HostGit::trusted("/r").command(&["status"]));
-    assert!(!args.iter().any(|a| a.starts_with("--no-")), "status takes no diff flags: {args:?}");
+    assert!(args.ends_with(&["status".into(), ALL[2].into()]), "{args:?}");
+    let args = args_of(&HostGit::trusted("/r").command(&["branch", "-D", "log"]));
+    assert!(args.ends_with(&["branch".into(), "-D".into(), "log".into()]), "a branch named log is not a subcommand: {args:?}");
+}
+
+#[test]
+fn filter_drivers_from_any_scope_but_global_are_named() {
+    let raw = b"global\0filter.lfs.clean\ngit-lfs clean -- %f\0local\0filter.my drv.clean\ntouch m\0\
+                worktree\0filter.a.b.process\nx\0local\0filter.my drv.smudge\ny\0local\0filter.lfs.smudge\nevil\0";
+    assert_eq!(repo_defined_drivers(raw), vec!["my drv".to_string(), "a.b".to_string(), "lfs".to_string()]);
+    assert!(repo_defined_drivers(b"").is_empty());
+}
+
+#[test]
+fn every_repo_defined_filter_driver_is_passed_empty() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    git(tmp.path(), &["init", "-q"]);
+    git(tmp.path(), &["config", "filter.x=y.clean", "touch m"]);
+    let cmd = HostGit::trusted(tmp.path()).command(&["status"]);
+    let env = |k: &str| env_of(&cmd, k).flatten();
+    assert_eq!(env("GIT_CONFIG_COUNT").as_deref(), Some("4"));
+    let pairs: Vec<(String, String)> =
+        (0..4).map(|i| (env(&format!("GIT_CONFIG_KEY_{i}")).unwrap(), env(&format!("GIT_CONFIG_VALUE_{i}")).unwrap())).collect();
+    assert_eq!(
+        pairs,
+        [("clean", ""), ("smudge", ""), ("process", ""), ("required", "false")]
+            .map(|(k, v)| (format!("filter.x=y.{k}"), v.to_string()))
+    );
+    let none = HostGit::trusted(tempfile::TempDir::new().unwrap().path()).command(&["status"]);
+    assert_eq!(env_of(&none, "GIT_CONFIG_COUNT"), Some(None), "no driver: the inherited count is still cleared");
 }
 
 // ── real git: a work tree whose `.git` the run replaced ─────────────────────
 
-use super::fixture::{git, PlantedWorktree, TreeChange};
+use super::fixture::{git, AttrPlace, PlantedWorktree, TreeChange};
 
 #[test]
 fn a_planted_git_dir_runs_its_commands_under_plain_git() {
@@ -123,23 +170,19 @@ fn run_written_mode_never_reads_a_planted_git_dir() {
 }
 
 #[test]
-fn trusted_mode_flags_stop_the_fsmonitor_and_dropping_tree_attributes_stops_the_filter() {
-    let f = PlantedWorktree::new();
-    f.plant(TreeChange::Content);
-    let host = HostGit::trusted(&f.wt);
-
-    // The limit, pinned: the flags alone cannot name an arbitrary filter.
-    host.stdout(&["status", "--porcelain"]).expect("status runs");
-    assert!(!f.fsmonitor_ran(), "core.fsmonitor=false must win over the planted config");
-    assert!(f.clean_ran(), "documented limit: a trusted repo's own filter still runs");
-    host.stdout(&["diff", "main"]).expect("diff runs");
-    assert!(!f.textconv_ran(), "--no-textconv must win over the planted driver");
-    let _ = f.anything_ran();
-
-    let no_attrs = host.clone().without_tree_attributes().expect("object format known");
-    let status = no_attrs.stdout(&["status", "--porcelain"]).expect("status runs");
-    assert!(status.contains("a.txt"), "{status:?}");
-    assert!(!f.anything_ran(), "with no tree attributes no filter is named");
+fn trusted_mode_runs_nothing_a_planted_repo_config_names_wherever_the_attributes_are() {
+    for place in [AttrPlace::WorkTree, AttrPlace::InfoAttributes, AttrPlace::AttributesFile] {
+        let f = PlantedWorktree::new();
+        f.plant_with(TreeChange::Content, place);
+        let host = HostGit::trusted(&f.wt);
+        let status = host.stdout(&["status", "--porcelain"]).expect("status runs");
+        assert!(status.contains("a.txt"), "{status:?}");
+        host.stdout(&["diff", "main"]).expect("diff runs");
+        host.stdout(&["log", "-p", "-2"]).expect("log runs");
+        assert!(!f.fsmonitor_ran(), "core.fsmonitor=false must win over the planted config");
+        assert!(!f.clean_ran(), "the planted clean filter ran on the host");
+        assert!(!f.textconv_ran(), "--no-textconv must win over the planted driver");
+    }
 }
 
 #[test]
@@ -177,6 +220,12 @@ fn a_submodule_the_run_planted_runs_nothing_under_run_written_mode() {
     ));
     std::fs::write(&cfg, config).unwrap();
     std::fs::write(wt.join("sub").join(".gitattributes"), "* filter=x\n").unwrap();
+    // The run also edits the work tree's `.gitmodules`: a per-submodule
+    // `ignore` there beats `diff.ignoreSubmodules` from `-c`; only the
+    // command-line `--ignore-submodules` beats it.
+    let mut gitmodules = std::fs::read_to_string(wt.join(".gitmodules")).unwrap();
+    gitmodules.push_str("\tignore = none\n");
+    std::fs::write(wt.join(".gitmodules"), gitmodules).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(1100));
     std::fs::write(wt.join("sub").join("s.txt"), "t\n").unwrap();
 
@@ -194,7 +243,9 @@ fn a_submodule_the_run_planted_runs_nothing_under_run_written_mode() {
 
     let host = HostGit::run_written(&admin, &wt);
     host.stdout(&["status", "--porcelain"]).expect("status runs");
+    assert!(!fs_marker.exists() && !clean_marker.exists(), "status ran the planted submodule's commands");
     host.stdout(&["diff", "main"]).expect("diff runs");
+    host.stdout(&["log", "-p", "-1"]).expect("log runs");
     assert!(!fs_marker.exists(), "the planted submodule's fsmonitor ran on the host");
     assert!(!clean_marker.exists(), "the planted submodule's clean filter ran on the host");
 }

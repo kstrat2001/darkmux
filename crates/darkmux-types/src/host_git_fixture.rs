@@ -41,6 +41,18 @@ pub enum TreeChange {
     TouchOnly,
 }
 
+/// Where the run puts the attributes that give every path its filter and
+/// diff driver.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AttrPlace {
+    /// `.gitattributes` in the work tree.
+    WorkTree,
+    /// `info/attributes` inside the planted git dir.
+    InfoAttributes,
+    /// A file the planted config names as `core.attributesFile`.
+    AttributesFile,
+}
+
 /// See the module doc.
 pub struct PlantedWorktree {
     _tmp: tempfile::TempDir,
@@ -94,6 +106,11 @@ impl PlantedWorktree {
     /// three marker commands, give every path the filter and diff driver,
     /// then leave `a.txt` as `change` says.
     pub fn plant(&self, change: TreeChange) {
+        self.plant_with(change, AttrPlace::WorkTree);
+    }
+
+    /// [`Self::plant`], with the attributes put where `place` says.
+    pub fn plant_with(&self, change: TreeChange, place: AttrPlace) {
         let staging = self.root.join("planted");
         git(&self.root, &["clone", "-q", "--no-checkout", self.repo.to_str().unwrap(), staging.to_str().unwrap()]);
         git(&staging, &["branch", "-q", "keep-me", "origin/keep-me"]);
@@ -111,8 +128,21 @@ impl PlantedWorktree {
             self.clean_marker.display(),
             self.textconv_marker.display(),
         ));
+        let attrs = "* filter=x diff=x\n";
+        match place {
+            AttrPlace::WorkTree => std::fs::write(self.wt.join(".gitattributes"), attrs).unwrap(),
+            AttrPlace::InfoAttributes => {
+                let info = self.wt.join(".git").join("info");
+                std::fs::create_dir_all(&info).unwrap();
+                std::fs::write(info.join("attributes"), attrs).unwrap();
+            }
+            AttrPlace::AttributesFile => {
+                let file = self.root.join("planted-attributes");
+                std::fs::write(&file, attrs).unwrap();
+                config.push_str(&format!("[core]\n\tattributesFile = {}\n", file.display()));
+            }
+        }
         std::fs::write(&cfg, config).unwrap();
-        std::fs::write(self.wt.join(".gitattributes"), "* filter=x diff=x\n").unwrap();
         // Past the index's own mtime second, so the rewrite is a stat change.
         std::thread::sleep(std::time::Duration::from_millis(1100));
         let body = match change {

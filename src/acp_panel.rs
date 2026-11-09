@@ -654,18 +654,14 @@ pub fn synthesize_diff_launch_inputs(config: &MissionConfig, cwd: &Path) -> Resu
 
 /// The note for a tree whose working copy holds changes the review does not
 /// cover (it reads the committed tree at `head`), or `None` when it holds
-/// none.
+/// none. When the check cannot run, the note says so.
 ///
-/// (#3457) Attributes come from the empty tree: a clean filter the
-/// repository's own config defines (a run with this checkout mounted
-/// read-write may have written it) never runs. A file that really is
-/// filtered (Git LFS) and whose stat changed can read as changed, which only
-/// ever over-reports here. When the check cannot run, the note says so.
+/// (#3457) Through the hardened helper, which passes every filter driver the
+/// checkout's own config defines empty, wherever attributes assign it
+/// (`.gitattributes`, `.git/info/attributes`, `core.attributesFile`): a run
+/// that had this checkout mounted read-write may have written that config.
 fn uncommitted_note(cwd: &Path, head: &str) -> Option<String> {
-    let Some(dirty) = darkmux_types::host_git::HostGit::trusted(cwd)
-        .without_tree_attributes()
-        .and_then(|git| git.stdout(&["status", "--porcelain"]))
-    else {
+    let Some(dirty) = darkmux_types::host_git::HostGit::trusted(cwd).stdout(&["status", "--porcelain"]) else {
         return Some("could not check this tree for uncommitted changes.".to_string());
     };
     if dirty.trim().is_empty() {
@@ -2754,19 +2750,32 @@ pub(crate) mod tests {
     /// a worktree's `.git` pointer with a directory whose config names an
     /// fsmonitor, a clean filter and a textconv. The panel's diff and its
     /// uncommitted-change check run none of them, and still report the change.
+    ///
+    /// The attributes that name the drivers are planted in each place git
+    /// reads them from: the work tree's `.gitattributes`, the git dir's
+    /// `info/attributes`, and a file the planted config names as
+    /// `core.attributesFile`.
     #[test]
     fn diff_synthesis_runs_nothing_a_run_planted_in_the_checkout() {
-        let f = darkmux_types::host_git::fixture::PlantedWorktree::new();
-        f.plant(darkmux_types::host_git::fixture::TreeChange::Content);
-        let synth = match synthesize_diff_launch_inputs(&embedded_review(), &f.wt).unwrap() {
-            DiffLaunchInputs::Ready(s) => s,
-            DiffLaunchInputs::NotNeeded | DiffLaunchInputs::Nothing(_) => panic!("expected a diff to review"),
-        };
-        assert!(!f.fsmonitor_ran(), "the planted fsmonitor ran on the host");
-        assert!(!f.clean_ran(), "the planted clean filter ran on the host");
-        assert!(!f.textconv_ran(), "the planted textconv ran on the host");
-        let note = synth.excluded_note.as_deref().unwrap_or_default();
-        assert!(note.contains("uncommitted"), "the change is still reported: {note:?}");
+        use darkmux_types::host_git::fixture::{AttrPlace, PlantedWorktree, TreeChange};
+        for place in [AttrPlace::WorkTree, AttrPlace::InfoAttributes, AttrPlace::AttributesFile] {
+            let f = PlantedWorktree::new();
+            f.plant_with(TreeChange::Content, place);
+            let synth = match synthesize_diff_launch_inputs(&embedded_review(), &f.wt).unwrap() {
+                DiffLaunchInputs::Ready(s) => s,
+                DiffLaunchInputs::NotNeeded | DiffLaunchInputs::Nothing(_) => panic!("expected a diff to review"),
+            };
+            let place = match place {
+                AttrPlace::WorkTree => ".gitattributes",
+                AttrPlace::InfoAttributes => "info/attributes",
+                AttrPlace::AttributesFile => "core.attributesFile",
+            };
+            assert!(!f.fsmonitor_ran(), "{place}: the planted fsmonitor ran on the host");
+            assert!(!f.clean_ran(), "{place}: the planted clean filter ran on the host");
+            assert!(!f.textconv_ran(), "{place}: the planted textconv ran on the host");
+            let note = synth.excluded_note.as_deref().unwrap_or_default();
+            assert!(note.contains("uncommitted"), "{place}: the change is still reported: {note:?}");
+        }
     }
 
     /// (#2404 P4d round 3) A no-remote repo whose base branch is only
