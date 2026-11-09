@@ -367,9 +367,16 @@ pub struct ProfileModel {
 
 /// (#3448) Why one `engine_args` entry is not the operator's to pass, or
 /// `None`: an empty argument, a flag darkmux sets itself, or a secret.
-fn reserved_engine_arg(arg: &str) -> Option<String> {
+/// (#3448) An `engine_args` entry no check can read safely: empty, a bare
+/// `--`, or a short flag.
+fn malformed_engine_arg(arg: &str) -> Option<String> {
     if arg.trim().is_empty() {
         return Some("`engine_args` holds an empty argument; remove it".to_string());
+    }
+    // A bare `--` would turn darkmux's own flags after it into positional
+    // arguments the engine may ignore (its `--host` and `--port` with them).
+    if arg == "--" {
+        return Some("`engine_args` holds `--`, which would make darkmux's own flags after it positional; remove it".to_string());
     }
     // A short flag (`-p`) could alias one darkmux sets, and neither this
     // check nor doctor's can tell which; a value like `-1` is not one.
@@ -379,6 +386,13 @@ fn reserved_engine_arg(arg: &str) -> Option<String> {
             "`engine_args` holds the short flag `{}`; write its long `--` form, which darkmux can check",
             arg.split('=').next().unwrap_or(arg)
         ));
+    }
+    None
+}
+
+fn reserved_engine_arg(arg: &str) -> Option<String> {
+    if let Some(why) = malformed_engine_arg(arg) {
+        return Some(why);
     }
     let flag = arg.split('=').next().unwrap_or(arg);
     let why = match flag {

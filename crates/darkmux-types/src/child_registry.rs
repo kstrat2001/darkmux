@@ -62,6 +62,11 @@ pub const SIGTERM: i32 = libc::SIGTERM;
 /// `libc` dependency (or a hardcoded `3`).
 pub const ESRCH: i32 = libc::ESRCH;
 
+/// `kill(2)`'s "not permitted" errno, re-exported for the same reason as
+/// [`ESRCH`]. macOS answers it for a process group whose only member is a
+/// zombie.
+pub const EPERM: i32 = libc::EPERM;
+
 /// Send `sig` to ONE pid the caller owns. Returns `Ok(())` if the kernel
 /// accepted the request, `Err(std::io::Error)` otherwise (`ESRCH` when the
 /// pid is gone, `EPERM` when it is not ours to signal) — unlike
@@ -98,6 +103,22 @@ pub fn kill_pid(pid: u32, sig: i32) -> std::io::Result<()> {
     } else {
         Err(std::io::Error::last_os_error())
     }
+}
+
+/// (#3448) Signal every process in group `pgid` (a server darkmux spawned
+/// as its own group's leader, so its workers die with it). Refuses group 0
+/// and 1, a value `kill(2)` would read otherwise, and this process's own
+/// group, so it can never signal darkmux itself.
+pub fn kill_group(pgid: u32, sig: i32) -> std::io::Result<()> {
+    let own = unsafe { libc::getpgrp() } as u32;
+    if pgid < 2 || pgid > i32::MAX as u32 || pgid == own {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing to signal process group {pgid}"),
+        ));
+    }
+    let rc = unsafe { libc::kill(-(pgid as libc::pid_t), sig) };
+    if rc == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
 }
 
 /// Register a just-spawned child pid. Call BEFORE blocking on it (a
