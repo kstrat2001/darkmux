@@ -743,7 +743,7 @@ The dispatch envelope, the flow records and the exit codes are unchanged. The fi
 - the engine binary is missing, or its version is one darkmux has not verified;
 - the memory it needs is held by another darkmux dispatch that is still running, and `fleet.busy_policy` is `refuse` (the default).
 
-**Busy memory follows `fleet.busy_policy` (operator, 2026-11-09).** A local dispatch whose memory is held by a running dispatch gets the answer a fleet job gets for a busy seat: `refuse` says so at once, naming what is running; `queue` waits until the memory frees, bounded by the dispatch's timeout, with a `queued` line every 20 seconds so the wait never looks like a stall. An app that queues work sets `darkmux config set fleet.busy_policy queue` on the machine that runs it. A model held by a running dispatch is never evicted under it (the residency leases), whichever policy is set.
+**Busy memory follows `fleet.busy_policy` (operator, 2026-11-09).** A local dispatch whose memory is held by a running dispatch gets the answer a fleet job gets for a busy seat: `refuse` says so at once, naming what is running; `queue` waits until the memory frees, bounded by the dispatch's timeout, with a `queued` line every 20 seconds so the wait never looks like a stall. An app with its own queue keeps the default and retries: the busy refusal, and the one for a model that does not fit at all, each carry a stable code in the `--json` envelope, so an app retries those and treats every other failure as a failure. `queue` is for callers that would rather darkmux wait for them. A model held by a running dispatch is never evicted under it (the residency leases), whichever policy is set.
 
 ### What the operator sees
 
