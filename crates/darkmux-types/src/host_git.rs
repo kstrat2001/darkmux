@@ -25,6 +25,16 @@
 //! [`CLEARED_ENV`] removals, and the subcommand gets [`DIFF_SAFETY`] and
 //! [`IGNORE_SUBMODULES`] where it takes them.
 //!
+//! **Limits, stated.** A filter driver defined in the user's GLOBAL config
+//! (git-lfs, typically) stays live by design: a run can assign it to files
+//! through attributes, and the user's own program then runs on them, never a
+//! run-written one. `git add` takes no `--ignore-submodules`, so a call that
+//! adds through this helper would still let a planted submodule's commands
+//! run; no production call does (route one through `status`/`diff` first).
+//! A config `include` pointing at a FIFO inside a mounted `.git` hangs git
+//! (a hang, not code execution, and true of any git), so a caller that runs
+//! trusted git in such a checkout should bound the call.
+//!
 //! **Filter drivers.** A clean/smudge/process filter's name is arbitrary, so
 //! no fixed `-c` switches it off, and attributes can assign one from the work
 //! tree's `.gitattributes`, the git dir's `info/attributes` or a
