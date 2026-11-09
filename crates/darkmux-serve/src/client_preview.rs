@@ -560,12 +560,42 @@ fn copy_env_from_source(recipe: &Recipe, workdir: &Path, checkout: &Path) -> Res
     for f in &recipe.env_from_source {
         let (from, to) = (checkout.join(f), workdir.join(f));
         if from.is_file() && std::fs::symlink_metadata(&to).is_err() {
+            check_unlinked_inside(workdir, f)?;
             if let Err(e) = std::fs::copy(&from, &to) {
                 return Err(format!("copying {f} from {}: {e}", checkout.display()));
             }
         }
     }
     Ok(())
+}
+
+/// Copying to `rel` inside `workdir` writes inside it: no component of the
+/// path (a folder a run may have replaced with a link) is a symlink, and the
+/// parent, resolved, is still inside the work copy.
+fn check_unlinked_inside(workdir: &Path, rel: &str) -> Result<(), String> {
+    let mut at = workdir.to_path_buf();
+    let parts: Vec<_> = Path::new(rel).components().collect();
+    for part in &parts[..parts.len().saturating_sub(1)] {
+        at.push(part);
+        if std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(format!(
+                "env_from_source: {} in the workspace is a symlink; refusing to copy {rel} through it",
+                at.display()
+            ));
+        }
+    }
+    let parent = workdir.join(rel).parent().map(Path::to_path_buf).unwrap_or_default();
+    let inside = match (parent.canonicalize(), workdir.canonicalize()) {
+        (Ok(p), Ok(w)) => p.starts_with(w),
+        // A folder that isn't there yet: the copy fails on its own.
+        (Err(_), _) => true,
+        (Ok(_), Err(_)) => false,
+    };
+    if inside {
+        Ok(())
+    } else {
+        Err(format!("env_from_source: {rel} would land outside the workspace; refusing"))
+    }
 }
 
 /// Runs the recipe's install command unless its `unless_exists` path is
@@ -772,6 +802,33 @@ mod tests {
         let server = std::fs::read_to_string(wt.join("server-env.txt")).unwrap();
         assert!(server.contains(&format!("FROM_RECIPE=yes {}", state.port)), "{server}");
         assert!(server.contains(&format!("DARKMUX_PREVIEW_PORT={}", state.port)), "{server}");
+    }
+
+    /// (review) `env_from_source` never writes through a link a run
+    /// planted: a workspace whose `config` is a symlink out of it gets no
+    /// `config/.env`, there or anywhere, and the preview says why.
+    #[cfg(unix)]
+    #[test]
+    fn env_from_source_never_writes_through_a_planted_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wt, checkout, outside) = (dir.path().join("w"), dir.path().join("mine"), dir.path().join("outside"));
+        for d in [&wt, &checkout.join("config"), &outside] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(checkout.join("config/.env"), "SECRET=1\n").unwrap();
+        std::os::unix::fs::symlink(&outside, wt.join("config")).unwrap();
+        let recipe = serde_json::json!({
+            "schema_version": "1.0", "command": "touch server-ran; exit 3", "env_from_source": ["config/.env"]
+        });
+        std::fs::create_dir_all(checkout.join(".darkmux")).unwrap();
+        std::fs::write(checkout.join(".darkmux/preview.json"), recipe.to_string()).unwrap();
+        let previews = Previews::new(dir.path().join("p"), std::process::id());
+        previews.start("w", &wt, &checkout).unwrap();
+        let v = until_failed(&previews, "w");
+        assert_eq!(v["status"], "failed", "{v}");
+        assert!(v["error"].as_str().unwrap().contains("symlink"), "{v}");
+        assert!(!outside.join(".env").exists(), "wrote through the planted link");
+        assert!(!wt.join("server-ran").exists(), "the server never ran");
     }
 
     #[test]
