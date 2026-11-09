@@ -42,7 +42,7 @@ WORKDIR /build/runtime
 RUN cargo build --release --locked || cargo build --release
 
 # ─── runtime ──────────────────────────────────────────────────────────────
-FROM alpine:3.20
+FROM alpine:3.22
 
 # The Unix toolkit agents reach for. Stays small.
 #
@@ -61,6 +61,11 @@ FROM alpine:3.20
 #                workloads with `setupContent: { "*.py": ... }` run their
 #                verify commands inside the container without an external
 #                pip install (#338).
+#   nodejs, npm — Node 22 LTS (alpine 3.22 ships 22.23). Client previews
+#                run a project's dev server in this image (#3456), and
+#                current Vite, rolldown and @vitejs/plugin-react need
+#                ^20.19 || >=22.12; on 20.15 `npm ci` skips their native
+#                bindings (#3482).
 #   py3-pip    — for workloads that need third-party Python packages
 #                (pytest, requests, etc.); operators install per-dispatch
 #                or per-sandbox as needed.
