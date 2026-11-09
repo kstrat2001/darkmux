@@ -108,6 +108,12 @@ fn names_in(dir: &OwnedFd) -> io::Result<Vec<OsString>> {
     Ok(names)
 }
 
+/// The deepest tree [`remove`] deletes, in folders. The walk holds one
+/// descriptor per level, and `client serve` runs under launchd's 256-file
+/// limit; no dependency tree comes near this, so a deeper one (a run built
+/// it) is refused with a reason rather than run out of descriptors.
+pub(crate) const MAX_DELETE_DEPTH: usize = 128;
+
 /// One open folder in [`remove_tree_at`]'s walk: its descriptor, its name
 /// in the folder below it on the stack, and the entries left to visit.
 struct Frame {
@@ -140,6 +146,11 @@ fn remove_tree_at(dir: RawFd, name: &OsStr) -> io::Result<()> {
         match top.pending.pop() {
             Some(entry) => {
                 if let Some(sub) = remove_or_open(top.fd.as_raw_fd(), &entry)? {
+                    if stack.len() >= MAX_DELETE_DEPTH {
+                        return Err(io::Error::other(format!(
+                            "the tree is deeper than {MAX_DELETE_DEPTH} folders, more than darkmux deletes; delete it yourself"
+                        )));
+                    }
                     stack.push(sub);
                 }
             }
@@ -288,24 +299,45 @@ mod tests {
         }
     }
 
-    /// A run can build a tree deeper than a recursive walk's stack (about
-    /// 2,000 levels on a 2 MiB stack in a debug build): removing one 1,000
-    /// deep on a 64 KiB stack neither overflows nor fails. (Deeper trees
-    /// are slow to build on APFS, where each level costs more than the
-    /// last, so the depth is scaled down and the stack with it.)
-    #[test]
-    fn a_tree_deeper_than_a_recursive_walk_could_take_is_removed() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("root");
-        nest(&root, 1000);
-        let removed = std::thread::Builder::new()
+    /// The open descriptors in this process, counted from `/dev/fd`.
+    fn open_fds() -> usize {
+        std::fs::read_dir("/dev/fd").unwrap().count()
+    }
+
+    /// Removes `root/deep`, `depth` folders deep, on a 64 KiB stack, where
+    /// a recursive walk overflows within about 64 levels in a debug build.
+    fn remove_nested(depth: usize) -> io::Result<std::path::PathBuf> {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let root = dir.join("root");
+        nest(&root, depth);
+        std::thread::Builder::new()
             .stack_size(64 * 1024)
             .spawn(move || remove(&root, "deep").map(|_| root))
             .unwrap()
             .join()
-            .expect("the walk overflowed its stack");
-        let root = removed.unwrap();
+            .expect("the walk overflowed its stack")
+    }
+
+    /// A tree as deep as darkmux deletes is removed without overflowing a
+    /// small stack.
+    #[test]
+    fn a_tree_as_deep_as_the_walk_takes_is_removed_on_a_small_stack() {
+        let root = remove_nested(MAX_DELETE_DEPTH).unwrap();
         assert!(std::fs::symlink_metadata(root.join("deep")).is_err(), "the tree is gone");
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// A run can build a tree far deeper (a recursive walk's stack ran out
+    /// near 2,000 levels on 2 MiB; a descriptor per level runs past a
+    /// 256-file limit sooner). One deeper than [`MAX_DELETE_DEPTH`] is
+    /// refused with a reason, without aborting and without holding a
+    /// descriptor per level.
+    #[test]
+    fn a_tree_deeper_than_the_walk_takes_is_refused_not_aborted() {
+        let before = open_fds();
+        let err = remove_nested(1000).unwrap_err();
+        assert!(err.to_string().contains("deeper than"), "{err}");
+        assert!(open_fds() <= before + 2, "descriptors left open");
     }
 
     /// A FIFO where the file should be is refused at once, never opened in a

@@ -256,6 +256,11 @@ fn harness() -> Harness {
             args.extend([fx.as_str(), d.as_str()]);
             run_git(None, &args);
             run_git(Some(dest), &["remote", "set-url", "origin", url]);
+            // The identity the operator's own git config gives a commit:
+            // a machine with none (a CI runner, whose account has an empty
+            // name) refuses the run's commit otherwise.
+            run_git(Some(dest), &["config", "user.name", "Owner"]);
+            run_git(Some(dest), &["config", "user.email", "owner@example.com"]);
             Ok(())
         }),
         // Records every fetch; a checkout whose origin is a local path (a
