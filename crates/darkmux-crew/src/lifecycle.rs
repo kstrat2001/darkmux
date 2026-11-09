@@ -2284,13 +2284,12 @@ mod task_step_storage_tests {
     }
 
     /// A task records the branch and main repository its worktree was made
-    /// from (#3457). A darkmux reading task schema 1.0 would drop both on its
-    /// next save and tear the worktree down from the branch its HEAD names, so
-    /// the marker darkmux writes is past 1.0 and that reader refuses the file.
+    /// from (#3457), under a marker past 1.0, so a darkmux reading task
+    /// schema 1.0 does not read it (it cannot tell what the new fields mean).
     /// A 1.0 task, with neither field, still loads here.
     #[test]
     #[serial]
-    fn a_task_holding_its_launch_branch_is_refused_by_a_task_schema_1_0_reader() {
+    fn a_task_holding_its_launch_branch_is_marked_past_task_schema_1_0() {
         let _g = CrewGuard::new();
         let mut t = task("t-br", "p-br");
         t.branch = Some("darkmux/m-br".to_string());
@@ -2299,7 +2298,7 @@ mod task_step_storage_tests {
         let path = task_path("m-br", "p-br", "t-br");
         let mut doc = on_disk(&path);
         assert_eq!(doc["branch"], "darkmux/m-br", "{doc}");
-        assert!(darkmux_types::data_version::newer(&doc, "1.0").is_some(), "a task schema 1.0 reader must refuse it: {doc}");
+        assert!(darkmux_types::data_version::newer(&doc, "1.0").is_some(), "a task schema 1.0 reader must not read it: {doc}");
 
         let obj = doc.as_object_mut().unwrap();
         obj.remove("branch");

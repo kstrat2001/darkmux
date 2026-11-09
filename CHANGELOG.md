@@ -182,16 +182,21 @@ darkmux release.
   read-only mount and whose pointer a run can rewrite. Inspect the work tree before running git in
   it, or use darkmux's own worktrees.
 
-- **Two state shapes move a minor version, so an older darkmux refuses what this one writes.**
-  `TASK_SCHEMA_VERSION` 1.0 -> 1.1: a task record gains `branch` and `repo_root` (#3457), and a
-  darkmux reading 1.0 would drop both on its next save and tear a coder phase's worktree down from
-  the branch its HEAD names. darkmux 5.0 through 5.9 refuse a 1.1 task ("written by a newer
-  darkmux") instead. `MISSION_CONFIG_SCHEMA` 4.0 -> 4.1: a `dispatch.internal` step's `workdir_git_writable`
+- **Two state shapes move a minor version; an older darkmux cannot read what this one writes.**
+  `TASK_SCHEMA_VERSION` 1.0 -> 1.1: a task record gains `branch` and `repo_root` (#3457), and
+  every task this release saves is marked 1.1. darkmux 5.0 through 5.9 cannot read a 1.1 task and
+  skip it without saying so: a mission this release touched shows no tasks there (its graph reads
+  as one that predates the Task/Step registry, and `--json` gives `tasks: null`), and `mission
+  abort` of its coder phase reports the worktree "already gone", deletes no branch, marks the
+  mission aborted and exits 0, leaving the real worktree and branch behind. Don't move a mission
+  in flight back to an older darkmux. If you did, clean up by hand: `git -C <repo> worktree list`
+  names the worktree and its branch, then `git -C <repo> worktree remove --force <path>` and
+  `git -C <repo> branch -D <branch>`. `MISSION_CONFIG_SCHEMA` 4.0 -> 4.1: a `dispatch.internal` step's `workdir_git_writable`
   (#3461); the shipped configs declare 4.1, and `gate_image` / `gate_on_host` (#3177, added in 5.1
   without a bump) are named by it too. A 4.0 config means what it always did, and `darkmux doctor`
   notes one as an older minor, informational only. Upgrade every darkmux that reads the same
   `~/.darkmux`, a `brew services` daemon included (`brew services restart darkmux`), or the older
-  one refuses this one's task records.
+  one shows this one's missions without their tasks.
 
 - **The minimum supported Rust is 1.89** for the `darkmux` binary and the crates that reach
   SQLite (`darkmux-crew`, `-doctor`, `-fleet`, `-lab`, `-serve`), up from 1.88 and 1.86:
@@ -201,6 +206,17 @@ darkmux release.
 
 <!-- 5.10 fix PRs in flight: engine hardening, client git/preview hardening, client work/pairing.
      The orchestrator adds their Fixed lines here, above this release's earlier entries. -->
+
+- **A coder phase whose task names no branch is torn down by the branch its worktree has checked
+  out, never one the conventions derive (#3457 follow-up).** A worktree task written before this
+  release (a mission in flight across the upgrade) records no branch. `mission finalize` and
+  `abort` then force-deleted the name the conventions `branch_template` derives whenever the
+  worktree still existed: with `feat/{ticket}` and ticket `ABC-1`, an unrelated branch of yours
+  named `feat/ABC-1` was deleted and the phase's real branch was left behind (with no template,
+  the real branch was left behind). The branch is now the one the main repository's record of the
+  worktree has checked out (its `worktrees/<name>/HEAD`, never the worktree's own `.git`), and only
+  when that branch exists. When it cannot tell (a detached HEAD, no record), it deletes no branch
+  and prints the `git worktree list` / `git branch -D` commands to finish by hand.
 
 - **A preview's heartbeat belongs to its run, not its workspace's name (#3485).** A preview's
   container and heartbeat folder were named by workspace and port, so two runs of one workspace on
@@ -253,7 +269,7 @@ darkmux release.
   read the worktree only through the git directory the main repository holds for it, and
   `mission finalize`/`abort` delete the branch darkmux recorded at launch (a new `Task.branch`),
   never the one the worktree's HEAD names, through the main repository recorded at launch (a new
-  `Task.repo_root`, both under task schema 1.1, which an older darkmux refuses; see Changed),
+  `Task.repo_root`, both under task schema 1.1, which an older darkmux cannot read; see Changed),
   never one resolved from a cwd inside the worktree. A repo-defined filter
   driver never runs under darkmux's host git, wherever attributes assign it (a driver only your
   global config defines, such as Git LFS's default install, still does). Every host git call carries overrides for the settings

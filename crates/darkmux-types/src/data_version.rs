@@ -61,9 +61,11 @@ pub const MISSION_SCHEMA_VERSION: &str = "1.0";
 pub const PHASE_SCHEMA_VERSION: &str = "1.0";
 /// A task JSON. 1.1 adds `branch` and `repo_root` (#3457): the branch and
 /// main repository a coder phase's worktree was made from, which `mission
-/// finalize` and `abort` tear it down by. A darkmux reading 1.0 would drop
-/// both on its next save and delete the branch the worktree's HEAD names, so
-/// it refuses a 1.1 task instead.
+/// finalize` and `abort` tear it down by. Every save writes this marker, so a
+/// darkmux reading 1.0 (5.0 through 5.9) cannot read any task this one
+/// saved. Its callers skip a task they cannot read without saying so: it
+/// shows such a mission with no tasks, and its `mission abort` leaves the
+/// coder worktree and its branch for the operator to remove by hand.
 pub const TASK_SCHEMA_VERSION: &str = "1.1";
 /// A step JSON.
 pub const STEP_SCHEMA_VERSION: &str = "1.0";

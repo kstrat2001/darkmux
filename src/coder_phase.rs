@@ -1455,13 +1455,18 @@ fn teardown_and_terminate_phase(
         // could point its `.git` at a HEAD naming any branch in the repo.
         // The conventions fallback is only a DERIVED guess, for a phase
         // whose task records predate the field or that never launched.
-        let recorded_branch = resolve_run_branch(mission_id, &phase.id);
-        let b = recorded_branch
-            .clone()
-            .unwrap_or_else(|| conventions_branch(phase, mission, conv));
         // The worktree's git dir, from the main repository (never from the
         // worktree's own `.git`).
         let admin = wt_exists.then(|| worktree_admin_dir(root, &wt_path));
+        // A task an older darkmux wrote has no recorded branch: the branch is
+        // then the one the main repository's record of the worktree has
+        // checked out, read before the worktree (and that record) is removed.
+        // A name only derived from conventions is never confirmed: it may be
+        // an unrelated branch of the operator's.
+        let recorded_branch = resolve_run_branch(mission_id, &phase.id);
+        let confirmed = recorded_branch
+            .or_else(|| admin.as_ref().and_then(|a| a.as_ref().ok()).and_then(|a| checked_out_branch(root, a)));
+        let b = confirmed.clone().unwrap_or_else(|| conventions_branch(phase, mission, conv));
 
         // (#1463) SUCCESS-path data-loss guard. `mission finalize` runs AFTER
         // the frontier orchestrator has committed + pushed the work by hand —
@@ -1484,7 +1489,7 @@ fn teardown_and_terminate_phase(
                      closes.",
                     wt_path.display(),
                     wt_path.display(),
-                    b
+                    confirmed.as_deref().unwrap_or("<its branch, from `git worktree list`>")
                 ))
             );
         } else {
@@ -1497,29 +1502,7 @@ fn teardown_and_terminate_phase(
                 None => println!("{}", style::dim(&format!("worktree {} already gone", wt_path.display()))),
             }
 
-            // (#1463) Only force-delete a branch we KNOW is real — one darkmux
-            // recorded at launch, or one whose worktree still exists. A
-            // never-launched Planned phase has only a DERIVED conventions name;
-            // force-deleting that could blow away an unrelated branch that
-            // merely matches the template, so it's left untouched.
-            if should_force_delete_branch(recorded_branch.is_some(), wt_exists) {
-                match HostGit::trusted(root).output(&["branch", "-D", &b]) {
-                    Ok(o) if o.status.success() => {
-                        println!("{}", style::success(&format!("✓ deleted branch {b}")));
-                    }
-                    _ => println!(
-                        "{}",
-                        style::dim(&format!("branch {b} not deleted: likely already gone"))
-                    ),
-                }
-            } else {
-                println!(
-                    "{}",
-                    style::dim(&format!(
-                        "branch {b} not deleted: never had a worktree (derived name), left untouched"
-                    ))
-                );
-            }
+            delete_phase_branch(root, &wt_path, wt_exists, confirmed.as_deref(), &b);
         }
         wt_display = Some(wt_path.display().to_string());
         branch = Some(b);
@@ -3004,14 +2987,61 @@ pub(crate) fn print_unverified_banner(failed: &[FailedExec]) {
     );
 }
 
+/// (#1463) Force-delete the phase's branch when it is `confirmed` (recorded
+/// at launch, or what the main repository says the worktree had checked
+/// out); otherwise delete nothing. `b` is the name reported either way.
+fn delete_phase_branch(root: &Path, wt_path: &Path, wt_exists: bool, confirmed: Option<&str>, b: &str) {
+    // Only force-delete a branch we KNOW is the phase's. A DERIVED
+    // conventions name could be an unrelated branch that merely matches the
+    // template, so it is left untouched.
+    if should_force_delete_branch(confirmed.is_some()) {
+        match HostGit::trusted(root).output(&["branch", "-D", b]) {
+            Ok(o) if o.status.success() => {
+                println!("{}", style::success(&format!("✓ deleted branch {b}")));
+            }
+            _ => println!("{}", style::dim(&format!("branch {b} not deleted: likely already gone"))),
+        }
+    } else if wt_exists {
+        eprintln!(
+            "{}",
+            style::warn(&format!(
+                "no branch deleted: darkmux did not record the branch of worktree {} and \
+                 its repository does not name one. Find it with `git -C {} worktree list`, \
+                 then `git -C {} branch -D <branch>` once you know it is the phase's.",
+                wt_path.display(),
+                root.display(),
+                root.display()
+            ))
+        );
+    } else {
+        println!("{}", style::dim(&format!("branch {b} not deleted: never had a worktree (derived name), left untouched")));
+    }
+}
+
 /// (#1463) Whether a whole-mission teardown may force-delete a phase's branch.
-/// YES only when the name is backed by a real worktree — one darkmux recorded
-/// when it created the worktree (`recorded_branch_present`, #3457), or one
-/// whose worktree still exists on disk (`wt_exists`). A never-launched Planned phase has only a DERIVED conventions
-/// name; force-deleting that could blow away an unrelated branch that merely
-/// matches the template, so the caller leaves it untouched. Pure, for testing.
-fn should_force_delete_branch(recorded_branch_present: bool, wt_exists: bool) -> bool {
-    recorded_branch_present || wt_exists
+/// YES only when the name is confirmed: the one darkmux recorded when it
+/// created the worktree (#3457), or the one the main repository's record of
+/// the worktree has checked out ([`checked_out_branch`]). A name derived from
+/// conventions is never enough, even when the worktree still exists: it may
+/// be an unrelated branch that merely matches the template. Pure, for testing.
+fn should_force_delete_branch(confirmed_branch_present: bool) -> bool {
+    confirmed_branch_present
+}
+
+/// The branch the linked worktree whose git dir is `admin` has checked out,
+/// read from the main repository's record of it (`<admin>/HEAD`), never from
+/// the worktree's own `.git`, which a run may have replaced. `None` for a
+/// detached HEAD, a name git would take as an option, or a branch `root` does
+/// not hold: nothing an unrecorded teardown may force-delete.
+fn checked_out_branch(root: &Path, admin: &Path) -> Option<String> {
+    let head = std::fs::read_to_string(admin.join("HEAD")).ok()?;
+    let name = head.trim_end_matches(['\n', '\r']).strip_prefix("ref: refs/heads/")?;
+    if name.is_empty() || name.starts_with('-') {
+        return None;
+    }
+    let full = format!("refs/heads/{name}");
+    let real = HostGit::trusted(root).output(&["rev-parse", "--verify", "--quiet", &full]).ok()?.status.success();
+    real.then(|| name.to_string())
 }
 
 /// (#1463) True when a worktree holds work the operator has not saved yet:
