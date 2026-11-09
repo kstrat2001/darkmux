@@ -1355,7 +1355,11 @@ fn name_words(name: &str) -> Vec<String> {
 
 /// git's `user.name`, which a run's text may carry.
 fn git_user_name() -> Option<String> {
-    let here = std::env::current_dir().ok()?;
+    git_user_name_in(&std::env::current_dir().ok()?)
+}
+
+/// git's `user.name` as git reads it in `here`.
+fn git_user_name_in(here: &std::path::Path) -> Option<String> {
     let out = darkmux_types::host_git::HostGit::trusted(here).output(&["config", "--get", "user.name"]).ok()?;
     user_name_from(out.status.success(), &out.stdout)
 }
