@@ -762,7 +762,9 @@ async fn a_held_open_flood_delays_pairing_by_at_most_two_lookup_rounds() {
     };
     let (flooded, (code, v, waited)) = tokio::join!(futures::future::join_all(flood), app);
     assert_eq!(code, 202, "{v}");
-    assert!(waited < std::time::Duration::from_millis(650), "the app waited {waited:?}");
+    // The round count below is the bound; the wall clock only has to tell
+    // ~2 rounds apart from one lookup per queued request (8 s here).
+    assert!(waited < std::time::Duration::from_secs(2), "the app waited {waited:?}");
     assert!(flooded.iter().all(|(code, _)| *code == 202));
     assert!(rounds.load(Ordering::SeqCst) <= 3, "{} rounds", rounds.load(Ordering::SeqCst));
     assert_eq!(most.load(Ordering::SeqCst), 1, "never two rounds at once");
