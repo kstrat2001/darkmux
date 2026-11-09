@@ -46,7 +46,7 @@ pub use dispatch::{
     DispatchDegeneracyWarningPayload, DispatchEndPayload, DispatchFeedbackPayload, DispatchHeartbeatPayload,
     DispatchReasoningPayload, DispatchRestPayload, DispatchRoleInputs, DispatchRoutePayload, DispatchStartPayload,
     DispatchToolPayload, PromptAdditions, RoleInputSource,
-    DispatchTurnPayload, DispatchWorkdirGitUnavailablePayload, GitCheckout, GitdirKind, HostWindow, Knob, KnobSource, KnobValue,
+    DispatchModelPayload, DispatchTurnPayload, DispatchWorkdirGitUnavailablePayload, GitCheckout, GitdirKind, HostWindow, Knob, KnobSource, KnobValue,
     LiveSummary, ResultClass, RouteDecision, RuntimeBounds, StreamPhase, ToolOutcome, TurnUsage,
 };
 pub use lifecycle::{
@@ -281,6 +281,9 @@ flow_payloads! {
     DispatchDegeneracyWarning => DispatchDegeneracyWarningPayload;
     DispatchWorkdirGitUnavailable => DispatchWorkdirGitUnavailablePayload;
     DispatchRoute => DispatchRoutePayload;
+    DispatchModelStart => DispatchModelPayload;
+    DispatchModelLoading => DispatchModelPayload;
+    DispatchModelReady => DispatchModelPayload;
     GhVerbExecuted => GhVerbExecutedPayload;
     HookFired => HookDeliveryPayload;
     HookFailed => HookFailedPayload;
