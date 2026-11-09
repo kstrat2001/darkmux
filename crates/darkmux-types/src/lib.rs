@@ -23,6 +23,7 @@ pub mod env_audit;
 pub mod execution_id;
 #[cfg(unix)]
 pub mod flock;
+pub mod host_git;
 #[cfg(unix)]
 pub mod interrupt;
 pub mod param_scalar;
