@@ -275,7 +275,8 @@ impl Tensorfold {
     /// The server darkmux runs for `model` on `endpoint`: `tensorfold-native
     /// serve <id>` with the model's `engine_args` first and darkmux's own
     /// flags after them (loopback, the endpoint's `port`, the model's `n_ctx`
-    /// as `--context`, its `darkmux:` name, no update check), so darkmux's
+    /// as `--context`, its `darkmux:` name, `host.docker.internal` allowed as
+    /// a Host so a dispatch container can reach it, no update check), so darkmux's
     /// win wherever the engine takes the last of a repeated flag. The
     /// `engine_args` darkmux sets are refused before this is reached
     /// (`ProfileModel::engine_args_problem`).
@@ -295,6 +296,10 @@ impl Tensorfold {
             ("--port", port.to_string()),
             ("--context", n_ctx.to_string()),
             ("--name", served_name.clone()),
+            // A dispatch container dials the server as `host.docker.internal`
+            // (`loopback_to_docker_host`), and Tensorfold answers 403 to a
+            // Host it does not allow.
+            ("--allowed-host", "host.docker.internal".to_string()),
         ] {
             argv.push(flag.to_string());
             argv.push(value);
@@ -391,7 +396,9 @@ mod tests {
     }
 
     /// The command darkmux runs: the model's `engine_args` first, darkmux's
-    /// own flags after them, served under the model's `darkmux:` name.
+    /// own flags after them, served under the model's `darkmux:` name, and
+    /// answering a container's `Host: host.docker.internal` (Tensorfold
+    /// answers 403 to a Host it does not allow, measured on 1.2.4).
     #[test]
     fn the_serve_command_puts_darkmuxs_flags_after_the_models_engine_args() {
         let model: darkmux_types::ProfileModel = serde_json::from_value(serde_json::json!({
@@ -405,7 +412,7 @@ mod tests {
             [
                 "/opt/tf/tensorfold-native", "serve", "TensorFold/Qwen3.8-27B-MLX-4bit", "--drafter", "z/d", "--host",
                 "127.0.0.1", "--port", "8091", "--context", "262144", "--name", "darkmux:TensorFold/Qwen3.8-27B-MLX-4bit",
-                "--no-update-check",
+                "--allowed-host", "host.docker.internal", "--no-update-check",
             ]
         );
         assert_eq!(spec.served_name, "darkmux:TensorFold/Qwen3.8-27B-MLX-4bit");
