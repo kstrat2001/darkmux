@@ -81,7 +81,12 @@ darkmux release.
   by a `client serve` that died is removed when the next starts. A dev server must listen on
   `0.0.0.0` in its container; a Vite project sets `server.watch.usePolling: true`. `node_modules`
   installed there holds Linux binaries (the workspace is darkmux's worktree, not your checkout).
-  A recipe's `env` keys must be variable names. Previews need Docker now.
+  A dev server that binds 127.0.0.1 in its container is named as the reason when it never
+  answers. If `client serve` is killed without stopping its previews, each container stops itself
+  once a heartbeat `client serve` touches every 30 s is two minutes old. A preview container has
+  the network, and through `host.docker.internal` it reaches this Mac's loopback services (LM
+  Studio, the darkmux daemons, local databases), as a dispatch container does. A recipe's `env`
+  keys must be variable names. Previews need Docker now.
 - Previews are off by default (`clients.preview.enabled`, CONFIG 2.8, default `false`). Even
   with its recipe read only from your own checkout, a preview runs the workspace's code (its
   `package.json` scripts and whatever they load, which a model may have written), in a container

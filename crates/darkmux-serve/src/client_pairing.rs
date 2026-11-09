@@ -803,6 +803,14 @@ pub fn run(port: u16) -> Result<()> {
         });
         // (#3459) Previews no app asks about any more are stopped.
         let idle_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // (#3456 review F2) Its preview containers stop themselves once
+        // this heartbeat goes stale (a `client serve` killed without its
+        // handlers).
+        let _heartbeat = crate::client_preview::spawn_heartbeat(
+            state.previews.clone(),
+            crate::client_preview::BEAT_EVERY,
+            idle_stop.clone(),
+        );
         let _idle_check = spawn_preview_idle_check(
             state.clone(),
             PREVIEW_IDLE_CHECK_INTERVAL,

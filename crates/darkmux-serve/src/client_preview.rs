@@ -16,11 +16,26 @@
 //! with (an exported API key) reaches the workspace's code. It has the
 //! dispatch container's hardening and the default network (an install step
 //! fetches packages). It stays up across the dispatches that edit the
-//! workspace, so edits hot-reload into it; a stop, the idle check (#3459)
-//! and `client serve`'s shutdown remove it, and one a `client serve` that
-//! died left behind is removed when the next one starts (it carries its
-//! host's labels, like a dispatch container). No preview process runs on the
-//! host.
+//! workspace, so edits hot-reload into it. It is created first and started
+//! after (`docker create`, then `docker start -a`), so a stop at any moment
+//! finds it by name. A stop, the idle check (#3459), `client serve`'s
+//! shutdown and any end of the preview (a failure, the docker CLI exiting)
+//! remove it. A `client serve` killed without its handlers cannot, so each
+//! container watches a heartbeat file `client serve` touches every 30 s
+//! (mounted read-only at [`HEARTBEAT_AT`]) and stops itself once it is two
+//! minutes old; one left behind is also removed when the next `client serve`
+//! starts (it carries its host's labels, like a dispatch container). No
+//! preview process runs on the host.
+//!
+//! **What a preview container can reach.** No host file outside the
+//! workspace and no host environment. It does have the network, and on
+//! Docker Desktop `host.docker.internal` reaches this Mac's loopback
+//! services, arriving from 127.0.0.1: `client serve`'s own unauthenticated
+//! pairing routes (`POST /client/pair`, `GET /client/pair/:id`; a pairing
+//! still needs your approval), LM Studio, the darkmux daemon, and any local
+//! database or cache. Dispatch containers have the same reach (they need it
+//! to call the model), and `--add-host` does not remove it. That is the
+//! remaining reason previews stay off by default.
 //!
 //! The workspace holds the persistent state (code, `node_modules`, caches);
 //! the container is disposable. `node_modules` installed in the container
@@ -321,9 +336,11 @@ struct Entry {
     port: u16,
     hmr_port: u16,
     status: Status,
-    /// The preview's container, once its `docker run` has started; taken
-    /// by whoever stops it.
+    /// The preview's container, once `docker create` made it; taken by
+    /// whoever removes it.
     container: Option<String>,
+    /// Its heartbeat file, which `client serve` touches while it runs.
+    heartbeat: Option<PathBuf>,
     log: PathBuf,
     /// When an app last asked about it (a start or a status), in the
     /// [`Previews`] clock's seconds.
@@ -421,6 +438,44 @@ const STARTED_LINE: &str = "darkmux-preview: container started";
 const SERVING_LINE: &str = "darkmux-preview: starting the dev server";
 /// Printed when the install step fails, followed by its exit code.
 const INSTALL_FAILED_LINE: &str = "darkmux-preview: install exited with";
+/// Printed when the container stops itself because darkmux stopped beating.
+const STALE_LINE: &str =
+    "darkmux-preview: darkmux stopped answering (its heartbeat is stale); stopping";
+
+/// (#3456 review F2) Where a preview container sees its heartbeat folder,
+/// read-only. `client serve` touches the file in it every [`BEAT_EVERY`];
+/// the container stops itself once the file is [`HEARTBEAT_STALE_SECS`]
+/// old, so a `client serve` killed without its handlers (SIGKILL, a crash)
+/// does not leave a dev server running until the next one starts.
+pub const HEARTBEAT_AT: &str = "/darkmux-heartbeat";
+/// The heartbeat file's name, in its folder.
+pub const HEARTBEAT_FILE: &str = "alive";
+/// How often `client serve` touches each live preview's heartbeat.
+pub const BEAT_EVERY: Duration = Duration::from_secs(30);
+/// How old the heartbeat may get before the container stops itself.
+pub const HEARTBEAT_STALE_SECS: u64 = 120;
+/// How often the container looks at its heartbeat, in seconds.
+const HEARTBEAT_CHECK_SECS: &str = "10";
+
+/// What the container's watchdog reads, and when it gives up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Watch {
+    /// The heartbeat file, as the container sees it.
+    file: String,
+    stale_secs: u64,
+    /// `sleep`'s argument between looks.
+    every: String,
+}
+
+impl Watch {
+    fn production() -> Self {
+        Watch {
+            file: format!("{HEARTBEAT_AT}/{HEARTBEAT_FILE}"),
+            stale_secs: HEARTBEAT_STALE_SECS,
+            every: HEARTBEAT_CHECK_SECS.to_string(),
+        }
+    }
+}
 
 /// One preview container: everything `docker run` is told. Nothing of
 /// `client serve`'s own environment is in it: `env` is the whole of it.
@@ -428,9 +483,12 @@ const INSTALL_FAILED_LINE: &str = "darkmux-preview: install exited with";
 pub struct ContainerSpec {
     pub name: String,
     pub image: String,
-    /// The workspace, mounted read-write at [`WORKSPACE_AT`]; the only host
-    /// path the container sees.
+    /// The workspace, mounted read-write at [`WORKSPACE_AT`]: the only host
+    /// path the container can write.
     pub workspace: PathBuf,
+    /// The preview's heartbeat folder, mounted read-only at
+    /// [`HEARTBEAT_AT`]; it holds nothing but the heartbeat file.
+    pub heartbeat: PathBuf,
     /// The app port and the HMR port, each published on 127.0.0.1 only, at
     /// the same number inside.
     pub ports: [u16; 2],
@@ -446,17 +504,19 @@ pub struct ContainerSpec {
     pub script: String,
 }
 
-/// `docker run` arguments for a preview container: the dispatch
+/// `docker create` arguments for a preview container: the dispatch
 /// container's hardening (no capabilities, no new privileges, its pid and
-/// memory limits, `--init`), removed when it exits, the workspace the only
-/// mount, only the preview's two ports published and only on loopback, and
-/// an environment of exactly `spec.env`. It keeps the default network: an
-/// install step fetches packages.
-pub fn docker_run_args(spec: &ContainerSpec) -> Vec<String> {
+/// memory limits, `--init`), removed when it exits, the workspace its only
+/// writable mount (and its heartbeat folder, read-only), only the
+/// preview's two ports published and only on loopback, and an environment
+/// of exactly `spec.env`. It keeps the default network: an install step
+/// fetches packages. Created first and started after (`docker start -a`),
+/// so a stop at any moment finds the container by name.
+pub fn docker_create_args(spec: &ContainerSpec) -> Vec<String> {
     use darkmux_crew::dispatch_internal::{
         DOCKER_CAP_DROP, DOCKER_MEMORY, DOCKER_PIDS_LIMIT, DOCKER_SECURITY_OPT,
     };
-    let mut args: Vec<String> = ["run", "--rm", "--init", "--name", &spec.name]
+    let mut args: Vec<String> = ["create", "--rm", "--init", "--name", &spec.name]
         .iter()
         .map(|s| s.to_string())
         .collect();
@@ -472,6 +532,8 @@ pub fn docker_run_args(spec: &ContainerSpec) -> Vec<String> {
     args.extend([
         "-v".to_string(),
         format!("{}:{WORKSPACE_AT}", spec.workspace.display()),
+        "-v".to_string(),
+        format!("{}:{HEARTBEAT_AT}:ro", spec.heartbeat.display()),
         "-w".to_string(),
         WORKSPACE_AT.to_string(),
     ]);
@@ -501,18 +563,38 @@ pub fn docker_run_args(spec: &ContainerSpec) -> Vec<String> {
     args
 }
 
-/// The container's script: a start line, the install step when it is due
-/// (in a subshell, so its own `exit` ends only it), then the dev server.
-fn container_script(recipe: &Recipe, install_due: bool) -> String {
-    let mut script = format!("echo '{STARTED_LINE}'\n");
+/// The container's script: a start line, a watchdog in the background
+/// that ends the script (and with it the container: `--init`'s PID 1 exits
+/// when it does) once the heartbeat is stale, then, in a subshell, the
+/// install step when it is due (its own `exit` ends only it) and the dev
+/// server.
+fn container_script(recipe: &Recipe, install_due: bool, watch: &Watch) -> String {
+    let mut script = format!("echo '{STARTED_LINE}'\n{}", watchdog(watch));
+    script.push_str("(\n");
     if let (true, Some(install)) = (install_due, &recipe.install) {
         script.push_str(&format!(
             "(\n{}\n) || {{ s=$?; echo \"{INSTALL_FAILED_LINE} $s\"; exit $s; }}\n",
             install.command
         ));
     }
-    script.push_str(&format!("echo '{SERVING_LINE}'\n{}\n", recipe.command));
+    script.push_str(&format!("echo '{SERVING_LINE}'\n{}\n)\n", recipe.command));
     script
+}
+
+/// The background loop that stops the container when darkmux stops
+/// beating: every `watch.every` it reads the heartbeat's mtime (GNU `stat`,
+/// else BSD's), and once it is more than `watch.stale_secs` old (or gone)
+/// it says so and ends the script (`$$`, the script's own pid).
+fn watchdog(watch: &Watch) -> String {
+    format!(
+        "( while kill -0 $$ 2>/dev/null && sleep {every}; do \
+         seen=$(stat -c %Y '{file}' 2>/dev/null || stat -f %m '{file}' 2>/dev/null || echo 0); \
+         if [ $(( $(date +%s) - seen )) -gt {stale} ]; then echo '{STALE_LINE}'; kill -TERM $$; exit 0; fi; \
+         done ) &\n",
+        every = watch.every,
+        file = watch.file,
+        stale = watch.stale_secs,
+    )
 }
 
 /// The container's environment: polling first, the recipe's `env` with
@@ -544,9 +626,15 @@ pub trait PreviewContainers: Send + Sync {
     fn image_and_user(&self) -> Result<(String, Option<String>), String>;
     /// The labels naming the darkmux process that starts a container.
     fn host_labels(&self) -> Vec<String>;
-    /// Starts the container, attached: its output goes to `log`, and the
-    /// child ends when the container does.
-    fn run(&self, spec: &ContainerSpec, log: &Path) -> Result<std::process::Child, String>;
+    /// Creates the container (not started). It returns once the container
+    /// exists, so a stop from then on finds it by name.
+    fn create(&self, spec: &ContainerSpec) -> Result<(), String>;
+    /// Starts the created container, attached: its output goes to `log`,
+    /// and the child ends when the container does.
+    fn start(&self, name: &str, log: &Path) -> Result<std::process::Child, String>;
+    /// The container's `/proc/net/tcp` and `/proc/net/tcp6`, to tell why a
+    /// dev server never answered; `None` when they cannot be read.
+    fn listeners(&self, name: &str) -> Option<String>;
     /// Stops and removes the container: TERM, KILL after five seconds.
     /// Best effort; a container already gone is the goal.
     fn remove(&self, name: &str);
@@ -563,8 +651,10 @@ pub struct Docker {
     pub image: Option<String>,
 }
 
-/// How long one `docker stop` or `docker rm` may take.
+/// How long one `docker stop`, `docker rm` or `docker exec` may take.
 const DOCKER_CALL_BOUND: Duration = Duration::from_secs(30);
+/// How long `docker create` may take (the image is already resolved).
+const DOCKER_CREATE_BOUND: Duration = Duration::from_secs(120);
 
 impl PreviewContainers for Docker {
     fn image_and_user(&self) -> Result<(String, Option<String>), String> {
@@ -584,7 +674,33 @@ impl PreviewContainers for Docker {
             .unwrap_or_default()
     }
 
-    fn run(&self, spec: &ContainerSpec, log: &Path) -> Result<std::process::Child, String> {
+    fn create(&self, spec: &ContainerSpec) -> Result<(), String> {
+        use darkmux_crew::bounded_command::{run_bounded, Bounded};
+        let mut cmd = std::process::Command::new("docker");
+        cmd.args(docker_create_args(spec));
+        match run_bounded(cmd, DOCKER_CREATE_BOUND) {
+            Bounded::Finished { success: true, .. } => Ok(()),
+            Bounded::Finished { stderr, .. } => Err(format!(
+                "docker create: {}",
+                String::from_utf8_lossy(&stderr).trim()
+            )),
+            other => Err(format!("docker create did not finish: {other:?}")),
+        }
+    }
+
+    fn listeners(&self, name: &str) -> Option<String> {
+        use darkmux_crew::bounded_command::{run_bounded, Bounded};
+        let mut cmd = std::process::Command::new("docker");
+        cmd.args(["exec", name, "cat", "/proc/net/tcp", "/proc/net/tcp6"]);
+        match run_bounded(cmd, DOCKER_CALL_BOUND) {
+            Bounded::Finished { stdout, .. } if !stdout.is_empty() => {
+                Some(String::from_utf8_lossy(&stdout).to_string())
+            }
+            _ => None,
+        }
+    }
+
+    fn start(&self, name: &str, log: &Path) -> Result<std::process::Child, String> {
         let out = std::fs::OpenOptions::new()
             .append(true)
             .create(true)
@@ -594,7 +710,7 @@ impl PreviewContainers for Docker {
             .try_clone()
             .map_err(|e| format!("opening {}: {e}", log.display()))?;
         let mut cmd = std::process::Command::new("docker");
-        cmd.args(docker_run_args(spec))
+        cmd.args(["start", "-a", name])
             .stdin(std::process::Stdio::null())
             .stdout(out)
             .stderr(err);
@@ -708,6 +824,7 @@ impl Previews {
             hmr_port,
             status: Status::Starting,
             container: None,
+            heartbeat: None,
             log: log.clone(),
             last_asked: (self.clock)(),
         }));
@@ -795,11 +912,59 @@ impl Previews {
         names
     }
 
+    /// (#3456 review F2) Touches the heartbeat of every live preview. `client
+    /// serve` calls it every [`BEAT_EVERY`]; a container whose heartbeat is
+    /// [`HEARTBEAT_STALE_SECS`] old stops itself.
+    pub fn beat(&self) {
+        let files: Vec<PathBuf> = self
+            .entries
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|e| {
+                let e = e.lock().unwrap();
+                e.status.live().then(|| e.heartbeat.clone()).flatten()
+            })
+            .collect();
+        for file in files {
+            touch(&file);
+        }
+    }
+
     /// Removes preview containers a `client serve` that died left behind
     /// (their labeled host process is gone). Returns their names.
     pub fn reap_orphans(&self) -> Vec<String> {
         self.containers.reap_orphans()
     }
+}
+
+/// Sets `file`'s mtime to now, in place (the container sees the same
+/// inode through its bind mount). Best effort.
+fn touch(file: &Path) {
+    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(file) {
+        let _ = f.set_modified(std::time::SystemTime::now());
+    }
+}
+
+/// (#3456 review F2) Beats every `interval` until `stop` is set: the
+/// thread `client serve` runs so its preview containers know it is alive.
+pub fn spawn_heartbeat(
+    previews: Arc<Previews>,
+    interval: Duration,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    use std::sync::atomic::Ordering;
+    std::thread::spawn(move || {
+        let poll = interval.min(Duration::from_millis(200));
+        while !stop.load(Ordering::SeqCst) {
+            previews.beat();
+            let mut slept = Duration::ZERO;
+            while slept < interval && !stop.load(Ordering::SeqCst) {
+                std::thread::sleep(poll);
+                slept += poll;
+            }
+        }
+    })
 }
 
 fn unix_seconds() -> u64 {
@@ -857,6 +1022,18 @@ fn run(entry: Arc<Mutex<Entry>>, recipe: Recipe, at: RunIn, containers: &dyn Pre
     // A stop is already recorded; `set` never overwrites it with a failure.
     if let Err(Halt::Failed(why)) = ended {
         set(&entry, Status::Failed(why));
+    }
+    // (#3456 review) However it ended (the docker CLI can exit while its
+    // container runs on), a container nobody has removed yet is removed now.
+    let (left, heartbeat) = {
+        let mut e = entry.lock().unwrap();
+        (e.container.take(), e.heartbeat.take())
+    };
+    if let Some(container) = left {
+        containers.remove(&container);
+    }
+    if let Some(dir) = heartbeat.as_deref().and_then(Path::parent) {
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 
@@ -939,18 +1116,42 @@ fn spec_for(
 ) -> ContainerSpec {
     let mut labels = host_labels;
     labels.push(format!("{WORKSPACE_LABEL}={}", at.name));
+    let name = container_name(at);
     ContainerSpec {
-        // The app port makes it unique: a restarted preview never collides
-        // with its predecessor while that one is still being removed.
-        name: format!("{PREVIEW_CONTAINER_PREFIX}{}-{}", at.name, at.port),
+        heartbeat: heartbeat_dir(at, &name),
+        name,
         image,
         workspace: at.workdir.clone(),
         ports: [at.port, at.hmr_port],
         user,
         labels,
         env: container_env(recipe, at.port, at.hmr_port),
-        script: container_script(recipe, install_due),
+        script: container_script(recipe, install_due, &Watch::production()),
     }
+}
+
+/// The preview's container name. The app port makes it unique: a restarted
+/// preview never collides with its predecessor while that one is still
+/// being removed.
+fn container_name(at: &RunIn) -> String {
+    format!("{PREVIEW_CONTAINER_PREFIX}{}-{}", at.name, at.port)
+}
+
+/// The preview's heartbeat folder: beside its log, outside the workspace.
+fn heartbeat_dir(at: &RunIn, name: &str) -> PathBuf {
+    let previews = at.log.parent().map(Path::to_path_buf).unwrap_or_default();
+    previews.join("heartbeats").join(name)
+}
+
+/// A fresh heartbeat folder and file for the container, recorded on the
+/// entry so [`Previews::beat`] touches it.
+fn fresh_heartbeat(entry: &Arc<Mutex<Entry>>, dir: &Path) -> Result<(), String> {
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let file = dir.join(HEARTBEAT_FILE);
+    std::fs::write(&file, "").map_err(|e| format!("{}: {e}", file.display()))?;
+    entry.lock().unwrap().heartbeat = Some(file);
+    Ok(())
 }
 
 /// Starts the container, waits for the dev server to answer, then waits
@@ -968,8 +1169,10 @@ fn serve(
         .image_and_user()
         .map_err(|e| format!("a preview runs in a container: {e}"))?;
     let spec = spec_for(recipe, at, install_due, resolved, containers.host_labels());
-    let mut child = containers.run(&spec, &at.log)?;
-    adopt(entry, &mut child, &spec.name, containers)?;
+    fresh_heartbeat(entry, &spec.heartbeat)?;
+    containers.create(&spec)?;
+    adopt(entry, &spec.name, containers)?;
+    let mut child = containers.start(&spec.name, &at.log)?;
     wait_ready(entry, &mut child, &spec.name, containers, at, recipe)?;
     // Ready: wait for it to end, and say why unless it was stopped.
     let status = child.wait();
@@ -998,6 +1201,9 @@ fn exit_reason(
         .lines()
         .find_map(|l| l.strip_prefix(INSTALL_FAILED_LINE))
         .map(str::trim);
+    if text.lines().any(|l| l == STALE_LINE) {
+        return "the preview's container stopped itself: darkmux stopped answering".to_string();
+    }
     match (install_code, &recipe.install) {
         (Some(code), Some(install)) => {
             format!(
@@ -1009,11 +1215,11 @@ fn exit_reason(
     }
 }
 
-/// Records the container so `stop` can reach it; if the preview was
-/// stopped while it started, removes it instead.
+/// Records the created container so a stop can reach it; if the preview
+/// was stopped while it was being created, removes it instead (#3456
+/// review F1: the container now exists, so the removal finds it).
 fn adopt(
     entry: &Arc<Mutex<Entry>>,
-    child: &mut std::process::Child,
     name: &str,
     containers: &dyn PreviewContainers,
 ) -> Result<(), Halt> {
@@ -1021,7 +1227,6 @@ fn adopt(
     if e.status == Status::Stopped {
         drop(e);
         containers.remove(name);
-        let _ = child.wait();
         return Err(Halt::Stopped);
     }
     e.container = Some(name.to_string());
@@ -1071,14 +1276,67 @@ fn wait_ready(
             return Ok(());
         }
         if serving_since.is_some_and(|t| t.elapsed() > READY_WITHIN) {
-            containers.remove(name);
-            return Err(Halt::Failed(format!(
-                "the dev server didn't answer on port {} within 3 minutes; in its container it \
-                 must listen on 0.0.0.0 (the port is published on 127.0.0.1 only)",
-                at.port
+            let listening = containers.listeners(name);
+            return Err(Halt::Failed(not_ready_reason(
+                at.port,
+                listening.as_deref(),
             )));
         }
         std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// Why a dev server never answered on its published port. (#3456 review F5)
+/// When the container's `/proc/net/tcp*` shows it listening on the port on
+/// loopback only, that is why: say so, and what to change.
+fn not_ready_reason(port: u16, listeners: Option<&str>) -> String {
+    if listeners.is_some_and(|l| listens_on_loopback_only(l, port)) {
+        return format!(
+            "the dev server listens on 127.0.0.1 inside its container; set it to bind 0.0.0.0 \
+             (the port is published on this Mac's loopback only); port {port}"
+        );
+    }
+    format!(
+        "the dev server didn't answer on port {port} within 3 minutes; in its container it must \
+         listen on 0.0.0.0 (the port is published on 127.0.0.1 only)"
+    )
+}
+
+/// Whether `/proc/net/tcp` / `tcp6` text shows a listener on `port` bound
+/// to a loopback address (127.x, `::1`, or `::ffff:127.x`) and none on every
+/// address (`0.0.0.0` or `::`), which the published port could reach.
+fn listens_on_loopback_only(proc_net: &str, port: u16) -> bool {
+    let want = format!("{port:04X}");
+    let mut loopback = false;
+    for line in proc_net.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let (Some(local), Some(state)) = (fields.get(1), fields.get(3)) else {
+            continue;
+        };
+        let Some((addr, p)) = local.rsplit_once(':') else {
+            continue;
+        };
+        if *state != "0A" || p != want {
+            continue;
+        }
+        if addr.chars().all(|c| c == '0') {
+            return false;
+        }
+        loopback |= is_loopback_hex(addr);
+    }
+    loopback
+}
+
+/// A `/proc/net/tcp*` address (hex, in the kernel's byte order) that is
+/// loopback: IPv4 127.x, IPv6 `::1`, or IPv4-mapped `::ffff:127.x`.
+fn is_loopback_hex(addr: &str) -> bool {
+    match addr.len() {
+        8 => addr.ends_with("7F"),
+        32 => {
+            addr == "00000000000000000000000001000000"
+                || (addr.starts_with("0000000000000000FFFF0000") && addr.ends_with("7F"))
+        }
+        _ => false,
     }
 }
 
@@ -1089,22 +1347,34 @@ fn log_has(log: &Path, line: &str) -> bool {
 
 /// TEST ONLY: a [`PreviewContainers`] that plays a container's part
 /// without Docker, so the preview lifecycle (ports, readiness, the install
-/// step, stop, the HTTP routes) is testable on any machine. It runs the
-/// spec's script with `sh` in the workspace, with exactly the spec's
-/// environment plus `PATH` (an image has its own), in its own process
-/// group under a watchdog that ends it with the test process. Production
-/// never runs a preview on the host: [`Docker`] is the only production
-/// implementation. The shape a real container gets is asserted on
-/// [`docker_run_args`] directly.
+/// step, stop, the HTTP routes) is testable on any machine. `create`
+/// records the spec; `start` runs its script with `sh` in the workspace,
+/// with exactly the spec's environment plus `PATH` (an image has its own)
+/// and the heartbeat folder at its host path (as the mount would show it),
+/// in its own process group under a watchdog that ends it with the test
+/// process. Production never runs a preview on the host: [`Docker`] is the
+/// only production implementation, and the shape a real container gets is
+/// asserted on [`docker_create_args`] directly.
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct HostEmulator {
-    /// Every spec it was asked to run.
+    /// Every spec it was asked to create.
     pub specs: Mutex<Vec<ContainerSpec>>,
     /// Every container it was asked to remove.
     pub removed: Mutex<Vec<String>>,
     /// Set: resolving the image fails with this.
     pub image_error: Mutex<Option<String>>,
+    /// How long `create` takes (a stop can land meanwhile).
+    pub create_delay: Mutex<Duration>,
+    /// How long `start` waits before starting (a stop can land between
+    /// create and start).
+    pub start_delay: Mutex<Duration>,
+    /// Set: `start`'s child (the docker CLI) exits at once while the
+    /// container runs on.
+    pub cli_exits_early: Mutex<bool>,
+    /// What `listeners` answers.
+    pub proc_net: Mutex<Option<String>>,
+    created: Mutex<HashMap<String, ContainerSpec>>,
     groups: Mutex<HashMap<String, i32>>,
 }
 
@@ -1121,19 +1391,36 @@ impl PreviewContainers for HostEmulator {
         vec![format!("darkmux.dispatch.host-pid={}", std::process::id())]
     }
 
-    fn run(&self, spec: &ContainerSpec, log: &Path) -> Result<std::process::Child, String> {
-        use std::os::unix::process::CommandExt;
+    fn create(&self, spec: &ContainerSpec) -> Result<(), String> {
+        std::thread::sleep(*self.create_delay.lock().unwrap());
         self.specs.lock().unwrap().push(spec.clone());
+        self.created
+            .lock()
+            .unwrap()
+            .insert(spec.name.clone(), spec.clone());
+        Ok(())
+    }
+
+    fn start(&self, name: &str, log: &Path) -> Result<std::process::Child, String> {
+        use std::os::unix::process::CommandExt;
+        std::thread::sleep(*self.start_delay.lock().unwrap());
+        let Some(spec) = self.created.lock().unwrap().get(name).cloned() else {
+            return Err(format!(
+                "Error response from daemon: No such container: {name}"
+            ));
+        };
         let out = std::fs::OpenOptions::new()
             .append(true)
             .create(true)
             .open(log)
             .map_err(|e| e.to_string())?;
         let err = out.try_clone().map_err(|e| e.to_string())?;
+        let script = spec
+            .script
+            .replace(HEARTBEAT_AT, &spec.heartbeat.display().to_string());
         let watchdog = format!(
-            "trap 'kill 0' EXIT; ( {} ) & c=$!; while kill -0 {} 2>/dev/null && kill -0 $c 2>/dev/null; do sleep 1; done; \
+            "trap 'kill 0' EXIT; ( {script} ) & c=$!; while kill -0 {} 2>/dev/null && kill -0 $c 2>/dev/null; do sleep 1; done; \
              if kill -0 $c 2>/dev/null; then exit 0; fi; wait $c",
-            spec.script,
             std::process::id()
         );
         let mut cmd = std::process::Command::new("/bin/sh");
@@ -1149,16 +1436,28 @@ impl PreviewContainers for HostEmulator {
             .stdout(out)
             .stderr(err)
             .process_group(0);
-        let child = cmd.spawn().map_err(|e| e.to_string())?;
+        let container = cmd.spawn().map_err(|e| e.to_string())?;
         self.groups
             .lock()
             .unwrap()
-            .insert(spec.name.clone(), child.id() as i32);
-        Ok(child)
+            .insert(name.to_string(), container.id() as i32);
+        if *self.cli_exits_early.lock().unwrap() {
+            // The container's process is reaped by the group kill in `remove`.
+            std::mem::forget(container);
+            return std::process::Command::new("true")
+                .spawn()
+                .map_err(|e| e.to_string());
+        }
+        Ok(container)
+    }
+
+    fn listeners(&self, _name: &str) -> Option<String> {
+        self.proc_net.lock().unwrap().clone()
     }
 
     fn remove(&self, name: &str) {
         self.removed.lock().unwrap().push(name.to_string());
+        self.created.lock().unwrap().remove(name);
         let Some(pgid) = self.groups.lock().unwrap().remove(name) else {
             return;
         };
@@ -1187,6 +1486,11 @@ impl HostEmulator {
             .unwrap()
             .get(name)
             .is_some_and(|g| unsafe { libc::kill(-g, 0) == 0 })
+    }
+
+    /// Whether the container `name` exists (created, not yet removed).
+    pub fn exists(&self, name: &str) -> bool {
+        self.created.lock().unwrap().contains_key(name)
     }
 }
 
@@ -1263,11 +1567,11 @@ mod tests {
     fn a_preview_container_mounts_only_the_workspace_and_publishes_only_its_ports_on_loopback() {
         let recipe =
             a_recipe(serde_json::json!({"schema_version": "1.0", "command": "npm run dev"}));
-        let args = docker_run_args(&a_spec(&recipe, None));
+        let args = docker_create_args(&a_spec(&recipe, None));
         assert_eq!(
             args[..5],
             [
-                "run",
+                "create",
                 "--rm",
                 "--init",
                 "--name",
@@ -1276,8 +1580,11 @@ mod tests {
         );
         assert_eq!(
             values_of(&args, "-v"),
-            ["/tmp/ws/site:/workspace"],
-            "the only mount"
+            [
+                "/tmp/ws/site:/workspace",
+                "/tmp/p/heartbeats/darkmux-preview-site-4100:/darkmux-heartbeat:ro"
+            ],
+            "the workspace, and the heartbeat folder read-only"
         );
         assert!(
             !args
@@ -1339,7 +1646,7 @@ mod tests {
             "schema_version": "1.0", "command": "npm run dev",
             "env": {"PORT": "{port}", "VITE_HMR_PORT": "{hmrPort}", "CHOKIDAR_USEPOLLING": "false"}
         }));
-        let args = docker_run_args(&a_spec(&recipe, None));
+        let args = docker_create_args(&a_spec(&recipe, None));
         unsafe { std::env::remove_var("SOME_PROVIDER_API_KEY") };
         let joined = args.join(" ");
         assert!(
@@ -1364,7 +1671,7 @@ mod tests {
             "polling first (the recipe may turn it off), the ports last"
         );
         // With a container user, its home is one it owns.
-        let args = docker_run_args(&a_spec(&recipe, Some("501:20".into())));
+        let args = docker_create_args(&a_spec(&recipe, Some("501:20".into())));
         assert!(
             args.join(" ").contains("--user=501:20 -e HOME=/tmp"),
             "{args:?}"
@@ -1380,20 +1687,251 @@ mod tests {
             "schema_version": "1.0", "command": "echo serving",
             "install": {"command": "echo installing; exit 4", "unless_exists": "node_modules"}
         }));
-        let not_due = container_script(&recipe, false);
+        let beat = tempfile::NamedTempFile::new().unwrap();
+        let watch = a_watch(beat.path(), 60);
+        let not_due = container_script(&recipe, false, &watch);
         assert!(!not_due.contains("installing"), "{not_due}");
-        let out = std::process::Command::new("sh")
+        // Waited on, not `output()`: the watchdog in the background keeps
+        // the pipe open until it sees the script gone (in a container, the
+        // script's exit ends the container).
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let status = std::process::Command::new("sh")
             .arg("-c")
-            .arg(container_script(&recipe, true))
-            .output()
+            .arg(container_script(&recipe, true, &watch))
+            .stdout(log.reopen().unwrap())
+            .status()
             .unwrap();
-        let text = String::from_utf8_lossy(&out.stdout);
-        assert_eq!(out.status.code(), Some(4), "{text}");
+        let text = std::fs::read_to_string(log.path()).unwrap();
+        assert_eq!(status.code(), Some(4), "{text}");
         assert!(text.starts_with(STARTED_LINE), "{text}");
         assert!(
             text.contains(&format!("{INSTALL_FAILED_LINE} 4")) && !text.contains("serving"),
             "{text}"
         );
+    }
+
+    /// A watchdog on a host file, looking every 0.1 s.
+    fn a_watch(file: &Path, stale_secs: u64) -> Watch {
+        Watch {
+            file: file.display().to_string(),
+            stale_secs,
+            every: "0.1".to_string(),
+        }
+    }
+
+    /// Sets `file`'s mtime `secs` seconds into the past.
+    fn age(file: &Path, secs: u64) {
+        let f = std::fs::OpenOptions::new().write(true).open(file).unwrap();
+        f.set_modified(std::time::SystemTime::now() - Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    /// (#3456 review F2, the old `a_preview_ends_when_darkmux_does`) A
+    /// preview container stops itself once darkmux stops beating: its script
+    /// runs while the heartbeat is fresh, and ends, saying why, once it is
+    /// stale. Driven directly with a 1 s threshold, not two minutes.
+    #[cfg(unix)]
+    #[test]
+    fn a_preview_ends_when_darkmux_does() {
+        use std::os::unix::process::CommandExt;
+        let beat = tempfile::NamedTempFile::new().unwrap();
+        let recipe = a_recipe(serde_json::json!({"schema_version": "1.0", "command": "sleep 30"}));
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let mut sh = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(container_script(&recipe, false, &a_watch(beat.path(), 1)))
+            .stdout(out.reopen().unwrap())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let group = sh.id() as i32;
+        for _ in 0..8 {
+            touch(beat.path());
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        assert!(
+            sh.try_wait().unwrap().is_none(),
+            "a fresh heartbeat keeps it running"
+        );
+        age(beat.path(), 5);
+        let mut ended = None;
+        for _ in 0..40 {
+            ended = sh.try_wait().unwrap();
+            if ended.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        unsafe { libc::kill(-group, libc::SIGKILL) };
+        assert!(
+            ended.is_some(),
+            "a stale heartbeat ends the container's script"
+        );
+        let said = std::fs::read_to_string(out.path()).unwrap();
+        assert!(said.contains(STALE_LINE), "{said}");
+    }
+
+    /// (#3456 review F2) `beat` touches every live preview's heartbeat, the
+    /// file the container sees through its read-only mount.
+    #[test]
+    fn beat_touches_each_live_previews_heartbeat() {
+        let dir = tempfile::tempdir().unwrap();
+        let (previews, emu, name) = a_live_preview(dir.path(), frozen_clock().1);
+        let spec = emu.specs.lock().unwrap()[0].clone();
+        assert_eq!(spec.name, name);
+        let file = spec.heartbeat.join(HEARTBEAT_FILE);
+        age(&file, 600);
+        previews.beat();
+        let modified = std::fs::metadata(&file).unwrap().modified().unwrap();
+        assert!(
+            modified.elapsed().unwrap() < Duration::from_secs(5),
+            "touched"
+        );
+        previews.stop("w");
+    }
+
+    /// (#3456 review F2) `client serve`'s heartbeat thread beats on its own
+    /// and ends when told.
+    #[test]
+    fn the_heartbeat_thread_beats() {
+        let dir = tempfile::tempdir().unwrap();
+        let (previews, emu, _name) = a_live_preview(dir.path(), frozen_clock().1);
+        let file = emu.specs.lock().unwrap()[0].heartbeat.join(HEARTBEAT_FILE);
+        age(&file, 600);
+        let previews = Arc::new(previews);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread = spawn_heartbeat(previews.clone(), Duration::from_millis(20), stop.clone());
+        let mut fresh = false;
+        for _ in 0..100 {
+            let modified = std::fs::metadata(&file).unwrap().modified().unwrap();
+            if modified.elapsed().unwrap() < Duration::from_secs(5) {
+                fresh = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        thread.join().unwrap();
+        assert!(fresh, "the thread touched the heartbeat");
+        previews.stop("w");
+    }
+
+    /// (#3456 review F1) A stop that lands while the container is being
+    /// created removes it once it exists; nothing ever runs.
+    #[test]
+    fn a_stop_while_the_container_is_created_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (previews, emu) = emulated(dir.path());
+        *emu.create_delay.lock().unwrap() = Duration::from_millis(300);
+        let wt = a_workspace(dir.path(), "touch ran; sleep 30");
+        previews.start("w", &wt, &wt).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(previews.stop("w"));
+        let name = until_removed(&emu);
+        assert!(
+            !emu.exists(&name) && !emu.running(&name),
+            "no container is left"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!wt.join("ran").exists(), "nothing ran");
+    }
+
+    /// (#3456 review F1) A stop between create and start removes the
+    /// created container, and the start then finds none to run.
+    #[test]
+    fn a_stop_between_create_and_start_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (previews, emu) = emulated(dir.path());
+        *emu.start_delay.lock().unwrap() = Duration::from_millis(300);
+        let wt = a_workspace(dir.path(), "touch ran; sleep 30");
+        previews.start("w", &wt, &wt).unwrap();
+        for _ in 0..100 {
+            if previews.entries.lock().unwrap()["w"]
+                .lock()
+                .unwrap()
+                .container
+                .is_some()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(previews.stop("w"));
+        let name = until_removed(&emu);
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            !emu.exists(&name) && !emu.running(&name),
+            "no container is left"
+        );
+        assert!(!wt.join("ran").exists(), "nothing ran");
+        assert_eq!(previews.status("w").unwrap().status, "stopped");
+    }
+
+    /// (#3456 review) When the docker CLI exits while its container runs on,
+    /// the preview fails and the container is removed by name.
+    #[test]
+    fn a_container_whose_cli_exits_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (previews, emu) = emulated(dir.path());
+        *emu.cli_exits_early.lock().unwrap() = true;
+        let wt = a_workspace(dir.path(), "sleep 30");
+        previews.start("w", &wt, &wt).unwrap();
+        let v = until_failed(&previews, "w");
+        assert_eq!(v["status"], "failed", "{v}");
+        let name = until_removed(&emu);
+        assert!(
+            !emu.exists(&name) && !emu.running(&name),
+            "the container was left running"
+        );
+    }
+
+    /// A workspace whose own recipe runs `command`.
+    fn a_workspace(dir: &Path, command: &str) -> PathBuf {
+        let wt = dir.join("w");
+        std::fs::create_dir_all(wt.join(".darkmux")).unwrap();
+        let recipe = serde_json::json!({"schema_version": "1.0", "command": command});
+        std::fs::write(wt.join(".darkmux/preview.json"), recipe.to_string()).unwrap();
+        wt
+    }
+
+    /// Waits for the emulator to have removed a container; returns its name.
+    fn until_removed(emu: &HostEmulator) -> String {
+        for _ in 0..200 {
+            if let Some(name) = emu.removed.lock().unwrap().first() {
+                return name.clone();
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("nothing was removed");
+    }
+
+    /// (#3456 review F5) A dev server that never answered names why when
+    /// the container's `/proc/net/tcp` shows it listening on loopback only
+    /// (recorded from a Vite dev server with `HOST: 127.0.0.1`, port 5173 =
+    /// 0x1435), and not when it also listens on every address.
+    #[test]
+    fn a_dev_server_listening_on_loopback_only_is_named() {
+        let tcp = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 0100007F:1435 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 61232 1 0000000000000000 100 0 0 10 0\n   1: 0B00007F:A5F1 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 59311 1 0000000000000000 100 0 0 10 0\n";
+        let why = not_ready_reason(5173, Some(tcp));
+        assert!(
+            why.starts_with("the dev server listens on 127.0.0.1 inside its container; set it to bind 0.0.0.0 (the port is published on this Mac's loopback only)"),
+            "{why}"
+        );
+        let v6 = "   0: 00000000000000000000000001000000:1435 00000000000000000000000000000000:0000 0A 0 0 0 0 0 0";
+        assert!(listens_on_loopback_only(v6, 5173), "::1");
+        let any = format!("{tcp}   2: 00000000:1435 00000000:0000 0A 0 0 0 0 0 0\n");
+        assert!(
+            !listens_on_loopback_only(&any, 5173),
+            "also on 0.0.0.0: reachable"
+        );
+        assert!(!listens_on_loopback_only(tcp, 3000), "another port");
+        let established = tcp.replace(" 0A ", " 01 ");
+        assert!(
+            !listens_on_loopback_only(&established, 5173),
+            "not a listener"
+        );
+        assert!(not_ready_reason(5173, None).contains("didn't answer"));
+        assert!(not_ready_reason(3000, Some(tcp)).contains("didn't answer"));
     }
 
     /// (#3456) Why a container ended, from what it printed.
@@ -1628,7 +2166,7 @@ mod tests {
     #[test]
     #[ignore]
     #[serial_test::serial]
-    fn a_preview_runs_in_the_runtime_image_and_reaches_nothing_else_of_the_host() {
+    fn a_preview_runs_in_the_runtime_image_with_no_host_files_or_host_env() {
         let image = darkmux_crew::runtime_image::pinned_runtime_image(env!("CARGO_PKG_VERSION"));
         let inspect = std::process::Command::new("docker")
             .args(["image", "inspect", &image])
