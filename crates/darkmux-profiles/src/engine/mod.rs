@@ -20,6 +20,7 @@
 
 mod lmstudio;
 mod openai_compat;
+pub mod tensorfold;
 mod unresolved;
 
 pub use lmstudio::LmStudio;

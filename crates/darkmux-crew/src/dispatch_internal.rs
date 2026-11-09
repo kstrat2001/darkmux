@@ -3281,6 +3281,17 @@ fn route_dispatch(opts: &DispatchOpts) -> Result<Option<DispatchRoute>> {
                 target: Box::new(target),
             }
         }
+        // (#3448) The managed route loads through LM Studio, which never
+        // holds a Tensorfold model. Every dispatching preflight already
+        // refuses the endpoint (`config_enum::undispatchable_engine_endpoints`);
+        // this refuses it again for a caller that skipped preflight, so its
+        // model is never loaded into LM Studio by mistake.
+        darkmux_types::EndpointKind::Managed(darkmux_types::ManagedBackend::Tensorfold) => anyhow::bail!(
+            "darkmux dispatch: profile `{}` runs `{}` on a `tensorfold` endpoint, whose server darkmux cannot \
+             start yet (#3448); point a `url` endpoint at a server you started instead",
+            target.profile_name,
+            target.model.id
+        ),
         darkmux_types::EndpointKind::Managed(_) => DispatchRoute::Managed(Box::new(target)),
     }))
 }
