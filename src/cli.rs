@@ -267,8 +267,13 @@ pub(crate) enum Cmd {
         #[arg(long, value_name = "TAG")]
         image: Option<String>,
         /// Cap the completion tokens of a single-shot hosted dispatch
-        /// (a tool-less role on a remote endpoint). Default 4096. Raise it
-        /// when a long output (e.g. a many-finding review) would truncate.
+        /// (a tool-less role on a remote endpoint). Default 4096, or 16384
+        /// when the endpoint sets `reasoning_effort`. Raise it when a long
+        /// output (e.g. a many-finding review) would truncate, or when a
+        /// reasoning model spends the cap thinking: a reply that stops at the
+        /// cap with no answer fails the dispatch, naming the cap.
+        /// Local dispatch only: ignored on a `--profile <p>@<machine>`
+        /// dispatch, which does not carry the value to the other machine.
         /// No effect on container-path dispatches (local or agentic-remote).
         #[arg(long, value_name = "N")]
         max_completion_tokens: Option<u32>,
