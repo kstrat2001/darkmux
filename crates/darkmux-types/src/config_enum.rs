@@ -556,6 +556,49 @@ pub fn misplaced_endpoint_hardware(reg: &crate::ProfileRegistry) -> Vec<InvalidS
         .collect()
 }
 
+/// (#3448) Every profile model whose `engine_args` cannot be used as written
+/// (`ProfileModel::engine_args_problem`). Refused at every dispatching
+/// preflight and Fail in doctor, naming `profiles.<p>.models[<i>].engine_args`.
+pub fn invalid_engine_args(reg: &crate::ProfileRegistry) -> Vec<InvalidSetting> {
+    let mut out = Vec::new();
+    for (pname, profile) in &reg.profiles {
+        for (i, m) in profile.models.iter().enumerate() {
+            if let Some(why) = m.engine_args_problem() {
+                out.push(InvalidSetting {
+                    set_in: SetIn::Profiles(format!("profiles.{pname}.models[{i}].engine_args")),
+                    problem: why,
+                    valid: "flags of `tensorfold-native serve` other than `--port`, `--host`, `--context`, `--name` \
+                            and `--api-key`, on a model whose endpoint is `\"managed\": \"tensorfold\"`"
+                        .to_string(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// (#3448) Every endpoint darkmux would have to start a server for, which no
+/// dispatch path does yet. Refused at every dispatching preflight, so a
+/// Tensorfold model is never taken for an LM Studio load; `darkmux doctor`
+/// reports it on the endpoint's line instead of failing it. Goes away when
+/// dispatch starts the server.
+pub fn undispatchable_engine_endpoints(reg: &crate::ProfileRegistry) -> Vec<InvalidSetting> {
+    use crate::endpoint::{EndpointKind, ManagedBackend};
+    reg.endpoints
+        .iter()
+        .filter(|(_, ep)| matches!(ep.kind(), Ok(EndpointKind::Managed(ManagedBackend::Tensorfold))))
+        .map(|(id, _)| InvalidSetting {
+            set_in: SetIn::Profiles(format!("endpoints.{id}.managed")),
+            problem: "this darkmux reads a `tensorfold` endpoint but cannot start its server yet, so no dispatch \
+                      can use it (#3448)"
+                .to_string(),
+            valid: "until it can, a server you start yourself as a `url` endpoint: \
+                    `{\"url\": \"http://127.0.0.1:<port>/v1\", \"hardware\": \"submitting-machine\"}`"
+                .to_string(),
+        })
+        .collect()
+}
+
 /// (#2902 step 5) The valid shape of an endpoint's `limits`, for a refusal.
 pub const LIMITS_SHAPE: &str = "`limits`: {\"window\": {\"period\": \"<n>m|<n>h|<n>d\", \"tokens\": <integer>, \
      \"calls\": <integer>}, \"policy\": \"off\"|\"warn\"|\"wait\", \"warn_at\": <a fraction between 0 and 1>, \

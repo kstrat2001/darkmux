@@ -35,7 +35,10 @@ pub mod profiles;
 /// `hardware` (`config_enum::bad_endpoint_hardware`, #3397), every `hardware`
 /// darkmux already knows the answer to (`config_enum::misplaced_endpoint_hardware`),
 /// every unmanaged endpoint whose host it cannot read unambiguously
-/// (`config_enum::invalid_endpoint_hosts`), and every key its schema does not
+/// (`config_enum::invalid_endpoint_hosts`), every profile model's `engine_args`
+/// that cannot be used as written (`config_enum::invalid_engine_args`, #3448),
+/// every Tensorfold endpoint while no dispatch can start its server
+/// (`config_enum::undispatchable_engine_endpoints`), and every key its schema does not
 /// know (`darkmux_types::user_files`), and `default_engine`, whose values
 /// are endpoint ids (`darkmux_types::default_engine`). `profiles.json` is a file
 /// `darkmux-types` cannot locate on its own, so this crate (the registry's
@@ -69,6 +72,8 @@ pub fn preflight_with(
                 refusal.invalid.extend(config_enum::invalid_endpoint_limits(&loaded.registry));
                 refusal.invalid.extend(config_enum::invalid_endpoint_hosts(&loaded.registry));
                 refusal.invalid.extend(config_enum::misplaced_endpoint_hardware(&loaded.registry));
+                refusal.invalid.extend(config_enum::invalid_engine_args(&loaded.registry));
+                refusal.invalid.extend(config_enum::undispatchable_engine_endpoints(&loaded.registry));
                 refusal.invalid.extend(darkmux_types::default_engine::invalid(&loaded.registry));
                 refusal.files.extend(profiles::user_file_problem(&loaded.path));
             }

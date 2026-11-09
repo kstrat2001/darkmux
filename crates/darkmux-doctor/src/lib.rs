@@ -23,6 +23,7 @@ mod checks_container;
 mod checks_power;
 // (#2093) The flow-record hook sink's rows — see the module doc.
 mod checks_hooks;
+mod checks_engines;
 use checks_hooks::check_hooks;
 mod fleet_submission;
 pub use fleet_submission::{
@@ -141,6 +142,8 @@ pub fn run() -> DoctorReport {
         // (#2707) Read-only: counts what darkmux left in the temp root.
         check_temp_residue(),
         check_lms_binary(),
+        // (#3448) Only asks the binary when an endpoint declares Tensorfold.
+        checks_engines::check_tensorfold_engine(),
         check_docker_runtime(),
         check_models_loaded(),
         check_profile_loaded_match(),
@@ -4179,6 +4182,7 @@ fn endpoints_status(
     let mut invalid = limits.clone();
     invalid.extend(darkmux_types::config_enum::invalid_endpoint_hosts(registry));
     invalid.extend(darkmux_types::config_enum::misplaced_endpoint_hardware(registry));
+    invalid.extend(darkmux_types::config_enum::invalid_engine_args(registry));
     if !bad.is_empty() || !invalid.is_empty() {
         let mut problems: Vec<String> = bad.iter().map(|b| format!("{}; {}", b.summary(), b.valid_line())).collect();
         problems.extend(invalid.iter().map(|v| format!("{}: {}", v.set_in, v.problem)));
@@ -4200,15 +4204,7 @@ fn endpoints_status(
     }
     let mut lines: Vec<String> = Vec::new();
     for (id, ep) in &registry.endpoints {
-        let kind = match ep.kind() {
-            Ok(darkmux_types::EndpointKind::Managed(darkmux_types::ManagedBackend::Lmstudio)) => {
-                "managed (lmstudio)".to_string()
-            }
-            Ok(darkmux_types::EndpointKind::Unmanaged) => {
-                format!("unmanaged, {}{}", ep.host().unwrap_or_else(|| "no host".to_string()), hardware_note(ep))
-            }
-            Err(e) => format!("unusable: {e}"),
-        };
+        let kind = endpoint_kind_label(ep);
         let dialect = ep.resolved_dialect().map(|d| d.as_str()).unwrap_or("?");
         let credential = match ep.auth.as_ref().map(|a| a.credential_source()) {
             None | Some(darkmux_types::CredentialSource::NoHeader) => "no auth header".to_string(),
@@ -4230,6 +4226,26 @@ fn endpoints_status(
     };
     let c = uncached_claude_check(&name, &listed, registry, file).unwrap_or(Check { name, status: Status::Pass, message: listed, hint: None });
     with_undeclared_hardware(c, registry, file)
+}
+
+/// (#3448) The endpoints row's description of what darkmux does at `ep`.
+fn endpoint_kind_label(ep: &darkmux_types::ModelEndpoint) -> String {
+    match ep.kind() {
+        Ok(darkmux_types::EndpointKind::Managed(darkmux_types::ManagedBackend::Lmstudio)) => {
+            "managed (lmstudio)".to_string()
+        }
+        // (#3448) Read and checked, but no dispatch starts its server yet;
+        // every dispatching preflight refuses it
+        // (`config_enum::undispatchable_engine_endpoints`).
+        Ok(darkmux_types::EndpointKind::Managed(darkmux_types::ManagedBackend::Tensorfold)) => format!(
+            "managed (tensorfold, port {}; darkmux does not start its server yet, so dispatch refuses it, #3448)",
+            ep.port.unwrap_or_default()
+        ),
+        Ok(darkmux_types::EndpointKind::Unmanaged) => {
+            format!("unmanaged, {}{}", ep.host().unwrap_or_else(|| "no host".to_string()), hardware_note(ep))
+        }
+        Err(e) => format!("unusable: {e}"),
+    }
 }
 
 /// (#3397) Which machine serves an unmanaged endpoint, for its line.
@@ -12615,8 +12631,11 @@ mod tests {
         //
         // (#3423) 71: `check_daemon_docker` joined beside the daemon
         // freshness row.
+        //
+        // (#3448) 72: `checks_engines::check_tensorfold_engine` joined beside
+        // the lms binary row.
         let expected =
-            71 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            72 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

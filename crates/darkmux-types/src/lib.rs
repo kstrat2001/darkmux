@@ -350,11 +350,36 @@ pub struct ProfileModel {
     #[serde(default, skip_serializing_if = "Option::is_none", with = "endpoint::endpoint_field")]
     #[schemars(with = "Option<endpoint::EndpointFieldSchema>")]
     pub endpoint: Option<ModelEndpoint>,
+    /// (#3448) Extra flags for the server darkmux starts for this model
+    /// (`tensorfold-native serve`), e.g. `["--drafter", "<repo>"]`. Only on a
+    /// model whose endpoint is `"managed": "tensorfold"`; never a flag darkmux
+    /// sets itself ([`ProfileModel::engine_args_problem`]). `darkmux doctor`
+    /// checks each flag against the installed engine.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub engine_args: Vec<String>,
     /// Forward-compat overflow — unknown keys land here and
     /// re-serialize flat (a newer config read by an older binary).
     #[serde(flatten)]
     #[schemars(skip)]
     pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+/// (#3448) Why one `engine_args` entry is not the operator's to pass, or
+/// `None`: an empty argument, a flag darkmux sets itself, or a secret.
+fn reserved_engine_arg(arg: &str) -> Option<String> {
+    if arg.trim().is_empty() {
+        return Some("`engine_args` holds an empty argument; remove it".to_string());
+    }
+    let flag = arg.split('=').next().unwrap_or(arg);
+    let why = match flag {
+        "--port" => "darkmux sets it from the endpoint's `port`",
+        "--host" => "darkmux sets it: the server is bound to loopback",
+        "--context" => "darkmux sets it from the model's `n_ctx`",
+        "--name" => "darkmux sets it to the model's `darkmux:` name (contract 4)",
+        "--api-key" => "a secret does not belong in profiles.json",
+        _ => return None,
+    };
+    Some(format!("`engine_args` names `{flag}`, which is not yours to pass: {why}. Remove it"))
 }
 
 impl ProfileModel {
@@ -383,6 +408,35 @@ impl ProfileModel {
     /// cannot place is never loaded on a guess.
     pub fn is_managed(&self) -> bool {
         self.endpoint_kind().is_ok_and(EndpointKind::is_managed)
+    }
+
+    /// (#3448) Why this model's `engine_args` cannot be used as written, or
+    /// `None`. They are flags for a server darkmux starts, so they need a
+    /// Tensorfold endpoint; darkmux sets `--port`, `--host`, `--context` and
+    /// `--name` itself, and a secret (`--api-key`) does not belong in
+    /// `profiles.json`. Never echoes a flag's value (it may be a secret).
+    pub fn engine_args_problem(&self) -> Option<String> {
+        if self.engine_args.is_empty() {
+            return None;
+        }
+        match self.endpoint_kind() {
+            Ok(EndpointKind::Managed(ManagedBackend::Tensorfold)) => {}
+            Ok(EndpointKind::Managed(other)) => {
+                return Some(format!(
+                    "`engine_args` are flags for a server darkmux starts, which needs an endpoint with \
+                     `\"managed\": \"tensorfold\"`; this model is loaded into `{}`, which takes none. Remove them",
+                    crate::config_enum::ConfigEnum::token(other)
+                ));
+            }
+            Ok(EndpointKind::Unmanaged) => {
+                return Some("`engine_args` are flags for a server darkmux starts, which needs an endpoint with \
+                     `\"managed\": \"tensorfold\"`; this model's endpoint is one darkmux only sends requests to. \
+                     Remove them"
+                    .to_string());
+            }
+            Err(_) => return None, // the endpoint's own refusal names it
+        }
+        self.engine_args.iter().find_map(|arg| reserved_engine_arg(arg))
     }
 
     /// (#2902 step 4) THE n_ctx rule: a managed model must declare the window
@@ -760,7 +814,12 @@ impl Profile {
 // endpoint whose host the built-in provider registry does not list. Minor
 // bump: every 2.1 registry reads unchanged. A 2.1 binary given the key keeps
 // it in `ModelEndpoint.extras` and refuses it at preflight (contract 7).
-pub const PROFILES_SCHEMA_VERSION: &str = "2.2";
+// 2.3 (#3448): additive `"managed": "tensorfold"` (a new `ManagedBackend`
+// value), `port` on an endpoint (required on a Tensorfold endpoint, refused
+// elsewhere) and `engine_args` on a profile model (flags for the server
+// darkmux starts). Minor bump: every 2.2 registry reads unchanged. A 2.2
+// binary given any of them refuses it at preflight (contracts 7 and 9).
+pub const PROFILES_SCHEMA_VERSION: &str = "2.3";
 
 /// Scopes a review probe seat's draws to a subset of fact families, and
 /// optionally caps how many bundles it considers. Carried on
@@ -933,16 +992,21 @@ impl ProfileRegistry {
     /// assumed away), and so does a registry declaring no model and no
     /// binding at all (no evidence either way).
     pub fn needs_lmstudio(&self) -> bool {
+        // (#3448) What LM Studio does not serve: an endpoint darkmux only
+        // sends to, and a Tensorfold server darkmux starts itself.
+        let elsewhere = |kind: Result<EndpointKind, EndpointError>| {
+            matches!(kind, Ok(EndpointKind::Unmanaged | EndpointKind::Managed(ManagedBackend::Tensorfold)))
+        };
         let mut declared = false;
         for m in self.profiles.values().flat_map(|p| p.models.iter()) {
             declared = true;
-            if !matches!(m.endpoint_kind(), Ok(EndpointKind::Unmanaged)) {
+            if !elsewhere(m.endpoint_kind()) {
                 return true;
             }
         }
         if self.utility_model_id().is_some() {
             declared = true;
-            if !self.utility_is_unmanaged() {
+            if !self.utility_endpoint().is_some_and(|ep| elsewhere(ep.kind())) {
                 return true;
             }
         }
@@ -1357,7 +1421,7 @@ mod tests {
 
     #[test]
     fn profile_model_round_trips() {
-        let m = ProfileModel { max_output_tokens: None,
+        let m = ProfileModel { max_output_tokens: None, engine_args: Vec::new(),
             endpoint: None,
             id: "x".to_string(),
             n_ctx: Some(32_000),
@@ -1374,7 +1438,7 @@ mod tests {
 
     #[test]
     fn profile_model_omits_none_identifier() {
-        let m = ProfileModel { max_output_tokens: None,
+        let m = ProfileModel { max_output_tokens: None, engine_args: Vec::new(),
             endpoint: None,
             id: "x".to_string(),
             n_ctx: Some(1024),
@@ -1656,6 +1720,16 @@ mod tests {
         assert!(reg(r#"{"p":{"models":[{"id":"m","n_ctx":8}]}}"#, r#"{"id":"u","n_ctx":8,"endpoint":"mlx"}"#).needs_lmstudio());
         assert!(!reg(unmanaged_models, r#"{"id":""}"#).needs_lmstudio(), "no binding, every model unmanaged");
         assert!(materialized(r#"{"profiles":{}}"#).needs_lmstudio(), "an empty registry is no evidence");
+        // (#3448) A model or binding on a Tensorfold endpoint is served by a
+        // server darkmux starts, never by LM Studio.
+        let tf = r#""endpoints":{"tf":{"managed":"tensorfold","port":8091}}"#;
+        let tf_reg = |utility: &str| {
+            materialized(&format!(
+                r#"{{"profiles":{{"p":{{"models":[{{"id":"m","n_ctx":8,"endpoint":"tf"}}]}}}},{tf},"internal":{{"utility":{utility}}}}}"#
+            ))
+        };
+        assert!(!tf_reg(r#"{"id":"u","n_ctx":8,"endpoint":"tf"}"#).needs_lmstudio(), "Tensorfold models and binding need no LM Studio");
+        assert!(tf_reg(r#"{"id":"u","n_ctx":8}"#).needs_lmstudio(), "an endpoint-less binding still loads into LM Studio");
     }
 
     #[test]

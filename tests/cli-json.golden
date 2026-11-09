@@ -659,7 +659,7 @@ MachineTotals
   projected_total_bytes: uint64 | null
   state: LedgerState
   shrink_hint?: string | null
-ManagedBackend = "lmstudio"
+ManagedBackend = "lmstudio" | "tensorfold"
 MetricStats
   peak_pct: uint64 | null
   mean_pct: double | null
@@ -741,6 +741,7 @@ ModelEndpoint
   dialect?: Lenient2 | null
   limits?: Lenient3 | null
   hardware?: Lenient5 | null
+  port?: uint16 | null
 ModelJson
   id: string
   unmanaged: boolean
@@ -824,6 +825,7 @@ ProfileModel
   identifier?: string | null
   capabilities: CapabilityProfile
   endpoint?: EndpointField | null
+  engine_args?: string[]
 ProfileRegistry
   profiles: { [key: string]: Profile }
   schema_version?: string | null

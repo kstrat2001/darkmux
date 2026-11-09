@@ -3341,6 +3341,39 @@
         assert_eq!(local.unwrap(), None, "a managed target runs in the container");
     }
 
+    /// (#3448) A model on a Tensorfold endpoint never takes the managed
+    /// (LM Studio) route: until darkmux starts its server, the route refuses
+    /// it by name even for a caller that skipped preflight, so the model is
+    /// never loaded into LM Studio by mistake.
+    #[test]
+    #[serial]
+    fn a_tensorfold_target_is_refused_before_any_route_is_taken() {
+        let home = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+        let tmp = TempDir::new().unwrap();
+        let pf = tmp.path().join("profiles.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{"tf":{"models":[{"id":"TensorFold/Qwen3.8-27B-MLX-4bit","n_ctx":32768,"endpoint":"tf"}]}},
+                "endpoints":{"tf":{"managed":"tensorfold","port":8091}},
+                "default_profile":"tf"}"#,
+        )
+        .unwrap();
+        let mut o = dispatch_preflight_probe_opts();
+        o.role_id = "pr-reviewer".to_string();
+        o.config_path = Some(pf.to_str().unwrap().to_string());
+        let routed = one_call_context(&o);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        let err = format!("{:#}", routed.expect_err("a Tensorfold target is refused, not routed"));
+        assert!(err.contains("tensorfold") && err.contains("#3448") && err.contains("Qwen3.8-27B"), "{err}");
+    }
+
     // ─── #1645 fix-pass MUST FIX 1 (fuller fix): dispatch_unmanaged itself ──
 
     /// (#1645 fix-pass review) `build_unmanaged_record_threads_mission_id_
@@ -8253,7 +8286,7 @@
             extras: Default::default(),
             description: None,
             default_model: None,
-            models: vec![ProfileModel { max_output_tokens: None,
+            models: vec![ProfileModel { max_output_tokens: None, engine_args: Vec::new(),
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary".into(),
@@ -8295,7 +8328,7 @@
             extras: Default::default(),
             description: None,
             default_model: None,
-            models: vec![ProfileModel { max_output_tokens: None,
+            models: vec![ProfileModel { max_output_tokens: None, engine_args: Vec::new(),
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
@@ -8335,7 +8368,7 @@
             extras: Default::default(),
             description: None,
             default_model: None,
-            models: vec![ProfileModel { max_output_tokens: None,
+            models: vec![ProfileModel { max_output_tokens: None, engine_args: Vec::new(),
                 endpoint: Some(ModelEndpoint {
                     url: Some("https://example.azure.com/openai".into()),
                     ..Default::default()
@@ -8424,7 +8457,7 @@
             extras: Default::default(),
             description: None,
             default_model: None,
-            models: vec![ProfileModel { max_output_tokens: None,
+            models: vec![ProfileModel { max_output_tokens: None, engine_args: Vec::new(),
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
@@ -8460,7 +8493,7 @@
             extras: Default::default(),
             description: None,
             default_model: None,
-            models: vec![ProfileModel { max_output_tokens: None,
+            models: vec![ProfileModel { max_output_tokens: None, engine_args: Vec::new(),
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
@@ -8510,7 +8543,7 @@
             extras: Default::default(),
             description: None,
             default_model: None,
-            models: vec![ProfileModel { max_output_tokens: None,
+            models: vec![ProfileModel { max_output_tokens: None, engine_args: Vec::new(),
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
@@ -8564,7 +8597,7 @@
             extras: Default::default(),
             description: None,
             default_model: None,
-            models: vec![ProfileModel { max_output_tokens: None,
+            models: vec![ProfileModel { max_output_tokens: None, engine_args: Vec::new(),
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
@@ -8606,7 +8639,7 @@
             extras: Default::default(),
             description: None,
             default_model: None,
-            models: vec![ProfileModel { max_output_tokens: None,
+            models: vec![ProfileModel { max_output_tokens: None, engine_args: Vec::new(),
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
@@ -8662,7 +8695,7 @@
             extras: Default::default(),
             description: None,
             default_model: None,
-            models: vec![ProfileModel { max_output_tokens: None,
+            models: vec![ProfileModel { max_output_tokens: None, engine_args: Vec::new(),
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
@@ -8699,7 +8732,7 @@
             extras: Default::default(),
             description: None,
             default_model: None,
-            models: vec![ProfileModel { max_output_tokens: None,
+            models: vec![ProfileModel { max_output_tokens: None, engine_args: Vec::new(),
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
@@ -15283,7 +15316,7 @@
             extras: Default::default(),
             description: None,
             default_model: None,
-            models: vec![ProfileModel { max_output_tokens: None,
+            models: vec![ProfileModel { max_output_tokens: None, engine_args: Vec::new(),
                 endpoint: None,
                 extras: Default::default(),
                 id: bare_key.into(),
@@ -15678,7 +15711,7 @@ fn dispatch_wire_model_id_namespaces_a_plain_profile_model() {
         extras: Default::default(),
         description: None,
         default_model: None,
-        models: vec![ProfileModel { max_output_tokens: None,
+        models: vec![ProfileModel { max_output_tokens: None, engine_args: Vec::new(),
             endpoint: None,
             extras: Default::default(),
             id: "qwen3-4b-instruct-2507".into(),
@@ -15706,7 +15739,7 @@ fn dispatch_wire_model_id_passes_through_an_explicit_identifier() {
         extras: Default::default(),
         description: None,
         default_model: None,
-        models: vec![ProfileModel { max_output_tokens: None,
+        models: vec![ProfileModel { max_output_tokens: None, engine_args: Vec::new(),
             endpoint: None,
             extras: Default::default(),
             id: "qwen3-4b-instruct-2507".into(),
