@@ -786,7 +786,8 @@ pub async fn bind_listener(port: u16) -> std::io::Result<tokio::net::TcpListener
     tokio::net::TcpListener::bind(bind_addr(port)).await
 }
 
-/// Serve until Ctrl-C (blocking; builds its own runtime).
+/// Serve until Ctrl-C, SIGTERM or SIGHUP (blocking; builds its own
+/// runtime). Each runs the same cleanup on the way out.
 pub fn run(port: u16) -> Result<()> {
     preflight()?;
     let state = ClientServerState::production()?;
@@ -837,7 +838,8 @@ pub fn run(port: u16) -> Result<()> {
             router(state).into_make_service_with_connect_info::<SocketAddr>(),
         )
         .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
+            let signal = shutdown_signal().await;
+            eprintln!("darkmux client serve: stopping ({signal})");
         })
         .await
         .context("serving");
@@ -852,6 +854,36 @@ pub fn run(port: u16) -> Result<()> {
         }
         served
     })
+}
+
+/// The first of SIGINT (Ctrl-C), SIGTERM (launchd stopping the job, a
+/// plain `kill`) and SIGHUP (its terminal closed), by name. Caught through
+/// `tokio::signal` like the viewer daemon's own shutdown, so each reaches
+/// the cleanup after the server stops instead of ending the process where
+/// it stands.
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let wait = |kind: SignalKind| async move {
+            match signal(kind) {
+                Ok(mut s) => {
+                    s.recv().await;
+                }
+                Err(_) => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => "SIGINT",
+            _ = wait(SignalKind::terminate()) => "SIGTERM",
+            _ = wait(SignalKind::hangup()) => "SIGHUP",
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "Ctrl-C"
+    }
 }
 
 /// The listener's router, built from the client route table
@@ -2889,8 +2921,9 @@ fn git_quiet(wc: &WorkCopy, args: &[&str]) -> Result<(), String> {
 /// Commits exactly `paths` to the work copy's branch. Anything else in the
 /// work copy, staged or not, stays out. The paths are a run's file names,
 /// passed to git literally (`--literal-pathspecs`): a file named `[ab].txt`
-/// is that file, never a glob that also takes the owner's `b.txt`. Returns
-/// (full id, branch).
+/// is that file, never a glob that also takes the owner's `b.txt`. A
+/// submodule among them ([`submodule_paths`]) is left out. Returns (full id,
+/// branch).
 pub(crate) fn commit_run(
     wd: &WorkCopy,
     paths: &[String],
@@ -2900,14 +2933,53 @@ pub(crate) fn commit_run(
     if branch.is_empty() {
         return Err("the work copy isn't on a branch, so the run wasn't committed".to_string());
     }
+    let submodules = submodule_paths(wd, paths)?;
+    let inside = |p: &str| submodules.iter().any(|s| p == s || p.strip_prefix(s.as_str()).is_some_and(|r| r.starts_with('/')));
+    let paths: Vec<&str> = paths.iter().map(String::as_str).filter(|p| !inside(p)).collect();
+    if paths.is_empty() {
+        return Err(format!(
+            "the run changed only submodules ({}), which darkmux does not commit",
+            submodules.join(", ")
+        ));
+    }
     let mut add = vec!["--literal-pathspecs", "add", "-A", "--"];
-    add.extend(paths.iter().map(String::as_str));
+    add.extend(paths.iter().copied());
     git_quiet(wd, &add)?;
     let mut commit = vec!["--literal-pathspecs", "commit", "--quiet", "-m", message, "--"];
-    commit.extend(paths.iter().map(String::as_str));
+    commit.extend(paths.iter().copied());
     git_quiet(wd, &commit)?;
     let sha = git_line(wd, &["rev-parse", "HEAD"]).ok_or("reading the new commit failed")?;
     Ok((sha, branch))
+}
+
+/// The submodules among a run's changed `paths`: each one the index records
+/// as a gitlink, and each folder that holds a `.git` and is one of the paths
+/// or contains one. `git add` on a populated submodule whose commit matches
+/// the index spawns git INSIDE it to see whether its files changed; that git
+/// reads the repository the run left there, filters and fsmonitor included,
+/// and takes no `--ignore-submodules`. So a submodule is never handed to
+/// `add`.
+fn submodule_paths(wd: &WorkCopy, paths: &[String]) -> Result<Vec<String>, String> {
+    let mut ls = vec!["--literal-pathspecs", "ls-files", "-s", "-z", "--"];
+    ls.extend(paths.iter().map(String::as_str));
+    let out = crate::client_git::run_or_why(wd, None, &ls)?;
+    let mut found: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .split('\0')
+        .filter_map(|e| e.strip_prefix("160000 ")?.split_once('\t').map(|(_, p)| p.to_string()))
+        .collect();
+    for p in paths {
+        let mut prefix = PathBuf::new();
+        for part in Path::new(p).components() {
+            prefix.push(part);
+            if std::fs::symlink_metadata(wd.work_tree.join(&prefix).join(".git")).is_ok() {
+                found.push(prefix.to_string_lossy().into_owned());
+                break;
+            }
+        }
+    }
+    found.sort();
+    found.dedup();
+    Ok(found)
 }
 
 /// This client's finished run with a commit, for Undo (and old clients'

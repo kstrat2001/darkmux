@@ -29,9 +29,12 @@
 //! **Limits, stated.** A filter driver defined in the user's GLOBAL config
 //! (git-lfs, typically) stays live by design: a run can assign it to files
 //! through attributes, and the user's own program then runs on them, never a
-//! run-written one. `git add` takes no `--ignore-submodules`, so a call that
-//! adds through this helper would still let a planted submodule's commands
-//! run; no production call does (route one through `status`/`diff` first).
+//! run-written one. `git add` takes no `--ignore-submodules`: adding a
+//! populated submodule whose commit matches the index spawns git inside it,
+//! where a planted repository's commands run. So a caller that adds keeps
+//! every submodule out of the paths it names (a paired app's commit drops
+//! them), or adds into a fresh, empty index, which holds no gitlink to check
+//! (the paired app's snapshot).
 //! A config `include` pointing at a FIFO inside a mounted `.git` hangs git
 //! (a hang, not code execution, and true of any git), so a caller that runs
 //! trusted git in such a checkout should bound the call.
@@ -113,10 +116,15 @@ const DIFF_FAMILY: [&str; 7] = ["diff", "diff-index", "diff-files", "diff-tree",
 /// `GIT_INDEX_FILE`. The rest name config or a program for git to run
 /// (`GIT_CONFIG_PARAMETERS` is how an outer `git -c` reaches a child); none
 /// is needed by a call this helper makes, which never fetches or pushes.
-/// `GIT_CONFIG_GLOBAL` is deliberately kept: it is where the operator keeps
-/// their own global config, so clearing it would make darkmux read a
-/// different one than the operator's own git does.
-pub const CLEARED_ENV: [&str; 13] = [
+/// `GIT_CONFIG` makes `git config` read that one file in place of the
+/// repository's config, which would hide the repository's filter drivers
+/// from the read that passes them empty, while every other command still
+/// runs them. `GIT_CONFIG_GLOBAL` is deliberately kept: it is where the
+/// operator keeps their own global config, so clearing it would make darkmux
+/// read a different one than the operator's own git does.
+/// `GIT_CONFIG_SYSTEM` needs no clearing: `GIT_CONFIG_NOSYSTEM` wins over it.
+/// A stray `GIT_CONFIG_KEY_<n>` is inert once `GIT_CONFIG_COUNT` is gone.
+pub const CLEARED_ENV: [&str; 14] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_INDEX_FILE",
@@ -125,6 +133,7 @@ pub const CLEARED_ENV: [&str; 13] = [
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_CONFIG_PARAMETERS",
     "GIT_CONFIG_COUNT",
+    "GIT_CONFIG",
     "GIT_EXTERNAL_DIFF",
     "GIT_SSH_COMMAND",
     "GIT_SSH",

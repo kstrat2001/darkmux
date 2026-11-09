@@ -26,7 +26,7 @@ const EXPECTED_CONFIG: [&str; 7] = [
     "credential.helper=",
     "diff.ignoreSubmodules=dirty",
 ];
-const EXPECTED_CLEARED: [&str; 13] = [
+const EXPECTED_CLEARED: [&str; 14] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_INDEX_FILE",
@@ -35,6 +35,7 @@ const EXPECTED_CLEARED: [&str; 13] = [
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_CONFIG_PARAMETERS",
     "GIT_CONFIG_COUNT",
+    "GIT_CONFIG",
     "GIT_EXTERNAL_DIFF",
     "GIT_SSH_COMMAND",
     "GIT_SSH",
@@ -278,4 +279,29 @@ fn a_submodule_the_run_planted_runs_nothing_under_run_written_mode() {
     host.stdout(&["log", "-p", "-1"]).expect("log runs");
     assert!(!fs_marker.exists(), "the planted submodule's fsmonitor ran on the host");
     assert!(!clean_marker.exists(), "the planted submodule's clean filter ran on the host");
+}
+
+/// An inherited `GIT_CONFIG` makes `git config` read that one file instead
+/// of the repository's config, so the driver read would find no filter and
+/// pass none empty, while the commands that follow (which ignore
+/// `GIT_CONFIG`) still run the repository's filter.
+#[test]
+#[serial_test::serial]
+fn an_inherited_git_config_does_not_hide_a_repo_filter() {
+    let f = PlantedWorktree::new();
+    f.plant(TreeChange::Content);
+    let empty = f.root.join("empty-config");
+    std::fs::write(&empty, "").unwrap();
+    let prev = std::env::var_os("GIT_CONFIG");
+    // SAFETY: #[serial]; restored below.
+    unsafe { std::env::set_var("GIT_CONFIG", &empty) };
+    let status = HostGit::trusted(&f.wt).stdout(&["status", "--porcelain"]);
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("GIT_CONFIG", v),
+            None => std::env::remove_var("GIT_CONFIG"),
+        }
+    }
+    assert!(status.is_some_and(|s| s.contains("a.txt")), "status runs");
+    assert!(!f.clean_ran(), "the repository's clean filter ran: GIT_CONFIG hid it from the driver read");
 }

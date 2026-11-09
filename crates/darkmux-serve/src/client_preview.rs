@@ -104,10 +104,10 @@
 //! runs first, in the container. (#3484) After it succeeds darkmux records a
 //! fingerprint of its inputs beside the workspace (`.<name>.install` in the
 //! worktrees base, like the `.source` record, where no run can write): the
-//! runtime image id, the install command, and each lockfile present
-//! (`package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml`,
-//! `yarn.lock`), else `package.json`, each read without following a link (a
-//! symlinked lockfile counts as its link text). The install is skipped only
+//! runtime image id, the install command, `package.json` and each lockfile
+//! present (`package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml`,
+//! `yarn.lock`, `bun.lock`, `bun.lockb`), each read without following a link
+//! (a symlinked lockfile counts as its link text). The install is skipped only
 //! when its `unless_exists` path exists AND the record matches, so a
 //! dependency a run adds, a new image, or a broken earlier install is
 //! installed again; a failed install records nothing. A start with
@@ -116,7 +116,7 @@
 //! never followed; nothing outside the work copy, never your checkout), then
 //! starts it with a fresh install. `env_from_source` copies untracked files (like `.env`) from
 //! that same checkout into the workspace, never overwriting and never
-//! through a symlink.
+//! through a symlink at either end.
 
 use crate::client_wire::PreviewState;
 use darkmux_types::data_version::PREVIEW_RECIPE_SCHEMA_VERSION;
@@ -280,7 +280,7 @@ fn check_recipe_paths(recipe: &Recipe) -> Result<(), RecipeRefusal> {
     for (key, p) in named {
         if !plain_relative(p) {
             return Err(RecipeRefusal::Invalid(format!(
-                "{key}: {p:?} must be a plain relative path"
+                "{key}: {p:?} must be a plain relative path (no `..`, and no trailing `/` or `.`)"
             )));
         }
     }
@@ -589,14 +589,15 @@ pub struct Previews {
     ports: Arc<dyn Fn() -> Result<u16, String> + Send + Sync>,
 }
 
-/// A relative path inside the work copy: no absolute paths, no `..`.
+/// A relative path inside the work copy, spelled plainly: no absolute
+/// path, and every `/`-separated part a real name (no `..`, no `.`, no
+/// empty part, so no trailing `/`). A trailing `/` or `/.` would make the
+/// filesystem follow a symlink at the last name, which a delete or a copy
+/// must never do.
 pub fn plain_relative(p: &str) -> bool {
-    let path = Path::new(p);
     !p.is_empty()
-        && !path.is_absolute()
-        && path
-            .components()
-            .all(|c| matches!(c, std::path::Component::Normal(_)))
+        && !Path::new(p).is_absolute()
+        && p.split('/').all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
 /// A free TCP port on 127.0.0.1, by asking the OS.
@@ -692,6 +693,9 @@ pub const BEAT_EVERY: Duration = Duration::from_secs(30);
 pub const HEARTBEAT_MISSED_LOOKS: u32 = 12;
 /// How often the container looks at its heartbeat, in seconds.
 const HEARTBEAT_CHECK_SECS: &str = "10";
+/// How long a stale container's script gets after TERM before KILL, in
+/// seconds: a dev server that ignores TERM still ends.
+const STALE_KILL_GRACE_SECS: &str = "5";
 
 /// What the container's watchdog reads, and when it gives up.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -702,6 +706,8 @@ struct Watch {
     missed: u32,
     /// `sleep`'s argument between looks.
     every: String,
+    /// `sleep`'s argument between the TERM and the KILL.
+    grace: String,
 }
 
 impl Watch {
@@ -710,6 +716,7 @@ impl Watch {
             file: format!("{HEARTBEAT_AT}/{HEARTBEAT_FILE}"),
             missed: HEARTBEAT_MISSED_LOOKS,
             every: HEARTBEAT_CHECK_SECS.to_string(),
+            grace: STALE_KILL_GRACE_SECS.to_string(),
         }
     }
 }
@@ -822,7 +829,10 @@ fn container_script(recipe: &Recipe, install_due: bool, watch: &Watch) -> String
 /// beating: every `watch.every` it reads the heartbeat's mtime (GNU `stat`,
 /// else BSD's; a missing file reads as `gone`), counts the looks in a row
 /// that found it unchanged, and once that reaches `watch.missed` it says so
-/// and ends the script (`$$`, the script's own pid). Workspace code runs in
+/// and ends the script (`$$`, the script's own pid): TERM, then KILL after
+/// `watch.grace`, so the script ends even when `$$` does not on TERM (a
+/// shell that ran the dev server in its own place, one started with TERM
+/// ignored). Workspace code runs in
 /// the same container and can kill this loop; then the preview is left to
 /// the reaper at the next `client serve` start, as before the heartbeat.
 fn watchdog(watch: &Watch) -> String {
@@ -830,11 +840,13 @@ fn watchdog(watch: &Watch) -> String {
         "( last=''; same=0; while kill -0 $$ 2>/dev/null && sleep {every}; do \
          seen=$(stat -c %Y '{file}' 2>/dev/null || stat -f %m '{file}' 2>/dev/null || echo gone); \
          if [ \"$seen\" = \"$last\" ]; then same=$((same + 1)); else same=0; last=$seen; fi; \
-         if [ $same -ge {missed} ]; then echo '{STALE_LINE}'; kill -TERM $$; exit 0; fi; \
+         if [ $same -ge {missed} ]; then echo '{STALE_LINE}'; kill -TERM $$; \
+         sleep {grace}; kill -KILL $$ 2>/dev/null; exit 0; fi; \
          done ) &\n",
         every = watch.every,
         file = watch.file,
         missed = watch.missed,
+        grace = watch.grace,
     )
 }
 
@@ -1336,35 +1348,32 @@ fn prepare(recipe: &Recipe, at: &RunIn) -> Result<(), Halt> {
     Ok(())
 }
 
-/// (#3484) The lockfiles whose contents an install's inputs are, in the
-/// workspace's root; with none, `package.json` stands in.
-const LOCKFILES: [&str; 4] = [
+/// (#3484) The lockfiles whose contents are an install's inputs, in the
+/// workspace's root, beside `package.json`, which always counts (a run can
+/// add a dependency there before any lockfile changes).
+const LOCKFILES: [&str; 6] = [
     "package-lock.json",
     "npm-shrinkwrap.json",
     "pnpm-lock.yaml",
     "yarn.lock",
+    "bun.lock",
+    "bun.lockb",
 ];
 /// The most of one input file the fingerprint reads.
 const MAX_INPUT_BYTES: u64 = 256 * 1024 * 1024;
 
 /// (#3484) The fingerprint of an install: the runtime image id, the install
-/// command and its inputs (each lockfile present, else `package.json`). The
+/// command and its inputs (`package.json` and each lockfile present). The
 /// workspace is run-written, so an input is read without following a link:
 /// a symlink is hashed as its link text, never as what it points at.
 pub(crate) fn install_fingerprint(workdir: &Path, command: &str, image: &str) -> String {
     let mut hash = blake3::Hasher::new();
     hash_field(&mut hash, "image", image.as_bytes());
     hash_field(&mut hash, "command", command.as_bytes());
-    let present: Vec<&str> = LOCKFILES
+    let present = LOCKFILES
         .into_iter()
-        .filter(|f| std::fs::symlink_metadata(workdir.join(f)).is_ok())
-        .collect();
-    let inputs = if present.is_empty() {
-        vec!["package.json"]
-    } else {
-        present
-    };
-    for file in inputs {
+        .filter(|f| std::fs::symlink_metadata(workdir.join(f)).is_ok());
+    for file in std::iter::once("package.json").chain(present) {
         hash_field(&mut hash, file, &input_bytes(&workdir.join(file)));
     }
     hash.finalize().to_hex().to_string()
@@ -1460,7 +1469,7 @@ fn remove_inside(workdir: &Path, rel: &str) -> Result<(), String> {
             "{rel:?} is not a plain relative path; refusing to delete it"
         ));
     }
-    check_unlinked_inside(workdir, rel)?;
+    check_unlinked_inside(workdir, rel, "install.unless_exists", "delete")?;
     let path = workdir.join(rel);
     let removed = match std::fs::symlink_metadata(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -1473,34 +1482,73 @@ fn remove_inside(workdir: &Path, rel: &str) -> Result<(), String> {
 }
 
 /// Untracked files the dev server needs, from the user's own checkout (the
-/// one the recipe came from); never overwritten.
+/// one the recipe came from); never overwritten. The checkout is the user's,
+/// but a run that once had it mounted could have left a link there (a
+/// `.env` pointing at a key), so a source reached through any symlink is
+/// refused, and the file is opened without following one.
 fn copy_env_from_source(recipe: &Recipe, workdir: &Path, checkout: &Path) -> Result<(), String> {
     for f in &recipe.env_from_source {
         let (from, to) = (checkout.join(f), workdir.join(f));
-        if from.is_file() && std::fs::symlink_metadata(&to).is_err() {
-            check_unlinked_inside(workdir, f)?;
-            if let Err(e) = std::fs::copy(&from, &to) {
-                return Err(format!("copying {f} from {}: {e}", checkout.display()));
-            }
+        if std::fs::symlink_metadata(&to).is_ok() {
+            continue;
+        }
+        if let Some(link) = first_link(checkout, f, true) {
+            return Err(format!(
+                "env_from_source: {} in your checkout is a symlink; refusing to copy {f} through it \
+                 (copy the file it points at into place instead)",
+                link.display()
+            ));
+        }
+        if std::fs::symlink_metadata(&from).is_ok_and(|m| m.is_file()) {
+            check_unlinked_inside(workdir, f, "env_from_source", "copy")?;
+            copy_unlinked(&from, &to).map_err(|e| format!("copying {f} from {}: {e}", checkout.display()))?;
         }
     }
     Ok(())
 }
 
-/// Copying to `rel` inside `workdir` writes inside it: no component of the
-/// path (a folder a run may have replaced with a link) is a symlink, and the
-/// parent, resolved, is still inside the work copy.
-fn check_unlinked_inside(workdir: &Path, rel: &str) -> Result<(), String> {
-    let mut at = workdir.to_path_buf();
+/// Copies the regular file `from` to a new file `to`, with its permission
+/// bits: never through a symlink at either end (`from` opened with
+/// `O_NOFOLLOW`, `to` created exclusively).
+fn copy_unlinked(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut read = std::fs::OpenOptions::new();
+    read.read(true);
+    let mut write = std::fs::OpenOptions::new();
+    write.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        read.custom_flags(libc::O_NOFOLLOW);
+        write.mode(std::fs::symlink_metadata(from)?.permissions().mode() & 0o777);
+    }
+    std::io::copy(&mut read.open(from)?, &mut write.open(to)?).map(|_| ())
+}
+
+/// The first component of `rel` under `root` that is a symlink: every
+/// folder on the way, and the last name too when `with_last`.
+fn first_link(root: &Path, rel: &str, with_last: bool) -> Option<PathBuf> {
     let parts: Vec<_> = Path::new(rel).components().collect();
-    for part in &parts[..parts.len().saturating_sub(1)] {
+    let upto = if with_last { parts.len() } else { parts.len().saturating_sub(1) };
+    let mut at = root.to_path_buf();
+    for part in &parts[..upto] {
         at.push(part);
         if std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) {
-            return Err(format!(
-                "env_from_source: {} in the workspace is a symlink; refusing to copy {rel} through it",
-                at.display()
-            ));
+            return Some(at);
         }
+    }
+    None
+}
+
+/// Writing (`verb`: copying or deleting) `rel` inside `workdir`, named by the
+/// recipe's `key`, stays inside it: no folder on the way (one a run may have
+/// replaced with a link) is a symlink, and the parent, resolved, is still
+/// inside the work copy.
+fn check_unlinked_inside(workdir: &Path, rel: &str, key: &str, verb: &str) -> Result<(), String> {
+    if let Some(at) = first_link(workdir, rel, false) {
+        return Err(format!(
+            "{key}: {} in the workspace is a symlink; refusing to {verb} {rel} through it",
+            at.display()
+        ));
     }
     let parent = workdir
         .join(rel)
@@ -1516,9 +1564,7 @@ fn check_unlinked_inside(workdir: &Path, rel: &str) -> Result<(), String> {
     if inside {
         Ok(())
     } else {
-        Err(format!(
-            "env_from_source: {rel} would land outside the workspace; refusing"
-        ))
+        Err(format!("{key}: {rel} is outside the workspace; refusing to {verb} it"))
     }
 }
 
@@ -1961,7 +2007,7 @@ mod tests {
         for good in [".env", "node_modules", "config/.env.local"] {
             assert!(plain_relative(good), "{good}");
         }
-        for bad in ["", "/etc/passwd", "../.env", "a/../../b", "./x"] {
+        for bad in ["", "/etc/passwd", "../.env", "a/../../b", "./x", "node_modules/", "node_modules/.", "a//b", "a/./b", "."] {
             assert!(!plain_relative(bad), "{bad:?}");
         }
     }
@@ -2175,6 +2221,7 @@ mod tests {
             file: file.display().to_string(),
             missed,
             every: "0.1".to_string(),
+            grace: "0.5".to_string(),
         }
     }
 
@@ -2244,6 +2291,45 @@ mod tests {
         );
         let said = std::fs::read_to_string(out.path()).unwrap();
         assert!(said.contains(STALE_LINE), "{said}");
+    }
+
+    /// A stale container's script ends even when it ignores TERM: the
+    /// watchdog follows the TERM with KILL. Driven directly: `sh` started
+    /// with TERM ignored, which a shell cannot undo.
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_preview_that_ignores_term_is_killed() {
+        use std::os::unix::process::CommandExt;
+        let beat = tempfile::NamedTempFile::new().unwrap();
+        beat_at(beat.path(), 0);
+        let recipe = a_recipe(serde_json::json!({"schema_version": "1.0", "command": "sleep 30"}));
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(container_script(&recipe, false, &a_watch(beat.path(), 3)))
+            .stdout(out.reopen().unwrap())
+            .process_group(0);
+        // SAFETY: only async-signal-safe `signal` between fork and exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                Ok(())
+            })
+        };
+        let mut sh = cmd.spawn().unwrap();
+        let group = sh.id() as i32;
+        let mut ended = None;
+        for _ in 0..60 {
+            ended = sh.try_wait().unwrap();
+            if ended.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        unsafe { libc::kill(-group, libc::SIGKILL) };
+        let said = std::fs::read_to_string(out.path()).unwrap();
+        assert!(said.contains(STALE_LINE), "the watchdog saw it stale: {said}");
+        assert!(ended.is_some(), "a script that ignores TERM is still ended");
     }
 
     /// (#3456 review F2) `beat` touches every live preview's heartbeat, the
@@ -2600,6 +2686,101 @@ mod tests {
         std::fs::remove_file(wt.join("yarn.lock")).unwrap();
         std::fs::write(wt.join("yarn.lock"), "secret two, changed").unwrap();
         assert_ne!(fp(&wt), linked, "a link is not the file it points at");
+    }
+
+    /// The fingerprint reads `package.json` beside the lockfiles (a run can
+    /// add a dependency there before any lockfile changes), and Bun's
+    /// lockfiles count as lockfiles.
+    #[test]
+    fn the_fingerprint_reads_package_json_beside_a_lockfile_and_bun_lockfiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().join("w");
+        std::fs::create_dir_all(&wt).unwrap();
+        let fp = |wt: &Path| install_fingerprint(wt, "npm ci", "img");
+        std::fs::write(wt.join("package.json"), "{}").unwrap();
+        std::fs::write(wt.join("package-lock.json"), "{}").unwrap();
+        let locked = fp(&wt);
+        std::fs::write(wt.join("package.json"), "{\"dependencies\": {\"left-pad\": \"1\"}}").unwrap();
+        assert_ne!(fp(&wt), locked, "a changed package.json counts beside a lockfile");
+        for bun in ["bun.lock", "bun.lockb"] {
+            std::fs::write(wt.join(bun), "one").unwrap();
+            let before = fp(&wt);
+            std::fs::write(wt.join(bun), "two").unwrap();
+            assert_ne!(fp(&wt), before, "{bun} counts");
+        }
+    }
+
+    /// A clean restart whose `unless_exists` ends in `/` or `.` never
+    /// deletes through a symlink the run planted there: the recipe is
+    /// refused, and what the link points at outside the workspace is left.
+    #[cfg(unix)]
+    #[test]
+    fn clean_never_deletes_through_a_planted_link_named_with_a_trailing_slash() {
+        for unless in ["node_modules/", "node_modules/."] {
+            let dir = tempfile::tempdir().unwrap();
+            let (wt, mine, outside) = (dir.path().join("w"), dir.path().join("mine"), dir.path().join("outside"));
+            for d in [&wt, &mine.join(".darkmux"), &outside] {
+                std::fs::create_dir_all(d).unwrap();
+            }
+            std::fs::write(outside.join("precious.txt"), "mine").unwrap();
+            std::os::unix::fs::symlink(&outside, wt.join("node_modules")).unwrap();
+            let recipe = serde_json::json!({
+                "schema_version": "1.0", "command": "x", "install": {"command": "i", "unless_exists": unless}
+            });
+            std::fs::write(mine.join(".darkmux/preview.json"), recipe.to_string()).unwrap();
+            let (previews, _emu) = emulated(dir.path());
+            let out = previews.clean("w", &wt, &RecipeSource::Checkout(mine));
+            assert!(outside.join("precious.txt").exists(), "{unless}: deleted outside the workspace through the link");
+            assert!(out.is_err(), "{unless}: the recipe is refused");
+        }
+    }
+
+    /// Deleting a path inside the workspace refuses one under a folder the
+    /// run replaced with a link, and says it is a delete.
+    #[cfg(unix)]
+    #[test]
+    fn remove_inside_refuses_a_path_under_a_symlinked_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wt, outside) = (dir.path().join("w"), dir.path().join("outside"));
+        std::fs::create_dir_all(outside.join("deps")).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(outside.join("deps/precious.txt"), "mine").unwrap();
+        std::os::unix::fs::symlink(&outside, wt.join("web")).unwrap();
+        let err = remove_inside(&wt, "web/deps").unwrap_err();
+        assert!(outside.join("deps/precious.txt").exists(), "deleted through the symlinked folder");
+        assert!(err.contains("delete") && !err.contains("copy"), "{err}");
+    }
+
+    /// `env_from_source` never copies through a link in the user's own
+    /// checkout (one a run could have planted while it had the checkout
+    /// mounted): a `.env` that links to a key, or a folder that links out,
+    /// is refused, and nothing lands in the workspace.
+    #[cfg(unix)]
+    #[test]
+    fn env_from_source_never_reads_through_a_link_in_the_checkout() {
+        for (file, link_at) in [(".env", ".env"), ("config/.env", "config")] {
+            let dir = tempfile::tempdir().unwrap();
+            let (wt, checkout, secrets) = (dir.path().join("w"), dir.path().join("mine"), dir.path().join("secrets"));
+            for d in [&wt, &checkout.join(".darkmux"), &secrets] {
+                std::fs::create_dir_all(d).unwrap();
+            }
+            std::fs::write(secrets.join(".env"), "PRIVATE KEY\n").unwrap();
+            let target = match link_at {
+                ".env" => secrets.join(".env"),
+                _ => secrets.clone(),
+            };
+            std::os::unix::fs::symlink(&target, checkout.join(link_at)).unwrap();
+            let recipe = serde_json::json!({
+                "schema_version": "1.0", "command": "touch server-ran; exit 3", "env_from_source": [file]
+            });
+            std::fs::write(checkout.join(".darkmux/preview.json"), recipe.to_string()).unwrap();
+            let (previews, _emu) = emulated(dir.path());
+            previews.start("w", &wt, &RecipeSource::Checkout(checkout.clone())).unwrap();
+            let v = until_failed(&previews, "w");
+            assert!(!wt.join(file).exists(), "{file}: copied through the checkout's link");
+            assert_eq!(v["status"], "failed", "{file}: {v}");
+            assert!(v["error"].as_str().unwrap().contains("symlink"), "{file}: {v}");
+        }
     }
 
     /// A workspace whose own recipe runs `command`.

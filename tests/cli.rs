@@ -15635,3 +15635,43 @@ fn profile_list_machine_names_an_unknown_peer() {
     assert_eq!(stdout, "");
     assert!(stderr.contains("no machine named `no-such-peer` in the roster"), "{stderr}");
 }
+
+/// `client serve` (launchd stops it with SIGTERM; a closed terminal sends
+/// SIGHUP) shuts down the way Ctrl-C does: it says which signal, runs its
+/// cleanup (every preview container stopped) and exits 0, rather than dying
+/// where it stood. Isolated HOME, its own
+/// port, a `docker` that refuses every call.
+#[test]
+fn client_serve_shuts_down_cleanly_on_sigterm_sighup_and_sigint() {
+    for (signal, name) in [(libc::SIGTERM, "SIGTERM"), (libc::SIGHUP, "SIGHUP"), (libc::SIGINT, "SIGINT")] {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let mut cmd = darkmux_std_cmd();
+        cmd.args(["client", "serve", "--port", &port.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(log.reopen().unwrap());
+        let mut child = DirectChildGuard(cmd.spawn().expect("spawning darkmux client serve"));
+        let said = || std::fs::read_to_string(log.path()).unwrap_or_default();
+        let deadline = std::time::Instant::now() + FLEET_TEST_HANG_BOUND;
+        while !said().contains("listening on") {
+            assert!(child.try_wait().unwrap().is_none(), "{name}: client serve exited early: {}", said());
+            assert!(std::time::Instant::now() < deadline, "{name}: client serve never listened: {}", said());
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // SAFETY: signalling the child this test spawned.
+        unsafe { libc::kill(child.id() as i32, signal) };
+        let deadline = std::time::Instant::now() + FLEET_TEST_HANG_BOUND;
+        let status = loop {
+            if let Some(s) = child.try_wait().unwrap() {
+                break s;
+            }
+            assert!(std::time::Instant::now() < deadline, "{name}: client serve did not exit: {}", said());
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert_eq!(status.code(), Some(0), "{name}: {status:?}, not a clean exit: {}", said());
+        assert!(said().contains(&format!("stopping ({name})")), "{name}: {}", said());
+    }
+}
