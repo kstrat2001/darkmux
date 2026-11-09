@@ -778,11 +778,13 @@ Each engine is asked once per listing, within a time bound, and the listing load
 
 **That a dispatch is starting its model.** A dispatch that has to make its model resident says so between `dispatch.start` and its first turn, with three flow records, the same for every managed engine (an LM Studio load of a large model takes long enough to need them too):
 
+<!-- flow-action-guard:allow-start — planned #3448 actions, not in the vocabulary until PR 4 adds them -->
 - `dispatch.model.start`: the model, the engine, the endpoint, and the darkmux residents it evicts to make room.
 - `dispatch.model.loading`: every 10 seconds while the model loads or the server starts, with the time elapsed and the engine's own progress when it reports one. A start of minutes (a 62 GB Tensorfold model) is visibly alive, never a stall.
 - `dispatch.model.ready`: the model answers; how long it took.
 
 A dispatch that finds its model resident writes none of them. `darkmux run list --json` (and `GET /runs`) shows a running dispatch between `dispatch.model.start` and `dispatch.model.ready` with `activity: "starting_model"`, derived by the one function that owns a run's status, so a run card says "starting the model" without reading the record stream itself.
+<!-- flow-action-guard:allow-end -->
 
 **Why a dispatch failed, readable by code.** The `dispatch --json` envelope's refusal and `dispatch.error` carry one `code` an app can branch on, beside the message for a person: `busy` (retry later), `wont_fit` (retrying cannot help), `model_start_failed` (the server would not start or exited; the record names its log file), `port_in_use` (a server darkmux did not start holds the port) and `engine_unavailable` (no binary, or an unverified version). **darkmux never switches to another model on its own:** a failed start fails the dispatch, and offering the next model is the app's decision, made on these codes and the `availability` list.
 
