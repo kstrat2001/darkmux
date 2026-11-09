@@ -81,7 +81,14 @@ use std::process::{Command, Output};
 ///   takes no `--ignore-submodules` flag. It is only a default: a
 ///   `.gitmodules` the run wrote can set a submodule's own `ignore = none`
 ///   over it, which is why [`IGNORE_SUBMODULES`] goes on the command line too.
-pub const HARDENING_CONFIG: [&str; 7] = [
+/// - `diff.submodule=short` / `status.submoduleSummary=false`: a changed
+///   submodule shows as its two commit ids. The `diff` and `log` forms (an
+///   operator's global `diff.submodule = diff`, say) and the status summary
+///   run git INSIDE the submodule, in whatever repository the run left
+///   there, and that child gets none of these settings.
+/// - `submodule.recurse=false`: no subcommand that recurses (checkout,
+///   reset, revert's merge) descends into one either.
+pub const HARDENING_CONFIG: [&str; 10] = [
     "core.fsmonitor=false",
     "core.hooksPath=/dev/null",
     "commit.gpgsign=false",
@@ -89,6 +96,9 @@ pub const HARDENING_CONFIG: [&str; 7] = [
     "core.sshCommand=ssh",
     "credential.helper=",
     "diff.ignoreSubmodules=dirty",
+    "diff.submodule=short",
+    "status.submoduleSummary=false",
+    "submodule.recurse=false",
 ];
 
 /// Added after a subcommand that renders a diff: no `diff.<driver>.textconv`

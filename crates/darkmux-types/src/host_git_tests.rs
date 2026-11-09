@@ -17,7 +17,7 @@ fn env_of(cmd: &Command, key: &str) -> Option<Option<String>> {
 
 /// The settings, spelled out rather than read from `HARDENING_CONFIG`, so
 /// dropping one from the constant fails here.
-const EXPECTED_CONFIG: [&str; 7] = [
+const EXPECTED_CONFIG: [&str; 10] = [
     "core.fsmonitor=false",
     "core.hooksPath=/dev/null",
     "commit.gpgsign=false",
@@ -25,6 +25,9 @@ const EXPECTED_CONFIG: [&str; 7] = [
     "core.sshCommand=ssh",
     "credential.helper=",
     "diff.ignoreSubmodules=dirty",
+    "diff.submodule=short",
+    "status.submoduleSummary=false",
+    "submodule.recurse=false",
 ];
 const EXPECTED_CLEARED: [&str; 14] = [
     "GIT_DIR",

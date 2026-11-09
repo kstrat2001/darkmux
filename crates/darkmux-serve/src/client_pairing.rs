@@ -833,16 +833,7 @@ pub fn run(port: u16) -> Result<()> {
             PREVIEW_IDLE_CHECK_INTERVAL,
             idle_stop.clone(),
         );
-        let served = axum::serve(
-            listener,
-            router(state).into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(async {
-            let signal = shutdown_signal().await;
-            eprintln!("darkmux client serve: stopping ({signal})");
-        })
-        .await
-        .context("serving");
+        let served = serve_until_stopped(listener, router(state)).await;
         idle_stop.store(true, std::sync::atomic::Ordering::SeqCst);
         // (#3456) Shutting down removes every preview container.
         let previews = shutdown_previews.clone();
@@ -854,6 +845,53 @@ pub fn run(port: u16) -> Result<()> {
         }
         served
     })
+}
+
+/// How long a stopping `client serve` waits for open connections to finish
+/// before it closes them and cleans up: well inside launchd's own wait
+/// (20 s) before it sends SIGKILL, so the previews are always stopped.
+const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Serves until a signal, then stops accepting and lets open connections
+/// finish for at most [`SHUTDOWN_DRAIN`]: a connection holding half a
+/// request (one a container can open) is closed rather than waited on. A
+/// second signal while draining closes them at once.
+async fn serve_until_stopped(listener: tokio::net::TcpListener, app: Router) -> Result<()> {
+    let stop = Arc::new(tokio::sync::Notify::new());
+    let graceful = stop.clone();
+    let server = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+        .with_graceful_shutdown(async move { graceful.notified().await });
+    let mut serving = tokio::spawn(std::future::IntoFuture::into_future(server));
+    let ended = tokio::select! {
+        ended = &mut serving => Some(ended),
+        signal = shutdown_signal() => {
+            eprintln!("darkmux client serve: stopping ({signal})");
+            None
+        }
+    };
+    let ended = match ended {
+        Some(ended) => ended,
+        None => {
+            stop.notify_one();
+            tokio::select! {
+                ended = &mut serving => ended,
+                _ = tokio::time::sleep(SHUTDOWN_DRAIN) => {
+                    eprintln!(
+                        "darkmux client serve: connections still open after {}s; closing them",
+                        SHUTDOWN_DRAIN.as_secs()
+                    );
+                    serving.abort();
+                    Ok(Ok(()))
+                }
+                signal = shutdown_signal() => {
+                    eprintln!("darkmux client serve: {signal} again; closing open connections now");
+                    serving.abort();
+                    Ok(Ok(()))
+                }
+            }
+        }
+    };
+    ended.context("the server task")?.context("serving")
 }
 
 /// The first of SIGINT (Ctrl-C), SIGTERM (launchd stopping the job, a

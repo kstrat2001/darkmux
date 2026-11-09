@@ -119,6 +119,11 @@
 //! through a symlink at either end.
 
 use crate::client_wire::PreviewState;
+
+/// Delete and create inside a run-written folder without crossing a link.
+#[cfg(unix)]
+#[path = "client_preview_at.rs"]
+mod at;
 use darkmux_types::data_version::PREVIEW_RECIPE_SCHEMA_VERSION;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1462,7 +1467,9 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 
 /// (#3484) Deletes `rel` inside `workdir`: only once it resolves inside the
 /// work copy ([`check_unlinked_inside`]: no symlinked folder on the way),
-/// and a symlink at `rel` is unlinked, never followed. Absent is done.
+/// and a symlink at `rel` is unlinked, never followed. Absent is done. The
+/// delete itself walks from the workspace's descriptor ([`at::remove`]), so
+/// a run that swaps a folder for a link after the check is refused too.
 fn remove_inside(workdir: &Path, rel: &str) -> Result<(), String> {
     if !plain_relative(rel) {
         return Err(format!(
@@ -1470,13 +1477,21 @@ fn remove_inside(workdir: &Path, rel: &str) -> Result<(), String> {
         ));
     }
     check_unlinked_inside(workdir, rel, "install.unless_exists", "delete")?;
-    let path = workdir.join(rel);
-    let removed = match std::fs::symlink_metadata(&path) {
+    #[cfg(unix)]
+    return at::remove(workdir, rel).map_err(|e| format!("deleting {rel} in {}: {e}", workdir.display()));
+    #[cfg(not(unix))]
+    remove_by_path(&workdir.join(rel))
+}
+
+/// [`remove_inside`]'s delete where no descriptor walk exists.
+#[cfg(not(unix))]
+fn remove_by_path(path: &Path) -> Result<(), String> {
+    let removed = match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => Err(e),
-        Ok(m) if m.is_dir() => std::fs::remove_dir_all(&path),
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(path),
         // A file, or a symlink (removed as the link itself).
-        Ok(_) => std::fs::remove_file(&path),
+        Ok(_) => std::fs::remove_file(path),
     };
     removed.map_err(|e| format!("deleting {}: {e}", path.display()))
 }
@@ -1485,7 +1500,8 @@ fn remove_inside(workdir: &Path, rel: &str) -> Result<(), String> {
 /// one the recipe came from); never overwritten. The checkout is the user's,
 /// but a run that once had it mounted could have left a link there (a
 /// `.env` pointing at a key), so a source reached through any symlink is
-/// refused, and the file is opened without following one.
+/// refused, and the copy reads and writes by descriptor walks that cross no
+/// link ([`copy_unlinked`]).
 fn copy_env_from_source(recipe: &Recipe, workdir: &Path, checkout: &Path) -> Result<(), String> {
     for f in &recipe.env_from_source {
         let (from, to) = (checkout.join(f), workdir.join(f));
@@ -1501,27 +1517,29 @@ fn copy_env_from_source(recipe: &Recipe, workdir: &Path, checkout: &Path) -> Res
         }
         if std::fs::symlink_metadata(&from).is_ok_and(|m| m.is_file()) {
             check_unlinked_inside(workdir, f, "env_from_source", "copy")?;
-            copy_unlinked(&from, &to).map_err(|e| format!("copying {f} from {}: {e}", checkout.display()))?;
+            copy_unlinked(checkout, workdir, f).map_err(|e| format!("copying {f} from {}: {e}", checkout.display()))?;
         }
     }
     Ok(())
 }
 
-/// Copies the regular file `from` to a new file `to`, with its permission
-/// bits: never through a symlink at either end (`from` opened with
-/// `O_NOFOLLOW`, `to` created exclusively).
-fn copy_unlinked(from: &Path, to: &Path) -> std::io::Result<()> {
-    let mut read = std::fs::OpenOptions::new();
-    read.read(true);
+/// Copies the regular file `rel` in `checkout` to a new file `rel` in
+/// `workdir`, with its permission bits: each end reached from its folder's
+/// descriptor, crossing no symlink, so a folder swapped for a link after the
+/// checks is refused; the new file is created exclusively.
+#[cfg(unix)]
+fn copy_unlinked(checkout: &Path, workdir: &Path, rel: &str) -> std::io::Result<()> {
+    let (mut from, mode) = at::open_regular(checkout, rel)?;
+    let mut to = at::create_new(workdir, rel, mode)?;
+    std::io::copy(&mut from, &mut to).map(|_| ())
+}
+
+/// [`copy_unlinked`] where no descriptor walk exists.
+#[cfg(not(unix))]
+fn copy_unlinked(checkout: &Path, workdir: &Path, rel: &str) -> std::io::Result<()> {
     let mut write = std::fs::OpenOptions::new();
     write.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        read.custom_flags(libc::O_NOFOLLOW);
-        write.mode(std::fs::symlink_metadata(from)?.permissions().mode() & 0o777);
-    }
-    std::io::copy(&mut read.open(from)?, &mut write.open(to)?).map(|_| ())
+    std::io::copy(&mut std::fs::File::open(checkout.join(rel))?, &mut write.open(workdir.join(rel))?).map(|_| ())
 }
 
 /// The first component of `rel` under `root` that is a symlink: every
@@ -2749,6 +2767,87 @@ mod tests {
         let err = remove_inside(&wt, "web/deps").unwrap_err();
         assert!(outside.join("deps/precious.txt").exists(), "deleted through the symlinked folder");
         assert!(err.contains("delete") && !err.contains("copy"), "{err}");
+    }
+
+    /// A workspace whose `web` a writer keeps swapping (atomically, by
+    /// rename) between a real folder and a link to `outside`, the way a
+    /// run's container can while darkmux works in it. Calls `act` until the
+    /// deadline or until `escaped` says something reached `outside`;
+    /// returns how many calls escaped.
+    #[cfg(unix)]
+    fn race_a_swapped_folder(
+        act: impl Fn(&Path),
+        escaped: impl Fn(&Path) -> bool,
+        prepare_outside: impl Fn(&Path),
+    ) -> usize {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let (wt, outside) = (dir.path().join("w"), dir.path().join("outside"));
+        std::fs::create_dir_all(wt.join("web")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, wt.join("web.link")).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let swapper = {
+            let (stop, wt) = (stop.clone(), wt.clone());
+            std::thread::spawn(move || {
+                let (web, real, link) = (wt.join("web"), wt.join("web.real"), wt.join("web.link"));
+                while !stop.load(Ordering::SeqCst) {
+                    let _ = std::fs::rename(&web, &real);
+                    let _ = std::fs::rename(&link, &web);
+                    let _ = std::fs::rename(&web, &link);
+                    let _ = std::fs::rename(&real, &web);
+                }
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut escapes = 0;
+        while Instant::now() < deadline {
+            prepare_outside(&outside);
+            act(&wt);
+            if escaped(&outside) {
+                escapes += 1;
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        swapper.join().unwrap();
+        escapes
+    }
+
+    /// A clean restart's delete never lands outside the workspace while a
+    /// writer swaps a folder on its path (two seconds of races; before the
+    /// descriptor walk, thousands escaped in that time).
+    #[cfg(unix)]
+    #[test]
+    fn stress_remove_inside_never_deletes_through_a_folder_swapped_mid_delete() {
+        let escapes = race_a_swapped_folder(
+            |wt| {
+                let _ = remove_inside(wt, "web/node_modules");
+            },
+            |outside| !outside.join("node_modules").exists(),
+            |outside| std::fs::create_dir_all(outside.join("node_modules")).unwrap(),
+        );
+        assert_eq!(escapes, 0, "deleted outside the workspace {escapes} times");
+    }
+
+    /// `env_from_source` never creates the user's file outside the workspace
+    /// while a writer swaps a folder on its path (two seconds of races).
+    #[cfg(unix)]
+    #[test]
+    fn stress_env_copy_never_writes_through_a_folder_swapped_mid_copy() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(src.path().join("web")).unwrap();
+        std::fs::write(src.path().join("web/.env"), "SECRET=1\n").unwrap();
+        let recipe = a_recipe(serde_json::json!({"schema_version": "1.0", "command": "x", "env_from_source": ["web/.env"]}));
+        let escapes = race_a_swapped_folder(
+            |wt| {
+                let _ = copy_env_from_source(&recipe, wt, src.path());
+                let _ = std::fs::remove_file(wt.join("web/.env"));
+                let _ = std::fs::remove_file(wt.join("web.real/.env"));
+            },
+            |outside| std::fs::remove_file(outside.join(".env")).is_ok(),
+            |_| {},
+        );
+        assert_eq!(escapes, 0, "wrote outside the workspace {escapes} times");
     }
 
     /// `env_from_source` never copies through a link in the user's own

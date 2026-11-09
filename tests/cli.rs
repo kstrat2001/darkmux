@@ -15675,3 +15675,73 @@ fn client_serve_shuts_down_cleanly_on_sigterm_sighup_and_sigint() {
         assert!(said().contains(&format!("stopping ({name})")), "{name}: {}", said());
     }
 }
+
+/// Spawns `client serve` on an isolated HOME and its own port; returns the
+/// child, its port and its stderr log once it listens.
+fn a_listening_client_serve() -> (DirectChildGuard, u16, tempfile::NamedTempFile) {
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let mut cmd = darkmux_std_cmd();
+    cmd.args(["client", "serve", "--port", &port.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(log.reopen().unwrap());
+    let mut child = DirectChildGuard(cmd.spawn().expect("spawning darkmux client serve"));
+    let deadline = std::time::Instant::now() + FLEET_TEST_HANG_BOUND;
+    while !std::fs::read_to_string(log.path()).unwrap_or_default().contains("listening on") {
+        assert!(child.try_wait().unwrap().is_none(), "client serve exited early");
+        assert!(std::time::Instant::now() < deadline, "client serve never listened");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    (child, port, log)
+}
+
+/// How long `child` took to exit after now, or `None` past `bound`.
+fn exits_within(child: &mut DirectChildGuard, bound: std::time::Duration) -> Option<(std::time::Duration, std::process::ExitStatus)> {
+    let started = std::time::Instant::now();
+    while started.elapsed() < bound {
+        if let Some(s) = child.try_wait().unwrap() {
+            return Some((started.elapsed(), s));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    None
+}
+
+/// A connection holding half a request (one a container can open through
+/// `host.docker.internal`) does not hold `client serve`'s shutdown open: the
+/// drain is bounded, cleanup runs, and it exits 0 well inside launchd's
+/// own wait. A second signal stops it at once.
+#[test]
+fn client_serve_shutdown_is_bounded_by_a_half_open_request_and_a_second_signal_is_now() {
+    use std::io::Write;
+    let half_open = |port: u16| {
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.write_all(format!("GET /client/status HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n").as_bytes()).unwrap();
+        s
+    };
+    let (mut child, port, log) = a_listening_client_serve();
+    let _held = half_open(port);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    // SAFETY: signalling the child this test spawned.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let said = || std::fs::read_to_string(log.path()).unwrap_or_default();
+    let (took, status) = exits_within(&mut child, std::time::Duration::from_secs(20))
+        .unwrap_or_else(|| panic!("client serve did not exit within 20s of SIGTERM with a half-open request: {}", said()));
+    assert_eq!(status.code(), Some(0), "{status:?}: {}", said());
+    assert!(took < std::time::Duration::from_secs(12), "took {took:?}: {}", said());
+
+    let (mut child, port, log) = a_listening_client_serve();
+    let _held = half_open(port);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let said = || std::fs::read_to_string(log.path()).unwrap_or_default();
+    let (took, status) = exits_within(&mut child, std::time::Duration::from_secs(20))
+        .unwrap_or_else(|| panic!("client serve did not exit after a second SIGTERM: {}", said()));
+    assert_eq!(status.code(), Some(0), "{status:?}: {}", said());
+    assert!(took < std::time::Duration::from_secs(3), "a second signal took {took:?}: {}", said());
+}
