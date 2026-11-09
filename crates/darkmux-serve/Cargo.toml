@@ -36,7 +36,7 @@ futures = "0.3"
 # admitted with (never the token itself). Already in the tree via
 # darkmux-flow's audit sink.
 blake3 = "1.5"
-tower-http = { version = "0.5", features = ["cors", "timeout"] }
+tower-http = { version = "0.5", features = ["cors", "timeout", "catch-panic"] }
 serde = { version = "1.0", features = ["derive"] }
 # The CLI `--json` golden derives its field schemas from these types too, so the
 # ones a verb shares with the daemon (`Run`, `MissionGraph`) carry the derive.

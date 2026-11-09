@@ -5176,6 +5176,64 @@ fn the_failed_run_code_reader_reads_the_dispatch_error() {
     let store = crate::flow_window::FlowRecordStore::new(crate::client_pairing::feeds_work_activity);
     let read = |id: &str| crate::client_pairing::dispatch_error_code_in(&store, dir.path(), "coder", id);
     assert_eq!(read("w-1").as_deref(), Some("wont_fit"));
+    // (#3468 review) A role id escaped on the wire is found too.
+    let escaped = darkmux_types::session_id::SessionId::adhoc(
+        darkmux_types::session_id::RunId::mission("dispatch-code-1-a-0").unwrap(),
+        "code_writer",
+        "w-5",
+    )
+    .wire();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.path().join(format!("{day}.jsonl")))
+        .and_then(|mut f| {
+            use std::io::Write;
+            writeln!(f, "{}", rec(&escaped, "dispatch.error", serde_json::json!({"error": "held", "code": "busy"})))
+        })
+        .unwrap();
+    assert_eq!(
+        crate::client_pairing::dispatch_error_code_in(&store, dir.path(), "code_writer", "w-5").as_deref(),
+        Some("busy")
+    );
     assert_eq!(read("w-3"), None, "a terminal with no code names none");
     assert_eq!(read("w-9"), None, "no record");
+}
+
+/// (#3468 review) A path segment the router cannot read (not UTF-8) is
+/// refused as JSON with a code, like every other refusal, never axum's
+/// plain-text rejection.
+#[tokio::test]
+async fn an_unreadable_path_segment_is_a_coded_json_refusal() {
+    let h = harness();
+    let token = paired(&h).await;
+    for req in [
+        get("/client/work/%FF", &[("authorization", &bearer(&token))]),
+        get("/client/pair/%FF", &[("x-pair-secret", SECRET)]),
+        post("/client/workspaces/%FF/preview", Some(&token), serde_json::json!({})),
+    ] {
+        let (code, v) = call(&h, req).await;
+        assert_eq!((code, v["code"].as_str()), (400, Some("bad_request")), "{v}");
+        assert!(v["error"].is_string(), "{v}");
+    }
+}
+
+/// (#3468 review) A handler that panics outside `spawn_blocking` answers a
+/// coded 500 instead of dropping the connection.
+#[tokio::test]
+async fn a_panicking_handler_is_a_coded_500() {
+    let mut h = harness();
+    let token = paired(&h).await;
+    h.state.profiles_policy = Arc::new(|| panic!("the policy read panicked"));
+    let (code, v) = call(&h, get("/client/whoami", &[("authorization", &bearer(&token))])).await;
+    assert_eq!((code, v["code"].as_str()), (500, Some("internal")), "{v}");
+}
+
+/// (#3468 review) Every client route takes its path parameters through
+/// `ClientPath`, so none answers axum's plain-text rejection.
+#[test]
+fn every_client_route_reads_its_path_through_client_path() {
+    let src = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/client_pairing.rs")).unwrap();
+    let bare: Vec<&str> = src.lines().filter(|l| l.contains(": UrlPath<") || l.contains("): UrlPath<")).collect();
+    assert!(bare.is_empty(), "a handler takes a bare `UrlPath`: {bare:?}");
+    assert!(src.matches(": ClientPath<").count() >= 10, "the routes were found");
 }

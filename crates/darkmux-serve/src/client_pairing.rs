@@ -942,6 +942,39 @@ fn err(status: StatusCode, code: ClientCode, msg: impl Into<String>) -> Response
     (status, Json(ClientError { error: msg.into(), code })).into_response()
 }
 
+/// (#3468) A path parameter, as every client route takes it: one the router
+/// cannot read (a segment that is not UTF-8) is refused as a coded JSON 400
+/// like every other refusal, never axum's plain-text rejection.
+pub(crate) struct ClientPath<T>(pub T);
+
+#[axum::async_trait]
+impl<T, S> axum::extract::FromRequestParts<S> for ClientPath<T>
+where
+    T: serde::de::DeserializeOwned + Send,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut axum::http::request::Parts, state: &S) -> Result<Self, Response> {
+        use axum::response::IntoResponse as _;
+        match UrlPath::<T>::from_request_parts(parts, state).await {
+            Ok(UrlPath(v)) => Ok(ClientPath(v)),
+            Err(e) => {
+                let text = e.body_text();
+                let _ = e.into_response();
+                Err(err(StatusCode::BAD_REQUEST, ClientCode::BadRequest, text))
+            }
+        }
+    }
+}
+
+/// (#3468) What a handler that panicked outside `spawn_blocking` answers:
+/// a coded 500, never a dropped connection.
+pub(crate) fn panic_response(_panic: Box<dyn std::any::Any + Send + 'static>) -> Response {
+    eprintln!("darkmux client serve: a handler panicked");
+    err(StatusCode::INTERNAL_SERVER_ERROR, ClientCode::Internal, "internal error; see the darkmux client serve log")
+}
+
 /// A refusal on its way back to a handler, boxed: a `Response` is large, and
 /// these travel through `Result`s.
 type Refused = Box<Response>;
@@ -1098,7 +1131,7 @@ fn policy_or_503(state: &ClientServerState) -> Result<Option<Vec<String>>, Refus
 
 pub(crate) async fn poll_handler(
     State(state): State<ClientServerState>,
-    UrlPath(request_id): UrlPath<String>,
+    ClientPath(request_id): ClientPath<String>,
     headers: HeaderMap,
 ) -> Response {
     let Some(secret) = headers.get("x-pair-secret").and_then(|v| v.to_str().ok()) else {
@@ -2326,7 +2359,7 @@ fn no_recipe_in(
 /// recipe to run (a cloned workspace, or none in the checkout).
 pub(crate) async fn preview_start_handler(
     State(state): State<ClientServerState>,
-    UrlPath(name): UrlPath<String>,
+    ClientPath(name): ClientPath<String>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(r) = authenticate(&state, &headers) {
@@ -2383,7 +2416,7 @@ fn start_preview(state: &ClientServerState, name: &str) -> Response {
 
 pub(crate) async fn preview_status_handler(
     State(state): State<ClientServerState>,
-    UrlPath(name): UrlPath<String>,
+    ClientPath(name): ClientPath<String>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(r) = authenticate(&state, &headers).and_then(|_| previews_allowed(&state)) {
@@ -2496,7 +2529,7 @@ pub(crate) fn spawn_preview_idle_check(
 
 pub(crate) async fn preview_stop_handler(
     State(state): State<ClientServerState>,
-    UrlPath(name): UrlPath<String>,
+    ClientPath(name): ClientPath<String>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(r) = authenticate(&state, &headers) {
@@ -2526,7 +2559,7 @@ pub const MAX_CHANGES_BYTES: usize = 25 * 1024 * 1024;
 /// content (base64), mode} | {path, deleted: true}]}.
 pub(crate) async fn workspace_changes_handler(
     State(state): State<ClientServerState>,
-    UrlPath(name): UrlPath<String>,
+    ClientPath(name): ClientPath<String>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(r) = authenticate(&state, &headers) {
@@ -2606,7 +2639,7 @@ pub(crate) async fn workspace_changes_handler(
 /// `GET /client/workspaces/{name}`: branch, head and repo of one workspace.
 pub(crate) async fn workspace_status_handler(
     State(state): State<ClientServerState>,
-    UrlPath(name): UrlPath<String>,
+    ClientPath(name): ClientPath<String>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(r) = authenticate(&state, &headers) {
@@ -2623,7 +2656,7 @@ pub(crate) async fn workspace_status_handler(
 
 pub(crate) async fn work_status_handler(
     State(state): State<ClientServerState>,
-    UrlPath(work_id): UrlPath<String>,
+    ClientPath(work_id): ClientPath<String>,
     headers: HeaderMap,
 ) -> Response {
     let client = match authenticate(&state, &headers) {
@@ -2751,7 +2784,7 @@ fn work_status_json(state: &ClientServerState, work_id: &str, w: WorkEntry) -> W
 /// executor's: SIGTERM, then SIGKILL after [`CANCEL_GRACE`].
 pub(crate) async fn cancel_handler(
     State(state): State<ClientServerState>,
-    UrlPath(work_id): UrlPath<String>,
+    ClientPath(work_id): ClientPath<String>,
     headers: HeaderMap,
 ) -> Response {
     let client = match authenticate(&state, &headers) {
@@ -2854,7 +2887,7 @@ fn committed_run(
 /// same files, naming the run that made it. 200 {revert, files}.
 pub(crate) async fn undo_handler(
     State(state): State<ClientServerState>,
-    UrlPath(work_id): UrlPath<String>,
+    ClientPath(work_id): ClientPath<String>,
     headers: HeaderMap,
 ) -> Response {
     let st = state.clone();
@@ -2940,7 +2973,7 @@ pub(crate) async fn undo_handler(
 /// Old clients' Keep: the run is already committed; this reports it.
 pub(crate) async fn keep_handler(
     State(state): State<ClientServerState>,
-    UrlPath(work_id): UrlPath<String>,
+    ClientPath(work_id): ClientPath<String>,
     headers: HeaderMap,
     _body: Body,
 ) -> Response {
@@ -2958,7 +2991,7 @@ pub(crate) async fn keep_handler(
 /// Old clients' Discard: an Undo.
 pub(crate) async fn discard_handler(
     state: State<ClientServerState>,
-    work_id: UrlPath<String>,
+    work_id: ClientPath<String>,
     headers: HeaderMap,
 ) -> Response {
     let reply = undo_handler(state, work_id, headers).await;

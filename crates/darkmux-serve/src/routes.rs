@@ -185,6 +185,8 @@ pub(crate) fn client_router(state: crate::client_pairing::ClientServerState) -> 
         .fallback(cp::no_such_route)
         .method_not_allowed_fallback(cp::method_not_allowed)
         .layer(axum::middleware::from_fn_with_state(state.clone(), cp::only_this_machines_apps))
+        // (#3468) A panic in a handler answers a coded 500 (`ClientError`).
+        .layer(tower_http::catch_panic::CatchPanicLayer::custom(cp::panic_response))
         .with_state(state)
 }
 
