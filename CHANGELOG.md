@@ -183,6 +183,14 @@ darkmux release.
 
 ### Fixed
 
+- **A preview's heartbeat belongs to its run, not its workspace's name (#3485).** A preview's
+  container and heartbeat folder were named by workspace and port, so two runs of one workspace on
+  the same port (a stop or clean restart, then a start that drew the freed port) shared one folder,
+  and the first run's cleanup deleted the folder the second run's container watched; that container
+  then stopped itself as if `client serve` had died. Each run now carries its own id in its
+  container's name and its heartbeat folder, and a run's end removes only its own. A start while the
+  workspace's preview is live already joins it (200), checked and registered under one lock.
+
 - **The runtime image carries Node 22 (#3482).** It moves from Alpine 3.20 (Node 20.15) to Alpine 3.22 (Node 22.23 LTS, npm 11). Client previews run a project's dev server in this image, and current Vite, rolldown and @vitejs/plugin-react need `^20.19 || >=22.12`: on 20.15, `npm ci` skipped their native bindings and the dev server could not start. Dispatches run in the same image, so their tools move with it (git 2.49, Python 3.12).
 - **The bundled SQLite is patched (RUSTSEC-2026-0459).** `rusqlite` 0.31 -> 0.41, which bundles
   `libsqlite3-sys` 0.39 and with it a SQLite past the CVE the advisory names. `rusqlite` 0.41 needs

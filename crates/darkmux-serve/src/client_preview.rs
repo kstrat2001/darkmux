@@ -585,6 +585,8 @@ pub struct Previews {
     containers: Arc<dyn PreviewContainers>,
     entries: Mutex<HashMap<String, Arc<Mutex<Entry>>>>,
     clock: Clock,
+    /// Picks a free port (a test pins one, to make two runs share it).
+    ports: Arc<dyn Fn() -> Result<u16, String> + Send + Sync>,
 }
 
 /// A relative path inside the work copy: no absolute paths, no `..`.
@@ -996,7 +998,18 @@ impl Previews {
             containers,
             entries: Mutex::new(HashMap::new()),
             clock: Arc::new(unix_seconds),
+            ports: Arc::new(free_port),
         }
+    }
+
+    /// The same previews picking ports with `ports` (a test's fixed ones).
+    #[cfg(test)]
+    pub(crate) fn with_ports(
+        mut self,
+        ports: Arc<dyn Fn() -> Result<u16, String> + Send + Sync>,
+    ) -> Self {
+        self.ports = ports;
+        self
     }
 
     /// The same previews on another clock (a test's frozen one).
@@ -1053,8 +1066,8 @@ impl Previews {
         std::fs::create_dir_all(&self.dir)
             .map_err(|e| unreadable(format!("{}: {e}", self.dir.display())))?;
         let (port, hmr_port) = (
-            free_port().map_err(unreadable)?,
-            free_port().map_err(unreadable)?,
+            (self.ports)().map_err(unreadable)?,
+            (self.ports)().map_err(unreadable)?,
         );
         let log = self.dir.join(format!("{name}.log"));
         let _ = std::fs::write(&log, "");
@@ -1073,6 +1086,7 @@ impl Previews {
 
         let at = RunIn {
             name: name.to_string(),
+            run: run_id(),
             workdir: workdir.to_path_buf(),
             checkout: source.checkout().map(Path::to_path_buf),
             log,
@@ -1283,6 +1297,9 @@ fn advance(entry: &Arc<Mutex<Entry>>, status: Status) -> Result<(), Halt> {
 /// and its ports.
 struct RunIn {
     name: String,
+    /// (#3485) This run's own id: its container and heartbeat are keyed by
+    /// it, so two runs of one workspace never share either, even on one port.
+    run: String,
     workdir: PathBuf,
     checkout: Option<PathBuf>,
     log: PathBuf,
@@ -1533,7 +1550,22 @@ fn spec_for(
 /// preview never collides with its predecessor while that one is still
 /// being removed.
 fn container_name(at: &RunIn) -> String {
-    format!("{PREVIEW_CONTAINER_PREFIX}{}-{}", at.name, at.port)
+    format!(
+        "{PREVIEW_CONTAINER_PREFIX}{}-{}-{}",
+        at.name, at.port, at.run
+    )
+}
+
+/// (#3485) A preview run's id: unique in this process (a counter) and
+/// across restarts of it (the clock).
+fn run_id() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    format!("{nanos:x}{n:x}")
 }
 
 /// The preview's heartbeat folder: beside its log, outside the workspace.
@@ -1967,6 +1999,7 @@ mod tests {
     fn a_spec(recipe: &Recipe, user: Option<String>) -> ContainerSpec {
         let at = RunIn {
             name: "site".into(),
+            run: "r1".into(),
             workdir: PathBuf::from("/tmp/ws/site"),
             checkout: Some(PathBuf::from("/tmp/mine")),
             log: PathBuf::from("/tmp/p/site.log"),
@@ -2001,14 +2034,14 @@ mod tests {
                 "--rm",
                 "--init",
                 "--name",
-                "darkmux-preview-site-4100"
+                "darkmux-preview-site-4100-r1"
             ]
         );
         assert_eq!(
             values_of(&args, "-v"),
             [
                 "/tmp/ws/site:/workspace",
-                "/tmp/p/heartbeats/darkmux-preview-site-4100:/darkmux-heartbeat:ro"
+                "/tmp/p/heartbeats/darkmux-preview-site-4100-r1:/darkmux-heartbeat:ro"
             ],
             "the workspace, and the heartbeat folder read-only"
         );
@@ -2436,6 +2469,84 @@ mod tests {
             "the marker path is deleted"
         );
         assert!(wt.join("package-lock.json").exists() && wt.join(".darkmux/preview.json").exists());
+    }
+
+    /// The spec of the emulated container whose name starts `prefix`, the
+    /// newest first.
+    fn wait_container(emu: &HostEmulator, count: usize) -> ContainerSpec {
+        for _ in 0..200 {
+            if let Some(spec) = emu.specs.lock().unwrap().get(count - 1) {
+                return spec.clone();
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("container {count} never created");
+    }
+
+    /// (#3485) Two starts back to back (here from two threads at once) give
+    /// one live preview: the second joins the first and reports it, and only
+    /// one container is created.
+    #[test]
+    fn back_to_back_starts_give_one_live_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = a_workspace(dir.path(), "sleep 30");
+        let (previews, emu) = emulated(dir.path());
+        let previews = Arc::new(previews);
+        let starts: Vec<_> = (0..4)
+            .map(|_| {
+                let (p, wt) = (previews.clone(), wt.clone());
+                std::thread::spawn(move || {
+                    p.start("w", &wt, &RecipeSource::Checkout(wt.clone()))
+                        .unwrap()
+                })
+            })
+            .collect();
+        let replies: Vec<(PreviewState, bool)> =
+            starts.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(
+            replies.iter().filter(|(_, joined)| !joined).count(),
+            1,
+            "one new run"
+        );
+        assert!(
+            replies.iter().all(|(v, _)| v.port == replies[0].0.port),
+            "all report the same run"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(emu.specs.lock().unwrap().len(), 1, "one container");
+        previews.stop("w");
+    }
+
+    /// (#3485) Each preview run has its own heartbeat folder, even when two
+    /// runs of one workspace get the same port (as a stop then a start can):
+    /// run A's end removes only A's folder, and run B keeps beating.
+    #[test]
+    fn a_runs_end_removes_only_its_own_heartbeat() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = a_workspace(dir.path(), "sleep 30");
+        let (previews, emu) = emulated(dir.path());
+        let previews = previews.with_ports(Arc::new(|| Ok(45_454)));
+        let src = RecipeSource::Checkout(wt.clone());
+        previews.start("w", &wt, &src).unwrap();
+        let a = wait_container(&emu, 1);
+        previews.stop("w");
+        previews.start("w", &wt, &src).unwrap();
+        let b = wait_container(&emu, 2);
+        assert_ne!(a.heartbeat, b.heartbeat, "a heartbeat folder per run");
+        assert_ne!(a.name, b.name, "a container name per run");
+        // Run A's thread ends after its container does, and cleans up.
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(!a.heartbeat.exists(), "A's folder is removed");
+        let beat = b.heartbeat.join(HEARTBEAT_FILE);
+        assert!(beat.exists(), "B's folder survives A's end");
+        age(&beat, 600);
+        previews.beat();
+        let modified = std::fs::metadata(&beat).unwrap().modified().unwrap();
+        assert!(
+            modified.elapsed().unwrap() < Duration::from_secs(5),
+            "B keeps beating"
+        );
+        previews.stop("w");
     }
 
     /// (#3484) A failed install records nothing, so the next start retries.
