@@ -1178,6 +1178,7 @@ mod tests {
             ("Kind", "what kind of fact a withheld `config.json` value is (`panel_audience`), never a setting"),
             ("Verdict", "whether a remote console viewer is shown a `config.json` path (`panel_audience`), never a setting"),
             ("RunIdKind", "how a run's identity is formed (`session_id`), never a setting"),
+            ("ServerState", "what an engine server's record says about its process now (`engine_record`, #3448), never a setting"),
             ("SessionKind", "a session's kind within its run (`session_id`), never a setting"),
             ("SessionScope", "what a step kind declares about its sessions (`session_id`), never a setting"),
             ("WireKind", "a session kind's tag in the session id wire grammar (`session_id`), never a setting"),
