@@ -12,18 +12,25 @@
 //! is unloaded or loaded:
 //!
 //! 1. The plan's need is what its loads take, less what its own unloads
-//!    free ([`darkmux_gestalt::plan_room`]). A load larger than the whole
-//!    machine is refused `wont_fit` before free memory is read: evicting or
-//!    waiting can never help. With no figure for the need or for free
-//!    memory, the load goes ahead and LM Studio decides, with a warning.
-//! 2. While the plan does not fit the reclaimable memory, it stops
+//!    free ([`darkmux_gestalt::plan_room`]), two ways (#3514): the
+//!    commitment (what a load takes when it is made: a GGUF model's cache
+//!    is allocated then, an MLX model's grows as the context fills) and the
+//!    potential (the whole context filled). A commitment larger than the
+//!    whole machine is refused `wont_fit` before free memory is read:
+//!    evicting or waiting can never help. With no figure for free memory,
+//!    or none for the need, the load goes ahead and LM Studio decides, with
+//!    a warning; a load whose architecture is unreadable has no commitment
+//!    and is never refused.
+//! 2. While the plan's potential does not fit the reclaimable memory, it stops
 //!    darkmux's idle servers, the least recently started first, with the
 //!    engine path's own eviction ([`crate::engine_dispatch::evict`]): the
 //!    leases are read again under the endpoint's lock, where the server is
 //!    stopped, and a server a running dispatch holds is never stopped. A
 //!    server darkmux did not start (no record matching the live process) is
 //!    never seen at all (contract 4).
-//! 3. When nothing idle is left it refuses with a stable code (#3510):
+//! 3. When nothing idle is left and the commitment still does not fit, it
+//!    refuses with a stable code (#3510); a potential not reached is only
+//!    a warning:
 //!    `busy` when a running dispatch holds memory that would free later (a
 //!    server, or an LM Studio load the plan keeps because it is pinned),
 //!    `memory_in_use` when only memory darkmux did not take is short.
