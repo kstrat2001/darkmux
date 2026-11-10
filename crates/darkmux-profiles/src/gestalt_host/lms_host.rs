@@ -150,6 +150,11 @@ impl ModelHost for LmsHost {
     /// (#3508) Read from each model's own `config.json`, else its GGUF
     /// header, as `darkmux machine resources` prices a resident: the rows of
     /// the catalog just listed, or a fresh `lms ls --json`.
+    /// LM Studio runs on this machine: its loads take this machine's memory.
+    fn on_this_machine(&self) -> bool {
+        true
+    }
+
     fn arch_facts(&mut self, model_keys: &[&str]) -> darkmux_gestalt::ModelArch {
         let rows = match self.last_ls.take() {
             Some(rows) => rows,

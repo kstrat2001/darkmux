@@ -1168,7 +1168,9 @@ pub fn run_step_graph(
                     // the endpoints' own concurrency, resolved per seat.
                     darkmux_types::config_access::dispatch_free_concurrency() as usize,
                     host_factory,
-                    &crate::lms_room::ServerRoom::this_machine(),
+                    // (#3514) Planned against this machine only when its
+                    // loads take this machine's memory.
+                    &crate::lms_room::ServerRoom::for_host(host_factory().as_ref()),
                 )
             });
             for sig in rx.iter() {
@@ -5735,6 +5737,45 @@ mod tests {
         }
         let loaded = loads.lock().unwrap().clone();
         assert!(loaded.contains(&"map-model".to_string()), "the wave loader loaded the map's model: {loaded:?}");
+    }
+    /// (#3514) A map step whose wave is refused never runs and is never
+    /// silent: the step errors, its `step.error` names the refusal with its
+    /// code, and nothing is loaded. Here the AI budget cannot hold the model.
+    #[test]
+    #[serial_test::serial]
+    fn a_map_step_whose_wave_is_refused_errors_with_its_code_and_loads_nothing() {
+        let loads: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let loads_for_factory = loads.clone();
+        let factory = move || -> Box<dyn ModelHost> {
+            Box::new(RecordingHost { loads: loads_for_factory.clone(), residents: vec![] })
+        };
+        let (t_src, s_src) = kinded_step("src", "test.emit-collection", json!({ "output_json": "[\"x\"]" }), &[]);
+        let (t_map, s_map) = kinded_step(
+            "map",
+            "dispatch.map",
+            json!({ "model": "map-model", "user_template": "check {item}", "n_ctx": 8000, "timeout_seconds": 1 }),
+            &["src"],
+        );
+        let (tasks, mut steps) = graph(vec![(t_src, s_src), (t_map, s_map)]);
+        let kinds = StepKindRegistry::with_builtins();
+        kinds.register(Arc::new(EmitCollectionKind)).unwrap();
+        let facts = Facts { budget: darkmux_gestalt::Budget { max_darkmux_bytes: Some(1_000_000_000) }, ..Default::default() };
+        let est = FixedEstimator(BTreeMap::from([("map-model".to_string(), 5_000_000_000)]));
+        let mut emitted = Vec::new();
+        let report = run_step_graph(&crate::test_run(), &mut steps, &tasks, &kinds, &facts, &est, &factory, &mut |r| emitted.push(r), &mut |_s| {},
+            None, None, &[]).unwrap();
+        assert!(loads.lock().unwrap().is_empty(), "nothing loaded");
+        assert!(report.errored.iter().any(|e| e.contains("map")), "the step errored: {:?}", report.errored);
+        let cause = emitted
+            .iter()
+            .find_map(|r| match &r.payload {
+                Some(darkmux_flow::Payload::StepError(p)) if r.handle == "map-step" => Some(p.cause.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the map step's step.error: {:?}", emitted.iter().map(|r| r.handle.clone()).collect::<Vec<_>>()));
+        assert!(cause.contains("[wont_fit]"), "its code: {cause}");
+        let started = emitted.iter().any(|r| r.handle == "map-step" && r.action == darkmux_flow::FlowAction::StepStart);
+        assert!(started, "the step's own bookends: started, then errored");
     }
     /// (#1530) A kind that REQUIRES an artifact no step in the graph
     /// provides, and no caller seeds, must fail BEFORE any step runs —

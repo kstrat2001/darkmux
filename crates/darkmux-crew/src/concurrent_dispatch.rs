@@ -566,11 +566,7 @@ fn run_local_waves<T: Send + 'static>(
         if let Some((index, _job)) = by_seat.remove(&refusal.placement.seat) {
             results.lock().expect("results mutex poisoned").push((
                 index,
-                Err(anyhow!(
-                    "darkmux: \"{}\" never fits a co-residency wave — {}",
-                    refusal.placement.model_key,
-                    refusal.reason
-                )),
+                Err(never_fits(&refusal.placement.model_key, &refusal.reason)),
             ));
         }
     }
@@ -1313,6 +1309,16 @@ fn wave_failure(e: &anyhow::Error, model_key: &str) -> anyhow::Error {
     }
 }
 
+/// (#3514) A placement no wave can hold, as its job's error: with its code,
+/// read by `refusal_code` and named on the step's `step.error`.
+fn never_fits(model_key: &str, reason: &Reason) -> anyhow::Error {
+    let text = format!("darkmux: \"{model_key}\" never fits a co-residency wave — {reason}");
+    match block_code(reason) {
+        Some(code) => crate::engine_dispatch::RefusedRun { code, text: format!("{text} [{code}]") }.into(),
+        None => anyhow!(text),
+    }
+}
+
 /// (#3510) The stable code of a planner refusal, when its cause is one an
 /// app branches on: memory a running dispatch or the standing utility
 /// binding holds (`busy`), memory held by something darkmux did not start
@@ -1563,8 +1569,8 @@ mod tests {
         Box::new(MockHost::new())
     }
 
-    /// [`super::run_bounded`] with no machine figures: these tests plan on
-    /// the facts they set, as before the planner read the machine.
+    /// [`super::run_bounded`] with no machine: these tests plan on the facts
+    /// they set.
     fn run_bounded<T: Send + 'static>(
         jobs: Vec<QueuedJob<T>>,
         facts: &Facts,
@@ -1572,12 +1578,11 @@ mod tests {
         dispatch_free_cap: usize,
         host_factory: &(dyn Fn() -> Box<dyn ModelHost> + Sync),
     ) -> Result<Vec<(usize, JobOutcome<T>)>> {
-        super::run_bounded(jobs, facts, est, dispatch_free_cap, host_factory, &crate::lms_room::ServerRoom::unknown_machine())
+        super::run_bounded(jobs, facts, est, dispatch_free_cap, host_factory, &crate::lms_room::ServerRoom::without_machine())
     }
 
-    /// [`super::ensure_wave_loaded`] on this machine's engine-server room,
-    /// which every test here isolates under its own `DARKMUX_HOME` (no
-    /// server records there, so no room step runs).
+    /// [`super::ensure_wave_loaded`] in its host's room: a double's loads
+    /// take none of this machine's memory, so nothing here reads it.
     fn ensure_wave_loaded(
         placements: &[Placement],
         est: &(dyn FootprintEstimator + Sync),
@@ -1585,7 +1590,8 @@ mod tests {
         lease: &residency_lease::LeaseGuard,
         utility_binding: Option<&str>,
     ) -> Result<()> {
-        super::ensure_wave_loaded(placements, est, host, lease, utility_binding, &crate::lms_room::ServerRoom::this_machine())
+        let room = crate::lms_room::ServerRoom::for_host(&*host);
+        super::ensure_wave_loaded(placements, est, host, lease, utility_binding, &room)
     }
 
     /// (#1487 PR2) `ensure_wave_loaded` now writes/reads a residency lease

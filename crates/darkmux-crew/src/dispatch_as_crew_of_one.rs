@@ -1597,8 +1597,9 @@ mod tests {
 
     /// (#3514) A crew-of-one dispatch whose LM Studio wave is refused never
     /// reaches its step, yet the run's error carries the wave's code, so the
-    /// `dispatch --json` refusal envelope names it. A GGUF model larger than
-    /// any test machine is `wont_fit` at the wave.
+    /// `dispatch --json` refusal envelope names it. Here the model is resident
+    /// at too small a context and another dispatch holds it, so the wave is
+    /// `busy` (no machine is read).
     #[test]
     #[serial_test::serial]
     fn a_refused_wave_reaches_the_crew_of_one_run_with_its_code() {
@@ -1614,13 +1615,16 @@ mod tests {
         let calls = kind.calls.clone();
         let registry = test_registry(kind);
         let host_factory = || -> Box<dyn darkmux_gestalt::ModelHost> {
-            let inner = MockHost::new().cataloged("test-model", 1 << 42);
-            Box::new(crate::lms_room::tests::ArchHost::new(inner, crate::lms_room::tests::Format::Gguf))
+            Box::new(MockHost::new().resident("darkmux:test-model", "test-model", 1_000, Some(1_000)))
         };
+        let other = darkmux_types::residency_lease::LeaseGuard::acquire();
+        other.write(&["darkmux:test-model".to_string()]).unwrap();
+        other.mark_loaded(&["darkmux:test-model".to_string()]).unwrap();
         let opts = test_opts("coder", "build the thing");
         let session = opts.session.clone();
         let err = dispatch_as_crew_of_one_with(opts, &registry, &host_factory).unwrap_err();
-        assert_eq!(crate::engine_dispatch::refusal_code(&err), Some("wont_fit"), "{err:#}");
+        drop(other);
+        assert_eq!(crate::engine_dispatch::refusal_code(&err), Some("busy"), "{err:#}");
         assert!(calls.lock().unwrap().is_empty(), "the step never ran");
         assert_eq!(crate::engine_dispatch::take_refusal(&session), None, "the run took its code");
     }

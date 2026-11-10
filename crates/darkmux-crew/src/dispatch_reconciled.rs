@@ -252,13 +252,14 @@ pub(crate) fn dispatch_reconciled_with(
             let lease_guard = residency_lease::LeaseGuard::acquire();
             let est = FixedEstimator::default();
             let mut host = host_factory();
+            let room = crate::lms_room::ServerRoom::for_host(host.as_ref());
             crate::concurrent_dispatch::ensure_wave_loaded(
                 &[placement],
                 &est,
                 host.as_mut(),
                 &lease_guard,
                 crate::concurrent_dispatch::standing_utility_binding(opts.config_path.as_deref()).as_deref(),
-                &crate::lms_room::ServerRoom::this_machine(),
+                &room,
             )
             .with_context(
                 || {

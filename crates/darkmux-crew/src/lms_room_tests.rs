@@ -442,11 +442,12 @@ fn a_held_lm_studio_load_makes_a_short_wave_busy() {
     assert!(!host.ops.contains(&HostOp::Unload { identifier: "darkmux:busy".into() }), "the held load was kept: {:?}", host.ops);
 }
 
-/// Contract 2 at the wave's seam: a wave whose load is refused runs none of
-/// its jobs, and each comes back as an error carrying the code (the step's
-/// `step.error`, and the run's terminal, are written from it). This uses
-/// the production room: this machine's own memory, which no test machine
-/// has a terabyte of, and the records under the test's `DARKMUX_HOME`.
+/// Contract 2 at the wave's seam, and #3514's CI failure made
+/// deterministic: a map step's 5 GB model on a machine with 1 GiB free (a
+/// small CI runner). The wave is refused `memory_in_use`, none of its jobs
+/// runs, and each comes back as an error carrying the code, from which the
+/// step's `step.error` and the run's terminal are written. Larger than the
+/// machine, the same wave is `wont_fit`.
 #[test]
 #[serial_test::serial]
 fn a_refused_wave_runs_none_of_its_jobs_and_each_ends_in_an_error() {
@@ -454,29 +455,30 @@ fn a_refused_wave_runs_none_of_its_jobs_and_each_ends_in_an_error() {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
     let rig = Rig::new();
-    let home_dirs = Dirs::under_home();
-    assert!(home_dirs.records.starts_with(rig.dir.path()), "the records are the test's own: {:?}", home_dirs.records);
-    let mut tf = FakeServer::darkmux(&home_dirs, "tf", "TensorFold/q", 1_000);
-    let ran = Arc::new(AtomicU32::new(0));
-    let job = |i: usize| -> crate::concurrent_dispatch::DispatchJob<usize> {
-        let ran = ran.clone();
-        Box::new(move || {
-            ran.fetch_add(1, Ordering::SeqCst);
-            Ok((i, vec![]))
-        })
-    };
-    let seat = |s: &str| crate::step_kinds::SeatClaim::LocalModel(Placement { seat: s.into(), ..wave("huge")[0].clone() });
-    let jobs = vec![QueuedJob { index: 0, seat: seat("a"), job: job(0) }, QueuedJob { index: 1, seat: seat("b"), job: job(1) }];
-    let factory = || -> Box<dyn ModelHost> { Box::new(ArchHost::new(MockHost::new().cataloged("huge", 1 << 40), Format::Gguf)) };
-    let room = ServerRoom::this_machine();
-    let results = run_bounded(jobs, &Facts::default(), &FixedEstimator::default(), 4, &factory, &room).expect("planned");
-    assert_eq!(ran.load(Ordering::SeqCst), 0, "no job of the refused wave ran");
-    assert_eq!(results.len(), 2, "every job has its terminal result");
-    for (_, r) in &results {
-        let e = r.as_ref().expect_err("an error");
-        assert!(format!("{e:#}").contains("[wont_fit]"), "the code reaches the step's error: {e:#}");
+    for (capacity, code) in [(128 * GIB, "memory_in_use"), (4 * GIB, "wont_fit")] {
+        let ran = Arc::new(AtomicU32::new(0));
+        let job = |i: usize| -> crate::concurrent_dispatch::DispatchJob<usize> {
+            let ran = ran.clone();
+            Box::new(move || {
+                ran.fetch_add(1, Ordering::SeqCst);
+                Ok((i, vec![]))
+            })
+        };
+        let seat = |s: &str| crate::step_kinds::SeatClaim::LocalModel(Placement { seat: s.into(), ..wave("map-model")[0].clone() });
+        let jobs = vec![QueuedJob { index: 0, seat: seat("a"), job: job(0) }, QueuedJob { index: 1, seat: seat("b"), job: job(1) }];
+        let factory = || -> Box<dyn ModelHost> { Box::new(MockHost::new()) };
+        let free = || Some(GIB);
+        let machine = FakeMachine { capacity: Some(capacity), ..FakeMachine::new(&free) };
+        let est = FixedEstimator(std::collections::BTreeMap::from([("map-model".to_string(), 5_000_000_000)]));
+        let results = run_bounded(jobs, &Facts::default(), &est, 4, &factory, &rig.room(&machine)).expect("planned");
+        assert_eq!(ran.load(Ordering::SeqCst), 0, "no job of the refused wave ran");
+        assert_eq!(results.len(), 2, "every job has its terminal result");
+        for (_, r) in &results {
+            let e = r.as_ref().expect_err("an error");
+            assert_eq!(refusal_code(e), Some(code), "{e:#}");
+            assert!(format!("{e:#}").contains(&format!("[{code}]")), "the code reaches the step's error text: {e:#}");
+        }
     }
-    assert!(tf.running(), "a load larger than the machine stops nothing");
 }
 
 /// A wave that loads nothing (its model is already resident) asks nothing
@@ -554,7 +556,7 @@ fn a_missions_waves_are_packed_against_the_machines_memory() {
     let schedule = schedule_waves(&siblings, &Facts::default(), &FixedEstimator::default(), &factory, &room).unwrap();
     assert_eq!(schedule.waves.len(), 1, "{schedule:?}");
     // A caller's own pool is planned on as given.
-    let unknown = ServerRoom::unknown_machine();
+    let unknown = ServerRoom::without_machine();
     let schedule = schedule_waves(&three, &Facts::default(), &FixedEstimator::default(), &factory, &unknown).unwrap();
     assert_eq!(schedule.waves.len(), 1, "no machine figures, no constraint: {schedule:?}");
 }
@@ -1014,4 +1016,16 @@ fn a_wave_that_loads_waits_for_the_residency_lock() {
     drop(held);
     let ops = rx.recv_timeout(Duration::from_secs(5)).expect("it goes ahead once the lock is free").unwrap();
     assert!(ops.iter().any(|op| matches!(op, HostOp::Load { .. })), "{ops:?}");
+}
+
+/// (#3514) A host's room: LM Studio's loads take this machine's memory; a
+/// double's take none, so a test driving the wave loader with one is never
+/// planned against the memory of the machine it runs on.
+#[test]
+fn only_a_host_on_this_machine_is_planned_against_its_memory() {
+    let lms = darkmux_profiles::gestalt_host::LmsHost::with_bin("/nonexistent/lms");
+    assert!(ServerRoom::for_host(&lms).machine.capacity().is_some(), "LM Studio's room reads this machine");
+    let room = ServerRoom::for_host(&MockHost::new());
+    assert_eq!((room.machine.capacity(), room.machine.reclaimable(), (room.workers)()), (None, None, None));
+    assert!(room.pools().is_empty(), "no pool: the planner plans as the test's facts say");
 }

@@ -536,12 +536,13 @@ fn reserve_preflight(
     Ok((lease, need, before))
 }
 
-/// A machine whose memory is unknown, for tests that plan without one.
-#[cfg(test)]
-pub(crate) struct UnknownMachine;
+/// (#3514) No machine: the room of a model host whose loads take none of
+/// this machine's memory (a test's double). It has no memory figures, so the
+/// planner plans with no pool and the room step decides nothing, and it has
+/// no engine-server records, so no server is ever stopped for it.
+pub(crate) struct NoMachine;
 
-#[cfg(test)]
-impl Machine for UnknownMachine {
+impl Machine for NoMachine {
     fn reclaimable(&self) -> Option<u64> {
         None
     }
@@ -562,19 +563,29 @@ impl Machine for UnknownMachine {
     }
 }
 
-#[cfg(test)]
 impl ServerRoom<'static> {
-    /// No machine figures: the planner plans with no pool, as it did before
-    /// it read the machine.
-    pub(crate) fn unknown_machine() -> Self {
+    /// [`NoMachine`]'s room.
+    pub(crate) fn without_machine() -> Self {
         ServerRoom {
-            dirs: Dirs::under_home(),
+            dirs: Dirs { records: std::path::PathBuf::new(), logs: std::path::PathBuf::new() },
             bounds: server::Bounds::default(),
-            machine: &UnknownMachine,
+            machine: &NoMachine,
             settle: |res, _, _| {
                 res.set(0);
             },
             workers: || None,
+        }
+    }
+
+    /// (#3514) The room for loads `host` makes: this machine when they take
+    /// its memory (LM Studio's), else [`Self::without_machine`]. A host that
+    /// loads into nothing on this machine is never planned against this
+    /// machine's memory, so a test's double never reads the host it runs on.
+    pub(crate) fn for_host(host: &dyn ModelHost) -> Self {
+        if host.on_this_machine() {
+            Self::this_machine()
+        } else {
+            Self::without_machine()
         }
     }
 }

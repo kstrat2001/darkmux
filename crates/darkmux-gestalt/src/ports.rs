@@ -117,6 +117,13 @@ pub trait ModelHost {
         let _ = model_keys;
         ModelArch::default()
     }
+    /// (#3514) Whether the models this host loads take this machine's
+    /// memory, so a load is planned against it. A double answers `false`:
+    /// it is planned with no machine figures, never against the memory of
+    /// the machine its test runs on.
+    fn on_this_machine(&self) -> bool {
+        false
+    }
 }
 
 /// (#3508) What a host could read of its models' architecture.
