@@ -3633,14 +3633,28 @@ async fn reuse_runs_no_git_in_another_bots_or_apps_workspace() {
     // Another app's, for a bot of the very name asking.
     crate::client_workspace::record_owner(&h.base, theirs["workspace"].as_str().unwrap(), "c-someone-else").unwrap();
     crate::client_workspace::record_bot(&h.base, theirs["workspace"].as_str().unwrap(), "Mine").unwrap();
-    for v in [&other, &theirs] {
-        let config = crate::client_git::clone_git_dir(&h.base, v["workspace"].as_str().unwrap()).join("config");
-        std::fs::remove_file(&config).unwrap();
+    let pipes: Vec<PathBuf> = [&other, &theirs]
+        .iter()
+        .map(|v| crate::client_git::clone_git_dir(&h.base, v["workspace"].as_str().unwrap()).join("config"))
+        .collect();
+    for config in &pipes {
+        std::fs::remove_file(config).unwrap();
         let fifo = std::ffi::CString::new(config.to_str().unwrap()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
     }
     let made = tokio::time::timeout(std::time::Duration::from_secs(10), call(&h, ask("Mine")));
-    let (code, v) = made.await.expect("git ran in another bot's or app's workspace");
+    let Ok((code, v)) = made.await else {
+        // Let a git waiting on a pipe go (it reads an empty config), so the
+        // failure is reported now rather than at the runner's bound.
+        for _ in 0..50 {
+            for config in &pipes {
+                use std::os::unix::fs::OpenOptionsExt;
+                let _ = std::fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(config);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!("git ran in another bot's or app's workspace");
+    };
     assert_eq!(code, 201, "{v}");
 }
 
