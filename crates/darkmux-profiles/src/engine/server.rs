@@ -296,16 +296,49 @@ pub fn ensure(
     held: Held<'_>,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<Ensured, ServerError> {
+    let lock = endpoint_lock(dirs, &spec.endpoint)?;
+    ensure_locked(spec, dirs, bounds, held, progress, &lock)
+}
+
+/// The endpoint's own lock, `<stem>.server.lock` (never a name the record's
+/// own `<stem>.json.lock` can take for another endpoint: holding both in one
+/// process would otherwise block on itself, since flock locks per open
+/// file). Waits for whoever holds it.
+pub fn endpoint_lock(dirs: &Dirs, endpoint: &str) -> Result<darkmux_types::flock::FlockGuard, ServerError> {
+    darkmux_types::flock::lock_exclusive(&endpoint_lock_path(dirs, endpoint)).map_err(|e| lock_failed(dirs, endpoint, e))
+}
+
+/// (#3509) [`endpoint_lock`] without waiting: `None` while another holder
+/// has it (a start in flight there holds it until its server answers). A
+/// caller holding the machine-wide residency lock takes the endpoint's this
+/// way, and lets the residency lock go before it waits.
+pub fn try_endpoint_lock(dirs: &Dirs, endpoint: &str) -> Result<Option<darkmux_types::flock::FlockGuard>, ServerError> {
+    darkmux_types::flock::try_lock_exclusive(&endpoint_lock_path(dirs, endpoint)).map_err(|e| lock_failed(dirs, endpoint, e))
+}
+
+fn endpoint_lock_path(dirs: &Dirs, endpoint: &str) -> PathBuf {
+    engine_record::path_in(&dirs.records, endpoint).with_extension("server.lock")
+}
+
+fn lock_failed(dirs: &Dirs, endpoint: &str, e: anyhow::Error) -> ServerError {
+    ServerError::StartFailed { endpoint: endpoint.to_string(), log: dirs.log_for(endpoint), detail: format!("{e:#}") }
+}
+
+/// [`ensure`] with the endpoint's lock already held (`_lock`, from
+/// [`endpoint_lock`] or [`try_endpoint_lock`]).
+pub fn ensure_locked(
+    spec: &ServerSpec,
+    dirs: &Dirs,
+    bounds: Bounds,
+    held: Held<'_>,
+    progress: &mut dyn FnMut(Progress),
+    _lock: &darkmux_types::flock::FlockGuard,
+) -> Result<Ensured, ServerError> {
     let start_failed = |detail: String| ServerError::StartFailed {
         endpoint: spec.endpoint.clone(),
         log: dirs.log_for(&spec.endpoint),
         detail,
     };
-    // `<stem>.server.lock`, never a name the record's own `<stem>.json.lock`
-    // can take for another endpoint (holding both in one process would
-    // otherwise block on itself, since flock locks per open file).
-    let lock_path = engine_record::path_in(&dirs.records, &spec.endpoint).with_extension("server.lock");
-    let _lock = darkmux_types::flock::lock_exclusive(&lock_path).map_err(|e| start_failed(format!("{e:#}")))?;
     if let Some(rec) = reuse_or_stop(spec, dirs, bounds, held, progress)? {
         return Ok(Ensured::Reused(rec));
     }
@@ -339,12 +372,19 @@ pub fn reuse(
     held: Held<'_>,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<Option<EngineRecord>, ServerError> {
-    let lock_path = engine_record::path_in(&dirs.records, &spec.endpoint).with_extension("server.lock");
-    let _lock = darkmux_types::flock::lock_exclusive(&lock_path).map_err(|e| ServerError::StartFailed {
-        endpoint: spec.endpoint.clone(),
-        log: dirs.log_for(&spec.endpoint),
-        detail: format!("{e:#}"),
-    })?;
+    let lock = endpoint_lock(dirs, &spec.endpoint)?;
+    reuse_locked(spec, dirs, bounds, held, progress, &lock)
+}
+
+/// [`reuse`] with the endpoint's lock already held.
+pub fn reuse_locked(
+    spec: &ServerSpec,
+    dirs: &Dirs,
+    bounds: Bounds,
+    held: Held<'_>,
+    progress: &mut dyn FnMut(Progress),
+    _lock: &darkmux_types::flock::FlockGuard,
+) -> Result<Option<EngineRecord>, ServerError> {
     reuse_or_stop(spec, dirs, bounds, held, progress)
 }
 
@@ -529,6 +569,22 @@ pub fn stop(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds) -> Result<(), Serve
 /// it up since the caller looked is seen. `Ok(false)`: held, left running.
 pub fn stop_unless_held(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds, held: Held<'_>) -> Result<bool, ServerError> {
     let _lock = lock_for_stop(dirs, rec)?;
+    if held(rec) {
+        return Ok(false);
+    }
+    stop_locked(dirs, rec, bounds)?;
+    Ok(true)
+}
+
+/// (#3509) [`stop_unless_held`] without waiting for the endpoint's lock:
+/// `Ok(false)`, left running, while another holder has it (a start in flight
+/// there, or a reuse being decided). An evictor holding the machine-wide
+/// residency lock stops servers this way, so it never waits on an
+/// endpoint's lock while holding the machine's.
+pub fn try_stop_unless_held(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds, held: Held<'_>) -> Result<bool, ServerError> {
+    let taken = darkmux_types::flock::try_lock_exclusive(&endpoint_lock_path(dirs, &rec.endpoint))
+        .map_err(|e| ServerError::StopFailed { endpoint: rec.endpoint.clone(), pid: rec.pid, detail: format!("{e:#}") })?;
+    let Some(_lock) = taken else { return Ok(false) };
     if held(rec) {
         return Ok(false);
     }

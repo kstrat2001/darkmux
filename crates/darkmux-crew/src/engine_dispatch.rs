@@ -58,7 +58,7 @@ use darkmux_profiles::engine::flint::{self, Rec};
 use darkmux_profiles::engine::server::{self, Dirs, Progress, ServerSpec};
 use darkmux_profiles::engine::tensorfold::Tensorfold;
 use darkmux_types::engine_record::{self, EngineRecord};
-use darkmux_types::residency_lease::LeaseGuard;
+use darkmux_types::residency_lease::{LeaseGuard, Reservation};
 use darkmux_types::{EndpointKind, ManagedBackend};
 
 /// Which `dispatch.model.*` (or, #3504, `dispatch.queue.*`) record a note is.
@@ -507,6 +507,55 @@ pub(crate) trait Machine {
     fn utility(&self) -> Option<String> {
         None
     }
+    /// (#3509) Keep a started server's reservation until its memory pages
+    /// in ([`settle_reservation`]), on a thread of its own: the dispatch
+    /// goes on at once.
+    fn settle(&self, res: Reservation, pid: u32, need: u64) {
+        std::thread::spawn(move || {
+            settle_reservation(
+                res,
+                need,
+                &|| darkmux_platform::current().process_footprint(pid),
+                &std::thread::sleep,
+                SETTLE_BOUND,
+            )
+        });
+    }
+}
+
+/// (#3509) How long a started server's reservation may outlive its answer
+/// while its memory pages in. A server answers before it has paged in all
+/// its weights (MLX maps them and touches them on first use), so the
+/// reservation is kept until the server's footprint reaches the need, and
+/// at most this long: two minutes covers the first request of a large
+/// model reading from disk, and bounds the time a footprint that never
+/// reaches the floor (its margin is never all resident) keeps a phantom
+/// reservation that refuses other starts as `busy`.
+const SETTLE_BOUND: Duration = Duration::from_secs(120);
+/// How often the reservation is shrunk to what has not paged in yet.
+const SETTLE_POLL: Duration = Duration::from_millis(500);
+
+/// Shrink `res` to what of `need` the server's `footprint` has not reached,
+/// each [`SETTLE_POLL`], until it reaches it or `bound` passes; then end it.
+/// An unreadable footprint keeps the whole need. Stops at once when the
+/// dispatch's lease is gone.
+pub(crate) fn settle_reservation(
+    res: Reservation,
+    need: u64,
+    footprint: &dyn Fn() -> Option<u64>,
+    sleep: &dyn Fn(Duration),
+    bound: Duration,
+) {
+    let mut waited = Duration::ZERO;
+    while waited < bound {
+        let left = footprint().map_or(need, |f| need.saturating_sub(f));
+        if left == 0 || !res.set(left) {
+            break;
+        }
+        sleep(SETTLE_POLL);
+        waited += SETTLE_POLL;
+    }
+    res.set(0);
 }
 
 struct ThisMachine<'a> {
@@ -579,9 +628,12 @@ fn prepare_in(
 }
 
 /// Start `spec`'s server, which needs `need` bytes. (#3509) Decided under
-/// the machine-wide residency lock (the busy check, the room it makes, the
-/// lease with its reservation), which is released once the server has
-/// spawned; the reservation counts the start from then on.
+/// both the machine-wide residency lock and the endpoint's own lock, taken
+/// in that order ([`take_locks`]): the endpoint is read again under them, so
+/// a start another dispatch made in between is reused (the same command) or
+/// refused `busy` (another), never decided on a stale look. The residency
+/// lock is never held while waiting on the endpoint's lock, nor past the
+/// spawn: from then on the start's reservation counts it.
 fn start_server(
     spec: &ServerSpec,
     need: Option<u64>,
@@ -591,35 +643,110 @@ fn start_server(
     lease: LeaseGuard,
     note: &mut dyn FnMut(Note, DispatchModelPayload),
 ) -> Result<EngineReady, EngineRefusal> {
-    let endpoint = spec.endpoint.as_str();
-    let base = DispatchModelPayload {
-        engine: spec.engine.clone(),
-        endpoint: endpoint.to_string(),
-        model: spec.model.clone(),
-        ..Default::default()
-    };
-    let current = server::running(dirs, endpoint);
-    let mut machine_lock = Some(residency_lock()?);
-    let leased = held_now(machine, &lease);
-    refuse_a_held_server(current.as_ref(), &leased, endpoint)?;
-    let freed_by_replacing = current.as_ref().and_then(|r| machine.footprint(r.pid)).unwrap_or(0);
-    let room = Room { need, freed_by_replacing, endpoint, leased: &leased, lease: &lease };
-    let evicted = make_room(&room, dirs, bounds, machine)?;
-    // Decided: the lease, with what the start needs reserved.
-    write_lease(&lease, &spec.served_name, need)?;
-    let replacing = current.as_ref().map(|r| r.model.clone());
-    let mut progress = |p: Progress| {
-        if matches!(p, Progress::Spawned) {
-            machine_lock.take();
+    let start = Start { spec, need, dirs, bounds, machine, lease: &lease };
+    loop {
+        let (machine_lock, endpoint_lock) = take_locks(dirs, &spec.endpoint)?;
+        if let Some((record, started)) = start.under(machine_lock, &endpoint_lock, note)? {
+            drop(endpoint_lock);
+            mark_ready(&lease, &spec.served_name, &record, started.then_some(need).flatten(), machine);
+            return Ok(EngineReady { record, started, _lease: lease });
         }
-        report(p, &base, &replacing, &evicted, note)
-    };
-    // What other dispatches hold, read fresh wherever a stop is decided.
-    let held = |r: &EngineRecord| held_now(machine, &lease).contains(&served_name_of(r));
-    let ensured = server::ensure(spec, dirs, bounds, &held, &mut progress).map_err(server_refusal)?;
-    let _ = lease.mark_loaded(std::slice::from_ref(&spec.served_name));
-    let started = matches!(ensured, server::Ensured::Started(_));
-    Ok(EngineReady { record: ensured.record().clone(), started, _lease: lease })
+    }
+}
+
+/// The residency lock, then the endpoint's. While another holder has the
+/// endpoint's (a start in flight there, until its server answers), the
+/// residency lock is let go before waiting for it, and both are taken again.
+fn take_locks(
+    dirs: &Dirs,
+    endpoint: &str,
+) -> Result<(darkmux_types::residency_lock::ResidencyLock, darkmux_types::flock::FlockGuard), EngineRefusal> {
+    loop {
+        let machine_lock = residency_lock()?;
+        if let Some(endpoint_lock) = server::try_endpoint_lock(dirs, endpoint).map_err(server_refusal)? {
+            return Ok((machine_lock, endpoint_lock));
+        }
+        drop(machine_lock);
+        drop(server::endpoint_lock(dirs, endpoint).map_err(server_refusal)?);
+    }
+}
+
+/// One start's inputs ([`start_server`]).
+struct Start<'a> {
+    spec: &'a ServerSpec,
+    need: Option<u64>,
+    dirs: &'a Dirs,
+    bounds: server::Bounds,
+    machine: &'a dyn Machine,
+    lease: &'a LeaseGuard,
+}
+
+impl Start<'_> {
+    /// Decide and start under both locks: `Some((record, started))` when the
+    /// model answers, `None` to take the locks and decide again (a server of
+    /// the same command was found unhealthy and stopped).
+    fn under(
+        &self,
+        machine_lock: darkmux_types::residency_lock::ResidencyLock,
+        endpoint_lock: &darkmux_types::flock::FlockGuard,
+        note: &mut dyn FnMut(Note, DispatchModelPayload),
+    ) -> Result<Option<(EngineRecord, bool)>, EngineRefusal> {
+        let (spec, dirs, bounds, machine, lease) = (self.spec, self.dirs, self.bounds, self.machine, self.lease);
+        let endpoint = spec.endpoint.as_str();
+        let held = |r: &EngineRecord| held_now(machine, lease).contains(&served_name_of(r));
+        let current = server::running(dirs, endpoint);
+        if current.as_ref().is_some_and(|r| r.argv == spec.argv) {
+            // Started by another dispatch since this one looked: reuse it.
+            drop(machine_lock);
+            write_lease(lease, &spec.served_name, None)?;
+            let reused = server::reuse_locked(spec, dirs, bounds, &held, &mut |_| {}, endpoint_lock).map_err(server_refusal)?;
+            if reused.is_none() {
+                let _ = lease.write(&[]);
+            }
+            return Ok(reused.map(|record| (record, false)));
+        }
+        let leased = held_now(machine, lease);
+        refuse_a_held_server(current.as_ref(), &leased, endpoint)?;
+        let freed_by_replacing = current.as_ref().and_then(|r| machine.footprint(r.pid)).unwrap_or(0);
+        let room = Room { need: self.need, freed_by_replacing, endpoint, leased: &leased, lease };
+        let evicted = make_room(&room, dirs, bounds, machine)?;
+        // Decided: the lease, with what the start needs reserved.
+        write_lease(lease, &spec.served_name, self.need)?;
+        let base = DispatchModelPayload {
+            engine: spec.engine.clone(),
+            endpoint: endpoint.to_string(),
+            model: spec.model.clone(),
+            ..Default::default()
+        };
+        let replacing = current.as_ref().map(|r| r.model.clone());
+        let mut machine_lock = Some(machine_lock);
+        let mut progress = |p: Progress| {
+            if matches!(p, Progress::Spawned) {
+                machine_lock.take();
+            }
+            report(p, &base, &replacing, &evicted, note)
+        };
+        let ensured = server::ensure_locked(spec, dirs, bounds, &held, &mut progress, endpoint_lock).map_err(server_refusal)?;
+        let started = matches!(ensured, server::Ensured::Started(_));
+        Ok(Some((ensured.record().clone(), started)))
+    }
+}
+
+/// The model answers: its lease is marked loaded. (#3509) A server this
+/// dispatch started keeps `need` reserved until its memory pages in
+/// ([`Machine::settle`]); one it reused reserves nothing.
+fn mark_ready(lease: &LeaseGuard, served_name: &str, record: &EngineRecord, need: Option<u64>, machine: &dyn Machine) {
+    let models = [served_name.to_string()];
+    match need {
+        Some(bytes) => {
+            if let Ok(res) = lease.mark_loaded_reserving(&models, bytes) {
+                machine.settle(res, record.pid, bytes);
+            }
+        }
+        None => {
+            let _ = lease.mark_loaded(&models);
+        }
+    }
 }
 
 /// The machine-wide residency lock, or the refusal saying why not.
@@ -880,7 +1007,9 @@ fn evict(resident: &Resident, dirs: &Dirs, bounds: server::Bounds, machine: &dyn
     match resident {
         Resident::Server(r) => {
             let held = |r: &EngineRecord| held_now(machine, lease).contains(&served_name_of(r));
-            server::stop_unless_held(dirs, r, bounds, &held).map_err(server_refusal)
+            // (#3509) Never waits on that endpoint's lock under the machine's:
+            // one taken (a start or a reuse there) is left running.
+            server::try_stop_unless_held(dirs, r, bounds, &held).map_err(server_refusal)
         }
         Resident::Load(id) => {
             if held_now(machine, lease).contains(id) {

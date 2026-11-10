@@ -269,6 +269,27 @@ impl LeaseGuard {
         write_lease_file(self.pid, &desired, &loaded, need)
     }
 
+    /// (#3509) [`mark_loaded`](Self::mark_loaded) for a start whose memory
+    /// is still paging in after its model answers: `models` are marked
+    /// loaded and `still_needed` bytes stay reserved, in one write, so no
+    /// decision in between reads the start as uncounted. The returned
+    /// [`Reservation`] shrinks it as the memory pages in, and ends it.
+    pub fn mark_loaded_reserving(&self, models: &[String], still_needed: u64) -> Result<Reservation> {
+        let mut active = ACTIVE_LEASES.lock().unwrap_or_else(|poison| poison.into_inner());
+        {
+            let entry = active.entry(self.token).or_default();
+            for m in models {
+                if entry.desired.contains(m) && !entry.loaded.contains(m) {
+                    entry.loaded.push(m.clone());
+                }
+            }
+            entry.need_bytes = still_needed;
+        }
+        let (desired, loaded, need) = union_of(&active);
+        write_lease_file(self.pid, &desired, &loaded, need)?;
+        Ok(Reservation { pid: self.pid, token: self.token })
+    }
+
     /// (#3509) The memory every OTHER holder's start still in flight has
     /// reserved, bytes: other processes' leases and this process's other
     /// guards, never this guard's own.
@@ -469,6 +490,32 @@ impl LeaseGuard {
             .filter(|(m, min_priority)| !in_use.contains(m) && my_priority < *min_priority)
             .map(|(m, _)| m)
             .collect()
+    }
+}
+
+/// (#3509) One guard's reservation, held apart from the guard so another
+/// thread can shrink it as the start's memory pages in
+/// ([`LeaseGuard::mark_loaded_reserving`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reservation {
+    pid: u32,
+    token: u64,
+}
+
+impl Reservation {
+    /// Reserve `need_bytes` now (0 ends the reservation). `false` once the
+    /// guard is gone: a dropped guard reserves nothing, and is never brought
+    /// back.
+    pub fn set(&self, need_bytes: u64) -> bool {
+        let mut active = ACTIVE_LEASES.lock().unwrap_or_else(|poison| poison.into_inner());
+        let Some(entry) = active.get_mut(&self.token) else { return false };
+        if entry.need_bytes == need_bytes {
+            return true;
+        }
+        entry.need_bytes = need_bytes;
+        let (desired, loaded, need) = union_of(&active);
+        let _ = write_lease_file(self.pid, &desired, &loaded, need);
+        true
     }
 }
 
@@ -792,6 +839,28 @@ mod tests {
         starting.write_starting(&["darkmux:big".to_string()], 8 << 30).unwrap();
         drop(starting);
         assert_eq!(other.reserved_by_others(), 0, "dropped: nothing is reserved");
+    }
+
+    /// (#3509) A start whose memory is still paging in when its model
+    /// answers stays reserved, shrinking as it pages in, until it is set to
+    /// 0 or its guard drops; a handle never brings a dropped guard back.
+    #[serial_test::serial]
+    #[test]
+    fn a_reservation_outlives_the_ready_until_it_is_settled() {
+        let tmp = TempDir::new().unwrap();
+        let _env = EnvGuard::set(tmp.path());
+        let starting = LeaseGuard::acquire();
+        let other = LeaseGuard::acquire();
+        starting.write_starting(&["darkmux:big".to_string()], 30 << 30).unwrap();
+        let res = starting.mark_loaded_reserving(&["darkmux:big".to_string()], 30 << 30).unwrap();
+        assert_eq!(other.reserved_by_others(), 30 << 30, "answering is not paged in");
+        assert!(res.set(10 << 30));
+        assert_eq!(other.reserved_by_others(), 10 << 30, "shrinks as it pages in");
+        assert!(res.set(0));
+        assert_eq!(other.reserved_by_others(), 0);
+        drop(starting);
+        assert!(!res.set(5 << 30), "a dropped guard reserves nothing");
+        assert_eq!(other.reserved_by_others(), 0);
     }
 
     #[serial_test::serial]
