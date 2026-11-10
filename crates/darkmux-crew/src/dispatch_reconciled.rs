@@ -258,6 +258,7 @@ pub(crate) fn dispatch_reconciled_with(
                 host.as_mut(),
                 &lease_guard,
                 crate::concurrent_dispatch::standing_utility_binding(opts.config_path.as_deref()).as_deref(),
+                &crate::lms_room::ServerRoom::this_machine(),
             )
             .with_context(
                 || {
@@ -525,6 +526,10 @@ mod tests {
             *ops_at_dispatch_time.lock().unwrap(),
             vec![
                 HostOp::ListResident,
+                // The load is priced off LM Studio's catalog (#3508), and the
+                // residents re-read right before the unload (#3511).
+                HostOp::ListCatalog,
+                HostOp::ListResident,
                 HostOp::Unload { identifier: "darkmux:orphan".to_string() },
                 HostOp::Load { model_key: "m".to_string(), identifier: "darkmux:m".to_string(), min_ctx: 8_000 },
             ],
@@ -535,6 +540,8 @@ mod tests {
         assert_eq!(
             ops,
             vec![
+                HostOp::ListResident,
+                HostOp::ListCatalog,
                 HostOp::ListResident,
                 HostOp::Unload { identifier: "darkmux:orphan".to_string() },
                 HostOp::Load { model_key: "m".to_string(), identifier: "darkmux:m".to_string(), min_ctx: 8_000 },

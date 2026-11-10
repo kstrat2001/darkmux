@@ -788,11 +788,9 @@ pub struct LedgerInputs {
 /// NEITHER reader could answer — a corrupt/unusual GGUF, an ambiguous
 /// multi-file directory, or a weights format neither reader understands.
 ///
-/// [`Self::estimate_with_source`] is the ONLY port this type exposes —
-/// there is no bare `FootprintEstimator::estimate_bytes` impl, because
-/// nothing in this module calls one and a private type gains no drop-in
-/// value from implementing a trait it has no consumer for; add it back if
-/// a real caller needs it.
+/// [`Self::estimate_with_source`] prices a resident with its source (the
+/// ledger shows which); its `FootprintEstimator` impl is the same figure
+/// without the source, which the LM Studio load path plans with (#3508).
 ///
 /// An ESTIMATED row's `kv_per_token_bytes` field stays `None` (the flat V1
 /// rate is never decomposed into a per-token figure written back onto the
@@ -805,7 +803,7 @@ pub struct LedgerInputs {
 /// which could render the FALSE claim "no shrinkable context" when the
 /// estimated resident was in fact the only one with room to shrink;
 /// `effective_kv_rate` closes that gap.
-struct ArchWithSizeFallback {
+pub struct ArchWithSizeFallback {
     arch: ArchEstimator,
     // No `fallback: V1Estimator` field: since the tiers landed, the fallback's
     // KV rate is chosen PER MODEL from its catalog size, so the estimator is
@@ -814,8 +812,16 @@ struct ArchWithSizeFallback {
     // exact shape that under-reserved large models and the merge gate caught.
 }
 
+/// (#3508) The ledger's pricing as the planner's estimator, so a load is
+/// planned at the figure `darkmux machine resources` shows for it resident.
+impl FootprintEstimator for ArchWithSizeFallback {
+    fn estimate_bytes(&self, model_key: &str, min_ctx: u32, catalog: Option<&[CatalogFact]>) -> Option<u64> {
+        self.estimate_with_source(model_key, min_ctx, catalog).map(|(bytes, _)| bytes)
+    }
+}
+
 impl ArchWithSizeFallback {
-    fn new(arch: BTreeMap<String, ArchFacts>) -> Self {
+    pub fn new(arch: BTreeMap<String, ArchFacts>) -> Self {
         ArchWithSizeFallback { arch: ArchEstimator::new(arch) }
     }
 
@@ -1784,20 +1790,34 @@ fn resolve_arch_facts(
     arch_reader: &ArchFactsReader,
     gguf_reader: &GgufFactsReader,
 ) -> BTreeMap<String, ArchFacts> {
+    resolve_arch_facts_of(residents.iter().map(|r| r.model_key.as_str()), arch_reader, gguf_reader)
+}
+
+/// [`resolve_arch_facts`] over model keys.
+fn resolve_arch_facts_of<'k>(
+    model_keys: impl Iterator<Item = &'k str>,
+    arch_reader: &ArchFactsReader,
+    gguf_reader: &GgufFactsReader,
+) -> BTreeMap<String, ArchFacts> {
     let mut arch: BTreeMap<String, ArchFacts> = BTreeMap::new();
-    for r in residents {
-        if arch.contains_key(&r.model_key) {
+    for key in model_keys {
+        if arch.contains_key(key) {
             continue;
         }
-        if let Some(raw) = arch_reader.read(&r.model_key) {
-            arch.insert(r.model_key.clone(), arch_facts_v1(&raw));
-            continue;
-        }
-        if let Some(raw) = gguf_reader.read(&r.model_key) {
-            arch.insert(r.model_key.clone(), arch_facts_v1(&raw));
+        if let Some(raw) = arch_reader.read(key).or_else(|| gguf_reader.read(key)) {
+            arch.insert(key.to_string(), arch_facts_v1(&raw));
         }
     }
     arch
+}
+
+/// (#3508) Architecture facts for `model_keys`, read from the models
+/// `ls_rows` (`lms ls --json`) lists, in [`resolve_arch_facts`]'s order. A
+/// load is then priced as [`ModelLedger`] prices a resident.
+pub fn arch_facts_for(ls_rows: &[serde_json::Value], model_keys: &[&str]) -> BTreeMap<String, ArchFacts> {
+    let arch_reader = ArchFactsReader::from_ls_entries(ls_rows);
+    let gguf_reader = GgufFactsReader::from_ls_entries(ls_rows);
+    resolve_arch_facts_of(model_keys.iter().copied(), &arch_reader, &gguf_reader)
 }
 
 /// `ArchFactsRaw` → gestalt [`ArchFacts`] with the v1 KV dtype width. NOT a
@@ -3538,6 +3558,37 @@ esac
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// (#3508) A load is priced from the model `lms ls` locates: its own
+    /// `config.json` under LM Studio's models root, read for each key asked
+    /// (a key no reader can answer is left out, for the size fallback). The
+    /// estimator then prices it with the KV term, as the ledger prices a
+    /// resident.
+    #[test]
+    #[serial_test::serial]
+    fn a_load_is_priced_from_the_architecture_lms_ls_locates() {
+        let home = tempfile::tempdir().unwrap();
+        write_fixture_config_json(&home.path().join(".lmstudio/models/org/m-4bit"), 32, 8, 128);
+        let prev = std::env::var_os("HOME");
+        // SAFETY: #[serial]; restored below.
+        unsafe { std::env::set_var("HOME", home.path()) };
+        let rows = [serde_json::json!({"modelKey": "m", "path": "org/m-4bit", "sizeBytes": 4_000_000_000u64})];
+        let arch = arch_facts_for(&rows, &["m", "absent"]);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        assert_eq!(arch.keys().collect::<Vec<_>>(), ["m"], "only the model on disk is read");
+        assert_eq!((arch["m"].total_layers, arch["m"].kv_heads, arch["m"].head_dim), (32, 8, 128));
+        let catalog = [CatalogFact { model_key: "m".into(), size_bytes: Some(4_000_000_000) }];
+        let est = ArchWithSizeFallback::new(arch);
+        let short = est.estimate_bytes("m", 4_096, Some(&catalog)).unwrap();
+        let long = est.estimate_bytes("m", 65_536, Some(&catalog)).unwrap();
+        assert!(short > 4_000_000_000, "weights plus KV and margin: {short}");
+        assert_eq!(long - short, 32 * 8 * 128 * 2 * 2 * (65_536 - 4_096), "the KV term grows with the context, per the architecture");
     }
 
     #[test]

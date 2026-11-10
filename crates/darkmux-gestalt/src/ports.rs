@@ -6,6 +6,7 @@
 //! ingest ([`crate::desired::QuarantineReason::RemoteEndpoint`]), preserving
 //! the #1177 residency-free design instead of a meaningless no-op adapter.
 
+use crate::estimator::ArchFacts;
 use crate::facts::{CatalogFact, Pools, ResidentFact};
 use crate::plan::OwnedTarget;
 use serde::{Deserialize, Serialize};
@@ -107,6 +108,14 @@ pub trait ModelHost {
         deadline: Deadline,
     ) -> Result<LoadReport, HostError>;
     fn unload(&mut self, target: &OwnedTarget, deadline: Deadline) -> Result<(), HostError>;
+    /// (#3508) Architecture facts for each of `model_keys` the host can
+    /// read (layers, KV heads, head size), the KV-cache term of a load's
+    /// estimate. A host that cannot read them answers none, and the estimate
+    /// falls back to the catalog size.
+    fn arch_facts(&mut self, model_keys: &[&str]) -> BTreeMap<String, ArchFacts> {
+        let _ = model_keys;
+        BTreeMap::new()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

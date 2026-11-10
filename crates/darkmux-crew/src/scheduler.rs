@@ -1168,6 +1168,7 @@ pub fn run_step_graph(
                     // the endpoints' own concurrency, resolved per seat.
                     darkmux_types::config_access::dispatch_free_concurrency() as usize,
                     host_factory,
+                    &crate::lms_room::ServerRoom::this_machine(),
                 )
             });
             for sig in rx.iter() {
