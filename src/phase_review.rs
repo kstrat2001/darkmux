@@ -366,6 +366,41 @@ fn review_dispatch_opts(prompt: String, session_id: &SessionId) -> crate::crew::
     }
 }
 
+/// The most of a diff the reviewer's prompt carries. A byte budget
+/// (`line.len()` counts bytes); for typical Rust + JSON diffs this is
+/// effectively chars, but a diff containing many multi-byte UTF-8 chars
+/// could under-count by up to ~4× and exceed the documented limit.
+/// Acceptable for this use; tighten if non-ASCII becomes common in reviewed
+/// diffs.
+const REVIEW_DIFF_MAX_BYTES: usize = 80_000;
+
+/// `diff` cut after its last whole line within `max` bytes, with a note of
+/// how many lines were left out; unchanged when it fits.
+fn truncate_diff(diff: String, max: usize) -> String {
+    if diff.len() <= max {
+        return diff;
+    }
+    let mut end_pos = 0;
+    let mut char_count = 0;
+    for line in diff.lines() {
+        let next = end_pos + line.len() + 1;
+        if char_count + line.len() > max {
+            break;
+        }
+        end_pos = next;
+        char_count += line.len() + 1; // \n
+    }
+    let remaining_lines = diff[end_pos..].lines().count();
+    format!("{}\n... [diff truncated, {} lines omitted]", &diff[..end_pos], remaining_lines)
+}
+
+/// The `code-reviewer` prompt for `diff`, branch `branch` against `base_ref`.
+fn review_prompt(branch: &str, base_ref: &str, truncated_diff: String) -> String {
+    format!(
+        "You are the darkmux `code-reviewer` role. Your job: read this PR's diff and emit a structured QA-REVIEW-SIGNOFF block.\n\n## The diff\n\nBranch `{branch}` vs base `{base_ref}`:\n\n```\n{truncated_diff}\n```\n\n## Reporting format (strict)\n\nEmit findings as:\n\nQA-REVIEW-SIGNOFF\n- [SEVERITY] <file>:<line> — <one-sentence finding>\n- ...\n\nSummary: <N blockers, M flags, K nits>\n\nSeverity levels:\n- BLOCK: must fix before merge (security, correctness, broken tests)\n- FLAG: should address but mergeable with operator awareness\n- NIT: style / consistency / minor\n\nIf you find no issues at all, say so explicitly: `No findings. PR is mergeable.`\n\nBe specific. \"logic error\" without a line is useless. \"src/foo.rs:192 — sum is missing `tool_schemas`\" is a real finding."
+    )
+}
+
 /// The code-review core (#1463): run the `code-reviewer` role against `git`'s
 /// diff vs `base` and return the structured [`PhaseReviewOutput`] (verdict +
 /// findings). Does NOT print or map an exit code — callers decide how to
@@ -471,36 +506,7 @@ pub(crate) fn phase_review_output_at(
     // Count changed files from diff stat.
     let files_changed = count_files_changed(git, base_ref);
 
-    // Build reviewer prompt. `MAX_CHARS` is a byte budget (line.len() returns
-    // bytes); for typical Rust + JSON diffs this is effectively chars, but
-    // a diff containing many multi-byte UTF-8 chars could under-count by up
-    // to ~4× and exceed the documented limit. Acceptable for this verb's use
-    // case; tighten if non-ASCII becomes common in reviewed diffs.
-    const MAX_CHARS: usize = 80_000;
-    let truncated_diff = if diff.len() > MAX_CHARS {
-        let mut end_pos = 0;
-        let mut char_count = 0;
-        for line in diff.lines() {
-            let next = end_pos + line.len() + 1;
-            if char_count + line.len() > MAX_CHARS {
-                break;
-            }
-            end_pos = next;
-            char_count += line.len() + 1; // \n
-        }
-        let remaining_lines = diff[end_pos..].lines().count();
-        format!(
-            "{}\n... [diff truncated, {} lines omitted]",
-            &diff[..end_pos],
-            remaining_lines
-        )
-    } else {
-        diff
-    };
-
-    let prompt = format!(
-        "You are the darkmux `code-reviewer` role. Your job: read this PR's diff and emit a structured QA-REVIEW-SIGNOFF block.\n\n## The diff\n\nBranch `{branch}` vs base `{base_ref}`:\n\n```\n{truncated_diff}\n```\n\n## Reporting format (strict)\n\nEmit findings as:\n\nQA-REVIEW-SIGNOFF\n- [SEVERITY] <file>:<line> — <one-sentence finding>\n- ...\n\nSummary: <N blockers, M flags, K nits>\n\nSeverity levels:\n- BLOCK: must fix before merge (security, correctness, broken tests)\n- FLAG: should address but mergeable with operator awareness\n- NIT: style / consistency / minor\n\nIf you find no issues at all, say so explicitly: `No findings. PR is mergeable.`\n\nBe specific. \"logic error\" without a line is useless. \"src/foo.rs:192 — sum is missing `tool_schemas`\" is a real finding.",
-    );
+    let prompt = review_prompt(&branch, base_ref, truncate_diff(diff, REVIEW_DIFF_MAX_BYTES));
 
     let dispatch_opts = review_dispatch_opts(prompt, &session_id);
 
@@ -583,6 +589,30 @@ mod tests {
     use super::*;
 
     // ── phase review tests ─────────────────────────────────────────────
+
+    /// A diff within the budget reaches the reviewer whole; a longer one is
+    /// cut after its last whole line that fits, saying how many lines were
+    /// left out.
+    #[test]
+    fn a_diff_over_the_budget_is_cut_at_a_whole_line_and_says_how_much() {
+        let diff = "+aaaa\n+bbbb\n+cccc\n+dddd\n".to_string();
+        assert_eq!(truncate_diff(diff.clone(), diff.len()), diff, "a diff that fits is unchanged");
+        let cut = truncate_diff(diff.clone(), 12);
+        assert_eq!(cut, "+aaaa\n+bbbb\n\n... [diff truncated, 2 lines omitted]");
+        // A line whose bytes reach the budget exactly is kept (its newline is
+        // not counted against it).
+        assert_eq!(truncate_diff(diff, 11), cut);
+        let first_line_too_long = truncate_diff("+0123456789\n+x\n".to_string(), 5);
+        assert_eq!(first_line_too_long, "\n... [diff truncated, 2 lines omitted]");
+    }
+
+    /// The prompt carries the branch, the base and the diff as given.
+    #[test]
+    fn the_review_prompt_names_the_branch_the_base_and_the_diff() {
+        let prompt = review_prompt("feat/x", "main", "+added line".to_string());
+        assert!(prompt.contains("Branch `feat/x` vs base `main`:\n\n```\n+added line\n```"), "{prompt}");
+        assert!(prompt.starts_with("You are the darkmux `code-reviewer` role.") && prompt.contains("QA-REVIEW-SIGNOFF"));
+    }
 
     fn sample_signoff() -> String {
         "QA-REVIEW-SIGNOFF\n\

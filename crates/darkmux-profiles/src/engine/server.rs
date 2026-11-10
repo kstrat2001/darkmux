@@ -569,16 +569,21 @@ fn port_closed_within(port: u16, bounds: Bounds) {
 /// `alive(rec)`, so the pid is darkmux's; "no such process" for either is
 /// not an error (it already exited, or it leads no group).
 fn signal_server(pid: u32, sig: i32) -> std::io::Result<()> {
-    use darkmux_types::child_registry::{kill_group, kill_pid, ESRCH};
-    // macOS answers EPERM, not ESRCH, for a group whose only member is a
-    // zombie (exited, not yet reaped): that server is gone too.
-    let ok_if_gone = |r: std::io::Result<()>| match r {
+    use darkmux_types::child_registry::{kill_group, kill_pid};
+    ok_if_gone(kill_group(pid, sig), || is_zombie(pid)).and_then(|()| ok_if_gone(kill_pid(pid, sig), || is_zombie(pid)))
+}
+
+/// A signal's result, with "the process is gone" read as success: ESRCH,
+/// and EPERM when `zombie` says the target is a zombie (macOS answers EPERM,
+/// not ESRCH, for a group whose only member is a zombie: exited, not yet
+/// reaped). `zombie` is asked only for an EPERM.
+fn ok_if_gone(result: std::io::Result<()>, zombie: impl FnOnce() -> bool) -> std::io::Result<()> {
+    use darkmux_types::child_registry::{EPERM, ESRCH};
+    match result {
         Err(e) if e.raw_os_error() == Some(ESRCH) => Ok(()),
-        Err(e) if e.raw_os_error() == Some(darkmux_types::child_registry::EPERM) && is_zombie(pid) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(EPERM) && zombie() => Ok(()),
         other => other,
-    };
-    ok_if_gone(kill_group(pid, sig))?;
-    ok_if_gone(kill_pid(pid, sig))
+    }
 }
 
 fn gone_within(rec: &EngineRecord, bounds: Bounds) -> bool {
@@ -1387,5 +1392,21 @@ S(("127.0.0.1", port), H).serve_forever()
         assert_eq!(other.map_err(|e| e.code()), Err("busy"));
         let same = ensure(&spec(&f, "tf", "m/a", port, &["--daemonize"]), &f.dirs, quick(), &held, &mut no_progress());
         assert_eq!(same, Ok(Ensured::Reused(rec)));
+    }
+
+    /// A signal to a process that is gone succeeds: ESRCH always, EPERM only
+    /// for a zombie (asked only then); any other error, and EPERM for a live
+    /// process, stays an error.
+    #[test]
+    fn a_signal_to_a_gone_process_is_success_and_nothing_else_is() {
+        use darkmux_types::child_registry::{EPERM, ESRCH};
+        let err = |code| Err(std::io::Error::from_raw_os_error(code));
+        let never = || -> bool { panic!("zombie is asked only for EPERM") };
+        assert!(ok_if_gone(Ok(()), never).is_ok());
+        assert!(ok_if_gone(err(ESRCH), never).is_ok(), "no such process: already gone");
+        assert!(ok_if_gone(err(EPERM), || true).is_ok(), "EPERM for a zombie: gone");
+        assert_eq!(ok_if_gone(err(EPERM), || false).unwrap_err().raw_os_error(), Some(EPERM), "EPERM for a live process");
+        // EINVAL (an invalid signal number): 22 on macOS and Linux alike.
+        assert_eq!(ok_if_gone(err(22), never).unwrap_err().raw_os_error(), Some(22));
     }
 }

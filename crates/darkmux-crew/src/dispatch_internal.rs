@@ -7413,6 +7413,37 @@ fn prepare_host_out(
     Ok(host_out)
 }
 
+/// (#3448) A model on a server darkmux starts is made resident between the
+/// container dispatch's `dispatch.start` and its container, with its
+/// `dispatch.model.*` records; a refusal closes `bookend` with this
+/// execution's `dispatch.error`, carrying its code, and is returned. No
+/// `brain` target, or one on no engine server, makes nothing resident.
+fn container_model_resident(
+    opts: &DispatchOpts,
+    execution: &ExecutionId,
+    model: &str,
+    brain: Option<&crate::target::Target>,
+    endpoint_label: Option<&str>,
+    bookend: &mut DispatchBookendGuard<'_>,
+    started: std::time::Instant,
+) -> Result<Option<crate::engine_dispatch::EngineReady>> {
+    let record = |level: darkmux_flow::Level, p: darkmux_flow::Payload| {
+        crate::dispatch::build_dispatch_record(level, &opts.role_id, &opts.session, execution, Some(model), opts.phase_id.as_deref(), p)
+    };
+    let resident = brain.map_or(Ok(None), |t| {
+        engine_resident(t, |p| {
+            let _ = darkmux_flow::record(record(darkmux_flow::Level::Info, p));
+        })
+    });
+    resident.map_err(|refusal| {
+        let mut payload =
+            refusal_terminal(&refusal, started.elapsed().as_millis() as u64, endpoint_label, opts.resume_from.as_deref());
+        merge_record_context(&mut payload, &opts.record_context);
+        bookend.close(record(darkmux_flow::Level::Error, payload));
+        anyhow::Error::from(refusal)
+    })
+}
+
 /// The container run, from its `dispatch.start` to its terminal record.
 /// It owns the bookend guard (contract 2): `dispatch.start` opens it, and
 /// every exit closes it exactly once, explicitly on the two mid-run exits
@@ -7496,43 +7527,15 @@ fn run_container(opts: &DispatchOpts, execution: &ExecutionId, mut run: Containe
             ));
         };
 
-    // (#3448) A model on a server darkmux starts is made resident now,
-    // between `dispatch.start` and the container, with its `dispatch.model.*`
-    // records; a refusal is this execution's `dispatch.error`, with its code.
-    let record_model = |p: darkmux_flow::Payload| {
-        let _ = darkmux_flow::record(crate::dispatch::build_dispatch_record(
-            darkmux_flow::Level::Info,
-            &opts.role_id,
-            &session,
-            execution,
-            Some(&model),
-            phase_id.as_deref(),
-            p,
-        ));
-    };
-    let resident = run.brain.agentic_pm.as_ref().map_or(Ok(None), |t| engine_resident(t, record_model));
-    let _engine = match resident {
-        Ok(ready) => ready,
-        Err(refusal) => {
-            let mut payload = refusal_terminal(
-                &refusal,
-                dispatch_start_instant.elapsed().as_millis() as u64,
-                run.unmanaged_endpoint_raw_label.as_deref(),
-                opts.resume_from.as_deref(),
-            );
-            merge_record_context(&mut payload, &opts.record_context);
-            bookend.close(crate::dispatch::build_dispatch_record(
-                darkmux_flow::Level::Error,
-                &opts.role_id,
-                &session,
-                execution,
-                Some(&model),
-                phase_id.as_deref(),
-                payload,
-            ));
-            return Err(refusal.into());
-        }
-    };
+    let _engine = container_model_resident(
+        opts,
+        execution,
+        &model,
+        run.brain.agentic_pm.as_ref(),
+        run.unmanaged_endpoint_raw_label.as_deref(),
+        &mut bookend,
+        dispatch_start_instant,
+    )?;
 
     let remote_auth = run.remote_auth.take();
     let mut launched = launch_container(opts, execution, &run, remote_auth)?;

@@ -666,14 +666,16 @@ pub fn machine_port_owners() -> Vec<PortOwner> {
 
 /// The port `url` is dialed on: the one it names, else its scheme's.
 fn url_port(url: &str) -> Option<u16> {
+    let (scheme, _) = url.split_once("://")?;
+    // A host `url_host` accepts closes any `[` it opens.
     let hostport = crate::endpoint::url_host(url)?;
     let after_host = match hostport.strip_prefix('[') {
-        Some(v6) => v6.split_once(']')?.1,
+        Some(v6) => v6.split_once(']').map_or("", |(_, tail)| tail),
         None => hostport.find(':').map_or("", |i| &hostport[i..]),
     };
     match after_host.strip_prefix(':').filter(|p| !p.is_empty()) {
         Some(port) => port.parse().ok(),
-        None => scheme_port(url.split_once("://")?.0),
+        None => scheme_port(scheme),
     }
 }
 
@@ -1011,6 +1013,9 @@ mod tests {
             ("http://localhost", Some(80)),
             ("https://[::1]/v1", Some(443)),
             ("ftp://localhost", None),
+            ("localhost:1234", None),
+            ("http://bad host:1234", None),
+            ("http://localhost:99999", None),
         ] {
             assert_eq!(super::url_port(url), port, "{url}");
         }
