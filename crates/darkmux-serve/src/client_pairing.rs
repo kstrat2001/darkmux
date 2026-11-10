@@ -2593,12 +2593,14 @@ fn bot_slug(bot: Option<&str>) -> String {
 
 /// A workspace reused with no bot's exact name recorded (made before the
 /// name was recorded, matched by its branch) becomes this bot's now, so a
-/// later bot whose name makes the same slug gets its own.
-fn claim_for_bot(base: &Path, name: &str, made: &Made) -> Result<(), Refused> {
-    if crate::client_workspace::bot_of(base, name).is_some() {
-        return Ok(());
+/// later bot whose name makes the same slug gets its own; then `reuse` it.
+fn claimed(base: &Path, name: &str, made: &Made, reuse: impl FnOnce() -> Response) -> Response {
+    if crate::client_workspace::bot_of(base, name).is_none() {
+        if let Err(e) = crate::client_workspace::record_bot(base, name, made.bot.exact) {
+            return internal(anyhow!(e));
+        }
     }
-    crate::client_workspace::record_bot(base, name, made.bot.exact).map_err(|e| Box::new(internal(anyhow!(e))))
+    reuse()
 }
 
 /// The client's own workspace `find` names, if any, after
@@ -2638,10 +2640,7 @@ fn clone_workspace(state: &ClientServerState, url: &str, normalized: &str, made:
     };
     let _one_at_a_time = state.workspace_lock.lock().unwrap();
     match reusable(state, &base, || ws::find_by_origin(&base, normalized, made.bot, made.client)) {
-        Ok(Some(name)) => match claim_for_bot(&base, &name, made) {
-            Ok(()) => existing_clone(state, &name),
-            Err(r) => *r,
-        },
+        Ok(Some(name)) => claimed(&base, &name, made, || existing_clone(state, &name)),
         Ok(None) => new_clone(state, &base, (url, normalized), made),
         Err(r) => *r,
     }
@@ -2902,10 +2901,7 @@ fn worktree_workspace(state: &ClientServerState, source: &Path, made: &Made) -> 
     };
     let _one_at_a_time = state.workspace_lock.lock().unwrap();
     match reusable(state, &base, || ws::find_worktree_of(&base, &common, made.bot, made.client)) {
-        Ok(Some(name)) => match claim_for_bot(&base, &name, made) {
-            Ok(()) => reused_worktree(state, &base, &name, &source),
-            Err(r) => *r,
-        },
+        Ok(Some(name)) => claimed(&base, &name, made, || reused_worktree(state, &base, &name, &source)),
         Ok(None) => new_worktree(state, &base, (&source, &common), made),
         Err(r) => *r,
     }
