@@ -310,6 +310,14 @@ flow_actions! {
     DispatchModelLoading => Dispatch, "dispatch.model.loading", Execution;
     /// (#3448) The model answers; the dispatch's first turn follows.
     DispatchModelReady => Dispatch, "dispatch.model.ready", Execution;
+    /// (#3504) A dispatch whose model's endpoint or memory a running
+    /// dispatch holds is waiting for it (`fleet.busy_policy` `queue`): when
+    /// the wait starts, and every 20 s while it lasts.
+    DispatchQueueWait => Dispatch, "dispatch.queue.wait", Execution;
+    /// (#3504) The wait ended and the dispatch goes on making its model
+    /// resident. A wait that timed out or was stopped writes none: the
+    /// dispatch's `dispatch.error` closes it.
+    DispatchQueueResume => Dispatch, "dispatch.queue.resume", Execution;
     GhVerbExecuted => Gh, "gh.verb.executed";
     HookFired => Hook, "hook.fired";
     HookFailed => Hook, "hook.failed";

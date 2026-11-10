@@ -185,14 +185,17 @@ not_reporting?: boolean,
 /**
  * (#3467) What a running run is doing besides its turns:
  * `starting_model` while one of its dispatches starts its model (from
- * `dispatch.model.start` until `.ready`). Decided by the run lifecycle
- * (`Attempt::starting_model`), read by every surface (`GET /runs`,
+ * `dispatch.model.start` until `.ready`); (#3504) `queued` while one
+ * waits for a busy endpoint or memory (from `dispatch.queue.wait` until
+ * `.resume`). Decided by the run lifecycle
+ * (`Attempt::starting_model`, `Attempt::queued`), read by every surface (`GET /runs`,
  * `darkmux run list --json`, the client's work status). Absent when the
  * run is not running or is doing nothing else.
  */
 activity?: RunActivity, 
 /**
  * (#3467) With `activity`: how long it has taken so far, ms, from the
- * latest `dispatch.model.loading` (0 before the first).
+ * latest `dispatch.model.loading` (0 before the first), or the latest
+ * `dispatch.queue.wait`.
  */
 activity_elapsed_ms?: number, };

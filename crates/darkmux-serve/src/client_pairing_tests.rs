@@ -1972,6 +1972,21 @@ fn the_child_runner_parses_the_json_envelope_and_reports_failures() {
     let refused = FakeTeardown { code: Some("wont_fit".into()), ..FakeTeardown::default() };
     let e = run_dispatch_child(&bad, &spec, &CancelFlag::default(), GRACE, &refused).unwrap_err();
     assert_eq!(e.code.as_deref(), Some("wont_fit"));
+
+    // (#3505) A refused dispatch prints its refusal envelope on stdout: that
+    // is a failed run carrying the envelope's code, never a finished one.
+    let no = dir.path().join("no");
+    std::fs::write(
+        &no,
+        "#!/bin/sh
+cat >/dev/null
+printf '{\"result\":\"refused\",\"code\":\"busy\",\"error\":\"held\"}'\necho 'held' >&2\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&no, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let e = run_dispatch_child(&no, &spec, &CancelFlag::default(), GRACE, &FakeTeardown::default()).unwrap_err();
+    assert_eq!((e.reason.as_str(), e.code.as_deref()), ("exit 1", Some("busy")), "{e:?}");
+    assert_eq!(e.error, "held");
 }
 
 // ─── Cancel ──────────────────────────────────────────────────────────────
@@ -2085,6 +2100,11 @@ fn the_work_activity_reader_follows_the_dispatchs_records() {
     assert_eq!(read(), (Some(crate::runs::RunActivity::StartingModel), Some(30_000)));
     append(&[rec(ours, "dispatch.model.ready", model(31_000))]);
     assert_eq!(read(), (None, None), "ready: running as usual");
+    // (#3504) A queued wait reads `queued`, its time the latest wait record's.
+    append(&[rec(ours, "dispatch.queue.wait", model(0)), rec(ours, "dispatch.queue.wait", model(20_000))]);
+    assert_eq!(read(), (Some(crate::runs::RunActivity::Queued), Some(20_000)));
+    append(&[rec(ours, "dispatch.queue.resume", model(21_000))]);
+    assert_eq!(read(), (None, None), "resumed: running as usual");
 
     // (#3467 review) A role id outside `[A-Za-z0-9-]` is escaped on the
     // wire; its work is still found.

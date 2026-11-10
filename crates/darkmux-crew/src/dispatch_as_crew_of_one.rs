@@ -198,6 +198,9 @@ pub(crate) fn dispatch_as_crew_of_one_with(
         &[],
     );
 
+    // (#3505) The step hands a refused dispatch's error back as text; its
+    // refusal code rides beside it, keyed by this dispatch's session.
+    let refused = crate::engine_dispatch::take_refusal(&opts.session);
     if let Err(e) = graph_result {
         reconcile_on_error(&mission_id, &phase_id, &format!("{e:#}"));
         return Err(e);
@@ -258,13 +261,22 @@ pub(crate) fn dispatch_as_crew_of_one_with(
             // a step that never ran to completion at all).
             let reason = step.output.clone().unwrap_or_default();
             finalize(&mission_id, &phase_id, MissionOutcomeStatus::Error, Some(reason.clone()));
-            Err(anyhow!("{reason}"))
+            Err(step_error(reason, refused))
         }
         other => {
             let reason = format!("dispatch: crew-of-one step ended in unexpected status {other:?}");
             finalize(&mission_id, &phase_id, MissionOutcomeStatus::Error, Some(reason.clone()));
             bail!(reason);
         }
+    }
+}
+
+/// The run's error for its errored step's `reason`: (#3505) carrying the
+/// refusal code its dispatch stashed, when it was refused.
+fn step_error(reason: String, refused: Option<&'static str>) -> anyhow::Error {
+    match refused {
+        Some(code) => crate::engine_dispatch::RefusedRun { code, text: reason }.into(),
+        None => anyhow!("{reason}"),
     }
 }
 
@@ -763,7 +775,7 @@ mod tests {
                 step.config.get("session_id").and_then(|v| v.as_str()).map(String::from);
             let message =
                 step.config.get("message").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-            self.calls.lock().unwrap().push((message, session_id.clone()));
+            self.calls.lock().unwrap().push((message.clone(), session_id.clone()));
             // (#2614 review, "the red-prove does not reach the ordering
             // assertions") A SECOND, redundant `resume_from` check here —
             // mirroring the real `DispatchInternalStepKind::run`, which
@@ -796,6 +808,16 @@ mod tests {
                 })?;
                 crate::dispatch_internal::validate_resume_checkpoint_content(&resume_from, &role_id)
                     .context("darkmux dispatch --resume-from")?;
+            }
+            if self.should_err && message == "refuse busy" {
+                // As the real kind does with a refused dispatch (#3505).
+                let refused = anyhow::Error::from(crate::engine_dispatch::EngineRefusal {
+                    code: "busy",
+                    message: "endpoint `tf` is serving `a` for a running dispatch; retry when it finishes".into(),
+                    waiting_on: None,
+                });
+                crate::engine_dispatch::stash_refusal(&SessionId::parse(session_id.as_deref().unwrap_or_default())?, &refused);
+                return Err(refused.context(format!("step `{}` dispatch.internal", step.id)));
             }
             if self.should_err {
                 bail!("fake dispatch() failure — preflight/model resolution");
@@ -1539,6 +1561,38 @@ mod tests {
         // `fleet::dispatch_routed(opts)?` contract.
         let err = dispatch_as_crew_of_one_with(opts, &registry, &host_factory).unwrap_err();
         assert!(err.to_string().contains("fake dispatch() failure"), "{err}");
+    }
+
+    /// (#3505) A dispatch refused before its role ran comes back from the
+    /// crew-of-one run carrying its refusal code (the step graph hands back
+    /// only the error's text), with the same text; any other hard error
+    /// carries none, and no code outlives the run that stashed it.
+    #[test]
+    #[serial_test::serial]
+    fn a_refused_crew_of_one_dispatch_carries_its_refusal_code() {
+        let _guard = RunGuard::new();
+        let run = |message: &str| {
+            let kind = FakeDispatchKind {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+                should_err: true,
+                placement: placement(),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            };
+            let registry = test_registry(kind);
+            let host = Arc::new(Mutex::new(MockHost::new().cataloged("test-model", 5_000_000_000)));
+            let host_factory = move || -> Box<dyn darkmux_gestalt::ModelHost> { Box::new(SharedMockHost(host.clone())) };
+            let opts = test_opts("coder", message);
+            let session = opts.session.clone();
+            (dispatch_as_crew_of_one_with(opts, &registry, &host_factory).unwrap_err(), session)
+        };
+        let (err, session) = run("refuse busy");
+        assert_eq!(crate::engine_dispatch::refusal_code(&err), Some("busy"), "{err:#}");
+        assert!(format!("{err:#}").contains("retry when it finishes [busy]"), "{err:#}");
+        assert_eq!(crate::engine_dispatch::take_refusal(&session), None, "the run took its code");
+        let (plain, _) = run("build the thing");
+        assert_eq!(crate::engine_dispatch::refusal_code(&plain), None, "{plain:#}");
     }
 
     /// (#1509 review — the MUST FIX) A hard `dispatch()`-level `Err` must
