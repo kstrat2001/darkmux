@@ -2296,7 +2296,7 @@ fn severity_word(severity: Severity) -> &'static str {
 }
 
 /// One model's row of [`render_human`]'s table, with its footnotes.
-fn push_model_row(out: &mut String, m: &ModelRow) {
+fn push_model_row(out: &mut String, m: &ModelRow, now_ms: u64) {
     let ident = truncate_ident(&m.identifier, 46);
     // #1819: an ESTIMATED row's state carries the disclosure right next
     // to the figure it qualifies — provenance visible everywhere the
@@ -2335,7 +2335,8 @@ fn push_model_row(out: &mut String, m: &ModelRow) {
         out.push_str(&format!("  ↳ {h}\n"));
     }
     if let Some(s) = &m.server {
-        let state = if s.answering { "measured" } else { "starting the model, measured" };
+        let measured = if m.current_bytes.is_some() { "measured" } else { "not measured" };
+        let state = if s.answering { measured.to_string() } else { format!("{}, {measured}", s.silent_word(now_ms)) };
         out.push_str(&format!(
             "  ↳ {} server for `{}` on endpoint `{}` (port {}, pid {}), {state}\n",
             s.engine, s.model, s.endpoint, s.port, s.pid
@@ -2364,7 +2365,7 @@ pub fn render_human(ledger: &ModelLedger) -> String {
         out.push_str("  (no models loaded)\n");
     }
     for m in &ledger.models {
-        push_model_row(&mut out, m);
+        push_model_row(&mut out, m, ledger.generated_at_ms);
     }
     let limit_desc = limit_desc(&ledger.limit_source);
     // #1819: the machine-total parenthetical names BOTH gaps when both are
@@ -2574,6 +2575,21 @@ mod tests {
         assert_eq!(l.machine.unpriced_models, 0);
     }
 
+    /// A measured server row earns the state its numbers earn, as every LM
+    /// Studio row does: on a machine that reads green, it reads green too,
+    /// never a bare "unknown" beside its measured bytes.
+    #[test]
+    fn a_measured_server_row_takes_the_machine_state_like_any_priced_row() {
+        let mut inputs = base_inputs();
+        inputs.servers = vec![tf_server(Some(5_000_000_000))];
+        let l = compute_ledger(inputs, 0);
+        assert_eq!(l.machine.state, LedgerState::Green, "fixture: a healthy machine");
+        let row = l.models.iter().find(|m| m.server.is_some()).unwrap();
+        assert_eq!(row.state, LedgerState::Green);
+        let lms = l.models.iter().find(|m| m.server.is_none()).unwrap();
+        assert_eq!(row.state, lms.state, "a server row and an LM Studio row read alike");
+    }
+
     /// (#3450) A server row never takes part in the LM Studio worker
     /// attribution: two workers for two LM Studio residents still pair one
     /// to one beside a server.
@@ -2686,6 +2702,28 @@ mod tests {
         let at = text.lines().position(|l| l.starts_with("darkmux:TensorFold/q38")).expect(&text);
         let note = text.lines().nth(at + 1).unwrap_or_default();
         assert_eq!(note, "  ↳ tensorfold server for `TensorFold/q38` on endpoint `tf` (port 8091, pid 4242), measured", "{text}");
+    }
+
+    /// The table's server note says what the server is doing: "starting the
+    /// model" only while its start is young (read on the ledger's own clock),
+    /// "not answering" after; and "not measured" when its memory could not
+    /// be read, never a bare "measured".
+    #[test]
+    fn the_table_says_not_answering_past_the_start_bound_and_not_measured() {
+        let note_for = |memory: Option<u64>, answering: bool, generated_at_ms: u64| {
+            let mut inputs = base_inputs();
+            let mut s = tf_server(memory);
+            s.server.answering = answering;
+            inputs.servers = vec![s];
+            let text = render_human(&compute_ledger(inputs, generated_at_ms));
+            let at = text.lines().position(|l| l.starts_with("darkmux:TensorFold/q38")).expect(&text);
+            text.lines().nth(at + 1).unwrap_or_default().to_string()
+        };
+        let bound = crate::engine::server::START_BOUND.as_millis() as u64;
+        // `tf_server` started at 1_000 ms.
+        assert!(note_for(Some(5), false, 1_000 + 60_000).ends_with("starting the model, measured"));
+        assert!(note_for(Some(5), false, 1_000 + bound + 1).ends_with("not answering, measured"));
+        assert!(note_for(None, true, 1_000).ends_with(", not measured"));
     }
 
     // Expected potentials from the probed arithmetic (same rows as the

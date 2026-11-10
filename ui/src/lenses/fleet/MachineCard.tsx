@@ -371,13 +371,18 @@ function CardTube({
 }
 
 /** (#3450) The servers the machine's darkmux started, as its residents:
- * "starting the model" first for one that does not answer yet, then the
- * resident ones; the title names each in full. Nothing when it runs none. */
+ * the ones still starting first, then the ones not answering, then the
+ * resident ones; the title names each in full, and a phone, which has no
+ * hover, wraps the line rather than cutting the names off. Nothing when it
+ * runs none. */
 function ServersLine({ servers }: { servers: readonly EngineServer[] }) {
-  const line = serversLine(servers);
+  // The card re-renders on its presence poll; a server's start age only
+  // has to be right to the poll.
+  const nowMs = Date.now();
+  const line = serversLine(servers, nowMs);
   if (!line) return null;
   return (
-    <div className="serves" data-testid="engine-servers-line" title={serversTitle(servers)}>
+    <div className="serves serves--engines" data-testid="engine-servers-line" title={serversTitle(servers, nowMs)}>
       {line}
     </div>
   );

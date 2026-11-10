@@ -4255,6 +4255,13 @@ body {
   .mach .serves {
     font-size: 11px;
   }
+  /* (#3450) The engine servers' names live in the line's title on desktop;
+     a phone has no hover, so the line wraps instead of cutting them off. */
+  .mach .serves.serves--engines {
+    height: auto;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
 }
 /* The status lamp (`components/LampDot.tsx`), as the run page's state lamps. */
 .mach .stat[data-lamp="dashed"],

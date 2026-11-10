@@ -1820,7 +1820,9 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
       n_ctx: 262144,
       port: 8091,
       pid: 4242,
-      started_at_ms: 0,
+      // A minute old, measured on the clock the card reads: a start that is
+      // still inside its bound.
+      started_at_ms: Date.now() - 60_000,
       answering,
     });
     mockFleetFetch({
