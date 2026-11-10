@@ -1151,8 +1151,35 @@ impl WaveLoad<'_> {
             .map_err(|refusal| room_refused(refusal, committed))?;
         let starting = self.reserve(&plan, &facts, &pricing)?;
         let mut lock = lock;
-        let outcome = execute_plan(&plan, host, self.deadline, committed, &|| self.held(), &mut || drop(lock.take()));
+        // Watched while it loads: a load that returns onto a machine whose
+        // memory pressure turned critical is unloaded again and refused.
+        let (outcome, critical) = crate::lms_room::watching_pressure(self.room.machine, self.room.bounds.poll, || {
+            execute_plan(&plan, host, self.deadline, committed, &|| self.held(), &mut || drop(lock.take()))
+        });
+        if let Some(reading) = critical.filter(|_| matches!(outcome, PlanExecOutcome::Loaded)) {
+            return Err(self.cut_loads(&plan, &reading, host, committed));
+        }
         Ok((outcome, pinned, starting))
+    }
+
+    /// Unload what `plan` just loaded (its reservation ends with the
+    /// caller's `Starting`), and the wave's `memory_in_use` refusal. A load
+    /// another running dispatch took up meanwhile is left loaded.
+    fn cut_loads(&self, plan: &Plan, reading: &str, host: &mut dyn ModelHost, committed: &[String]) -> anyhow::Error {
+        let loaded: Vec<String> = plan
+            .actions
+            .iter()
+            .filter_map(|a| match &a.action {
+                Action::Load { identifier, .. } => Some(identifier.clone()),
+                _ => None,
+            })
+            .collect();
+        let held = |id: &str| self.held().iter().any(|h| h == id);
+        let refusal = crate::lms_room::cut_for_pressure(&loaded, reading, &held, &mut |id| {
+            let target = darkmux_gestalt::OwnedTarget::claim(id, Some(id)).map_err(|e| anyhow!("`{}` is not darkmux's to unload", e.identifier))?;
+            host.unload(&target, self.deadline).map_err(|e| anyhow!("{e}"))
+        });
+        room_refused(refusal, committed)
     }
 
     /// (#3509) Reserve what the plan's loads commit (#3514), under the lock,

@@ -106,6 +106,43 @@ pub fn weights_bytes(model_dir: &Path) -> Option<u64> {
     (total > 0).then_some(total)
 }
 
+/// What a Flint server takes beyond its weights before its context fills:
+/// 2 GB.
+///
+/// rec says nothing of a model's memory, so this and
+/// [`KV_BYTES_PER_CONTEXT_TOKEN`] are measurements standing in for an
+/// engine-reported estimate. Measured on rec 0.1.0, 2026-11-10, on a clean
+/// 128 GB M5 Max, with the command darkmux starts (`--context-limit
+/// 262144`, 22.6 GB of weights), the server's footprint by prompt size:
+///
+/// | prompt tokens | footprint |
+/// |---|---|
+/// | none (ready) | 22 GB |
+/// | 12,007 | 24 GB |
+/// | 48,007 | 24 GB |
+/// | 144,007 | 28 GB |
+///
+/// So Flint grows its KV cache as the context fills (Tensorfold reserves
+/// its at start), and the cache is small: 6 GB at 144,007 tokens. The first
+/// requests took the footprint from 22 to 24 GB, which is this margin.
+pub const START_MARGIN_BYTES: u64 = 2_000_000_000;
+
+/// What a context token grows a Flint server by: 42 KB, the 6 GB between
+/// ready and a 144,007-token prompt (see [`START_MARGIN_BYTES`] for the
+/// measurement).
+pub const KV_BYTES_PER_CONTEXT_TOKEN: u64 = 42_000;
+
+/// What a Flint start is priced at: its weights, [`START_MARGIN_BYTES`],
+/// and the cache its whole context can grow to
+/// ([`KV_BYTES_PER_CONTEXT_TOKEN`] at `n_ctx`). Flint commits only the
+/// first two at start, but the price is what the reservation and the fit
+/// are judged on, and a server priced at its weights alone is admitted
+/// beside memory its context then grows into. Every measured point is
+/// priced at or above what it took.
+pub fn conservative_commitment(weights_bytes: u64, n_ctx: u32) -> u64 {
+    weights_bytes.saturating_add(START_MARGIN_BYTES).saturating_add(KV_BYTES_PER_CONTEXT_TOKEN.saturating_mul(u64::from(n_ctx)))
+}
+
 /// rec's install: its command and its data directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rec {
@@ -439,5 +476,14 @@ mod tests {
         assert!(rec.serve_spec("fl", 8092, &no_ctx, "0.1.0").is_err(), "n_ctx is the server's --context-limit");
         assert_eq!(weights_bytes(&data.join("models/fdc852")), Some(1024), "the safetensors only");
         assert_eq!(weights_bytes(&data.join("runtimes")), None);
+        // Priced at or over every measured footprint of a 22.6 GB model,
+        // whether the context is the prompt's size or the whole 262,144.
+        for (tokens, measured_gb) in [(12_007u32, 24u64), (48_007, 24), (144_007, 28)] {
+            for n_ctx in [tokens, 262_144] {
+                let priced = conservative_commitment(22_600_000_000, n_ctx);
+                assert!(priced >= measured_gb * 1_000_000_000, "{tokens} tokens at context {n_ctx}: {priced}");
+            }
+        }
+        assert!(conservative_commitment(22_600_000_000, 262_144) < 36_000_000_000, "and not far over");
     }
 }

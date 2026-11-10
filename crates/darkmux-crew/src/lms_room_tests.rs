@@ -87,11 +87,24 @@ pub(crate) struct FakeMachine<'a> {
     /// Where LM Studio unloads are noted; `None` for a wave, whose room step
     /// never unloads anything.
     lms_unloads: Option<&'a Mutex<Vec<String>>>,
+    /// The memory pressure each reading finds, in order; the last one
+    /// stays. Empty: none can be read.
+    pressure: Mutex<Vec<darkmux_platform::MemoryPressure>>,
+}
+
+/// A pressure reading at the kernel's `level`.
+fn pressure_at(level: darkmux_platform::PressureLevel) -> darkmux_platform::MemoryPressure {
+    darkmux_platform::MemoryPressure { level: Some(level), swap_used_bytes: Some(24 * GIB), swap_free_bytes: Some(GIB), compressor_pct: Some(40), compressor_segments_pct: Some(40) }
 }
 
 impl<'a> FakeMachine<'a> {
     fn new(free: &'a (dyn Fn() -> Option<u64> + Sync)) -> Self {
-        FakeMachine { free, leased: Mutex::new(vec![Vec::new()]), capacity: Some(128 * GIB), utility: None, lms_unloads: None }
+        FakeMachine { free, leased: Mutex::new(vec![Vec::new()]), capacity: Some(128 * GIB), utility: None, lms_unloads: None, pressure: Mutex::new(Vec::new()) }
+    }
+    /// The pressure readings, in order.
+    fn pressed(self, levels: &[darkmux_platform::PressureLevel]) -> Self {
+        *self.pressure.lock().unwrap() = levels.iter().map(|l| pressure_at(*l)).collect();
+        self
     }
     fn leasing(mut self, answers: &[&[&str]]) -> Self {
         self.leased = Mutex::new(answers.iter().map(|a| a.iter().map(|s| s.to_string()).collect()).collect());
@@ -130,6 +143,14 @@ impl Machine for FakeMachine<'_> {
     }
     fn capacity(&self) -> Option<u64> {
         self.capacity
+    }
+    fn pressure(&self) -> Option<darkmux_platform::MemoryPressure> {
+        let mut readings = self.pressure.lock().unwrap();
+        if readings.len() > 1 {
+            Some(readings.remove(0))
+        } else {
+            readings.first().copied()
+        }
     }
 }
 
@@ -1476,4 +1497,240 @@ fn a_doubles_wave_never_creates_the_residency_lock() {
     ensure_wave_loaded(&wave("m"), &FixedEstimator::default(), &mut host, &lease, None, &ServerRoom::without_machine()).expect("loads");
     assert!(host.ops.iter().any(|op| matches!(op, HostOp::Load { .. })));
     assert!(!lock.exists(), "no lock file: {}", lock.display());
+}
+
+// ── #3538: the pressure gate and the load watchdog on the LM Studio path ──
+
+/// A wave whose load fits by the arithmetic is refused while the machine
+/// is already under memory pressure, and nothing loads.
+#[test]
+#[serial_test::serial]
+fn high_memory_pressure_refuses_a_wave_that_fits() {
+    use darkmux_platform::PressureLevel;
+    let rig = Rig::new();
+    let free = || Some(64 * GIB);
+    let machine = FakeMachine::new(&free).pressed(&[PressureLevel::Warning]);
+    let mut host = MockHost::new().cataloged("m", 20 * GIB);
+    let err = load(&mut host, &wave("m"), &rig.room(&machine)).expect_err("refused");
+    assert_eq!(refusal_code(&err), Some("memory_in_use"), "{err:#}");
+    assert!(format!("{err:#}").contains("`warning` memory pressure"), "the reading is named: {err:#}");
+    assert!(!loaded(&host), "{:?}", host.ops);
+    assert_eq!(reserved_now(), 0, "nothing stays reserved");
+    // A wave that only reuses what is resident decides nothing, and goes on.
+    let mut host = MockHost::new().resident("darkmux:m", "m", 8_000, Some(GIB));
+    load(&mut host, &wave("m"), &rig.room(&machine)).expect("a reuse is never gated");
+}
+
+/// A preflight load (the compactor, the utility model, a lab run's model)
+/// meets the same gate.
+#[test]
+#[serial_test::serial]
+fn high_memory_pressure_refuses_a_preflight_load_that_fits() {
+    use darkmux_platform::PressureLevel;
+    let rig = Rig::new();
+    let free = || Some(64 * GIB);
+    let machine = FakeMachine::new(&free).pressed(&[PressureLevel::Critical]);
+    let gate = FakePreflight::on(rig.dirs(), &machine).cataloged("m", 20 * GIB);
+    let err = preflight(&gate, "m").expect_err("refused");
+    assert_eq!(refusal_code(&err), Some("memory_in_use"), "{err:#}");
+    assert!(format!("{err:#}").contains("`critical` memory pressure"), "{err:#}");
+    assert!(gate.calls().is_empty(), "nothing loaded: {:?}", gate.calls());
+    assert!(LeaseGuard::acquire().all_live_leased_models().is_empty(), "and no lease is left behind");
+}
+
+/// Pressure that turns critical while a preflight's `lms load` runs: the
+/// instance just loaded is unloaded once the load returns, the dispatch is
+/// refused, and neither its reservation nor its lease is left.
+#[test]
+#[serial_test::serial]
+fn pressure_turning_critical_during_a_preflight_load_unloads_it_and_refuses() {
+    use darkmux_platform::PressureLevel;
+    let rig = Rig::new();
+    let free = || Some(64 * GIB);
+    let machine = FakeMachine::new(&free).pressed(&[PressureLevel::Normal, PressureLevel::Critical]);
+    // The leases on disk: the preflight's own lease on the load never reads
+    // as another dispatch holding it.
+    let gate = FakePreflight::on(rig.dirs(), &machine).priced("util", 5 * GIB).reading_leases();
+    // The load outlasts several polls; the pressure is critical while it
+    // runs and normal again by the time it returns, so only a reading
+    // taken during the load sees it.
+    let slow = |_: &str, id: &str, _: u32| -> anyhow::Result<()> {
+        std::thread::sleep(BOUNDS.poll * 10);
+        *machine.pressure.lock().unwrap() = vec![pressure_at(PressureLevel::Normal)];
+        gate.calls.lock().unwrap().push(format!("load {id}"));
+        Ok(())
+    };
+    let err = load_reserved(&gate, "util", "darkmux:util", 16_384, &slow).err().expect("refused");
+    assert_eq!(refusal_code(&err), Some("memory_in_use"), "{err:#}");
+    assert!(format!("{err:#}").contains("`critical` memory pressure") && format!("{err:#}").contains("unloaded"), "{err:#}");
+    assert_eq!(gate.calls(), ["load darkmux:util", "unload darkmux:util"], "the load it made is cut");
+    assert_eq!(reserved_now(), 0, "its reservation ends");
+    assert!(LeaseGuard::acquire().all_live_leased_models().is_empty(), "and its lease");
+}
+
+/// The same for a wave: a load that returns onto a machine whose pressure
+/// turned critical is unloaded, and the wave refused.
+#[test]
+#[serial_test::serial]
+fn pressure_turning_critical_during_a_waves_load_unloads_it_and_refuses() {
+    use darkmux_platform::PressureLevel;
+    let rig = Rig::new();
+    let free = || Some(64 * GIB);
+    let machine = FakeMachine::new(&free).pressed(&[PressureLevel::Normal, PressureLevel::Critical]);
+    let mut host = MockHost::new().cataloged("m", 20 * GIB);
+    let err = load(&mut host, &wave("m"), &rig.room(&machine)).expect_err("refused");
+    assert_eq!(refusal_code(&err), Some("memory_in_use"), "{err:#}");
+    assert!(format!("{err:#}").contains("unloaded"), "{err:#}");
+    let unloads: Vec<&HostOp> = host.ops.iter().filter(|op| matches!(op, HostOp::Unload { .. })).collect();
+    assert_eq!(unloads.len(), 1, "the load it made is cut: {:?}", host.ops);
+    assert!(loaded(&host), "after it loaded: {:?}", host.ops);
+    assert_eq!(reserved_now(), 0, "its reservation ends");
+}
+
+/// A load under no critical pressure is left alone.
+#[test]
+#[serial_test::serial]
+fn a_load_under_warning_pressure_mid_load_is_kept() {
+    use darkmux_platform::PressureLevel;
+    let rig = Rig::new();
+    let free = || Some(64 * GIB);
+    let machine = FakeMachine::new(&free).pressed(&[PressureLevel::Normal, PressureLevel::Warning]);
+    let mut host = MockHost::new().cataloged("m", 20 * GIB);
+    load(&mut host, &wave("m"), &rig.room(&machine)).expect("loads");
+    assert!(!host.ops.iter().any(|op| matches!(op, HostOp::Unload { .. })), "{:?}", host.ops);
+}
+
+/// The pressure gate is asked before anything is evicted: a wave refused
+/// under pressure leaves darkmux's idle server running, and loads nothing.
+#[test]
+#[serial_test::serial]
+fn a_wave_refused_under_pressure_stops_no_idle_server() {
+    use darkmux_platform::PressureLevel;
+    let rig = Rig::new();
+    let mut tf = FakeServer::darkmux(&rig.dirs(), "tf", "TensorFold/q", 1_000);
+    let rec = tf.rec.clone();
+    let free = || Some(if server::alive(&rec) { 8 * GIB } else { 64 * GIB });
+    let machine = FakeMachine::new(&free).pressed(&[PressureLevel::Warning]);
+    let mut host = MockHost::new().cataloged("m", 20 * GIB);
+    let err = load(&mut host, &wave("m"), &rig.room(&machine)).expect_err("refused");
+    assert_eq!(refusal_code(&err), Some("memory_in_use"), "{err:#}");
+    assert!(format!("{err:#}").contains("already under pressure"), "{err:#}");
+    assert!(tf.running(), "the idle server was not stopped");
+    assert!(!loaded(&host), "{:?}", host.ops);
+}
+
+/// The same for a preflight load: no idle server is stopped and no idle LM
+/// Studio load unloaded.
+#[test]
+#[serial_test::serial]
+fn a_preflight_refused_under_pressure_evicts_nothing() {
+    use darkmux_platform::PressureLevel;
+    let rig = Rig::new();
+    let mut tf = FakeServer::darkmux(&rig.dirs(), "tf", "TensorFold/q", 1_000);
+    let rec = tf.rec.clone();
+    let unloads = Mutex::new(Vec::new());
+    let free = || Some(if server::alive(&rec) { 8 * GIB } else { 64 * GIB });
+    let machine = FakeMachine { lms_unloads: Some(&unloads), ..FakeMachine::new(&free) }.pressed(&[PressureLevel::Warning]);
+    let gate = FakePreflight::on(rig.dirs(), &machine).resident("darkmux:orphan", "orphan", 8_000, 16 * GIB).cataloged("m", 20 * GIB);
+    let err = preflight(&gate, "m").expect_err("refused");
+    assert_eq!(refusal_code(&err), Some("memory_in_use"), "{err:#}");
+    assert!(tf.running(), "the idle server was not stopped");
+    assert!(unloads.lock().unwrap().is_empty(), "no idle load was unloaded: {:?}", unloads.lock().unwrap());
+    assert!(gate.calls().is_empty(), "nothing loaded: {:?}", gate.calls());
+}
+
+/// A reload under pressure keeps the instance it would replace: its stale
+/// instance is unloaded only once the load it makes way for may go ahead.
+#[test]
+#[serial_test::serial]
+fn a_preflight_reload_refused_under_pressure_unloads_nothing() {
+    use darkmux_platform::PressureLevel;
+    let rig = Rig::new();
+    let free = || Some(64 * GIB);
+    let machine = FakeMachine::new(&free).pressed(&[PressureLevel::Warning]);
+    let gate = FakePreflight::on(rig.dirs(), &machine).resident("darkmux:m", "m", 4_096, 20 * GIB).cataloged("m", 20 * GIB);
+    let err = preflight(&gate, "m").expect_err("refused");
+    assert_eq!(refusal_code(&err), Some("memory_in_use"), "{err:#}");
+    assert!(gate.calls().is_empty(), "the stale instance stays: {:?}", gate.calls());
+}
+
+/// A preflight's load cut for pressure is never unloaded while a running
+/// dispatch holds it: one that took up the instance as it finished loading
+/// keeps it, and the refusal says the instance was left loaded and why.
+#[test]
+#[serial_test::serial]
+fn a_load_cut_for_pressure_is_left_loaded_when_a_dispatch_took_it_up() {
+    use darkmux_platform::PressureLevel;
+    let rig = Rig::new();
+    let free = || Some(64 * GIB);
+    let machine = FakeMachine::new(&free).pressed(&[PressureLevel::Normal, PressureLevel::Critical]);
+    let gate = FakePreflight::on(rig.dirs(), &machine).priced("util", 5 * GIB).reading_leases();
+    let peer = Mutex::new(None);
+    let taken_up = |_: &str, id: &str, _: u32| -> anyhow::Result<()> {
+        *peer.lock().unwrap() = Some(lease_on(id));
+        gate.calls.lock().unwrap().push(format!("load {id}"));
+        Ok(())
+    };
+    let err = load_reserved(&gate, "util", "darkmux:util", 16_384, &taken_up).err().expect("refused");
+    assert_eq!(refusal_code(&err), Some("memory_in_use"), "{err:#}");
+    assert!(format!("{err:#}").contains("left `darkmux:util` loaded"), "{err:#}");
+    assert_eq!(gate.calls(), ["load darkmux:util"], "never unloaded under the dispatch that holds it");
+    assert_eq!(reserved_now(), 0, "its reservation ends");
+}
+
+/// Another dispatch's lease on `identifier`, marked loaded: it is running
+/// on it.
+fn lease_on(identifier: &str) -> LeaseGuard {
+    let lease = LeaseGuard::acquire();
+    lease.write(&[identifier.to_string()]).unwrap();
+    lease.mark_loaded(&[identifier.to_string()]).unwrap();
+    lease
+}
+
+/// A mock LM Studio on which another dispatch takes up each instance the
+/// moment it is loaded.
+struct TakenUp {
+    inner: ArchHost,
+    peers: Vec<LeaseGuard>,
+}
+
+impl ModelHost for TakenUp {
+    fn list_resident(&mut self) -> Result<Vec<ResidentFact>, darkmux_gestalt::HostError> {
+        self.inner.list_resident()
+    }
+    fn list_catalog(&mut self) -> Result<Vec<CatalogFact>, darkmux_gestalt::HostError> {
+        self.inner.list_catalog()
+    }
+    fn load(&mut self, k: &str, id: &str, ctx: u32, d: darkmux_gestalt::Deadline) -> Result<darkmux_gestalt::LoadReport, darkmux_gestalt::HostError> {
+        let report = self.inner.load(k, id, ctx, d)?;
+        self.peers.push(lease_on(id));
+        Ok(report)
+    }
+    fn unload(&mut self, t: &darkmux_gestalt::OwnedTarget, d: darkmux_gestalt::Deadline) -> Result<(), darkmux_gestalt::HostError> {
+        self.inner.unload(t, d)
+    }
+    fn on_this_machine(&self) -> bool {
+        self.inner.on_this_machine()
+    }
+    fn arch_facts(&mut self, keys: &[&str]) -> darkmux_gestalt::ModelArch {
+        self.inner.arch_facts(keys)
+    }
+}
+
+/// The same for a wave's load: an instance a running dispatch took up is
+/// left loaded, and the wave is refused saying so.
+#[test]
+#[serial_test::serial]
+fn a_waves_load_cut_for_pressure_is_left_loaded_when_a_dispatch_took_it_up() {
+    use darkmux_platform::PressureLevel;
+    let rig = Rig::new();
+    let free = || Some(64 * GIB);
+    let machine = FakeMachine::new(&free).pressed(&[PressureLevel::Normal, PressureLevel::Critical]);
+    let mut host = TakenUp { inner: ArchHost::new(MockHost::new().cataloged("m", 20 * GIB), Format::Gguf), peers: Vec::new() };
+    let lease = LeaseGuard::acquire();
+    let err = ensure_wave_loaded(&wave("m"), &FixedEstimator::default(), &mut host, &lease, None, &rig.room(&machine)).expect_err("refused");
+    assert_eq!(refusal_code(&err), Some("memory_in_use"), "{err:#}");
+    assert!(format!("{err:#}").contains("left `darkmux:m` loaded"), "{err:#}");
+    assert!(!host.inner.inner.ops.iter().any(|op| matches!(op, HostOp::Unload { .. })), "never unloaded: {:?}", host.inner.inner.ops);
+    assert_eq!(host.peers.len(), 1, "the dispatch that took it up");
 }

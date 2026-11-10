@@ -7,6 +7,7 @@ pub struct FakePlatform {
     pub container_user: ContainerUser,
     pub machine_uid: Option<String>,
     pub reclaimable_memory_bytes: Option<u64>,
+    pub memory_pressure: Option<crate::MemoryPressure>,
     /// `(pid, stamp)` pairs [`Platform::process_start_stamp`] answers; any
     /// other pid reads as `None`.
     pub process_start_stamps: Vec<(u32, u64)>,
@@ -43,6 +44,7 @@ impl Default for FakePlatform {
             container_user: ContainerUser::Image,
             machine_uid: None,
             reclaimable_memory_bytes: None,
+            memory_pressure: None,
             process_start_stamps: Vec::new(),
             process_footprints: Vec::new(),
             pid_namespace: None,
@@ -116,6 +118,10 @@ impl Platform for FakePlatform {
 
     fn reclaimable_memory_bytes(&self) -> Option<u64> {
         self.reclaimable_memory_bytes
+    }
+
+    fn memory_pressure(&self) -> Option<crate::MemoryPressure> {
+        self.memory_pressure
     }
 
     fn process_start_stamp(&self, pid: u32) -> Option<u64> {

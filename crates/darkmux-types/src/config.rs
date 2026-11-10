@@ -445,6 +445,11 @@ use std::path::Path;
 //           `engines.flint.bin` (`DARKMUX_FLINT_BIN`), the `rec` command for
 //           a `"managed": "flint"` endpoint. Absent = `rec` on `PATH`. An
 //           older binary refuses a config carrying it.
+//           Also ADDED (#3538, unreleased with 2.8, so folded into it):
+//           `runtime.memory.pressure_gate` (`DARKMUX_MEMORY_PRESSURE_GATE`;
+//           `warning`, `critical` or `off`, default `warning`), the memory
+//           pressure at which darkmux refuses to start or load a model. An
+//           older binary refuses a config carrying it.
 pub const CONFIG_SCHEMA_VERSION: &str = "2.8";
 
 /// A `config.json` key an older darkmux read (and `init` may have written)
@@ -1191,6 +1196,9 @@ pub struct RuntimeBehaviorConfig {
     /// (#2110/#2109) The thermal governor + breaker's tuning block. See
     /// [`ThermalConfig`]'s own doc for the pause/resume/breaker semantics.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub thermal: Option<ThermalConfig>,
+    /// (#3538) The memory pressure gate on a model's start or load. See
+    /// [`MemoryConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub memory: Option<MemoryConfig>,
     /// (#2846) Per-detector policy block. The runtime carries several
     /// detectors that WATCH a dispatch and ACT on what they find; this is
     /// where an operator says how much authority each one has. See
@@ -1424,6 +1432,19 @@ pub struct DetectionConfig {
     /// `observe` the check-in still fires on exactly the same cadence and the
     /// tail ratio is still computed and recorded; what stops is the cut.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub degeneracy: Option<DetectorConfig>,
+    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[schemars(skip)]
+    pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+/// (#3538) What darkmux does about memory pressure when it starts an engine
+/// server or loads a model into LM Studio. Visible and on by default, like
+/// the thermal block: the operator tunes the file, not the source.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MemoryConfig {
+    /// The pressure at which a start or load is refused `memory_in_use`:
+    /// `warning`, `critical` or `off` ([`PressureGate`]). Default `warning`.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub pressure_gate: Option<String>,
     #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
     #[schemars(skip)]
     pub extras: serde_json::Map<String, serde_json::Value>,
@@ -2202,6 +2223,30 @@ impl From<FleetMode> for DeclaredFleetMode {
     }
 }
 
+/// (#3538) `runtime.memory.pressure_gate`: the memory pressure at which
+/// darkmux refuses to start an engine server or load a model into LM Studio,
+/// however much memory the arithmetic says is free
+/// ([`crate::memory_pressure`]). A start of darkmux's own that is already
+/// under way is stopped when pressure turns critical under either gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PressureGate {
+    Warning,
+    Critical,
+    Off,
+}
+
+impl PressureGate {
+    pub fn as_str(self) -> &'static str {
+        crate::config_enum::ConfigEnum::token(self)
+    }
+}
+
+crate::config_enum!(PressureGate, "memory pressure gate", [
+    Warning = "warning" => "refuse a start or load while memory pressure is at warning or above; stop darkmux's own start if it turns critical",
+    Critical = "critical" => "refuse a start or load only while memory pressure is critical; stop darkmux's own start if it turns critical",
+    Off = "off" => "never refuse or stop on memory pressure: only the memory arithmetic decides",
+]);
+
 /// (#2947) An OS thermal state, as `runtime.thermal.pause_at` / `resume_at`
 /// name one. Declared in severity order, mildest first: the governor ranks a
 /// state by its position (`darkmux_crew::host_probe::thermal::THERMAL_STATES`
@@ -2376,6 +2421,10 @@ impl DarkmuxConfig {
                         policy: Some(DetectionPolicy::Conclude.as_str().to_string()),
                         extras: Default::default(),
                     }),
+                    extras: Default::default(),
+                }),
+                memory: Some(MemoryConfig {
+                    pressure_gate: Some(crate::config_access::MEMORY_PRESSURE_GATE_DEFAULT.to_string()),
                     extras: Default::default(),
                 }),
                 thermal: Some(ThermalConfig {
