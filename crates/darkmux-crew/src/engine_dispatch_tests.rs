@@ -9,14 +9,19 @@ use std::time::Duration;
 
 /// What the stand-in prints for `capabilities --json` and `serve --help`: a
 /// few flags, `--keep-warm` taking a value.
-const FAKE_CAPS: &str = r#"{"schema":1,"serve":{"flags":{"--host":{},"--port":{},"--name":{},"--context":{},"--allowed-host":{},"--no-update-check":{},"--keep-warm":{},"--slide":{}}}}"#;
-const FAKE_USAGE: &str = "usage: tensorfold serve [-h] [--host HOST] [--port PORT] [--name NAME] [--allowed-host NAME] [--context CONTEXT] [--keep-warm SECONDS] [--slide] [--no-update-check] model";
+const FAKE_CAPS: &str = r#"{"schema":1,"serve":{"flags":{"--drafter":{},"--host":{},"--port":{},"--name":{},"--context":{},"--allowed-host":{},"--no-update-check":{},"--keep-warm":{},"--slide":{}}}}"#;
+const FAKE_USAGE: &str = "usage: tensorfold serve [-h] [--drafter DRAFTER] [--host HOST] [--port PORT] [--name NAME] [--allowed-host NAME] [--context CONTEXT] [--keep-warm SECONDS] [--slide] [--no-update-check] model";
 
 /// A stand-in `tensorfold-native`: `--version`, `info` (with the memory
 /// floor the test asks for), `capabilities --json` and `serve --help`
 /// ([`FAKE_CAPS`], [`FAKE_USAGE`]), and `serve`, which runs a tiny server
 /// answering `GET /v1/models` with its `--name`.
 fn fake_tensorfold(dir: &std::path::Path, version: &str, floor_gib: f64) -> PathBuf {
+    fake_tensorfold_of(dir, version, GIB, floor_gib)
+}
+
+/// [`fake_tensorfold`], its `info` naming `weights_bytes` of weights.
+fn fake_tensorfold_of(dir: &std::path::Path, version: &str, weights_bytes: u64, floor_gib: f64) -> PathBuf {
     // Stable scripts behind a per-test link (see `stable_script`): a freshly
     // written executable can wait seconds for macOS to assess it.
     let server = stable_script(
@@ -43,9 +48,9 @@ S(("127.0.0.1", port), H).serve_forever()
 "#,
     );
     let stable = stable_script(
-        "tensorfold-native",
+        &format!("tensorfold-native-{weights_bytes}"),
         &format!(
-            "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'tensorfold-native {version}' ;;\n  info) printf 'weights: 1.00 GiB (1073741824 bytes)\\nmemory floor: {floor_gib:.2} GiB (weights plus a margin)\\n' ;;\n  capabilities) echo '{FAKE_CAPS}' ;;\n  serve) if [ \"$2\" = --help ]; then echo '{FAKE_USAGE}'; exit 0; fi; shift; exec python3 -u {} serve \"$@\" ;;\nesac\n",
+            "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'tensorfold-native {version}' ;;\n  info) printf 'weights: 1.00 GiB ({weights_bytes} bytes)\\nmemory floor: {floor_gib:.2} GiB (weights plus a margin)\\n' ;;\n  capabilities) echo '{FAKE_CAPS}' ;;\n  serve) if [ \"$2\" = --help ]; then echo '{FAKE_USAGE}'; exit 0; fi; shift; exec python3 -u {} serve \"$@\" ;;\nesac\n",
             server.display()
         ),
     );
@@ -64,8 +69,12 @@ fn target(model: &str, port: u16) -> crate::target::Target {
 }
 
 fn target_with_args(model: &str, port: u16, engine_args: &[&str]) -> crate::target::Target {
+    target_at(model, port, 8192, engine_args)
+}
+
+fn target_at(model: &str, port: u16, n_ctx: u32, engine_args: &[&str]) -> crate::target::Target {
     let mut reg: darkmux_types::ProfileRegistry = serde_json::from_value(serde_json::json!({
-        "profiles": {"p": {"models": [{"id": model, "n_ctx": 8192, "endpoint": "tf", "engine_args": engine_args}]}},
+        "profiles": {"p": {"models": [{"id": model, "n_ctx": n_ctx, "endpoint": "tf", "engine_args": engine_args}]}},
         "endpoints": {"tf": {"managed": "tensorfold", "port": port}}
     }))
     .unwrap();
@@ -90,6 +99,18 @@ struct FakeMachine {
     capacity: Option<u64>,
     /// The standing utility binding (#3507).
     utility: Option<String>,
+    /// The memory pressure each reading finds, in order; the last one
+    /// stays. Empty: none can be read.
+    pressure: RefCell<Vec<darkmux_platform::MemoryPressure>>,
+    /// How many times the pressure was read.
+    pressure_reads: RefCell<u32>,
+    /// `runtime.memory.pressure_gate`; `None` is its default.
+    gate: Option<darkmux_types::config::PressureGate>,
+}
+
+/// A pressure reading at the kernel's `level`.
+fn pressure_at(level: darkmux_platform::PressureLevel) -> darkmux_platform::MemoryPressure {
+    darkmux_platform::MemoryPressure { level: Some(level), swap_used_bytes: Some(24 * GIB), swap_free_bytes: Some(GIB), compressor_pct: Some(40), compressor_segments_pct: Some(40) }
 }
 
 impl Machine for FakeMachine {
@@ -118,6 +139,18 @@ impl Machine for FakeMachine {
     }
     fn utility(&self) -> Option<String> {
         self.utility.clone()
+    }
+    fn pressure(&self) -> Option<darkmux_platform::MemoryPressure> {
+        *self.pressure_reads.borrow_mut() += 1;
+        let mut readings = self.pressure.borrow_mut();
+        if readings.len() > 1 {
+            Some(readings.remove(0))
+        } else {
+            readings.first().copied()
+        }
+    }
+    fn pressure_gate(&self) -> darkmux_types::config::PressureGate {
+        self.gate.unwrap_or(darkmux_types::config::PressureGate::Warning)
     }
 }
 
@@ -1323,8 +1356,11 @@ fn a_queued_dispatch_starts_once_the_holders_lease_goes_never_evicting_it_while_
     );
 }
 
-/// A machine whose leases are this process's real ones, with room to spare.
-struct RealLeases;
+/// A machine whose leases are this process's real ones, with room to spare
+/// and no pressure: what an end-to-end dispatch test stands in for the host
+/// ([`super::with_test_machine`]), so it never depends on the runner's
+/// memory.
+pub(crate) struct RealLeases;
 
 impl Machine for RealLeases {
     fn reclaimable(&self) -> Option<u64> {
@@ -1928,4 +1964,257 @@ fn the_machine_measures_a_server_as_its_whole_group() {
     if let Some(leader) = leader {
         assert!(measured.is_some_and(|m| m > leader), "the group, not the leader alone: {measured:?} vs {leader}");
     }
+}
+
+// ── #3538: a start is priced at what it commits, refused under memory
+// pressure, and stopped if pressure turns critical while it starts ───────
+
+/// The measured model's `info`: 16.08 GB of weights, a 16.98 GiB floor.
+const MEASURED_WEIGHTS: u64 = 16_081_519_429;
+
+/// The start that panicked a 128 GB machine: a 262,144 context with a
+/// drafter, priced at its 18.2 GB floor, went ahead beside an idle 30 GiB
+/// resident and committed 67 GB. Priced near what it commits, it evicts
+/// the idle resident first, and reserves that price.
+#[test]
+#[serial_test::serial]
+fn a_long_context_start_is_priced_near_what_it_commits_and_evicts_for_it() {
+    let r = rig();
+    let tf = Tensorfold::at(fake_tensorfold_of(r.dir.path(), "1.2.4", MEASURED_WEIGHTS, 16.98).to_string_lossy().into_owned());
+    let machine = FakeMachine {
+        reclaimable: RefCell::new(Some(40 * GIB)),
+        frees_per_unload: 30 * GIB,
+        lms: RefCell::new(vec!["darkmux:idle".into()]),
+        ..Default::default()
+    };
+    let t = target_at("TensorFold/m", free_port(), 262_144, &["--drafter", "z-lab/d"]);
+    let mut notes = Vec::new();
+    let ready = prepare_in(&t, &r.dirs, &tf, quick(), &machine, &mut |n, p| notes.push((n, p))).unwrap();
+    assert!(ready.started);
+    assert_eq!(*machine.unloaded.borrow(), vec!["darkmux:idle".to_string()], "40 GiB free does not hold a 67 GB start");
+    assert_eq!(notes[0].1.evicted, vec!["darkmux:idle".to_string()]);
+    let reserved = reserved_now() as f64 / 1e9;
+    assert!((67.3..72.0).contains(&reserved), "the start reserves about 67 GB, not its 18.2 GB floor: {reserved:.1} GB");
+}
+
+/// With nothing of darkmux's to evict, the same start is refused: it never
+/// goes ahead on its weights floor.
+#[test]
+#[serial_test::serial]
+fn a_long_context_start_that_does_not_fit_is_refused_not_started_on_its_floor() {
+    let r = rig();
+    let tf = Tensorfold::at(fake_tensorfold_of(r.dir.path(), "1.2.4", MEASURED_WEIGHTS, 16.98).to_string_lossy().into_owned());
+    let machine = FakeMachine { reclaimable: RefCell::new(Some(40 * GIB)), capacity: Some(128 * GIB), ..Default::default() };
+    let t = target_at("TensorFold/m", free_port(), 262_144, &["--drafter", "z-lab/d"]);
+    let err = prepare_in(&t, &r.dirs, &tf, quick(), &machine, &mut |_, _| {}).err().expect("refused");
+    assert_eq!(err.code, "memory_in_use", "{err}");
+    assert!(err.message.contains("66.4 GiB"), "the price is named: {err}");
+    assert!(err.message.contains("estimate"), "and that it is an estimate: {err}");
+    assert_eq!(engine_record::list_in(&r.dirs.records).0.len(), 0, "nothing was started");
+}
+
+/// A start that fits by the arithmetic is refused while the machine is
+/// already under memory pressure, naming the reading; nothing starts and
+/// nothing stays reserved.
+#[test]
+#[serial_test::serial]
+fn high_memory_pressure_refuses_a_start_that_fits() {
+    use darkmux_platform::PressureLevel;
+    let r = rig();
+    let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 2.0).to_string_lossy().into_owned());
+    let machine = FakeMachine {
+        reclaimable: RefCell::new(Some(64 * GIB)),
+        pressure: RefCell::new(vec![pressure_at(PressureLevel::Warning)]),
+        ..Default::default()
+    };
+    let t = target("TensorFold/m", free_port());
+    let mut notes = Vec::new();
+    let err = prepare_in(&t, &r.dirs, &tf, quick(), &machine, &mut |n, p| notes.push((n, p))).err().expect("refused");
+    assert_eq!(err.code, "memory_in_use", "{err}");
+    for part in ["`warning` memory pressure", "24.0 GiB of swap", "40% of its limit", "runtime.memory.pressure_gate"] {
+        assert!(err.message.contains(part), "{part}: {err}");
+    }
+    assert!(notes.is_empty(), "no start was reported: {notes:?}");
+    assert_eq!(engine_record::list_in(&r.dirs.records).0.len(), 0, "nothing was started");
+    assert_eq!(reserved_now(), 0, "nothing stays reserved");
+}
+
+/// The gate is asked before anything is evicted: a start refused under
+/// pressure leaves darkmux's idle residents loaded, whether the kernel's
+/// level says warning or only the compressor's segments do. Evicting first
+/// and refusing after freed memory for nothing and said nothing of it.
+#[test]
+#[serial_test::serial]
+fn a_start_refused_under_pressure_evicts_nothing() {
+    use darkmux_platform::PressureLevel;
+    let segments = darkmux_platform::MemoryPressure { compressor_segments_pct: Some(75), compressor_pct: Some(75), ..pressure_at(PressureLevel::Normal) };
+    for reading in [pressure_at(PressureLevel::Warning), segments] {
+        let r = rig();
+        let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 2.0).to_string_lossy().into_owned());
+        // 1 GiB free does not hold the start; evicting the idle load would.
+        let machine = FakeMachine {
+            reclaimable: RefCell::new(Some(GIB)),
+            frees_per_unload: 30 * GIB,
+            lms: RefCell::new(vec!["darkmux:idle".into()]),
+            pressure: RefCell::new(vec![reading]),
+            ..Default::default()
+        };
+        let err = prepare_in(&target("TensorFold/m", free_port()), &r.dirs, &tf, quick(), &machine, &mut |_, _| {}).err().expect("refused");
+        assert_eq!(err.code, "memory_in_use", "{err}");
+        assert!(err.message.contains("already under pressure"), "refused for the pressure, not the arithmetic: {err}");
+        assert!(machine.unloaded.borrow().is_empty(), "nothing was evicted: {:?}", machine.unloaded.borrow());
+        assert_eq!(engine_record::list_in(&r.dirs.records).0.len(), 0, "nothing was started");
+    }
+}
+
+/// The gate is the operator's: `critical` lets a start through at warning,
+/// and `off` lets it through at critical.
+#[test]
+#[serial_test::serial]
+fn the_pressure_gate_setting_decides_what_refuses() {
+    use darkmux_platform::PressureLevel;
+    use darkmux_types::config::PressureGate;
+    for (gate, level) in [(PressureGate::Critical, PressureLevel::Warning), (PressureGate::Off, PressureLevel::Critical)] {
+        let r = rig();
+        let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 2.0).to_string_lossy().into_owned());
+        let machine = FakeMachine {
+            reclaimable: RefCell::new(Some(64 * GIB)),
+            pressure: RefCell::new(vec![pressure_at(level)]),
+            gate: Some(gate),
+            ..Default::default()
+        };
+        let ready = prepare_in(&target("TensorFold/m", free_port()), &r.dirs, &tf, quick(), &machine, &mut |_, _| {});
+        assert!(ready.is_ok_and(|ready| ready.started), "{gate:?} at {level:?} starts");
+    }
+}
+
+/// Pressure that turns critical while darkmux's own server is starting
+/// stops that server at once and refuses the dispatch: the record is gone,
+/// its process is gone, and its reservation and lease with it.
+#[test]
+#[serial_test::serial]
+fn pressure_turning_critical_mid_start_stops_the_server_and_refuses() {
+    use darkmux_platform::PressureLevel;
+    let r = rig();
+    let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 2.0).to_string_lossy().into_owned());
+    // Normal when the start is decided; critical from the first poll after
+    // the spawn. `--slide` keeps the server from answering for 1.5 s.
+    let machine = FakeMachine {
+        reclaimable: RefCell::new(Some(64 * GIB)),
+        pressure: RefCell::new(vec![pressure_at(PressureLevel::Normal), pressure_at(PressureLevel::Critical)]),
+        ..Default::default()
+    };
+    let t = target_with_args("TensorFold/m", free_port(), &["--slide"]);
+    let spawned: RefCell<Option<EngineRecord>> = RefCell::new(None);
+    let mut note = |n: Note, _: DispatchModelPayload| {
+        if n == Note::Start {
+            assert!(spawned.borrow().is_none());
+        }
+    };
+    let began = std::time::Instant::now();
+    let watched = prepare_with(&t, &r.dirs, &tf, quick(), &WatchingMachine { inner: &machine, dirs: &r.dirs, seen: &spawned }, &unhurried(), &mut note);
+    let err = match watched {
+        Err(NotResident::Refused(refusal)) => refusal,
+        Err(NotResident::Stopped(why)) => panic!("no stop was given: {why}"),
+        Ok(_) => panic!("the start went ahead under critical pressure"),
+    };
+    assert_eq!(err.code, "memory_in_use", "{err}");
+    assert!(err.message.contains("`critical` memory pressure") && err.message.contains("stopped the server"), "{err}");
+    assert!(began.elapsed() < Duration::from_millis(1400), "stopped before the server would have answered: {:?}", began.elapsed());
+    let rec = spawned.borrow().clone().expect("the server was spawned before it was stopped");
+    assert!(!server::alive(&rec), "the server darkmux was starting is gone");
+    assert_eq!(engine_record::list_in(&r.dirs.records).0.len(), 0, "its record with it");
+    assert_eq!(reserved_now(), 0, "and its reservation");
+    assert!(LeaseGuard::acquire().all_live_leased_models().is_empty(), "and the dispatch's lease");
+}
+
+/// A [`FakeMachine`] that notes the server on the rig's endpoint each time
+/// the pressure is read, so a test can tell the process that was spawned.
+struct WatchingMachine<'a> {
+    inner: &'a FakeMachine,
+    dirs: &'a Dirs,
+    seen: &'a RefCell<Option<EngineRecord>>,
+}
+
+impl Machine for WatchingMachine<'_> {
+    fn reclaimable(&self) -> Option<u64> {
+        self.inner.reclaimable()
+    }
+    fn footprint(&self, pid: u32) -> Option<u64> {
+        self.inner.footprint(pid)
+    }
+    fn lmstudio_residents(&self) -> Vec<String> {
+        self.inner.lmstudio_residents()
+    }
+    fn lmstudio_unload(&self, identifier: &str) -> anyhow::Result<()> {
+        self.inner.lmstudio_unload(identifier)
+    }
+    fn leased(&self, own: &LeaseGuard) -> Vec<String> {
+        self.inner.leased(own)
+    }
+    fn capacity(&self) -> Option<u64> {
+        self.inner.capacity()
+    }
+    fn pressure(&self) -> Option<darkmux_platform::MemoryPressure> {
+        if let Ok(Some(rec)) = engine_record::read_in(&self.dirs.records, "tf") {
+            *self.seen.borrow_mut() = Some(rec);
+        }
+        self.inner.pressure()
+    }
+}
+
+/// A start that is never pressed is watched and goes ahead: the pressure
+/// is read while it starts, and a warning mid-start stops nothing.
+#[test]
+#[serial_test::serial]
+fn a_start_under_no_critical_pressure_is_watched_and_goes_ahead() {
+    use darkmux_platform::PressureLevel;
+    let r = rig();
+    let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 2.0).to_string_lossy().into_owned());
+    let machine = FakeMachine {
+        reclaimable: RefCell::new(Some(64 * GIB)),
+        pressure: RefCell::new(vec![pressure_at(PressureLevel::Normal), pressure_at(PressureLevel::Warning)]),
+        ..Default::default()
+    };
+    let t = target_with_args("TensorFold/m", free_port(), &["--slide"]);
+    let ready = prepare_in(&t, &r.dirs, &tf, quick(), &machine, &mut |_, _| {}).unwrap();
+    assert!(ready.started);
+    assert!(*machine.pressure_reads.borrow() > 5, "read at every poll of a 1.5 s start: {}", machine.pressure_reads.borrow());
+}
+
+/// A Flint start is priced over its weights: a margin, and the cache its
+/// context can grow to. Before, it was priced at its weights alone.
+#[test]
+#[serial_test::serial]
+fn a_flint_start_reserves_its_weights_a_margin_and_its_contexts_cache() {
+    let r = rig();
+    let rec = fake_rec(r.dir.path(), "0.1.0");
+    let machine = FakeMachine { reclaimable: RefCell::new(Some(64 * GIB)), ..Default::default() };
+    let ready = prepare_in(&flint_target("flint-int4", free_port()), &r.dirs, &rec, quick(), &machine, &mut |_, _| {}).unwrap();
+    assert!(ready.started);
+    // The stand-in's 1024 bytes of weights, 2 GB, and 42 KB for each of its 8192 tokens.
+    assert_eq!(reserved_now(), 1024 + 2_000_000_000 + 42_000 * 8192);
+}
+
+/// A start stopped for memory pressure is `memory_in_use`, and its refusal
+/// says whether the server was stopped or is still to be stopped.
+#[test]
+fn a_start_stopped_for_pressure_says_what_became_of_its_server() {
+    let stopped = server::ServerError::MemoryPressure {
+        endpoint: "tf".into(),
+        model: "TensorFold/m".into(),
+        reading: "the kernel reports `critical` memory pressure".into(),
+        left_running: None,
+    };
+    let refusal = server_refusal(stopped);
+    assert_eq!(refusal.code, "memory_in_use");
+    assert!(refusal.message.contains("`critical` memory pressure") && refusal.message.contains("darkmux stopped the server"), "{refusal}");
+    let left = server::ServerError::MemoryPressure {
+        endpoint: "tf".into(),
+        model: "TensorFold/m".into(),
+        reading: "r".into(),
+        left_running: Some("it is still running after SIGKILL".into()),
+    };
+    let said = left.to_string();
+    assert!(said.contains("could not stop the server") && said.contains("still running after SIGKILL") && said.contains("darkmux machine eject"), "{said}");
 }

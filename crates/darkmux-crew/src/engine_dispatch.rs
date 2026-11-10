@@ -15,16 +15,21 @@
 //! 2. When darkmux's server on the endpoint already runs this exact command,
 //!    it is reused and nothing else happens.
 //! 3. Otherwise darkmux makes room: while the machine's reclaimable memory is
-//!    below the model's memory floor (the engine's own `info` figure),
+//!    below what the start is priced at (never less than it commits:
+//!    [`ServerEngine::memory_need`]),
 //!    it stops its own idle engine servers on other endpoints, oldest first,
 //!    then unloads its own idle LM Studio `darkmux:` loads. A resident a
 //!    running dispatch holds (a residency lease) is never touched: the
 //!    leases are read again before each eviction, and a server's under its
 //!    endpoint's lock, where it is stopped. When nothing is left to free,
 //!    the dispatch fails `busy` (something darkmux holds would free it
-//!    later) or `wont_fit`.
+//!    later) or `wont_fit`. A start that fits is still refused
+//!    `memory_in_use` while the machine's memory is already under pressure
+//!    ([`refuse_under_pressure`]).
 //! 4. It starts the server ([`darkmux_profiles::engine::server::ensure`]) and
 //!    waits until it answers, failing `port_in_use` or `model_start_failed`.
+//!    While it waits it reads the machine's memory pressure at every poll:
+//!    critical stops the server it is starting and fails `memory_in_use`.
 //!    Whether a running dispatch holds darkmux's server on the endpoint is
 //!    asked under the endpoint's lock, with the decision to stop it: one
 //!    that is held is reused when it runs the same command (however slowly
@@ -73,7 +78,7 @@ use darkmux_flow::payload::DispatchModelPayload;
 use darkmux_types::config::BusyPolicy;
 use darkmux_profiles::engine::flint::{self, Rec};
 use darkmux_profiles::engine::server::{self, Dirs, Progress, ServerSpec};
-use darkmux_profiles::engine::tensorfold::Tensorfold;
+use darkmux_profiles::engine::tensorfold::{self, Tensorfold};
 use darkmux_types::engine_record::{self, EngineRecord};
 use darkmux_types::residency_lease::LeaseGuard;
 use darkmux_types::residency_reservation::{self, Reserved};
@@ -295,7 +300,9 @@ pub(crate) trait ServerEngine {
     /// The command for `model` on `endpoint`, refused with the code an app
     /// branches on (`engine_unavailable` for an engine darkmux cannot run).
     fn plan(&self, endpoint: &str, port: u16, model: &darkmux_types::ProfileModel) -> Result<ServerSpec, EngineRefusal>;
-    /// The memory the model needs, when the engine says.
+    /// What a start of the model is priced at: never less than it commits
+    /// (the engine's own conservative figure), or `None` when the engine's
+    /// install gives nothing to price it from.
     fn memory_need(&self, model: &darkmux_types::ProfileModel) -> Option<u64>;
     /// The address of a server the engine started itself (not darkmux),
     /// when one is up and it allows only one.
@@ -317,8 +324,12 @@ impl ServerEngine for Tensorfold {
         }
         self.serve_spec(endpoint, port, model, version).map_err(|e| refuse("model_start_failed", format!("{e:#}")))
     }
+    /// `info`'s weights and floor, priced with the KV cache Tensorfold
+    /// reserves at start for the model's context, and its drafter
+    /// ([`tensorfold::conservative_commitment`]).
     fn memory_need(&self, model: &darkmux_types::ProfileModel) -> Option<u64> {
-        self.info(&model.id).map(|i| i.memory_floor_bytes).ok()
+        let (info, n_ctx) = (self.info(&model.id).ok()?, model.require_n_ctx().ok()?);
+        Some(tensorfold::conservative_commitment(info, n_ctx, tensorfold::has_drafter(&model.engine_args)))
     }
     /// Tensorfold runs as many servers as it is asked for.
     fn own_server(&self) -> Result<Option<String>, EngineRefusal> {
@@ -332,9 +343,12 @@ impl ServerEngine for Rec {
         let version = self.verified_version().map_err(unavailable)?;
         self.serve_spec(endpoint, port, model, &version).map_err(unavailable)
     }
-    /// The weights on disk: rec says nothing of a model's memory.
+    /// The weights on disk, priced with a margin and the cache the model's
+    /// context can grow to ([`flint::conservative_commitment`]): rec says
+    /// nothing of a model's memory.
     fn memory_need(&self, model: &darkmux_types::ProfileModel) -> Option<u64> {
-        self.model_dir(&model.id).ok().and_then(|d| flint::weights_bytes(&d))
+        let weights = self.model_dir(&model.id).ok().and_then(|d| flint::weights_bytes(&d))?;
+        Some(flint::conservative_commitment(weights, model.require_n_ctx().ok()?))
     }
     fn own_server(&self) -> Result<Option<String>, EngineRefusal> {
         Rec::own_server(self).map_err(unavailable)
@@ -405,12 +419,42 @@ pub fn prepare(
         }
     };
     let base = queue_payload(target);
-    crate::budget::with_env(|env| {
-        let machine = ThisMachine { profiles_file: wait.caller.profiles_file };
-        let mut attempt =
-            |patience: &Patience<'_>, note: &mut dyn FnMut(Note, DispatchModelPayload)| prepare_with(target, &dirs, engine.as_ref(), bounds, &machine, patience, note);
-        wait_while_busy(wait, env, &base, &mut attempt, note)
+    with_machine(wait.caller.profiles_file, |machine| {
+        crate::budget::with_env(|env| {
+            let mut attempt =
+                |patience: &Patience<'_>, note: &mut dyn FnMut(Note, DispatchModelPayload)| prepare_with(target, &dirs, engine.as_ref(), bounds, machine, patience, note);
+            wait_while_busy(wait, env, &base, &mut attempt, note)
+        })
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's stand-in for this machine in [`prepare`], so a test that
+    /// dispatches end to end through a real engine-server start never
+    /// prices it against the host's memory, capacity or pressure.
+    /// Thread-local: [`prepare`] runs on the dispatching thread.
+    static TEST_MACHINE: std::cell::RefCell<Option<std::rc::Rc<dyn Machine>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with `machine` standing in for [`ThisMachine`] in [`prepare`] on
+/// this thread.
+#[cfg(test)]
+pub(crate) fn with_test_machine<T>(machine: std::rc::Rc<dyn Machine>, f: impl FnOnce() -> T) -> T {
+    TEST_MACHINE.with(|m| *m.borrow_mut() = Some(machine));
+    let out = f();
+    TEST_MACHINE.with(|m| *m.borrow_mut() = None);
+    out
+}
+
+/// Run `f` with the machine [`prepare`] decides against: this one, or a
+/// test's stand-in ([`with_test_machine`]).
+fn with_machine<T>(profiles_file: Option<&str>, f: impl FnOnce(&dyn Machine) -> T) -> T {
+    #[cfg(test)]
+    if let Some(machine) = TEST_MACHINE.with(|m| m.borrow().clone()) {
+        return f(&*machine);
+    }
+    f(&ThisMachine { profiles_file })
 }
 
 /// What a `dispatch.queue.*` record names: the engine, endpoint and model.
@@ -604,6 +648,16 @@ pub(crate) trait Machine {
     fn utility(&self) -> Option<String> {
         None
     }
+    /// The machine's memory pressure now
+    /// ([`darkmux_types::memory_pressure`]); `None` when it reads none.
+    fn pressure(&self) -> Option<darkmux_platform::MemoryPressure> {
+        None
+    }
+    /// `runtime.memory.pressure_gate`: the pressure at which a start or
+    /// load is refused.
+    fn pressure_gate(&self) -> darkmux_types::config::PressureGate {
+        darkmux_types::config::PressureGate::Warning
+    }
 }
 
 /// (#3509) How long a started server's reservation may outlive its answer
@@ -650,6 +704,25 @@ impl Machine for ThisMachine<'_> {
     }
     fn capacity(&self) -> Option<u64> {
         darkmux_platform::current().ram_installed_bytes()
+    }
+    fn pressure(&self) -> Option<darkmux_platform::MemoryPressure> {
+        darkmux_types::memory_pressure::read()
+    }
+    fn pressure_gate(&self) -> darkmux_types::config::PressureGate {
+        darkmux_types::memory_pressure::configured_gate()
+    }
+}
+
+/// Refuse `memory_in_use` while the machine's memory is already under
+/// pressure, naming the reading
+/// ([`darkmux_types::memory_pressure::refuses_start`]): asked under the
+/// residency lock by every start and load, before its memory arithmetic and
+/// anything it would evict, so a price that is wrong ends as a refusal and
+/// a refusal frees nothing for nobody.
+pub(crate) fn refuse_under_pressure(machine: &dyn Machine) -> Result<(), EngineRefusal> {
+    match darkmux_types::memory_pressure::refuses_start(machine.pressure_gate(), machine.pressure().as_ref()) {
+        Some(why) => Err(refuse("memory_in_use", format!("{why}; retry once memory is free"))),
+        None => Ok(()),
     }
 }
 
@@ -823,7 +896,7 @@ impl Start<'_> {
         let leased = held_now(machine, lease);
         refuse_a_held_server(current.as_ref(), &leased, endpoint)?;
         let room = Room { need: self.need, replacing: current.as_ref(), endpoint, leased: &leased, lease };
-        let (need, evicted) = make_room(&room, dirs, bounds, machine)?;
+        let (need, evicted) = room_unless_pressed(&room, dirs, bounds, machine)?;
         // Decided: the lease, and what the start needs, reserved apart from it.
         write_lease(lease, &spec.served_name)?;
         let mut reserved = Some(reserve(need, &spec.served_name)?);
@@ -839,8 +912,12 @@ impl Start<'_> {
             }
             report(p, &base, &replacing, &evicted, note)
         };
+        // While the server starts, the machine's pressure is read at every
+        // poll: critical stops this start's own server and refuses.
+        let gate = machine.pressure_gate();
+        let watch = || darkmux_types::memory_pressure::stops_start(gate, machine.pressure().as_ref());
         // A start that fails ends its reservation with `reserved`.
-        let ensured = server::ensure_locked(spec, dirs, bounds, &held, &mut progress, endpoint_lock).map_err(server_refusal)?;
+        let ensured = server::ensure_watched(spec, dirs, bounds, &held, &mut progress, endpoint_lock, &watch).map_err(server_refusal)?;
         let started = matches!(ensured, server::Ensured::Started(_));
         if let Some(reserved) = reserved.filter(|_| started) {
             leave_settling(reserved);
@@ -1004,7 +1081,8 @@ fn report(
 
 /// What a start needs room for.
 struct Room<'a> {
-    /// The model's memory floor; `None` when the engine did not say.
+    /// What the start is priced at; `None` when the engine gave nothing to
+    /// price it from.
     need: Option<u64>,
     /// darkmux's own server on this endpoint, which the start replaces.
     replacing: Option<&'a EngineRecord>,
@@ -1013,6 +1091,14 @@ struct Room<'a> {
     /// (through `lease`) before each eviction.
     leased: &'a [String],
     lease: &'a LeaseGuard,
+}
+
+/// A start's whole memory decision: the machine's own state
+/// ([`refuse_under_pressure`]), then [`make_room`] for its price. The gate
+/// comes first: a start refused under pressure evicts nothing.
+fn room_unless_pressed(room: &Room<'_>, dirs: &Dirs, bounds: server::Bounds, machine: &dyn Machine) -> Result<(u64, Vec<String>), EngineRefusal> {
+    refuse_under_pressure(machine)?;
+    make_room(room, dirs, bounds, machine)
 }
 
 /// Evict darkmux's own idle residents until the model's need is reclaimable
@@ -1036,7 +1122,7 @@ fn make_room(room: &Room<'_>, dirs: &Dirs, bounds: server::Bounds, machine: &dyn
     if let Some(total) = machine.capacity().filter(|t| need > *t) {
         return Err(refuse(
             "wont_fit",
-            format!("the model needs {:.1} GiB and this machine has {:.1} GiB in all", gib(need), gib(total)),
+            format!("the model needs {:.1} GiB and this machine has {:.1} GiB in all. {ESTIMATED}", gib(need), gib(total)),
         ));
     }
     // The server this start replaces frees its memory, and reserves none.
@@ -1068,7 +1154,9 @@ fn make_room(room: &Room<'_>, dirs: &Dirs, bounds: server::Bounds, machine: &dyn
             return Ok((need, evicted));
         }
         let Some(next) = idle.pop() else {
-            return Err(short_of_memory(need, usable(free), &held, reserved()));
+            let mut short = short_of_memory(need, usable(free), &held, reserved());
+            short.message = format!("{}. {ESTIMATED}", short.message);
+            return Err(short);
         };
         if evict(&next, dirs, bounds, machine, room.lease)? {
             evicted.push(next.name());
@@ -1078,6 +1166,11 @@ fn make_room(room: &Room<'_>, dirs: &Dirs, bounds: server::Bounds, machine: &dyn
         }
     }
 }
+
+/// Said with an engine server's price when it refuses a start: where the
+/// figure comes from, and what lowers it.
+const ESTIMATED: &str = "The figure is darkmux's estimate of what the start commits (the engine reports none before it \
+                         starts); a smaller `n_ctx` needs less";
 
 /// (#3510) Short of memory with nothing of darkmux's idle left to evict:
 /// `busy` when running dispatches hold some of it, or starts still paging in
