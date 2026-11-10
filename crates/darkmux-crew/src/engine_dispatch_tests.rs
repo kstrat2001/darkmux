@@ -1883,3 +1883,25 @@ fn a_dispatchs_waits_share_its_one_timeout() {
     assert_eq!(tries.get(), 3, "25 s + 5 s queued + 25 s + the 5 s left, then the one try at the bound");
     assert_eq!(env.paused_total(), 10_000, "the queue slept the 10 s the tries left of the 60 s");
 }
+
+/// (#3450) The room a dispatch frees by replacing its endpoint's server is
+/// the server's whole group's footprint, the figure the ledger shows, not
+/// the leader's alone (a server's leader can be tiny while a worker holds
+/// the weights).
+#[test]
+fn the_machine_measures_a_server_as_its_whole_group() {
+    let mut cmd = std::process::Command::new("sh");
+    cmd.args(["-c", "sleep 30 & sleep 30"]);
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let mut child = cmd.spawn().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let pid = child.id();
+    let leader = darkmux_platform::current().process_footprint(pid);
+    let machine = ThisMachine { profiles_file: None };
+    let measured = machine.footprint(pid);
+    let _ = darkmux_types::child_registry::kill_group(pid, darkmux_types::child_registry::SIGKILL);
+    let _ = child.wait();
+    if let Some(leader) = leader {
+        assert!(measured.is_some_and(|m| m > leader), "the group, not the leader alone: {measured:?} vs {leader}");
+    }
+}

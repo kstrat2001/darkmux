@@ -11,6 +11,8 @@ import { MachineIcon } from "../../components/MachineIcon";
 import { TokenScope } from "../../components/TokenScope";
 import { UtilityGlyph } from "../../components/UtilityGlyph";
 import { ServesLine } from "../../components/ServesLine";
+import { serversLine, serversTitle } from "../../lib/engineServers";
+import type { EngineServer } from "../../types/generated/EngineServer";
 import { LampDot } from "../../components/LampDot";
 import { LampForm } from "../../lib/lamp";
 import { WALL_CLOCK } from "../../lib/restHand";
@@ -368,6 +370,19 @@ function CardTube({
   return null;
 }
 
+/** (#3450) The servers the machine's darkmux started, as its residents:
+ * "starting the model" first for one that does not answer yet, then the
+ * resident ones; the title names each in full. Nothing when it runs none. */
+function ServersLine({ servers }: { servers: readonly EngineServer[] }) {
+  const line = serversLine(servers);
+  if (!line) return null;
+  return (
+    <div className="serves" data-testid="engine-servers-line" title={serversTitle(servers)}>
+      {line}
+    </div>
+  );
+}
+
 /** What the tube needs of the page's clock. */
 export interface CardClock {
   playhead: number | null;
@@ -444,6 +459,7 @@ export function MachineCard({
         <StatusLine status={status} note={card.note} reading={reading} />
         <CountLine card={card} face={face} status={status} machineKey={machineKey} executions={execs.length} position={selectedIdx + 1} />
         <ServesLine machine={card.name} profiles={card.servesProfiles} radio={card.servesRadio} />
+        <ServersLine servers={card.engineServers} />
         <CardTube card={card} face={face} selected={selected} position={selectedIdx + 1} count={execs.length} onCycle={cycle} clock={clock} />
       </div>
     </div>

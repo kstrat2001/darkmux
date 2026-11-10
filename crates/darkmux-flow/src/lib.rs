@@ -4082,8 +4082,10 @@ mod tests {
         //   2.7.0 — (#3448) additive: `dispatch.model.start` / `.loading` /
         //            `.ready` (`DispatchModelPayload`) and `dispatch.error`'s
         //            `payload.code`, (#3461) `dispatch.start`'s
-        //            `workdir_git`, and (#3504) `dispatch.queue.wait` /
-        //            `.resume`.
+        //            `workdir_git`, (#3504) `dispatch.queue.wait` /
+        //            `.resume`, and (#3450) `thermal.tier5_eject`'s
+        //            `stopped_servers` and `thermal.tier5_eject_failed`'s
+        //            `failed_servers` / `stopped_servers`.
         //   2.0.0 — (4.0) MAJOR: one wire spelling per action, dotted on
         //            write; a retired spelling reads as an unknown action
         //            (5.0, #3036). Also drops

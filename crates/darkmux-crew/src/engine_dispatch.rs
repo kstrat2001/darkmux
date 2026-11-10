@@ -580,6 +580,8 @@ fn queued_line(waiting_on: &str, waited_ms: u64, bound_ms: Option<u64>, caller: 
 pub(crate) trait Machine {
     /// Bytes the OS could hand out now, reclaimable cache included.
     fn reclaimable(&self) -> Option<u64>;
+    /// (#3450) The memory darkmux's server `pid` holds: its whole group's
+    /// footprint ([`server::memory`]), the figure the ledger shows.
     fn footprint(&self, pid: u32) -> Option<u64>;
     /// darkmux's own (`darkmux:`) LM Studio residents.
     fn lmstudio_residents(&self) -> Vec<String>;
@@ -627,7 +629,7 @@ impl Machine for ThisMachine<'_> {
         darkmux_types::residency_lock::reclaimable_bytes()
     }
     fn footprint(&self, pid: u32) -> Option<u64> {
-        darkmux_platform::current().process_footprint(pid)
+        server::memory(pid)
     }
     fn lmstudio_residents(&self) -> Vec<String> {
         darkmux_profiles::engine::lmstudio()
@@ -810,7 +812,7 @@ impl Start<'_> {
     ) -> Result<Option<(EngineRecord, bool)>, EngineRefusal> {
         let (spec, dirs, bounds, machine, lease) = (self.spec, self.dirs, self.bounds, self.machine, self.lease);
         let endpoint = spec.endpoint.as_str();
-        let held = |r: &EngineRecord| held_now(machine, lease).contains(&served_name_of(r));
+        let held = |r: &EngineRecord| held_now(machine, lease).contains(&server::served_name(r));
         let current = server::running(dirs, endpoint);
         if current.as_ref().is_some_and(|r| r.argv == spec.argv) {
             // Started by another dispatch since this one looked: reuse it.
@@ -851,7 +853,7 @@ impl Start<'_> {
     /// withdrawn, when it was found unhealthy and stopped.
     fn reuse(&self, endpoint_lock: &darkmux_types::flock::FlockGuard) -> Result<Option<EngineRecord>, EngineRefusal> {
         let (spec, machine, lease) = (self.spec, self.machine, self.lease);
-        let held = |r: &EngineRecord| held_now(machine, lease).contains(&served_name_of(r));
+        let held = |r: &EngineRecord| held_now(machine, lease).contains(&server::served_name(r));
         let reused = server::reuse_locked(spec, self.dirs, self.bounds, &held, &mut |_| {}, endpoint_lock).map_err(server_refusal)?;
         if reused.is_none() {
             let _ = lease.write(&[]);
@@ -907,7 +909,7 @@ fn residency_lock() -> Result<darkmux_types::residency_lock::ResidencyLock, Engi
 /// Refused here before anything is evicted for a start that cannot happen;
 /// `ensure` asks again under the endpoint's lock.
 fn refuse_a_held_server(current: Option<&EngineRecord>, leased: &[String], endpoint: &str) -> Result<(), EngineRefusal> {
-    match current.filter(|r| leased.contains(&served_name_of(r))) {
+    match current.filter(|r| leased.contains(&server::served_name(r))) {
         Some(cur) => Err(busy(
             format!("endpoint `{endpoint}` is serving `{}` for a running dispatch", cur.model),
             "retry when it finishes",
@@ -1105,15 +1107,6 @@ pub(crate) fn short_of_memory(need: u64, free: u64, held: &[String], reserved: u
     busy(format!("{short}; {}", holders.join(" and ")), "retry when they finish")
 }
 
-/// The model name a recorded server answers to: `flint` for rec's (it has
-/// no `--name`, #3453), else the `--name` it was started under.
-fn served_name_of(rec: &EngineRecord) -> String {
-    if rec.engine == flint::ENGINE {
-        return flint::SERVED_NAME.to_string();
-    }
-    rec.argv.iter().skip_while(|a| *a != "--name").nth(1).cloned().unwrap_or_default()
-}
-
 /// darkmux's own residents other than `endpoint`'s server: the idle ones,
 /// in eviction order (last is evicted first), and the names of those a
 /// running dispatch holds.
@@ -1134,7 +1127,7 @@ pub(crate) fn darkmux_residents(dirs: &Dirs, endpoint: &str, leased: &[String], 
         }
     }
     for r in servers {
-        if leased.contains(&served_name_of(&r)) {
+        if leased.contains(&server::served_name(&r)) {
             held.push(format!("{} ({})", r.model, r.endpoint));
         } else {
             idle.push(Resident::Server(r));
@@ -1149,7 +1142,7 @@ pub(crate) fn darkmux_residents(dirs: &Dirs, endpoint: &str, leased: &[String], 
 pub(crate) fn evict(resident: &Resident, dirs: &Dirs, bounds: server::Bounds, machine: &dyn Machine, lease: &LeaseGuard) -> Result<bool, EngineRefusal> {
     match resident {
         Resident::Server(r) => {
-            let held = |r: &EngineRecord| held_now(machine, lease).contains(&served_name_of(r));
+            let held = |r: &EngineRecord| held_now(machine, lease).contains(&server::served_name(r));
             // (#3509) Never waits on that endpoint's lock under the machine's:
             // one taken (a start or a reuse there) is left running.
             server::try_stop_unless_held(dirs, r, bounds, &held).map_err(server_refusal)

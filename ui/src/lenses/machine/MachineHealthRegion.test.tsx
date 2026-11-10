@@ -106,6 +106,35 @@ describe("MachineHealthRegion: absence vs zero (the machine-lens provenance key 
     expect(unpricedRow.textContent).toContain("UNPRICED · potential unknown");
   });
 
+  // (#3450) A server darkmux started is one of darkmux's rows: grouped with
+  // its own residents, named by the engine and endpoint, and saying
+  // "starting the model" while it does not answer yet.
+  it("draws a server darkmux started as its own resident, starting or not", () => {
+    const serverRow = (answering: boolean): MachineResourcesResponse["models"][number] => ({
+      identifier: "darkmux:TensorFold/q38",
+      model_key: "TensorFold/q38",
+      owner: "darkmux",
+      loaded_ctx: 262144,
+      weights_bytes: null as unknown as number,
+      kv_per_token_bytes: null as unknown as number,
+      kv_bytes_at_ctx: null as unknown as number,
+      potential_bytes: 21474836480,
+      potential_source: "measured",
+      current_bytes: 21474836480,
+      state: "green",
+      server: { endpoint: "tensorfold", engine: "tensorfold", model: "TensorFold/q38", served_name: "darkmux:TensorFold/q38", n_ctx: 262144, port: 8091, pid: 4242, started_at_ms: 0, answering },
+    });
+    for (const answering of [false, true]) {
+      const withServer = { ...BASE, models: [...BASE.models, serverRow(answering)] };
+      const { container, unmount } = renderRegion(withServer);
+      const row = [...container.querySelectorAll(".mm-row")].find((c) => c.textContent?.includes("TensorFold/q38"))!;
+      expect(row.textContent).toContain("tensorfold server for TensorFold/q38 on endpoint tensorfold, port 8091");
+      expect(row.textContent?.includes("STARTING THE MODEL")).toBe(!answering);
+      expect(row.textContent).not.toContain("UNPRICED");
+      unmount();
+    }
+  });
+
   it("draws a .mm-row-pot layer for a priced model in the SAME payload", () => {
     const { container } = renderRegion(BASE);
     const pricedRow = [...container.querySelectorAll(".mm-row")].find((c) => c.textContent?.includes("priced-model") && !c.textContent?.includes("unpriced"))!;
