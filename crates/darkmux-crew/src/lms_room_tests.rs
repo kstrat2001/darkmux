@@ -992,3 +992,26 @@ fn a_loads_reservation_is_measured_on_lm_studios_workers_not_free_memory() {
     assert_eq!(grown_since(Some(GIB), None), None);
     assert_eq!(grown_since(None, Some(GIB)), None);
 }
+
+/// (#3514) Only a reuse goes ahead without the lock: a wave that loads
+/// waits for it, and decides under it.
+#[test]
+#[serial_test::serial]
+fn a_wave_that_loads_waits_for_the_residency_lock() {
+    let rig = Rig::new();
+    let held = darkmux_types::residency_lock::acquire().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let dirs = rig.dirs();
+    std::thread::spawn(move || {
+        let free = || Some(64 * GIB);
+        let machine = FakeMachine::new(&free);
+        let room = ServerRoom { dirs, bounds: server::Bounds::default(), machine: &machine, settle: |_, _, _| {}, workers: || None };
+        let mut host = ArchHost::new(MockHost::new().cataloged("m", GIB), Format::Gguf);
+        let lease = LeaseGuard::acquire();
+        let _ = tx.send(ensure_wave_loaded(&wave("m"), &FixedEstimator::default(), &mut host, &lease, None, &room).map(|()| host.inner.ops));
+    });
+    assert!(rx.recv_timeout(Duration::from_millis(500)).is_err(), "a load does not go ahead while another dispatch decides");
+    drop(held);
+    let ops = rx.recv_timeout(Duration::from_secs(5)).expect("it goes ahead once the lock is free").unwrap();
+    assert!(ops.iter().any(|op| matches!(op, HostOp::Load { .. })), "{ops:?}");
+}
