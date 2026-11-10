@@ -44,6 +44,9 @@ fn run_verb(sub: ClientCmd, here: &Here, input: &mut dyn BufRead, out: &mut dyn 
         ClientCmd::List => list_to(&here.store, here.now, &here.policy, out),
         ClientCmd::Claim { workspace, client } => claim(here, &workspace, &client, out, err),
         ClientCmd::Revoke { name } => revoke(here, &name, out, err),
+        ClientCmd::Workspace { sub: crate::cli::ClientWorkspaceCmd::Rm { name, force } } => {
+            remove_workspace(here, &name, force, out, err)
+        }
         ClientCmd::Serve { .. } => anyhow::bail!("`client serve` listens; it is not run as a verb here"),
     }
 }
@@ -56,6 +59,37 @@ fn revoke(here: &Here, name: &str, out: &mut dyn Write, err: &mut dyn Write) -> 
     }
     writeln!(err, "no paired client named {name} (see `darkmux client list`)")?;
     Ok(1)
+}
+
+/// `client workspace rm <name> [--force]`: a workspace darkmux made for a
+/// paired app, whoever owns it (or no one), removed with what darkmux made
+/// for it. A run, an Undo or a live preview in it (in `client serve`, which
+/// holds its name while it uses it) refuses it.
+fn remove_workspace(here: &Here, name: &str, force: bool, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32> {
+    use darkmux_serve::client_workspace as ws;
+    let base = match here.base.canonicalize() {
+        Ok(b) => b,
+        Err(e) => return writeln!(err, "no workspaces under {}: {e}", here.base.display()).map(|()| 1).map_err(Into::into),
+    };
+    match ws::remove_workspace_within(&base, name, force, std::time::Duration::ZERO) {
+        Ok(r) => {
+            writeln!(out, "removed {} workspace {name}{}", r.kind.word(), branch_said(&r))?;
+            Ok(0)
+        }
+        Err(e) => writeln!(err, "{e}").map(|()| 1).map_err(Into::into),
+    }
+}
+
+/// What `client workspace rm` says about the removed workspace's branch.
+fn branch_said(r: &darkmux_serve::client_workspace::Removal) -> String {
+    match (&r.branch, r.branch_removed) {
+        (Some(b), true) => format!("; branch {b} removed"),
+        (Some(b), false) if b.starts_with("mux/") => {
+            format!("; branch {b} kept (no other branch holds its commits: `--force` removes it)")
+        }
+        (Some(b), false) => format!("; branch {b} left as it is"),
+        (None, _) => String::new(),
+    }
 }
 
 /// `client claim <workspace> <client>`.
@@ -527,6 +561,78 @@ mod tests {
         let (code, _, err) = verb(&here, claim("missions", "phone"), "");
         assert_eq!(code, 1);
         assert!(err.contains("missions is not a workspace darkmux made"), "{err}");
+    }
+
+    /// A real clone under `here`'s base, made the way darkmux makes one
+    /// (its repository beside it, recorded), on a fresh `mux/` branch.
+    fn real_clone(here: &Here, name: &str) {
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let ok = std::process::Command::new("git").current_dir(dir).args(args).output().unwrap();
+            assert!(ok.status.success(), "{args:?}: {}", String::from_utf8_lossy(&ok.stderr));
+        };
+        let origin = here.base.parent().unwrap().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        git(&origin, &["init", "--quiet", "-b", "main"]);
+        git(&origin, &["-c", "user.name=o", "-c", "user.email=o@x", "commit", "--quiet", "--allow-empty", "-m", "one"]);
+        std::fs::create_dir_all(&here.base).unwrap();
+        let (held, dir) = (here.base.join(format!(".{name}.git")), here.base.join(name));
+        git(&here.base, &["clone", "--quiet", "--separate-git-dir", held.to_str().unwrap(), origin.to_str().unwrap(), dir.to_str().unwrap()]);
+        git(&dir, &["checkout", "--quiet", "-b", "mux/app-abc123"]);
+        darkmux_serve::client_git::record_git_dir(&here.base, name, &held).unwrap();
+    }
+
+    /// `client workspace rm` removes a workspace darkmux made, whoever owns
+    /// it; refuses one in use (`client serve` holds its name) and a folder
+    /// darkmux did not make; and parses with `--force`.
+    #[test]
+    fn workspace_rm_removes_a_workspace_or_says_why_not() {
+        use clap::Parser;
+        use darkmux_serve::client_workspace::{try_hold, Hold};
+        let (_d, here) = here(&["phone"], &["handmade"]);
+        real_clone(&here, "hcr");
+        let rm = |n: &str| ClientCmd::Workspace { sub: crate::cli::ClientWorkspaceCmd::Rm { name: n.into(), force: false } };
+        let in_use = try_hold(&here.base, "hcr", Hold::Shared).unwrap().unwrap();
+        let (code, _, err) = verb(&here, rm("hcr"), "");
+        assert_eq!(code, 1);
+        assert!(err.contains("workspace hcr is in use"), "{err}");
+        drop(in_use);
+        let (code, out, err) = verb(&here, rm("hcr"), "");
+        assert_eq!((code, out.as_str()), (0, "removed clone workspace hcr; branch mux/app-abc123 removed\n"), "{err}");
+        assert!(!here.base.join("hcr").exists() && !here.base.join(".hcr.git").exists());
+        let (code, _, err) = verb(&here, rm("handmade"), "");
+        assert_eq!(code, 1);
+        assert!(err.contains("refusing to remove it"), "a recorded repository that is no git repository: {err}");
+        assert!(here.base.join("handmade").is_dir(), "left as it was");
+        std::fs::create_dir(here.base.join("loose")).unwrap();
+        let (code, _, err) = verb(&here, rm("loose"), "");
+        assert_eq!(code, 1);
+        assert!(err.contains("not a workspace darkmux made"), "{err}");
+        assert!(here.base.join("loose").is_dir(), "left as it was");
+        let (code, _, err) = verb(&here, rm("nope"), "");
+        assert!(code == 1 && err.contains("no workspace named nope"), "{err}");
+        let cli = crate::cli::Cli::try_parse_from(["darkmux", "client", "workspace", "rm", "hcr", "--force"]).unwrap();
+        let crate::cli::Cmd::Client { sub: ClientCmd::Workspace { sub: crate::cli::ClientWorkspaceCmd::Rm { name, force } } } = cli.command else {
+            panic!("not `client workspace rm`");
+        };
+        assert_eq!((name.as_str(), force), ("hcr", true));
+    }
+
+    /// What `client workspace rm` says about the branch: removed, a `mux/`
+    /// branch kept (and how to remove it), a branch of the user's left as
+    /// it is, or nothing when detached.
+    #[test]
+    fn workspace_rm_says_what_became_of_the_branch() {
+        use darkmux_serve::client_workspace::{Removal, WorkspaceKind};
+        let said = |branch: Option<&str>, branch_removed: bool| {
+            branch_said(&Removal { kind: WorkspaceKind::Worktree, branch: branch.map(str::to_string), branch_removed })
+        };
+        assert_eq!(said(Some("mux/app-abc123"), true), "; branch mux/app-abc123 removed");
+        assert_eq!(
+            said(Some("mux/app-abc123"), false),
+            "; branch mux/app-abc123 kept (no other branch holds its commits: `--force` removes it)"
+        );
+        assert_eq!(said(Some("feature"), false), "; branch feature left as it is");
+        assert_eq!(said(None, false), "");
     }
 
     /// `client list` with no clients says so and how to approve what waits;
