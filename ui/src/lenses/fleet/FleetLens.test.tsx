@@ -128,6 +128,7 @@ function viewRow(specs: Partial<MachineSpecsResponse> = {}, over: Partial<FleetM
     ram_free_for_ai_bytes: null,
     cpu_brand: null,
     loaded_models: [],
+    engine_servers: [],
     lms_unreachable: false,
     engine: null,
     utility_model: null,
@@ -1805,6 +1806,47 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
     expect(studio.querySelector('.serves [data-testid="profiles-served"]')!.textContent).toBe("3 profiles");
     expect(studio.querySelector(".spec")!.textContent).toBe("Apple M1 Max · 32 GB");
     expect(studio.textContent).not.toMatch(/runs |accepts nothing|radio-host/);
+  });
+
+  // (#3450) A peer's servers darkmux started are its residents: each one's
+  // model, engine and endpoint on its card, and "starting the model" while
+  // one does not answer yet. A machine running none shows no such line.
+  it("a card lists the servers its machine's darkmux runs, and one still starting says so", async () => {
+    const server = (endpoint: string, model: string, answering: boolean) => ({
+      endpoint,
+      engine: endpoint,
+      model,
+      served_name: endpoint === "flint" ? "flint" : `darkmux:${model}`,
+      n_ctx: 262144,
+      port: 8091,
+      pid: 4242,
+      started_at_ms: 0,
+      answering,
+    });
+    mockFleetFetch({
+      specs: { machine_id: "MacBook-Pro", machine_uid: "u-self", cpu_brand: "Apple M5 Max", ram_total_bytes: 137438953472 },
+      view: [
+        viewRow(
+          {
+            machine_id: "studio",
+            machine_uid: "u-studio",
+            cpu_brand: "Apple M1 Max",
+            ram_total_bytes: 34359738368,
+            engine_servers: [server("tensorfold", "TensorFold/q38", true), server("flint", "flint-int4", false)],
+          },
+          { entry: { id: "studio", address: "100.64.1.2:8765", added_unix_ms: 1000 } },
+        ),
+      ],
+      runs: [],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelectorAll(".mach")).toHaveLength(2));
+    const studio = [...document.querySelectorAll(".mach")].find((c) => c.querySelector(".mach-name")!.textContent === "studio")!;
+    const line = studio.querySelector('[data-testid="engine-servers-line"]')!;
+    expect(line.textContent).toBe("2 servers · 1 starting · flint-int4, q38");
+    expect(line.getAttribute("title")).toBe("TensorFold/q38 (tensorfold on tensorfold): resident\nflint-int4 (flint on flint): starting the model");
+    const self = [...document.querySelectorAll(".mach")].find((c) => c !== studio)!;
+    expect(self.querySelector('[data-testid="engine-servers-line"]')).toBeNull();
   });
 
   it("a peer whose card does not state serves_radio shows no icon, whatever the serving machine's grant says", async () => {

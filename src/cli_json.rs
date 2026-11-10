@@ -134,21 +134,29 @@ pub(crate) struct MachineStatusOutput<'a> {
     pub engine: Option<darkmux_serve::wire::MachineEngine>,
     pub managed: Vec<&'a LoadedModel>,
     pub user_state: Vec<&'a LoadedModel>,
+    /// (#3450) The servers darkmux started that are running now: darkmux's
+    /// own residents beside `managed`, known whatever `lms_unreachable` says.
+    pub engine_servers: &'a [darkmux_serve::wire::EngineServer],
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matching_profiles: Option<&'a [String]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub registry: Option<&'a str>,
 }
 
-impl MachineStatusOutput<'_> {
+impl<'a> MachineStatusOutput<'a> {
     /// The answer when the engine could not be queried.
-    pub(crate) fn lms_unreachable(machine_id: Option<String>, engine: Option<darkmux_serve::wire::MachineEngine>) -> Self {
+    pub(crate) fn lms_unreachable(
+        machine_id: Option<String>,
+        engine: Option<darkmux_serve::wire::MachineEngine>,
+        engine_servers: &'a [darkmux_serve::wire::EngineServer],
+    ) -> Self {
         MachineStatusOutput {
             machine_id,
             lms_unreachable: true,
             engine,
             managed: Vec::new(),
             user_state: Vec::new(),
+            engine_servers,
             matching_profiles: None,
             registry: None,
         }
@@ -832,13 +840,14 @@ mod tests {
     #[test]
     fn machine_status_answers_with_the_same_keys_whether_or_not_lms_answered() {
         let keys = |v: &serde_json::Value| -> Vec<String> { v.as_object().unwrap().keys().cloned().collect() };
-        let unreachable = serde_json::to_value(MachineStatusOutput::lms_unreachable(Some("studio".into()), None)).unwrap();
+        let unreachable = serde_json::to_value(MachineStatusOutput::lms_unreachable(Some("studio".into()), None, &[])).unwrap();
         let answered = serde_json::to_value(MachineStatusOutput {
             machine_id: Some("studio".into()),
             lms_unreachable: false,
             engine: None,
             managed: Vec::new(),
             user_state: Vec::new(),
+            engine_servers: &[],
             matching_profiles: None,
             registry: None,
         })
