@@ -156,6 +156,46 @@ fn rig() -> Rig {
     Rig { dir, dirs, prev_home }
 }
 
+fn real_sleep(span: Duration) -> u64 {
+    std::thread::sleep(span);
+    span.as_millis() as u64
+}
+
+fn never_stopped() -> Option<String> {
+    None
+}
+
+/// A dispatch with no timeout whose run is never stopped, on the real clock.
+fn unhurried() -> Patience<'static> {
+    Patience::new(&real_sleep, &never_stopped, None)
+}
+
+/// [`prepare_with`] for an [`unhurried`] dispatch, its refusal as the error.
+fn prepare_in(
+    target: &crate::target::Target,
+    dirs: &Dirs,
+    engine: &dyn ServerEngine,
+    bounds: server::Bounds,
+    machine: &dyn Machine,
+    note: &mut dyn FnMut(Note, DispatchModelPayload),
+) -> Result<EngineReady, EngineRefusal> {
+    prepare_with(target, dirs, engine, bounds, machine, &unhurried(), note).map_err(|e| match e {
+        NotResident::Refused(refusal) => refusal,
+        NotResident::Stopped(why) => panic!("no stop was given: {why}"),
+    })
+}
+
+/// What starts still paging in reserve, every footprint unread (so each
+/// server's whole need).
+fn reserved_now() -> u64 {
+    reserved_with(&|_| None)
+}
+
+/// What they reserve, each server's footprint as `footprint` reads it.
+fn reserved_with(footprint: &dyn Fn(u32) -> Option<u64>) -> u64 {
+    residency_reservation::reserved(&residency_reservation::Servers { alive: &server::process_alive, footprint })
+}
+
 fn quick() -> server::Bounds {
     server::Bounds { start: Duration::from_secs(20), stop_grace: Duration::from_secs(2), poll: Duration::from_millis(50) }
 }
@@ -1057,6 +1097,27 @@ fn a_lease_that_cannot_be_written_refuses_the_dispatch() {
     assert!(engine_record::list_in(&r.dirs.records).0.is_empty(), "nothing started");
 }
 
+/// A reservation that cannot be written refuses the dispatch before
+/// anything starts: a start no other decision counts would be admitted
+/// beside one it does not fit with.
+#[test]
+#[serial_test::serial]
+fn a_reservation_that_cannot_be_written_refuses_the_dispatch() {
+    let r = rig();
+    let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 2.0).to_string_lossy().into_owned());
+    // The reservations directory's own name is a file.
+    std::fs::create_dir_all(r.dir.path().join("home").join("run")).unwrap();
+    std::fs::write(r.dir.path().join("home").join("run").join("reservations"), "").unwrap();
+    let roomy = FakeMachine { reclaimable: RefCell::new(Some(64 * GIB)), ..Default::default() };
+    let err = prepare_in(&target("TensorFold/m", free_port()), &r.dirs, &tf, quick(), &roomy, &mut |_, _| {})
+        .err()
+        .expect("refused");
+    assert_eq!(err.code, "model_start_failed", "{err}");
+    assert!(err.message.contains("could not record the memory `darkmux:TensorFold/m` is about to take"), "{err}");
+    assert!(engine_record::list_in(&r.dirs.records).0.is_empty(), "nothing started");
+    assert!(LeaseGuard::acquire().all_live_leased_models().is_empty(), "and its lease is withdrawn");
+}
+
 
 // ─── A busy dispatch follows fleet.busy_policy (#3504) ──────────────────────
 
@@ -1072,11 +1133,11 @@ fn tf_base() -> DispatchModelPayload {
 
 /// An attempt that is `busy` for its first `n` tries, then succeeds; counts
 /// every try.
-fn busy_for(n: u32, tries: &std::cell::Cell<u32>) -> impl FnMut(&mut dyn FnMut(Note, DispatchModelPayload)) -> Result<(), EngineRefusal> + '_ {
-    move |_| {
+fn busy_for(n: u32, tries: &std::cell::Cell<u32>) -> impl FnMut(&Patience<'_>, &mut dyn FnMut(Note, DispatchModelPayload)) -> Result<(), NotResident> + '_ {
+    move |_, _| {
         tries.set(tries.get() + 1);
         if tries.get() <= n {
-            Err(busy("endpoint `tf` is serving `TensorFold/a` for a running dispatch".into(), "retry when it finishes"))
+            Err(busy("endpoint `tf` is serving `TensorFold/a` for a running dispatch".into(), "retry when it finishes").into())
         } else {
             Ok(())
         }
@@ -1165,9 +1226,9 @@ fn only_busy_waits() {
             &wait_as(BusyPolicy::Queue, Some(600)),
             &env,
             &tf_base(),
-            &mut |_| -> Result<(), EngineRefusal> {
+            &mut |_, _| -> Result<(), NotResident> {
                 tries.set(tries.get() + 1);
-                Err(refuse(code, "no"))
+                Err(refuse(code, "no").into())
             },
             &mut |_, _| {},
         )
@@ -1247,7 +1308,7 @@ fn a_queued_dispatch_starts_once_the_holders_lease_goes_never_evicting_it_while_
         &wait_as(BusyPolicy::Queue, Some(600)),
         &env,
         &queue_payload(&b),
-        &mut |note| prepare_in(&b, &r.dirs, &tf, quick(), &machine, note),
+        &mut |patience, note| prepare_with(&b, &r.dirs, &tf, quick(), &machine, patience, note),
         &mut |n, _| notes.push(n),
     )
     .unwrap();
@@ -1308,7 +1369,7 @@ fn four_queued_dispatches_behind_one_holder_start_one_at_a_time() {
                     &wait_as(BusyPolicy::Queue, None),
                     &env,
                     &queue_payload(&t),
-                    &mut |note| prepare_in(&t, &dirs, &tf, quick(), &RealLeases, note),
+                    &mut |patience, note| prepare_with(&t, &dirs, &tf, quick(), &RealLeases, patience, note),
                     &mut |_, _| {},
                 )
                 .unwrap_or_else(|e| panic!("{m}: {}", e.message()));
@@ -1343,8 +1404,7 @@ fn four_queued_dispatches_behind_one_holder_start_one_at_a_time() {
 fn a_start_in_flight_reservation_counts_against_free_memory() {
     let r = rig();
     let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 30.0).to_string_lossy().into_owned());
-    let in_flight = LeaseGuard::acquire();
-    in_flight.write_starting(&["darkmux:TensorFold/other".to_string()], 30 * GIB).unwrap();
+    let in_flight = Reserved::begin(30 * GIB).unwrap();
     let machine = FakeMachine { reclaimable: RefCell::new(Some(40 * GIB)), capacity: Some(128 * GIB), ..Default::default() };
     let err = prepare_in(&target("TensorFold/m", free_port()), &r.dirs, &tf, quick(), &machine, &mut |_, _| {})
         .err()
@@ -1496,45 +1556,118 @@ fn a_start_in_flight_never_keeps_the_machine_lock_from_a_third_party() {
 }
 
 /// The reservation outlives the start's answer until the server's memory
-/// pages in: right after a start, another start still sees it reserved.
+/// pages in: right after a start, another start still sees it reserved. It
+/// is the server's, not the dispatch's: it outlives the dispatch, shrinks as
+/// the server's footprint grows, and ends with the server.
 #[test]
 #[serial_test::serial]
-fn a_started_servers_reservation_outlives_its_answer() {
+fn a_started_servers_reservation_outlives_its_answer_and_its_dispatch() {
     let r = rig();
     let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 30.0).to_string_lossy().into_owned());
     let machine = FakeMachine { reclaimable: RefCell::new(Some(64 * GIB)), ..Default::default() };
     let ready = prepare_in(&target("TensorFold/m", free_port()), &r.dirs, &tf, quick(), &machine, &mut |_, _| {}).unwrap();
     assert!(ready.started);
-    let other = LeaseGuard::acquire();
-    let reserved = other.reserved_by_others();
-    assert!(reserved > 29 * GIB && reserved <= 30 * GIB, "its memory has not paged in (the stand-in is tiny): {reserved}");
+    assert_eq!(reserved_now(), 30 * GIB, "its memory has not paged in");
+    let rec = ready.record.clone();
     drop(ready);
-    assert_eq!(other.reserved_by_others(), 0, "a dispatch that ends reserves nothing");
+    assert_eq!(reserved_now(), 30 * GIB, "the dispatch ended; the server's memory is still paging in");
+    let held = LeaseGuard::acquire().all_live_leased_models();
+    assert!(held.is_empty(), "reserved, never held: {held:?}");
+    let paged = |pid: u32| (pid == rec.pid).then_some(25 * GIB);
+    assert_eq!(reserved_with(&paged), 5 * GIB, "read against the server's footprint");
+    server::stop(&r.dirs, &rec, quick()).unwrap();
+    assert_eq!(reserved_now(), 0, "a stopped server reserves nothing");
 }
 
-/// The reservation shrinks as the server's footprint grows and ends when it
-/// reaches the need, or at the bound when it never does (an unreadable
-/// footprint keeps the whole need until then).
+/// A server reused, not started, reserves nothing more.
 #[test]
 #[serial_test::serial]
-fn a_reservation_settles_as_the_footprint_grows_or_at_its_bound() {
-    let _r = rig();
-    let reserved = |footprints: Vec<Option<u64>>, bound: Duration| {
-        let guard = LeaseGuard::acquire();
-        guard.write_starting(&["darkmux:x".to_string()], 30 * GIB).unwrap();
-        let res = guard.mark_loaded_reserving(&["darkmux:x".to_string()], 30 * GIB).unwrap();
-        let other = LeaseGuard::acquire();
-        let seen = RefCell::new(Vec::new());
-        let reads = RefCell::new(footprints.into_iter());
-        settle_reservation(res, 30 * GIB, &|| reads.borrow_mut().next().flatten(), &|_| seen.borrow_mut().push(other.reserved_by_others()), bound);
-        (seen.into_inner(), other.reserved_by_others())
-    };
-    let (seen, after) = reserved(vec![Some(10 * GIB), Some(25 * GIB), Some(30 * GIB)], Duration::from_secs(120));
-    assert_eq!(seen, [20 * GIB, 5 * GIB], "shrinks as it pages in");
-    assert_eq!(after, 0, "ends at the need");
-    let (seen, after) = reserved(vec![None; 1_000], Duration::from_secs(2));
-    assert!(seen.iter().all(|b| *b == 30 * GIB) && seen.len() == 4, "unread: the whole need, polled to the bound: {seen:?}");
-    assert_eq!(after, 0, "ends at the bound");
+fn a_reused_server_reserves_nothing_more() {
+    let r = rig();
+    let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 30.0).to_string_lossy().into_owned());
+    let machine = FakeMachine { reclaimable: RefCell::new(Some(64 * GIB)), ..Default::default() };
+    let t = target("TensorFold/m", free_port());
+    drop(prepare_in(&t, &r.dirs, &tf, quick(), &machine, &mut |_, _| {}).unwrap());
+    let again = prepare_in(&t, &r.dirs, &tf, quick(), &machine, &mut |_, _| {}).unwrap();
+    assert!(!again.started);
+    assert_eq!(reserved_now(), 30 * GIB, "only its start's");
+}
+
+/// A start that fails ends its reservation.
+#[test]
+#[serial_test::serial]
+fn a_start_that_fails_reserves_nothing_after() {
+    let r = rig();
+    let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 30.0).to_string_lossy().into_owned());
+    let machine = FakeMachine { reclaimable: RefCell::new(Some(64 * GIB)), ..Default::default() };
+    // Something else already answers on the port.
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let err = prepare_in(&target("TensorFold/m", taken.local_addr().unwrap().port()), &r.dirs, &tf, quick(), &machine, &mut |_, _| {})
+        .err()
+        .expect("refused");
+    assert_eq!(err.code, "port_in_use", "{err}");
+    assert_eq!(reserved_now(), 0);
+}
+
+/// A start that replaces darkmux's server on its endpoint leaves out what
+/// that server still reserves: what it has not paged in, it never will.
+#[test]
+#[serial_test::serial]
+fn replacing_a_server_still_paging_in_leaves_out_its_reservation() {
+    let r = rig();
+    let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 30.0).to_string_lossy().into_owned());
+    let machine = FakeMachine { reclaimable: RefCell::new(Some(40 * GIB)), capacity: Some(128 * GIB), ..Default::default() };
+    let port = free_port();
+    drop(prepare_in(&target("TensorFold/a", port), &r.dirs, &tf, quick(), &machine, &mut |_, _| {}).unwrap());
+    assert_eq!(reserved_now(), 30 * GIB, "a's start, still paging in");
+    let b = prepare_in(&target("TensorFold/b", port), &r.dirs, &tf, quick(), &machine, &mut |_, _| {}).unwrap();
+    assert!(b.started, "b's 30 GiB fits the 40 GiB free: a's reservation goes with a");
+    assert_eq!(reserved_now(), 30 * GIB, "b's own start, and no more");
+}
+
+/// An idle server evicted to make room reserves nothing once it is stopped:
+/// the reservations are read again after each eviction.
+#[test]
+#[serial_test::serial]
+fn evicting_a_server_still_paging_in_ends_what_it_reserved() {
+    let r = rig();
+    let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 30.0).to_string_lossy().into_owned());
+    let roomy = FakeMachine { reclaimable: RefCell::new(Some(64 * GIB)), ..Default::default() };
+    let mut other = target("TensorFold/o", free_port());
+    other.endpoint.source = darkmux_types::endpoint::EndpointSource::Named("other".into());
+    let o_rec = prepare_in(&other, &r.dirs, &tf, quick(), &roomy, &mut |_, _| {}).unwrap().record.clone();
+    assert_eq!(reserved_now(), 30 * GIB, "the idle server's start, still paging in");
+    let frees = || Some(if server::alive(&o_rec) { 10 * GIB } else { 50 * GIB });
+    let machine = LeasedLater { inner: FakeMachine { capacity: Some(128 * GIB), ..Default::default() }, reclaim: Some(&frees), first: Vec::new(), then: Vec::new(), reads: RefCell::new(0) };
+    let ready = prepare_in(&target("TensorFold/m", free_port()), &r.dirs, &tf, quick(), &machine, &mut |_, _| {}).unwrap();
+    assert!(ready.started && !server::alive(&o_rec), "evicted, and its 30 GiB no longer reserved against the 50 GiB free");
+}
+
+/// A dispatch interrupted mid-start (Ctrl-C) is gone, and its server keeps
+/// loading: the start's reservation is the server's from the spawn on, so
+/// it still counts, read as if the dispatch's process no longer existed.
+#[test]
+#[serial_test::serial]
+fn a_start_interrupted_mid_start_still_reserves_while_its_server_loads() {
+    let r = rig();
+    let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 30.0).to_string_lossy().into_owned());
+    let (dirs, port) = (r.dirs.clone(), free_port());
+    let starting = std::thread::spawn(move || {
+        let machine = FakeMachine { reclaimable: RefCell::new(Some(64 * GIB)), ..Default::default() };
+        prepare_in(&slow("TensorFold/m", port), &dirs, &tf, quick(), &machine, &mut |_, _| {}).map(|ready| ready.started)
+    });
+    while server::running_now(&r.dirs, "tf").is_none() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Spawned, and 1.5 s from answering; the residency lock goes right
+    // after the reservation is bound to the server.
+    drop(darkmux_types::residency_lock::acquire().unwrap());
+    let me = std::process::id();
+    let without_the_dispatch = |pid: u32| if pid == me { None } else { darkmux_types::residency_lease::process_start_stamp(pid) };
+    let servers = residency_reservation::Servers { alive: &server::process_alive, footprint: &|_| None };
+    let reserved = residency_reservation::reserved_at(residency_reservation::now_ms(), &without_the_dispatch, &servers);
+    assert_eq!(starting.join().unwrap(), Ok(true));
+    assert_eq!(reserved, 30 * GIB, "counted mid-start with its dispatch gone");
 }
 
 /// An evictor holding the machine lock never waits on another endpoint's
@@ -1577,4 +1710,176 @@ fn a_server_failure_is_the_refusal_its_code_names() {
         holder: server::PortHolder::BeforeStart,
     });
     assert_eq!((taken.code, taken.waiting_on), ("port_in_use", None));
+}
+
+
+// ─── No dispatch waits blind on an endpoint's lock ─────────────────────────
+
+/// A slow start (1.5 s) of `model` in flight on `port`, begun on a thread:
+/// returns once its server is spawned and recorded.
+fn start_in_flight(r: &Rig, tf: &Tensorfold, model: &'static str, port: u16) -> std::thread::JoinHandle<Result<bool, String>> {
+    let (tf, dirs) = (tf.clone(), r.dirs.clone());
+    let starting = std::thread::spawn(move || {
+        let ready = prepare_in(&slow(model, port), &dirs, &tf, quick(), &RealLeases, &mut |_, _| {}).map_err(|e| e.code.to_string())?;
+        // Its dispatch runs on a while, holding its server.
+        std::thread::sleep(Duration::from_millis(300));
+        Ok(ready.started)
+    });
+    while server::running_now(&r.dirs, "tf").is_none() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    starting
+}
+
+/// While a start is in flight on an endpoint, a dispatch for another model
+/// there is `busy` at once, not once that start answers (it holds the
+/// endpoint's lock until then: up to the start bound, minutes for a large
+/// model).
+#[test]
+#[serial_test::serial]
+fn busy_for_another_model_is_answered_at_once_while_a_start_is_in_flight() {
+    let r = rig();
+    let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 2.0).to_string_lossy().into_owned());
+    let port = free_port();
+    let a = start_in_flight(&r, &tf, "TensorFold/a", port);
+    let asked = std::time::Instant::now();
+    let err = prepare_in(&target("TensorFold/b", port), &r.dirs, &tf, quick(), &RealLeases, &mut |_, _| {}).err().expect("refused");
+    let waited = asked.elapsed();
+    assert_eq!(a.join().unwrap(), Ok(true));
+    assert_eq!(err.code, "busy", "{err}");
+    assert_eq!(err.waiting_on.as_deref(), Some("endpoint `tf` is serving `TensorFold/a` for a running dispatch"));
+    assert!(waited < Duration::from_millis(700), "busy was answered after {waited:?}, behind the other model's start");
+}
+
+/// `busy` for another model is read before any lock is asked for: while
+/// some other decision holds the machine-wide residency lock (it may be
+/// waiting on a slow stop or unload), the dispatch is still answered at once.
+#[test]
+#[serial_test::serial]
+fn busy_for_another_model_never_waits_on_the_residency_lock() {
+    let r = rig();
+    let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 2.0).to_string_lossy().into_owned());
+    let port = free_port();
+    let _a = prepare_in(&target("TensorFold/a", port), &r.dirs, &tf, quick(), &RealLeases, &mut |_, _| {}).unwrap();
+    let deciding = darkmux_types::residency_lock::acquire().unwrap();
+    let (dirs, (tx, rx)) = (r.dirs.clone(), std::sync::mpsc::channel());
+    std::thread::spawn(move || {
+        let _ = tx.send(prepare_in(&target("TensorFold/b", port), &dirs, &tf, quick(), &RealLeases, &mut |_, _| {}).map(|_| ()).map_err(|e| e.code));
+    });
+    let answered = rx.recv_timeout(Duration::from_secs(2)).expect("answered while the residency lock is still taken");
+    drop(deciding);
+    assert_eq!(answered, Err("busy"));
+}
+
+/// A dispatch that finds the endpoint's lock taken with nothing there yet
+/// (another dispatch is deciding) waits, and is `busy` the moment the
+/// endpoint turns out to serve another model for a running dispatch: while
+/// that lock is still taken, not once the start that holds it answers.
+#[test]
+#[serial_test::serial]
+fn a_waiter_is_busy_as_soon_as_the_endpoint_turns_out_to_serve_another_held_model() {
+    let r = rig();
+    let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 2.0).to_string_lossy().into_owned());
+    let port = free_port();
+    let taken = server::try_endpoint_lock(&r.dirs, "tf").unwrap().expect("free");
+    let (tf_b, dirs, (tx, rx)) = (tf.clone(), r.dirs.clone(), std::sync::mpsc::channel());
+    std::thread::spawn(move || {
+        let _ = tx.send(prepare_in(&target("TensorFold/b", port), &dirs, &tf_b, quick(), &RealLeases, &mut |_, _| {}).map(|_| ()).map_err(|e| e.code));
+    });
+    assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "nothing is known of the endpoint yet: it waits");
+    // The dispatch holding the lock starts another model there, leased.
+    let spec = tf.plan("tf", port, &target("TensorFold/a", port).model).unwrap();
+    let holder = LeaseGuard::acquire();
+    holder.write(std::slice::from_ref(&spec.served_name)).unwrap();
+    server::ensure_locked(&spec, &r.dirs, quick(), &|_| true, &mut |_| {}, &taken).unwrap();
+    let answered = rx.recv_timeout(Duration::from_secs(2)).expect("answered while the endpoint's lock is still taken");
+    drop(taken);
+    assert_eq!(answered, Err("busy"));
+}
+
+/// A dispatch for the model a start in flight is loading waits for it,
+/// saying `dispatch.model.loading`, and reuses the server.
+#[test]
+#[serial_test::serial]
+fn a_dispatch_for_the_model_being_started_waits_saying_loading_and_reuses_it() {
+    let r = rig();
+    let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 2.0).to_string_lossy().into_owned());
+    let port = free_port();
+    let a = start_in_flight(&r, &tf, "TensorFold/m", port);
+    let mut notes = Vec::new();
+    let b = prepare_in(&slow("TensorFold/m", port), &r.dirs, &tf, quick(), &RealLeases, &mut |n, p| notes.push((n, p))).unwrap();
+    assert!(!b.started, "reused");
+    assert_eq!(a.join().unwrap(), Ok(true));
+    let kinds: Vec<Note> = notes.iter().map(|(n, _)| *n).collect();
+    assert_eq!(kinds, [Note::Loading], "one loading record for a wait shorter than its cadence: {notes:?}");
+    let p = &notes[0].1;
+    assert_eq!((p.engine.as_str(), p.endpoint.as_str(), p.model.as_str()), ("tensorfold", "tf", "TensorFold/m"));
+    assert!(p.elapsed_ms.is_some_and(|ms| ms > 0), "{p:?}");
+}
+
+/// That wait ends at once when the dispatch's run is stopped (Ctrl-C, a
+/// client's cancel, `mission abort`), long before the start answers, and
+/// nothing is started or stopped.
+#[test]
+#[serial_test::serial]
+fn a_stop_ends_the_wait_for_a_start_in_flight() {
+    let r = rig();
+    let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 2.0).to_string_lossy().into_owned());
+    let port = free_port();
+    let a = start_in_flight(&r, &tf, "TensorFold/m", port);
+    let asked = std::time::Instant::now();
+    let stop = || (asked.elapsed() >= Duration::from_millis(200)).then(|| "interrupted".to_string());
+    let patience = Patience::new(&real_sleep, &stop, None);
+    let err = prepare_with(&slow("TensorFold/m", port), &r.dirs, &tf, quick(), &RealLeases, &patience, &mut |_, _| {}).err().expect("stopped");
+    let waited = asked.elapsed();
+    assert_eq!(err.code(), None, "a stop is not a refusal: {err:?}");
+    assert_eq!(err.message(), "darkmux dispatch: stopped waiting for `TensorFold/m` (interrupted); nothing was started or evicted");
+    assert!(waited < Duration::from_millis(700), "the stop was seen after {waited:?}");
+    assert_eq!(a.join().unwrap(), Ok(true), "the start in flight went on");
+}
+
+/// And it ends `busy` at the dispatch's timeout, saying what it waited on.
+#[test]
+#[serial_test::serial]
+fn the_wait_for_a_start_in_flight_ends_busy_at_the_dispatchs_timeout() {
+    let r = rig();
+    let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 2.0).to_string_lossy().into_owned());
+    let port = free_port();
+    let a = start_in_flight(&r, &tf, "TensorFold/m", port);
+    let asked = std::time::Instant::now();
+    let patience = Patience::new(&real_sleep, &never_stopped, Some(Duration::from_millis(200)));
+    let err = prepare_with(&slow("TensorFold/m", port), &r.dirs, &tf, quick(), &RealLeases, &patience, &mut |_, _| {}).err().expect("refused");
+    let waited = asked.elapsed();
+    let NotResident::Refused(refusal) = err else { panic!("{err:?}") };
+    assert_eq!(refusal.code, "busy", "{refusal}");
+    assert_eq!(refusal.waiting_on.as_deref(), Some("endpoint `tf` is starting `TensorFold/m` for another dispatch"));
+    assert!(refusal.message.contains("still busy after waiting"), "{refusal}");
+    assert!(waited < Duration::from_millis(700), "the timeout was seen after {waited:?}");
+    assert_eq!(a.join().unwrap(), Ok(true), "the start in flight went on");
+}
+
+/// A dispatch's waits share one bound: time a try spent waiting for an
+/// endpoint counts toward the queue's, so together they never outlast the
+/// dispatch's timeout.
+#[test]
+fn a_dispatchs_waits_share_its_one_timeout() {
+    let env = FakeEnv::new(Vec::new());
+    let tries = std::cell::Cell::new(0);
+    let err = wait_while_busy(
+        &wait_as(BusyPolicy::Queue, Some(60)),
+        &env,
+        &tf_base(),
+        &mut |patience, _| -> Result<(), NotResident> {
+            tries.set(tries.get() + 1);
+            // Each try waits 25 s of its own before it is busy.
+            patience.sleep(Duration::from_secs(25));
+            Err(busy("endpoint `tf` is serving `TensorFold/a` for a running dispatch".into(), "retry when it finishes").into())
+        },
+        &mut |_, _| {},
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), Some("busy"));
+    assert!(err.message().contains("still busy after waiting 1m"), "{}", err.message());
+    assert_eq!(tries.get(), 3, "25 s + 5 s queued + 25 s + the 5 s left, then the one try at the bound");
+    assert_eq!(env.paused_total(), 10_000, "the queue slept the 10 s the tries left of the 60 s");
 }
