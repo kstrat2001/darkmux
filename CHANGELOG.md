@@ -201,6 +201,15 @@ schema 1.2, which an older `client serve` refuses, so every request it handles w
   never touched. Work held nowhere else is refused with the new code `unsaved_commits` until `force`,
   and a refused removal leaves a live preview running.
 
+- **An app can hand-edit text in a workspace (#3533).** `POST /client/workspaces/{name}/edit` with
+  `{old, new}` finds the one place in the workspace's tracked files that holds the text a person
+  selected in the preview, replaces only that span (in markup files `& < > { }` typed in `new` are
+  written as entities), and commits it as a work record with no model (role `hand-edit`) that
+  `/client/work/{id}/undo` reverts. Found zero times or more than once, nothing changes and the reply
+  says how many. The file is read and replaced without following any link; the edit is refused while a
+  run or an Undo is busy in that work copy, while the workspace is being removed, or when the file has
+  uncommitted changes.
+
 ### Changed
 
 - **A `--workdir` checkout's `.git` is mounted read-only by default (#3461).** When the workdir's
@@ -480,6 +489,17 @@ schema 1.2, which an older `client serve` refuses, so every request it handles w
   inserted into the window (about 50 ms to under 0.1 ms per record at 30k); an engine server that does
   not answer reads "starting the model" only within the start bound, else "not answering"; two Flint
   servers are two rows; an unmeasured server reads "not measured".
+
+- **A server start is priced at what it commits, and memory pressure refuses or stops it (#3538).** A
+  Tensorfold start reserves its KV cache for the whole `n_ctx` before its first answer (measured: 27.6 GB
+  at 8k, 34.6 GB at 64k, 67.3 GB at 262k with a drafter, for Qwen3.8-27B 4-bit), so darkmux now prices it
+  from those measurements instead of its weights floor; a Flint start adds a measured allowance for its
+  lazily grown cache. The figures stand in for an engine-reported estimate (ashhart/TensorFold#2761). A
+  start or LM Studio load is refused `memory_in_use`, before anything is evicted, while memory pressure is
+  at or above `runtime.memory.pressure_gate` (`warning` by default, `critical`, `off`), including when the
+  memory compressor's segments are 70% full while the kernel still reads normal; a server darkmux is
+  starting is stopped, and an LM Studio load unloaded unless a dispatch took it up, if pressure turns
+  critical meanwhile. A stress test on 5.10 builds without this panicked the machine.
 
 ## [5.9.3] - 2026-10-29
 
