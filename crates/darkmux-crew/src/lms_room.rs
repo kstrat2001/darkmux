@@ -39,14 +39,14 @@
 //! Exclusive scope already unloads every one the wave does not want, so only
 //! servers are evicted here.
 
-use crate::engine_dispatch::{darkmux_residents, evict, refuse, EngineRefusal, Machine, Resident, ThisMachine};
+use crate::engine_dispatch::{darkmux_residents, evict, refuse, short_of_memory, EngineRefusal, Machine, Resident, ThisMachine};
 use darkmux_gestalt::{
     decide_residency, is_darkmux_owned, plan_room, Action, CatalogFact, ResidencyDecision, Facts, FootprintEstimator, ModelHost, Placement, Plan, PlanRoom,
     PoolFact, PoolId, Pools, ResidentFact,
 };
 use darkmux_profiles::engine::server::{self, Dirs};
 use darkmux_profiles::model_ledger::{LoadFigures, LoadPricer};
-use darkmux_types::residency_lease::LeaseGuard;
+use darkmux_types::residency_lease::{LeaseGuard, Reservation};
 
 /// Where darkmux's engine servers are recorded, how long a stop may take,
 /// and the machine's memory and leases.
@@ -54,13 +54,29 @@ pub(crate) struct ServerRoom<'a> {
     pub(crate) dirs: Dirs,
     pub(crate) bounds: server::Bounds,
     pub(crate) machine: &'a (dyn Machine + Sync),
+    /// (#3509) Keeps a load's reservation until its memory pages in, given
+    /// the reservation, the need and the free figure read before the load.
+    pub(crate) settle: fn(Reservation, u64, u64),
 }
+
+/// This machine, as the LM Studio path reads it: the wave already knows its
+/// utility binding, so none is read from a registry here.
+static THIS_MACHINE: ThisMachine<'static> = ThisMachine { profiles_file: None };
 
 impl ServerRoom<'static> {
     /// This machine: the records under darkmux's home, its real memory.
     pub(crate) fn this_machine() -> Self {
-        ServerRoom { dirs: Dirs::under_home(), bounds: server::Bounds::default(), machine: &ThisMachine }
+        ServerRoom { dirs: Dirs::under_home(), bounds: server::Bounds::default(), machine: &THIS_MACHINE, settle: settle_on_this_machine }
     }
+}
+
+/// (#3509) A load answers before its memory has all paged in (MLX maps its
+/// weights and touches them on first use), so its reservation outlives the
+/// load: [`crate::engine_dispatch::settle_reservation`], on a thread of its
+/// own, with what the machine's free figure has fallen by since the load
+/// began as the load's footprint (LM Studio names no process per model).
+fn settle_on_this_machine(res: Reservation, need: u64, free_before: u64) {
+    std::thread::spawn(move || settle_on_this_machine_now(res, need, free_before));
 }
 
 impl ServerRoom<'_> {
@@ -71,11 +87,17 @@ impl ServerRoom<'_> {
         self.pool_with(0)
     }
 
+    /// (#3509) Less what starts still in flight reserve: their memory has
+    /// not paged in yet.
     fn pool_with(&self, credit: u64) -> Pools {
+        let reserved = self.machine.reserved(&LeaseGuard::acquire());
         match (self.machine.capacity(), self.machine.reclaimable()) {
             (Some(capacity_bytes), Some(free)) => Pools::from([(
                 PoolId(darkmux_profiles::gestalt_host::UNIFIED_POOL.into()),
-                PoolFact { capacity_bytes, available_bytes: free.saturating_add(credit).min(capacity_bytes) },
+                PoolFact {
+                    capacity_bytes,
+                    available_bytes: free.saturating_add(credit).saturating_sub(reserved).min(capacity_bytes),
+                },
             )]),
             _ => Pools::new(),
         }
@@ -238,20 +260,23 @@ pub(crate) fn make_room(
         eprintln!("darkmux: warning: this machine's free memory is unreadable; loading unchecked and LM Studio decides");
         return Ok(());
     };
-    if target.fits(free) {
+    // (#3509) Starts still in flight count, though their memory has not
+    // paged in yet.
+    let reserved = room.machine.reserved(lease);
+    if target.fits(free.saturating_sub(reserved)) {
         return Ok(());
     }
-    let (free, held) = stop_idle_servers_toward(target, lease, pinned, plan, facts, room, stopped)?;
+    let (free, held) = stop_idle_servers_toward(target, reserved, lease, pinned, plan, facts, room, stopped)?;
     match commitment {
-        Some(c) if !c.fits(free) => Err(out_of_room(c, free, &held)),
-        _ if target.fits(free) => Ok(()),
+        Some(c) if !c.fits(free.saturating_sub(reserved)) => Err(out_of_room(c, free, &held, reserved)),
+        _ if target.fits(free.saturating_sub(reserved)) => Ok(()),
         _ => {
             eprintln!(
                 "darkmux: warning: this LM Studio load can grow to {:.1} GiB with its whole context filled, and \
                  {:.1} GiB is free after evicting every idle darkmux resident; loading it, and LM Studio decides as \
                  its context fills",
                 gib(target.need_bytes),
-                gib(free.saturating_add(target.freed_bytes))
+                gib(free.saturating_add(target.freed_bytes).saturating_sub(reserved))
             );
             Ok(())
         }
@@ -261,8 +286,10 @@ pub(crate) fn make_room(
 /// Stop darkmux's idle servers, the least recently started first, until
 /// `target` fits or none is left; returns the free memory then, and what a
 /// running dispatch holds.
+#[allow(clippy::too_many_arguments)]
 fn stop_idle_servers_toward(
     target: PlanRoom,
+    reserved: u64,
     lease: &LeaseGuard,
     pinned: &[String],
     plan: &Plan,
@@ -276,7 +303,7 @@ fn stop_idle_servers_toward(
     held.extend(held_loads(plan, facts, pinned));
     loop {
         let free = room.machine.reclaimable().unwrap_or(0);
-        if target.fits(free) {
+        if target.fits(free.saturating_sub(reserved)) {
             return Ok((free, held));
         }
         let Some(next) = idle.pop() else { return Ok((free, held)) };
@@ -301,7 +328,12 @@ fn gib(bytes: u64) -> f64 {
 /// darkmux's LM Studio loads a running dispatch holds that the plan keeps
 /// (pinned, so never unloaded) and this wave does not itself use: memory
 /// that frees when that dispatch finishes.
+///
+/// (#3507) The standing utility binding counts as held: a running dispatch
+/// loads it on demand to compact, and the planner never unloads it, so its
+/// memory frees only when no dispatch needs it.
 fn held_loads(plan: &Plan, facts: &Facts, pinned: &[String]) -> Vec<String> {
+    let held = |id: &str| pinned.iter().any(|p| p == id) || facts.utility_binding.as_deref() == Some(id);
     let wanted = |id: &str| {
         plan.actions.iter().any(|a| match &a.action {
             Action::Load { identifier, .. } | Action::Reuse { identifier, .. } => identifier == id,
@@ -312,29 +344,18 @@ fn held_loads(plan: &Plan, facts: &Facts, pinned: &[String]) -> Vec<String> {
         .residents
         .iter()
         .map(|r| r.identifier.as_str())
-        .filter(|id| pinned.iter().any(|p| p == id) && is_darkmux_owned(id) && !wanted(id))
+        .filter(|id| held(id) && is_darkmux_owned(id) && !wanted(id))
         .map(str::to_string)
         .collect()
 }
 
-/// The refusal once nothing idle is left (#3510): `busy` when something a
-/// running dispatch holds would free the memory later, `memory_in_use`
-/// when only memory darkmux did not take is short. Neither is `wont_fit`:
-/// the load fits this machine, so retrying can help.
-fn out_of_room(need: PlanRoom, free: u64, held: &[String]) -> EngineRefusal {
-    let short = format!(
-        "the model needs {:.1} GiB and {:.1} GiB is free after evicting every idle darkmux resident",
-        gib(need.need_bytes),
-        gib(free.saturating_add(need.freed_bytes))
-    );
-    if held.is_empty() {
-        refuse(
-            "memory_in_use",
-            format!("{short}; memory darkmux did not take holds the rest, so retry when it frees"),
-        )
-    } else {
-        refuse("busy", format!("{short}; running dispatches hold {}, so retry when they finish", held.join(", ")))
-    }
+/// The refusal once nothing idle is left (#3510), in the engine path's
+/// words ([`short_of_memory`]): `busy` when something a running dispatch
+/// holds, or a start still in flight reserves, would free the memory later,
+/// `memory_in_use` when only memory darkmux did not take is short. Neither
+/// is `wont_fit`: the load fits this machine, so retrying can help.
+fn out_of_room(need: PlanRoom, free: u64, held: &[String], reserved: u64) -> EngineRefusal {
+    short_of_memory(need.need_bytes, free.saturating_add(need.freed_bytes).saturating_sub(reserved), held, reserved)
 }
 
 /// (#3507) The residency lease a container dispatch holds for as long as it
@@ -364,6 +385,105 @@ pub(crate) fn hold_dispatch_models(lease: &LeaseGuard, job: Option<&str>, compac
     })?;
     // Resident by now: a racing acquirer must read them as in use.
     let _ = lease.mark_loaded(&models);
+    Ok(())
+}
+
+/// (#3514) The residency protocol around the dispatch preflight's own LM
+/// Studio loads (`ensure_model_resident_from`: the compactor, the utility
+/// model, a lab run's model), which load outside any wave.
+pub(crate) trait Preflight {
+    /// What every running darkmux dispatch holds now.
+    fn held_by_others(&self) -> Vec<String>;
+    fn lock(&self) -> anyhow::Result<darkmux_types::residency_lock::ResidencyLock>;
+    /// What loading `model_key` at `n_ctx` commits, when it can be priced.
+    fn commitment(&self, model_key: &str, n_ctx: u32) -> Option<u64>;
+    fn reclaimable(&self) -> Option<u64>;
+    /// Keep `res` until the load's memory pages in, holding `lease` that
+    /// long.
+    fn settle(&self, lease: LeaseGuard, res: Reservation, need: u64, free_before: u64);
+}
+
+/// This machine's [`Preflight`].
+pub(crate) struct ThisPreflight;
+
+impl Preflight for ThisPreflight {
+    fn held_by_others(&self) -> Vec<String> {
+        LeaseGuard::acquire().all_live_leased_models()
+    }
+    fn lock(&self) -> anyhow::Result<darkmux_types::residency_lock::ResidencyLock> {
+        darkmux_types::residency_lock::acquire()
+    }
+    fn commitment(&self, model_key: &str, n_ctx: u32) -> Option<u64> {
+        let mut host = darkmux_profiles::engine::lmstudio().host()?;
+        let catalog = host.list_catalog().ok()?;
+        let pricer = LoadPricer::new(host.arch_facts(&[model_key]));
+        pricer.figures(model_key, n_ctx, Some(&catalog))?.commitment
+    }
+    fn reclaimable(&self) -> Option<u64> {
+        darkmux_types::residency_lock::reclaimable_bytes()
+    }
+    fn settle(&self, lease: LeaseGuard, res: Reservation, need: u64, free_before: u64) {
+        std::thread::spawn(move || {
+            settle_on_this_machine_now(res, need, free_before);
+            drop(lease);
+        });
+    }
+}
+
+/// [`settle_on_this_machine`] on the calling thread.
+fn settle_on_this_machine_now(res: Reservation, need: u64, free_before: u64) {
+    crate::engine_dispatch::settle_reservation(
+        res,
+        need,
+        &|| darkmux_types::residency_lock::reclaimable_bytes().map(|f| free_before.saturating_sub(f)),
+        &std::thread::sleep,
+        crate::engine_dispatch::SETTLE_BOUND,
+    )
+}
+
+/// (#3514) A preflight reload's unload of the stale instance, refused
+/// `busy` when a running dispatch holds that instance: it is serving that
+/// dispatch at its own context, and is never unloaded under it. Read right
+/// before the unload, as the engine path reads a load's lease.
+pub(crate) fn unload_unless_held(gate: &dyn Preflight, identifier: &str, unload: &dyn Fn(&str) -> anyhow::Result<()>) -> anyhow::Result<()> {
+    if gate.held_by_others().iter().any(|h| h == identifier) {
+        return Err(refuse(
+            "busy",
+            format!("`{identifier}` is serving a running dispatch at its own context, so it is not reloaded under it; retry when it finishes"),
+        )
+        .into());
+    }
+    unload(identifier)
+}
+
+/// (#3514) A preflight load in the residency protocol: under the lock, its
+/// lease with a reservation of what it commits; the lock let go before the
+/// load begins; the reservation kept past the load until its memory pages
+/// in. A load that cannot be priced is leased with no reservation.
+pub(crate) fn load_reserved(
+    gate: &dyn Preflight,
+    model_key: &str,
+    identifier: &str,
+    n_ctx: u32,
+    load: &dyn Fn(&str, &str, u32) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let lock = gate.lock().map_err(|e| {
+        refuse("model_start_failed", format!("could not take darkmux's residency lock ({e:#}); check that darkmux's home is writable"))
+    })?;
+    let lease = LeaseGuard::acquire();
+    let models = [identifier.to_string()];
+    let need = gate.commitment(model_key, n_ctx);
+    let free_before = gate.reclaimable().unwrap_or(0);
+    match need {
+        Some(bytes) => lease.write_starting(&models, bytes)?,
+        None => lease.write(&models)?,
+    }
+    drop(lock);
+    load(model_key, identifier, n_ctx)?;
+    if let Some(bytes) = need {
+        let res = lease.mark_loaded_reserving(&models, bytes)?;
+        gate.settle(lease, res, bytes, free_before);
+    }
     Ok(())
 }
 
@@ -398,10 +518,10 @@ impl ServerRoom<'static> {
     /// No machine figures: the planner plans with no pool, as it did before
     /// it read the machine.
     pub(crate) fn unknown_machine() -> Self {
-        ServerRoom { dirs: Dirs::under_home(), bounds: server::Bounds::default(), machine: &UnknownMachine }
+        ServerRoom { dirs: Dirs::under_home(), bounds: server::Bounds::default(), machine: &UnknownMachine, settle: |res, _, _| { res.set(0); } }
     }
 }
 
 #[cfg(test)]
 #[path = "lms_room_tests.rs"]
-mod tests;
+pub(crate) mod tests;

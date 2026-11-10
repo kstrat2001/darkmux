@@ -154,6 +154,15 @@ pub struct SubmissionReply {
     /// `reason` is the sentence for a person and is never parsed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusal: Option<RefusalCode>,
+    /// (#3505, wire 8.2) For `error`: the stable code of a dispatch the
+    /// receiver refused before its role ran (`busy`, `memory_in_use`,
+    /// `wont_fit`, `model_start_failed`, ...), the one its `dispatch.error`
+    /// record carries. Absent when the failure has none. A string, kept as
+    /// written, so a code a newer receiver adds reaches an app unchanged: an
+    /// app retries `busy` and `memory_in_use`, gives up on `wont_fit`, and
+    /// treats every other failure as a failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
     /// For `checked`: what a run of the job would meet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check: Option<CheckReport>,
@@ -261,6 +270,7 @@ impl SubmissionReply {
             stderr: None,
             reason: None,
             refusal: None,
+            code: None,
             check: None,
         }
     }
@@ -1430,16 +1440,44 @@ impl std::fmt::Display for SubmitRefused {
 
 impl std::error::Error for SubmitRefused {}
 
+/// (#3505) A receiver took the job and its dispatch failed. Carried by
+/// [`submit_work`]'s `Err` so a caller reads the dispatch's `code` (the
+/// receiver's refusal code, when it had one), not the sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchFailed {
+    pub code: Option<String>,
+    /// The sentence for a person, control characters removed.
+    pub reason: String,
+}
+
+impl std::fmt::Display for DispatchFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for DispatchFailed {}
+
+/// A code as darkmux spells one (`snake_case`, at most 64 bytes): anything
+/// else a receiver sends is dropped, never printed as a code.
+fn is_code_shaped(code: &str) -> bool {
+    (1..=64).contains(&code.len()) && code.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
 /// What a receiver's final reply means to the sender: the reply for a job it
 /// took, an error for one it did not, ran badly, or answered in a status this
 /// darkmux does not know (never read as taken).
 fn reply_outcome(target: &str, code: u16, reply: SubmissionReply) -> Result<SubmissionReply> {
     match reply.status {
         ReplyStatus::Completed | ReplyStatus::Accepted | ReplyStatus::Queued => Ok(reply),
-        ReplyStatus::Error => Err(anyhow!(
-            "{target} accepted the job but the dispatch failed: {}",
-            sanitize_remote_text(reply.reason.as_deref().unwrap_or("no reason given"))
-        )),
+        ReplyStatus::Error => Err(DispatchFailed {
+            code: reply.code.as_deref().filter(|c| is_code_shaped(c)).map(str::to_string),
+            reason: format!(
+                "{target} accepted the job but the dispatch failed: {}",
+                sanitize_remote_text(reply.reason.as_deref().unwrap_or("no reason given"))
+            ),
+        }
+        .into()),
         ReplyStatus::Unknown => Err(anyhow!(
             "{target} answered with a status this darkmux does not recognize (is it on a newer darkmux? \
              run the same version on both machines)"
@@ -2273,6 +2311,26 @@ mod tests {
         let err = reply_outcome("studio", 403, old_receiver).unwrap_err();
         assert_eq!(err.downcast_ref::<SubmitRefused>().unwrap().code, RefusalCode::Unknown);
         assert!(reply_outcome("studio", 200, SubmissionReply::of(ReplyStatus::Checked)).is_err());
+    }
+
+    /// (#3505) A dispatch the receiver refused reaches the sender as a typed
+    /// error carrying its code; one spelled unlike a darkmux code is dropped,
+    /// never passed on, and an older receiver's reply (no code) has none.
+    #[test]
+    fn a_refused_dispatchs_code_reaches_the_sender() {
+        let reply = |code: Option<&str>| SubmissionReply {
+            reason: Some("darkmux dispatch: endpoint `tf` is serving `a` for a running dispatch [busy]".into()),
+            code: code.map(str::to_string),
+            ..SubmissionReply::of(ReplyStatus::Error)
+        };
+        let err = reply_outcome("studio", 500, reply(Some("busy"))).unwrap_err();
+        let failed = err.downcast_ref::<DispatchFailed>().expect("a typed dispatch failure");
+        assert_eq!(failed.code.as_deref(), Some("busy"));
+        assert!(failed.reason.starts_with("studio accepted the job but the dispatch failed:"), "{}", failed.reason);
+        for (sent, read) in [(Some("Busy\u{1b}[2J"), None), (Some(""), None), (None, None), (Some("memory_in_use"), Some("memory_in_use"))] {
+            let err = reply_outcome("studio", 500, reply(sent)).unwrap_err();
+            assert_eq!(err.downcast_ref::<DispatchFailed>().unwrap().code.as_deref(), read, "{sent:?}");
+        }
     }
 
     fn roster_entry(address: &str, node_id: Option<&str>) -> crate::MachineEntry {

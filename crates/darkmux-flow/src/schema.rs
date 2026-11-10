@@ -26,14 +26,21 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.7.0";
 //           loading and ready), written between `dispatch.start` and the
 //           first turn when a dispatch starts the engine server its model
 //           runs on; and `payload.code` on `dispatch.error` (`busy`,
-//           `wont_fit`, `model_start_failed`, `model_stop_failed`,
+//           `wont_fit`, `memory_in_use` (#3510, unreleased with it),
+//           `model_start_failed`, `model_stop_failed`,
 //           `port_in_use`, `engine_unavailable`, and `engine_in_use` from
 //           #3453, unreleased with it). Also `payload.workdir_git` on `dispatch.start`
 //           (`"read_only"` | `"read_write"`, from #3461, unreleased with
 //           it): how a `--workdir` checkout's own `.git` directory was
 //           mounted, read-only unless `--workdir-git-writable` (or a step's
 //           `workdir_git_writable`); absent when the workdir has no `.git`
-//           directory or the workspace is read-only. ADDITIVE: a reader that does not know
+//           directory or the workspace is read-only. Also (#3504, unreleased
+//           with it) two actions, `dispatch.queue.wait` (when a dispatch
+//           whose model's endpoint or memory a running dispatch holds starts
+//           waiting under `fleet.busy_policy` `queue`, and every 20 s while
+//           it waits) and `dispatch.queue.resume` (the wait ended), on
+//           `DispatchModelPayload`, which gains `waiting_on` and
+//           `wait_bound_ms`; `elapsed_ms` there is the time waited. ADDITIVE: a reader that does not know
 //           the actions keeps them as unknown records, and `code` and
 //           `workdir_git` are absent on every record before 2.7.0 (when such
 //           a `.git` was always read-write); an unknown `workdir_git` value

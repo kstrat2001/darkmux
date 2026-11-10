@@ -7632,15 +7632,16 @@ fn headroom_bytes_from(reclaimable_gb: Option<u64>, resident_gb: f64, safety_gb:
     Some((real_gb * 1024.0 * 1024.0 * 1024.0).round() as u64)
 }
 
-/// The host's reclaimable memory in whole GiB, rounded down: the platform's
-/// answer (macOS `vm_stat`, Linux `/proc/meminfo`), never an OS check here.
+/// The host's reclaimable memory in whole GiB, rounded down: the one figure
+/// every memory decision reads (`darkmux_types::residency_lock::reclaimable_bytes`,
+/// #3511), never an OS check here.
 fn read_reclaimable_gb() -> Option<u64> {
     reclaimable_gb_from(darkmux_platform::current())
 }
 
 /// [`read_reclaimable_gb`] against a given platform, so a test can fake it.
 fn reclaimable_gb_from(platform: &dyn darkmux_platform::Platform) -> Option<u64> {
-    platform.reclaimable_memory_bytes().map(|bytes| bytes / (1024 * 1024 * 1024))
+    darkmux_types::residency_lock::reclaimable_bytes_on(platform).map(|bytes| bytes / (1024 * 1024 * 1024))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

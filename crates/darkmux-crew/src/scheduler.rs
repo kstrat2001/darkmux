@@ -1235,7 +1235,10 @@ pub fn run_step_graph(
             let id = ready_ids[idx].clone();
             let (result, flow_records) = match outcome {
                 Ok((job_result, records)) => (Ok(job_result.output), records),
-                Err(e) => (Err(format!("{e:#}")), Vec::new()),
+                Err(e) => {
+                    stash_unrun_refusal(steps.get(&id), &e);
+                    (Err(format!("{e:#}")), Vec::new())
+                }
             };
             apply_step_terminal(
                 run,
@@ -1826,6 +1829,20 @@ fn seat_unresolved_record(run: &RunId, step: &Step, reason: &str) -> FlowRecord 
 
 /// (F9) The `step.error` record: the lifecycle record plus the cause, so the
 /// stream says why a step failed (the full message stays in the step file).
+/// (#3514) A step whose wave was refused never ran, so its dispatch could
+/// not keep its refusal code for the run as a refused dispatch does
+/// (`dispatch_step_error`): kept here instead, for a step that asked for its
+/// result to be preserved (the crew-of-one, whose `--json` envelope names
+/// the code) and named its session.
+fn stash_unrun_refusal(step: Option<&Step>, e: &anyhow::Error) {
+    let Some(config) = step.map(|s| &s.config) else { return };
+    let preserved = config.get("preserve_dispatch_result").and_then(|v| v.as_bool()) == Some(true);
+    let session = config.get("session_id").and_then(|v| v.as_str()).and_then(|s| SessionId::parse(s).ok());
+    if let (true, Some(session)) = (preserved, session) {
+        crate::engine_dispatch::stash_refusal(&session, e);
+    }
+}
+
 fn step_error_record(run: &RunId, step: &Step, message: &str) -> FlowRecord {
     FlowRecord {
         source: Some(darkmux_flow::FlowSource::Scheduler),

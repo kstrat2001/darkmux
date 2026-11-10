@@ -1,0 +1,8 @@
+{
+  "status": "error",
+  "machine": "studio",
+  "session_id": "radio.solo.relay.laptop.radio.solo.adhoc.radio-host.n1",
+  "profile": "deep",
+  "reason": "darkmux dispatch: endpoint `tf` is serving `a` for a running dispatch; retry when it finishes [busy]",
+  "code": "busy"
+}

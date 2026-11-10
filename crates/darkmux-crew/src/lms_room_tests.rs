@@ -141,7 +141,9 @@ impl Rig {
     }
     fn room<'a>(&self, machine: &'a (dyn Machine + Sync)) -> ServerRoom<'a> {
         let bounds = server::Bounds { start: Duration::from_secs(5), stop_grace: Duration::from_secs(2), poll: Duration::from_millis(20) };
-        ServerRoom { dirs: self.dirs(), bounds, machine }
+        // A load's reservation is kept, as it is while memory pages in, until
+        // its lease drops.
+        ServerRoom { dirs: self.dirs(), bounds, machine, settle: |res, need, _| drop(res.set(need)) }
     }
 }
 
@@ -164,7 +166,7 @@ fn wave(model_key: &str) -> Vec<Placement> {
 /// The weights' formats a test host reports, as the readers would name
 /// them.
 #[derive(Clone, Copy)]
-enum Format {
+pub(crate) enum Format {
     /// A GGUF header was read: the KV cache is paid at load.
     Gguf,
     /// A `config.json` was read (MLX): the cache grows as the context fills.
@@ -174,8 +176,8 @@ enum Format {
 }
 
 /// A mock LM Studio that also reports each model's architecture.
-struct ArchHost {
-    inner: MockHost,
+pub(crate) struct ArchHost {
+    pub(crate) inner: MockHost,
     format: Format,
     arch: darkmux_gestalt::ArchFacts,
 }
@@ -186,7 +188,7 @@ const DENSE: darkmux_gestalt::ArchFacts =
     darkmux_gestalt::ArchFacts { total_layers: 48, full_attention_layers: 48, kv_heads: 8, head_dim: 128, kv_bytes_per_element: 2 };
 
 impl ArchHost {
-    fn new(inner: MockHost, format: Format) -> Self {
+    pub(crate) fn new(inner: MockHost, format: Format) -> Self {
         ArchHost { inner, format, arch: DENSE }
     }
 }
@@ -292,7 +294,7 @@ fn a_server_a_running_dispatch_holds_is_never_stopped_and_the_load_is_busy() {
     assert_eq!(refusal_code(&err), Some("busy"), "{err:#}");
     let text = format!("{err:#}");
     assert!(text.contains("GiB and 8.0 GiB is free after evicting every idle darkmux resident"), "{text}");
-    assert!(text.contains("running dispatches hold TensorFold/q (tf), so retry when they finish"), "{text}");
+    assert!(text.contains("running dispatches hold TensorFold/q (tf); retry when they finish"), "{text}");
     assert!(tf.running(), "the held server was not stopped");
     assert!(!loaded(&host), "nothing was loaded over the memory it holds: {:?}", host.ops);
 }
@@ -330,7 +332,7 @@ fn a_server_darkmux_did_not_start_is_never_touched_and_the_load_is_memory_in_use
     let mut host = MockHost::new().cataloged("m", 20 * GIB);
     let err = load(&mut host, &wave("m"), &rig.room(&machine)).expect_err("refused");
     assert_eq!(refusal_code(&err), Some("memory_in_use"), "{err:#}");
-    assert!(format!("{err:#}").contains("memory darkmux did not take holds the rest, so retry when it frees"), "{err:#}");
+    assert!(format!("{err:#}").contains("programs darkmux did not start hold the rest, so retry once they free it"), "{err:#}");
     assert!(format!("{err:#}").contains("stopped the idle engine server TensorFold/ours (ours)"), "the wave's error names what it stopped: {err:#}");
     assert!(!ours.running(), "darkmux's own idle server was stopped");
     assert!(theirs.running(), "the server darkmux did not start was never touched");
@@ -746,4 +748,185 @@ fn a_wave_is_refused_only_on_the_commitment() {
     let schedule = schedule_waves(&long, &Facts::default(), &FixedEstimator::default(), &factory, &room).unwrap();
     assert!(schedule.refusals.is_empty(), "{schedule:?}");
     assert_eq!(schedule.waves, vec![long]);
+}
+
+/// Whether another thread can take the machine-wide residency lock within
+/// a short wait (the lock is per open file, so a thread of this process
+/// excludes as another process would).
+fn residency_lock_is_free() -> bool {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        if let Ok(lock) = darkmux_types::residency_lock::acquire() {
+            let _ = tx.send(());
+            drop(lock);
+        }
+    });
+    rx.recv_timeout(Duration::from_millis(400)).is_ok()
+}
+
+/// A mock LM Studio that notes, at each unload and load, whether the
+/// residency lock is free, and what other dispatches reserve.
+struct LockProbe {
+    inner: ArchHost,
+    at_unload: Vec<bool>,
+    at_load: Vec<(bool, u64)>,
+}
+
+impl ModelHost for LockProbe {
+    fn list_resident(&mut self) -> Result<Vec<ResidentFact>, darkmux_gestalt::HostError> {
+        self.inner.list_resident()
+    }
+    fn list_catalog(&mut self) -> Result<Vec<CatalogFact>, darkmux_gestalt::HostError> {
+        self.inner.list_catalog()
+    }
+    fn load(&mut self, k: &str, id: &str, ctx: u32, d: darkmux_gestalt::Deadline) -> Result<darkmux_gestalt::LoadReport, darkmux_gestalt::HostError> {
+        self.at_load.push((residency_lock_is_free(), LeaseGuard::acquire().reserved_by_others()));
+        self.inner.load(k, id, ctx, d)
+    }
+    fn unload(&mut self, t: &darkmux_gestalt::OwnedTarget, d: darkmux_gestalt::Deadline) -> Result<(), darkmux_gestalt::HostError> {
+        self.at_unload.push(residency_lock_is_free());
+        self.inner.unload(t, d)
+    }
+    fn arch_facts(&mut self, keys: &[&str]) -> darkmux_gestalt::ModelArch {
+        self.inner.arch_facts(keys)
+    }
+}
+
+/// (#3509) An LM Studio wave decides, evicts and unloads under the
+/// machine-wide residency lock, reserves what its load commits, and lets
+/// the lock go before the load begins; the reservation outlives the load.
+#[test]
+#[serial_test::serial]
+fn a_wave_decides_under_the_residency_lock_and_loads_outside_it_with_a_reservation() {
+    let rig = Rig::new();
+    let free = || Some(64 * GIB);
+    let machine = FakeMachine::new(&free);
+    let inner = ArchHost::new(MockHost::new().resident("darkmux:orphan", "orphan", 8_000, Some(GIB)).cataloged("m", 20 * GIB), Format::Gguf);
+    let mut host = LockProbe { inner, at_unload: Vec::new(), at_load: Vec::new() };
+    let lease = LeaseGuard::acquire();
+    ensure_wave_loaded(&wave("m"), &FixedEstimator::default(), &mut host, &lease, None, &rig.room(&machine)).expect("loads");
+    assert_eq!(host.at_unload, [false], "the orphan is unloaded under the lock");
+    let (free_at_load, reserved_at_load) = host.at_load[0];
+    assert!(free_at_load, "the lock is let go before the load begins");
+    assert!(reserved_at_load > 20 * GIB, "the load's commitment is reserved while it loads: {reserved_at_load}");
+    assert_eq!(LeaseGuard::acquire().reserved_by_others(), reserved_at_load, "and kept past the load, while its memory pages in");
+    drop(lease);
+    assert_eq!(LeaseGuard::acquire().reserved_by_others(), 0, "until the dispatch's lease goes");
+}
+
+/// (#3509) A wave that does not load ends its reservation.
+#[test]
+#[serial_test::serial]
+fn a_wave_that_fails_to_load_reserves_nothing_after() {
+    let rig = Rig::new();
+    let free = || Some(64 * GIB);
+    let machine = FakeMachine::new(&free);
+    let mut inner = MockHost::new().cataloged("m", 20 * GIB);
+    inner.fail_next_load = Some(darkmux_gestalt::HostError::CommandFailed { detail: "no".into() });
+    let mut host = ArchHost::new(inner, Format::Gguf);
+    let lease = LeaseGuard::acquire();
+    ensure_wave_loaded(&wave("m"), &FixedEstimator::default(), &mut host, &lease, None, &rig.room(&machine)).expect_err("fails");
+    assert_eq!(LeaseGuard::acquire().reserved_by_others(), 0);
+}
+
+/// (#3509) What starts still in flight reserve counts against the load:
+/// another dispatch's 50 GiB start leaves 14 GiB of 64 GiB for this one, so
+/// a 21 GiB load is `busy`, naming the reservation.
+#[test]
+#[serial_test::serial]
+fn another_dispatchs_starting_reservation_counts_against_the_load() {
+    let rig = Rig::new();
+    let free = || Some(64 * GIB);
+    let machine = FakeMachine::new(&free);
+    let other = LeaseGuard::acquire();
+    other.write_starting(&["darkmux:TensorFold/big".to_string()], 50 * GIB).unwrap();
+    let mut host = MockHost::new().cataloged("m", 20 * GIB);
+    let err = load(&mut host, &wave("m"), &rig.room(&machine)).expect_err("refused");
+    drop(other);
+    assert_eq!(refusal_code(&err), Some("busy"), "{err:#}");
+    assert!(format!("{err:#}").contains("starts in flight reserve 50.0 GiB"), "{err:#}");
+}
+
+/// (#3507) The standing utility binding counts as held: memory it takes
+/// frees when no dispatch needs it, so a short wave is `busy`, never
+/// `memory_in_use`.
+#[test]
+#[serial_test::serial]
+fn the_utility_binding_counts_as_held() {
+    let rig = Rig::new();
+    let free = || Some(8 * GIB);
+    let machine = FakeMachine::new(&free);
+    let inner = MockHost::new().resident("darkmux:util", "util", 8_000, Some(30 * GIB)).cataloged("m", 20 * GIB);
+    let mut host = ArchHost::new(inner, Format::Gguf);
+    let lease = LeaseGuard::acquire();
+    let err = ensure_wave_loaded(&wave("m"), &FixedEstimator::default(), &mut host, &lease, Some("darkmux:util"), &rig.room(&machine))
+        .expect_err("refused");
+    assert_eq!(refusal_code(&err), Some("busy"), "{err:#}");
+    assert!(format!("{err:#}").contains("darkmux:util"), "{err:#}");
+}
+
+/// A preflight stand-in: what it holds, prices and reserves.
+struct FakePreflight {
+    held: Vec<String>,
+    commitment: Option<u64>,
+    settled: std::sync::Mutex<Vec<u64>>,
+}
+
+impl Preflight for FakePreflight {
+    fn held_by_others(&self) -> Vec<String> {
+        self.held.clone()
+    }
+    fn lock(&self) -> anyhow::Result<darkmux_types::residency_lock::ResidencyLock> {
+        darkmux_types::residency_lock::acquire()
+    }
+    fn commitment(&self, _model_key: &str, _n_ctx: u32) -> Option<u64> {
+        self.commitment
+    }
+    fn reclaimable(&self) -> Option<u64> {
+        Some(64 * GIB)
+    }
+    fn settle(&self, lease: LeaseGuard, res: Reservation, need: u64, _free_before: u64) {
+        self.settled.lock().unwrap().push(need);
+        drop((res, lease));
+    }
+}
+
+/// (#3514) A preflight load (the compactor, the utility model, a lab run's
+/// model) follows the protocol: its reservation written under the lock,
+/// the lock let go before the load, the reservation handed on to settle.
+#[test]
+#[serial_test::serial]
+fn a_preflight_load_reserves_under_the_lock_and_loads_outside_it() {
+    let _rig = Rig::new();
+    let gate = FakePreflight { held: Vec::new(), commitment: Some(5 * GIB), settled: Default::default() };
+    let seen = std::sync::Mutex::new(None);
+    let load = |_: &str, _: &str, _: u32| -> anyhow::Result<()> {
+        *seen.lock().unwrap() = Some((residency_lock_is_free(), LeaseGuard::acquire().reserved_by_others()));
+        Ok(())
+    };
+    load_reserved(&gate, "util", "darkmux:util", 16_384, &load).unwrap();
+    assert_eq!(*seen.lock().unwrap(), Some((true, 5 * GIB)), "loaded outside the lock, its 5 GiB reserved");
+    assert_eq!(*gate.settled.lock().unwrap(), [5 * GIB], "the reservation is kept until it settles");
+    let failing = |_: &str, _: &str, _: u32| -> anyhow::Result<()> { anyhow::bail!("no") };
+    load_reserved(&gate, "util", "darkmux:util", 16_384, &failing).unwrap_err();
+    assert_eq!(LeaseGuard::acquire().reserved_by_others(), 0, "a failed load reserves nothing after");
+}
+
+/// (#3514) A preflight reload never unloads the stale instance while a
+/// running dispatch holds it: that is `busy`, and nothing is unloaded.
+#[test]
+#[serial_test::serial]
+fn a_preflight_reload_never_unloads_an_instance_a_dispatch_holds() {
+    let unloaded = std::sync::Mutex::new(Vec::new());
+    let unload = |id: &str| -> anyhow::Result<()> {
+        unloaded.lock().unwrap().push(id.to_string());
+        Ok(())
+    };
+    let held = FakePreflight { held: vec!["darkmux:util".into()], commitment: None, settled: Default::default() };
+    let err = unload_unless_held(&held, "darkmux:util", &unload).unwrap_err();
+    assert_eq!(refusal_code(&err), Some("busy"), "{err:#}");
+    assert!(unloaded.lock().unwrap().is_empty());
+    let idle = FakePreflight { held: Vec::new(), commitment: None, settled: Default::default() };
+    unload_unless_held(&idle, "darkmux:util", &unload).unwrap();
+    assert_eq!(*unloaded.lock().unwrap(), ["darkmux:util"]);
 }

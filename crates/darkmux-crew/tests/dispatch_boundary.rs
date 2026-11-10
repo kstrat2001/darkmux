@@ -684,7 +684,8 @@ fn a_model_that_will_not_load_fails_before_a_record() {
     let (res, _) = run(&rig, rig.opts());
     let err = format!("{:#}", res.expect_err("load failure"));
     assert!(err.starts_with("model selection failed: darkmux: model `model-a` could not load at n_ctx=32000"), "{err}");
-    assert_eq!(rig.lms_log(), vec!["ps --json", "load model-a --context-length 32000 --identifier darkmux:model-a -y"]);
+    // The load is priced off the catalog for its reservation (#3514).
+    assert_eq!(rig.lms_log(), vec!["ps --json", "ls --json", "load model-a --context-length 32000 --identifier darkmux:model-a -y"]);
     assert!(rig.docker_run().is_none());
     assert!(bookends(&rig).is_empty(), "records: {:?}", rig.actions());
 }

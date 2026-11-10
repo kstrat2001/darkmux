@@ -580,7 +580,7 @@ fn run_local_waves<T: Send + 'static>(
                 if let Some((index, _job)) = by_seat.remove(&placement.seat) {
                     results.lock().expect("results mutex poisoned").push((
                         index,
-                        Err(anyhow!("darkmux: could not load \"{}\" for this wave: {e:#}", placement.model_key)),
+                        Err(wave_failure(&e, &placement.model_key)),
                     ));
                 }
             }
@@ -768,6 +768,9 @@ fn execute_plan(
     deadline: Deadline,
     committed: &mut Vec<String>,
     held: &dyn Fn() -> Vec<String>,
+    // (#3509) Called right before each load begins: the wave lets go of the
+    // residency lock there.
+    before_load: &mut dyn FnMut(),
 ) -> PlanExecOutcome {
     // (#2674) The refuse-fast gate: decide every Block first, mutate
     // nothing. Reports the FIRST refusal in action order — identical to
@@ -788,6 +791,7 @@ fn execute_plan(
                 }
             }
             Action::Load { model_key, identifier, min_ctx } => {
+                before_load();
                 if let Err(host_error) = host.load(model_key, identifier, *min_ctx, deadline) {
                     return PlanExecOutcome::HostFailed {
                         detail: format!(
@@ -1037,14 +1041,23 @@ pub(crate) fn ensure_wave_loaded(
         attempt += 1;
         // (#3509) One decide-then-load step, read fresh each attempt: the
         // call a machine-wide residency lock wraps.
-        let (outcome, pinned) = wave.decide_and_load(host, &mut committed)?;
+        let (outcome, pinned, starting) = wave.decide_and_load(host, &mut committed)?;
         if let PlanExecOutcome::Loaded = outcome {
-            wave.mark_loaded();
+            wave.mark_loaded(starting);
             return Ok(());
         }
+        wave.unreserve(starting);
         settle_attempt(outcome, attempt, &pinned, &committed)?;
         std::thread::sleep(BLOCKED_BY_HOLDER_RETRY_DELAY);
     }
+}
+
+/// (#3509) What a wave reserved for its loads: their commitment, and the
+/// free figure read before they began.
+#[derive(Debug, Clone, Copy)]
+struct Starting {
+    need: u64,
+    free_before: u64,
 }
 
 /// One wave's load, as each attempt of [`ensure_wave_loaded`] decides and
@@ -1063,7 +1076,17 @@ impl WaveLoad<'_> {
     /// Read the residents, the machine's memory and the leases, plan, make
     /// room on darkmux's engine servers, and execute the plan: one attempt,
     /// returning its outcome and the leases it planned against.
-    fn decide_and_load(&self, host: &mut dyn ModelHost, committed: &mut Vec<String>) -> Result<(PlanExecOutcome, Vec<String>)> {
+    ///
+    /// (#3509) Under the machine-wide residency lock, in its protocol's
+    /// order: the decision, the room step (a server is stopped only when its
+    /// endpoint's lock is free, never waited for) and the plan's unloads, and
+    /// the wave's reservation of its commitment. The lock is let go right
+    /// before the first `lms load` begins, never held across a load: from
+    /// there the reservation counts the load.
+    fn decide_and_load(&self, host: &mut dyn ModelHost, committed: &mut Vec<String>) -> Result<(PlanExecOutcome, Vec<String>, Option<Starting>)> {
+        let lock = darkmux_types::residency_lock::acquire().map_err(|e| {
+            wave_error(Some("model_start_failed"), format!("could not take darkmux's residency lock ({e:#}); check that darkmux's home is writable"))
+        })?;
         let residents = host
             .list_resident()
             .map_err(|e| anyhow!("darkmux: could not read LMStudio residents (`lms ps`): {e}{}", partial_execution_note(committed)))?;
@@ -1106,7 +1129,30 @@ impl WaveLoad<'_> {
         // or loaded, or the wave is refused with a code.
         crate::lms_room::make_room(&plan, &facts, &pricing, self.lease, &pinned, self.room, committed)
             .map_err(|refusal| room_refused(refusal, committed))?;
-        Ok((execute_plan(&plan, host, self.deadline, committed, &|| self.held()), pinned))
+        let starting = self.reserve(&plan, &facts, &pricing)?;
+        let mut lock = Some(lock);
+        let outcome = execute_plan(&plan, host, self.deadline, committed, &|| self.held(), &mut || drop(lock.take()));
+        Ok((outcome, pinned, starting))
+    }
+
+    /// (#3509) Reserve what the plan's loads commit (#3514), under the lock,
+    /// before they begin: a decision another dispatch makes while their
+    /// memory pages in still counts it. Nothing is reserved when the plan
+    /// loads nothing, or its commitment is unknown.
+    fn reserve(&self, plan: &Plan, facts: &Facts, pricing: &crate::lms_room::LoadPricing<'_>) -> Result<Option<Starting>> {
+        let Some(need) = darkmux_gestalt::plan_room(plan, facts, &pricing.commitment()) else { return Ok(None) };
+        self.lease.write_starting(self.own_models, need.need_bytes).map_err(|e| {
+            wave_error(Some("model_start_failed"), format!("could not record this wave's reservation ({e:#}); check that darkmux's home is writable"))
+        })?;
+        let free_before = self.room.machine.reclaimable().unwrap_or(0);
+        Ok(Some(Starting { need: need.need_bytes, free_before }))
+    }
+
+    /// A wave that did not load ends its reservation.
+    fn unreserve(&self, starting: Option<Starting>) {
+        if starting.is_some() {
+            let _ = self.lease.write_starting(self.own_models, 0);
+        }
     }
 
     /// What every other live darkmux dispatch holds, read now (the comment
@@ -1129,8 +1175,15 @@ impl WaveLoad<'_> {
     /// its leader-election fast path, never correctness (#2669's own
     /// Block-on-claim guard still protects a resident that fresh facts show
     /// is actually loaded).
-    fn mark_loaded(&self) {
-        if let Err(e) = self.lease.mark_loaded(self.own_models) {
+    ///
+    /// (#3509) A wave that reserved keeps its reservation past the load,
+    /// until its memory pages in ([`crate::lms_room::ServerRoom::settle`]).
+    fn mark_loaded(&self, starting: Option<Starting>) {
+        let marked = match starting {
+            Some(st) => self.lease.mark_loaded_reserving(self.own_models, st.need).map(|res| (self.room.settle)(res, st.need, st.free_before)),
+            None => self.lease.mark_loaded(self.own_models),
+        };
+        if let Err(e) = marked {
             eprintln!("darkmux: could not mark this wave's residency lease as loaded (non-fatal): {e}");
         }
     }
@@ -1210,17 +1263,31 @@ fn settle_host_failed(detail: &str, host_error: &HostError, attempt: u32, pinned
     Err(wave_error(Some(code), format!("could not load for this wave: {detail} ({why}){}", partial_execution_note(committed))))
 }
 
+/// (#3514) Each job's error for a wave that could not load: its refusal
+/// code kept ([`crate::engine_dispatch::RefusedRun`]), since one error
+/// answers every job in the wave.
+fn wave_failure(e: &anyhow::Error, model_key: &str) -> anyhow::Error {
+    let text = format!("darkmux: could not load \"{model_key}\" for this wave: {e:#}");
+    match crate::engine_dispatch::refusal_code(e) {
+        Some(code) => crate::engine_dispatch::RefusedRun { code, text }.into(),
+        None => anyhow!(text),
+    }
+}
+
 /// (#3510) The stable code of a planner refusal, when its cause is one an
-/// app branches on: memory a running dispatch holds (`busy`), memory held
-/// by something darkmux did not start (`memory_in_use`), the configured
-/// budget (`wont_fit`), or a model LM Studio does not have
+/// app branches on: memory a running dispatch or the standing utility
+/// binding holds (`busy`), memory held by something darkmux did not start
+/// (`memory_in_use`), the configured budget (`wont_fit`), or a model LM
+/// Studio does not have
 /// (`engine_unavailable`). A same-plan collision is a staffing error, with
 /// no code.
 fn block_code(reason: &Reason) -> Option<&'static str> {
     match reason {
         Reason::ClaimedResidentInsufficientCtx { clearable: true, .. } => Some("busy"),
         Reason::ForeignDuplicateNoCapacity { .. } => Some("memory_in_use"),
-        Reason::BudgetRefuse { .. } | Reason::UtilityHeldResident { .. } => Some("wont_fit"),
+        Reason::BudgetRefuse { .. } => Some("wont_fit"),
+        // The utility binding frees when no dispatch needs it: retryable.
+        Reason::UtilityHeldResident { .. } => Some("busy"),
         Reason::UnknownModelKey { .. } => Some("engine_unavailable"),
         _ => None,
     }
@@ -1989,7 +2056,7 @@ mod tests {
             .resident("darkmux:m", "m", 32_000, Some(1_000));
         let mut committed = Vec::new();
         let outcome =
-            execute_plan(&plan, &mut host, Deadline::from_secs(1), &mut committed, &Vec::new);
+            execute_plan(&plan, &mut host, Deadline::from_secs(1), &mut committed, &Vec::new, &mut || {});
 
         assert!(matches!(outcome, PlanExecOutcome::Blocked { .. }), "the plan refuses");
         assert!(
@@ -2027,7 +2094,7 @@ mod tests {
         let mut host = MockHost::new().resident("darkmux:m", "m", 32_000, Some(1_000));
         let mut committed = Vec::new();
         let outcome =
-            execute_plan(&plan, &mut host, Deadline::from_secs(1), &mut committed, &Vec::new);
+            execute_plan(&plan, &mut host, Deadline::from_secs(1), &mut committed, &Vec::new, &mut || {});
 
         assert!(matches!(outcome, PlanExecOutcome::Blocked { .. }), "the plan refuses");
         assert!(
@@ -2069,7 +2136,7 @@ mod tests {
         let mut host = MockHost::new().resident("darkmux:orphan", "orphan", 8_000, Some(1_000));
         let mut committed = Vec::new();
         let held = || vec!["darkmux:orphan".to_string()];
-        let outcome = execute_plan(&unload_then_load(Some(8_000)), &mut host, Deadline::from_secs(1), &mut committed, &held);
+        let outcome = execute_plan(&unload_then_load(Some(8_000)), &mut host, Deadline::from_secs(1), &mut committed, &held, &mut || {});
         assert!(matches!(&outcome, PlanExecOutcome::Drifted { identifier, .. } if identifier == "darkmux:orphan"));
         assert!(!unloaded_anything(&host) && !host.ops.iter().any(|op| matches!(op, darkmux_gestalt::mock::HostOp::Load { .. })), "{:?}", host.ops);
         assert!(committed.is_empty());
@@ -2082,12 +2149,12 @@ mod tests {
     fn execute_plan_checks_an_unloads_precondition_right_before_it() {
         for (resident_ctx, at_ctx, drifts) in [(8_000, Some(8_000), false), (16_000, Some(8_000), true), (16_000, None, false)] {
             let mut host = MockHost::new().resident("darkmux:orphan", "orphan", resident_ctx, Some(1_000));
-            let outcome = execute_plan(&unload_then_load(at_ctx), &mut host, Deadline::from_secs(1), &mut Vec::new(), &Vec::new);
+            let outcome = execute_plan(&unload_then_load(at_ctx), &mut host, Deadline::from_secs(1), &mut Vec::new(), &Vec::new, &mut || {});
             assert_eq!(matches!(outcome, PlanExecOutcome::Drifted { .. }), drifts, "resident at {resident_ctx}, planned at {at_ctx:?}");
             assert_eq!(unloaded_anything(&host), !drifts);
         }
         let mut gone = MockHost::new();
-        let outcome = execute_plan(&unload_then_load(None), &mut gone, Deadline::from_secs(1), &mut Vec::new(), &Vec::new);
+        let outcome = execute_plan(&unload_then_load(None), &mut gone, Deadline::from_secs(1), &mut Vec::new(), &Vec::new, &mut || {});
         assert!(matches!(outcome, PlanExecOutcome::Drifted { .. }), "a resident that left is not unloaded");
     }
 
@@ -2169,6 +2236,11 @@ mod tests {
         assert_eq!(code(foreign, &[]), Some("memory_in_use"));
         let budget = PlanExecOutcome::Blocked { model_key: "m".into(), reason: Reason::BudgetRefuse { est_bytes: 2, budget_bytes: 1 } };
         assert_eq!(code(budget, &[]), Some("wont_fit"));
+        let utility = PlanExecOutcome::Blocked {
+            model_key: "m".into(),
+            reason: Reason::UtilityHeldResident { identifier: "darkmux:u".into(), held_bytes: 1, est_bytes: 2, over_bytes: 1, budget_bytes: 2 },
+        };
+        assert_eq!(code(utility, &[]), Some("busy"), "the utility binding frees when no dispatch needs it");
         let collision = PlanExecOutcome::Blocked {
             model_key: "m".into(),
             reason: Reason::ClaimedResidentInsufficientCtx { identifier: "darkmux:m".into(), resident_ctx: 1, min_ctx: 2, clearable: false },
@@ -2208,7 +2280,7 @@ mod tests {
         let mut host = MockHost::new().resident("darkmux:orphan", "orphan", 8_000, Some(1_000));
         let mut committed = Vec::new();
         let outcome =
-            execute_plan(&plan, &mut host, Deadline::from_secs(1), &mut committed, &Vec::new);
+            execute_plan(&plan, &mut host, Deadline::from_secs(1), &mut committed, &Vec::new, &mut || {});
 
         assert!(matches!(outcome, PlanExecOutcome::Loaded), "a Block-free plan still runs");
         assert_eq!(
@@ -2270,7 +2342,7 @@ mod tests {
             Some(HostError::InsufficientResources { detail: "not enough RAM".into() });
         let mut committed = Vec::new();
         let outcome =
-            execute_plan(&plan, &mut host, Deadline::from_secs(1), &mut committed, &Vec::new);
+            execute_plan(&plan, &mut host, Deadline::from_secs(1), &mut committed, &Vec::new, &mut || {});
 
         assert!(
             matches!(outcome, PlanExecOutcome::HostFailed { .. }),
@@ -2363,7 +2435,7 @@ mod tests {
             .resident("my-alias", "aliased", 8_000, Some(1_000))
             .resident("darkmux:orphan", "orphan", 8_000, Some(1_000));
         let mut committed = Vec::new();
-        let outcome = execute_plan(&plan, &mut host, Deadline::from_secs(1), &mut committed, &Vec::new);
+        let outcome = execute_plan(&plan, &mut host, Deadline::from_secs(1), &mut committed, &Vec::new, &mut || {});
 
         assert!(matches!(outcome, PlanExecOutcome::Loaded), "every action succeeds");
         // Non-vacuity: all four mutations genuinely reached the host, so
@@ -2468,7 +2540,7 @@ mod tests {
         };
         let mut host = MockHost::new().resident("darkmux:orphan", "orphan", 8_000, Some(1_000));
         let mut committed = Vec::new();
-        let outcome = execute_plan(&plan, &mut host, Deadline::from_secs(1), &mut committed, &Vec::new);
+        let outcome = execute_plan(&plan, &mut host, Deadline::from_secs(1), &mut committed, &Vec::new, &mut || {});
 
         match outcome {
             PlanExecOutcome::Blocked { model_key, reason } => {
@@ -2523,7 +2595,7 @@ mod tests {
             .resident("darkmux:m", "m", 32_000, Some(1_000));
         host.fail_next_unload = Some(HostError::CommandFailed { detail: "lms is wedged".into() });
         let mut committed = Vec::new();
-        let outcome = execute_plan(&plan, &mut host, Deadline::from_secs(1), &mut committed, &Vec::new);
+        let outcome = execute_plan(&plan, &mut host, Deadline::from_secs(1), &mut committed, &Vec::new, &mut || {});
 
         assert!(
             matches!(outcome, PlanExecOutcome::Blocked { .. }),

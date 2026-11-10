@@ -555,9 +555,15 @@ fn finished_reply(
                 ..with_status(base, ReplyStatus::Completed)
             },
         ),
+        // (#3505) A dispatch refused before its role ran carries its code,
+        // the same reading its `dispatch.error` record's takes.
         Some(Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            SubmissionReply { reason: Some(format!("{e:#}")), ..with_status(base, ReplyStatus::Error) },
+            SubmissionReply {
+                reason: Some(format!("{e:#}")),
+                code: darkmux_crew::engine_dispatch::refusal_code(&e).map(str::to_string),
+                ..with_status(base, ReplyStatus::Error)
+            },
         ),
         None => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1446,6 +1452,27 @@ mod tests {
     use super::*;
     use darkmux_fleet::{test_node, StaticIdentityProvider};
     use std::time::Duration;
+
+    /// (#3505) A finished job whose dispatch was refused before its role ran
+    /// answers `error` with the refusal's code, read through any context the
+    /// error gathered; any other failure carries none.
+    #[test]
+    fn a_refused_dispatchs_reply_carries_its_code() {
+        let base = SubmissionReply::of(ReplyStatus::Accepted);
+        let refused = darkmux_crew::engine_dispatch::EngineRefusal {
+            code: "busy",
+            message: "endpoint `tf` is serving `a` for a running dispatch; retry when it finishes".into(),
+            waiting_on: None,
+        };
+        let err = anyhow::Error::from(refused).context("step `s` dispatch.internal");
+        let (status, reply) = finished_reply(&base, Some(Err(err)));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!((reply.status, reply.code.as_deref()), (ReplyStatus::Error, Some("busy")));
+        assert!(reply.reason.as_deref().is_some_and(|r| r.contains("retry when it finishes")), "{reply:?}");
+        let (_, plain) = finished_reply(&base, Some(Err(anyhow::anyhow!("docker exited 125"))));
+        assert_eq!(plain.code, None);
+        assert!(!serde_json::to_string(&plain).unwrap().contains("\"code\""), "absent, not null");
+    }
 
     const TOKEN: &str = "fleet-test-token";
 

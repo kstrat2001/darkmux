@@ -423,15 +423,18 @@ pub struct Run {
     pub not_reporting: bool,
     /// (#3467) What a running run is doing besides its turns:
     /// `starting_model` while one of its dispatches starts its model (from
-    /// `dispatch.model.start` until `.ready`). Decided by the run lifecycle
-    /// (`Attempt::starting_model`), read by every surface (`GET /runs`,
+    /// `dispatch.model.start` until `.ready`); (#3504) `queued` while one
+    /// waits for a busy endpoint or memory (from `dispatch.queue.wait` until
+    /// `.resume`). Decided by the run lifecycle
+    /// (`Attempt::starting_model`, `Attempt::queued`), read by every surface (`GET /runs`,
     /// `darkmux run list --json`, the client's work status). Absent when the
     /// run is not running or is doing nothing else.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub activity: Option<RunActivity>,
     /// (#3467) With `activity`: how long it has taken so far, ms, from the
-    /// latest `dispatch.model.loading` (0 before the first).
+    /// latest `dispatch.model.loading` (0 before the first), or the latest
+    /// `dispatch.queue.wait`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional, type = "number"))]
     pub activity_elapsed_ms: Option<u64>,
@@ -446,6 +449,9 @@ pub struct Run {
 pub enum RunActivity {
     /// A dispatch is starting its model (an engine server, a load).
     StartingModel,
+    /// (#3504) A dispatch is waiting for an endpoint or memory a running
+    /// dispatch holds (`fleet.busy_policy` `queue`).
+    Queued,
 }
 
 /// (#3467) A running session's `activity` from its records alone (the
@@ -471,8 +477,12 @@ fn activity_of<'a>(
     if status != RunStatus::Running {
         return (None, None);
     }
-    match sessions.into_iter().find_map(|s| s.model_starting) {
-        Some(ms) => (Some(RunActivity::StartingModel), Some(ms)),
+    let sessions: Vec<&SessionAgg> = sessions.into_iter().collect();
+    if let Some(ms) = sessions.iter().find_map(|s| s.model_starting) {
+        return (Some(RunActivity::StartingModel), Some(ms));
+    }
+    match sessions.iter().find_map(|s| s.queued) {
+        Some(ms) => (Some(RunActivity::Queued), Some(ms)),
         None => (None, None),
     }
 }
@@ -2655,6 +2665,8 @@ struct SessionAgg {
     stopped_by_operator: bool,
     /// (#3467) Its current attempt is starting its model: for how long, ms.
     model_starting: Option<u64>,
+    /// (#3504) Its current attempt is queued: for how long, ms.
+    queued: Option<u64>,
     /// The session's attempts (`run_lifecycle.rs`), whose current one the
     /// attempt-scoped fields above describe once settled.
     lifecycle: crate::run_lifecycle::RunFold,
@@ -2693,6 +2705,7 @@ impl SessionAgg {
         self.terminal_ts = a.fold.close.as_ref().map(|(ts, _)| ts.clone());
         self.stopped_by_operator = ending.and_then(|e| e.reason) == Some(AbandonReason::Aborted);
         self.model_starting = a.starting_model();
+        self.queued = a.queued();
     }
 
     /// (#1918) `true` when this session's records name more than one
@@ -6192,6 +6205,51 @@ mod tests {
         assert_eq!((ready.activity, ready.activity_elapsed_ms), (None, None));
         let wire = serde_json::to_value(&ready).unwrap();
         assert!(wire.get("activity").is_none() && wire.get("activity_elapsed_ms").is_none(), "absent, not null: {wire}");
+    }
+
+    /// (#3504) A dispatch queued for a busy endpoint or memory reads
+    /// `queued` from its `dispatch.queue.wait` until its
+    /// `dispatch.queue.resume`, its elapsed time the latest wait record's;
+    /// the start that follows reads `starting_model`.
+    #[test]
+    #[serial_test::serial]
+    fn a_queued_dispatch_reads_queued_until_it_resumes() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let now = now_unix() as i64;
+        let rec = |action: &str, back: i64, elapsed: Option<u64>| {
+            let mut payload = serde_json::json!({"engine": "tensorfold", "endpoint": "tf", "model": "TF/m"});
+            if let Some(ms) = elapsed {
+                payload["elapsed_ms"] = ms.into();
+            }
+            serde_json::json!({
+                "ts": darkmux_flow::ts_utc_at(now - back), "action": action, "session_id": "q-sess",
+                "execution_id": "exec-q", "handle": "coder", "model": "TF/m", "payload": payload,
+            })
+        };
+        let row = |lines: &[serde_json::Value]| {
+            write_day_file(flows.path(), &today(), lines);
+            let runs = build_runs_judged_by(None, flows.path(), None, &[], &ScanWindow::default_window(), &PeerClocks::default()).runs;
+            runs.into_iter().find(|r| r.id == "q-sess").expect("the run")
+        };
+        let mut lines = vec![
+            rec("dispatch.start", 50, None),
+            rec("dispatch.queue.wait", 49, Some(0)),
+            rec("dispatch.queue.wait", 29, Some(20_000)),
+        ];
+        let queued = row(&lines);
+        assert_eq!(queued.status, RunStatus::Running);
+        assert_eq!((queued.activity, queued.activity_elapsed_ms), (Some(RunActivity::Queued), Some(20_000)));
+        assert_eq!(serde_json::to_value(&queued).unwrap()["activity"], "queued");
+        lines.push(rec("dispatch.queue.resume", 20, Some(29_000)));
+        let resumed = row(&lines);
+        assert_eq!((resumed.activity, resumed.activity_elapsed_ms), (None, None), "resumed: no longer queued");
+        lines.push(rec("dispatch.model.start", 19, None));
+        assert_eq!(row(&lines).activity, Some(RunActivity::StartingModel));
+        lines.truncate(3);
+        lines.push(rec("dispatch.error", 10, None));
+        let ended = row(&lines);
+        assert_eq!((ended.activity, ended.activity_elapsed_ms), (None, None), "a wait its dispatch.error closed");
     }
 
     #[test]
