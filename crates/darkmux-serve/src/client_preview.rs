@@ -1212,7 +1212,13 @@ impl Previews {
     /// `client serve` does as it shuts down. Returns the workspaces whose
     /// container it removed.
     pub fn stop_all(&self) -> Vec<String> {
-        self.stop_where(|_| true)
+        self.stop_where(|_, _| true)
+    }
+
+    /// Stops every live preview whose workspace `pick` chooses, the way
+    /// [`Previews::stop`] does. Returns the workspaces stopped.
+    pub fn stop_live(&self, pick: impl Fn(&str) -> bool) -> Vec<String> {
+        self.stop_where(|name, e| e.status.live() && pick(name))
     }
 
     /// (#3459) Stops every live preview nobody has asked about (a start or
@@ -1228,16 +1234,16 @@ impl Previews {
         }
         let now = (self.clock)();
         let idle_after = idle_minutes.saturating_mul(60);
-        self.stop_where(|e| e.status.live() && now.saturating_sub(e.last_asked) >= idle_after)
+        self.stop_where(|_, e| e.status.live() && now.saturating_sub(e.last_asked) >= idle_after)
     }
 
     /// Marks every preview `pick` chooses stopped, under its own lock, then
     /// removes their containers. Returns their workspaces, sorted.
-    fn stop_where(&self, pick: impl Fn(&Entry) -> bool) -> Vec<String> {
+    fn stop_where(&self, pick: impl Fn(&str, &Entry) -> bool) -> Vec<String> {
         let mut ended = Vec::new();
         for (name, entry) in self.entries.lock().unwrap().iter() {
             let mut e = entry.lock().unwrap();
-            if pick(&e) {
+            if pick(name, &e) {
                 e.status = Status::Stopped;
                 ended.push((name.clone(), e.container.take()));
             }
