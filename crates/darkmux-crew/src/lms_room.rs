@@ -38,7 +38,7 @@ use darkmux_gestalt::{
     PoolFact, PoolId, Pools, ResidentFact,
 };
 use darkmux_profiles::engine::server::{self, Dirs};
-use darkmux_profiles::model_ledger::ArchWithSizeFallback;
+use darkmux_profiles::model_ledger::{LoadFigures, LoadPricer};
 use darkmux_types::residency_lease::LeaseGuard;
 
 /// Where darkmux's engine servers are recorded, how long a stop may take,
@@ -79,11 +79,22 @@ impl ServerRoom<'_> {
     /// loads (a wave's Exclusive pass unloads them) and its idle servers
     /// (stopped to make room). A wave that would not fit runs after the one
     /// before it, instead of beside it.
-    pub(crate) fn wave_pools(&self, residents: &[ResidentFact], utility_binding: Option<&str>) -> Pools {
+    ///
+    /// A resident a placement reuses, reconciles or replaces is not
+    /// credited: the packer accounts for it itself (a reuse costs nothing, a
+    /// reconcile's stale is freed), and crediting it here too counted it
+    /// twice (#3514). An idle GGUF load's mapped weights may already be
+    /// partly reclaimable, so crediting its full size can over-admit by
+    /// those pages; the room step re-reads memory before any load.
+    pub(crate) fn wave_pools(&self, residents: &[ResidentFact], placements: &[Placement], utility_binding: Option<&str>) -> Pools {
         let lease = LeaseGuard::acquire();
         let leased = self.machine.leased(&lease);
+        let kept: Vec<String> = placements.iter().filter_map(|p| kept_by(residents, p)).collect();
         let idle_load = |r: &&ResidentFact| {
-            is_darkmux_owned(&r.identifier) && !leased.contains(&r.identifier) && utility_binding != Some(r.identifier.as_str())
+            is_darkmux_owned(&r.identifier)
+                && !leased.contains(&r.identifier)
+                && utility_binding != Some(r.identifier.as_str())
+                && !kept.contains(&r.identifier)
         };
         let loads: u64 = residents.iter().filter(idle_load).filter_map(|r| r.est_bytes).sum();
         let (idle, _) = darkmux_residents(&self.dirs, NO_ENDPOINT, &leased, Vec::new());
@@ -98,12 +109,25 @@ impl ServerRoom<'_> {
     }
 }
 
-/// (#3508) What a wave's loads take: the caller's estimate when it has one
-/// (a test's fixed figure), else the ledger's pricing over LM Studio's
+/// The resident `p` reuses, reconciles or sits beside, if any: the wave
+/// packer accounts for it.
+fn kept_by(residents: &[ResidentFact], p: &Placement) -> Option<String> {
+    match decide_residency(residents, p) {
+        ResidencyDecision::Reuse { identifier, .. } => Some(identifier),
+        ResidencyDecision::Reconcile { stale_identifier, .. } => Some(stale_identifier),
+        ResidencyDecision::OtherOwnedCopy { other_identifier, .. } => Some(other_identifier),
+        _ => None,
+    }
+}
+
+/// (#3508) What a wave's loads take, two ways (#3514): the commitment a
+/// refusal may rest on, and the potential eviction and wave packing aim
+/// for ([`LoadFigures`]). The caller's estimate, when it has one (a test's
+/// fixed figure), is both. Otherwise the ledger's pricing over LM Studio's
 /// catalog and each model's own architecture.
 pub(crate) struct LoadPricing<'a> {
     caller: &'a dyn FootprintEstimator,
-    measured: Option<(ArchWithSizeFallback, Vec<CatalogFact>)>,
+    measured: Option<(LoadPricer, Vec<CatalogFact>)>,
 }
 
 impl<'a> LoadPricing<'a> {
@@ -128,25 +152,60 @@ impl<'a> LoadPricing<'a> {
         }
         let catalog = host.list_catalog().unwrap_or_default();
         let arch = host.arch_facts(&unpriced);
-        LoadPricing { caller, measured: Some((ArchWithSizeFallback::new(arch), catalog)) }
+        LoadPricing { caller, measured: Some((LoadPricer::new(arch), catalog)) }
+    }
+
+    fn figures(&self, model_key: &str, min_ctx: u32, catalog: Option<&[CatalogFact]>) -> Option<LoadFigures> {
+        if let Some(bytes) = self.caller.estimate_bytes(model_key, min_ctx, catalog) {
+            return Some(LoadFigures { commitment: Some(bytes), potential: bytes });
+        }
+        let (pricer, own) = self.measured.as_ref()?;
+        pricer.figures(model_key, min_ctx, Some(catalog.unwrap_or(own)))
+    }
+
+    /// The figure a load may be refused on.
+    pub(crate) fn commitment(&self) -> Commitment<'_, 'a> {
+        Commitment(self)
+    }
+
+    /// The figure eviction and wave packing aim for.
+    pub(crate) fn potential(&self) -> Potential<'_, 'a> {
+        Potential(self)
     }
 }
 
-impl FootprintEstimator for LoadPricing<'_> {
+/// [`LoadPricing`]'s commitment, as the planner's estimator.
+pub(crate) struct Commitment<'p, 'a>(&'p LoadPricing<'a>);
+
+impl FootprintEstimator for Commitment<'_, '_> {
     fn estimate_bytes(&self, model_key: &str, min_ctx: u32, catalog: Option<&[CatalogFact]>) -> Option<u64> {
-        self.caller.estimate_bytes(model_key, min_ctx, catalog).or_else(|| {
-            let (measured, own) = self.measured.as_ref()?;
-            measured.estimate_bytes(model_key, min_ctx, Some(catalog.unwrap_or(own)))
-        })
+        self.0.figures(model_key, min_ctx, catalog)?.commitment
+    }
+}
+
+/// [`LoadPricing`]'s potential, as the planner's estimator.
+pub(crate) struct Potential<'p, 'a>(&'p LoadPricing<'a>);
+
+impl FootprintEstimator for Potential<'_, '_> {
+    fn estimate_bytes(&self, model_key: &str, min_ctx: u32, catalog: Option<&[CatalogFact]>) -> Option<u64> {
+        self.0.figures(model_key, min_ctx, catalog).map(|f| f.potential)
     }
 }
 
 /// Stop darkmux's idle engine servers until `plan`'s loads fit, recording
 /// each stop in `stopped`. See the module doc.
+///
+/// (#3514) Two figures. Idle servers are stopped to reach the loads'
+/// potential (their whole context filled), but only the commitment (what
+/// the load takes the moment it is made) can refuse it: an MLX model's KV
+/// cache grows as its context fills, so refusing a long-context load on its
+/// potential would refuse loads LM Studio makes fine. A potential not
+/// reached is a warning; a load with no commitment (its architecture
+/// unreadable) is never refused.
 pub(crate) fn make_room(
     plan: &Plan,
     facts: &Facts,
-    est: &dyn FootprintEstimator,
+    pricing: &LoadPricing<'_>,
     lease: &LeaseGuard,
     pinned: &[String],
     room: &ServerRoom<'_>,
@@ -155,34 +214,65 @@ pub(crate) fn make_room(
     if !plan.actions.iter().any(|a| matches!(a.action, Action::Load { .. })) {
         return Ok(());
     }
-    let Some(need) = plan_room(plan, facts, est) else {
+    let commitment = plan_room(plan, facts, &pricing.commitment());
+    let Some(target) = plan_room(plan, facts, &pricing.potential()) else {
         eprintln!("darkmux: warning: no memory figure for this LM Studio load; loading it unchecked and LM Studio decides");
         return Ok(());
     };
-    // Larger than the machine: evicting or waiting can never help.
-    if let Some(total) = room.machine.capacity().filter(|t| need.need_bytes > *t) {
+    // Larger than the machine at the moment of loading: evicting or
+    // waiting can never help.
+    if let Some((c, total)) = commitment.zip(room.machine.capacity()).filter(|(c, t)| c.need_bytes > *t) {
         return Err(refuse(
             "wont_fit",
-            format!("the model needs {:.1} GiB and this machine has {:.1} GiB in all", gib(need.need_bytes), gib(total)),
+            format!("the model needs {:.1} GiB and this machine has {:.1} GiB in all", gib(c.need_bytes), gib(total)),
         ));
     }
     let Some(free) = room.machine.reclaimable() else {
         eprintln!("darkmux: warning: this machine's free memory is unreadable; loading unchecked and LM Studio decides");
         return Ok(());
     };
-    if need.fits(free) {
+    if target.fits(free) {
         return Ok(());
     }
+    let (free, held) = stop_idle_servers_toward(target, lease, pinned, plan, facts, room, stopped)?;
+    match commitment {
+        Some(c) if !c.fits(free) => Err(out_of_room(c, free, &held)),
+        _ if target.fits(free) => Ok(()),
+        _ => {
+            eprintln!(
+                "darkmux: warning: this LM Studio load can grow to {:.1} GiB with its whole context filled, and \
+                 {:.1} GiB is free after evicting every idle darkmux resident; loading it, and LM Studio decides as \
+                 its context fills",
+                gib(target.need_bytes),
+                gib(free.saturating_add(target.freed_bytes))
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Stop darkmux's idle servers, the least recently started first, until
+/// `target` fits or none is left; returns the free memory then, and what a
+/// running dispatch holds.
+fn stop_idle_servers_toward(
+    target: PlanRoom,
+    lease: &LeaseGuard,
+    pinned: &[String],
+    plan: &Plan,
+    facts: &Facts,
+    room: &ServerRoom<'_>,
+    stopped: &mut Vec<String>,
+) -> Result<(u64, Vec<String>), EngineRefusal> {
     let leased = room.machine.leased(lease);
     // Every darkmux server counts: an LM Studio load replaces none of them.
     let (mut idle, mut held) = darkmux_residents(&room.dirs, NO_ENDPOINT, &leased, Vec::new());
     held.extend(held_loads(plan, facts, pinned));
     loop {
-        let Some(free) = room.machine.reclaimable() else { return Ok(()) };
-        if need.fits(free) {
-            return Ok(());
+        let free = room.machine.reclaimable().unwrap_or(0);
+        if target.fits(free) {
+            return Ok((free, held));
         }
-        let Some(next) = idle.pop() else { return Err(out_of_room(need, free, &held)) };
+        let Some(next) = idle.pop() else { return Ok((free, held)) };
         if evict(&next, &room.dirs, room.bounds, room.machine, lease)? {
             eprintln!("darkmux: stopped darkmux's idle engine server {} to make room for an LM Studio load", next.name());
             stopped.push(format!("stopped the idle engine server {}", next.name()));

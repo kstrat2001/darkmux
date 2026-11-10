@@ -150,7 +150,7 @@ impl ModelHost for LmsHost {
     /// (#3508) Read from each model's own `config.json`, else its GGUF
     /// header, as `darkmux machine resources` prices a resident: the rows of
     /// the catalog just listed, or a fresh `lms ls --json`.
-    fn arch_facts(&mut self, model_keys: &[&str]) -> std::collections::BTreeMap<String, darkmux_gestalt::ArchFacts> {
+    fn arch_facts(&mut self, model_keys: &[&str]) -> darkmux_gestalt::ModelArch {
         let rows = match self.last_ls.take() {
             Some(rows) => rows,
             None => self.run_json_list(&["ls", "--json"], "ls", Deadline(self.list_bound)).unwrap_or_default(),

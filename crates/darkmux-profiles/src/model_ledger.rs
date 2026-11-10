@@ -65,7 +65,7 @@
 use crate::gestalt_host::lms_host::{run_bounded, StdoutMode};
 use crate::gestalt_host::{ArchFactsReader, GgufFactsReader};
 use darkmux_gestalt::{
-    ArchEstimator, ArchFacts, CatalogFact, Deadline, FootprintEstimator, V1Estimator,
+    ArchEstimator, ArchFacts, CatalogFact, Deadline, FootprintEstimator, ModelArch, V1Estimator,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -1790,22 +1790,26 @@ fn resolve_arch_facts(
     arch_reader: &ArchFactsReader,
     gguf_reader: &GgufFactsReader,
 ) -> BTreeMap<String, ArchFacts> {
-    resolve_arch_facts_of(residents.iter().map(|r| r.model_key.as_str()), arch_reader, gguf_reader)
+    resolve_arch_facts_of(residents.iter().map(|r| r.model_key.as_str()), arch_reader, gguf_reader).facts
 }
 
-/// [`resolve_arch_facts`] over model keys.
+/// [`resolve_arch_facts`] over model keys, saying which came from a GGUF
+/// header (the reader that answered names the format).
 fn resolve_arch_facts_of<'k>(
     model_keys: impl Iterator<Item = &'k str>,
     arch_reader: &ArchFactsReader,
     gguf_reader: &GgufFactsReader,
-) -> BTreeMap<String, ArchFacts> {
-    let mut arch: BTreeMap<String, ArchFacts> = BTreeMap::new();
+) -> ModelArch {
+    let mut arch = ModelArch::default();
     for key in model_keys {
-        if arch.contains_key(key) {
+        if arch.facts.contains_key(key) {
             continue;
         }
-        if let Some(raw) = arch_reader.read(key).or_else(|| gguf_reader.read(key)) {
-            arch.insert(key.to_string(), arch_facts_v1(&raw));
+        if let Some(raw) = arch_reader.read(key) {
+            arch.facts.insert(key.to_string(), arch_facts_v1(&raw));
+        } else if let Some(raw) = gguf_reader.read(key) {
+            arch.facts.insert(key.to_string(), arch_facts_v1(&raw));
+            arch.kv_at_load.insert(key.to_string());
         }
     }
     arch
@@ -1814,10 +1818,49 @@ fn resolve_arch_facts_of<'k>(
 /// (#3508) Architecture facts for `model_keys`, read from the models
 /// `ls_rows` (`lms ls --json`) lists, in [`resolve_arch_facts`]'s order. A
 /// load is then priced as [`ModelLedger`] prices a resident.
-pub fn arch_facts_for(ls_rows: &[serde_json::Value], model_keys: &[&str]) -> BTreeMap<String, ArchFacts> {
+pub fn arch_facts_for(ls_rows: &[serde_json::Value], model_keys: &[&str]) -> ModelArch {
     let arch_reader = ArchFactsReader::from_ls_entries(ls_rows);
     let gguf_reader = GgufFactsReader::from_ls_entries(ls_rows);
     resolve_arch_facts_of(model_keys.iter().copied(), &arch_reader, &gguf_reader)
+}
+
+/// (#3514) What a load costs, two ways.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoadFigures {
+    /// What the load takes the moment it is made: a GGUF model's weights,
+    /// its KV cache at the whole context and the margin (llama.cpp allocates
+    /// the cache at load); an MLX model's weights and the margin (MLX grows
+    /// the cache as the context fills). `None` when the architecture could
+    /// not be read: the size-based estimate is a guess, never a refusal.
+    pub commitment: Option<u64>,
+    /// What it can grow to with its whole context filled: the ledger's
+    /// potential, [`ArchWithSizeFallback`]'s figure.
+    pub potential: u64,
+}
+
+/// (#3514) Prices a load both ways: the commitment a refusal may rest on,
+/// and the potential eviction and wave packing aim for.
+pub struct LoadPricer {
+    estimator: ArchWithSizeFallback,
+    kv_at_load: std::collections::BTreeSet<String>,
+}
+
+impl LoadPricer {
+    pub fn new(arch: ModelArch) -> Self {
+        LoadPricer { estimator: ArchWithSizeFallback::new(arch.facts), kv_at_load: arch.kv_at_load }
+    }
+
+    /// `None` when the model cannot be priced at all.
+    pub fn figures(&self, model_key: &str, min_ctx: u32, catalog: Option<&[CatalogFact]>) -> Option<LoadFigures> {
+        let (potential, source) = self.estimator.estimate_with_source(model_key, min_ctx, catalog)?;
+        let weights = || catalog?.iter().find(|c| c.model_key == model_key)?.size_bytes;
+        let commitment = match source {
+            PotentialSource::Arch if self.kv_at_load.contains(model_key) => Some(potential),
+            PotentialSource::Arch => weights().map(|w| w + darkmux_gestalt::DEFAULT_TRANSIENT_MARGIN_BYTES),
+            PotentialSource::Estimated | PotentialSource::Unknown => None,
+        };
+        Some(LoadFigures { commitment, potential })
+    }
 }
 
 /// `ArchFactsRaw` → gestalt [`ArchFacts`] with the v1 KV dtype width. NOT a
@@ -3574,7 +3617,7 @@ esac
         // SAFETY: #[serial]; restored below.
         unsafe { std::env::set_var("HOME", home.path()) };
         let rows = [serde_json::json!({"modelKey": "m", "path": "org/m-4bit", "sizeBytes": 4_000_000_000u64})];
-        let arch = arch_facts_for(&rows, &["m", "absent"]);
+        let arch = arch_facts_for(&rows, &["m", "absent"]).facts;
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("HOME", v),

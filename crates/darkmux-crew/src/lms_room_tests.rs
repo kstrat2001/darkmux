@@ -7,7 +7,7 @@ use super::*;
 use crate::concurrent_dispatch::ensure_wave_loaded;
 use crate::engine_dispatch::refusal_code;
 use darkmux_gestalt::mock::{HostOp, MockHost};
-use darkmux_gestalt::{FixedEstimator, Placement};
+use darkmux_gestalt::{CatalogFact, FixedEstimator, Placement, ResidentFact};
 use darkmux_types::engine_record::{self, EngineRecord, ENGINE_RECORD_SCHEMA};
 use std::process::{Child, Command};
 use std::sync::Mutex;
@@ -161,9 +161,76 @@ fn wave(model_key: &str) -> Vec<Placement> {
 }
 
 /// Load the wave the way every LM Studio dispatch does, against `room`.
+/// The weights' formats a test host reports, as the readers would name
+/// them.
+#[derive(Clone, Copy)]
+enum Format {
+    /// A GGUF header was read: the KV cache is paid at load.
+    Gguf,
+    /// A `config.json` was read (MLX): the cache grows as the context fills.
+    Mlx,
+    /// Neither: the size-based estimate.
+    Unreadable,
+}
+
+/// A mock LM Studio that also reports each model's architecture.
+struct ArchHost {
+    inner: MockHost,
+    format: Format,
+    arch: darkmux_gestalt::ArchFacts,
+}
+
+/// A dense model's KV per token: 48 layers x 8 KV heads x 128 x 2 (K, V)
+/// x 2 bytes, 192 KiB a token.
+const DENSE: darkmux_gestalt::ArchFacts =
+    darkmux_gestalt::ArchFacts { total_layers: 48, full_attention_layers: 48, kv_heads: 8, head_dim: 128, kv_bytes_per_element: 2 };
+
+impl ArchHost {
+    fn new(inner: MockHost, format: Format) -> Self {
+        ArchHost { inner, format, arch: DENSE }
+    }
+}
+
+impl ModelHost for ArchHost {
+    fn list_resident(&mut self) -> Result<Vec<ResidentFact>, darkmux_gestalt::HostError> {
+        self.inner.list_resident()
+    }
+    fn list_catalog(&mut self) -> Result<Vec<CatalogFact>, darkmux_gestalt::HostError> {
+        self.inner.list_catalog()
+    }
+    fn load(&mut self, k: &str, id: &str, ctx: u32, d: darkmux_gestalt::Deadline) -> Result<darkmux_gestalt::LoadReport, darkmux_gestalt::HostError> {
+        self.inner.load(k, id, ctx, d)
+    }
+    fn unload(&mut self, t: &darkmux_gestalt::OwnedTarget, d: darkmux_gestalt::Deadline) -> Result<(), darkmux_gestalt::HostError> {
+        self.inner.unload(t, d)
+    }
+    fn arch_facts(&mut self, keys: &[&str]) -> darkmux_gestalt::ModelArch {
+        let mut arch = darkmux_gestalt::ModelArch::default();
+        if matches!(self.format, Format::Unreadable) {
+            return arch;
+        }
+        for k in keys {
+            arch.facts.insert(k.to_string(), self.arch);
+            if matches!(self.format, Format::Gguf) {
+                arch.kv_at_load.insert(k.to_string());
+            }
+        }
+        arch
+    }
+}
+
+/// Load the wave the way every LM Studio dispatch does, against `room`,
+/// its models GGUF: their whole cache is committed at load.
 fn load(host: &mut MockHost, wave: &[Placement], room: &ServerRoom<'_>) -> anyhow::Result<()> {
+    load_as(host, Format::Gguf, wave, room)
+}
+
+fn load_as(host: &mut MockHost, format: Format, wave: &[Placement], room: &ServerRoom<'_>) -> anyhow::Result<()> {
     let lease = LeaseGuard::acquire();
-    ensure_wave_loaded(wave, &FixedEstimator::default(), host, &lease, None, room)
+    let mut arch = ArchHost::new(std::mem::take(host), format);
+    let result = ensure_wave_loaded(wave, &FixedEstimator::default(), &mut arch, &lease, None, room);
+    *host = arch.inner;
+    result
 }
 
 fn loaded(host: &MockHost) -> bool {
@@ -398,7 +465,7 @@ fn a_refused_wave_runs_none_of_its_jobs_and_each_ends_in_an_error() {
     };
     let seat = |s: &str| crate::step_kinds::SeatClaim::LocalModel(Placement { seat: s.into(), ..wave("huge")[0].clone() });
     let jobs = vec![QueuedJob { index: 0, seat: seat("a"), job: job(0) }, QueuedJob { index: 1, seat: seat("b"), job: job(1) }];
-    let factory = || -> Box<dyn ModelHost> { Box::new(MockHost::new().cataloged("huge", 1 << 40)) };
+    let factory = || -> Box<dyn ModelHost> { Box::new(ArchHost::new(MockHost::new().cataloged("huge", 1 << 40), Format::Gguf)) };
     let room = ServerRoom::this_machine();
     let results = run_bounded(jobs, &Facts::default(), &FixedEstimator::default(), 4, &factory, &room).expect("planned");
     assert_eq!(ran.load(Ordering::SeqCst), 0, "no job of the refused wave ran");
@@ -547,4 +614,102 @@ fn the_planner_names_a_user_load_whose_memory_darkmux_cannot_free() {
     let err = load(&mut host, &wave("m"), &rig.room(&machine)).expect_err("refused");
     assert_eq!(refusal_code(&err), Some("memory_in_use"), "{err:#}");
     assert!(format!("{err:#}").contains("user-loaded instance \"m\""), "the planner's pool arm names it: {err:#}");
+}
+
+/// (#3514 B1) The review's probe, on a 128 GiB machine: a load is refused
+/// only when what it takes at the moment it is made exceeds what darkmux can
+/// free. A model's potential (its whole context filled) drives eviction and
+/// earns a warning, never a refusal; an unreadable architecture is never a
+/// refusal at all.
+#[test]
+#[serial_test::serial]
+fn a_long_context_load_is_refused_only_on_what_it_commits_at_load() {
+    let rig = Rig::new();
+    let at = |model: &str, ctx: u32| vec![Placement { min_ctx: ctx, ..wave(model)[0].clone() }];
+    // (format, weights GiB, context, free GiB, refused with)
+    let rows: [(Format, u64, u32, u64, Option<&str>); 6] = [
+        // A 15 GiB dense MLX model at 200k: its cache grows as it fills (36.6
+        // GiB at 200k), so with 40 GiB free it loads.
+        (Format::Mlx, 15, 200_000, 40, None),
+        // The same model as GGUF commits that cache at load: 52 GiB does not
+        // fit 40 GiB free, which is a real shortfall.
+        (Format::Gguf, 15, 200_000, 40, Some("memory_in_use")),
+        // As GGUF with 64 GiB free it fits.
+        (Format::Gguf, 15, 200_000, 64, None),
+        // 48 GiB of weights at 262k with the architecture unreadable: the
+        // size-based guess exceeds the machine, and is never a refusal.
+        (Format::Unreadable, 48, 262_144, 100, None),
+        // A 2.5 GiB 4B at 120k with 24 GiB free, unreadable or MLX: loads.
+        (Format::Unreadable, 2, 120_000, 24, None),
+        (Format::Mlx, 2, 120_000, 24, None),
+    ];
+    for (format, weights, ctx, free_gib, refused) in rows {
+        let free = move || Some(free_gib * GIB);
+        let machine = FakeMachine::new(&free);
+        let mut host = MockHost::new().cataloged("m", weights * GIB);
+        let result = load_as(&mut host, format, &at("m", ctx), &rig.room(&machine));
+        match refused {
+            None => {
+                result.unwrap_or_else(|e| panic!("{weights} GiB at {ctx} with {free_gib} GiB free loads: {e:#}"));
+                assert!(loaded(&host));
+            }
+            Some(code) => {
+                let err = result.expect_err("refused");
+                assert_eq!(refusal_code(&err), Some(code), "{err:#}");
+                assert!(!loaded(&host));
+            }
+        }
+    }
+}
+
+/// (#3514 B1) Only a commitment larger than the whole machine is
+/// `wont_fit`: an MLX model whose potential is larger than the machine
+/// loads (its cache may never fill), a GGUF one whose commitment is does not.
+#[test]
+#[serial_test::serial]
+fn wont_fit_rests_on_the_commitment_alone() {
+    let rig = Rig::new();
+    let free = || Some(120 * GIB);
+    let machine = FakeMachine::new(&free);
+    let big = vec![Placement { min_ctx: 600_000, ..wave("m")[0].clone() }];
+    let mut host = MockHost::new().cataloged("m", 20 * GIB);
+    load_as(&mut host, Format::Mlx, &big, &rig.room(&machine)).expect("its potential (130 GiB) is past the machine, its commitment is not");
+    let mut host = MockHost::new().cataloged("m", 20 * GIB);
+    let err = load_as(&mut host, Format::Gguf, &big, &rig.room(&machine)).expect_err("a GGUF commits it at load");
+    assert_eq!(refusal_code(&err), Some("wont_fit"), "{err:#}");
+}
+
+/// (#3514 B1) The potential drives eviction: an MLX load whose commitment
+/// already fits still stops darkmux's idle server to reach its potential.
+#[test]
+#[serial_test::serial]
+fn idle_servers_are_stopped_to_reach_the_potential() {
+    let rig = Rig::new();
+    let mut tf = FakeServer::darkmux(&rig.dirs(), "tf", "TensorFold/q", 1_000);
+    let rec = tf.rec.clone();
+    let free = || Some(if server::alive(&rec) { 30 * GIB } else { 90 * GIB });
+    let machine = FakeMachine::new(&free);
+    let mut host = MockHost::new().cataloged("m", 15 * GIB);
+    let long = vec![Placement { min_ctx: 200_000, ..wave("m")[0].clone() }];
+    load_as(&mut host, Format::Mlx, &long, &rig.room(&machine)).expect("loads");
+    assert!(!tf.running(), "stopped to make room for the cache the load may grow into");
+}
+
+/// (#3514 B2) A resident a placement reuses is not credited to the wave
+/// pool: the packer already prices the reuse at nothing. Resident `a` (40
+/// GiB) and `b`, `c` to load (40 GiB each) with 50 GiB free is two waves,
+/// not one the room step would then refuse.
+#[test]
+#[serial_test::serial]
+fn a_resident_the_wave_reuses_is_not_credited_to_its_pool() {
+    use crate::concurrent_dispatch::schedule_waves;
+    let rig = Rig::new();
+    let free = || Some(50 * GIB);
+    let machine = FakeMachine::new(&free);
+    let room = rig.room(&machine);
+    let est = FixedEstimator(["a", "b", "c"].iter().map(|k| (k.to_string(), 40 * GIB)).collect());
+    let factory = || -> Box<dyn ModelHost> { Box::new(MockHost::new().resident("darkmux:a", "a", 8_000, Some(40 * GIB))) };
+    let abc: Vec<Placement> = ["a", "b", "c"].iter().flat_map(|m| wave(m)).collect();
+    let schedule = schedule_waves(&abc, &Facts::default(), &est, &factory, &room).unwrap();
+    assert_eq!(schedule.waves, vec![abc[..2].to_vec(), vec![abc[2].clone()]], "{schedule:?}");
 }

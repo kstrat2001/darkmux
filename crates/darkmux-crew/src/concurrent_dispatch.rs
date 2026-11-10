@@ -509,10 +509,15 @@ pub(crate) fn schedule_waves(
     }
     let mut host = host_factory();
     let residents = host.list_resident().unwrap_or_default();
-    let pools = room.wave_pools(&residents, facts.utility_binding.as_deref());
-    let priced = crate::lms_room::LoadPricing::for_placements(placements, &residents, est, host.as_mut());
+    let pools = room.wave_pools(&residents, placements, facts.utility_binding.as_deref());
+    let pricing = crate::lms_room::LoadPricing::for_placements(placements, &residents, est, host.as_mut());
     let machine = Facts { residents, pools, ..facts.clone() };
-    darkmux_gestalt::plan_waves(placements, &machine, &priced, WaveMode::Auto).map_err(refused)
+    // (#3514) Packed on the potential; refused only on the commitment.
+    let packed = darkmux_gestalt::plan_waves(placements, &machine, &pricing.potential(), WaveMode::Auto).map_err(refused)?;
+    if packed.refusals.is_empty() {
+        return Ok(packed);
+    }
+    darkmux_gestalt::plan_waves(placements, &machine, &pricing.commitment(), WaveMode::Auto).map_err(refused)
 }
 
 /// The local track: walk `schedule.waves` in order, running every job in
@@ -1092,12 +1097,14 @@ impl WaveLoad<'_> {
         let opts = AcquireOpts { pinned: pinned.clone(), ..AcquireOpts::new(CallerIntent::Auto, AcquireScope::Exclusive) };
         // (#3508) Priced as `darkmux machine resources` prices a resident,
         // where the caller's estimator has no figure.
-        let est = crate::lms_room::LoadPricing::for_placements(self.unique, &facts.residents, self.est, host);
-        let plan = plan_acquire(self.unique, &facts, opts, &est);
+        let pricing = crate::lms_room::LoadPricing::for_placements(self.unique, &facts.residents, self.est, host);
+        // (#3514) Planned on the commitment: the planner's refusals rest on
+        // what a load takes when it is made, never on its potential.
+        let plan = plan_acquire(self.unique, &facts, opts, &pricing.commitment());
         // (#3506) darkmux's idle engine servers count in the machine's one
         // memory budget: stopped to make room before anything is unloaded
         // or loaded, or the wave is refused with a code.
-        crate::lms_room::make_room(&plan, &facts, &est, self.lease, &pinned, self.room, committed)
+        crate::lms_room::make_room(&plan, &facts, &pricing, self.lease, &pinned, self.room, committed)
             .map_err(|refusal| room_refused(refusal, committed))?;
         Ok((execute_plan(&plan, host, self.deadline, committed, &|| self.held()), pinned))
     }

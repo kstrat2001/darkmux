@@ -72,7 +72,7 @@ pub use plan::{
     Precondition, Reason, Warning,
 };
 pub use planner::{plan_acquire, plan_release, AcquireOpts, AcquireScope};
-pub use ports::{Deadline, HostError, LoadReport, ModelHost, ProbeError, ResourceProbe};
+pub use ports::{Deadline, HostError, LoadReport, ModelArch, ModelHost, ProbeError, ResourceProbe};
 pub use residency::{decide_residency, ResidencyDecision};
 pub use room::{plan_room, PlanRoom};
 pub use waves::{

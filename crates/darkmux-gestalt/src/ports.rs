@@ -110,12 +110,24 @@ pub trait ModelHost {
     fn unload(&mut self, target: &OwnedTarget, deadline: Deadline) -> Result<(), HostError>;
     /// (#3508) Architecture facts for each of `model_keys` the host can
     /// read (layers, KV heads, head size), the KV-cache term of a load's
-    /// estimate. A host that cannot read them answers none, and the estimate
-    /// falls back to the catalog size.
-    fn arch_facts(&mut self, model_keys: &[&str]) -> BTreeMap<String, ArchFacts> {
+    /// estimate, and which of them pay that cache at load. A host that
+    /// cannot read them answers none, and the estimate falls back to the
+    /// catalog size.
+    fn arch_facts(&mut self, model_keys: &[&str]) -> ModelArch {
         let _ = model_keys;
-        BTreeMap::new()
+        ModelArch::default()
     }
+}
+
+/// (#3508) What a host could read of its models' architecture.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelArch {
+    pub facts: BTreeMap<String, ArchFacts>,
+    /// The keys whose facts came from a GGUF file's header. llama.cpp
+    /// allocates a GGUF model's KV cache at load, for the whole context; an
+    /// MLX model (facts from its `config.json`) grows its cache as the
+    /// context fills, so only its weights are committed at load.
+    pub kv_at_load: std::collections::BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
