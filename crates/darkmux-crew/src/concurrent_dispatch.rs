@@ -141,6 +141,14 @@ pub fn standing_facts(config_path: Option<&str>) -> Facts {
     Facts { utility_binding: standing_utility_binding(config_path), ..Facts::default() }
 }
 
+/// One reconcile's snapshot: LM Studio's `residents` read now, and the
+/// utility binding the caller was handed, which it must name (a snapshot
+/// without it forfeits the utility hold). A wave's reuse check and a
+/// preflight load's memory decision are built here.
+pub(crate) fn reconcile_facts(residents: Vec<darkmux_gestalt::ResidentFact>, utility_binding: Option<String>) -> Facts {
+    Facts { residents, utility_binding, ..Facts::default() }
+}
+
 /// One job's completed outcome: its own value plus every flow record it
 /// produced (see the module doc's "Flow-record ordering" section).
 pub type JobOutcome<T> = Result<(T, Vec<FlowRecord>)>;
@@ -1138,7 +1146,8 @@ impl WaveLoad<'_> {
         // (#3506) darkmux's idle engine servers count in the machine's one
         // memory budget: stopped to make room before anything is unloaded
         // or loaded, or the wave is refused with a code.
-        crate::lms_room::make_room(&plan, &facts, &pricing, self.lease, &pinned, self.room, committed)
+        let evict = crate::lms_room::Evict { lease: self.lease, pinned: &pinned, loads: Vec::new() };
+        crate::lms_room::make_room(&plan, &facts, &pricing, &evict, self.room, committed)
             .map_err(|refusal| room_refused(refusal, committed))?;
         let starting = self.reserve(&plan, &facts, &pricing)?;
         let mut lock = lock;
@@ -1194,7 +1203,7 @@ impl WaveLoad<'_> {
         let residents = host
             .list_resident()
             .map_err(|e| anyhow!("darkmux: could not read LMStudio residents (`lms ps`): {e}{}", partial_execution_note(committed)))?;
-        let facts = Facts { residents, utility_binding: self.utility_binding.map(str::to_string), ..Default::default() };
+        let facts = reconcile_facts(residents, self.utility_binding.map(str::to_string));
         let pinned = self.held();
         let opts = AcquireOpts { pinned: pinned.clone(), ..AcquireOpts::new(CallerIntent::Auto, AcquireScope::Exclusive) };
         let plan = plan_acquire(self.unique, &facts, opts, self.est);

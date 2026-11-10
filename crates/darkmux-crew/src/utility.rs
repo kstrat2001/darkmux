@@ -326,7 +326,9 @@ fn utility_wire_model(route: UtilityRoute<'_>, target: &crate::target::UtilityTa
     } else {
         crate::dispatch_internal::WindowSource::UtilityFallback
     };
-    crate::dispatch_internal::ensure_model_loaded_at_ctx_from(
+    // Its lease goes with this function: a utility job holds no lease of
+    // its own, and the standing binding is never unloaded to make room.
+    let _hold = crate::dispatch_internal::ensure_model_loaded_at_ctx_from(
         &crate::dispatch_internal::utility_residency_pm(binding_id, window),
         source,
     )
