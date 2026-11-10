@@ -278,6 +278,15 @@ impl ClientStore {
         let Some(mut guard) = darkmux_types::flock::lock_shared_existing(&self.path)? else {
             return Ok(ClientsFile::default());
         };
+        // A lock that was waited for can be on the file a change replaced
+        // meanwhile ([`ClientStore::lock_current`]): look once more, at the
+        // file that change left.
+        if !is_file_at(guard.file(), &self.path)? {
+            match darkmux_types::flock::lock_shared_existing(&self.path)? {
+                Some(current) => guard = current,
+                None => return Ok(ClientsFile::default()),
+            }
+        }
         let mut text = String::new();
         guard
             .file()

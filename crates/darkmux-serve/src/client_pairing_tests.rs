@@ -7169,3 +7169,29 @@ fn a_change_that_waited_for_the_lock_builds_on_the_one_before_it() {
     assert_eq!(now.legacy_owner.as_deref(), Some("first"), "the first change survived the second");
     assert_eq!(now.clients, vec![client]);
 }
+
+/// A read that waited for the store's lock reads the store as the change
+/// it waited on left it, never the file that change replaced.
+#[test]
+fn a_peek_that_waited_for_the_lock_reads_the_change_it_waited_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(ClientStore::at(dir.path().join("clients.json")));
+    store.update(|f| { f.legacy_owner = Some("start".into()); Ok(()) }).unwrap();
+    let (writer, holding) = (store.clone(), Arc::new(std::sync::Barrier::new(2)));
+    let held = holding.clone();
+    let a = std::thread::spawn(move || {
+        writer
+            .update(|f| {
+                held.wait();
+                // The read is waiting on the lock by now.
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                f.legacy_owner = Some("changed".into());
+                Ok(())
+            })
+            .unwrap();
+    });
+    holding.wait();
+    let seen = store.peek().unwrap();
+    a.join().unwrap();
+    assert_eq!(seen.legacy_owner.as_deref(), Some("changed"));
+}
