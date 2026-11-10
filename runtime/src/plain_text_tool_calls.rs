@@ -967,9 +967,13 @@ fn parse_xml_block(
     })
 }
 
-/// Try to interpret a parameter VALUE as JSON; fall back to the raw
-/// string when it's not valid JSON. Trims leading/trailing whitespace
-/// since Qwen 3.x sometimes emits indented multi-line values.
+/// Try to interpret a parameter VALUE as JSON; fall back to the string
+/// when it's not valid JSON. The JSON attempt trims all surrounding
+/// whitespace (Qwen 3.x sometimes indents multi-line values). The string
+/// fallback drops only the newlines that wrap a value written on its own
+/// line (one leading, one trailing), as the reference Qwen3-Coder parser
+/// does: `write`/`edit` content may legitimately start or end with spaces
+/// or blank lines.
 fn parse_xml_parameter_value(text: &str) -> serde_json::Value {
     let trimmed = text.trim();
     // Heuristic: only try JSON parsing for things that look like JSON
@@ -987,7 +991,13 @@ fn parse_xml_parameter_value(text: &str) -> serde_json::Value {
             return parsed;
         }
     }
-    serde_json::Value::String(text.to_string())
+    serde_json::Value::String(strip_wrapping_newlines(text).to_string())
+}
+
+/// `text` without one leading and one trailing newline (`\n` or `\r\n`).
+fn strip_wrapping_newlines(text: &str) -> &str {
+    let text = text.strip_prefix("\r\n").or_else(|| text.strip_prefix('\n')).unwrap_or(text);
+    text.strip_suffix("\r\n").or_else(|| text.strip_suffix('\n')).unwrap_or(text)
 }
 
 // ─── helpers ───────────────────────────────────────────────────────────
@@ -1266,6 +1276,45 @@ mod tests {
         assert_eq!(blocks[0].name, "bash");
         assert_eq!(blocks[1].name, "read");
         assert_eq!(blocks[1].arguments.get("path").unwrap().as_str().unwrap(), "/a");
+    }
+
+    /// Nanbeige4.3-33B puts each value on its own line. The promoted `read`
+    /// received `"\n/workspace/src/tokenRotation.js\n"` and failed to
+    /// resolve the path, so the wrapping newlines must come off.
+    #[test]
+    fn xml_format_newline_wrapped_path_loses_its_wrapping_newlines() {
+        let text = "<tool_call>\n<function=read>\n<parameter=path>\n/workspace/src/tokenRotation.js\n</parameter>\n</function>\n</tool_call>";
+        let blocks = blocks_only(parse_plain_text_tool_call_blocks(text, &allowed(&["read"]), DEFAULT_MAX_PAYLOAD_BYTES)).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0].arguments.get("path").unwrap().as_str().unwrap(),
+            "/workspace/src/tokenRotation.js"
+        );
+    }
+
+    /// Only ONE wrapping newline comes off each end, as in the reference
+    /// Qwen3-Coder parser: file content keeps its indentation, its inner
+    /// blank lines and any further trailing newline.
+    #[test]
+    fn xml_format_newline_wrapped_content_keeps_its_own_whitespace() {
+        let text = "<tool_call><function=write><parameter=path>/workspace/a.py</parameter><parameter=content>\n    indented first\n\nlast line\n\n</parameter></function></tool_call>";
+        let blocks = blocks_only(parse_plain_text_tool_call_blocks(text, &allowed(&["write"]), DEFAULT_MAX_PAYLOAD_BYTES)).unwrap();
+        assert_eq!(
+            blocks[0].arguments.get("content").unwrap().as_str().unwrap(),
+            "    indented first\n\nlast line\n"
+        );
+        let crlf = "<tool_call><function=write><parameter=content>\r\nx\r\n</parameter></function></tool_call>";
+        let blocks = blocks_only(parse_plain_text_tool_call_blocks(crlf, &allowed(&["write"]), DEFAULT_MAX_PAYLOAD_BYTES)).unwrap();
+        assert_eq!(blocks[0].arguments.get("content").unwrap().as_str().unwrap(), "x", "a CRLF is one newline");
+    }
+
+    /// An inline value is not newline-wrapped, so nothing comes off it:
+    /// spaces at either end are the value's own.
+    #[test]
+    fn xml_format_inline_value_keeps_surrounding_spaces() {
+        let text = "<tool_call><function=write><parameter=content>  x  </parameter></function></tool_call>";
+        let blocks = blocks_only(parse_plain_text_tool_call_blocks(text, &allowed(&["write"]), DEFAULT_MAX_PAYLOAD_BYTES)).unwrap();
+        assert_eq!(blocks[0].arguments.get("content").unwrap().as_str().unwrap(), "  x  ");
     }
 
     // ─── Format detection (the trajectory observability split) ─────────

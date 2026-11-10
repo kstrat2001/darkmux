@@ -1695,6 +1695,59 @@ pub const RUNTIME_BINARY_NAME: &str = "darkmux-runtime";
 /// self-invalidating on exactly the event that matters.
 pub const RUNTIME_BINARY_STAMP: &str = "darkmux-runtime.version";
 
+/// The lock file that serializes extraction into one cache directory, across
+/// threads and processes alike (an `flock` per open file).
+pub const RUNTIME_BINARY_LOCK: &str = "darkmux-runtime.lock";
+
+/// The prefix of every extraction's temp file. Only an extraction holding
+/// [`RUNTIME_BINARY_LOCK`] writes one, so any found while holding it is a
+/// crashed extraction's orphan.
+const RUNTIME_BINARY_TEMP_PREFIX: &str = ".darkmux-runtime.tmp.";
+
+static RUNTIME_BINARY_TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A temp path in `dir` unique per call (pid plus a process-wide counter), in
+/// the same directory as the binary so its publish is one atomic rename.
+pub(crate) fn runtime_binary_temp_path(dir: &Path) -> PathBuf {
+    let seq = RUNTIME_BINARY_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    dir.join(format!("{RUNTIME_BINARY_TEMP_PREFIX}{}.{seq}", std::process::id()))
+}
+
+/// Takes the cache directory's extraction lock, blocking until it is free.
+/// Released when the returned file drops.
+fn lock_runtime_binary_cache(dir: &Path) -> Result<fs::File> {
+    let path = dir.join(RUNTIME_BINARY_LOCK);
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("opening runtime-binary cache lock {}", path.display()))?;
+    loop {
+        match file.lock() {
+            Ok(()) => return Ok(file),
+            // A signal can interrupt a blocking lock; ask again.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                return Err(anyhow::Error::new(e)
+                    .context(format!("locking runtime-binary cache lock {}", path.display())))
+            }
+        }
+    }
+}
+
+/// Removes temp files a crashed extraction left in `dir`. Called with the
+/// extraction lock held, so none of them belongs to a live extraction.
+fn sweep_runtime_binary_temps(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with(RUNTIME_BINARY_TEMP_PREFIX) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Paths of the cached runtime binary and its version stamp inside `dir`.
 pub fn runtime_binary_cache_paths_at(dir: &Path) -> (PathBuf, PathBuf) {
     (dir.join(RUNTIME_BINARY_NAME), dir.join(RUNTIME_BINARY_STAMP))
@@ -1845,6 +1898,16 @@ fn ensure_runtime_binary_cached_at(
     if cached_binary_is_current_at(dir, want_version, want_image_id.as_deref()) {
         return Ok(dest);
     }
+    fs::create_dir_all(dir)
+        .with_context(|| format!("creating runtime-binary cache dir {}", dir.display()))?;
+    // Concurrent first runs (several `lab run` queues in a fresh home) all
+    // miss above. One extracts; the rest wait here, then find its current,
+    // stamped binary and use it. Holding the lock through the stamp write
+    // also means no run ever stamps a binary another run published.
+    let _lock = lock_runtime_binary_cache(dir)?;
+    if cached_binary_is_current_at(dir, want_version, want_image_id.as_deref()) {
+        return Ok(dest);
+    }
     // Not a cache miss but a cache INVALIDATION — say which, once, because
     // the alternative (silence) is a dispatch that dies inside a container
     // with `unknown flag` and no host-side breadcrumb.
@@ -1855,9 +1918,23 @@ fn ensure_runtime_binary_cached_at(
             cached_runtime_binary_version_at(dir).unwrap_or_else(|| "an unknown build".into())
         );
     }
-    fs::create_dir_all(dir)
-        .with_context(|| format!("creating runtime-binary cache dir {}", dir.display()))?;
+    sweep_runtime_binary_temps(dir);
+    let tmp = runtime_binary_temp_path(dir);
+    extract_runtime_binary_to(source_image, &tmp)?;
+    publish_runtime_binary(&tmp, &dest, &stamp, &stamp_contents(want_version, want_image_id.as_deref()))?;
 
+    eprintln!(
+        "darkmux dispatch: cached runtime binary → {} (from {source_image}, darkmux \
+         {want_version}, image id {}, for --image injection)",
+        dest.display(),
+        want_image_id.as_deref().unwrap_or("unavailable")
+    );
+    Ok(dest)
+}
+
+/// Copies the runtime binary out of `source_image` to `tmp` through a
+/// throwaway container. On failure `tmp` is removed.
+fn extract_runtime_binary_to(source_image: &str, tmp: &Path) -> Result<()> {
     // A throwaway container is the standard `docker cp` source; clean it up
     // unconditionally afterward.
     // (#907) `--` fences the image ref as a positional arg (symmetry with the
@@ -1882,12 +1959,11 @@ fn ensure_runtime_binary_cached_at(
         bail!("docker create returned an empty container id while extracting the runtime binary");
     }
 
-    // Extract to a temp path then atomically rename into place. `docker cp`
-    // is NOT atomic — a partial write must never be left at `dest`, or the
-    // cache-hit check above would hand out a truncated binary on every later
-    // dispatch. The temp is cleaned up on any failure.
-    let tmp = dir.join("darkmux-runtime.partial");
-    let _ = fs::remove_file(&tmp);
+    // `docker cp` is NOT atomic, so it writes to this call's own temp path,
+    // and only `publish_runtime_binary`'s rename ever puts a file at the
+    // binary's real name: a partial write must never be left there, or the
+    // cache-hit check would hand out a truncated binary on every later
+    // dispatch.
     let tmp_str = tmp.to_str().ok_or_else(|| {
         anyhow!(
             "runtime-binary cache temp path is not valid UTF-8: {}",
@@ -1905,26 +1981,30 @@ fn ensure_runtime_binary_cached_at(
     let _ = Command::new("docker").args(["rm", "-f", &cid]).output();
     let cp = cp.context("docker cp (extracting the runtime binary)")?;
     if !cp.status.success() {
-        let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_file(tmp);
         bail!(
             "docker cp of the runtime binary failed: {}",
             String::from_utf8_lossy(&cp.stderr).trim()
         );
     }
+    Ok(())
+}
 
-    // Ensure it's executable for the bind-mount; clean up the temp on failure
-    // so a non-executable partial is never promoted.
+/// Makes the extracted `tmp` executable, renames it onto `dest` and writes
+/// `stamp`. On failure before the rename `tmp` is removed, so a
+/// non-executable partial is never promoted.
+fn publish_runtime_binary(tmp: &Path, dest: &Path, stamp: &Path, stamp_body: &str) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let chmod = (|| -> Result<()> {
-            let mut perms = fs::metadata(&tmp)?.permissions();
+            let mut perms = fs::metadata(tmp)?.permissions();
             perms.set_mode(0o755);
-            fs::set_permissions(&tmp, perms)?;
+            fs::set_permissions(tmp, perms)?;
             Ok(())
         })();
         if let Err(e) = chmod {
-            let _ = fs::remove_file(&tmp);
+            let _ = fs::remove_file(tmp);
             return Err(e).with_context(|| {
                 format!("chmod extracted runtime binary {}", tmp.display())
             });
@@ -1934,22 +2014,16 @@ fn ensure_runtime_binary_cached_at(
     // (#2386 review) The stamp is removed BEFORE the binary is published and
     // written AFTER, so a crash between the two leaves an unstamped binary —
     // which reads as stale and re-extracts, never as current-but-wrong.
-    let _ = fs::remove_file(&stamp);
+    let _ = fs::remove_file(stamp);
 
     // Atomic publish — only a complete, executable binary ever appears at dest.
-    fs::rename(&tmp, &dest)
-        .with_context(|| format!("publishing runtime binary to {}", dest.display()))?;
+    if let Err(e) = fs::rename(tmp, dest) {
+        let _ = fs::remove_file(tmp);
+        return Err(e).with_context(|| format!("publishing runtime binary to {}", dest.display()));
+    }
 
-    fs::write(&stamp, stamp_contents(want_version, want_image_id.as_deref()))
-        .with_context(|| format!("writing runtime-binary version stamp {}", stamp.display()))?;
-
-    eprintln!(
-        "darkmux dispatch: cached runtime binary → {} (from {source_image}, darkmux \
-         {want_version}, image id {}, for --image injection)",
-        dest.display(),
-        want_image_id.as_deref().unwrap_or("unavailable")
-    );
-    Ok(dest)
+    fs::write(stamp, stamp_body)
+        .with_context(|| format!("writing runtime-binary version stamp {}", stamp.display()))
 }
 
 /// (#3207) The compactor on an unmanaged utility endpoint: its URL, its
