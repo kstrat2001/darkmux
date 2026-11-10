@@ -749,6 +749,12 @@ fn wait_ready(
             if let Some(holder) = listener(rec).holder() {
                 return Err(NotReady::Foreign(holder));
             }
+            // The watch ends at the first answer. For Tensorfold that is
+            // the whole commitment: its footprint read at ready, before any
+            // request, was 25 GB at an 8k context, 32 GB at 64k and 62 GB
+            // at 262k, so its KV cache is committed before `/v1/models`
+            // answers. Flint's cache grows after ready, as its context
+            // fills; watching that growth is #3539's.
             progress(Progress::Ready { elapsed: began.elapsed() });
             return Ok(());
         }

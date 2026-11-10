@@ -715,6 +715,7 @@ pub(crate) fn pressure_from_meminfo(meminfo: &str) -> Option<crate::MemoryPressu
         swap_used_bytes: Some(total.saturating_sub(free) * 1024),
         swap_free_bytes: Some(free * 1024),
         compressor_pct: None,
+        compressor_segments_pct: None,
     })
 }
 

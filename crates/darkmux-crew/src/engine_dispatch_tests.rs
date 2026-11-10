@@ -110,7 +110,7 @@ struct FakeMachine {
 
 /// A pressure reading at the kernel's `level`.
 fn pressure_at(level: darkmux_platform::PressureLevel) -> darkmux_platform::MemoryPressure {
-    darkmux_platform::MemoryPressure { level: Some(level), swap_used_bytes: Some(24 * GIB), swap_free_bytes: Some(GIB), compressor_pct: Some(40) }
+    darkmux_platform::MemoryPressure { level: Some(level), swap_used_bytes: Some(24 * GIB), swap_free_bytes: Some(GIB), compressor_pct: Some(40), compressor_segments_pct: Some(40) }
 }
 
 impl Machine for FakeMachine {
@@ -2034,6 +2034,34 @@ fn high_memory_pressure_refuses_a_start_that_fits() {
     assert!(notes.is_empty(), "no start was reported: {notes:?}");
     assert_eq!(engine_record::list_in(&r.dirs.records).0.len(), 0, "nothing was started");
     assert_eq!(reserved_now(), 0, "nothing stays reserved");
+}
+
+/// The gate is asked before anything is evicted: a start refused under
+/// pressure leaves darkmux's idle residents loaded, whether the kernel's
+/// level says warning or only the compressor's segments do. Evicting first
+/// and refusing after freed memory for nothing and said nothing of it.
+#[test]
+#[serial_test::serial]
+fn a_start_refused_under_pressure_evicts_nothing() {
+    use darkmux_platform::PressureLevel;
+    let segments = darkmux_platform::MemoryPressure { compressor_segments_pct: Some(75), compressor_pct: Some(75), ..pressure_at(PressureLevel::Normal) };
+    for reading in [pressure_at(PressureLevel::Warning), segments] {
+        let r = rig();
+        let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 2.0).to_string_lossy().into_owned());
+        // 1 GiB free does not hold the start; evicting the idle load would.
+        let machine = FakeMachine {
+            reclaimable: RefCell::new(Some(GIB)),
+            frees_per_unload: 30 * GIB,
+            lms: RefCell::new(vec!["darkmux:idle".into()]),
+            pressure: RefCell::new(vec![reading]),
+            ..Default::default()
+        };
+        let err = prepare_in(&target("TensorFold/m", free_port()), &r.dirs, &tf, quick(), &machine, &mut |_, _| {}).err().expect("refused");
+        assert_eq!(err.code, "memory_in_use", "{err}");
+        assert!(err.message.contains("already under pressure"), "refused for the pressure, not the arithmetic: {err}");
+        assert!(machine.unloaded.borrow().is_empty(), "nothing was evicted: {:?}", machine.unloaded.borrow());
+        assert_eq!(engine_record::list_in(&r.dirs.records).0.len(), 0, "nothing was started");
+    }
 }
 
 /// The gate is the operator's: `critical` lets a start through at warning,

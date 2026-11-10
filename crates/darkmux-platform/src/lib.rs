@@ -295,6 +295,10 @@ pub struct MemoryPressure {
     /// How full the compressor is against the kernel's own limits for it,
     /// in percent: the fuller of its segments and its compressed pages.
     pub compressor_pct: Option<u8>,
+    /// How full the compressor's segments are against the kernel's limit
+    /// for them, in percent: the figure a kernel panic report prints as
+    /// "% of segments limit".
+    pub compressor_segments_pct: Option<u8>,
 }
 
 impl MemorySnapshot {

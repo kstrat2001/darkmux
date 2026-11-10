@@ -1076,7 +1076,7 @@ fn linux_pressure_is_its_swap_and_no_level() {
     let meminfo = "MemTotal: 16000000 kB\nSwapTotal:  8000000 kB\nSwapFree:   6000000 kB\n";
     let p = linux::pressure_from_meminfo(meminfo).unwrap();
     assert_eq!((p.swap_used_bytes, p.swap_free_bytes), (Some(2_000_000 * 1024), Some(6_000_000 * 1024)));
-    assert_eq!((p.level, p.compressor_pct), (None, None));
+    assert_eq!((p.level, p.compressor_pct, p.compressor_segments_pct), (None, None, None));
     assert_eq!(linux::pressure_from_meminfo("MemTotal: 16000000 kB\n"), None);
 }
 
@@ -1094,4 +1094,8 @@ fn an_os_with_no_strategy_reads_no_pressure_and_a_fake_answers_what_was_set() {
 fn a_mac_reads_its_own_pressure_level() {
     let p = MacPlatform.memory_pressure().expect("a Mac reads its pressure");
     assert!(p.level.is_some(), "{p:?}");
+    // The segments figure the gate trips early on is read on its own, and
+    // the compressor's fuller figure is never under it.
+    let segments = p.compressor_segments_pct.expect("the compressor's segments against their limit");
+    assert!(p.compressor_pct.is_some_and(|fuller| fuller >= segments), "{p:?}");
 }

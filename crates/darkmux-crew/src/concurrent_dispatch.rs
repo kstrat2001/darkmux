@@ -1163,7 +1163,8 @@ impl WaveLoad<'_> {
     }
 
     /// Unload what `plan` just loaded (its reservation ends with the
-    /// caller's `Starting`), and the wave's `memory_in_use` refusal.
+    /// caller's `Starting`), and the wave's `memory_in_use` refusal. A load
+    /// another running dispatch took up meanwhile is left loaded.
     fn cut_loads(&self, plan: &Plan, reading: &str, host: &mut dyn ModelHost, committed: &[String]) -> anyhow::Error {
         let loaded: Vec<String> = plan
             .actions
@@ -1173,7 +1174,8 @@ impl WaveLoad<'_> {
                 _ => None,
             })
             .collect();
-        let refusal = crate::lms_room::cut_for_pressure(&loaded, reading, &mut |id| {
+        let held = |id: &str| self.held().iter().any(|h| h == id);
+        let refusal = crate::lms_room::cut_for_pressure(&loaded, reading, &held, &mut |id| {
             let target = darkmux_gestalt::OwnedTarget::claim(id, Some(id)).map_err(|e| anyhow!("`{}` is not darkmux's to unload", e.identifier))?;
             host.unload(&target, self.deadline).map_err(|e| anyhow!("{e}"))
         });

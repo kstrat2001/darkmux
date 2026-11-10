@@ -108,10 +108,8 @@ impl Platform for MacPlatform {
         let int = |name: &str| sysctl_bytes(name).and_then(|b| uint_from_sysctl(&b));
         let level = int("kern.memorystatus_vm_pressure_level").and_then(pressure_level_from);
         let swap = sysctl_bytes("vm.swapusage").and_then(|b| swap_from_xsw_usage(&b));
-        let compressor_pct = fuller_pct(&[
-            (int("vm.compressor.segment.total"), int("vm.compressor.segment.limit")),
-            (int("vm.compressor.pages_compressed"), int("vm.compressor.pages_compressed_limit")),
-        ]);
+        let segments = (int("vm.compressor.segment.total"), int("vm.compressor.segment.limit"));
+        let compressor_pct = fuller_pct(&[segments, (int("vm.compressor.pages_compressed"), int("vm.compressor.pages_compressed_limit"))]);
         if level.is_none() && swap.is_none() && compressor_pct.is_none() {
             return None;
         }
@@ -120,6 +118,7 @@ impl Platform for MacPlatform {
             swap_used_bytes: swap.map(|(used, _)| used),
             swap_free_bytes: swap.map(|(_, free)| free),
             compressor_pct,
+            compressor_segments_pct: fuller_pct(&[segments]),
         })
     }
     /// `sysctl(CTL_KERN, KERN_PROC, KERN_PROC_PID, pid)`'s

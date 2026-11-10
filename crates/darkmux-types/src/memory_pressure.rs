@@ -15,19 +15,31 @@
 //!
 //! [`darkmux_platform::Platform::memory_pressure`]: the kernel's own
 //! pressure level, how full the compressor is against the kernel's limits,
-//! and the swap in use. Two of them decide:
+//! and the swap in use. Three of them decide:
 //!
 //! - **The kernel's level** (normal, warning, critical). It is the
 //!   kernel's own verdict, it is live, and it falls again when the pressure
-//!   passes.
-//! - **The compressor against its limit**, at [`COMPRESSOR_NEAR_LIMIT_PCT`]
-//!   or more, read as critical whatever the level says.
+//!   passes. It can lag the danger: XNU raises warning only once the memory
+//!   not yet compressed falls below what the compressor itself holds, and
+//!   critical later still (or with the compressor past 98% of a limit), and
+//!   swap is not one of its inputs. The panic above may have read normal.
+//! - **The compressor's segments filling**, at
+//!   [`COMPRESSOR_SEGMENTS_FILLING_PCT`] of their limit or more, read as
+//!   warning whatever the level says: the early trip for a level that has
+//!   not caught up.
+//! - **The compressor near its limit**, at [`COMPRESSOR_NEAR_LIMIT_PCT`]
+//!   or more of either of its limits, read as critical whatever the level
+//!   says.
 //!
 //! Swap is named in every refusal and decides nothing. On macOS swap grows
 //! on demand, so the swap left in what is allocated is not headroom, and
 //! swap in use outlives the pressure that caused it: a threshold on either
 //! would refuse on a machine that has long recovered. The kernel's own
-//! "swap space low" verdict, the one a panic report prints, has no reader.
+//! "swap space low" verdict, the one a panic report prints, has no reader,
+//! and neither has its count of swap files (45 in the panic): no sysctl
+//! gives it, and `vm.swapusage`'s total is the same figure in bytes, with
+//! the same flaw. The compressor's segments, read live, are the early
+//! signal instead.
 //!
 //! A platform that reads no level and no compressor figure (Linux today)
 //! has no gate: an unknown pressure is never a refusal, since it would
@@ -51,18 +63,29 @@ use darkmux_platform::{MemoryPressure, PressureLevel};
 /// is the first signal, and this is the backstop for a level that lags.
 pub const COMPRESSOR_NEAR_LIMIT_PCT: u8 = 90;
 
-/// The pressure a reading comes to: the kernel's level, or critical when
-/// the compressor is near its limit. `None` when the reading has neither
-/// figure.
+/// The compressor's segments, in percent of the kernel's limit for them,
+/// from which darkmux reads memory pressure as at least warning.
+///
+/// The kernel's level can still read normal when the compressor is nearly
+/// out of segments (see the module doc): the panic's report printed "97% of
+/// segments limit (OK)". A warning reading refuses a start or load under
+/// the default gate, so this trips the gate well before
+/// [`COMPRESSOR_NEAR_LIMIT_PCT`] would stop one. 70% is a chosen margin
+/// below the 97% the panic showed, not a measured point: a machine that
+/// far into its segments refuses the next start while the kernel may still
+/// read normal, and a start that has begun is not stopped at it (only
+/// critical stops one).
+pub const COMPRESSOR_SEGMENTS_FILLING_PCT: u8 = 70;
+
+/// The pressure a reading comes to: the worst of the kernel's level,
+/// warning when the compressor's segments are filling, and critical when
+/// the compressor is near its limit. `None` when the reading has none of
+/// those figures.
 pub fn level(reading: &MemoryPressure) -> Option<PressureLevel> {
-    let compressor = reading.compressor_pct.map(|pct| {
-        if pct >= COMPRESSOR_NEAR_LIMIT_PCT {
-            PressureLevel::Critical
-        } else {
-            PressureLevel::Normal
-        }
-    });
-    reading.level.into_iter().chain(compressor).max()
+    let from = |pct: Option<u8>, at: u8, then: PressureLevel| pct.map(|pct| if pct >= at { then } else { PressureLevel::Normal });
+    let compressor = from(reading.compressor_pct, COMPRESSOR_NEAR_LIMIT_PCT, PressureLevel::Critical);
+    let segments = from(reading.compressor_segments_pct, COMPRESSOR_SEGMENTS_FILLING_PCT, PressureLevel::Warning);
+    [reading.level, compressor, segments].into_iter().flatten().max()
 }
 
 /// The reading in a sentence's worth of words, every figure it has.
@@ -73,6 +96,9 @@ pub fn describe(reading: &MemoryPressure) -> String {
     }
     if let Some(pct) = reading.compressor_pct {
         parts.push(format!("the compressor is at {pct}% of its limit"));
+    }
+    if let Some(pct) = reading.compressor_segments_pct {
+        parts.push(format!("its segments at {pct}% of their limit"));
     }
     if let Some(used) = reading.swap_used_bytes {
         parts.push(format!("{:.1} GiB of swap is in use", used as f64 / f64::from(1u32 << 30)));
@@ -141,7 +167,7 @@ mod tests {
     use super::*;
 
     fn at(level: Option<PressureLevel>, compressor_pct: Option<u8>) -> MemoryPressure {
-        MemoryPressure { level, compressor_pct, swap_used_bytes: Some(24 << 30), swap_free_bytes: Some(1 << 30) }
+        MemoryPressure { level, compressor_pct, compressor_segments_pct: compressor_pct, swap_used_bytes: Some(24 << 30), swap_free_bytes: Some(1 << 30) }
     }
 
     /// The panic's own reading: the compressor at 97% of its limit is
@@ -153,6 +179,31 @@ mod tests {
         assert_eq!(level(&at(Some(PressureLevel::Warning), Some(COMPRESSOR_NEAR_LIMIT_PCT - 1))), Some(PressureLevel::Warning));
         assert_eq!(level(&at(None, Some(10))), Some(PressureLevel::Normal));
         assert_eq!(level(&at(None, None)), None, "swap alone decides nothing");
+    }
+
+    /// The kernel's level can lag the danger: the panic's own report read
+    /// the compressor's segments at 97% of their limit, where the level may
+    /// still have been normal. Segments at 70% or more read as warning
+    /// whatever the level says, so the default gate refuses there, and a
+    /// start under way is not stopped for it.
+    #[test]
+    fn compressor_segments_filling_read_as_warning_whatever_the_level_says() {
+        let segments = |pct: u8| MemoryPressure {
+            level: Some(PressureLevel::Normal),
+            compressor_segments_pct: Some(pct),
+            compressor_pct: Some(pct),
+            ..Default::default()
+        };
+        assert_eq!(level(&segments(75)), Some(PressureLevel::Warning));
+        assert_eq!(level(&segments(COMPRESSOR_SEGMENTS_FILLING_PCT)), Some(PressureLevel::Warning));
+        assert_eq!(level(&segments(COMPRESSOR_SEGMENTS_FILLING_PCT - 1)), Some(PressureLevel::Normal));
+        assert_eq!(level(&segments(COMPRESSOR_NEAR_LIMIT_PCT)), Some(PressureLevel::Critical), "90% is still critical");
+        let only_segments = MemoryPressure { compressor_segments_pct: Some(75), ..Default::default() };
+        assert_eq!(level(&only_segments), Some(PressureLevel::Warning), "with no level read at all");
+        let said = refuses_start(PressureGate::Warning, Some(&segments(75))).expect("the default gate refuses");
+        assert!(said.contains("segments at 75% of their limit"), "the figure that decided is named: {said}");
+        assert!(refuses_start(PressureGate::Critical, Some(&segments(75))).is_none());
+        assert!(stops_start(PressureGate::Warning, Some(&segments(75))).is_none(), "warning never stops a start");
     }
 
     #[test]

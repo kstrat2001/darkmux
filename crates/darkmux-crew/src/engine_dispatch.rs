@@ -686,8 +686,9 @@ impl Machine for ThisMachine<'_> {
 /// Refuse `memory_in_use` while the machine's memory is already under
 /// pressure, naming the reading
 /// ([`darkmux_types::memory_pressure::refuses_start`]): asked under the
-/// residency lock by every start and load, after its memory arithmetic, so a
-/// price that is wrong ends as a refusal.
+/// residency lock by every start and load, before its memory arithmetic and
+/// anything it would evict, so a price that is wrong ends as a refusal and
+/// a refusal frees nothing for nobody.
 pub(crate) fn refuse_under_pressure(machine: &dyn Machine) -> Result<(), EngineRefusal> {
     match darkmux_types::memory_pressure::refuses_start(machine.pressure_gate(), machine.pressure().as_ref()) {
         Some(why) => Err(refuse("memory_in_use", format!("{why}; retry once memory is free"))),
@@ -1062,12 +1063,12 @@ struct Room<'a> {
     lease: &'a LeaseGuard,
 }
 
-/// A start's whole memory decision: [`make_room`] for its price, then the
-/// machine's own state ([`refuse_under_pressure`]).
+/// A start's whole memory decision: the machine's own state
+/// ([`refuse_under_pressure`]), then [`make_room`] for its price. The gate
+/// comes first: a start refused under pressure evicts nothing.
 fn room_unless_pressed(room: &Room<'_>, dirs: &Dirs, bounds: server::Bounds, machine: &dyn Machine) -> Result<(u64, Vec<String>), EngineRefusal> {
-    let made = make_room(room, dirs, bounds, machine)?;
     refuse_under_pressure(machine)?;
-    Ok(made)
+    make_room(room, dirs, bounds, machine)
 }
 
 /// Evict darkmux's own idle residents until the model's need is reclaimable

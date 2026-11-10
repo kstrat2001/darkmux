@@ -15108,7 +15108,7 @@ pub(crate) fn preflight_load(pm: &darkmux_types::ProfileModel, source: WindowSou
         pm,
         source,
         &|| gate.loaded(),
-        &|identifier| crate::lms_room::unload_unless_held(gate, identifier, &|id| gate.unload(id)),
+        &|identifier| crate::lms_room::unload_for_reload(gate, identifier),
         &|model_key, identifier, n_ctx| {
             let lease = crate::lms_room::load_reserved(gate, model_key, identifier, n_ctx, &|k, id, ctx| gate.load(k, id, ctx))?;
             *hold.borrow_mut() = Some(lease);

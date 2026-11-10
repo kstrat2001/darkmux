@@ -35,11 +35,13 @@
 //!    server, or an LM Studio load the plan keeps because it is pinned),
 //!    `memory_in_use` when only memory darkmux did not take is short.
 //!
-//! 4. A load that fits is still refused `memory_in_use` while the
-//!    machine's memory is already under pressure
-//!    ([`darkmux_types::memory_pressure`]), and one whose `lms load` returns
-//!    onto a machine whose pressure turned critical meanwhile is unloaded
-//!    again and refused the same way ([`watching_pressure`]).
+//! Before any of that, a plan that loads is refused `memory_in_use` while
+//! the machine's memory is already under pressure
+//! ([`darkmux_types::memory_pressure`]): nothing is stopped or unloaded for
+//! a load that will not happen. A load whose `lms load` returns onto a
+//! machine whose pressure turned critical meanwhile is unloaded again and
+//! refused the same way ([`watching_pressure`]), unless a running dispatch
+//! took it up meanwhile: that one is left loaded.
 //!
 //! darkmux's idle LM Studio loads are the planner's own business: the wave's
 //! Exclusive scope already unloads every one the wave does not want, so only
@@ -306,10 +308,11 @@ pub(crate) struct Evict<'a> {
 /// reached is a warning; a load with no commitment (its architecture
 /// unreadable) is never refused.
 ///
-/// A plan whose loads fit is still refused `memory_in_use` while the
-/// machine's memory is already under pressure
+/// A plan that loads is refused `memory_in_use` while the machine's memory
+/// is already under pressure
 /// ([`crate::engine_dispatch::refuse_under_pressure`]), as an engine
-/// server's start is: the arithmetic is only as good as its prices.
+/// server's start is: the arithmetic is only as good as its prices. That is
+/// asked first, so a refused plan stops and unloads nothing.
 pub(crate) fn make_room(
     plan: &Plan,
     facts: &Facts,
@@ -321,8 +324,8 @@ pub(crate) fn make_room(
     if !plan.actions.iter().any(|a| matches!(a.action, Action::Load { .. })) {
         return Ok(());
     }
-    room_for_loads(plan, facts, pricing, evict, room, stopped)?;
-    crate::engine_dispatch::refuse_under_pressure(room.machine)
+    crate::engine_dispatch::refuse_under_pressure(room.machine)?;
+    room_for_loads(plan, facts, pricing, evict, room, stopped)
 }
 
 /// [`make_room`]'s memory arithmetic, for a plan that loads.
@@ -597,6 +600,15 @@ pub(crate) fn unload_unless_held(gate: &dyn Preflight, identifier: &str, unload:
     unload(identifier)
 }
 
+/// A preflight reload's unload of the stale instance, asked after the
+/// pressure gate: under pressure the load it makes way for would be
+/// refused, so the instance is kept and the reload refused `memory_in_use`
+/// before anything is unloaded. Then [`unload_unless_held`].
+pub(crate) fn unload_for_reload(gate: &dyn Preflight, identifier: &str) -> anyhow::Result<()> {
+    crate::engine_dispatch::refuse_under_pressure(gate.room().machine)?;
+    unload_unless_held(gate, identifier, &|id| gate.unload(id))
+}
+
 /// (#3514) A preflight load in the residency protocol: under the lock, its
 /// lease and a reservation of what it commits; the lock let go before the
 /// load begins; the reservation kept past the load until its memory pages
@@ -623,8 +635,11 @@ pub(crate) fn load_reserved(
     let (loaded, critical) = watching_pressure(room.machine, room.bounds.poll, || load(model_key, identifier, n_ctx));
     loaded?;
     if let Some(reading) = critical {
-        // Cut with its reservation and its lease, which end here.
-        return Err(cut_for_pressure(&[identifier.to_string()], &reading, &mut |id| gate.unload(id)).into());
+        // Cut with its reservation and its lease, which end here: the lease
+        // first, so only another dispatch's reads as holding the instance.
+        drop(lease);
+        let held = |id: &str| gate.held_by_others().iter().any(|h| h == id);
+        return Err(cut_for_pressure(&[identifier.to_string()], &reading, &held, &mut |id| gate.unload(id)).into());
     }
     let _ = lease.mark_loaded(&[identifier.to_string()]);
     if let Some(res) = reserved {
@@ -668,16 +683,41 @@ pub(crate) fn watching_pressure<T>(machine: &(dyn Machine + Sync), poll: std::ti
 
 /// Unload the instances a load just made onto a machine whose memory
 /// pressure turned critical (`reading`), and refuse `memory_in_use`, naming
-/// any that could not be unloaded.
-pub(crate) fn cut_for_pressure(identifiers: &[String], reading: &str, unload: &mut dyn FnMut(&str) -> anyhow::Result<()>) -> EngineRefusal {
-    let left: Vec<String> = identifiers.iter().filter_map(|id| unload(id).err().map(|e| format!("`{id}` ({e:#})"))).collect();
+/// any that could not be unloaded. One a running dispatch holds (`held`,
+/// read right before each unload, as [`unload_unless_held`] reads it) took
+/// it up since it loaded: it is serving that dispatch, so it is left loaded
+/// and the refusal says so.
+pub(crate) fn cut_for_pressure(
+    identifiers: &[String],
+    reading: &str,
+    held: &dyn Fn(&str) -> bool,
+    unload: &mut dyn FnMut(&str) -> anyhow::Result<()>,
+) -> EngineRefusal {
+    let (mut kept, mut left) = (Vec::new(), Vec::new());
+    for id in identifiers {
+        if held(id) {
+            kept.push(format!("`{id}`"));
+        } else if let Err(e) = unload(id) {
+            left.push(format!("`{id}` ({e:#})"));
+        }
+    }
     let names = identifiers.iter().map(|id| format!("`{id}`")).collect::<Vec<_>>().join(", ");
-    let did = if left.is_empty() {
-        "so darkmux unloaded what it had just loaded; retry once memory is free".to_string()
-    } else {
-        format!("and darkmux could not unload {}; unload it with `darkmux machine eject`", left.join(", "))
-    };
-    refuse("memory_in_use", format!("this machine's memory pressure turned critical while {names} was loading ({reading}), {did}"))
+    refuse("memory_in_use", format!("this machine's memory pressure turned critical while {names} was loading ({reading}), {}", cut_note(&kept, &left)))
+}
+
+/// What [`cut_for_pressure`] did, for its refusal.
+fn cut_note(kept: &[String], left: &[String]) -> String {
+    let mut did = Vec::new();
+    if !kept.is_empty() {
+        did.push(format!("left {} loaded: a running dispatch took it up meanwhile, and it is not unloaded under it", kept.join(", ")));
+    }
+    if !left.is_empty() {
+        did.push(format!("could not unload {}; unload it with `darkmux machine eject`", left.join(", ")));
+    }
+    if did.is_empty() {
+        return "so darkmux unloaded what it had just loaded; retry once memory is free".to_string();
+    }
+    format!("and darkmux {}", did.join(", and "))
 }
 
 /// [`load_reserved`]'s part under the lock: the lease and its reservation,
