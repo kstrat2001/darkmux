@@ -69,6 +69,10 @@ pub enum ClientCode {
     /// cloned at), so a PR or backup from it would push onto that branch
     /// (409); its next run moves it onto one.
     NoOwnBranch,
+    /// darkmux could not put the workspace on a `mux/` branch of its own
+    /// (a branch of the repo's, such as one named `mux`, is in the way;
+    /// 422); `error` carries git's reason.
+    BranchFailed,
 
     // ── A failed run, from its `dispatch.error` `code` ──
     /// The memory is held by a running dispatch; retry later.
@@ -150,6 +154,7 @@ mod tests {
             (NetworkKeyInRepoConfig, "network_key_in_repo_config"),
             (CloneFailed, "clone_failed"),
             (NoOwnBranch, "no_own_branch"),
+            (BranchFailed, "branch_failed"),
         ] {
             assert_eq!(wire(c), s);
             assert_eq!(

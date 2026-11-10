@@ -2110,8 +2110,7 @@ fn onto_own_branch(state: &ClientServerState, wc: Option<&WorkCopy>) -> Result<(
     let base = (state.worktrees_base)().map_err(|e| Box::new(internal(anyhow!(e))))?;
     let name = wc.work_tree.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let branch = new_bot_branch(&bot_slug(crate::client_workspace::bot_of(&base, &name).as_deref()))?;
-    head_onto_new_branch(wc, &branch)
-        .map_err(|e| Box::new(internal(anyhow!("moving {name} off {on} onto {branch}: {e}"))))
+    head_onto_new_branch(wc, &branch).map_err(|e| branch_failed(&format!("moving {name} off {on} onto {branch}: {e}")))
 }
 
 /// The branch `wc` is checked out on (empty when detached) when it has an
@@ -2592,6 +2591,16 @@ fn bot_slug(bot: Option<&str>) -> String {
     }
 }
 
+/// A workspace reused with no bot's exact name recorded (made before the
+/// name was recorded, matched by its branch) becomes this bot's now, so a
+/// later bot whose name makes the same slug gets its own.
+fn claim_for_bot(base: &Path, name: &str, made: &Made) -> Result<(), Refused> {
+    if crate::client_workspace::bot_of(base, name).is_some() {
+        return Ok(());
+    }
+    crate::client_workspace::record_bot(base, name, made.bot.exact).map_err(|e| Box::new(internal(anyhow!(e))))
+}
+
 /// The client's own workspace `find` names, if any, after
 /// [`adopt_unowned`] has given out what it may.
 fn reusable(state: &ClientServerState, base: &Path, find: impl FnOnce() -> Option<String>) -> Result<Option<String>, Refused> {
@@ -2629,7 +2638,10 @@ fn clone_workspace(state: &ClientServerState, url: &str, normalized: &str, made:
     };
     let _one_at_a_time = state.workspace_lock.lock().unwrap();
     match reusable(state, &base, || ws::find_by_origin(&base, normalized, made.bot, made.client)) {
-        Ok(Some(name)) => existing_clone(state, &name),
+        Ok(Some(name)) => match claim_for_bot(&base, &name, made) {
+            Ok(()) => existing_clone(state, &name),
+            Err(r) => *r,
+        },
         Ok(None) => new_clone(state, &base, (url, normalized), made),
         Err(r) => *r,
     }
@@ -2673,8 +2685,13 @@ fn start_bot_branch(state: &ClientServerState, base: &Path, name: &str, git_ref:
         .or_else(|| crate::client_workspace::remote_default_of(&wc))
         .unwrap_or_else(|| "HEAD".to_string());
     let branch = new_bot_branch(bot)?;
-    head_onto_new_branch(&wc, &branch).map_err(|e| Box::new(internal(anyhow!("starting {name} on {branch}: {e}"))))?;
+    head_onto_new_branch(&wc, &branch).map_err(|e| branch_failed(&format!("starting {name} on {branch}: {e}")))?;
     Ok(from)
+}
+
+/// Why a workspace could not be put on a branch of its own (git's reason).
+fn branch_failed(why: &str) -> Refused {
+    refuse(StatusCode::UNPROCESSABLE_ENTITY, ClientCode::BranchFailed, why)
 }
 
 /// Moves `wc`'s `HEAD` onto new branch `branch`, made where `HEAD` is (with
@@ -2885,7 +2902,10 @@ fn worktree_workspace(state: &ClientServerState, source: &Path, made: &Made) -> 
     };
     let _one_at_a_time = state.workspace_lock.lock().unwrap();
     match reusable(state, &base, || ws::find_worktree_of(&base, &common, made.bot, made.client)) {
-        Ok(Some(name)) => reused_worktree(state, &base, &name, &source),
+        Ok(Some(name)) => match claim_for_bot(&base, &name, made) {
+            Ok(()) => reused_worktree(state, &base, &name, &source),
+            Err(r) => *r,
+        },
         Ok(None) => new_worktree(state, &base, (&source, &common), made),
         Err(r) => *r,
     }

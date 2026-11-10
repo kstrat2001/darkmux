@@ -3551,7 +3551,7 @@ async fn a_clone_that_cannot_get_a_bots_branch_leaves_nothing_behind() {
     let token = paired(&h).await;
     run_git(Some(&h.fixture), &["branch", "mux"]);
     let (code, v) = call(&h, post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR, "ref": "mux"}))).await;
-    assert_eq!((code, v["code"].as_str()), (500, Some("internal")), "{v}");
+    assert_eq!((code, v["code"].as_str()), (422, Some("branch_failed")), "{v}");
     let left: Vec<String> = std::fs::read_dir(&h.base)
         .unwrap()
         .flatten()
@@ -3559,6 +3559,63 @@ async fn a_clone_that_cannot_get_a_bots_branch_leaves_nothing_behind() {
         .filter(|n| n.contains("hcr"))
         .collect();
     assert!(left.is_empty(), "left behind: {left:?}");
+}
+
+/// A run that cannot move its old clone onto a branch of its own (the repo
+/// has a local branch named `mux`, so no `mux/...` branch can exist) is
+/// refused with its code and forgotten, so the copy is not held busy: once
+/// the cause is gone, a run goes ahead there.
+#[tokio::test]
+async fn a_run_whose_clone_cannot_move_off_a_users_branch_is_refused_and_forgotten() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (code, v) = call(&h, post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR}))).await;
+    assert_eq!(code, 201, "{v}");
+    let made = v["branch"].as_str().unwrap().to_string();
+    held_git(&h, "hcr", &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    held_git(&h, "hcr", &["branch", "-D", &made]);
+    held_git(&h, "hcr", &["branch", "mux"]);
+    let work = || post("/client/work", Some(&token), serde_json::json!({"role": "coder", "message": "edit", "workspace": "hcr"}));
+    for attempt in 1..=2 {
+        let (code, v) = call(&h, work()).await;
+        assert_eq!((code, v["code"].as_str()), (422, Some("branch_failed")), "attempt {attempt}, never busy: {v}");
+    }
+    assert!(h.ran.lock().unwrap().is_empty());
+    held_git(&h, "hcr", &["branch", "-D", "mux"]);
+    let (code, v) = call(&h, work()).await;
+    assert_eq!(code, 202, "{v}");
+    let done = wait_done(&h, &token, v["work_id"].as_str().unwrap()).await;
+    assert!(crate::client_workspace::is_bot_branch(done["branch"].as_str().unwrap(), "app"), "{done}");
+}
+
+/// A workspace from before bots' exact names were recorded is claimed by
+/// the first bot that reuses it: that bot's name is recorded then, so a
+/// later bot whose name makes the same slug gets its own, from a local
+/// checkout or a repo link.
+#[tokio::test]
+async fn the_first_bot_to_reuse_an_unrecorded_workspace_keeps_it() {
+    let h = harness();
+    let token = paired(&h).await;
+    let mine = h.dir.path().join("my-site");
+    fixture_repo(&mine);
+    for source in [serde_json::json!({"source_path": mine.to_str()}), serde_json::json!({"repo_url": HCR})] {
+        let ask = |bot: &str| {
+            let mut body = source.clone();
+            body["bot"] = bot.into();
+            post("/client/workspaces", Some(&token), body)
+        };
+        let (code, a) = call(&h, ask("Bot A")).await;
+        assert_eq!(code, 201, "{a}");
+        let name = a["workspace"].as_str().unwrap().to_string();
+        // As a workspace made before the record existed.
+        std::fs::remove_file(h.base.join(format!(".{name}.bot"))).unwrap();
+        let (code, again) = call(&h, ask("Bot A")).await;
+        assert_eq!((code, again["workspace"].as_str()), (200, Some(name.as_str())), "{again}");
+        assert_eq!(crate::client_workspace::bot_of(&h.base, &name).as_deref(), Some("Bot A"));
+        let (code, other) = call(&h, ask("bot_a")).await;
+        assert_eq!(code, 201, "bot_a gets its own, not Bot A's: {other}");
+        assert_ne!(other["workspace"], again["workspace"]);
+    }
 }
 
 /// A checkout folder of 40 characters and a 32-character bot still make a
