@@ -684,7 +684,8 @@ fn a_model_that_will_not_load_fails_before_a_record() {
     let (res, _) = run(&rig, rig.opts());
     let err = format!("{:#}", res.expect_err("load failure"));
     assert!(err.starts_with("model selection failed: darkmux: model `model-a` could not load at n_ctx=32000"), "{err}");
-    assert_eq!(rig.lms_log(), vec!["ps --json", "load model-a --context-length 32000 --identifier darkmux:model-a -y"]);
+    // The load is priced off the catalog for its reservation (#3514).
+    assert_eq!(rig.lms_log(), vec!["ps --json", "ls --json", "load model-a --context-length 32000 --identifier darkmux:model-a -y"]);
     assert!(rig.docker_run().is_none());
     assert!(bookends(&rig).is_empty(), "records: {:?}", rig.actions());
 }
@@ -1021,6 +1022,25 @@ fn a_model_that_is_not_resident_is_loaded_namespaced_at_its_context() {
     res.unwrap();
     let lms = rig.lms_log();
     assert!(lms.contains(&"load model-a --context-length 32000 --identifier darkmux:model-a -y".to_string()), "{lms:?}");
+}
+
+/// (#3514) The same reload while another dispatch holds that instance (its
+/// lease names it): it is serving that dispatch at its own context, so it
+/// is never unloaded under it, and the dispatch is refused `busy`.
+#[test]
+#[serial]
+fn a_model_another_dispatch_holds_at_the_wrong_context_is_never_unloaded() {
+    own_process!();
+    let rig = Rig::new();
+    rig.resident(&[("darkmux:model-a", "model-a", 4096)]);
+    rig.container(ONE_TURN, ENVELOPE, "", 0);
+    let other = darkmux_types::residency_lease::LeaseGuard::acquire();
+    other.write(&["darkmux:model-a".to_string()]).unwrap();
+    let (res, _) = run(&rig, rig.opts());
+    drop(other);
+    let err = res.expect_err("refused");
+    assert_eq!(darkmux_crew::engine_dispatch::refusal_code(&err), Some("busy"), "{err:#}");
+    assert!(rig.lms_log().iter().all(|l| !l.starts_with("unload")), "{:?}", rig.lms_log());
 }
 
 #[test]

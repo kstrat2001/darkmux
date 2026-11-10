@@ -53,6 +53,9 @@ pub struct LmsHost {
     /// Bound applied to the read-only list calls (see [`DEFAULT_LIST_BOUND`]);
     /// also caps the post-load provenance re-list inside [`ModelHost::load`].
     list_bound: Duration,
+    /// The rows of the last `lms ls --json`, kept for [`ModelHost::arch_facts`]
+    /// so pricing a load after listing the catalog runs `lms ls` once.
+    last_ls: Option<Vec<serde_json::Value>>,
 }
 
 impl Default for LmsHost {
@@ -63,11 +66,11 @@ impl Default for LmsHost {
 
 impl LmsHost {
     pub fn new() -> Self {
-        Self { bin: lms_bin(), list_bound: DEFAULT_LIST_BOUND }
+        Self { bin: lms_bin(), list_bound: DEFAULT_LIST_BOUND, last_ls: None }
     }
 
     pub fn with_bin(bin: impl Into<String>) -> Self {
-        Self { bin: bin.into(), list_bound: DEFAULT_LIST_BOUND }
+        Self { bin: bin.into(), list_bound: DEFAULT_LIST_BOUND, last_ls: None }
     }
 
     /// Override the adapter-level list-call bound (defaults to
@@ -139,7 +142,27 @@ impl ModelHost for LmsHost {
     /// `Facts::catalog` contract. Adapter-bounded like `list_resident`.
     fn list_catalog(&mut self) -> Result<Vec<CatalogFact>, HostError> {
         let rows = self.run_json_list(&["ls", "--json"], "ls", Deadline(self.list_bound))?;
-        Ok(rows.iter().filter_map(catalog_fact_from_json).collect())
+        let catalog = rows.iter().filter_map(catalog_fact_from_json).collect();
+        self.last_ls = Some(rows);
+        Ok(catalog)
+    }
+
+    /// (#3508) Read from each model's own `config.json`, else its GGUF
+    /// header, as `darkmux machine resources` prices a resident: the rows of
+    /// the catalog just listed, or a fresh `lms ls --json`.
+    /// LM Studio runs on this machine: its loads take this machine's memory.
+    fn on_this_machine(&self) -> bool {
+        true
+    }
+
+    fn arch_facts(&mut self, model_keys: &[&str]) -> darkmux_gestalt::ModelArch {
+        let rows = match self.last_ls.take() {
+            Some(rows) => rows,
+            None => self.run_json_list(&["ls", "--json"], "ls", Deadline(self.list_bound)).unwrap_or_default(),
+        };
+        let facts = crate::model_ledger::arch_facts_for(&rows, model_keys);
+        self.last_ls = Some(rows);
+        facts
     }
 
     /// `lms load <key> --context-length <ctx> --identifier <id> -y` under the
@@ -1144,6 +1167,39 @@ esac"#,
         let err = host.list_resident().unwrap_err();
         assert!(matches!(err, HostError::Timeout { phase: "ps", .. }), "{err:?}");
         assert!(!marker.exists(), "the wedged `ps` was killed at the list bound, not waited out");
+    }
+
+    /// (#3508) Pricing a load right after listing the catalog runs `lms ls`
+    /// once: the architecture is read off the rows the catalog listed. With
+    /// no catalog listed first, it lists one itself.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn arch_facts_reads_the_rows_the_catalog_just_listed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // The readers look under `$HOME/.lmstudio/models`: the test's own.
+        let prev = std::env::var_os("HOME");
+        // SAFETY: #[serial]; restored below.
+        unsafe { std::env::set_var("HOME", dir.path()) };
+        let count = dir.path().join("ls-calls");
+        let stub = write_stub(
+            dir.path(),
+            &format!("echo x >> '{}'\necho '[{{\"modelKey\":\"m\",\"path\":\"nowhere/m\",\"sizeBytes\":5}}]'", count.display()),
+        );
+        let calls = || std::fs::read_to_string(&count).map(|s| s.lines().count()).unwrap_or(0);
+        let mut host = LmsHost::with_bin(stub.to_string_lossy());
+        assert_eq!(host.list_catalog().unwrap().len(), 1);
+        let _ = host.arch_facts(&["m"]);
+        assert_eq!(calls(), 1, "the catalog's rows are reused");
+        let mut fresh = LmsHost::with_bin(stub.to_string_lossy());
+        let _ = fresh.arch_facts(&["m"]);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        assert_eq!(calls(), 2, "with none listed, it lists");
     }
 
     #[cfg(unix)]
