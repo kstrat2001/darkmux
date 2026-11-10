@@ -1138,7 +1138,8 @@ impl WaveLoad<'_> {
         // (#3506) darkmux's idle engine servers count in the machine's one
         // memory budget: stopped to make room before anything is unloaded
         // or loaded, or the wave is refused with a code.
-        crate::lms_room::make_room(&plan, &facts, &pricing, self.lease, &pinned, self.room, committed)
+        let evict = crate::lms_room::Evict { lease: self.lease, pinned: &pinned, loads: Vec::new() };
+        crate::lms_room::make_room(&plan, &facts, &pricing, &evict, self.room, committed)
             .map_err(|refusal| room_refused(refusal, committed))?;
         let starting = self.reserve(&plan, &facts, &pricing)?;
         let mut lock = lock;

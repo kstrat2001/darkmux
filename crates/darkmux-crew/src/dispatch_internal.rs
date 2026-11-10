@@ -15035,15 +15035,25 @@ fn switch_notice_for(engine_id: &str, loading: engine::Loading, could_hold: Opti
 ///
 /// (#3514) Its loads follow the residency protocol (lock, reservation),
 /// and a stale reload never unloads an instance a running dispatch holds.
+/// Each load makes a wave's memory decision first
+/// ([`crate::lms_room::load_reserved`]): it stops darkmux's idle engine
+/// servers and unloads its idle LM Studio loads to make room, or is refused
+/// `wont_fit`, `busy` or `memory_in_use`.
 pub(crate) fn ensure_model_loaded_at_ctx_from(pm: &darkmux_types::ProfileModel, source: WindowSource) -> Result<()> {
-    let engine = engine::lmstudio();
-    let gate = crate::lms_room::ThisPreflight;
+    preflight_load(pm, source, &crate::lms_room::ThisPreflight)
+}
+
+/// [`ensure_model_loaded_at_ctx_from`] against `gate`'s LM Studio and
+/// machine, so a test drives the preflight exactly as a dispatch does.
+pub(crate) fn preflight_load(pm: &darkmux_types::ProfileModel, source: WindowSource, gate: &dyn crate::lms_room::Preflight) -> Result<()> {
     ensure_model_resident_from(
         pm,
         source,
-        &|| engine.loaded().unwrap_or_default(),
-        &|identifier| crate::lms_room::unload_unless_held(&gate, identifier, &|id| engine.unload(id)),
-        &|model_key, identifier, n_ctx| crate::lms_room::load_reserved(&gate, model_key, identifier, n_ctx, &load_at_ctx_bounded),
+        &|| gate.loaded(),
+        &|identifier| crate::lms_room::unload_unless_held(gate, identifier, &|id| gate.unload(id)),
+        &|model_key, identifier, n_ctx| {
+            crate::lms_room::load_reserved(gate, model_key, identifier, n_ctx, &|k, id, ctx| gate.load(k, id, ctx))
+        },
     )
 }
 
@@ -15223,7 +15233,7 @@ fn ensure_model_resident_from(
 ///
 /// `model_key` must already be BARE (`ensure_model_loaded_at_ctx` normalizes it
 /// via [`bare_model_key`], #1615) — the namespace belongs only in `identifier`.
-fn load_at_ctx_bounded(model_key: &str, identifier: &str, n_ctx: u32) -> Result<()> {
+pub(crate) fn load_at_ctx_bounded(model_key: &str, identifier: &str, n_ctx: u32) -> Result<()> {
     use darkmux_gestalt::Deadline;
     // (#316) As `concurrent_dispatch::lms_host_factory`: a managed model
     // loads on LM Studio, which always has a load lifecycle.

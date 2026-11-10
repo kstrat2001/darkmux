@@ -82,11 +82,16 @@ pub(crate) struct FakeMachine<'a> {
     free: &'a (dyn Fn() -> Option<u64> + Sync),
     leased: Mutex<Vec<Vec<String>>>,
     capacity: Option<u64>,
+    /// The standing utility binding.
+    utility: Option<String>,
+    /// Where LM Studio unloads are noted; `None` for a wave, whose room step
+    /// never unloads anything.
+    lms_unloads: Option<&'a Mutex<Vec<String>>>,
 }
 
 impl<'a> FakeMachine<'a> {
     fn new(free: &'a (dyn Fn() -> Option<u64> + Sync)) -> Self {
-        FakeMachine { free, leased: Mutex::new(vec![Vec::new()]), capacity: Some(128 * GIB) }
+        FakeMachine { free, leased: Mutex::new(vec![Vec::new()]), capacity: Some(128 * GIB), utility: None, lms_unloads: None }
     }
     fn leasing(mut self, answers: &[&[&str]]) -> Self {
         self.leased = Mutex::new(answers.iter().map(|a| a.iter().map(|s| s.to_string()).collect()).collect());
@@ -105,7 +110,12 @@ impl Machine for FakeMachine<'_> {
         panic!("the LM Studio path's room step never lists LM Studio for eviction")
     }
     fn lmstudio_unload(&self, identifier: &str) -> anyhow::Result<()> {
-        panic!("the LM Studio path's room step never unloads `{identifier}`: the plan does")
+        let Some(unloads) = self.lms_unloads else { panic!("a wave's room step never unloads `{identifier}`: the plan does") };
+        unloads.lock().unwrap().push(identifier.to_string());
+        Ok(())
+    }
+    fn utility(&self) -> Option<String> {
+        self.utility.clone()
     }
     fn leased(&self, own: &LeaseGuard) -> Vec<String> {
         let mut answers = self.leased.lock().unwrap();
@@ -140,9 +150,8 @@ impl Rig {
         Dirs { records: self.dir.path().join("run"), logs: self.dir.path().join("logs") }
     }
     fn room<'a>(&self, machine: &'a (dyn Machine + Sync)) -> ServerRoom<'a> {
-        let bounds = server::Bounds { start: Duration::from_secs(5), stop_grace: Duration::from_secs(2), poll: Duration::from_millis(20) };
         // A load's memory has paged in the moment it is loaded.
-        ServerRoom { dirs: self.dirs(), bounds, machine, settle: |res, _| drop(res), workers: || Some(0) }
+        ServerRoom { dirs: self.dirs(), bounds: BOUNDS, machine, settle: |res, _| drop(res), workers: || Some(0) }
     }
     /// [`Self::room`], each load's reservation kept whole, as it is while
     /// its memory pages in, until the test settles it ([`settle_all`]) or
@@ -151,6 +160,9 @@ impl Rig {
         ServerRoom { settle: |res, _| SETTLING.lock().unwrap().push(res), ..self.room(machine) }
     }
 }
+
+/// A stop's bounds, short for a test.
+const BOUNDS: server::Bounds = server::Bounds { start: Duration::from_secs(5), stop_grace: Duration::from_secs(2), poll: Duration::from_millis(20) };
 
 /// The loads' reservations a [`Rig::room`] was handed to settle.
 static SETTLING: Mutex<Vec<Reserved>> = Mutex::new(Vec::new());
@@ -900,7 +912,7 @@ fn a_load_whose_reservation_cannot_be_written_is_refused_before_it_loads() {
     assert_eq!(refusal_code(&err), Some("model_start_failed"), "{err:#}");
     assert!(format!("{err:#}").contains("could not record this wave's reservation"), "{err:#}");
     assert!(!loaded(&host), "nothing loaded");
-    let gate = FakePreflight { held: Vec::new(), commitment: Some(5 * GIB), settled: Default::default() };
+    let gate = FakePreflight::without_machine().priced("util", 5 * GIB);
     let loads = std::cell::Cell::new(0);
     let counting = |_: &str, _: &str, _: u32| -> anyhow::Result<()> {
         loads.set(loads.get() + 1);
@@ -946,29 +958,115 @@ fn the_utility_binding_counts_as_held() {
     assert!(format!("{err:#}").contains("darkmux:util"), "{err:#}");
 }
 
-/// A preflight stand-in: what it holds, prices and reserves.
-struct FakePreflight {
+/// A preflight stand-in: LM Studio as `lms ps` and its host report it, what
+/// other dispatches hold, and the machine a load takes its memory from.
+struct FakePreflight<'a> {
     held: Vec<String>,
-    commitment: Option<u64>,
-    /// The reservations handed on to settle, kept whole.
-    settled: std::sync::Mutex<Vec<Reserved>>,
+    est: FixedEstimator,
+    loaded: Vec<darkmux_types::LoadedModel>,
+    residents: Vec<ResidentFact>,
+    catalog: Vec<CatalogFact>,
+    format: Format,
+    dirs: Dirs,
+    machine: &'a (dyn Machine + Sync),
+    /// How often the residency lock was asked for.
+    locks: std::cell::Cell<u32>,
+    /// Every load and unload asked of LM Studio, in order.
+    calls: Mutex<Vec<String>>,
 }
 
-impl Preflight for FakePreflight {
+impl FakePreflight<'static> {
+    /// No machine to plan against, LM Studio empty.
+    fn without_machine() -> Self {
+        FakePreflight::on(Dirs { records: std::path::PathBuf::new(), logs: std::path::PathBuf::new() }, &NoMachine)
+    }
+}
+
+impl<'a> FakePreflight<'a> {
+    fn on(dirs: Dirs, machine: &'a (dyn Machine + Sync)) -> Self {
+        FakePreflight {
+            held: Vec::new(),
+            est: FixedEstimator::default(),
+            loaded: Vec::new(),
+            residents: Vec::new(),
+            catalog: Vec::new(),
+            format: Format::Gguf,
+            dirs,
+            machine,
+            locks: Default::default(),
+            calls: Default::default(),
+        }
+    }
+    /// The caller prices `model_key` at `bytes`, both ways.
+    fn priced(mut self, model_key: &str, bytes: u64) -> Self {
+        self.est.0.insert(model_key.into(), bytes);
+        self
+    }
+    fn holding(mut self, held: &[&str]) -> Self {
+        self.held = held.iter().map(|s| s.to_string()).collect();
+        self
+    }
+    fn cataloged(mut self, model_key: &str, size_bytes: u64) -> Self {
+        self.catalog.push(CatalogFact { model_key: model_key.into(), size_bytes: Some(size_bytes) });
+        self
+    }
+    fn formatted(mut self, format: Format) -> Self {
+        self.format = format;
+        self
+    }
+    /// Resident in LM Studio, as `lms ps` and the host both list it.
+    fn resident(mut self, identifier: &str, model_key: &str, ctx: u64, bytes: u64) -> Self {
+        self.loaded.push(darkmux_types::LoadedModel {
+            identifier: identifier.into(),
+            model: model_key.into(),
+            status: "idle".into(),
+            size: String::new(),
+            context: ctx,
+            queued: None,
+        });
+        self.residents.push(ResidentFact { identifier: identifier.into(), model_key: model_key.into(), ctx, est_bytes: Some(bytes), parallel: 0 });
+        self
+    }
+    fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl Preflight for FakePreflight<'_> {
     fn held_by_others(&self) -> Vec<String> {
         self.held.clone()
     }
     fn lock(&self) -> anyhow::Result<darkmux_types::residency_lock::ResidencyLock> {
+        self.locks.set(self.locks.get() + 1);
         darkmux_types::residency_lock::acquire()
     }
-    fn commitment(&self, _model_key: &str, _n_ctx: u32) -> Option<u64> {
-        self.commitment
+    fn loaded(&self) -> Vec<darkmux_types::LoadedModel> {
+        self.loaded.clone()
     }
-    fn workers(&self) -> Option<u64> {
-        Some(0)
+    fn unload(&self, identifier: &str) -> anyhow::Result<()> {
+        self.calls.lock().unwrap().push(format!("unload {identifier}"));
+        Ok(())
     }
-    fn settle(&self, res: Reserved, _before: Option<u64>) {
-        self.settled.lock().unwrap().push(res);
+    fn load(&self, _model_key: &str, identifier: &str, n_ctx: u32) -> anyhow::Result<()> {
+        self.calls.lock().unwrap().push(format!("load {identifier} {n_ctx}"));
+        Ok(())
+    }
+    fn host(&self) -> Option<Box<dyn ModelHost>> {
+        let inner = MockHost { residents: self.residents.clone(), catalog: self.catalog.clone(), ..Default::default() };
+        Some(Box::new(ArchHost::new(inner, self.format)))
+    }
+    fn estimator(&self) -> &dyn FootprintEstimator {
+        &self.est
+    }
+    fn room(&self) -> ServerRoom<'_> {
+        // Each load's reservation kept whole until the test settles it.
+        ServerRoom {
+            dirs: self.dirs.clone(),
+            bounds: BOUNDS,
+            machine: self.machine,
+            settle: |res, _| SETTLING.lock().unwrap().push(res),
+            workers: || Some(0),
+        }
     }
 }
 
@@ -979,7 +1077,7 @@ impl Preflight for FakePreflight {
 #[serial_test::serial]
 fn a_preflight_load_reserves_under_the_lock_and_loads_outside_it() {
     let _rig = Rig::new();
-    let gate = FakePreflight { held: Vec::new(), commitment: Some(5 * GIB), settled: Default::default() };
+    let gate = FakePreflight::without_machine().priced("util", 5 * GIB);
     let seen = std::sync::Mutex::new(None);
     let load = |_: &str, _: &str, _: u32| -> anyhow::Result<()> {
         *seen.lock().unwrap() = Some((residency_lock_is_free(), reserved_now()));
@@ -987,7 +1085,7 @@ fn a_preflight_load_reserves_under_the_lock_and_loads_outside_it() {
     };
     load_reserved(&gate, "util", "darkmux:util", 16_384, &load).unwrap();
     assert_eq!(*seen.lock().unwrap(), Some((true, 5 * GIB)), "loaded outside the lock, its 5 GiB reserved");
-    let handed_on: Vec<u64> = gate.settled.lock().unwrap().iter().map(Reserved::need_bytes).collect();
+    let handed_on: Vec<u64> = SETTLING.lock().unwrap().iter().map(Reserved::need_bytes).collect();
     assert_eq!(handed_on, [5 * GIB], "the reservation is kept until it settles");
     let failing = |_: &str, _: &str, _: u32| -> anyhow::Result<()> { anyhow::bail!("no") };
     load_reserved(&gate, "util", "darkmux:util", 16_384, &failing).unwrap_err();
@@ -1002,7 +1100,7 @@ fn a_preflight_load_reserves_under_the_lock_and_loads_outside_it() {
 #[serial_test::serial]
 fn a_freshly_loaded_compactor_is_reserved_but_neither_held_nor_busy() {
     let _rig = Rig::new();
-    let gate = FakePreflight { held: Vec::new(), commitment: Some(5 * GIB), settled: Default::default() };
+    let gate = FakePreflight::without_machine().priced("util", 5 * GIB);
     let held_during_load = std::sync::Mutex::new(Vec::new());
     let load = |_: &str, _: &str, _: u32| -> anyhow::Result<()> {
         *held_during_load.lock().unwrap() = LeaseGuard::acquire().all_live_leased_models();
@@ -1032,13 +1130,167 @@ fn a_preflight_reload_never_unloads_an_instance_a_dispatch_holds() {
         unloaded.lock().unwrap().push(id.to_string());
         Ok(())
     };
-    let held = FakePreflight { held: vec!["darkmux:util".into()], commitment: None, settled: Default::default() };
+    let held = FakePreflight::without_machine().holding(&["darkmux:util"]);
     let err = unload_unless_held(&held, "darkmux:util", &unload).unwrap_err();
     assert_eq!(refusal_code(&err), Some("busy"), "{err:#}");
     assert!(unloaded.lock().unwrap().is_empty());
-    let idle = FakePreflight { held: Vec::new(), commitment: None, settled: Default::default() };
+    let idle = FakePreflight::without_machine();
     unload_unless_held(&idle, "darkmux:util", &unload).unwrap();
     assert_eq!(*unloaded.lock().unwrap(), ["darkmux:util"]);
+}
+
+/// A profile model a dispatch's preflight makes resident at 8000 tokens.
+fn profile_model(id: &str) -> darkmux_types::ProfileModel {
+    darkmux_types::ProfileModel { id: id.into(), n_ctx: Some(8_000), ..Default::default() }
+}
+
+/// A preflight load as a dispatch makes it (a lab run's model, the
+/// compactor, the utility model), against `gate`.
+fn preflight(gate: &FakePreflight<'_>, id: &str) -> anyhow::Result<()> {
+    crate::dispatch_internal::preflight_load(&profile_model(id), crate::dispatch_internal::WindowSource::Profile, gate)
+}
+
+/// A preflight load decides memory as a wave does: an idle engine server
+/// darkmux started holds the memory, and it is stopped before the load.
+/// Before, the preflight loaded on top of it.
+#[test]
+#[serial_test::serial]
+fn a_preflight_load_stops_an_idle_engine_server_to_make_room() {
+    let rig = Rig::new();
+    let mut tf = FakeServer::darkmux(&rig.dirs(), "tf", "TensorFold/q", 1_000);
+    let rec = tf.rec.clone();
+    let free = || Some(if server::alive(&rec) { 8 * GIB } else { 64 * GIB });
+    let machine = FakeMachine::new(&free);
+    let gate = FakePreflight::on(rig.dirs(), &machine).cataloged("m", 20 * GIB);
+    preflight(&gate, "m").expect("the load fits once the idle server stopped");
+    assert!(!tf.running(), "the idle server holding the memory was stopped");
+    assert_eq!(gate.calls(), ["load darkmux:m 8000"]);
+    assert_eq!(gate.locks.get(), 1, "decided under the residency lock");
+}
+
+/// Short of memory that darkmux did not take, with nothing of darkmux's
+/// idle to free: the preflight is refused `memory_in_use`, and nothing loads.
+#[test]
+#[serial_test::serial]
+fn a_preflight_load_short_of_memory_darkmux_did_not_take_is_memory_in_use() {
+    let rig = Rig::new();
+    let free = || Some(8 * GIB);
+    let machine = FakeMachine::new(&free);
+    let gate = FakePreflight::on(rig.dirs(), &machine).cataloged("m", 20 * GIB);
+    let err = preflight(&gate, "m").expect_err("refused");
+    assert_eq!(refusal_code(&err), Some("memory_in_use"), "{err:#}");
+    assert!(format!("{err:#}").contains("programs darkmux did not start hold the rest"), "{err:#}");
+    assert!(gate.calls().is_empty(), "nothing loaded: {:?}", gate.calls());
+    assert!(LeaseGuard::acquire().all_live_leased_models().is_empty(), "and no lease is left behind");
+}
+
+/// Memory a running dispatch holds frees when it finishes: the preflight is
+/// `busy`, the server it holds is never stopped, and nothing loads.
+#[test]
+#[serial_test::serial]
+fn a_preflight_load_short_of_memory_a_running_dispatch_holds_is_busy() {
+    let rig = Rig::new();
+    let mut tf = FakeServer::darkmux(&rig.dirs(), "tf", "TensorFold/q", 1_000);
+    let free = || Some(8 * GIB);
+    let machine = FakeMachine::new(&free).leasing(&[&["darkmux:TensorFold/q"]]);
+    let gate = FakePreflight::on(rig.dirs(), &machine).holding(&["darkmux:TensorFold/q"]).cataloged("m", 20 * GIB);
+    let err = preflight(&gate, "m").expect_err("refused");
+    assert_eq!(refusal_code(&err), Some("busy"), "{err:#}");
+    assert!(format!("{err:#}").contains("running dispatches hold TensorFold/q (tf)"), "{err:#}");
+    assert!(tf.running(), "the held server was not stopped");
+    assert!(gate.calls().is_empty(), "nothing loaded: {:?}", gate.calls());
+}
+
+/// A load priced only by the size-based estimate (its architecture
+/// unreadable) has no commitment, and is never refused: it loads, and LM
+/// Studio decides.
+#[test]
+#[serial_test::serial]
+fn a_preflight_load_priced_by_its_size_alone_is_never_refused() {
+    let rig = Rig::new();
+    let free = || Some(8 * GIB);
+    let machine = FakeMachine::new(&free);
+    let gate = FakePreflight::on(rig.dirs(), &machine).cataloged("m", 20 * GIB).formatted(Format::Unreadable);
+    preflight(&gate, "m").expect("never refused on a guess");
+    assert_eq!(gate.calls(), ["load darkmux:m 8000"]);
+}
+
+/// A preflight that reuses what is resident at its context decides nothing
+/// about memory: it never asks for the residency lock.
+#[test]
+#[serial_test::serial]
+fn a_preflight_reuse_takes_no_lock() {
+    let rig = Rig::new();
+    let free = || Some(8 * GIB);
+    let machine = FakeMachine::new(&free);
+    let gate = FakePreflight::on(rig.dirs(), &machine).resident("darkmux:m", "m", 8_000, 20 * GIB).cataloged("m", 20 * GIB);
+    preflight(&gate, "m").expect("reused");
+    assert_eq!(gate.locks.get(), 0, "a reuse takes no lock");
+    assert!(gate.calls().is_empty(), "nothing loads or unloads: {:?}", gate.calls());
+}
+
+/// With no idle server left, darkmux's idle LM Studio loads are unloaded
+/// to make room, as a wave's own pass unloads them; never one a running
+/// dispatch holds, nor the standing utility binding.
+#[test]
+#[serial_test::serial]
+fn a_preflight_load_unloads_darkmuxs_idle_lm_studio_loads_but_never_a_held_one_or_the_utility_binding() {
+    let rig = Rig::new();
+    let unloads = Mutex::new(Vec::new());
+    let free = || Some(if unloads.lock().unwrap().is_empty() { 8 * GIB } else { 24 * GIB });
+    let machine = FakeMachine { utility: Some("darkmux:util".into()), lms_unloads: Some(&unloads), ..FakeMachine::new(&free) }
+        .leasing(&[&["darkmux:held"]]);
+    let gate = FakePreflight::on(rig.dirs(), &machine)
+        .holding(&["darkmux:held"])
+        .resident("darkmux:held", "held", 8_000, 16 * GIB)
+        .resident("darkmux:util", "util", 8_000, 16 * GIB)
+        .resident("darkmux:orphan", "orphan", 8_000, 16 * GIB)
+        .resident("theirs", "theirs", 8_000, 16 * GIB)
+        .cataloged("m", 20 * GIB);
+    preflight(&gate, "m").expect("8 GiB free plus the orphan's 16 GiB holds the load");
+    assert_eq!(*unloads.lock().unwrap(), ["darkmux:orphan"]);
+    assert_eq!(gate.calls(), ["load darkmux:m 8000"]);
+}
+
+/// What a preflight never unloads to make room: the instance it is loading
+/// (resident by the time the lock is held: another process loaded it), one a
+/// running dispatch holds, the standing utility binding. Short with only
+/// those, it is `busy`, naming each holder once.
+#[test]
+#[serial_test::serial]
+fn a_preflight_never_unloads_its_own_instance_a_held_one_or_the_utility_binding() {
+    let rig = Rig::new();
+    let unloads = Mutex::new(Vec::new());
+    let free = || Some(8 * GIB);
+    let machine = FakeMachine { utility: Some("darkmux:util".into()), lms_unloads: Some(&unloads), ..FakeMachine::new(&free) }
+        .leasing(&[&["darkmux:held"]]);
+    let mut gate = FakePreflight::on(rig.dirs(), &machine)
+        .holding(&["darkmux:held"])
+        .resident("darkmux:m", "m", 8_000, 16 * GIB)
+        .resident("darkmux:held", "held", 8_000, 16 * GIB)
+        .resident("darkmux:util", "util", 8_000, 16 * GIB)
+        .cataloged("m", 20 * GIB);
+    // `lms ps` read before the lock did not list it yet.
+    gate.loaded.retain(|m| m.identifier != "darkmux:m");
+    let err = preflight(&gate, "m").expect_err("refused");
+    assert_eq!(refusal_code(&err), Some("busy"), "{err:#}");
+    let text = format!("{err:#}");
+    assert!(text.contains("running dispatches hold darkmux:held, darkmux:util;"), "{text}");
+    assert!(unloads.lock().unwrap().is_empty(), "{:?}", unloads.lock().unwrap());
+}
+
+/// The stale-context reload through the same wiring: an instance a running
+/// dispatch holds is never unloaded under it, and the preflight is `busy`.
+#[test]
+#[serial_test::serial]
+fn a_preflight_reload_of_a_held_instance_is_busy_and_unloads_nothing() {
+    let rig = Rig::new();
+    let free = || Some(64 * GIB);
+    let machine = FakeMachine::new(&free);
+    let gate = FakePreflight::on(rig.dirs(), &machine).holding(&["darkmux:m"]).resident("darkmux:m", "m", 4_096, 20 * GIB);
+    let err = preflight(&gate, "m").expect_err("refused");
+    assert_eq!(refusal_code(&err), Some("busy"), "{err:#}");
+    assert!(gate.calls().is_empty(), "{:?}", gate.calls());
 }
 
 /// (#3514) A wave that only reuses what is resident takes no residency

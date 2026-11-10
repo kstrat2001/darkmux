@@ -37,7 +37,15 @@
 //!
 //! darkmux's idle LM Studio loads are the planner's own business: the wave's
 //! Exclusive scope already unloads every one the wave does not want, so only
-//! servers are evicted here.
+//! servers are evicted for a wave.
+//!
+//! A preflight load (the compactor, the utility model, a lab run's model,
+//! which load outside any wave: [`load_reserved`]) makes the same decision
+//! under the same lock, with the same pricing, reservation and codes. It
+//! has no Exclusive pass, so once no idle server is left it unloads
+//! darkmux's idle LM Studio loads too, as the engine path does: never the
+//! one it loads, one a running dispatch holds, or the standing utility
+//! binding.
 
 use crate::engine_dispatch::{darkmux_residents, evict, refuse, short_of_memory, EngineRefusal, Machine, Resident, ThisMachine};
 use darkmux_gestalt::{
@@ -64,8 +72,8 @@ pub(crate) struct ServerRoom<'a> {
     pub(crate) workers: fn() -> Option<u64>,
 }
 
-/// This machine, as the LM Studio path reads it: the wave already knows its
-/// utility binding, so none is read from a registry here.
+/// This machine, as the LM Studio path reads it: its utility binding is the
+/// default registry's.
 static THIS_MACHINE: ThisMachine<'static> = ThisMachine { profiles_file: None };
 
 impl ServerRoom<'static> {
@@ -212,8 +220,22 @@ impl<'a> LoadPricing<'a> {
         if unpriced.is_empty() {
             return LoadPricing { caller, measured: None };
         }
+        Self::measured(&unpriced, caller, host)
+    }
+
+    /// One preflight load's pricing: `model_key` measured on `host` unless
+    /// the caller prices it, or no figure when there is no host to ask.
+    pub(crate) fn for_load(model_key: &str, min_ctx: u32, caller: &'a dyn FootprintEstimator, host: Option<&mut dyn ModelHost>) -> Self {
+        match host.filter(|_| caller.estimate_bytes(model_key, min_ctx, None).is_none()) {
+            Some(host) => Self::measured(&[model_key], caller, host),
+            None => LoadPricing { caller, measured: None },
+        }
+    }
+
+    /// `keys` priced from `host`'s catalog and their architecture.
+    fn measured(keys: &[&str], caller: &'a dyn FootprintEstimator, host: &mut dyn ModelHost) -> Self {
         let catalog = host.list_catalog().unwrap_or_default();
-        let arch = host.arch_facts(&unpriced);
+        let arch = host.arch_facts(keys);
         LoadPricing { caller, measured: Some((LoadPricer::new(arch), catalog)) }
     }
 
@@ -254,8 +276,21 @@ impl FootprintEstimator for Potential<'_, '_> {
     }
 }
 
-/// Stop darkmux's idle engine servers until `plan`'s loads fit, recording
-/// each stop in `stopped`. See the module doc.
+/// What a room step may free beyond the plan's own unloads, and what it
+/// keeps.
+pub(crate) struct Evict<'a> {
+    pub(crate) lease: &'a LeaseGuard,
+    /// What every other running dispatch holds: never evicted, and memory
+    /// that frees when they finish.
+    pub(crate) pinned: &'a [String],
+    /// darkmux's idle LM Studio loads it may unload once no idle server is
+    /// left: a preflight load's. A wave names none: its own Exclusive pass
+    /// unloads every one it does not want.
+    pub(crate) loads: Vec<String>,
+}
+
+/// Stop darkmux's idle engine servers (then unload `evict.loads`) until
+/// `plan`'s loads fit, recording each in `stopped`. See the module doc.
 ///
 /// (#3514) Two figures. Idle servers are stopped to reach the loads'
 /// potential (their whole context filled), but only the commitment (what
@@ -268,8 +303,7 @@ pub(crate) fn make_room(
     plan: &Plan,
     facts: &Facts,
     pricing: &LoadPricing<'_>,
-    lease: &LeaseGuard,
-    pinned: &[String],
+    evict: &Evict<'_>,
     room: &ServerRoom<'_>,
     stopped: &mut Vec<String>,
 ) -> Result<(), EngineRefusal> {
@@ -298,7 +332,7 @@ pub(crate) fn make_room(
     if target.fits(free.saturating_sub(room.machine.reserved(None))) {
         return Ok(());
     }
-    let (free, held) = stop_idle_servers_toward(target, lease, pinned, plan, facts, room, stopped)?;
+    let (free, held) = stop_idle_servers_toward(target, evict, plan, facts, room, stopped)?;
     // Read again: a server stopped just now reserves nothing.
     let reserved = room.machine.reserved(None);
     match commitment {
@@ -317,36 +351,45 @@ pub(crate) fn make_room(
     }
 }
 
-/// Stop darkmux's idle servers, the least recently started first, until
-/// `target` fits or none is left; returns the free memory then, and what a
-/// running dispatch holds.
+/// Stop darkmux's idle servers, the least recently started first, then
+/// unload `frees.loads`, until `target` fits or none is left; returns the
+/// free memory then, and what a running dispatch holds.
 fn stop_idle_servers_toward(
     target: PlanRoom,
-    lease: &LeaseGuard,
-    pinned: &[String],
+    frees: &Evict<'_>,
     plan: &Plan,
     facts: &Facts,
     room: &ServerRoom<'_>,
     stopped: &mut Vec<String>,
 ) -> Result<(u64, Vec<String>), EngineRefusal> {
-    let leased = room.machine.leased(lease);
+    let leased = room.machine.leased(frees.lease);
     // Every darkmux server counts: an LM Studio load replaces none of them.
-    let (mut idle, mut held) = darkmux_residents(&room.dirs, NO_ENDPOINT, &leased, Vec::new());
-    held.extend(held_loads(plan, facts, pinned));
+    let (mut idle, mut held) = darkmux_residents(&room.dirs, NO_ENDPOINT, &leased, frees.loads.clone());
+    held.extend(held_loads(plan, facts, frees.pinned));
     loop {
         let free = room.machine.reclaimable().unwrap_or(0);
         if target.fits(free.saturating_sub(room.machine.reserved(None))) {
             return Ok((free, held));
         }
         let Some(next) = idle.pop() else { return Ok((free, held)) };
-        if evict(&next, &room.dirs, room.bounds, room.machine, lease)? {
-            eprintln!("darkmux: stopped darkmux's idle engine server {} to make room for an LM Studio load", next.name());
-            stopped.push(format!("stopped the idle engine server {}", next.name()));
+        if evict(&next, &room.dirs, room.bounds, room.machine, frees.lease)? {
+            stopped.push(made_room(&next));
         } else {
             // A dispatch took it up since the list was read.
             held.push(next.name());
         }
     }
+}
+
+/// What evicting `r` did, said once on stderr and returned for the
+/// refusal's note.
+fn made_room(r: &Resident) -> String {
+    let done = match r {
+        Resident::Server(_) => "stopped the idle engine server",
+        Resident::Load(_) => "unloaded the idle LM Studio load",
+    };
+    eprintln!("darkmux: {done} {} to make room for an LM Studio load", r.name());
+    format!("{done} {}", r.name())
 }
 
 /// No server darkmux started is on this endpoint id (an endpoint id is
@@ -422,23 +465,39 @@ pub(crate) fn hold_dispatch_models(lease: &LeaseGuard, job: Option<&str>, compac
 
 /// (#3514) The residency protocol around the dispatch preflight's own LM
 /// Studio loads (`ensure_model_resident_from`: the compactor, the utility
-/// model, a lab run's model), which load outside any wave.
+/// model, a lab run's model), which load outside any wave, and the LM Studio
+/// they load into.
 pub(crate) trait Preflight {
     /// What every running darkmux dispatch holds now.
     fn held_by_others(&self) -> Vec<String>;
     fn lock(&self) -> anyhow::Result<darkmux_types::residency_lock::ResidencyLock>;
-    /// What loading `model_key` at `n_ctx` commits, when it can be priced.
-    fn commitment(&self, model_key: &str, n_ctx: u32) -> Option<u64>;
-    /// LM Studio's workers' footprint now.
-    fn workers(&self) -> Option<u64>;
-    /// Keep `res` until the load's memory pages in. The reservation alone:
-    /// no lease outlives the load, so the model reads as held only while a
-    /// dispatch runs on it.
-    fn settle(&self, res: Reserved, before: Option<u64>);
+    /// LM Studio's residents, as `lms ps` lists them.
+    fn loaded(&self) -> Vec<darkmux_types::LoadedModel>;
+    fn unload(&self, identifier: &str) -> anyhow::Result<()>;
+    /// Load `model_key` as `identifier` at `n_ctx`, within the load deadline.
+    fn load(&self, model_key: &str, identifier: &str, n_ctx: u32) -> anyhow::Result<()>;
+    /// LM Studio as the planner's host: its residents' footprints, its
+    /// catalog and its models' architecture, read to price a load.
+    fn host(&self) -> Option<Box<dyn ModelHost>>;
+    /// A figure the caller has for a load before LM Studio is asked (a
+    /// test's fixed one); none on this machine.
+    fn estimator(&self) -> &dyn FootprintEstimator;
+    /// The machine the load takes its memory from: its memory, darkmux's
+    /// engine servers, and how a load's reservation settles.
+    fn room(&self) -> ServerRoom<'_>;
 }
 
 /// This machine's [`Preflight`].
 pub(crate) struct ThisPreflight;
+
+/// No figure before LM Studio is asked.
+struct Unpriced;
+
+impl FootprintEstimator for Unpriced {
+    fn estimate_bytes(&self, _model_key: &str, _min_ctx: u32, _catalog: Option<&[CatalogFact]>) -> Option<u64> {
+        None
+    }
+}
 
 impl Preflight for ThisPreflight {
     fn held_by_others(&self) -> Vec<String> {
@@ -447,17 +506,23 @@ impl Preflight for ThisPreflight {
     fn lock(&self) -> anyhow::Result<darkmux_types::residency_lock::ResidencyLock> {
         darkmux_types::residency_lock::acquire()
     }
-    fn commitment(&self, model_key: &str, n_ctx: u32) -> Option<u64> {
-        let mut host = darkmux_profiles::engine::lmstudio().host()?;
-        let catalog = host.list_catalog().ok()?;
-        let pricer = LoadPricer::new(host.arch_facts(&[model_key]));
-        pricer.figures(model_key, n_ctx, Some(&catalog))?.commitment
+    fn loaded(&self) -> Vec<darkmux_types::LoadedModel> {
+        darkmux_profiles::engine::lmstudio().loaded().unwrap_or_default()
     }
-    fn workers(&self) -> Option<u64> {
-        darkmux_profiles::model_ledger::lmstudio_workers_footprint()
+    fn unload(&self, identifier: &str) -> anyhow::Result<()> {
+        darkmux_profiles::engine::lmstudio().unload(identifier)
     }
-    fn settle(&self, res: Reserved, before: Option<u64>) {
-        settle_on_this_machine(res, before);
+    fn load(&self, model_key: &str, identifier: &str, n_ctx: u32) -> anyhow::Result<()> {
+        crate::dispatch_internal::load_at_ctx_bounded(model_key, identifier, n_ctx)
+    }
+    fn host(&self) -> Option<Box<dyn ModelHost>> {
+        darkmux_profiles::engine::lmstudio().host()
+    }
+    fn estimator(&self) -> &dyn FootprintEstimator {
+        &Unpriced
+    }
+    fn room(&self) -> ServerRoom<'_> {
+        ServerRoom::this_machine()
     }
 }
 
@@ -526,13 +591,13 @@ pub(crate) fn load_reserved(
     n_ctx: u32,
     load: &dyn Fn(&str, &str, u32) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    let models = [identifier.to_string()];
-    let (lease, reserved, before) = reserve_preflight(gate, model_key, &models, n_ctx)?;
+    let room = gate.room();
+    let (lease, reserved, before) = reserve_preflight(gate, &room, model_key, identifier, n_ctx)?;
     // A load that fails ends its reservation with `reserved`.
     load(model_key, identifier, n_ctx)?;
     drop(lease);
     if let Some(res) = reserved {
-        gate.settle(res, before);
+        (room.settle)(res, before);
     }
     Ok(())
 }
@@ -542,18 +607,61 @@ pub(crate) fn load_reserved(
 /// go on return.
 fn reserve_preflight(
     gate: &dyn Preflight,
+    room: &ServerRoom<'_>,
     model_key: &str,
-    models: &[String],
+    identifier: &str,
     n_ctx: u32,
 ) -> anyhow::Result<(LeaseGuard, Option<Reserved>, Option<u64>)> {
     let _lock = gate.lock().map_err(|e| {
         refuse("model_start_failed", format!("could not take darkmux's residency lock ({e:#}); check that darkmux's home is writable"))
     })?;
     let lease = LeaseGuard::acquire();
-    let before = gate.workers();
-    lease.write(models)?;
-    let reserved = gate.commitment(model_key, n_ctx).map(Reserved::begin).transpose()?;
+    let want = Placement { model_key: model_key.into(), identifier: identifier.into(), min_ctx: n_ctx, seat: String::new() };
+    let need = preflight_room(gate, room, &lease, &want)?;
+    // Read after the room step: a load it unloaded no longer counts.
+    let before = (room.workers)();
+    lease.write(&[identifier.to_string()])?;
+    let reserved = need.map(|n| Reserved::begin(n.need_bytes)).transpose()?;
     Ok((lease, reserved, before))
+}
+
+/// A preflight load's memory decision, a wave's own: priced two ways
+/// ([`LoadPricing`]), and [`make_room`] stops darkmux's idle servers, then
+/// unloads its idle LM Studio loads (never one a running dispatch holds,
+/// nor the standing utility binding), or refuses with the wave's code.
+/// Returns what the load commits, for its reservation.
+fn preflight_room(gate: &dyn Preflight, room: &ServerRoom<'_>, lease: &LeaseGuard, want: &Placement) -> anyhow::Result<Option<PlanRoom>> {
+    let mut host = gate.host();
+    let residents = host.as_mut().and_then(|h| h.list_resident().ok()).unwrap_or_default();
+    let facts = Facts { residents, utility_binding: room.machine.utility(), ..Default::default() };
+    let host = host.as_deref_mut().map(|h| h as &mut dyn ModelHost);
+    let pricing = LoadPricing::for_load(&want.model_key, want.min_ctx, gate.estimator(), host);
+    let plan = loading(want);
+    let pinned = gate.held_by_others();
+    let evict = Evict { lease, pinned: &pinned, loads: idle_loads(&facts, &pinned, &want.identifier) };
+    let mut stopped = Vec::new();
+    make_room(&plan, &facts, &pricing, &evict, room, &mut stopped).map_err(|refusal| {
+        let note = if stopped.is_empty() { String::new() } else { format!(" (after it {})", stopped.join(", ")) };
+        anyhow::Error::new(refusal).context(format!("darkmux: loading `{}` was refused{note}", want.identifier))
+    })?;
+    Ok(plan_room(&plan, &facts, &pricing.commitment()))
+}
+
+/// The plan of one preflight load, for the room step: the load alone (a
+/// reload's stale instance is already unloaded).
+fn loading(want: &Placement) -> Plan {
+    let action = Action::Load { model_key: want.model_key.clone(), identifier: want.identifier.clone(), min_ctx: want.min_ctx };
+    let precondition = darkmux_gestalt::Precondition::NoResidentForModelKey { model_key: want.model_key.clone() };
+    let load = darkmux_gestalt::PlannedAction { action, reason: darkmux_gestalt::Reason::NoResident, precondition };
+    Plan { actions: vec![load], ..Default::default() }
+}
+
+/// darkmux's LM Studio loads a preflight may unload to make room: not the
+/// one it loads, not one a running dispatch holds, not the standing utility
+/// binding.
+fn idle_loads(facts: &Facts, pinned: &[String], loading: &str) -> Vec<String> {
+    let kept = |id: &str| id == loading || pinned.iter().any(|p| p == id) || facts.utility_binding.as_deref() == Some(id);
+    facts.residents.iter().map(|r| r.identifier.as_str()).filter(|id| is_darkmux_owned(id) && !kept(id)).map(str::to_string).collect()
 }
 
 /// (#3514) No machine: the room of a model host whose loads take none of
