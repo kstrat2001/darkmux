@@ -18,7 +18,9 @@
 //! The names are read once and kept. A name not in the kept set re-reads
 //! them, at most once per [`REFRESH_AFTER`], so a rename or a roster edit is
 //! picked up without letting a stream of foreign names spawn a provider
-//! call each.
+//! call each. While the last read had no answer from the overlay network
+//! (still starting after a boot), the bound is [`RETRY_INCOMPLETE_AFTER`],
+//! so the tailnet name is not refused for a whole interval.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -32,9 +34,14 @@ use axum::response::{IntoResponse, Response};
 /// How long the kept names stand before a `Host` they lack re-reads them.
 const REFRESH_AFTER: Duration = Duration::from_secs(30);
 
-/// Where the names come from. Blocking: the production source asks the
+/// How soon a miss re-reads the names when the last read had no answer from
+/// the overlay network (it is still starting after a boot).
+const RETRY_INCOMPLETE_AFTER: Duration = Duration::from_secs(2);
+
+/// Where the names come from, and whether the read was complete (the
+/// overlay network answered). Blocking: the production source asks the
 /// overlay network's tool and reads the roster.
-type NameSource = dyn Fn() -> HashSet<String> + Send + Sync;
+type NameSource = dyn Fn() -> (HashSet<String>, bool) + Send + Sync;
 
 /// The name a test router's `Host` uses for this machine's tailnet name.
 #[cfg(test)]
@@ -44,7 +51,7 @@ pub(crate) const TEST_MACHINE_NAME: &str = "hub.tailnet-test.example";
 pub(crate) struct HostNames {
     source: Box<NameSource>,
     /// The kept names and when they were read; `None` until first needed.
-    known: Mutex<Option<(Instant, Arc<HashSet<String>>)>>,
+    known: Mutex<Option<Kept>>,
     /// Held across a re-read, so concurrent misses read once.
     reading: tokio::sync::Mutex<()>,
 }
@@ -58,7 +65,8 @@ impl HostNames {
             let roster: Vec<String> = darkmux_fleet::load_roster()
                 .map(|r| r.machines.into_values().map(|m| m.address).collect())
                 .unwrap_or_default();
-            names_of(os_hostname().as_deref(), node.as_ref(), &roster)
+            let complete = node.is_some();
+            (names_of(os_hostname().as_deref(), node.as_ref(), &roster), complete)
         }))
     }
 
@@ -66,38 +74,49 @@ impl HostNames {
     #[cfg(test)]
     pub(crate) fn fixed(names: &[&str]) -> Self {
         let set: HashSet<String> = names.iter().map(|n| normalize(n)).collect();
-        Self::from_source(Box::new(move || set.clone()))
+        Self::from_source(Box::new(move || (set.clone(), true)))
     }
 
     fn from_source(source: Box<NameSource>) -> Self {
         Self { source, known: Mutex::new(None), reading: tokio::sync::Mutex::new(()) }
     }
 
-    /// The kept names when they are younger than `max_age`.
-    fn kept(&self, max_age: Option<Duration>) -> Option<Arc<HashSet<String>>> {
+    /// The kept names; with `current`, only while they are too young to
+    /// re-read.
+    fn kept(&self, current: bool) -> Option<Arc<HashSet<String>>> {
         let guard = self.known.lock().unwrap_or_else(|p| p.into_inner());
-        let (at, names) = guard.as_ref()?;
-        max_age.is_none_or(|age| at.elapsed() < age).then(|| names.clone())
+        let kept = guard.as_ref()?;
+        let interval = if kept.complete { REFRESH_AFTER } else { RETRY_INCOMPLETE_AFTER };
+        (!current || kept.at.elapsed() < interval).then(|| kept.names.clone())
     }
 
     /// Whether `name` (already normalized) is one of this machine's.
     async fn answers_to(self: &Arc<Self>, name: &str) -> bool {
-        if self.kept(None).is_some_and(|n| n.contains(name)) {
+        if self.kept(false).is_some_and(|n| n.contains(name)) {
             return true;
         }
         let _reading = self.reading.lock().await;
         // A concurrent miss may have read them while this one waited.
-        if let Some(names) = self.kept(Some(REFRESH_AFTER)) {
+        if let Some(names) = self.kept(true) {
             return names.contains(name);
         }
         let me = self.clone();
-        let Ok(names) = tokio::task::spawn_blocking(move || (me.source)()).await else {
+        let Ok((names, complete)) = tokio::task::spawn_blocking(move || (me.source)()).await else {
             return false;
         };
         let names = Arc::new(names);
-        *self.known.lock().unwrap_or_else(|p| p.into_inner()) = Some((Instant::now(), names.clone()));
+        *self.known.lock().unwrap_or_else(|p| p.into_inner()) = Some(Kept { at: Instant::now(), names: names.clone(), complete });
         names.contains(name)
     }
+}
+
+/// One read of the names.
+struct Kept {
+    at: Instant,
+    names: Arc<HashSet<String>>,
+    /// The overlay network answered this read. While it has not, a miss
+    /// re-reads after [`RETRY_INCOMPLETE_AFTER`] instead of [`REFRESH_AFTER`].
+    complete: bool,
 }
 
 /// A host name as compared: lowercase, no trailing dot.
@@ -276,12 +295,45 @@ mod tests {
         let r = reads.clone();
         let names = Arc::new(HostNames::from_source(Box::new(move || {
             r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            ["laptop".to_string()].into_iter().collect()
+            (["laptop".to_string()].into_iter().collect(), true)
         })));
         assert!(names.answers_to("laptop").await);
         assert!(!names.answers_to("evil.example").await);
         assert!(!names.answers_to("evil2.example").await);
         assert!(names.answers_to("laptop").await);
         assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1, "foreign names inside the interval read nothing");
+    }
+
+    /// After a boot the overlay network may not answer the first read, and a
+    /// phone on the tailnet name would then be refused for a whole interval.
+    /// While the last read had no overlay answer, a miss re-reads after a
+    /// short bound; once a read is complete the normal interval applies.
+    #[tokio::test]
+    async fn an_incomplete_read_is_retried_soon_until_the_overlay_answers() {
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r = reads.clone();
+        let names = Arc::new(HostNames::from_source(Box::new(move || {
+            let n = r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                (HashSet::new(), false)
+            } else {
+                (["laptop".to_string()].into_iter().collect(), true)
+            }
+        })));
+        let count = || reads.load(std::sync::atomic::Ordering::SeqCst);
+        let age = |by: Duration| {
+            let mut g = names.known.lock().unwrap();
+            let kept = g.as_mut().unwrap();
+            kept.at = Instant::now().checked_sub(by).unwrap();
+        };
+        assert!(!names.answers_to("laptop").await, "the overlay did not answer the first read");
+        assert!(!names.answers_to("laptop").await);
+        assert_eq!(count(), 1, "the retry is bounded");
+        age(RETRY_INCOMPLETE_AFTER + Duration::from_millis(100));
+        assert!(names.answers_to("laptop").await, "a short wait later the miss re-reads");
+        assert_eq!(count(), 2);
+        age(RETRY_INCOMPLETE_AFTER + Duration::from_millis(100));
+        assert!(!names.answers_to("evil.example").await);
+        assert_eq!(count(), 2, "a complete read keeps the normal interval");
     }
 }
