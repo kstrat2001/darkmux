@@ -1595,6 +1595,40 @@ mod tests {
         assert_eq!(crate::engine_dispatch::refusal_code(&plain), None, "{plain:#}");
     }
 
+    /// (#3514) A crew-of-one dispatch whose LM Studio wave is refused never
+    /// reaches its step, yet the run's error carries the wave's code, so the
+    /// `dispatch --json` refusal envelope names it. Here the model is resident
+    /// at too small a context and another dispatch holds it, so the wave is
+    /// `busy` (no machine is read).
+    #[test]
+    #[serial_test::serial]
+    fn a_refused_wave_reaches_the_crew_of_one_run_with_its_code() {
+        let _guard = RunGuard::new();
+        let kind = FakeDispatchKind {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            should_err: false,
+            placement: placement(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let calls = kind.calls.clone();
+        let registry = test_registry(kind);
+        let host_factory = || -> Box<dyn darkmux_gestalt::ModelHost> {
+            Box::new(MockHost::new().resident("darkmux:test-model", "test-model", 1_000, Some(1_000)))
+        };
+        let other = darkmux_types::residency_lease::LeaseGuard::acquire();
+        other.write(&["darkmux:test-model".to_string()]).unwrap();
+        other.mark_loaded(&["darkmux:test-model".to_string()]).unwrap();
+        let opts = test_opts("coder", "build the thing");
+        let session = opts.session.clone();
+        let err = dispatch_as_crew_of_one_with(opts, &registry, &host_factory).unwrap_err();
+        drop(other);
+        assert_eq!(crate::engine_dispatch::refusal_code(&err), Some("busy"), "{err:#}");
+        assert!(calls.lock().unwrap().is_empty(), "the step never ran");
+        assert_eq!(crate::engine_dispatch::take_refusal(&session), None, "the run took its code");
+    }
+
     /// (#1509 review — the MUST FIX) A hard `dispatch()`-level `Err` must
     /// write an HONEST terminal record, not a dishonest "success"-shaped
     /// one. Before this fix, the `NodeStatus::Error` arm finalized with

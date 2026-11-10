@@ -6708,6 +6708,12 @@ struct ContainerRun {
     /// (#1187) The hosted brain's auth header, held only here until it is
     /// piped over the container's stdin.
     remote_auth: Option<(String, String)>,
+    /// (#3507) Held for the whole run, on the LM Studio job model and then
+    /// the compactor ([`crate::lms_room::hold_dispatch_models`]).
+    lease: darkmux_types::residency_lease::LeaseGuard,
+    /// The job model the lease holds: an LM Studio load darkmux made for
+    /// this dispatch, `None` on any other route.
+    leased_job: Option<String>,
 }
 
 /// The container path up to its `dispatch.start`, in the order the steps
@@ -6736,6 +6742,7 @@ fn prepare_container_run(
     let workspace_plan = plan_workspace(opts, unix_micros)?;
     let (model, resolved_profile, unmanaged_endpoint_raw_label) =
         resolve_container_model(&role, opts, brain.agentic_pm.as_ref())?;
+    let (lease, leased_job) = lease_lmstudio_job(opts, &brain, &model)?;
     record_split_gitdirs(opts, execution, &model, &workdir_split_gitdirs);
     let (workspace, workspace_cleanup, host_out) = materialize_dirs(
         opts,
@@ -6773,7 +6780,23 @@ fn prepare_container_run(
         workspace,
         host_out,
         remote_auth,
+        lease,
+        leased_job,
     })
+}
+
+/// (#3507) The LM Studio route's job model, leased as soon as it is
+/// resident, for the life of the run; on any other route the lease starts
+/// empty (the compactor may join it).
+fn lease_lmstudio_job(
+    opts: &DispatchOpts,
+    brain: &ContainerBrain,
+    model: &str,
+) -> Result<(darkmux_types::residency_lease::LeaseGuard, Option<String>)> {
+    let lease = darkmux_types::residency_lease::LeaseGuard::acquire();
+    let leased_job = (brain.agentic_pm.is_none() && opts.model_base_url_override.is_none()).then(|| model.to_string());
+    crate::lms_room::hold_dispatch_models(&lease, leased_job.as_deref(), None)?;
+    Ok((lease, leased_job))
 }
 
 /// (#2294) PREFLIGHT: does this workdir's git directory live outside
@@ -7918,6 +7941,9 @@ fn launch_container(
         resolve_dispatch_compaction(&run.role, opts)?;
     let (compaction, mut compactor_auth) =
         prepare_compactor(opts, compaction, compactor_n_ctx, unmanaged_compactor.as_ref())?;
+    // (#3507) The compactor this run may call mid-run joins its lease.
+    let local_compactor = compaction.compactor_model.as_deref().filter(|_| unmanaged_compactor.is_none());
+    crate::lms_room::hold_dispatch_models(&run.lease, run.leased_job.as_deref(), local_compactor)?;
 
     // Shared toolchain cache: resolve the host dir + best-effort create so
     // the bind-mount target exists (#703 Slice 3). If create fails the mount
@@ -14977,14 +15003,18 @@ fn switch_notice_for(engine_id: &str, loading: engine::Loading, could_hold: Opti
 
 /// [`ensure_model_loaded_at_ctx`] with the window's source named in the
 /// load messages (#2914 review, C5).
+///
+/// (#3514) Its loads follow the residency protocol (lock, reservation),
+/// and a stale reload never unloads an instance a running dispatch holds.
 pub(crate) fn ensure_model_loaded_at_ctx_from(pm: &darkmux_types::ProfileModel, source: WindowSource) -> Result<()> {
     let engine = engine::lmstudio();
+    let gate = crate::lms_room::ThisPreflight;
     ensure_model_resident_from(
         pm,
         source,
         &|| engine.loaded().unwrap_or_default(),
-        &|identifier| engine.unload(identifier),
-        &|model_key, identifier, n_ctx| load_at_ctx_bounded(model_key, identifier, n_ctx),
+        &|identifier| crate::lms_room::unload_unless_held(&gate, identifier, &|id| engine.unload(id)),
+        &|model_key, identifier, n_ctx| crate::lms_room::load_reserved(&gate, model_key, identifier, n_ctx, &load_at_ctx_bounded),
     )
 }
 

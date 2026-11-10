@@ -65,7 +65,7 @@
 use crate::gestalt_host::lms_host::{run_bounded, StdoutMode};
 use crate::gestalt_host::{ArchFactsReader, GgufFactsReader};
 use darkmux_gestalt::{
-    ArchEstimator, ArchFacts, CatalogFact, Deadline, FootprintEstimator, V1Estimator,
+    ArchEstimator, ArchFacts, CatalogFact, Deadline, FootprintEstimator, ModelArch, V1Estimator,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -788,11 +788,9 @@ pub struct LedgerInputs {
 /// NEITHER reader could answer — a corrupt/unusual GGUF, an ambiguous
 /// multi-file directory, or a weights format neither reader understands.
 ///
-/// [`Self::estimate_with_source`] is the ONLY port this type exposes —
-/// there is no bare `FootprintEstimator::estimate_bytes` impl, because
-/// nothing in this module calls one and a private type gains no drop-in
-/// value from implementing a trait it has no consumer for; add it back if
-/// a real caller needs it.
+/// [`Self::estimate_with_source`] prices a resident with its source (the
+/// ledger shows which); its `FootprintEstimator` impl is the same figure
+/// without the source, which the LM Studio load path plans with (#3508).
 ///
 /// An ESTIMATED row's `kv_per_token_bytes` field stays `None` (the flat V1
 /// rate is never decomposed into a per-token figure written back onto the
@@ -805,7 +803,7 @@ pub struct LedgerInputs {
 /// which could render the FALSE claim "no shrinkable context" when the
 /// estimated resident was in fact the only one with room to shrink;
 /// `effective_kv_rate` closes that gap.
-struct ArchWithSizeFallback {
+pub struct ArchWithSizeFallback {
     arch: ArchEstimator,
     // No `fallback: V1Estimator` field: since the tiers landed, the fallback's
     // KV rate is chosen PER MODEL from its catalog size, so the estimator is
@@ -814,8 +812,16 @@ struct ArchWithSizeFallback {
     // exact shape that under-reserved large models and the merge gate caught.
 }
 
+/// (#3508) The ledger's pricing as the planner's estimator, so a load is
+/// planned at the figure `darkmux machine resources` shows for it resident.
+impl FootprintEstimator for ArchWithSizeFallback {
+    fn estimate_bytes(&self, model_key: &str, min_ctx: u32, catalog: Option<&[CatalogFact]>) -> Option<u64> {
+        self.estimate_with_source(model_key, min_ctx, catalog).map(|(bytes, _)| bytes)
+    }
+}
+
 impl ArchWithSizeFallback {
-    fn new(arch: BTreeMap<String, ArchFacts>) -> Self {
+    pub fn new(arch: BTreeMap<String, ArchFacts>) -> Self {
         ArchWithSizeFallback { arch: ArchEstimator::new(arch) }
     }
 
@@ -1784,20 +1790,77 @@ fn resolve_arch_facts(
     arch_reader: &ArchFactsReader,
     gguf_reader: &GgufFactsReader,
 ) -> BTreeMap<String, ArchFacts> {
-    let mut arch: BTreeMap<String, ArchFacts> = BTreeMap::new();
-    for r in residents {
-        if arch.contains_key(&r.model_key) {
+    resolve_arch_facts_of(residents.iter().map(|r| r.model_key.as_str()), arch_reader, gguf_reader).facts
+}
+
+/// [`resolve_arch_facts`] over model keys, saying which came from a GGUF
+/// header (the reader that answered names the format).
+fn resolve_arch_facts_of<'k>(
+    model_keys: impl Iterator<Item = &'k str>,
+    arch_reader: &ArchFactsReader,
+    gguf_reader: &GgufFactsReader,
+) -> ModelArch {
+    let mut arch = ModelArch::default();
+    for key in model_keys {
+        if arch.facts.contains_key(key) {
             continue;
         }
-        if let Some(raw) = arch_reader.read(&r.model_key) {
-            arch.insert(r.model_key.clone(), arch_facts_v1(&raw));
-            continue;
-        }
-        if let Some(raw) = gguf_reader.read(&r.model_key) {
-            arch.insert(r.model_key.clone(), arch_facts_v1(&raw));
+        if let Some(raw) = arch_reader.read(key) {
+            arch.facts.insert(key.to_string(), arch_facts_v1(&raw));
+        } else if let Some(raw) = gguf_reader.read(key) {
+            arch.facts.insert(key.to_string(), arch_facts_v1(&raw));
+            arch.kv_at_load.insert(key.to_string());
         }
     }
     arch
+}
+
+/// (#3508) Architecture facts for `model_keys`, read from the models
+/// `ls_rows` (`lms ls --json`) lists, in [`resolve_arch_facts`]'s order. A
+/// load is then priced as [`ModelLedger`] prices a resident.
+pub fn arch_facts_for(ls_rows: &[serde_json::Value], model_keys: &[&str]) -> ModelArch {
+    let arch_reader = ArchFactsReader::from_ls_entries(ls_rows);
+    let gguf_reader = GgufFactsReader::from_ls_entries(ls_rows);
+    resolve_arch_facts_of(model_keys.iter().copied(), &arch_reader, &gguf_reader)
+}
+
+/// (#3514) What a load costs, two ways.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoadFigures {
+    /// What the load takes the moment it is made: a GGUF model's weights,
+    /// its KV cache at the whole context and the margin (llama.cpp allocates
+    /// the cache at load); an MLX model's weights and the margin (MLX grows
+    /// the cache as the context fills). `None` when the architecture could
+    /// not be read: the size-based estimate is a guess, never a refusal.
+    pub commitment: Option<u64>,
+    /// What it can grow to with its whole context filled: the ledger's
+    /// potential, [`ArchWithSizeFallback`]'s figure.
+    pub potential: u64,
+}
+
+/// (#3514) Prices a load both ways: the commitment a refusal may rest on,
+/// and the potential eviction and wave packing aim for.
+pub struct LoadPricer {
+    estimator: ArchWithSizeFallback,
+    kv_at_load: std::collections::BTreeSet<String>,
+}
+
+impl LoadPricer {
+    pub fn new(arch: ModelArch) -> Self {
+        LoadPricer { estimator: ArchWithSizeFallback::new(arch.facts), kv_at_load: arch.kv_at_load }
+    }
+
+    /// `None` when the model cannot be priced at all.
+    pub fn figures(&self, model_key: &str, min_ctx: u32, catalog: Option<&[CatalogFact]>) -> Option<LoadFigures> {
+        let (potential, source) = self.estimator.estimate_with_source(model_key, min_ctx, catalog)?;
+        let weights = || catalog?.iter().find(|c| c.model_key == model_key)?.size_bytes;
+        let commitment = match source {
+            PotentialSource::Arch if self.kv_at_load.contains(model_key) => Some(potential),
+            PotentialSource::Arch => weights().map(|w| w + darkmux_gestalt::DEFAULT_TRANSIENT_MARGIN_BYTES),
+            PotentialSource::Estimated | PotentialSource::Unknown => None,
+        };
+        Some(LoadFigures { commitment, potential })
+    }
 }
 
 /// `ArchFactsRaw` → gestalt [`ArchFacts`] with the v1 KV dtype width. NOT a
@@ -2013,6 +2076,23 @@ fn parse_worker_rss(ps_out: &str) -> Vec<WorkerProc> {
             Some(WorkerProc { pid, rss_bytes: rss_kib * 1024, footprint_bytes: None })
         })
         .collect()
+}
+
+/// (#3514) LM Studio's inference workers' memory now: the sum of their
+/// `phys_footprint`, never RSS (a server's RSS can read 0.1 GiB against a
+/// 24 GB footprint). `None` when `ps` or any worker's footprint cannot be
+/// read. Other apps and engine servers never move it.
+pub fn lmstudio_workers_footprint() -> Option<u64> {
+    let out = bounded_stdout("ps", &["-axo", "pid=,rss=,command="], "ps-workers", SYS_PROBE_BOUND, &mut Vec::new())?;
+    workers_footprint(&enrich_with_footprint(parse_worker_rss(&out), |pid| {
+        u32::try_from(pid).ok().and_then(|p| darkmux_platform::current().process_footprint(p))
+    }))
+}
+
+/// The sum of `workers`' footprints; `None` when any is unknown. No worker
+/// at all is 0: LM Studio holds no model yet.
+fn workers_footprint(workers: &[WorkerProc]) -> Option<u64> {
+    workers.iter().map(|w| w.footprint_bytes).sum()
 }
 
 /// Fills each worker's `footprint_bytes` from `probe`.
@@ -3554,6 +3634,78 @@ esac
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// (#3508) A load is priced from the model `lms ls` locates: its own
+    /// `config.json` under LM Studio's models root, read for each key asked
+    /// (a key no reader can answer is left out, for the size fallback). The
+    /// estimator then prices it with the KV term, as the ledger prices a
+    /// resident.
+    #[test]
+    #[serial_test::serial]
+    fn a_load_is_priced_from_the_architecture_lms_ls_locates() {
+        let home = tempfile::tempdir().unwrap();
+        write_fixture_config_json(&home.path().join(".lmstudio/models/org/m-4bit"), 32, 8, 128);
+        let prev = std::env::var_os("HOME");
+        // SAFETY: #[serial]; restored below.
+        unsafe { std::env::set_var("HOME", home.path()) };
+        let rows = [serde_json::json!({"modelKey": "m", "path": "org/m-4bit", "sizeBytes": 4_000_000_000u64})];
+        let arch = arch_facts_for(&rows, &["m", "absent"]).facts;
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        assert_eq!(arch.keys().collect::<Vec<_>>(), ["m"], "only the model on disk is read");
+        assert_eq!((arch["m"].total_layers, arch["m"].kv_heads, arch["m"].head_dim), (32, 8, 128));
+        let catalog = [CatalogFact { model_key: "m".into(), size_bytes: Some(4_000_000_000) }];
+        let est = ArchWithSizeFallback::new(arch);
+        let short = est.estimate_bytes("m", 4_096, Some(&catalog)).unwrap();
+        let long = est.estimate_bytes("m", 65_536, Some(&catalog)).unwrap();
+        assert!(short > 4_000_000_000, "weights plus KV and margin: {short}");
+        assert_eq!(long - short, 32 * 8 * 128 * 2 * 2 * (65_536 - 4_096), "the KV term grows with the context, per the architecture");
+    }
+
+    /// (#3514) The workers' footprint is their phys_footprint sum, never
+    /// RSS, and unknown when any worker's is.
+    #[test]
+    fn lm_studio_workers_footprint_sums_phys_footprint_never_rss() {
+        let w = |rss, fp| WorkerProc { pid: 1, rss_bytes: rss, footprint_bytes: fp };
+        assert_eq!(workers_footprint(&[w(100, Some(24_000)), w(5, Some(1_000))]), Some(25_000));
+        assert_eq!(workers_footprint(&[w(100, Some(24_000)), w(5, None)]), None, "one unreadable worker is no figure");
+        assert_eq!(workers_footprint(&[]), Some(0), "no worker holds nothing");
+    }
+
+    /// (#3514) The reader that answered names the format, and the format
+    /// what a load commits: a GGUF model pays its KV cache at load, an MLX
+    /// model (a `config.json`) only its weights, and a model neither reader
+    /// can answer has no commitment at all (its size-based guess is never a
+    /// refusal).
+    #[test]
+    fn a_load_commits_its_cache_only_when_its_weights_are_gguf() {
+        let root = TempTestRoot::new("commitment");
+        write_fixture_config_json(&root.0.join("mlx-model"), 32, 8, 128);
+        let gguf = root.0.join("gguf-model");
+        std::fs::create_dir_all(&gguf).unwrap();
+        std::fs::write(gguf.join("weights.gguf"), tiny_gguf_bytes(32, 32, 8, 4096)).unwrap();
+        let arch = resolve_arch_facts_of(
+            ["mlx-model", "gguf-model", "neither"].into_iter(),
+            &ArchFactsReader::with_root(&root.0),
+            &GgufFactsReader::with_root(&root.0),
+        );
+        assert_eq!(arch.kv_at_load.iter().collect::<Vec<_>>(), ["gguf-model"]);
+        let catalog: Vec<CatalogFact> = ["mlx-model", "gguf-model", "neither"]
+            .iter()
+            .map(|k| CatalogFact { model_key: k.to_string(), size_bytes: Some(4_000_000_000) })
+            .collect();
+        let pricer = LoadPricer::new(arch);
+        let at = |k: &str| pricer.figures(k, 100_000, Some(&catalog)).unwrap();
+        let margin = darkmux_gestalt::DEFAULT_TRANSIENT_MARGIN_BYTES;
+        assert_eq!(at("mlx-model").commitment, Some(4_000_000_000 + margin), "MLX: weights and the margin");
+        assert!(at("mlx-model").potential > 4_000_000_000 + margin, "its potential carries the cache");
+        assert_eq!(at("gguf-model").commitment, Some(at("gguf-model").potential), "GGUF: the cache at load");
+        assert_eq!(at("neither").commitment, None, "a guess commits nothing");
     }
 
     #[test]

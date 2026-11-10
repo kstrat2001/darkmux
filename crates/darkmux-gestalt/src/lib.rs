@@ -55,6 +55,7 @@ pub mod plan;
 pub mod planner;
 pub mod ports;
 pub mod residency;
+pub mod room;
 pub mod waves;
 
 pub use desired::{ingest, DesiredEntry, Placement, Quarantined, QuarantineReason};
@@ -71,8 +72,9 @@ pub use plan::{
     Precondition, Reason, Warning,
 };
 pub use planner::{plan_acquire, plan_release, AcquireOpts, AcquireScope};
-pub use ports::{Deadline, HostError, LoadReport, ModelHost, ProbeError, ResourceProbe};
+pub use ports::{Deadline, HostError, LoadReport, ModelArch, ModelHost, ProbeError, ResourceProbe};
 pub use residency::{decide_residency, ResidencyDecision};
+pub use room::{plan_room, PlanRoom};
 pub use waves::{
     plan_waves, wave_schedule_to_exec_mode, ExecMode, ForceParallelRefused, WaveMode, WaveRefusal,
     WaveSchedule,

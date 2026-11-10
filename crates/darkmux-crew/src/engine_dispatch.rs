@@ -92,7 +92,7 @@ impl std::fmt::Display for EngineRefusal {
 
 impl std::error::Error for EngineRefusal {}
 
-fn refuse(code: &'static str, message: impl Into<String>) -> EngineRefusal {
+pub(crate) fn refuse(code: &'static str, message: impl Into<String>) -> EngineRefusal {
     EngineRefusal { code, message: message.into(), waiting_on: None }
 }
 
@@ -531,7 +531,7 @@ pub(crate) trait Machine {
 /// model reading from disk, and bounds the time a footprint that never
 /// reaches the floor (its margin is never all resident) keeps a phantom
 /// reservation that refuses other starts as `busy`.
-const SETTLE_BOUND: Duration = Duration::from_secs(120);
+pub(crate) const SETTLE_BOUND: Duration = Duration::from_secs(120);
 /// How often the reservation is shrunk to what has not paged in yet.
 const SETTLE_POLL: Duration = Duration::from_millis(500);
 
@@ -558,9 +558,9 @@ pub(crate) fn settle_reservation(
     res.set(0);
 }
 
-struct ThisMachine<'a> {
+pub(crate) struct ThisMachine<'a> {
     /// The registry the dispatch resolved from, for its utility binding.
-    profiles_file: Option<&'a str>,
+    pub(crate) profiles_file: Option<&'a str>,
 }
 
 impl Machine for ThisMachine<'_> {
@@ -827,14 +827,14 @@ fn refuse_engines_own_server(engine: &dyn ServerEngine, dirs: &Dirs, endpoint: &
 
 
 /// One of darkmux's own residents that could be evicted to make room.
-enum Resident {
+pub(crate) enum Resident {
     Server(EngineRecord),
     /// A `darkmux:` load in LM Studio, by identifier.
     Load(String),
 }
 
 impl Resident {
-    fn name(&self) -> String {
+    pub(crate) fn name(&self) -> String {
         match self {
             Resident::Server(r) => format!("{} ({})", r.model, r.endpoint),
             Resident::Load(id) => id.clone(),
@@ -950,7 +950,7 @@ fn make_room(room: &Room<'_>, dirs: &Dirs, bounds: server::Bounds, machine: &dyn
 /// it frees when they finish; otherwise `memory_in_use`, programs darkmux
 /// did not start hold it. Both are retryable: `wont_fit` is only for a
 /// model larger than the machine.
-fn short_of_memory(need: u64, free: u64, held: &[String], reserved: u64) -> EngineRefusal {
+pub(crate) fn short_of_memory(need: u64, free: u64, held: &[String], reserved: u64) -> EngineRefusal {
     let gib = |b: u64| b as f64 / f64::from(1u32 << 30);
     let short = format!(
         "the model needs {:.1} GiB and {:.1} GiB is free after evicting every idle darkmux resident",
@@ -985,7 +985,7 @@ fn served_name_of(rec: &EngineRecord) -> String {
 /// darkmux's own residents other than `endpoint`'s server: the idle ones,
 /// in eviction order (last is evicted first), and the names of those a
 /// running dispatch holds.
-fn darkmux_residents(dirs: &Dirs, endpoint: &str, leased: &[String], lms: Vec<String>) -> (Vec<Resident>, Vec<String>) {
+pub(crate) fn darkmux_residents(dirs: &Dirs, endpoint: &str, leased: &[String], lms: Vec<String>) -> (Vec<Resident>, Vec<String>) {
     let (mut idle, mut held) = (Vec::new(), Vec::new());
     let mut servers: Vec<EngineRecord> = engine_record::list_in(&dirs.records)
         .0
@@ -1014,7 +1014,7 @@ fn darkmux_residents(dirs: &Dirs, endpoint: &str, leased: &[String], lms: Vec<St
 /// Evict `resident` unless a running dispatch holds it now: `Ok(false)`
 /// when held. A server's lease is read under its endpoint's lock, where it
 /// is stopped; a load's right before its unload.
-fn evict(resident: &Resident, dirs: &Dirs, bounds: server::Bounds, machine: &dyn Machine, lease: &LeaseGuard) -> Result<bool, EngineRefusal> {
+pub(crate) fn evict(resident: &Resident, dirs: &Dirs, bounds: server::Bounds, machine: &dyn Machine, lease: &LeaseGuard) -> Result<bool, EngineRefusal> {
     match resident {
         Resident::Server(r) => {
             let held = |r: &EngineRecord| held_now(machine, lease).contains(&served_name_of(r));
