@@ -1300,6 +1300,7 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
     let result = match fleet::dispatch_routed_via(opts, crew::dispatch_as_crew_of_one::dispatch_as_crew_of_one) {
         Ok(r) => r,
         Err(e) => {
+            print_refusal_envelope(json, &e);
             // (#2462) `dispatch_as_crew_of_one::dispatch` already finalizes
             // the crew-of-one mission (`finalize`/`reconcile_on_error`) to a
             // terminal status BEFORE returning this `Err` — the terminal
@@ -1348,6 +1349,34 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         eprint!("{}", result.stderr);
     }
     Ok(result.exit_code)
+}
+
+/// (#3505) A refused dispatch's `--json` caller reads its code on stdout;
+/// the error itself still goes to stderr and the exit code. Nothing for any
+/// other failure, or without `--json`. The dispatch's own error is what the
+/// caller returns, so a failure to print the envelope is said, not raised.
+fn print_refusal_envelope(json: bool, e: &anyhow::Error) {
+    let Some(code) = refused_dispatch_code(e).filter(|_| json) else { return };
+    if let Err(printing) = cli_json::emit(&crew::dispatch_envelope::DispatchRefusedEnvelope::new(code, format!("{e:#}"))) {
+        eprintln!("darkmux dispatch: could not print the refusal envelope: {printing:#}");
+    }
+}
+
+/// (#3505) The stable code of a dispatch refused before its role ran, from
+/// the one reading `dispatch.error` takes (`engine_dispatch::refusal_code`):
+/// this machine's refusal, or, for a `profile@machine` job, the code the
+/// receiver's `error` reply carried, or `busy` for a seat the receiver
+/// refused as busy (its queue full, or `fleet.busy_policy` `refuse`).
+fn refused_dispatch_code(e: &anyhow::Error) -> Option<String> {
+    if let Some(code) = crew::engine_dispatch::refusal_code(e) {
+        return Some(code.to_string());
+    }
+    e.chain().find_map(|c| {
+        if let Some(failed) = c.downcast_ref::<fleet::DispatchFailed>() {
+            return failed.code.clone();
+        }
+        c.downcast_ref::<fleet::SubmitRefused>().filter(|r| r.code == fleet::RefusalCode::Busy).map(|_| "busy".to_string())
+    })
 }
 
 /// The line `dispatch` prints naming the role execution it ran: its
@@ -2229,6 +2258,33 @@ fn model_ctx_label(m: &types::ProfileModel, registry: &darkmux_types::ProfileReg
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (#3505) A refused dispatch's code is read off its error wherever it
+    /// came from: this machine's refusal (through context, and through a
+    /// crew-of-one run's error), a receiver's `error` reply, or a seat the
+    /// receiver refused as busy; any other failure has none.
+    #[test]
+    fn a_refused_dispatchs_code_is_read_off_its_error() {
+        let local = anyhow::Error::from(crew::engine_dispatch::EngineRefusal {
+            code: "memory_in_use",
+            message: "no".into(),
+            waiting_on: None,
+        })
+        .context("making the model resident");
+        assert_eq!(refused_dispatch_code(&local).as_deref(), Some("memory_in_use"));
+        let run = anyhow::Error::from(crew::engine_dispatch::RefusedRun { code: "wont_fit", text: "step `s`: no".into() });
+        assert_eq!(refused_dispatch_code(&run).as_deref(), Some("wont_fit"));
+        let remote = anyhow::Error::from(fleet::DispatchFailed { code: Some("busy".into()), reason: "studio: no".into() });
+        assert_eq!(refused_dispatch_code(&remote).as_deref(), Some("busy"));
+        let seat = anyhow::Error::from(fleet::SubmitRefused { code: fleet::RefusalCode::Busy, reason: "busy".into() });
+        assert_eq!(refused_dispatch_code(&seat).as_deref(), Some("busy"));
+        let scope = anyhow::Error::from(fleet::SubmitRefused { code: fleet::RefusalCode::NotListed, reason: "no".into() });
+        assert_eq!(refused_dispatch_code(&scope), None, "a fleet refusal of another kind is no dispatch code");
+        assert_eq!(refused_dispatch_code(&anyhow::anyhow!("docker exited 125")), None);
+        let printed = cli_json::render(&crew::dispatch_envelope::DispatchRefusedEnvelope::new("busy", "darkmux dispatch: no")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&printed).unwrap();
+        assert_eq!(v, serde_json::json!({"result": "refused", "code": "busy", "error": "darkmux dispatch: no"}));
+    }
 
     /// (#3287) A peer's status body: `lms_unreachable` defaults to false, the
     /// residents parse, and a body with no list, or one this darkmux does not

@@ -3829,6 +3829,24 @@ S(("127.0.0.1", port), H).serve_forever()
         assert_eq!(records[1]["level"], "error", "{}", records[1]);
     }
 
+    /// (#3504) The terminal of a dispatch that made no model resident: a
+    /// refusal carries its code (a queued wait that timed out is `busy`),
+    /// and a queued wait its run's stop ended is a `dispatch.error` with no
+    /// code (the stop is named by its own rule), never a refusal.
+    #[test]
+    fn a_dispatch_whose_wait_was_stopped_ends_in_dispatch_error_with_no_code() {
+        use crate::engine_dispatch::{EngineRefusal, NotResident};
+        let code_of = |nr: &NotResident| match refusal_terminal(nr, 5, None, None) {
+            darkmux_flow::Payload::DispatchError(p) => (p.code, p.error),
+            other => panic!("not a dispatch.error: {other:?}"),
+        };
+        let timed_out = NotResident::Refused(EngineRefusal { code: "busy", message: "still busy".into(), waiting_on: None });
+        assert_eq!(code_of(&timed_out), (Some("busy".into()), Some("still busy".into())));
+        let stopped = NotResident::Stopped("stopped waiting".into());
+        assert_eq!(code_of(&stopped), (None, Some("stopped waiting".into())));
+        assert_eq!(crate::engine_dispatch::refusal_code(&stopped.into_error()), None);
+    }
+
     /// (#3448 PR 4 review) The container path names the model the way the
     /// server answers to it: `darkmux:<id>` on a Tensorfold endpoint.
     #[test]
@@ -11280,6 +11298,231 @@ S(("127.0.0.1", port), H).serve_forever()
             version: "3.5.0".into(),
             image_id: None,
         });
+    }
+
+    // ─── (#3410) concurrent first runs share one cache dir ───────────────
+
+    /// The bytes the fake `docker cp` writes, in three appends with a pause
+    /// between each, so two writers sharing one temp file interleave.
+    const FAKE_RUNTIME_BYTES: &str = "#!/bin/sh\n# fake darkmux-runtime\nexit 0\n";
+
+    /// A fake `docker` on `PATH` that extracts [`FAKE_RUNTIME_BYTES`] slowly
+    /// and logs one line per `docker create` to `<dir>/creates`. Returns the
+    /// creates log and the previous `PATH`.
+    fn install_slow_extracting_docker(dir: &TempDir) -> (std::path::PathBuf, Option<String>) {
+        install_extracting_docker(dir, "")
+    }
+
+    /// [`install_slow_extracting_docker`] with `override_case` (a shell `case`
+    /// arm, or empty) matched first, to make one subcommand fail.
+    fn install_extracting_docker(dir: &TempDir, override_case: &str) -> (std::path::PathBuf, Option<String>) {
+        let creates = dir.path().join("creates");
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n\
+             {override_case}\n\
+             image) echo sha256:fake ;;\n\
+             create) echo x >> {creates}; echo cid-$$ ;;\n\
+             cp) printf '#!/bin/sh\\n' > \"$3\"; sleep 0.03; \
+             printf '# fake darkmux-runtime\\n' >> \"$3\"; sleep 0.03; \
+             printf 'exit 0\\n' >> \"$3\" ;;\n\
+             esac\n",
+            creates = creates.display(),
+        );
+        let path = dir.path().join("docker");
+        std::fs::write(&path, script).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::process::Command::new(&path).arg("warm-up").status().unwrap();
+        let prev = std::env::var("PATH").ok();
+        // SAFETY: every caller is `#[serial]`.
+        unsafe { std::env::set_var("PATH", format!("{}:{}", dir.path().display(), prev.clone().unwrap_or_default())) };
+        (creates, prev)
+    }
+
+    /// Runs `threads` extractions into one empty cache dir at once and
+    /// returns each one's result, rendered.
+    fn extract_concurrently(cache: &std::path::Path, threads: usize) -> Vec<std::result::Result<PathBuf, String>> {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(threads));
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let cache = cache.to_path_buf();
+                thread::spawn(move || {
+                    barrier.wait();
+                    ensure_runtime_binary_cached_at(&cache, "darkmux-runtime:test", "9.9.9").map_err(|e| format!("{e:#}"))
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    }
+
+    /// Three `lab run` queues started at once in a fresh home: one died with
+    /// `chmod extracted runtime binary …partial: No such file or directory`,
+    /// because every extraction wrote the same fixed temp name and one
+    /// renamed it away under another. Every concurrent first run must
+    /// succeed, and what ends up published and stamped must be one whole,
+    /// executable copy, with no temp file left behind.
+    #[test]
+    #[serial]
+    fn concurrent_first_runs_all_get_one_whole_stamped_runtime_binary() {
+        let shim = TempDir::new().unwrap();
+        let (_creates, prev_path) = install_slow_extracting_docker(&shim);
+        let mut failures = Vec::new();
+        for round in 0..5 {
+            let cache = TempDir::new().unwrap();
+            for (i, r) in extract_concurrently(cache.path(), 6).into_iter().enumerate() {
+                match r {
+                    Ok(p) if p == cache.path().join(RUNTIME_BINARY_NAME) => {}
+                    other => failures.push(format!("round {round} thread {i}: {other:?}")),
+                }
+            }
+            let (binary, _) = runtime_binary_cache_paths_at(cache.path());
+            let bytes = std::fs::read_to_string(&binary).unwrap_or_default();
+            if bytes != FAKE_RUNTIME_BYTES {
+                failures.push(format!("round {round}: published binary is not one whole copy: {bytes:?}"));
+            }
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&binary).map(|m| m.permissions().mode() & 0o777).unwrap_or(0);
+                if mode != 0o755 {
+                    failures.push(format!("round {round}: published binary mode {mode:o}"));
+                }
+            }
+            let stamp = crate::dispatch_internal::cached_runtime_binary_stamp_at(cache.path());
+            let want = crate::dispatch_internal::RuntimeBinaryStamp { version: "9.9.9".into(), image_id: Some("sha256:fake".into()) };
+            if stamp.as_ref() != Some(&want) {
+                failures.push(format!("round {round}: stamp {stamp:?}"));
+            }
+            let mut left: Vec<String> = std::fs::read_dir(cache.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| n != RUNTIME_BINARY_NAME && n != RUNTIME_BINARY_STAMP && n != RUNTIME_BINARY_LOCK)
+                .collect();
+            left.sort();
+            if !left.is_empty() {
+                failures.push(format!("round {round}: left behind {left:?}"));
+            }
+        }
+        restore_path(prev_path);
+        assert!(failures.is_empty(), "{} problem(s):\n{}", failures.len(), failures.join("\n"));
+    }
+
+    /// The runs that lose the race wait for the winner and then find a
+    /// current, stamped binary, so they reuse it rather than extract again.
+    /// One extraction per cold cache also means no run ever stamps a binary
+    /// another run published.
+    #[test]
+    #[serial]
+    fn concurrent_first_runs_extract_the_runtime_binary_once() {
+        let shim = TempDir::new().unwrap();
+        let (creates, prev_path) = install_slow_extracting_docker(&shim);
+        let cache = TempDir::new().unwrap();
+        let results = extract_concurrently(cache.path(), 6);
+        restore_path(prev_path);
+        assert!(results.iter().all(|r| r.is_ok()), "{results:?}");
+        let n = std::fs::read_to_string(&creates).unwrap_or_default().lines().count();
+        assert_eq!(n, 1, "six concurrent first runs ran `docker create` {n} times");
+    }
+
+    /// A temp name is unique per call, so a crash mid-copy would leave its
+    /// file forever unless the next extraction sweeps it. A file that only
+    /// shares the old fixed name's stem is not ours to remove (a pre-fix
+    /// darkmux may be writing it).
+    #[test]
+    #[serial]
+    fn an_extraction_sweeps_the_temp_files_a_crashed_one_left() {
+        let shim = TempDir::new().unwrap();
+        let (_creates, prev_path) = install_slow_extracting_docker(&shim);
+        let cache = TempDir::new().unwrap();
+        let orphan = cache.path().join(".darkmux-runtime.tmp.1.0");
+        std::fs::write(&orphan, "half a binary").unwrap();
+        std::fs::write(cache.path().join("darkmux-runtime.partial"), "a pre-fix writer's").unwrap();
+        let got = ensure_runtime_binary_cached_at(cache.path(), "darkmux-runtime:test", "9.9.9");
+        restore_path(prev_path);
+        got.unwrap();
+        assert!(!orphan.exists(), "the crashed extraction's temp file is swept");
+        assert!(cache.path().join("darkmux-runtime.partial").exists());
+    }
+
+    /// A publish that fails (here: a directory sits at the binary's name)
+    /// removes its own temp file rather than leaving a binary-sized orphan.
+    #[test]
+    #[serial]
+    fn a_failed_publish_leaves_no_temp_file() {
+        let shim = TempDir::new().unwrap();
+        let (_creates, prev_path) = install_slow_extracting_docker(&shim);
+        let cache = TempDir::new().unwrap();
+        std::fs::create_dir_all(cache.path().join(RUNTIME_BINARY_NAME).join("occupied")).unwrap();
+        let got = ensure_runtime_binary_cached_at(cache.path(), "darkmux-runtime:test", "9.9.9");
+        restore_path(prev_path);
+        let err = got.expect_err("a directory at the binary's name cannot be renamed over");
+        assert!(format!("{err:#}").contains("publishing runtime binary"), "{err:#}");
+        let temps: Vec<_> = std::fs::read_dir(cache.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".darkmux-runtime.tmp."))
+            .collect();
+        assert!(temps.is_empty(), "{temps:?}");
+    }
+
+    /// Runs one extraction into a fresh cache dir against a `docker` whose
+    /// `override_case` arm fails, and returns the error plus the dir's
+    /// entries afterward.
+    fn failed_extraction(override_case: &str) -> (String, Vec<String>) {
+        let shim = TempDir::new().unwrap();
+        let (_creates, prev_path) = install_extracting_docker(&shim, override_case);
+        let cache = TempDir::new().unwrap();
+        let got = ensure_runtime_binary_cached_at(cache.path(), "darkmux-runtime:test", "9.9.9");
+        restore_path(prev_path);
+        let err = format!("{:#}", got.expect_err("the extraction must fail"));
+        let mut left: Vec<String> = std::fs::read_dir(cache.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != RUNTIME_BINARY_LOCK)
+            .collect();
+        left.sort();
+        (err, left)
+    }
+
+    /// A failed `docker create` names the image and docker's own error, and
+    /// publishes nothing.
+    #[test]
+    #[serial]
+    fn a_failed_docker_create_names_the_image_and_publishes_nothing() {
+        let (err, left) = failed_extraction("create) echo 'no such image' >&2; exit 1 ;;");
+        assert!(err.contains("docker create darkmux-runtime:test failed") && err.contains("no such image"), "{err}");
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// An empty container id leaves nothing to `docker rm`, so it is refused.
+    #[test]
+    #[serial]
+    fn an_empty_container_id_is_refused() {
+        let (err, left) = failed_extraction("create) ;;");
+        assert!(err.contains("empty container id"), "{err}");
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// A `docker cp` that fails partway removes its own partial copy and
+    /// publishes nothing.
+    #[test]
+    #[serial]
+    fn a_failed_docker_cp_leaves_no_partial_copy() {
+        let (err, left) = failed_extraction("cp) printf 'half' > \"$3\"; echo 'disk full' >&2; exit 1 ;;");
+        assert!(err.contains("docker cp of the runtime binary failed") && err.contains("disk full"), "{err}");
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// Two extractions in one process never share a temp path.
+    #[test]
+    fn each_extraction_gets_its_own_temp_path() {
+        let dir = std::path::Path::new("/cache");
+        let a = crate::dispatch_internal::runtime_binary_temp_path(dir);
+        let b = crate::dispatch_internal::runtime_binary_temp_path(dir);
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), Some(dir), "same directory, so the publish is one rename");
     }
 
     /// (#2386 C8) `doctor` needs to tell "nothing cached" apart from "a

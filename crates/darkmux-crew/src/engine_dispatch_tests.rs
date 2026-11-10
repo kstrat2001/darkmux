@@ -26,6 +26,9 @@ import json, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 a = sys.argv[1:]
 port = int(a[a.index("--port") + 1]); name = a[a.index("--name") + 1]
+if "--slide" in a:
+    # A slow start: the server answers 1.5 s after it is spawned.
+    import time; time.sleep(1.5)
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
         body = json.dumps({"object": "list", "data": [{"id": name}]}).encode()
@@ -85,6 +88,8 @@ struct FakeMachine {
     leased: Vec<String>,
     /// The machine's memory; `None` = unknown.
     capacity: Option<u64>,
+    /// The standing utility binding (#3507).
+    utility: Option<String>,
 }
 
 impl Machine for FakeMachine {
@@ -110,6 +115,9 @@ impl Machine for FakeMachine {
     }
     fn capacity(&self) -> Option<u64> {
         self.capacity
+    }
+    fn utility(&self) -> Option<String> {
+        self.utility.clone()
     }
 }
 
@@ -226,7 +234,7 @@ fn room_is_made_from_darkmuxs_idle_residents_only() {
 /// memory that would free later, `wont_fit` when nothing would.
 #[test]
 #[serial_test::serial]
-fn nothing_left_to_free_is_busy_or_wont_fit() {
+fn nothing_left_to_free_is_busy_or_memory_in_use_and_only_a_model_larger_than_the_machine_wont_fit() {
     let r = rig();
     let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 100.0).to_string_lossy().into_owned());
     let held = FakeMachine {
@@ -240,12 +248,49 @@ fn nothing_left_to_free_is_busy_or_wont_fit() {
         .expect("refused");
     assert_eq!(err.code, "busy");
     assert!(err.message.contains("darkmux:held"), "{err}");
-    let alone = FakeMachine { reclaimable: RefCell::new(Some(8 * GIB)), ..Default::default() };
+    // (#3510) Programs darkmux did not start hold the memory on a machine
+    // the model fits: retryable, never `wont_fit`.
+    let alone = FakeMachine { reclaimable: RefCell::new(Some(8 * GIB)), capacity: Some(128 * GIB), ..Default::default() };
     let err = prepare_in(&target("TensorFold/m", free_port()), &r.dirs, &tf, quick(), &alone, &mut |_, _| {})
         .err()
         .expect("refused");
-    assert_eq!(err.code, "wont_fit");
-    assert!(err.message.contains("100.0 GiB"), "{err}");
+    assert_eq!(err.code, "memory_in_use", "{err}");
+    assert!(err.message.contains("100.0 GiB") && err.message.contains("did not start"), "{err}");
+    // Only a model larger than the whole machine is `wont_fit`, and that is
+    // decided before free memory is read: unread, it still says so.
+    let small = FakeMachine { capacity: Some(64 * GIB), ..Default::default() };
+    let err = prepare_in(&target("TensorFold/m", free_port()), &r.dirs, &tf, quick(), &small, &mut |_, _| {})
+        .err()
+        .expect("refused");
+    assert_eq!(err.code, "wont_fit", "{err}");
+    assert!(err.message.contains("64.0 GiB in all"), "{err}");
+}
+
+/// (#3510) A figure darkmux cannot read never lets a start through: no free
+/// reading (on a machine the model fits) and no need figure both refuse,
+/// naming what is missing, and nothing is started.
+#[test]
+#[serial_test::serial]
+fn a_missing_memory_figure_refuses_rather_than_starting_blind() {
+    let r = rig();
+    let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 2.0).to_string_lossy().into_owned());
+    let unread = FakeMachine { capacity: Some(128 * GIB), ..Default::default() };
+    let err = prepare_in(&target("TensorFold/m", free_port()), &r.dirs, &tf, quick(), &unread, &mut |_, _| {})
+        .err()
+        .expect("refused");
+    assert_eq!(err.code, "model_start_failed", "{err}");
+    assert!(err.message.contains("free memory"), "{err}");
+    let rec = fake_rec(r.dir.path(), "0.1.0");
+    let bare = r.dir.path().join("share/rec/models/bb22");
+    std::fs::create_dir_all(&bare).unwrap();
+    std::fs::write(bare.join("flint-bare.json"), "{}").unwrap();
+    let roomy = FakeMachine { reclaimable: RefCell::new(Some(64 * GIB)), ..Default::default() };
+    let err = prepare_in(&flint_target("flint-bare", free_port()), &r.dirs, &rec, quick(), &roomy, &mut |_, _| {})
+        .err()
+        .expect("refused");
+    assert_eq!(err.code, "model_start_failed", "{err}");
+    assert!(err.message.contains("no memory figure"), "{err}");
+    assert!(engine_record::list_in(&r.dirs.records).0.is_empty(), "nothing started");
 }
 
 /// A refusal's code is readable back off the dispatch's error.
@@ -423,7 +468,7 @@ fn this_machine_counts_a_sibling_dispatch_in_the_same_process() {
     let sibling = LeaseGuard::acquire();
     sibling.write(&["darkmux:sibling".to_string()]).unwrap();
     let own = LeaseGuard::acquire();
-    let leased = ThisMachine.leased(&own);
+    let leased = ThisMachine { profiles_file: None }.leased(&own);
     drop(sibling);
     unsafe {
         match prev {
@@ -774,46 +819,30 @@ fn every_dispatch_refusal_code_is_a_client_code() {
 
 // ─── Concurrent dispatches on one endpoint ──────────────────────────────────
 
-/// A machine on which another dispatch runs its whole `prepare` between this
-/// dispatch's first look at the endpoint and its start: the first lease read
-/// starts `other` (keeping it running) and still answers with the world
-/// before it, nothing leased; every later read sees `other`'s lease, `held`.
-struct Interleaved<'a> {
-    other: &'a dyn Fn() -> EngineReady,
-    held: String,
-    running: RefCell<Option<EngineReady>>,
-    reads: RefCell<u32>,
+/// Start `target`'s server on `engine` with no lease and no residency lock.
+fn start_unlocked(engine: &dyn ServerEngine, target: &crate::target::Target, dirs: &Dirs) -> EngineRecord {
+    let endpoint = target.endpoint.named_id().unwrap().to_string();
+    let spec = engine.plan(&endpoint, target.endpoint.port.unwrap(), &target.model).unwrap();
+    server::ensure(&spec, dirs, quick(), &|_| false, &mut |_| {}).unwrap().record().clone()
 }
 
-impl Machine for Interleaved<'_> {
-    fn reclaimable(&self) -> Option<u64> {
-        Some(64 * GIB)
-    }
-    fn footprint(&self, _pid: u32) -> Option<u64> {
-        None
-    }
-    fn lmstudio_residents(&self) -> Vec<String> {
-        Vec::new()
-    }
-    fn lmstudio_unload(&self, _id: &str) -> anyhow::Result<()> {
-        Ok(())
-    }
-    fn leased(&self, _own: &LeaseGuard) -> Vec<String> {
-        *self.reads.borrow_mut() += 1;
-        if *self.reads.borrow() == 1 {
-            *self.running.borrow_mut() = Some((self.other)());
-            return Vec::new();
-        }
-        vec![self.held.clone()]
-    }
-    fn capacity(&self) -> Option<u64> {
-        None
-    }
+/// Run `b` on its own thread once it has taken its first look at the
+/// endpoint (cold) and is waiting for the residency lock, while `a` starts
+/// another server there in between, as a starter that takes no residency
+/// lock would (another darkmux's LM Studio path, an older darkmux). Returns
+/// what `a` started and `b`'s outcome.
+fn interleave<T: Send + 'static>(a: impl FnOnce() -> EngineRecord, b: impl FnOnce() -> T + Send + 'static) -> (EngineRecord, T) {
+    let lock = darkmux_types::residency_lock::acquire().unwrap();
+    let b = std::thread::spawn(b);
+    std::thread::sleep(Duration::from_millis(300));
+    let started = a();
+    drop(lock);
+    (started, b.join().unwrap())
 }
 
 /// Two dispatches on one Tensorfold endpoint, another model each: A starts
 /// its server while B is between its first look (nothing there) and its own
-/// start. B must find A's server held under the endpoint's lock and refuse
+/// start. B decides again under its locks, finds A's server held, and is
 /// `busy`; A's server is never stopped or replaced under it.
 #[test]
 #[serial_test::serial]
@@ -821,15 +850,17 @@ fn a_dispatch_racing_another_on_its_endpoint_never_replaces_the_server_the_other
     let r = rig();
     let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 2.0).to_string_lossy().into_owned());
     let port = free_port();
-    let roomy = FakeMachine { reclaimable: RefCell::new(Some(64 * GIB)), ..Default::default() };
-    let start_a = || prepare_in(&target("TensorFold/a", port), &r.dirs, &tf, quick(), &roomy, &mut |_, _| {}).unwrap();
-    let race = Interleaved { other: &start_a, held: "darkmux:TensorFold/a".into(), running: RefCell::new(None), reads: RefCell::new(0) };
-    let b = prepare_in(&target("TensorFold/b", port), &r.dirs, &tf, quick(), &race, &mut |_, _| {});
-    let a = race.running.borrow().as_ref().map(|a| a.record.clone()).expect("A started in between");
+    let (tf_b, dirs) = (tf.clone(), r.dirs.clone());
+    let (a, b) = interleave(
+        || start_unlocked(&tf, &target("TensorFold/a", port), &r.dirs),
+        move || {
+            let held = FakeMachine { reclaimable: RefCell::new(Some(64 * GIB)), leased: vec!["darkmux:TensorFold/a".into()], ..Default::default() };
+            prepare_in(&target("TensorFold/b", port), &dirs, &tf_b, quick(), &held, &mut |_, _| {}).map(|_| ()).map_err(|e| e.code)
+        },
+    );
     assert!(server::alive(&a), "A's server is untouched");
     assert_eq!(server::running(&r.dirs, "tf").map(|r| r.model), Some("TensorFold/a".to_string()), "A's model still serves");
-    let err = b.err().expect("B refused");
-    assert_eq!(err.code, "busy", "{err}");
+    assert_eq!(b, Err("busy"));
 }
 
 /// The same race on rec's Flint, where every server answers `flint`: had B
@@ -844,16 +875,19 @@ fn a_flint_dispatch_racing_another_never_gets_the_other_answered_by_its_model() 
     let int8 = r.dir.path().join("share/rec/models/aa11");
     std::fs::create_dir_all(&int8).unwrap();
     std::fs::write(int8.join("flint-int8.json"), "{}").unwrap();
+    std::fs::write(int8.join("model-00000.safetensors"), vec![0u8; 1024]).unwrap();
     let port = free_port();
-    let roomy = FakeMachine { reclaimable: RefCell::new(Some(64 * GIB)), ..Default::default() };
-    let start_a = || prepare_in(&flint_target("flint-int4", port), &r.dirs, &rec, quick(), &roomy, &mut |_, _| {}).unwrap();
-    let race = Interleaved { other: &start_a, held: "flint".into(), running: RefCell::new(None), reads: RefCell::new(0) };
-    let b = prepare_in(&flint_target("flint-int8", port), &r.dirs, &rec, quick(), &race, &mut |_, _| {});
-    let a = race.running.borrow().as_ref().map(|a| a.record.clone()).expect("A started in between");
+    let (rec_b, dirs) = (rec.clone(), r.dirs.clone());
+    let (a, b) = interleave(
+        || start_unlocked(&rec, &flint_target("flint-int4", port), &r.dirs),
+        move || {
+            let held = FakeMachine { reclaimable: RefCell::new(Some(64 * GIB)), leased: vec!["flint".into()], ..Default::default() };
+            prepare_in(&flint_target("flint-int8", port), &dirs, &rec_b, quick(), &held, &mut |_, _| {}).map(|_| ()).map_err(|e| e.code)
+        },
+    );
     assert!(server::alive(&a), "A's server is untouched");
     assert_eq!(server::running(&r.dirs, "fl").map(|r| r.model), Some("flint-int4".to_string()), "A's revision still serves");
-    let err = b.err().expect("B refused");
-    assert_eq!(err.code, "busy", "{err}");
+    assert_eq!(b, Err("busy"));
 }
 
 /// Send `sig` (`STOP`, `CONT`) to `pid`.
@@ -1023,3 +1057,524 @@ fn a_lease_that_cannot_be_written_refuses_the_dispatch() {
     assert!(engine_record::list_in(&r.dirs.records).0.is_empty(), "nothing started");
 }
 
+
+// ─── A busy dispatch follows fleet.busy_policy (#3504) ──────────────────────
+
+use crate::budget::tests::{solo_caller, FakeEnv};
+
+fn wait_as(policy: BusyPolicy, bound_secs: Option<u64>) -> BusyWait<'static> {
+    BusyWait { policy, bound: bound_secs.map(Duration::from_secs), caller: solo_caller() }
+}
+
+fn tf_base() -> DispatchModelPayload {
+    DispatchModelPayload { engine: "tensorfold".into(), endpoint: "tf".into(), model: "TensorFold/b".into(), ..Default::default() }
+}
+
+/// An attempt that is `busy` for its first `n` tries, then succeeds; counts
+/// every try.
+fn busy_for(n: u32, tries: &std::cell::Cell<u32>) -> impl FnMut(&mut dyn FnMut(Note, DispatchModelPayload)) -> Result<(), EngineRefusal> + '_ {
+    move |_| {
+        tries.set(tries.get() + 1);
+        if tries.get() <= n {
+            Err(busy("endpoint `tf` is serving `TensorFold/a` for a running dispatch".into(), "retry when it finishes"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Under `refuse` (the default) a busy dispatch is answered at once, exactly
+/// as before: one try, no sleep, no line, no record.
+#[test]
+fn under_refuse_a_busy_dispatch_is_answered_at_once() {
+    let env = FakeEnv::new(Vec::new());
+    let tries = std::cell::Cell::new(0);
+    let mut notes = Vec::new();
+    let err = wait_while_busy(&wait_as(BusyPolicy::Refuse, Some(600)), &env, &tf_base(), &mut busy_for(u32::MAX, &tries), &mut |n, _| notes.push(n))
+        .unwrap_err();
+    assert_eq!(err.code(), Some("busy"));
+    assert!(err.message().contains("retry when it finishes"), "{}", err.message());
+    assert_eq!(tries.get(), 1);
+    assert!(notes.is_empty() && env.said().is_empty() && env.paused_total() == 0, "{notes:?} {:?}", env.said());
+}
+
+/// Under `queue` a busy dispatch waits, tries again, and goes on once it is
+/// no longer busy: one `queued` line and `dispatch.queue.wait` record when the
+/// wait starts, a `dispatch.queue.resume` when it ends, and the pause
+/// recorded so the run's wall-clock bound extends.
+#[test]
+fn under_queue_a_busy_dispatch_waits_then_goes_on() {
+    let env = FakeEnv::new(Vec::new());
+    let tries = std::cell::Cell::new(0);
+    let mut notes = Vec::new();
+    wait_while_busy(&wait_as(BusyPolicy::Queue, Some(600)), &env, &tf_base(), &mut busy_for(3, &tries), &mut |n, p| notes.push((n, p)))
+        .unwrap();
+    assert_eq!(tries.get(), 4, "tried again until it was free");
+    let kinds: Vec<Note> = notes.iter().map(|(n, _)| *n).collect();
+    assert_eq!(kinds, [Note::Queued, Note::Resumed]);
+    assert_eq!(notes[0].1.elapsed_ms, Some(0), "the wait's start");
+    assert_eq!(notes[0].1.wait_bound_ms, Some(600_000));
+    assert!(notes[0].1.waiting_on.as_deref().is_some_and(|w| w.contains("TensorFold/a") && !w.contains("retry")), "{:?}", notes[0].1);
+    assert_eq!(notes[1].1.elapsed_ms, Some(15_000), "three 5 s retries");
+    assert_eq!(env.paused_total(), 15_000, "the wait is recorded as pause");
+    let said = env.said();
+    assert!(said[0].contains("queued: endpoint `tf` is serving `TensorFold/a`") && said[0].contains("Ctrl-C"), "{said:?}");
+}
+
+/// The wait is bounded by the dispatch's timeout and ends `busy`, saying so;
+/// while it lasts it says it still waits every 20 s, no oftener.
+#[test]
+fn a_queued_wait_ends_busy_at_the_dispatchs_timeout_saying_so_every_20s() {
+    let env = FakeEnv::new(Vec::new());
+    let tries = std::cell::Cell::new(0);
+    let mut notes = Vec::new();
+    let err = wait_while_busy(&wait_as(BusyPolicy::Queue, Some(60)), &env, &tf_base(), &mut busy_for(u32::MAX, &tries), &mut |n, p| notes.push((n, p)))
+        .unwrap_err();
+    assert_eq!(err.code(), Some("busy"));
+    assert!(err.message().contains("1m 0s, this dispatch's timeout"), "{}", err.message());
+    let at: Vec<Option<u64>> = notes.iter().map(|(_, p)| p.elapsed_ms).collect();
+    assert_eq!(at, [Some(0), Some(20_000), Some(40_000)], "a record at the start and every 20 s");
+    assert!(notes.iter().all(|(n, _)| *n == Note::Queued), "no resume for a wait that timed out");
+    assert_eq!(env.said().len(), 3, "a line with each record");
+    assert_eq!(env.paused_total(), 60_000, "waited exactly its bound");
+    assert_eq!(tries.get(), 13, "a last try at the bound, then no more");
+}
+
+/// A stop (Ctrl-C, a client's cancel, `mission abort`) ends the wait without
+/// trying again: nothing is started or evicted after it, and no code is
+/// written for it.
+#[test]
+fn a_stop_ends_the_wait_without_trying_again() {
+    let env = FakeEnv::new(Vec::new()).stopped_after(7_000, "the run was interrupted");
+    let tries = std::cell::Cell::new(0);
+    let err = wait_while_busy(&wait_as(BusyPolicy::Queue, Some(600)), &env, &tf_base(), &mut busy_for(2, &tries), &mut |_, _| {})
+        .unwrap_err();
+    assert_eq!(err.code(), None, "a stop is not a refusal");
+    assert!(err.message().contains("interrupted") && err.message().contains("nothing was started"), "{}", err.message());
+    assert_eq!(tries.get(), 2, "the try that would have started (the third) never ran");
+}
+
+/// `wont_fit` never waits (no wait can make it fit), nor does any other
+/// refusal: one try, answered at once.
+#[test]
+fn only_busy_waits() {
+    for code in ["wont_fit", "memory_in_use", "model_start_failed", "port_in_use"] {
+        let env = FakeEnv::new(Vec::new());
+        let tries = std::cell::Cell::new(0);
+        let err = wait_while_busy(
+            &wait_as(BusyPolicy::Queue, Some(600)),
+            &env,
+            &tf_base(),
+            &mut |_| -> Result<(), EngineRefusal> {
+                tries.set(tries.get() + 1);
+                Err(refuse(code, "no"))
+            },
+            &mut |_, _| {},
+        )
+        .unwrap_err();
+        assert_eq!((err.code(), tries.get(), env.paused_total()), (Some(code), 1, 0), "{code}");
+    }
+}
+
+/// A machine on which `held` is leased by another dispatch for the first
+/// `until` lease reads, and free after. While it is held, it records
+/// whether `holder` was still alive, and every lease this process counts as
+/// held (a waiter's own must never be among them).
+struct HeldUntil<'a> {
+    held: String,
+    until: u32,
+    reads: RefCell<u32>,
+    holder: &'a EngineRecord,
+    holder_alive_while_held: RefCell<bool>,
+    counted: RefCell<Vec<String>>,
+}
+
+impl Machine for HeldUntil<'_> {
+    fn reclaimable(&self) -> Option<u64> {
+        Some(64 * GIB)
+    }
+    fn footprint(&self, _pid: u32) -> Option<u64> {
+        None
+    }
+    fn lmstudio_residents(&self) -> Vec<String> {
+        Vec::new()
+    }
+    fn lmstudio_unload(&self, _id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn leased(&self, _own: &LeaseGuard) -> Vec<String> {
+        *self.reads.borrow_mut() += 1;
+        if *self.reads.borrow() <= self.until {
+            // A try that ends `busy` (and so waits): what is held now.
+            self.counted.borrow_mut().extend(LeaseGuard::acquire().all_live_leased_models());
+            let alive = server::alive(self.holder);
+            *self.holder_alive_while_held.borrow_mut() &= alive;
+            return vec![self.held.clone()];
+        }
+        Vec::new()
+    }
+    fn capacity(&self) -> Option<u64> {
+        None
+    }
+}
+
+/// End to end on the stand-in engine: under `queue`, a dispatch whose
+/// endpoint serves another model for a running dispatch waits (deciding
+/// again on every try, holding no lease another dispatch would count), never
+/// touches the held server, and starts its own once the holder's lease goes.
+#[test]
+#[serial_test::serial]
+fn a_queued_dispatch_starts_once_the_holders_lease_goes_never_evicting_it_while_held() {
+    let r = rig();
+    let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 2.0).to_string_lossy().into_owned());
+    let port = free_port();
+    let roomy = FakeMachine { reclaimable: RefCell::new(Some(64 * GIB)), ..Default::default() };
+    let a = prepare_in(&target("TensorFold/a", port), &r.dirs, &tf, quick(), &roomy, &mut |_, _| {}).unwrap();
+    let a_rec = a.record.clone();
+    drop(a);
+    let machine = HeldUntil {
+        held: "darkmux:TensorFold/a".into(),
+        until: 3,
+        reads: RefCell::new(0),
+        holder: &a_rec,
+        holder_alive_while_held: RefCell::new(true),
+        counted: RefCell::new(Vec::new()),
+    };
+    let env = FakeEnv::new(Vec::new());
+    let mut notes = Vec::new();
+    let b = target("TensorFold/b", port);
+    let ready = wait_while_busy(
+        &wait_as(BusyPolicy::Queue, Some(600)),
+        &env,
+        &queue_payload(&b),
+        &mut |note| prepare_in(&b, &r.dirs, &tf, quick(), &machine, note),
+        &mut |n, _| notes.push(n),
+    )
+    .unwrap();
+    assert!(*machine.holder_alive_while_held.borrow(), "the held server was never touched while held");
+    assert!(ready.started && !server::alive(&a_rec), "B replaced A's server once A's lease went");
+    let kinds: Vec<Note> = notes.iter().copied().filter(|n| matches!(n, Note::Queued | Note::Resumed | Note::Start)).collect();
+    assert_eq!(kinds, [Note::Queued, Note::Resumed, Note::Start]);
+    assert!(
+        !machine.counted.borrow().iter().any(|m| m == "darkmux:TensorFold/b"),
+        "the waiter's own lease was never counted as held: {:?}",
+        machine.counted.borrow()
+    );
+}
+
+/// A machine whose leases are this process's real ones, with room to spare.
+struct RealLeases;
+
+impl Machine for RealLeases {
+    fn reclaimable(&self) -> Option<u64> {
+        Some(64 * GIB)
+    }
+    fn footprint(&self, _pid: u32) -> Option<u64> {
+        None
+    }
+    fn lmstudio_residents(&self) -> Vec<String> {
+        Vec::new()
+    }
+    fn lmstudio_unload(&self, _id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn leased(&self, own: &LeaseGuard) -> Vec<String> {
+        own.all_live_leased_models()
+    }
+    fn capacity(&self) -> Option<u64> {
+        None
+    }
+}
+
+/// Four dispatches queued behind one holder on one endpoint, each for
+/// another model: when the holder ends they run one at a time, never two at
+/// once, and every one of them runs (none is starved or lost).
+#[test]
+#[serial_test::serial]
+fn four_queued_dispatches_behind_one_holder_start_one_at_a_time() {
+    let r = rig();
+    let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 2.0).to_string_lossy().into_owned());
+    let port = free_port();
+    let holder = prepare_in(&target("TensorFold/a", port), &r.dirs, &tf, quick(), &RealLeases, &mut |_, _| {}).unwrap();
+    let spans = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let waiters: Vec<_> = ["b", "c", "d", "e"]
+        .into_iter()
+        .map(|m| {
+            let (tf, dirs, spans) = (tf.clone(), r.dirs.clone(), spans.clone());
+            std::thread::spawn(move || {
+                let t = target(&format!("TensorFold/{m}"), port);
+                let env = FakeEnv::new(Vec::new());
+                let ready = wait_while_busy(
+                    &wait_as(BusyPolicy::Queue, None),
+                    &env,
+                    &queue_payload(&t),
+                    &mut |note| prepare_in(&t, &dirs, &tf, quick(), &RealLeases, note),
+                    &mut |_, _| {},
+                )
+                .unwrap_or_else(|e| panic!("{m}: {}", e.message()));
+                let began = std::time::Instant::now();
+                assert!(ready.started, "{m} started its own server");
+                std::thread::sleep(Duration::from_millis(150));
+                spans.lock().unwrap().push((began, std::time::Instant::now(), m));
+            })
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(300));
+    drop(holder);
+    for w in waiters {
+        w.join().unwrap();
+    }
+    let mut spans = spans.lock().unwrap().clone();
+    spans.sort();
+    assert_eq!(spans.len(), 4, "every waiter ran");
+    for pair in spans.windows(2) {
+        assert!(pair[1].0 >= pair[0].1, "{} began before {} ended", pair[1].2, pair[0].2);
+    }
+}
+
+// ─── The machine-wide residency lock and reservations (#3509) ──────────────
+
+/// A start still in flight counts against free memory though its memory has
+/// not paged in: with 40 GiB free and another start reserving 30 GiB, a
+/// 30 GiB start is `busy` (it frees when that start's dispatch ends), never
+/// admitted beside it.
+#[test]
+#[serial_test::serial]
+fn a_start_in_flight_reservation_counts_against_free_memory() {
+    let r = rig();
+    let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 30.0).to_string_lossy().into_owned());
+    let in_flight = LeaseGuard::acquire();
+    in_flight.write_starting(&["darkmux:TensorFold/other".to_string()], 30 * GIB).unwrap();
+    let machine = FakeMachine { reclaimable: RefCell::new(Some(40 * GIB)), capacity: Some(128 * GIB), ..Default::default() };
+    let err = prepare_in(&target("TensorFold/m", free_port()), &r.dirs, &tf, quick(), &machine, &mut |_, _| {})
+        .err()
+        .expect("refused");
+    assert_eq!(err.code, "busy", "{err}");
+    assert!(err.message.contains("starts in flight reserve 30.0 GiB"), "{err}");
+    assert!(engine_record::list_in(&r.dirs.records).0.is_empty(), "nothing started");
+    drop(in_flight);
+    let ready = prepare_in(&target("TensorFold/m", free_port()), &r.dirs, &tf, quick(), &machine, &mut |_, _| {}).unwrap();
+    assert!(ready.started, "with no start in flight it fits");
+}
+
+/// A start decides and spawns under the machine-wide residency lock: while
+/// another holder has it, nothing is started.
+#[test]
+#[serial_test::serial]
+fn a_start_waits_for_the_residency_lock() {
+    let r = rig();
+    let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 2.0).to_string_lossy().into_owned());
+    let lock = darkmux_types::residency_lock::acquire().unwrap();
+    let (dirs, port) = (r.dirs.clone(), free_port());
+    let start = std::thread::spawn(move || {
+        let roomy = FakeMachine { reclaimable: RefCell::new(Some(64 * GIB)), ..Default::default() };
+        prepare_in(&target("TensorFold/m", port), &dirs, &tf, quick(), &roomy, &mut |_, _| {}).map(|r| r.started)
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(engine_record::list_in(&r.dirs.records).0.is_empty(), "nothing is spawned while another holds the lock");
+    drop(lock);
+    assert_eq!(start.join().unwrap(), Ok(true), "it starts once the lock is free");
+}
+
+/// (#3507) The standing utility binding is never evicted to make room,
+/// though no lease names it: a running dispatch loads it on demand to
+/// compact. The idle load beside it is evicted instead.
+#[test]
+#[serial_test::serial]
+fn the_utility_binding_is_never_evicted_to_make_room() {
+    let r = rig();
+    let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 20.0).to_string_lossy().into_owned());
+    let machine = FakeMachine {
+        reclaimable: RefCell::new(Some(16 * GIB)),
+        frees_per_unload: 8 * GIB,
+        lms: RefCell::new(vec!["darkmux:idle".into(), "darkmux:qwen/qwen3-4b-2507".into()]),
+        utility: Some("darkmux:qwen/qwen3-4b-2507".into()),
+        ..Default::default()
+    };
+    let ready = prepare_in(&target("TensorFold/m", free_port()), &r.dirs, &tf, quick(), &machine, &mut |_, _| {}).unwrap();
+    assert!(ready.started);
+    assert_eq!(*machine.unloaded.borrow(), ["darkmux:idle"], "only the idle load was evicted");
+}
+
+/// (#3511) A server judged reusable that is gone by the time the reuse is
+/// decided under its endpoint's lock (here: it no longer answers, and
+/// nothing holds it) is started through the memory decision, never restarted
+/// blind: on a machine with no room, the dispatch is refused and nothing
+/// new is started.
+#[test]
+#[serial_test::serial]
+fn a_reusable_server_lost_before_its_reuse_is_restarted_only_through_the_memory_decision() {
+    let r = rig();
+    let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 20.0).to_string_lossy().into_owned());
+    let t = target("TensorFold/m", free_port());
+    let roomy = FakeMachine { reclaimable: RefCell::new(Some(64 * GIB)), ..Default::default() };
+    let first = prepare_in(&t, &r.dirs, &tf, quick(), &roomy, &mut |_, _| {}).unwrap();
+    let first_rec = first.record.clone();
+    drop(first);
+    signal(first_rec.pid, "STOP");
+    let short = FakeMachine { reclaimable: RefCell::new(Some(GIB)), capacity: Some(128 * GIB), ..Default::default() };
+    let result = prepare_in(&t, &r.dirs, &tf, quick(), &short, &mut |_, _| {});
+    signal(first_rec.pid, "CONT");
+    let err = result.err().expect("refused: there is no room to start it again");
+    assert_eq!(err.code, "memory_in_use", "{err}");
+    assert!(server::running(&r.dirs, "tf").is_none(), "nothing was started blind");
+}
+
+// ─── A start in flight on the endpoint (#3509 review) ───────────────────────
+
+/// A start that answers 1.5 s after its spawn (the stand-in's `--slide`).
+fn slow(model: &str, port: u16) -> crate::target::Target {
+    target_with_args(model, port, &["--slide"])
+}
+
+/// Hold the residency lock while `racers` all take their first look (each
+/// reads the endpoint cold), then let them race.
+fn race<T: Send + 'static>(racers: Vec<Box<dyn FnOnce() -> T + Send>>) -> Vec<T> {
+    let lock = darkmux_types::residency_lock::acquire().unwrap();
+    let handles: Vec<_> = racers.into_iter().map(std::thread::spawn).collect();
+    std::thread::sleep(Duration::from_millis(300));
+    drop(lock);
+    handles.into_iter().map(|h| h.join().unwrap()).collect()
+}
+
+/// Two dispatches for one cold 30 GiB model with 40 GiB free: one starts it,
+/// the other waits for that start (off the machine lock) and reuses the
+/// server. It is never `busy` against its own model's reservation.
+#[test]
+#[serial_test::serial]
+fn two_dispatches_for_one_cold_model_start_it_once_and_both_run() {
+    let r = rig();
+    let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 30.0).to_string_lossy().into_owned());
+    let port = free_port();
+    let racer = |tf: Tensorfold, dirs: Dirs| -> Box<dyn FnOnce() -> Result<bool, String> + Send> {
+        Box::new(move || {
+            let machine = FakeMachine { reclaimable: RefCell::new(Some(40 * GIB)), capacity: Some(128 * GIB), ..Default::default() };
+            let ready = prepare_in(&slow("TensorFold/m", port), &dirs, &tf, quick(), &machine, &mut |_, _| {}).map_err(|e| e.to_string())?;
+            std::thread::sleep(Duration::from_millis(200));
+            Ok(ready.started)
+        })
+    };
+    let mut outcomes = race(vec![racer(tf.clone(), r.dirs.clone()), racer(tf.clone(), r.dirs.clone())]);
+    outcomes.sort();
+    assert_eq!(outcomes, [Ok(false), Ok(true)], "one started it, the other reused it");
+}
+
+/// While a start is in flight on an endpoint, a dispatch for another model
+/// there never holds the machine-wide lock waiting on that endpoint: a third
+/// party takes the lock at once, not once the start answers. The other
+/// model's dispatch is `busy` (the endpoint serves a running dispatch).
+#[test]
+#[serial_test::serial]
+fn a_start_in_flight_never_keeps_the_machine_lock_from_a_third_party() {
+    let r = rig();
+    let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 2.0).to_string_lossy().into_owned());
+    let port = free_port();
+    let racer = |model: &'static str, tf: Tensorfold, dirs: Dirs| -> Box<dyn FnOnce() -> Result<bool, String> + Send> {
+        Box::new(move || {
+            let ready = prepare_in(&slow(model, port), &dirs, &tf, quick(), &RealLeases, &mut |_, _| {}).map_err(|e| e.code.to_string())?;
+            // The winner's dispatch runs on a while, holding its server.
+            std::thread::sleep(Duration::from_millis(1_000));
+            Ok(ready.started)
+        })
+    };
+    let records = r.dirs.records.clone();
+    let third = std::thread::spawn(move || {
+        while engine_record::list_in(&records).0.is_empty() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // The start is spawned and has 1.5 s to go; the loser has looked.
+        std::thread::sleep(Duration::from_millis(300));
+        let asked = std::time::Instant::now();
+        drop(darkmux_types::residency_lock::acquire().unwrap());
+        asked.elapsed()
+    });
+    let mut outcomes = race(vec![racer("TensorFold/a", tf.clone(), r.dirs.clone()), racer("TensorFold/b", tf.clone(), r.dirs.clone())]);
+    let waited = third.join().unwrap();
+    outcomes.sort();
+    assert_eq!(outcomes, [Ok(true), Err("busy".to_string())]);
+    assert!(waited < Duration::from_millis(500), "the third party waited {waited:?} for the machine lock");
+}
+
+/// The reservation outlives the start's answer until the server's memory
+/// pages in: right after a start, another start still sees it reserved.
+#[test]
+#[serial_test::serial]
+fn a_started_servers_reservation_outlives_its_answer() {
+    let r = rig();
+    let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 30.0).to_string_lossy().into_owned());
+    let machine = FakeMachine { reclaimable: RefCell::new(Some(64 * GIB)), ..Default::default() };
+    let ready = prepare_in(&target("TensorFold/m", free_port()), &r.dirs, &tf, quick(), &machine, &mut |_, _| {}).unwrap();
+    assert!(ready.started);
+    let other = LeaseGuard::acquire();
+    let reserved = other.reserved_by_others();
+    assert!(reserved > 29 * GIB && reserved <= 30 * GIB, "its memory has not paged in (the stand-in is tiny): {reserved}");
+    drop(ready);
+    assert_eq!(other.reserved_by_others(), 0, "a dispatch that ends reserves nothing");
+}
+
+/// The reservation shrinks as the server's footprint grows and ends when it
+/// reaches the need, or at the bound when it never does (an unreadable
+/// footprint keeps the whole need until then).
+#[test]
+#[serial_test::serial]
+fn a_reservation_settles_as_the_footprint_grows_or_at_its_bound() {
+    let _r = rig();
+    let reserved = |footprints: Vec<Option<u64>>, bound: Duration| {
+        let guard = LeaseGuard::acquire();
+        guard.write_starting(&["darkmux:x".to_string()], 30 * GIB).unwrap();
+        let res = guard.mark_loaded_reserving(&["darkmux:x".to_string()], 30 * GIB).unwrap();
+        let other = LeaseGuard::acquire();
+        let seen = RefCell::new(Vec::new());
+        let reads = RefCell::new(footprints.into_iter());
+        settle_reservation(res, 30 * GIB, &|| reads.borrow_mut().next().flatten(), &|_| seen.borrow_mut().push(other.reserved_by_others()), bound);
+        (seen.into_inner(), other.reserved_by_others())
+    };
+    let (seen, after) = reserved(vec![Some(10 * GIB), Some(25 * GIB), Some(30 * GIB)], Duration::from_secs(120));
+    assert_eq!(seen, [20 * GIB, 5 * GIB], "shrinks as it pages in");
+    assert_eq!(after, 0, "ends at the need");
+    let (seen, after) = reserved(vec![None; 1_000], Duration::from_secs(2));
+    assert!(seen.iter().all(|b| *b == 30 * GIB) && seen.len() == 4, "unread: the whole need, polled to the bound: {seen:?}");
+    assert_eq!(after, 0, "ends at the bound");
+}
+
+/// An evictor holding the machine lock never waits on another endpoint's
+/// lock: an idle server whose endpoint is taken (a reuse being decided
+/// there) is left running, and the start is answered at once instead.
+#[test]
+#[serial_test::serial]
+fn an_evictor_never_waits_on_a_taken_endpoint_under_the_machine_lock() {
+    let r = rig();
+    let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 20.0).to_string_lossy().into_owned());
+    let roomy = FakeMachine { reclaimable: RefCell::new(Some(64 * GIB)), ..Default::default() };
+    let mut other = target("TensorFold/o", free_port());
+    other.endpoint.source = darkmux_types::endpoint::EndpointSource::Named("other".into());
+    let o_rec = prepare_in(&other, &r.dirs, &tf, quick(), &roomy, &mut |_, _| {}).unwrap().record.clone();
+    let taken = server::endpoint_lock(&r.dirs, "other").unwrap();
+    let (dirs, (tx, rx)) = (r.dirs.clone(), std::sync::mpsc::channel());
+    let o_alive = o_rec.clone();
+    std::thread::spawn(move || {
+        let frees = || Some(if server::alive(&o_alive) { GIB } else { 64 * GIB });
+        let machine = LeasedLater { inner: FakeMachine { capacity: Some(128 * GIB), ..Default::default() }, reclaim: Some(&frees), first: Vec::new(), then: Vec::new(), reads: RefCell::new(0) };
+        let _ = tx.send(prepare_in(&target("TensorFold/m", free_port()), &dirs, &tf, quick(), &machine, &mut |_, _| {}).map(|_| ()).map_err(|e| e.code));
+    });
+    let answered = rx.recv_timeout(Duration::from_secs(5)).expect("answered without waiting on the taken endpoint");
+    drop(taken);
+    assert_eq!(answered, Err("busy"), "the taken server is counted as held");
+    assert!(server::alive(&o_rec), "left running");
+}
+
+/// A server lifecycle failure keeps its code; `busy` names what holds the
+/// endpoint, without the advice, as the thing a queued dispatch waits on.
+#[test]
+fn a_server_failure_is_the_refusal_its_code_names() {
+    let held = server_refusal(server::ServerError::Busy { endpoint: "tf".into(), model: "TensorFold/a".into() });
+    assert_eq!(held.code, "busy");
+    assert_eq!(held.waiting_on.as_deref(), Some("endpoint `tf` is serving `TensorFold/a` for a running dispatch"));
+    assert!(held.message.ends_with("retry when it finishes"), "{held}");
+    let taken = server_refusal(server::ServerError::PortInUse {
+        endpoint: "tf".into(),
+        port: 8091,
+        holder: server::PortHolder::BeforeStart,
+    });
+    assert_eq!((taken.code, taken.waiting_on), ("port_in_use", None));
+}

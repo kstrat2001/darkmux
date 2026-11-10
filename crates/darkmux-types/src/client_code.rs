@@ -64,12 +64,24 @@ pub enum ClientCode {
     FetchFailed,
     /// Cloning the repository failed.
     CloneFailed,
+    /// The workspace is not on a `mux/` branch of its own (a clone made
+    /// before clones got one, left on the default branch or the ref it was
+    /// cloned at), so a PR or backup from it would push onto that branch
+    /// (409); its next run moves it onto one.
+    NoOwnBranch,
+    /// darkmux could not put the workspace on a `mux/` branch of its own
+    /// (a branch of the repo's, such as one named `mux`, is in the way;
+    /// 422); `error` carries git's reason.
+    BranchFailed,
 
     // ── A failed run, from its `dispatch.error` `code` ──
     /// The memory is held by a running dispatch; retry later.
     Busy,
     /// The model does not fit this machine; retrying cannot help.
     WontFit,
+    /// (#3510) The memory is held by programs darkmux did not start; retry
+    /// once they free it.
+    MemoryInUse,
     /// The engine server would not start, or exited.
     ModelStartFailed,
     /// darkmux's own engine server would not stop to make way.
@@ -103,6 +115,7 @@ impl ClientCode {
         matches!(
             self,
             Busy | WontFit
+                | MemoryInUse
                 | ModelStartFailed
                 | ModelStopFailed
                 | PortInUse
@@ -137,6 +150,7 @@ mod tests {
             (RecipeInvalid, "recipe_invalid"),
             (Busy, "busy"),
             (WontFit, "wont_fit"),
+            (MemoryInUse, "memory_in_use"),
             (ModelStartFailed, "model_start_failed"),
             (PortInUse, "port_in_use"),
             (EngineUnavailable, "engine_unavailable"),
@@ -144,6 +158,8 @@ mod tests {
             (FilterInRepoConfig, "filter_in_repo_config"),
             (NetworkKeyInRepoConfig, "network_key_in_repo_config"),
             (CloneFailed, "clone_failed"),
+            (NoOwnBranch, "no_own_branch"),
+            (BranchFailed, "branch_failed"),
         ] {
             assert_eq!(wire(c), s);
             assert_eq!(
@@ -163,6 +179,7 @@ mod tests {
         for (raw, c) in [
             ("busy", Busy),
             ("wont_fit", WontFit),
+            ("memory_in_use", MemoryInUse),
             ("model_start_failed", ModelStartFailed),
             ("model_stop_failed", ModelStopFailed),
             ("port_in_use", PortInUse),

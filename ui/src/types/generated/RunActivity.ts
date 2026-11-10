@@ -4,4 +4,4 @@
  * (#3467) What a running run is doing besides its turns. One wire spelling
  * per value; a new one is additive.
  */
-export type RunActivity = "starting_model";
+export type RunActivity = "starting_model" | "queued";
