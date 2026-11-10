@@ -837,11 +837,20 @@ describe("liveStateWhileConnected", () => {
     expect(liveStateWhileConnected({ state: "stalled" }, true)).toEqual({ state: "stalled" });
   });
 
-  it("leaves every non-stalled state alone even while disconnected — only STALL is a false claim", () => {
-    expect(liveStateWhileConnected({ state: "generating" }, false)).toEqual({ state: "generating" });
-    expect(liveStateWhileConnected({ state: "rest", restSecondsLeft: 5 }, false)).toEqual({ state: "rest", restSecondsLeft: 5 });
-    expect(liveStateWhileConnected({ state: "tools" }, false)).toEqual({ state: "tools" });
-    expect(liveStateWhileConnected({ state: "prompt" }, false)).toEqual({ state: "prompt" });
+  // A frozen daemon held a card at "processing prompt" with a moving scope for
+  // as long as the freeze lasted: the prompt bound is minutes long, so the
+  // reading never reached STALL to be downgraded. Every state is a claim
+  // about NOW, and the page cannot make one without the daemon.
+  it("downgrades every state while disconnected, not only STALL — none of them is current", () => {
+    expect(liveStateWhileConnected({ state: "generating" }, false)).toBeNull();
+    expect(liveStateWhileConnected({ state: "rest", restSecondsLeft: 5 }, false)).toBeNull();
+    expect(liveStateWhileConnected({ state: "tools" }, false)).toBeNull();
+    expect(liveStateWhileConnected({ state: "prompt", promptChars: 36_000 }, false)).toBeNull();
+  });
+
+  it("leaves every non-stalled state alone while connected", () => {
+    expect(liveStateWhileConnected({ state: "generating" }, true)).toEqual({ state: "generating" });
+    expect(liveStateWhileConnected({ state: "prompt" }, true)).toEqual({ state: "prompt" });
   });
 
   it("passes a null reading through unchanged regardless of connection", () => {

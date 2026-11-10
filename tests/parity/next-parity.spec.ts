@@ -303,7 +303,7 @@ async function machineStageText(page): Promise<string> {
 test("next: click-navigation into #lens=machine matches goldens/machine.txt", async ({ page }) => {
   const meta = loadMeta();
   await installFrozenClock(page, meta.frozen_clock_ms);
-  installCorpusRoutes(page, meta);
+  installCorpusRoutes(page, meta, { liveStream: true });
 
   // Boot at the default route first (no hash) — the React-port equivalent
   // of the legacy click-navigation path. This scaffold has no lens-nav-tab
@@ -352,7 +352,7 @@ test("next: click-navigation into #lens=machine matches goldens/machine.txt", as
 test("next: #lens=machine deep-link boot matches goldens/machine-deeplink.txt", async ({ page }) => {
   const meta = loadMeta();
   await installFrozenClock(page, meta.frozen_clock_ms);
-  installCorpusRoutes(page, meta);
+  installCorpusRoutes(page, meta, { liveStream: true });
 
   // A FRESH boot with the hash already set — `useHashRoute`'s initial
   // `getSnapshot()` must resolve `{kind:"machine"}` on the FIRST render,
@@ -422,7 +422,7 @@ test("next: render-sanity — zero pageerror, no horizontal scroll at 390px, rea
 
   const meta = loadMeta();
   await installFrozenClock(page, meta.frozen_clock_ms);
-  installCorpusRoutes(page, meta);
+  installCorpusRoutes(page, meta, { liveStream: true });
 
   // Playwright viewport trap (overnight runbook): `devices['Desktop Chrome']`
   // spread in the project's `use` (next-parity.playwright.config.js) would
@@ -456,7 +456,7 @@ test("next: render-sanity — zero pageerror, no horizontal scroll at 390px, rea
 test("next: render-sanity screenshot at desktop width (populated, for review)", async ({ page }) => {
   const meta = loadMeta();
   await installFrozenClock(page, meta.frozen_clock_ms);
-  installCorpusRoutes(page, meta);
+  installCorpusRoutes(page, meta, { liveStream: true });
 
   await page.setViewportSize({ width: 1280, height: 900 });
   await page.goto("/index.html#lens=machine");
@@ -467,7 +467,7 @@ test("next: render-sanity screenshot at desktop width (populated, for review)", 
 test("next: render-sanity screenshot of the deep-link boot path", async ({ page }) => {
   const meta = loadMeta();
   await installFrozenClock(page, meta.frozen_clock_ms);
-  installCorpusRoutes(page, meta);
+  installCorpusRoutes(page, meta, { liveStream: true });
 
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/index.html#lens=machine");
@@ -507,7 +507,7 @@ const FLEET_LOADED = '.fleet-lens[data-state="loaded"]';
 test("next: fresh boot (no hash) into the fleet lens matches goldens/fleet.txt", async ({ page }) => {
   const meta = loadMeta();
   await installFrozenClock(page, meta.frozen_clock_ms);
-  installCorpusRoutes(page, meta);
+  installCorpusRoutes(page, meta, { liveStream: true });
 
   await page.goto("/index.html");
   await waitSettled(page, expect, FLEET_LOADED);
@@ -544,7 +544,7 @@ test("next: fleet lens render-sanity — zero pageerror, no horizontal scroll at
 
   const meta = loadMeta();
   await installFrozenClock(page, meta.frozen_clock_ms);
-  installCorpusRoutes(page, meta);
+  installCorpusRoutes(page, meta, { liveStream: true });
 
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/index.html");
@@ -568,7 +568,7 @@ test("next: fleet lens render-sanity — zero pageerror, no horizontal scroll at
 test("next: fleet lens render-sanity screenshot at desktop width (populated, for review)", async ({ page }) => {
   const meta = loadMeta();
   await installFrozenClock(page, meta.frozen_clock_ms);
-  installCorpusRoutes(page, meta);
+  installCorpusRoutes(page, meta, { liveStream: true });
 
   await page.setViewportSize({ width: 1280, height: 900 });
   await page.goto("/index.html");
@@ -635,7 +635,7 @@ const TWO_DAY_CLOCK_MS = Date.UTC(2026, 7, 8, 2, 0, 0);
 test("next: fresh boot into the fleet lens over the CONCATENATED two-day window matches goldens/fleet-two-day.txt", async ({ page }) => {
   const meta = loadMeta();
   await installFrozenClock(page, TWO_DAY_CLOCK_MS);
-  installCorpusRoutes(page, meta);
+  installCorpusRoutes(page, meta, { liveStream: true });
 
   await page.goto("/index.html");
   await waitSettled(page, expect, FLEET_LOADED);
@@ -719,7 +719,7 @@ test("next: the two-day golden is non-vacuous where fleet.txt is structurally bl
   expect(stamped, "the mutation must add tokens to at least one yesterday usage record").toBeGreaterThan(0);
 
   const installMutated = async () => {
-    installCorpusRoutes(page, meta);
+    installCorpusRoutes(page, meta, { liveStream: true });
     // Registered AFTER `installCorpusRoutes`, so it wins: Playwright matches
     // the most recently registered route first (the same ordering
     // `nav-chrome.spec.ts` relies on for its own `/fleet/machines/live`
@@ -753,7 +753,7 @@ test("next: the two-day golden is non-vacuous where fleet.txt is structurally bl
 test("next: the first activity lane keeps its place when the fleet view answers", async ({ page }) => {
   const meta = loadMeta();
   await installFrozenClock(page, meta.frozen_clock_ms);
-  installCorpusRoutes(page, meta);
+  installCorpusRoutes(page, meta, { liveStream: true });
   let release: () => void = () => {};
   const held = new Promise<void>((r) => (release = r));
   await page.route("**/fleet/view", async (route) => {

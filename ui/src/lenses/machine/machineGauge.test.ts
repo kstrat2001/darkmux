@@ -476,6 +476,84 @@ describe("modelKvLine — unchanged from the retired modelLines()'s fourth eleme
   });
 });
 
+describe("modelKvLine for a server darkmux started (#3450)", () => {
+  it("names the engine, endpoint and port, and the measured memory, never a weights or kv figure", () => {
+    const server = {
+      endpoint: "tensorfold",
+      engine: "tensorfold",
+      model: "TensorFold/q38",
+      served_name: "darkmux:TensorFold/q38",
+      n_ctx: 262144,
+      port: 8091,
+      pid: 4242,
+      started_at_ms: 0,
+      answering: true,
+    };
+    const line = modelKvLine(
+      model({
+        identifier: "darkmux:TensorFold/q38",
+        loaded_ctx: 262144,
+        weights_bytes: null as unknown as number,
+        kv_per_token_bytes: null as unknown as number,
+        kv_bytes_at_ctx: null as unknown as number,
+        potential_bytes: 21474836480,
+        current_bytes: 21474836480,
+        potential_source: "measured",
+        server,
+      }),
+    );
+    expect(line).toBe("ctx 262144 · tensorfold server for TensorFold/q38 on endpoint tensorfold, port 8091 · measured 20.00 GiB");
+  });
+});
+
+describe("server rows: not measured, and one row per server (#3450)", () => {
+  const server = (endpoint: string) => ({
+    endpoint,
+    engine: "flint",
+    model: "flint-int4",
+    served_name: "flint",
+    n_ctx: 32768,
+    port: 8092,
+    pid: 4243,
+    started_at_ms: 0,
+    answering: true,
+  });
+  const flintRow = (endpoint: string, current: number | null) =>
+    model({
+      identifier: "flint",
+      model_key: "flint-int4",
+      owner: "darkmux",
+      loaded_ctx: 32768,
+      weights_bytes: null as unknown as number,
+      kv_per_token_bytes: null as unknown as number,
+      kv_bytes_at_ctx: null as unknown as number,
+      potential_bytes: current as unknown as number,
+      current_bytes: current as unknown as number,
+      server: server(endpoint),
+    });
+
+  it("an unmeasured server reads 'not measured', never 'measured —'", () => {
+    const line = modelKvLine(flintRow("flint-a", null));
+    expect(line).toContain("· not measured");
+    expect(line).not.toContain("measured —");
+  });
+
+  // Every Flint server answers to the name `flint`, so two of them shared one
+  // row key: a duplicate React key, and NEW/DEPARTED merged across them.
+  it("two Flint servers on different endpoints are two rows, each tracked on its own", () => {
+    const a = flintRow("flint-a", 1_000);
+    const b = flintRow("flint-b", 2_000);
+    const first = advanceResidency(null, [a, b], 1000);
+    expect(new Set(first.rows.map((r) => r.identifier)).size).toBe(2);
+    // One of them stops: it departs, and the other stays live.
+    const second = advanceResidency(first.state, [a], 2000);
+    expect(second.rows.map((r) => [r.model.server?.endpoint, r.status])).toEqual([
+      ["flint-a", "live"],
+      ["flint-b", "ghost"],
+    ]);
+  });
+});
+
 describe("isEstimatedRow — the #1819 provenance predicate", () => {
   it("true only when potential_source is exactly 'estimated'", () => {
     expect(isEstimatedRow(model({ potential_source: "estimated" }))).toBe(true);

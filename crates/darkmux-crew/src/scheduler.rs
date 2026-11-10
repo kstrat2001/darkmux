@@ -1168,6 +1168,10 @@ pub fn run_step_graph(
                     // the endpoints' own concurrency, resolved per seat.
                     darkmux_types::config_access::dispatch_free_concurrency() as usize,
                     host_factory,
+                    // (#3514) Planned against this machine only when its
+                    // host's loads take this machine's memory, the host
+                    // made only when a local step needs one.
+                    None,
                 )
             });
             for sig in rx.iter() {
@@ -1234,7 +1238,10 @@ pub fn run_step_graph(
             let id = ready_ids[idx].clone();
             let (result, flow_records) = match outcome {
                 Ok((job_result, records)) => (Ok(job_result.output), records),
-                Err(e) => (Err(format!("{e:#}")), Vec::new()),
+                Err(e) => {
+                    stash_unrun_refusal(steps.get(&id), &e);
+                    (Err(format!("{e:#}")), Vec::new())
+                }
             };
             apply_step_terminal(
                 run,
@@ -1825,6 +1832,20 @@ fn seat_unresolved_record(run: &RunId, step: &Step, reason: &str) -> FlowRecord 
 
 /// (F9) The `step.error` record: the lifecycle record plus the cause, so the
 /// stream says why a step failed (the full message stays in the step file).
+/// (#3514) A step whose wave was refused never ran, so its dispatch could
+/// not keep its refusal code for the run as a refused dispatch does
+/// (`dispatch_step_error`): kept here instead, for a step that asked for its
+/// result to be preserved (the crew-of-one, whose `--json` envelope names
+/// the code) and named its session.
+fn stash_unrun_refusal(step: Option<&Step>, e: &anyhow::Error) {
+    let Some(config) = step.map(|s| &s.config) else { return };
+    let preserved = config.get("preserve_dispatch_result").and_then(|v| v.as_bool()) == Some(true);
+    let session = config.get("session_id").and_then(|v| v.as_str()).and_then(|s| SessionId::parse(s).ok());
+    if let (true, Some(session)) = (preserved, session) {
+        crate::engine_dispatch::stash_refusal(&session, e);
+    }
+}
+
 fn step_error_record(run: &RunId, step: &Step, message: &str) -> FlowRecord {
     FlowRecord {
         source: Some(darkmux_flow::FlowSource::Scheduler),
@@ -5717,6 +5738,82 @@ mod tests {
         }
         let loaded = loads.lock().unwrap().clone();
         assert!(loaded.contains(&"map-model".to_string()), "the wave loader loaded the map's model: {loaded:?}");
+    }
+    /// (#3514) The scheduler plans a test double's wave without reading this
+    /// machine: a model priced past any machine's memory still loads on a
+    /// host whose loads take none of it. (Planned against this machine, the
+    /// wave would be `wont_fit`; that is what failed on a small CI runner.)
+    #[test]
+    #[serial_test::serial]
+    fn the_scheduler_never_plans_a_doubles_wave_against_this_machine() {
+        let loads: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let loads_for_factory = loads.clone();
+        let factory = move || -> Box<dyn ModelHost> {
+            Box::new(RecordingHost { loads: loads_for_factory.clone(), residents: vec![] })
+        };
+        let (t_src, s_src) = kinded_step("src", "test.emit-collection", json!({ "output_json": "[\"x\"]" }), &[]);
+        let (t_map, s_map) = kinded_step(
+            "map",
+            "dispatch.map",
+            json!({ "model": "map-model", "user_template": "check {item}", "n_ctx": 8000, "timeout_seconds": 1 }),
+            &["src"],
+        );
+        let (tasks, mut steps) = graph(vec![(t_src, s_src), (t_map, s_map)]);
+        let kinds = StepKindRegistry::with_builtins();
+        kinds.register(Arc::new(EmitCollectionKind)).unwrap();
+        let est = FixedEstimator(BTreeMap::from([("map-model".to_string(), 1u64 << 50)]));
+        let url_key = "DARKMUX_LMSTUDIO_URL";
+        let prev_url = std::env::var(url_key).ok();
+        unsafe { std::env::set_var(url_key, "http://127.0.0.1:1") };
+        run_step_graph(&crate::test_run(), &mut steps, &tasks, &kinds, &Facts::default(), &est, &factory, &mut |_r| {}, &mut |_s| {},
+            None, None, &[]).unwrap();
+        unsafe {
+            match prev_url {
+                Some(v) => std::env::set_var(url_key, v),
+                None => std::env::remove_var(url_key),
+            }
+        }
+        assert!(loads.lock().unwrap().contains(&"map-model".to_string()), "{:?}", loads.lock().unwrap());
+    }
+
+    /// (#3514) A map step whose wave is refused never runs and is never
+    /// silent: the step errors, its `step.error` names the refusal with its
+    /// code, and nothing is loaded. Here the AI budget cannot hold the model.
+    #[test]
+    #[serial_test::serial]
+    fn a_map_step_whose_wave_is_refused_errors_with_its_code_and_loads_nothing() {
+        let loads: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let loads_for_factory = loads.clone();
+        let factory = move || -> Box<dyn ModelHost> {
+            Box::new(RecordingHost { loads: loads_for_factory.clone(), residents: vec![] })
+        };
+        let (t_src, s_src) = kinded_step("src", "test.emit-collection", json!({ "output_json": "[\"x\"]" }), &[]);
+        let (t_map, s_map) = kinded_step(
+            "map",
+            "dispatch.map",
+            json!({ "model": "map-model", "user_template": "check {item}", "n_ctx": 8000, "timeout_seconds": 1 }),
+            &["src"],
+        );
+        let (tasks, mut steps) = graph(vec![(t_src, s_src), (t_map, s_map)]);
+        let kinds = StepKindRegistry::with_builtins();
+        kinds.register(Arc::new(EmitCollectionKind)).unwrap();
+        let facts = Facts { budget: darkmux_gestalt::Budget { max_darkmux_bytes: Some(1_000_000_000) }, ..Default::default() };
+        let est = FixedEstimator(BTreeMap::from([("map-model".to_string(), 5_000_000_000)]));
+        let mut emitted = Vec::new();
+        let report = run_step_graph(&crate::test_run(), &mut steps, &tasks, &kinds, &facts, &est, &factory, &mut |r| emitted.push(r), &mut |_s| {},
+            None, None, &[]).unwrap();
+        assert!(loads.lock().unwrap().is_empty(), "nothing loaded");
+        assert!(report.errored.iter().any(|e| e.contains("map")), "the step errored: {:?}", report.errored);
+        let cause = emitted
+            .iter()
+            .find_map(|r| match &r.payload {
+                Some(darkmux_flow::Payload::StepError(p)) if r.handle == "map-step" => Some(p.cause.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the map step's step.error: {:?}", emitted.iter().map(|r| r.handle.clone()).collect::<Vec<_>>()));
+        assert!(cause.contains("[wont_fit]"), "its code: {cause}");
+        let started = emitted.iter().any(|r| r.handle == "map-step" && r.action == darkmux_flow::FlowAction::StepStart);
+        assert!(started, "the step's own bookends: started, then errored");
     }
     /// (#1530) A kind that REQUIRES an artifact no step in the graph
     /// provides, and no caller seeds, must fail BEFORE any step runs —

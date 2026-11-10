@@ -60,6 +60,19 @@ struct DayLines {
 pub(crate) struct WindowRecords(Vec<DayLines>);
 
 impl WindowRecords {
+    /// Feed `h` what changes when a kept line is added, dropped or rewritten:
+    /// each day's kept-line count, its newest kept line and its unterminated
+    /// tail. A line the store does not keep changes nothing here.
+    pub(crate) fn hash_into(&self, h: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        self.0.len().hash(h);
+        for day in &self.0 {
+            day.committed.len().hash(h);
+            day.committed.last().hash(h);
+            day.tail.hash(h);
+        }
+    }
+
     /// Visit each kept record in order, parsed one at a time.
     pub(crate) fn for_each(&self, mut visit: impl FnMut(&Value)) {
         for day in &self.0 {
@@ -92,7 +105,7 @@ struct DirState {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct FileId {
+pub(crate) struct FileId {
     dev: u64,
     ino: u64,
 }
@@ -253,7 +266,7 @@ impl DayFile {
 
 /// The last [`FINGERPRINT_BYTES`] of a file's first `upto` bytes (shorter
 /// when unreadable, which then fails to match a full print).
-fn last_bytes(file: &mut std::fs::File, upto: u64) -> Vec<u8> {
+pub(crate) fn last_bytes(file: &mut std::fs::File, upto: u64) -> Vec<u8> {
     let n = upto.min(FINGERPRINT_BYTES);
     let mut buf = Vec::with_capacity(n as usize);
     if file.seek(SeekFrom::Start(upto - n)).is_ok() {
@@ -263,13 +276,13 @@ fn last_bytes(file: &mut std::fs::File, upto: u64) -> Vec<u8> {
 }
 
 #[cfg(unix)]
-fn file_id(meta: &std::fs::Metadata) -> Option<FileId> {
+pub(crate) fn file_id(meta: &std::fs::Metadata) -> Option<FileId> {
     use std::os::unix::fs::MetadataExt;
     Some(FileId { dev: meta.dev(), ino: meta.ino() })
 }
 
 #[cfg(not(unix))]
-fn file_id(_meta: &std::fs::Metadata) -> Option<FileId> {
+pub(crate) fn file_id(_meta: &std::fs::Metadata) -> Option<FileId> {
     None
 }
 

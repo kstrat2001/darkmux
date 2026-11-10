@@ -265,6 +265,8 @@ def make_handler(inner, fx, hero, demo_uids, home):
             body = self._fixture(self.path)
             if body is not None:
                 return self._send(200, body)
+            if re.fullmatch(r"/flow/\d{4}-\d{2}-\d{2}/stream", self.path.split("?")[0]):
+                return self._idle_stream()
             req = urllib.request.Request(inner + self.path)
             # The panel CSRF header must survive the hop or the daemon 403s
             # every passthrough panel (`panel requests require the
@@ -289,6 +291,30 @@ def make_handler(inner, fx, hero, demo_uids, home):
                 return self._send(e.code, e.read(), e.headers.get("Content-Type", "text/plain"))
             except Exception as e:                        # noqa: BLE001
                 return self._send(502, str(e).encode(), "text/plain")
+
+        def _idle_stream(self):
+            """The live tail, as an open stream that carries nothing.
+
+            The proxy below reads a response to its end, which an SSE stream
+            never reaches, so the page's stream never opened and every shot
+            showed a page reconnecting to a daemon that was fine. The demo
+            world is a still frame: its records are all in `/flow/<date>`,
+            and an open, quiet stream is what a live page on an idle fleet
+            holds. Comments only (no events), until the browser hangs up.
+            """
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            try:
+                self.wfile.write(b": demo world\n\n")
+                self.wfile.flush()
+                while True:
+                    time.sleep(15)
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                return
 
         def do_OPTIONS(self):
             self.send_response(204)

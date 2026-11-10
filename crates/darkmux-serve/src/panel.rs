@@ -152,11 +152,15 @@
 //! floor-check function's signature has no parameter a variant key could
 //! even arrive through) rather than an observed behavior yet.
 //!
-//! **`cols` is deliberately NOT part of the cache key.** Two clients at
-//! different widths share one entry for up to the TTL, so the second sees
-//! the first's width — self-describing (the body carries the `cols` it was
-//! rendered at) and bounded at 3s. Keying on width would multiply spawns
-//! for a difference nobody notices in a 3-second window.
+//! **The render width is part of the cache key** ([`audience_key`]). A
+//! verb lays its output out for the width it is given, so a phone and a
+//! desktop sharing one entry each got the other's layout for a whole TTL.
+//! A requested width renders at the widest of a few fixed widths that fits
+//! it ([`bucket_cols`]), so clients at nearby widths share an entry and one
+//! caller sweeping every width starts at most one render per bucket. An
+//! entry is dropped once it is older than [`PANEL_CACHE_RETAIN`]. Inside a
+//! manual panel's remote floor, a caller at another width reads the last
+//! remote run at any width ([`last_remote_run`]) rather than being refused.
 //!
 //! **The spawn timeout kills the CHILD, not its descendants.** `kill_on_drop`
 //! SIGKILLs the direct child; a grandchild it left running (doctor's `curl`,
@@ -243,6 +247,12 @@ pub(crate) const PANEL_HEADER: &str = "x-darkmux-panel";
 /// "re-run" does not notice 30s; a loop is bounded to twice a minute and
 /// told so with `Retry-After`.
 const MANUAL_MIN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long a cache entry is kept at all: past every panel's TTL and the
+/// manual floor, so no entry still being served is dropped. The key carries
+/// the caller's width, so without a bound the entries of every width a
+/// caller asked for would stay for the daemon's life.
+const PANEL_CACHE_RETAIN: Duration = MANUAL_MIN_INTERVAL;
 
 /// One legal value of a [`PanelOpt`] and the literal argv fragment it
 /// contributes when selected.
@@ -823,6 +833,20 @@ pub(crate) enum Audience {
     Remote,
 }
 
+/// The widths a panel renders at. A requested width renders at the widest
+/// of these that fits in it ([`bucket_cols`]), so one caller cannot start a
+/// render (and keep a cache entry) per column across the whole 36..=200
+/// range. Narrow steps where phones sit, where a few columns decide what a
+/// verb sheds; wide steps above. Starts at `clamp_cols`' floor, so every
+/// clamped width has a bucket, and holds its default (100).
+const COLS_BUCKETS: &[u16] = &[36, 40, 44, 48, 52, 56, 64, 72, 80, 90, 100, 120, 140, 160, 180, 200];
+
+/// The width a clamped request renders at: the widest bucket no wider than
+/// it, so a render never overflows the space the caller has.
+fn bucket_cols(clamped: u16) -> u16 {
+    COLS_BUCKETS.iter().copied().take_while(|b| *b <= clamped).last().unwrap_or(COLS_BUCKETS[0])
+}
+
 fn clamp_cols(cols: Option<u16>) -> u16 {
     // (#1613) Floor is 36, not 60. A 390px phone fits ~52 columns at the
     // panel's font; the old 60 floor meant the viewer ASKED for 60, the CLI
@@ -1085,15 +1109,15 @@ fn redact_for_remote(body: &mut PanelResponse, r: &Redaction, w: &Withheld, mach
     };
 }
 
-/// The cache and single-flight key for a selection rendered for `remote`: a
-/// verb's remote form is a different output, so it never shares an entry with
-/// this machine's.
-fn audience_key(key: &str, remote: bool) -> String {
-    if remote {
-        format!("{key}\u{0}remote")
-    } else {
-        key.to_string()
-    }
+/// The cache and single-flight key for a selection rendered for `remote` at
+/// `cols`: a verb's remote form is a different output, and so is its layout
+/// at another width, so neither shares an entry.
+/// What separates a cache key's width from the rest of it.
+const COLS_KEY_SEPARATOR: &str = "\u{0}cols=";
+
+fn audience_key(key: &str, remote: bool, cols: u16) -> String {
+    let audience = if remote { "\u{0}remote" } else { "" };
+    format!("{key}{audience}{COLS_KEY_SEPARATOR}{cols}")
 }
 
 pub(crate) async fn panel_handler(
@@ -1146,7 +1170,6 @@ async fn run_panel(
     // `opt.<name>` query params. An unknown name or value is a 400, never
     // silently ignored.
     let (final_argv, key, opts_echo) = resolve_selection(state, &spec, &params).await?;
-    let key = audience_key(&key, remote);
 
     // (#1911) Lenient on read: a malformed `cols` (`abc`, empty, or past
     // `u16`) resolves to the default width rather than failing the whole
@@ -1157,7 +1180,8 @@ async fn run_panel(
     // but it IS a behavior change — pinned by `cols_is_lenient_on_read`.
     // Note the asymmetry with `opt.*` above, which fails CLOSED: a wrong
     // width is a cosmetic misread, a wrong option is a different command.
-    let cols = clamp_cols(parse_cols(&params));
+    let cols = bucket_cols(clamp_cols(parse_cols(&params)));
+    let key = audience_key(&key, remote, cols);
 
     // Manual-only panels are floored per audience ([`admit_run`]).
     let claim = match admit_run(state, &spec, remote, &key).await? {
@@ -1289,7 +1313,9 @@ async fn keep_panel_run(state: &AppState, spec: &PanelSpec, remote: bool, key: S
     // last remote run, which a remote caller inside the window reads
     // ([`last_remote_run`]); `cached_if_fresh` never serves it, TTL 0.
     let mut cache = state.panels.cache.lock().await;
-    cache.insert(key, CacheEntry { body: body.clone(), captured: SystemTime::now() });
+    let now = SystemTime::now();
+    cache.retain(|_, e| cache_entry_is_fresh(e.captured, now, PANEL_CACHE_RETAIN));
+    cache.insert(key, CacheEntry { body: body.clone(), captured: now });
 }
 
 /// The child command that renders panel `id`.
@@ -1465,10 +1491,19 @@ fn capped_stdout(stdout: &str) -> String {
 
 /// The last remote run of a manual panel, with `age_ms` saying how old it is:
 /// what a remote caller inside the panel's floor window is served instead of
-/// a new probe. `None` when no remote run has finished yet.
+/// a new probe. At the caller's width when there is one, else the newest at
+/// any width (the body says its own `cols`): a remote caller is redacted,
+/// never refused. `None` when no remote run has finished yet.
 async fn last_remote_run(panels: &PanelState, key: &str) -> Option<PanelResponse> {
     let cache = panels.cache.lock().await;
-    let entry = cache.get(key)?;
+    let any_width = key.rsplit_once(COLS_KEY_SEPARATOR).map_or(key, |(variant, _)| variant);
+    let entry = cache.get(key).or_else(|| {
+        cache
+            .iter()
+            .filter(|(k, _)| k.rsplit_once(COLS_KEY_SEPARATOR).is_some_and(|(variant, _)| variant == any_width))
+            .map(|(_, e)| e)
+            .max_by_key(|e| e.captured)
+    })?;
     let mut body = entry.body.clone();
     body.age_ms = cache_entry_age_ms_at(entry.captured, SystemTime::now());
     Some(body)
@@ -1581,6 +1616,21 @@ mod tests {
             let want = if s.needs_fleet_snapshot { FLEET_PANEL_CACHE_TTL } else { PANEL_CACHE_TTL };
             assert_eq!(s.cache_ttl, want, "{id}");
         }
+    }
+
+    #[test]
+    fn a_width_renders_at_the_widest_bucket_that_fits_it() {
+        assert_eq!(bucket_cols(36), 36);
+        assert_eq!(bucket_cols(43), 40);
+        assert_eq!(bucket_cols(100), 100);
+        assert_eq!(bucket_cols(164), 160);
+        assert_eq!(bucket_cols(200), 200);
+        for w in 36..=200u16 {
+            assert!(bucket_cols(w) <= w && COLS_BUCKETS.contains(&bucket_cols(w)), "{w}");
+        }
+        assert!(COLS_BUCKETS.windows(2).all(|p| p[0] < p[1]), "ascending");
+        assert_eq!((COLS_BUCKETS[0], *COLS_BUCKETS.last().unwrap()), (clamp_cols(Some(0)), clamp_cols(Some(u16::MAX))));
+        assert!(COLS_BUCKETS.contains(&clamp_cols(None)), "the default width is a bucket");
     }
 
     #[test]
@@ -3021,7 +3071,7 @@ mod tests {
         std::env::set_var("HOME", "/Users/tester");
         let mut state = app_state();
         state.panels.child_exe = Some(child);
-        state.panels.cache.lock().await.insert(audience_key("role-list", false), CacheEntry { body: probe, captured: SystemTime::now() });
+        state.panels.cache.lock().await.insert(audience_key("role-list", false, clamp_cols(None)), CacheEntry { body: probe, captured: SystemTime::now() });
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(PANEL_HEADER, "1".parse().unwrap());
         headers.insert("host", host.parse().unwrap());
@@ -3144,6 +3194,141 @@ mod tests {
             "peer at example-host.example:8765 role list []",
             "this machine's form is cached apart from the remote one, and unfiltered"
         );
+    }
+
+    /// A verb lays its output out for the width it is given, so two callers
+    /// at different widths never share a cache entry: a phone's narrow
+    /// render must not reach a desktop inside the TTL, nor the reverse.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_panel_is_cached_per_width() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("child.sh");
+        std::fs::write(&child, "#!/bin/sh\necho \"width $COLUMNS\"\n").unwrap();
+        std::fs::set_permissions(&child, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        // (#2976) The first exec of a fresh executable is scanned; do it
+        // outside the panel's spawn bound.
+        let _ = std::process::Command::new(&child).output();
+        let mut state = app_state();
+        state.panels.child_exe = Some(child);
+        let serve = |cols: &str| {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(PANEL_HEADER, "1".parse().unwrap());
+            headers.insert("host", "localhost:8765".parse().unwrap());
+            let params: HashMap<String, String> = [("cols".to_string(), cols.to_string())].into_iter().collect();
+            panel_handler(
+                Path("role-list".to_string()),
+                axum::extract::RawQuery(Some(format!("cols={cols}"))),
+                Query(params),
+                Some(axum::extract::ConnectInfo("127.0.0.1:50000".parse().unwrap())),
+                headers,
+                State(state.clone()),
+            )
+        };
+        let narrow = serve("40").await.unwrap().0;
+        let wide = serve("160").await.unwrap().0;
+        let narrow_again = serve("40").await.unwrap().0;
+        assert_eq!((narrow.cols, narrow.ansi_text.trim()), (40, "width 40"));
+        assert_eq!((wide.cols, wide.ansi_text.trim()), (160, "width 160"), "a wider caller gets its own render");
+        assert_eq!(narrow_again.ansi_text.trim(), "width 40", "callers at one width share the entry");
+    }
+
+    /// Serve panel `id` at `cols` to `peer`, from `state`.
+    async fn serve_at(state: &AppState, id: &str, peer: &str, cols: u16) -> Result<PanelResponse, (StatusCode, String)> {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(PANEL_HEADER, "1".parse().unwrap());
+        headers.insert("host", "localhost:8765".parse().unwrap());
+        let params: HashMap<String, String> = [("cols".to_string(), cols.to_string())].into_iter().collect();
+        panel_handler(
+            Path(id.to_string()),
+            axum::extract::RawQuery(Some(format!("cols={cols}"))),
+            Query(params),
+            Some(axum::extract::ConnectInfo(peer.parse().unwrap())),
+            headers,
+            State(state.clone()),
+        )
+        .await
+        .map(|j| j.0)
+    }
+
+    /// A child that logs each run to `runs` and prints its width.
+    fn counting_child(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let runs = dir.join("runs.log");
+        let child = dir.join("child.sh");
+        std::fs::write(&child, format!("#!/bin/sh\necho run >> '{}'\necho \"width $COLUMNS [$DARKMUX_PANEL_AUDIENCE]\"\n", runs.display())).unwrap();
+        std::fs::set_permissions(&child, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        // (#2976) The first exec of a fresh executable is scanned; do it
+        // outside the panel's spawn bound.
+        let _ = std::process::Command::new(&child).output();
+        let _ = std::fs::remove_file(&runs);
+        (child, runs)
+    }
+
+    /// A remote caller is redacted, never refused: inside doctor's remote
+    /// floor, a caller at another width than the last remote run is served
+    /// that run (it says its own width) rather than refused for its width.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_remote_caller_at_another_width_inside_the_floor_reads_the_last_remote_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let (child, runs) = counting_child(dir.path());
+        let mut state = app_state();
+        state.panels.child_exe = Some(child);
+        let first = serve_at(&state, "doctor", "100.64.1.2:50000", 40).await.expect("a remote caller runs doctor");
+        // Another panel's newer remote run is never the fallback.
+        let mut stranger = probe_body();
+        stranger.ansi_text = "another panel".into();
+        state.panels.cache.lock().await.insert(audience_key("role-list", true, 160), CacheEntry { body: stranger, captured: SystemTime::now() });
+        let other = serve_at(&state, "doctor", "100.64.9.9:50000", 160).await.expect("a remote caller at another width is answered");
+        assert_eq!(std::fs::read_to_string(&runs).unwrap().lines().count(), 1, "no new probe inside the floor");
+        assert_eq!((other.cols, other.ansi_text), (first.cols, first.ansi_text), "it reads the last remote run, at that run's width");
+    }
+
+    /// Every width a caller can ask for renders at one of a few widths, so a
+    /// reader sweeping the whole range cannot start a child per width (165 of
+    /// them every TTL) nor fill the cache with an entry per width. A render
+    /// is never wider than the caller asked for.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_caller_sweeping_every_width_starts_one_render_per_width_bucket() {
+        let dir = tempfile::tempdir().unwrap();
+        let (child, runs) = counting_child(dir.path());
+        let mut state = app_state();
+        state.panels.child_exe = Some(child);
+        for cols in 36..=200u16 {
+            let body = serve_at(&state, "role-list", "100.64.1.2:50000", cols).await.unwrap();
+            assert!(body.cols <= cols, "rendered {} for a caller that asked for {cols}", body.cols);
+            assert_eq!(body.ansi_text.trim(), format!("width {} [remote]", body.cols));
+        }
+        let spawned = std::fs::read_to_string(&runs).unwrap().lines().count();
+        assert!(spawned <= COLS_BUCKETS.len(), "{spawned} renders for one sweep");
+        assert!(state.panels.cache.lock().await.len() <= COLS_BUCKETS.len());
+    }
+
+    /// The width in the key multiplies the entries one caller can make, so a
+    /// kept run drops every entry older than [`PANEL_CACHE_RETAIN`], which is
+    /// past every TTL and the manual floor (nothing still served is lost).
+    #[tokio::test]
+    async fn keeping_a_run_drops_entries_past_the_retention() {
+        for id in PANEL_IDS {
+            let spec = panel_spec(id).unwrap();
+            assert!(spec.cache_ttl <= PANEL_CACHE_RETAIN, "{id}: its TTL outlives the retention");
+        }
+        assert!(MANUAL_MIN_INTERVAL <= PANEL_CACHE_RETAIN);
+        let state = app_state();
+        let spec = panel_spec("role-list").unwrap();
+        let old = SystemTime::now() - PANEL_CACHE_RETAIN - Duration::from_secs(1);
+        let young = SystemTime::now() - Duration::from_secs(1);
+        {
+            let mut cache = state.panels.cache.lock().await;
+            cache.insert("old".into(), CacheEntry { body: probe_body(), captured: old });
+            cache.insert("young".into(), CacheEntry { body: probe_body(), captured: young });
+        }
+        keep_panel_run(&state, &spec, false, "new".into(), &probe_body()).await;
+        let cache = state.panels.cache.lock().await;
+        let mut keys: Vec<&String> = cache.keys().collect();
+        keys.sort();
+        assert_eq!(keys, ["new", "young"]);
     }
 
     /// (5.0 review item 4) A caller that is not this machine can neither lock

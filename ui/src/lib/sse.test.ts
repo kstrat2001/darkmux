@@ -76,14 +76,92 @@ describe("startFlowTail", () => {
 
     MockEventSource.instances[0].emit(JSON.stringify({ action: "dispatch.start", ts: "2026-08-09T00:00:00Z", execution_id: "exec-1" }));
     MockEventSource.instances[0].emit(JSON.stringify({ action: "dispatch.complete", ts: "2026-08-09T00:00:05Z", execution_id: "exec-1" }));
+    // Appends are batched per frame; closing writes whatever is waiting.
+    handle.close();
 
     // Appended through the ingest boundary: each record carries its parsed time.
     expect(queryClient.getQueryData(queryKey)).toEqual([
       { action: "dispatch.start", ts: "2026-08-09T00:00:00Z", execution_id: "exec-1", tMs: Date.parse("2026-08-09T00:00:00Z") },
       { action: "dispatch.complete", ts: "2026-08-09T00:00:05Z", execution_id: "exec-1", tMs: Date.parse("2026-08-09T00:00:05Z") },
     ]);
+  });
 
-    handle.close();
+  // Every record used to be its own cache write, and every cache write
+  // re-merges the whole 24h window downstream. Records that arrive inside
+  // one frame are now one write.
+  it("records arriving within one frame land in ONE cache write, after the frame", () => {
+    vi.useFakeTimers();
+    try {
+      const queryClient = new QueryClient();
+      const queryKey = ["flow", "2026-08-09", "tail"];
+      const writes = vi.spyOn(queryClient, "setQueryData");
+      const handle = startFlowTail(queryClient, queryKey, "2026-08-09", (url) => new MockEventSource(url) as unknown as EventSource);
+      for (let i = 0; i < 3; i++) {
+        MockEventSource.instances[0].emit(JSON.stringify({ action: "dispatch.turn.heartbeat", ts: `2026-08-09T00:00:0${i}Z`, session_id: "s1" }));
+      }
+      expect(writes).not.toHaveBeenCalled();
+      vi.advanceTimersToNextFrame();
+      expect(writes).toHaveBeenCalledTimes(1);
+      expect((queryClient.getQueryData(queryKey) as unknown[]).length).toBe(3);
+      handle.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("close() writes what is still waiting for its frame, so a day rollover loses nothing", () => {
+    vi.useFakeTimers();
+    try {
+      const queryClient = new QueryClient();
+      const queryKey = ["flow", "2026-08-09", "tail"];
+      const handle = startFlowTail(queryClient, queryKey, "2026-08-09", (url) => new MockEventSource(url) as unknown as EventSource);
+      MockEventSource.instances[0].emit(JSON.stringify({ action: "dispatch.start", ts: "2026-08-09T23:59:59Z", session_id: "s1" }));
+      handle.close();
+      expect((queryClient.getQueryData(queryKey) as unknown[]).length).toBe(1);
+      // And the cancelled frame does not write it a second time.
+      vi.advanceTimersToNextFrame();
+      expect((queryClient.getQueryData(queryKey) as unknown[]).length).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // A hidden tab runs no animation frames, so a frame-only flush would hold
+  // every record until the tab is shown again.
+  it("a hidden tab still writes its records, on a timer instead of a frame", () => {
+    vi.useFakeTimers();
+    Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
+    try {
+      const queryClient = new QueryClient();
+      const queryKey = ["flow", "2026-08-09", "tail"];
+      const handle = startFlowTail(queryClient, queryKey, "2026-08-09", (url) => new MockEventSource(url) as unknown as EventSource);
+      vi.spyOn(window, "requestAnimationFrame").mockImplementation(() => 0); // frames never come
+      MockEventSource.instances[0].emit(JSON.stringify({ action: "dispatch.start", ts: "2026-08-09T00:00:00Z", session_id: "s1" }));
+      vi.advanceTimersByTime(1_000);
+      expect((queryClient.getQueryData(queryKey) as unknown[] | undefined)?.length).toBe(1);
+      handle.close();
+    } finally {
+      Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+      vi.useRealTimers();
+    }
+  });
+
+  it("a tab going hidden writes what was waiting for a frame at once", () => {
+    vi.useFakeTimers();
+    try {
+      const queryClient = new QueryClient();
+      const queryKey = ["flow", "2026-08-09", "tail"];
+      const handle = startFlowTail(queryClient, queryKey, "2026-08-09", (url) => new MockEventSource(url) as unknown as EventSource);
+      vi.spyOn(window, "requestAnimationFrame").mockImplementation(() => 0); // the frame never comes
+      MockEventSource.instances[0].emit(JSON.stringify({ action: "dispatch.start", ts: "2026-08-09T00:00:00Z", session_id: "s1" }));
+      Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
+      document.dispatchEvent(new Event("visibilitychange"));
+      expect((queryClient.getQueryData(queryKey) as unknown[] | undefined)?.length).toBe(1);
+      handle.close();
+    } finally {
+      Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+      vi.useRealTimers();
+    }
   });
 
   it("drops a malformed record instead of throwing", () => {

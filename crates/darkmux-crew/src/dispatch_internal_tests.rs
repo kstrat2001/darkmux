@@ -3863,7 +3863,7 @@ S(("127.0.0.1", port), H).serve_forever()
         let target = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
         let role = crate::loader::load_roles().unwrap().into_iter().find(|r| r.id == "coder").expect("the coder role");
         let opts = dispatch_preflight_probe_opts();
-        let (model, profile, _) = resolve_container_model(&role, &opts, Some(&target)).unwrap();
+        let (model, profile, _, _) = resolve_container_model(&role, &opts, Some(&target)).unwrap();
         assert_eq!((model.as_str(), profile.as_str()), ("darkmux:TensorFold/m", "p"));
     }
 
@@ -4021,7 +4021,7 @@ S(("127.0.0.1", port), H).serve_forever()
         };
         let target = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
         let role = crate::loader::load_roles().unwrap().into_iter().find(|r| r.id == "coder").expect("the coder role");
-        let (model, profile, _) = resolve_container_model(&role, &dispatch_preflight_probe_opts(), Some(&target)).unwrap();
+        let (model, profile, _, _) = resolve_container_model(&role, &dispatch_preflight_probe_opts(), Some(&target)).unwrap();
         assert_eq!((model.as_str(), profile.as_str()), ("flint", "p"));
     }
 
@@ -11024,7 +11024,7 @@ S(("127.0.0.1", port), H).serve_forever()
         assert!(args.contains("Some(resolved_profile.clone()),"), "profile argument: {args}");
         assert!(args.contains("opts.finding_sites.clone(),"), "finding_sites argument: {args}");
         assert!(
-            src.contains("        (r.wire_id, r.profile_name)\n"),
+            src.contains("        (r.wire_id, r.profile_name, r.hold)\n"),
             "the profile in play is the one the model resolution returned"
         );
     }
@@ -15884,7 +15884,7 @@ S(("127.0.0.1", port), H).serve_forever()
     fn ensure_utility_resident_warns_and_does_not_abort_on_load_failure() {
         let warning = super::ensure_utility_resident(Some("util-4b"), Some(68_000), |_pm| {
             anyhow::bail!("insufficient RAM")
-        })
+        }).unwrap()
         .expect("a failed load must produce a warning");
         assert!(warning.contains("util-4b"), "{warning}");
         assert!(warning.contains("68000"), "{warning}");
@@ -15904,6 +15904,42 @@ S(("127.0.0.1", port), H).serve_forever()
         );
     }
 
+    /// A compactor load refused for memory (`busy`, `memory_in_use`,
+    /// `wont_fit`) fails the dispatch before its container starts, with the
+    /// code: a run started anyway would die at its first compaction. A load
+    /// that failed any other way is still only a warning.
+    #[test]
+    fn a_compactor_load_refused_for_memory_fails_the_dispatch_with_its_code() {
+        for code in ["busy", "memory_in_use", "wont_fit"] {
+            let mut compaction = crate::dispatch::CompactionDispatchArgs {
+                compactor_model: Some("util-4b".to_string()),
+                ..Default::default()
+            };
+            let refused = super::apply_compactor_setup(&mut compaction, "util-4b", Some(64_000), false, |_pm, _src| {
+                Err(anyhow::Error::new(crate::engine_dispatch::refuse(code, "short of memory")).context("darkmux: loading `darkmux:util-4b` was refused"))
+            });
+            let err = refused.expect_err("a refusal fails the dispatch");
+            assert_eq!(crate::engine_dispatch::refusal_code(&err), Some(code), "{err:#}");
+            assert!(format!("{err:#}").contains("util-4b"), "{err:#}");
+        }
+        let mut compaction = crate::dispatch::CompactionDispatchArgs { compactor_model: Some("util-4b".to_string()), ..Default::default() };
+        let warning = super::apply_compactor_setup(&mut compaction, "util-4b", Some(64_000), false, |_pm, _src| anyhow::bail!("lms load failed"))
+            .expect("a plain load failure does not fail the dispatch");
+        assert!(warning.is_some_and(|w| w.contains("WARNING")), "it warns, as before");
+    }
+
+    /// The refused compactor's dispatch ends with a `dispatch.error` carrying
+    /// the code; any other launch failure is left to the bookend guard.
+    #[test]
+    fn a_launch_refused_for_memory_ends_with_the_refusal_code() {
+        let refused = anyhow::Error::new(crate::engine_dispatch::refuse("memory_in_use", "short")).context("compactor");
+        match super::refused_launch_terminal(&refused, 5, None, None) {
+            Some(darkmux_flow::Payload::DispatchError(p)) => assert_eq!(p.code.as_deref(), Some("memory_in_use")),
+            other => panic!("{other:?}"),
+        }
+        assert!(super::refused_launch_terminal(&anyhow::anyhow!("docker run failed"), 5, None, None).is_none());
+    }
+
     /// Success and not-configured are both silent (no warning): the load ran
     /// with the window-sized spec on success, and no compactor / no window
     /// means nothing to ensure.
@@ -15913,12 +15949,12 @@ S(("127.0.0.1", port), H).serve_forever()
         let result = super::ensure_utility_resident(Some("util-4b"), Some(68_000), |pm| {
             loaded.lock().unwrap().push((pm.id.clone(), pm.n_ctx));
             Ok(())
-        });
+        }).unwrap();
         assert!(result.is_none());
         assert_eq!(*loaded.lock().unwrap(), vec![("util-4b".to_string(), Some(68_000))]);
 
-        assert!(super::ensure_utility_resident(None, Some(68_000), |_| Ok(())).is_none());
-        assert!(super::ensure_utility_resident(Some("util-4b"), None, |_| Ok(())).is_none());
+        assert!(super::ensure_utility_resident(None, Some(68_000), |_| Ok(())).unwrap().is_none());
+        assert!(super::ensure_utility_resident(Some("util-4b"), None, |_| Ok(())).unwrap().is_none());
     }
 
     // ── (#2536) The compactor's WIRE model id must be the namespaced identifier ──
@@ -15992,7 +16028,7 @@ S(("127.0.0.1", port), H).serve_forever()
         let warning = super::apply_compactor_residency(&mut compaction, "util-4b", 68_000, |pm| {
             ensured.lock().unwrap().push((pm.id.clone(), pm.n_ctx));
             Ok(())
-        });
+        }).unwrap();
         assert!(warning.is_none(), "a successful load must not warn: {warning:?}");
         assert_eq!(
             ensured.lock().unwrap().as_slice(),
@@ -16028,7 +16064,7 @@ S(("127.0.0.1", port), H).serve_forever()
             None,
             false,
             |_pm, _src| Ok(()),
-        );
+        ).unwrap();
         assert!(warning.is_some(), "must warn on refusal when neither window is set");
         assert!(warning.as_ref().unwrap().contains("refusing compaction"));
         assert_eq!(
@@ -16060,7 +16096,7 @@ S(("127.0.0.1", port), H).serve_forever()
             Some(64_000),
             false,
             |_pm, _src| Ok(()),
-        );
+        ).unwrap();
         assert!(warning.is_none());
         assert_eq!(
             compaction.compactor_model.as_deref(),
@@ -16080,7 +16116,7 @@ S(("127.0.0.1", port), H).serve_forever()
             ..Default::default()
         };
         let warning =
-            super::apply_compactor_residency(&mut compaction, "util-4b", 68_000, |_pm| Ok(()));
+            super::apply_compactor_residency(&mut compaction, "util-4b", 68_000, |_pm| Ok(())).unwrap();
         assert!(warning.is_none());
 
         let config = DockerRunConfig {
@@ -16144,12 +16180,12 @@ S(("127.0.0.1", port), H).serve_forever()
             compactor_model: Some("util-4b".to_string()),
             ..Default::default()
         };
-        super::apply_compactor_residency(&mut bare, "util-4b", 68_000, |_| Ok(()));
+        super::apply_compactor_residency(&mut bare, "util-4b", 68_000, |_| Ok(())).unwrap();
         let mut namespaced = crate::dispatch::CompactionDispatchArgs {
             compactor_model: Some("darkmux:util-4b".to_string()),
             ..Default::default()
         };
-        super::apply_compactor_residency(&mut namespaced, "darkmux:util-4b", 68_000, |_| Ok(()));
+        super::apply_compactor_residency(&mut namespaced, "darkmux:util-4b", 68_000, |_| Ok(())).unwrap();
         assert_eq!(
             bare.compactor_model, namespaced.compactor_model,
             "#1615: both spellings of internal.utility must dispatch identically"
@@ -16172,7 +16208,7 @@ S(("127.0.0.1", port), H).serve_forever()
         };
         let warning = super::apply_compactor_residency(&mut compaction, "util-4b", 68_000, |_pm| {
             anyhow::bail!("insufficient RAM")
-        });
+        }).unwrap();
         assert!(warning.is_some(), "a load failure must still warn");
         assert_eq!(
             compaction.compactor_model.as_deref(),
@@ -19538,6 +19574,44 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         );
     }
 
+    /// (#3450, operator "Stop all") The tier-5 records name the engine
+    /// servers the breaker stopped, and the ones it could not, beside the LM
+    /// Studio sweep; when LM Studio could not even be listed, the servers it
+    /// still stopped are named on the failure record.
+    #[test]
+    fn the_tier5_records_name_the_engine_servers_it_stopped() {
+        use darkmux_profiles::ownership::{EjectFailure as Fail, EjectSummary, EjectedServer, ServerEjectSummary};
+        let server = |e: &str| EjectedServer { endpoint: e.into(), model: format!("m/{e}"), pid: 42, without_lock: false };
+        let servers = ServerEjectSummary {
+            stopped: vec![server("tf"), EjectedServer { without_lock: true, ..server("loading") }],
+            skipped: vec![server("gone")],
+            failed: vec![Fail { identifier: "fl".into(), error: "did not stop".into() }],
+            ..Default::default()
+        };
+        let lms = Ok(EjectSummary { ejected: Vec::new(), user_loaded_count: 0, failed: Vec::new() });
+        let records = super::tier5_records(lms, &servers, true);
+        let json: Vec<serde_json::Value> = records.iter().map(|p| serde_json::to_value(p).unwrap()).collect();
+        let actions: Vec<String> = records.iter().map(|p| p.action().as_str().to_string()).collect();
+        assert_eq!(actions, vec!["thermal.tier5_eject", "thermal.tier5_eject_failed"]);
+        assert_eq!(
+            json[0]["stopped_servers"],
+            serde_json::json!([
+                {"endpoint": "tf", "model": "m/tf", "pid": 42},
+                {"endpoint": "loading", "model": "m/loading", "pid": 42, "without_lock": true}
+            ]),
+            "{}",
+            json[0]
+        );
+        assert_eq!(json[0]["skipped_servers"], serde_json::json!([{"endpoint": "gone", "model": "m/gone", "pid": 42}]), "{}", json[0]);
+        assert_eq!(json[1]["failed_servers"], serde_json::json!([{"identifier": "fl", "error": "did not stop"}]), "{}", json[1]);
+        let unlisted = super::tier5_records(Err(anyhow::anyhow!("lms unreachable")), &servers, false);
+        let only: Vec<serde_json::Value> = unlisted.iter().map(|p| serde_json::to_value(p).unwrap()).collect();
+        assert_eq!(only.len(), 1);
+        assert_eq!(only[0]["error"], "lms unreachable");
+        assert_eq!(only[0]["stopped_servers"][0]["endpoint"], "tf", "{}", only[0]);
+        assert_eq!(only[0]["skipped_servers"][0]["endpoint"], "gone", "{}", only[0]);
+    }
+
     /// (C3) The tier-5 eject records, pinned by behavior through the seam
     /// that made it possible. `tier5_eject_on_critical` itself cannot be
     /// driven in-process — it shells out to `lms` to unload real residents
@@ -19570,6 +19644,8 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
                 reached_checkpoint_boundary: true,
                 ejected: Vec::new(),
                 user_loaded_count: 0,
+                stopped_servers: None,
+                skipped_servers: None,
                 simulated_host_source: None,
                 step_id: None,
                 context: None,
@@ -19582,6 +19658,9 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             failed: None,
             ejected_count: None,
             error: Some("lms unreachable".to_string()),
+            failed_servers: None,
+            stopped_servers: None,
+            skipped_servers: None,
             simulated_host_source: None,
             step_id: None,
             context: None,

@@ -684,7 +684,10 @@ fn a_model_that_will_not_load_fails_before_a_record() {
     let (res, _) = run(&rig, rig.opts());
     let err = format!("{:#}", res.expect_err("load failure"));
     assert!(err.starts_with("model selection failed: darkmux: model `model-a` could not load at n_ctx=32000"), "{err}");
-    assert_eq!(rig.lms_log(), vec!["ps --json", "load model-a --context-length 32000 --identifier darkmux:model-a -y"]);
+    // The load is priced off the catalog for its reservation (#3514), its
+    // memory decided as a wave's on LM Studio's residents read again under
+    // the residency lock.
+    assert_eq!(rig.lms_log(), vec!["ps --json", "ps --json", "ls --json", "load model-a --context-length 32000 --identifier darkmux:model-a -y"]);
     assert!(rig.docker_run().is_none());
     assert!(bookends(&rig).is_empty(), "records: {:?}", rig.actions());
 }
@@ -1021,6 +1024,25 @@ fn a_model_that_is_not_resident_is_loaded_namespaced_at_its_context() {
     res.unwrap();
     let lms = rig.lms_log();
     assert!(lms.contains(&"load model-a --context-length 32000 --identifier darkmux:model-a -y".to_string()), "{lms:?}");
+}
+
+/// (#3514) The same reload while another dispatch holds that instance (its
+/// lease names it): it is serving that dispatch at its own context, so it
+/// is never unloaded under it, and the dispatch is refused `busy`.
+#[test]
+#[serial]
+fn a_model_another_dispatch_holds_at_the_wrong_context_is_never_unloaded() {
+    own_process!();
+    let rig = Rig::new();
+    rig.resident(&[("darkmux:model-a", "model-a", 4096)]);
+    rig.container(ONE_TURN, ENVELOPE, "", 0);
+    let other = darkmux_types::residency_lease::LeaseGuard::acquire();
+    other.write(&["darkmux:model-a".to_string()]).unwrap();
+    let (res, _) = run(&rig, rig.opts());
+    drop(other);
+    let err = res.expect_err("refused");
+    assert_eq!(darkmux_crew::engine_dispatch::refusal_code(&err), Some("busy"), "{err:#}");
+    assert!(rig.lms_log().iter().all(|l| !l.starts_with("unload")), "{:?}", rig.lms_log());
 }
 
 #[test]
@@ -1747,6 +1769,59 @@ fn scenario(rig: &mut Rig, lines: &str) -> PathBuf {
     path
 }
 
+/// (#3450) A process standing in for an engine server darkmux started,
+/// recorded under the isolated home's `run/engines/`; killed when dropped.
+struct ServerStandIn(std::process::Child);
+
+impl ServerStandIn {
+    fn id(&self) -> u32 {
+        self.0.id()
+    }
+    fn alive(&self) -> bool {
+        let out = std::process::Command::new("ps").args(["-o", "stat=", "-p", &self.id().to_string()]).output().unwrap();
+        let stat = String::from_utf8_lossy(&out.stdout);
+        !stat.trim().is_empty() && !stat.trim_start().starts_with('Z')
+    }
+}
+
+impl Drop for ServerStandIn {
+    fn drop(&mut self) {
+        let _ = darkmux_types::child_registry::kill_group(self.id(), darkmux_types::child_registry::SIGKILL);
+        let _ = self.0.wait();
+    }
+}
+
+fn engine_server_stand_in(endpoint: &str) -> ServerStandIn {
+    let mut cmd = std::process::Command::new("sleep");
+    cmd.arg("30");
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let child = cmd.spawn().unwrap();
+    let stamp = (0..50)
+        .find_map(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            darkmux_platform::current().process_start_stamp(child.id())
+        })
+        .expect("a start stamp");
+    let model = format!("TensorFold/{endpoint}");
+    let rec = darkmux_types::engine_record::EngineRecord {
+        schema: darkmux_types::engine_record::ENGINE_RECORD_SCHEMA,
+        endpoint: endpoint.into(),
+        engine: "tensorfold".into(),
+        model: model.clone(),
+        n_ctx: 8192,
+        port: 1,
+        pid: child.id(),
+        start_stamp: stamp,
+        owner_pid: std::process::id(),
+        argv: vec!["tensorfold-native".into(), "--name".into(), format!("darkmux:{model}")],
+        log: "/dev/null".into(),
+        started_at_ms: 0,
+        engine_version: "tensorfold-native 1.2.4".into(),
+    };
+    darkmux_types::engine_record::write_in(&darkmux_types::engine_record::dir(), &rec).unwrap();
+    ServerStandIn(child)
+}
+
 fn rests(rig: &Rig) -> Vec<Value> {
     rig.flows().into_iter().filter(|r| r["action"] == "dispatch.rest").collect()
 }
@@ -1761,6 +1836,11 @@ fn a_critical_machine_trips_the_breaker_writes_the_pace_file_and_ejects_darkmux_
     rig.fake("lms-ps-after-unload.json", lms_ps(&[("users-own", "users-own", 4096)]));
     rig.container(ONE_TURN, ENVELOPE, "", 0);
     rig.fake("run-script", "sleep 3\n");
+    // (#3450, operator "Stop all") An engine server darkmux started, held by
+    // another dispatch's lease: tier 5 stops it too.
+    let server = engine_server_stand_in("tf");
+    let other = darkmux_types::residency_lease::LeaseGuard::acquire();
+    other.write(&["darkmux:TensorFold/tf".to_string()]).unwrap();
     let (res, stderr) = run(&rig, rig.opts());
     let out = res.unwrap().out_dir.unwrap();
     let sim = script.display().to_string();
@@ -1779,6 +1859,9 @@ fn a_critical_machine_trips_the_breaker_writes_the_pace_file_and_ejects_darkmux_
     let eject = payload(&rig.record("thermal.tier5_eject")).clone();
     assert_eq!(eject["ejected"], json!([{"identifier": "darkmux:model-a", "context": 32000}]), "{eject}");
     assert_eq!(eject["user_loaded_count"], 1);
+    assert_eq!(eject["stopped_servers"], json!([{"endpoint": "tf", "model": "TensorFold/tf", "pid": server.id()}]), "{eject}");
+    assert!(!server.alive(), "the held engine server is stopped");
+    drop(other);
     let hw = payload(&rig.record("dispatch.complete"))["host_window"].clone();
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) || darkmux_platform::current().memory_snapshot().is_some() {
         assert_eq!((hw["thermal_worst_state"].as_str(), hw["simulated_host_source"].as_str()), (Some("critical"), Some(sim.as_str())));

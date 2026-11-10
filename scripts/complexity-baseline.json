@@ -400,7 +400,6 @@
   "ui/src/lib/eventFilters.ts::matchesFilters": 13,
   "ui/src/lib/eventFilters.ts::readStoredPicksAt": 11,
   "ui/src/lib/flow.ts::flowToRenderModel.retagged": 11,
-  "ui/src/lib/flow.ts::perSessionRuntimeRecords": 11,
   "ui/src/lib/hashSync.ts::canonicalHash": 14,
   "ui/src/lib/ingest.ts::recordsAsOf": 11,
   "ui/src/lib/lifecycle.ts::closeEdgeOf": 13,

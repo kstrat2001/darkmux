@@ -386,7 +386,7 @@ fn resolve_role(
     role_id: &str,
     profiles: Result<&ProfilesCtx, &str>,
     bindings: &dyn Fn(&str) -> RoleBinding,
-    loaded_models: Result<&[LoadedModel], &str>,
+    loaded_models: ResidencyFacts<'_>,
 ) -> RoleResolution {
     let unresolved = |error: String| RoleResolution {
         role_id: role_id.to_string(),
@@ -483,7 +483,7 @@ fn resolve_role(
         }
     }
 
-    let (residency, residency_detail) = model_residency(pm, loaded_models);
+    let (residency, residency_detail) = residency_of(pm, loaded_models);
     RoleResolution {
         role_id: role_id.to_string(),
         profile: Some(resolved.profile_name.clone()),
@@ -497,6 +497,41 @@ fn resolve_role(
         residency_detail,
         error: None,
     }
+}
+
+/// What `mission config show` knows about what is resident: LM Studio's
+/// listing (or why it could not be read), and (#3450) the servers darkmux
+/// started, from their records.
+#[derive(Clone, Copy)]
+pub(crate) struct ResidencyFacts<'a> {
+    pub lms: Result<&'a [LoadedModel], &'a str>,
+    pub servers: &'a [darkmux_serve::wire::EngineServer],
+}
+
+/// (#3450) `pm`'s residency: for a model on an endpoint darkmux starts
+/// servers for (Tensorfold, rec's Flint), darkmux's server on that endpoint,
+/// read from its record and never from LM Studio; otherwise LM Studio's
+/// ([`model_residency`]).
+fn residency_of(pm: &darkmux_types::ProfileModel, facts: ResidencyFacts<'_>) -> (Residency, Option<String>) {
+    if !crate::machine_servers::on_a_server(pm) {
+        return model_residency(pm, facts.lms);
+    }
+    let endpoint = pm.endpoint.as_ref().and_then(|e| e.named_id());
+    let Some(s) = facts.servers.iter().find(|s| Some(s.endpoint.as_str()) == endpoint && s.model == pm.id) else {
+        return (Residency::NotLoaded, None);
+    };
+    if pm.n_ctx == Some(s.n_ctx) {
+        let detail = format!("served ({} on endpoint `{}`, port {}, ctx {})", s.engine, s.endpoint, s.port, s.n_ctx);
+        return (Residency::Loaded, Some(detail));
+    }
+    let detail = format!(
+        "served at ctx {} ({} on endpoint `{}`), not the profile's {}; launch would restart the server",
+        s.n_ctx,
+        s.engine,
+        s.endpoint,
+        pm.n_ctx.unwrap_or(0)
+    );
+    (Residency::LoadedStaleCtx, Some(detail))
 }
 
 /// Whether `pm` (a resolved role's model) is currently loaded, and — for
@@ -586,7 +621,7 @@ pub(crate) fn build_show(
     registry: &StepKindRegistry,
     profiles: Result<&ProfilesCtx, &str>,
     bindings: &dyn Fn(&str) -> RoleBinding,
-    loaded_models: Result<&[LoadedModel], &str>,
+    loaded_models: ResidencyFacts<'_>,
     warnings: &[String],
 ) -> ConfigShow {
     let config: &MissionConfig = &loaded.config;
@@ -641,7 +676,7 @@ pub(crate) fn build_show(
             error: Some(e.to_string()),
         },
     };
-    let residency_json = match loaded_models {
+    let residency_json = match loaded_models.lms {
         Ok(_) => ResidencyBlockJson { available: true, error: None },
         Err(e) => ResidencyBlockJson { available: false, error: Some(e.to_string()) },
     };
@@ -999,7 +1034,8 @@ fn show(id: &str, params: &[String], profiles_file: Option<&str>, json: bool) ->
     let profiles_ctx = profiles_owned.as_ref().map_err(|e| e.as_str());
 
     let loaded_models_owned = engine::local().loaded().map_err(|e| format!("{e:#}"));
-    let loaded_models = loaded_models_owned.as_deref().map_err(|e| e.as_str());
+    let servers = darkmux_profiles::engine::server::listed(&darkmux_profiles::engine::server::Dirs::under_home());
+    let loaded_models = ResidencyFacts { lms: loaded_models_owned.as_deref().map_err(|e| e.as_str()), servers: &servers };
 
     let show = build_show(id, &loaded, &registry, profiles_ctx, &bindings, loaded_models, &warnings);
 
@@ -1109,6 +1145,11 @@ mod tests {
         ProfileRegistry { profiles: map, default_profile: default.map(String::from), ..Default::default() }
     }
 
+    /// LM Studio's listing (or why it failed) and no engine server.
+    fn facts<'a>(lms: Result<&'a [LoadedModel], &'a str>) -> ResidencyFacts<'a> {
+        ResidencyFacts { lms, servers: &[] }
+    }
+
     fn ctx(registry: ProfileRegistry) -> ProfilesCtx {
         ProfilesCtx { registry, path: "<test-profiles>.json".to_string() }
     }
@@ -1144,7 +1185,7 @@ mod tests {
             )],
         )]);
         let loaded = loaded_doc(cfg);
-        let show = build_show("m", &loaded, &registry, Err("no registry needed"), &|_| RoleBinding::Unmapped, Err("no lms needed"), &[]);
+        let show = build_show("m", &loaded, &registry, Err("no registry needed"), &|_| RoleBinding::Unmapped, facts(Err("no lms needed")), &[]);
         let steps = &show.phases[0].tasks[0].steps;
         assert!(steps[0].constructible, "procedural.noop must be constructible");
         assert!(!steps[1].constructible, "totally.unknown must NOT be constructible");
@@ -1171,7 +1212,7 @@ mod tests {
             "role-b" => RoleBinding::Mapped("fast".to_string()),
             _ => RoleBinding::Unmapped,
         };
-        let show = build_show("m", &loaded, &registry, Ok(&pctx), &bindings, Ok(&[]), &[]);
+        let show = build_show("m", &loaded, &registry, Ok(&pctx), &bindings, facts(Ok(&[])), &[]);
         let roles: Vec<&RoleResolution> =
             show.phases[0].tasks.iter().map(|t| t.role.as_ref().unwrap()).collect();
         assert_eq!(roles[0].provenance, Some(RoleProfileSource::Overridden));
@@ -1202,7 +1243,7 @@ mod tests {
             "role-broken" => RoleBinding::Mapped("ghost-profile".to_string()),
             _ => RoleBinding::Unmapped,
         };
-        let show = build_show("m", &loaded, &registry, Ok(&pctx), &bindings, Ok(&[]), &[]);
+        let show = build_show("m", &loaded, &registry, Ok(&pctx), &bindings, facts(Ok(&[])), &[]);
         let broken = show.phases[0].tasks[0].role.as_ref().unwrap();
         assert!(broken.error.is_some(), "dangling mapping must be captured as an error");
         assert_eq!(broken.residency, Residency::Unknown);
@@ -1224,10 +1265,10 @@ mod tests {
         .unwrap();
         registry.materialize_endpoints();
         let pctx = ctx(registry);
-        let r = resolve_role("coder", Ok(&pctx), &|_| RoleBinding::Unmapped, Ok(&[]));
+        let r = resolve_role("coder", Ok(&pctx), &|_| RoleBinding::Unmapped, facts(Ok(&[])));
         assert!(r.model.is_none(), "{:?}", r.model);
         assert!(r.error.as_deref().is_some_and(|e| e.contains("nope")), "{:?}", r.error);
-        let unknown_role = resolve_role("role-a", Ok(&pctx), &|_| RoleBinding::Unmapped, Ok(&[]));
+        let unknown_role = resolve_role("role-a", Ok(&pctx), &|_| RoleBinding::Unmapped, facts(Ok(&[])));
         assert!(unknown_role.error.as_deref().is_some_and(|e| e.contains("nope")), "{:?}", unknown_role.error);
     }
 
@@ -1245,7 +1286,7 @@ mod tests {
         .unwrap();
         registry.materialize_endpoints();
         let pctx = ctx(registry);
-        let r = resolve_role("coder", Ok(&pctx), &|_| RoleBinding::Unmapped, Ok(&[]));
+        let r = resolve_role("coder", Ok(&pctx), &|_| RoleBinding::Unmapped, facts(Ok(&[])));
         assert!(r.model.is_none(), "{:?}", r.model);
         assert!(r.error.as_deref().is_some_and(|e| e.contains("nope")), "{:?}", r.error);
     }
@@ -1265,10 +1306,10 @@ mod tests {
         let mut profiles = reg(vec![("mixed", vec![model("generalist", "reasoning"), model("codestar", "code")])], Some("mixed"));
         profiles.profiles.get_mut("mixed").unwrap().default_model = Some("generalist".to_string());
         let pctx = ctx(profiles);
-        let r = resolve_role("coder", Ok(&pctx), &|_| RoleBinding::Unmapped, Ok(&[]));
+        let r = resolve_role("coder", Ok(&pctx), &|_| RoleBinding::Unmapped, facts(Ok(&[])));
         assert_eq!(r.model.as_ref().map(|m| m.id.as_str()), Some("codestar"), "{:?}", r.error);
         // A role this binary does not know keeps the profile default.
-        let unknown = resolve_role("role-a", Ok(&pctx), &|_| RoleBinding::Unmapped, Ok(&[]));
+        let unknown = resolve_role("role-a", Ok(&pctx), &|_| RoleBinding::Unmapped, facts(Ok(&[])));
         assert_eq!(unknown.model.as_ref().map(|m| m.id.as_str()), Some("generalist"));
     }
 
@@ -1286,7 +1327,7 @@ mod tests {
         let cfg = doc(vec![phase("p1", vec![task("t1", Some("role-a"), vec![step("s1", "k")])])]);
         let loaded = loaded_doc(cfg);
         let pctx = ctx(profiles);
-        let show = build_show("m", &loaded, &registry, Ok(&pctx), &|_| RoleBinding::Unmapped, Ok(&[]), &[]);
+        let show = build_show("m", &loaded, &registry, Ok(&pctx), &|_| RoleBinding::Unmapped, facts(Ok(&[])), &[]);
         let role = show.phases[0].tasks[0].role.as_ref().unwrap();
         assert!(
             role.error.is_some(),
@@ -1308,7 +1349,7 @@ mod tests {
         let cfg = doc(vec![phase("p1", vec![task("t1", Some("role-a"), vec![step("s1", "k")])])]);
         let loaded = loaded_doc(cfg);
         let pctx = ctx(profiles);
-        let show = build_show("m", &loaded, &registry, Ok(&pctx), &|_| RoleBinding::Unmapped, Ok(&[]), &[]);
+        let show = build_show("m", &loaded, &registry, Ok(&pctx), &|_| RoleBinding::Unmapped, facts(Ok(&[])), &[]);
         let role = show.phases[0].tasks[0].role.as_ref().unwrap();
         assert!(role.error.is_none(), "an unmanaged model must never be gated on n_ctx: {:?}", role.error);
         assert_eq!(role.residency, Residency::Unmanaged);
@@ -1327,7 +1368,7 @@ mod tests {
             let cfg = doc(vec![phase("p1", vec![task("t1", Some("role-a"), vec![step("s1", "k")])])]);
             let loaded = loaded_doc(cfg);
             let pctx = ctx(profiles);
-            let show = build_show("m", &loaded, &registry, Ok(&pctx), &|_| RoleBinding::Unmapped, Ok(&[]), &[]);
+            let show = build_show("m", &loaded, &registry, Ok(&pctx), &|_| RoleBinding::Unmapped, facts(Ok(&[])), &[]);
             let role = show.phases[0].tasks[0].role.as_ref().unwrap();
             let m = role.model.as_ref().expect("a resolved role carries its model");
             assert_eq!(m.unmanaged, want_unmanaged, "model {} unmanaged flag", m.id);
@@ -1445,6 +1486,58 @@ mod tests {
         );
     }
 
+    fn tensorfold_model(endpoint: &str, id: &str, n_ctx: u32) -> darkmux_types::ProfileModel {
+        darkmux_types::ProfileModel {
+            id: id.to_string(),
+            n_ctx: Some(n_ctx),
+            endpoint: Some(darkmux_types::ModelEndpoint {
+                managed: Some(darkmux_types::ManagedBackend::Tensorfold.into()),
+                port: Some(8091),
+                source: darkmux_types::EndpointSource::Named(endpoint.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn engine_server(endpoint: &str, model: &str, n_ctx: u32) -> darkmux_serve::wire::EngineServer {
+        darkmux_serve::wire::EngineServer {
+            endpoint: endpoint.into(),
+            engine: "tensorfold".into(),
+            model: model.into(),
+            served_name: format!("darkmux:{model}"),
+            n_ctx,
+            port: 8091,
+            pid: 4242,
+            started_at_ms: 0,
+            answering: true,
+        }
+    }
+
+    /// (#3450) A Tensorfold model's residency is darkmux's server on its
+    /// endpoint, read from the server record, never from LM Studio: loaded
+    /// at its context, loaded at another (a launch restarts it), or not
+    /// loaded; and known when LM Studio cannot be asked.
+    #[test]
+    fn a_tensorfold_models_residency_is_its_server_not_lm_studio() {
+        let m = tensorfold_model("tf", "TensorFold/q38", 262_144);
+        let up = [engine_server("tf", "TensorFold/q38", 262_144)];
+        let (r, detail) = residency_of(&m, ResidencyFacts { lms: Err("lms: command not found"), servers: &up });
+        assert_eq!(r, Residency::Loaded);
+        assert_eq!(detail.as_deref(), Some("served (tensorfold on endpoint `tf`, port 8091, ctx 262144)"));
+        let other_ctx = [engine_server("tf", "TensorFold/q38", 8192)];
+        let (r, detail) = residency_of(&m, ResidencyFacts { lms: Ok(&[]), servers: &other_ctx });
+        assert_eq!(r, Residency::LoadedStaleCtx);
+        assert!(detail.unwrap().contains("ctx 8192"));
+        // An LM Studio load of the same name is not this model's residency.
+        let lms = [loaded_model("TensorFold/q38", true, 262_144)];
+        let (r, detail) = residency_of(&m, ResidencyFacts { lms: Ok(&lms), servers: &[] });
+        assert_eq!((r, detail), (Residency::NotLoaded, None));
+        // An LM Studio model still reads LM Studio.
+        let (r, _) = residency_of(&local_model("m-a", 8000), ResidencyFacts { lms: Ok(&[loaded_model("m-a", true, 32000)]), servers: &up });
+        assert_eq!(r, Residency::Loaded);
+    }
+
     // (`residency_loaded_by_user_when_not_namespaced`, above, already covers
     // the plain `ForeignDuplicate` arm — a bare non-namespaced, non-alias
     // resident.)
@@ -1513,7 +1606,7 @@ mod tests {
         let cfg = doc(vec![phase("p1", vec![task("t1", Some("role-a"), vec![step("s1", "k")])])]);
         let loaded = loaded_doc(cfg);
         let pctx = ctx(profiles);
-        let show = build_show("m", &loaded, &registry, Ok(&pctx), &|_| RoleBinding::Unmapped, Ok(&[]), &[]);
+        let show = build_show("m", &loaded, &registry, Ok(&pctx), &|_| RoleBinding::Unmapped, facts(Ok(&[])), &[]);
         let v = serde_json::to_value(&show).unwrap();
         let role = &v["phases"][0]["tasks"][0]["role"];
         for key in ["role_id", "profile", "provenance", "model", "residency", "error"] {
@@ -1533,7 +1626,7 @@ mod tests {
         let loaded = loaded_doc(cfg);
         let pctx = ctx(profiles);
         let bindings = |_: &str| RoleBinding::Mapped("fast".to_string());
-        let show = build_show("m", &loaded, &registry, Ok(&pctx), &bindings, Ok(&[]), &[]);
+        let show = build_show("m", &loaded, &registry, Ok(&pctx), &bindings, facts(Ok(&[])), &[]);
         let text = render_show_text(&show);
         assert!(
             text.contains("↳ role role-a → profile fast (role_profiles map) → model m-fast"),
@@ -1546,7 +1639,7 @@ mod tests {
         let registry = StepKindRegistry::new(); // empty — nothing constructs
         let cfg = doc(vec![phase("p1", vec![task("t1", None, vec![step("s1", "unknown.kind")])])]);
         let loaded = loaded_doc(cfg);
-        let show = build_show("m", &loaded, &registry, Err("n/a"), &|_| RoleBinding::Unmapped, Err("n/a"), &[]);
+        let show = build_show("m", &loaded, &registry, Err("n/a"), &|_| RoleBinding::Unmapped, facts(Err("n/a")), &[]);
         let text = render_show_text(&show);
         assert!(text.contains("NOT constructible by this binary → launch would exit 4"), "got:\n{text}");
     }
@@ -1560,7 +1653,7 @@ mod tests {
         let cfg = doc(vec![phase("p1", vec![task("t1", Some("role-a"), vec![step("s1", "k")])])]);
         let loaded = loaded_doc(cfg);
         let pctx = ctx(profiles);
-        let show = build_show("m", &loaded, &registry, Ok(&pctx), &|_| RoleBinding::Unmapped, Ok(&[]), &[]);
+        let show = build_show("m", &loaded, &registry, Ok(&pctx), &|_| RoleBinding::Unmapped, facts(Ok(&[])), &[]);
         let text = render_show_text(&show);
         let task_at = text.find("  task t1").expect("task line");
         let role_at = text.find("↳ role role-a").expect("role line");
@@ -1575,7 +1668,7 @@ mod tests {
         let cfg = doc(vec![phase("p1", vec![task("t1", Some("role-a"), vec![step("s1", "k")])])]);
         let loaded = loaded_doc(cfg);
         let pctx = ctx(profiles);
-        let show = build_show("m", &loaded, &registry, Ok(&pctx), &|_| RoleBinding::Unmapped, Ok(&[]), &[]);
+        let show = build_show("m", &loaded, &registry, Ok(&pctx), &|_| RoleBinding::Unmapped, facts(Ok(&[])), &[]);
         assert_eq!(show.phases[0].tasks[0].role.as_ref().unwrap().residency, Residency::NotLoaded);
         let text = render_show_text(&show);
         assert!(text.contains("· not loaded"), "got:\n{text}");
@@ -1594,7 +1687,7 @@ mod tests {
             &registry,
             Err("n/a"),
             &|_| RoleBinding::Unmapped,
-            Err("n/a"),
+            facts(Err("n/a")),
             &warnings,
         );
         let text = render_show_text(&show);
@@ -1611,7 +1704,7 @@ mod tests {
         ph.tasks.push(t);
         let cfg = doc(vec![ph]);
         let loaded = loaded_doc(cfg);
-        let show = build_show("m", &loaded, &registry, Err("n/a"), &|_| RoleBinding::Unmapped, Err("n/a"), &[]);
+        let show = build_show("m", &loaded, &registry, Err("n/a"), &|_| RoleBinding::Unmapped, facts(Err("n/a")), &[]);
         let text = render_show_text(&show);
         assert!(text.contains("bundle, probe, dedup."), "phase description missing:\n{text}");
         assert!(text.contains("\"Bundle the diff\""), "task display_name missing:\n{text}");
@@ -1656,7 +1749,7 @@ mod tests {
             &registry,
             Err("no registry needed"),
             &|_| RoleBinding::Unmapped,
-            Err("no lms needed"),
+            facts(Err("no lms needed")),
             &[],
         );
 
@@ -1706,7 +1799,7 @@ mod tests {
             },
         ];
         let loaded = loaded_doc(cfg);
-        let show = build_show("m", &loaded, &registry, Err("n/a"), &|_| RoleBinding::Unmapped, Err("n/a"), &[]);
+        let show = build_show("m", &loaded, &registry, Err("n/a"), &|_| RoleBinding::Unmapped, facts(Err("n/a")), &[]);
         let text = render_show_text(&show);
         assert!(text.contains("role overrides: example-judge (optional)"), "got:\n{text}");
         assert!(!text.contains("    example-judge (optional)\n"), "must not ALSO list it individually:\n{text}");
@@ -1820,7 +1913,7 @@ mod tests {
     fn header_names_both_ids_when_a_user_tier_alias_shadows_the_document_id() {
         let registry = StepKindRegistry::new();
         let loaded = loaded_doc(doc(vec![])); // doc()'s own id is "m"
-        let show = build_show("foo", &loaded, &registry, Err("n/a"), &|_| RoleBinding::Unmapped, Err("n/a"), &[]);
+        let show = build_show("foo", &loaded, &registry, Err("n/a"), &|_| RoleBinding::Unmapped, facts(Err("n/a")), &[]);
         assert_eq!(show.requested_id, "foo");
         assert_eq!(show.id, "m");
         let text = render_show_text(&show);
@@ -1831,7 +1924,7 @@ mod tests {
     fn header_names_one_id_when_requested_matches_the_document() {
         let registry = StepKindRegistry::new();
         let loaded = loaded_doc(doc(vec![]));
-        let show = build_show("m", &loaded, &registry, Err("n/a"), &|_| RoleBinding::Unmapped, Err("n/a"), &[]);
+        let show = build_show("m", &loaded, &registry, Err("n/a"), &|_| RoleBinding::Unmapped, facts(Err("n/a")), &[]);
         let text = render_show_text(&show);
         assert!(text.starts_with("mission config \"m\" — M\n"), "got:\n{text}");
         assert!(!text.contains("document id"), "got:\n{text}");
@@ -1844,7 +1937,7 @@ mod tests {
         let registry = crate::mission_launch::all_step_kinds().unwrap();
         for id in ["review", "coder-phase"] {
             let loaded = mission_config::load(id).unwrap();
-            let show = build_show(id, &loaded, &registry, Err("no live profiles in this test"), &|_| RoleBinding::Unmapped, Err("no live lms in this test"), &[]);
+            let show = build_show(id, &loaded, &registry, Err("no live profiles in this test"), &|_| RoleBinding::Unmapped, facts(Err("no live lms in this test")), &[]);
             assert_eq!(show.id, id);
             assert!(!show.phases.is_empty());
         }
@@ -1866,7 +1959,7 @@ mod tests {
             &registry,
             Err("no live profiles in this test"),
             &|_| RoleBinding::Unmapped,
-            Err("no live lms in this test"),
+            facts(Err("no live lms in this test")),
             &[],
         );
         assert_eq!(show.id, "crawl");

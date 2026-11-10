@@ -74,7 +74,7 @@ function corpusFleetView() {
  * generic infrastructure a future live-daemon suite could reuse without
  * re-deriving it.
  */
-function installCorpusRoutes(page, meta) {
+function installCorpusRoutes(page, meta, { liveStream = false } = {}) {
   const served = {};
   page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
@@ -142,6 +142,12 @@ function installCorpusRoutes(page, meta) {
     // records, and an inert stream means nothing ever gets appended, which
     // is exactly the legacy behavior on a stream with no activity.
     if (/^\/flow\/\d{4}-\d{2}-\d{2}\/stream$/.test(p)) {
+      // `liveStream`: the suite's web server holds the stream open
+      // (`lib/layout-server.js`), so the page connects and stays connected
+      // and its golden records the connected page, with nothing timed. A
+      // fulfilled stream always ends, so the page flaps to reconnecting and
+      // what it shows then depends on how long the capture took.
+      if (liveStream) return route.continue();
       return route.fulfill({ status: 200, contentType: "text/event-stream", body: "" });
     }
 

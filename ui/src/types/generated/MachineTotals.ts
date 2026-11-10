@@ -63,7 +63,8 @@ estimated_models: number,
  */
 over_price_models: number, 
 /**
- * Total inference-worker footprint; `None` under
+ * Total inference-worker footprint, plus (#3450) the measured memory of
+ * every server darkmux started; `None` under
  * [`Attribution::Unavailable`].
  */
 current_bytes: number | null, 

@@ -73,6 +73,10 @@ pub enum ClientCode {
     /// (a branch of the repo's, such as one named `mux`, is in the way;
     /// 422); `error` carries git's reason.
     BranchFailed,
+    /// Removing the workspace would lose commits nothing else holds (a
+    /// clone's branch, a template project's history; 409): save them, then
+    /// remove it with `force`.
+    UnsavedCommits,
 
     // ── A failed run, from its `dispatch.error` `code` ──
     /// The memory is held by a running dispatch; retry later.
@@ -160,6 +164,7 @@ mod tests {
             (CloneFailed, "clone_failed"),
             (NoOwnBranch, "no_own_branch"),
             (BranchFailed, "branch_failed"),
+            (UnsavedCommits, "unsaved_commits"),
         ] {
             assert_eq!(wire(c), s);
             assert_eq!(

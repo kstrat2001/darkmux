@@ -31,6 +31,7 @@ import { attributionLine, DAEMON_UNREACHABLE_MESSAGE, estimatedSummaryLine, limi
 import { Meter, CX, type MeterBand, type MeterTick } from "../../components/Meter";
 import { useIsMobile } from "../../hooks/useIsMobile";
 import type { MachineResourcesResponse } from "../../types/generated/MachineResourcesResponse";
+import { serverStateWord } from "../../lib/engineServers";
 import type { ModelRow } from "../../types/generated/ModelRow";
 
 /**
@@ -442,6 +443,16 @@ function Odometer({ resources }: { resources: MachineResourcesResponse }) {
  *                                          ISO string, returns `null` rather
  *                                          than text when it cannot) */
 
+/** (#3450) A server darkmux started that does not answer: "starting the
+ * model" while its start is young, "not answering" after. The row is
+ * darkmux's resident either way, and says what it is doing rather than
+ * reading as idle. Nothing for any other row. */
+function ServerStateChip({ model, ghost, nowMs }: { model: ModelRow; ghost: boolean; nowMs: number }) {
+  if (ghost || !model.server || model.server.answering) return null;
+  const word = serverStateWord(model.server, nowMs);
+  return <span className={`mm-row-chip ${word === "starting the model" ? "is-new" : "is-warn"}`}>{word.toUpperCase()}</span>;
+}
+
 function ModelRow({
   row,
   scale,
@@ -474,6 +485,7 @@ function ModelRow({
             residency and footprint, and what it is doing. */}
         {isGhost && <span className="mm-row-chip is-warn">DEPARTED · last seen {new Date(row.lastSeenMs).toLocaleTimeString([], { hour12: false })}</span>}
         {isNew && <span className="mm-row-chip is-new">NEW · first seen {relAgoFrom(nowMs, row.firstSeenMs ?? row.lastSeenMs)}</span>}
+        <ServerStateChip model={m} ghost={isGhost} nowMs={nowMs} />
         {!isGhost && pot == null && <span className="mm-row-chip is-warn">UNPRICED · potential unknown</span>}
         {/* #1819: a row IS priced (pot != null) but by the size-based
             fallback, not a measurement — neither a severity verdict (it

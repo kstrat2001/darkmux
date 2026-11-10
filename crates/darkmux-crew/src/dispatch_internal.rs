@@ -22,7 +22,7 @@ use darkmux_flow::payload::{
     DispatchToolPayload, DispatchTurnPayload, DispatchWorkdirGitUnavailablePayload, EjectFailure, WorkdirGitMount, EjectedModel, GitCheckout,
     GitdirKind, HostWindow, Knob, KnobSource, KnobValue, LmsRole, MetricWindow, ResultClass, RuntimeBounds, StreamPhase,
     TelemetryCompactionPayload, TelemetryContextPayload, TelemetryDetectorPayload, TelemetryLmsPayload, TelemetryRuntimePayload,
-    ThermalStopUnresolvedPayload, ThermalTier5EjectFailedPayload, ThermalTier5EjectPayload, ToolOutcome, TurnUsage, UsagePayload,
+    StoppedServer, ThermalStopUnresolvedPayload, ThermalTier5EjectFailedPayload, ThermalTier5EjectPayload, ToolOutcome, TurnUsage, UsagePayload,
 };
 use crate::dispatch::DispatchOpts;
 use darkmux_types::execution_id::ExecutionId;
@@ -6497,6 +6497,27 @@ fn refusal_terminal(
     payload
 }
 
+/// The `dispatch.error` of a container that never started because darkmux
+/// refused a load it needs (its compactor's, for memory), carrying the
+/// refusal's code; `None` for any other launch failure, which the bookend
+/// guard closes.
+fn refused_launch_terminal(err: &anyhow::Error, wall_ms: u64, endpoint: Option<&str>, resume_from: Option<&std::path::Path>) -> Option<darkmux_flow::Payload> {
+    let code = crate::engine_dispatch::refusal_code(err)?;
+    let (mut payload, _) = ended_mid_run_terminal(&format!("{err:#}"), wall_ms, &TrajectorySummary::default(), endpoint, resume_from);
+    if let darkmux_flow::Payload::DispatchError(p) = &mut payload {
+        p.code = Some(code.to_string());
+    }
+    Some(payload)
+}
+
+/// Close `bookend` with `refused`, the terminal of a refused launch; the
+/// guard closes any other.
+fn close_if_refused(bookend: &mut DispatchBookendGuard<'_>, refused: Option<darkmux_flow::FlowRecord>) {
+    if let Some(record) = refused {
+        bookend.close(record);
+    }
+}
+
 /// (#3448) The flow payload of one `engine_dispatch` note.
 fn model_record(note: crate::engine_dispatch::Note, p: darkmux_flow::payload::DispatchModelPayload) -> darkmux_flow::Payload {
     use crate::engine_dispatch::Note;
@@ -6708,6 +6729,12 @@ struct ContainerRun {
     /// (#1187) The hosted brain's auth header, held only here until it is
     /// piped over the container's stdin.
     remote_auth: Option<(String, String)>,
+    /// (#3507) Held for the whole run, on the LM Studio job model and then
+    /// the compactor ([`crate::lms_room::hold_dispatch_models`]).
+    lease: darkmux_types::residency_lease::LeaseGuard,
+    /// The job model the lease holds: an LM Studio load darkmux made for
+    /// this dispatch, `None` on any other route.
+    leased_job: Option<String>,
 }
 
 /// The container path up to its `dispatch.start`, in the order the steps
@@ -6734,8 +6761,11 @@ fn prepare_container_run(
     let (role, system_prompt, allowed_tools, provenance) =
         container_role(opts, brain.agentic_pm.as_ref().is_some_and(brain_leaves_this_machine), &workdir_split_gitdirs)?;
     let workspace_plan = plan_workspace(opts, unix_micros)?;
-    let (model, resolved_profile, unmanaged_endpoint_raw_label) =
+    let (model, resolved_profile, unmanaged_endpoint_raw_label, preflight_hold) =
         resolve_container_model(&role, opts, brain.agentic_pm.as_ref())?;
+    let (lease, leased_job) = lease_lmstudio_job(opts, &brain, &model)?;
+    // The run's own lease holds the job model now.
+    drop(preflight_hold);
     record_split_gitdirs(opts, execution, &model, &workdir_split_gitdirs);
     let (workspace, workspace_cleanup, host_out) = materialize_dirs(
         opts,
@@ -6773,7 +6803,23 @@ fn prepare_container_run(
         workspace,
         host_out,
         remote_auth,
+        lease,
+        leased_job,
     })
+}
+
+/// (#3507) The LM Studio route's job model, leased as soon as it is
+/// resident, for the life of the run; on any other route the lease starts
+/// empty (the compactor may join it).
+fn lease_lmstudio_job(
+    opts: &DispatchOpts,
+    brain: &ContainerBrain,
+    model: &str,
+) -> Result<(darkmux_types::residency_lease::LeaseGuard, Option<String>)> {
+    let lease = darkmux_types::residency_lease::LeaseGuard::acquire();
+    let leased_job = (brain.agentic_pm.is_none() && opts.model_base_url_override.is_none()).then(|| model.to_string());
+    crate::lms_room::hold_dispatch_models(&lease, leased_job.as_deref(), None)?;
+    Ok((lease, leased_job))
 }
 
 /// (#2294) PREFLIGHT: does this workdir's git directory live outside
@@ -7236,16 +7282,16 @@ fn resolve_container_model(
     role: &crate::types::Role,
     opts: &DispatchOpts,
     agentic_pm: Option<&crate::target::Target>,
-) -> Result<(String, String, Option<String>)> {
+) -> Result<(String, String, Option<String>, PreflightHold)> {
     // (#1187) An agentic-remote dispatch already has its model resolved (via
     // `try_resolve_unmanaged_target`'s profile-based lookup, done up front so
     // the routing decision could be made before any container work) —
     // skip the local-probe/pin resolution entirely; there's no LMStudio
     // instance to probe when the brain is remote.
-    let (model, resolved_profile) = if let Some(t) = agentic_pm {
+    let (model, resolved_profile, hold) = if let Some(t) = agentic_pm {
         // (#3448) The name the server answers to: the id as written on an
         // endpoint darkmux only sends to, `darkmux:<id>` on a server it starts.
-        (t.wire_model(), t.profile_name.clone())
+        (t.wire_model(), t.profile_name.clone(), None)
     } else {
         let r = resolve_dispatch_internal(
             role,
@@ -7255,7 +7301,7 @@ fn resolve_container_model(
             opts.allow_utility_model,
         )
         .context("model selection failed")?;
-        (r.wire_id, r.profile_name)
+        (r.wire_id, r.profile_name, r.hold)
     };
     // (#1187 follow-up) Raw label (no eprintln prefix) — this is also the value
     // that must land in `dispatch_start_payload`'s `endpoint` field, the
@@ -7276,7 +7322,7 @@ fn resolve_container_model(
             .map(|l| format!(", brain: {l}"))
             .unwrap_or_default()
     );
-    Ok((model, resolved_profile, unmanaged_endpoint_raw_label))
+    Ok((model, resolved_profile, unmanaged_endpoint_raw_label, hold))
 }
 
 /// (#2294) Consumer 3 of the preflight detection: a durable record.
@@ -7634,7 +7680,14 @@ fn run_container(opts: &DispatchOpts, execution: &ExecutionId, mut run: Containe
     )?;
 
     let remote_auth = run.remote_auth.take();
-    let mut launched = launch_container(opts, execution, &run, remote_auth)?;
+    let mut launched = launch_container(opts, execution, &run, remote_auth).inspect_err(|e| {
+        let wall_ms = dispatch_start_instant.elapsed().as_millis() as u64;
+        let refused = refused_launch_terminal(e, wall_ms, run.unmanaged_endpoint_raw_label.as_deref(), opts.resume_from.as_deref());
+        close_if_refused(&mut bookend, refused.map(|mut payload| {
+            merge_record_context(&mut payload, &opts.record_context);
+            crate::dispatch::build_dispatch_record(darkmux_flow::Level::Error, &opts.role_id, &session, execution, Some(&model), phase_id.as_deref(), payload)
+        }));
+    })?;
     // (#2925) This dispatch's own stop: see `DispatchStop`.
     let local_stop = DispatchStop::new(launched.container_name.clone());
     let (_observer_guards, threads) = spawn_observers(opts, execution, &run, &launched, &local_stop)?;
@@ -7916,8 +7969,12 @@ fn launch_container(
     // window resolution is exercised by tests exactly as it runs here.
     let DispatchCompaction { compaction, compactor_n_ctx, utility_model, unmanaged_compactor } =
         resolve_dispatch_compaction(&run.role, opts)?;
-    let (compaction, mut compactor_auth) =
+    let (compaction, mut compactor_auth, compactor_hold) =
         prepare_compactor(opts, compaction, compactor_n_ctx, unmanaged_compactor.as_ref())?;
+    // (#3507) The compactor this run may call mid-run joins its lease.
+    let local_compactor = compaction.compactor_model.as_deref().filter(|_| unmanaged_compactor.is_none());
+    crate::lms_room::hold_dispatch_models(&run.lease, run.leased_job.as_deref(), local_compactor)?;
+    drop(compactor_hold);
 
     // Shared toolchain cache: resolve the host dir + best-effort create so
     // the bind-mount target exists (#703 Slice 3). If create fails the mount
@@ -8057,6 +8114,10 @@ fn feedback_templates_json(role: &crate::types::Role) -> serde_json::Value {
     }
 }
 
+/// [`prepare_compactor`]'s result: the compaction args, the compactor's
+/// credential, and the lease on a compactor it just loaded.
+type PreparedCompactor = (crate::dispatch::CompactionDispatchArgs, Option<(String, String)>, PreflightHold);
+
 /// (#1280) Ensure the utility/compactor model is RESIDENT AT ITS DECLARED
 /// CONTEXT — namespaced — before the container starts, exactly as the
 /// dispatch model already is (#1135). Pre-#1280 this path only eprintln'd a
@@ -8098,8 +8159,9 @@ fn prepare_compactor(
     mut compaction: crate::dispatch::CompactionDispatchArgs,
     compactor_n_ctx: Option<u32>,
     unmanaged_compactor: Option<&crate::target::UtilityTarget>,
-) -> Result<(crate::dispatch::CompactionDispatchArgs, Option<(String, String)>)> {
+) -> Result<PreparedCompactor> {
     let mut compactor_auth: Option<(String, String)> = None;
+    let hold = std::cell::RefCell::new(None);
     if opts.model_base_url_override.is_none() {
         if let Some(utility) = unmanaged_compactor.filter(|_| compaction.compactor_model.is_some()) {
             // (#3207) An unmanaged utility endpoint: nothing is loaded, the
@@ -8115,13 +8177,10 @@ fn prepare_compactor(
             // integration test this crate does not have; the mock-model
             // harness cannot supply one, since the enclosing
             // `model_base_url_override.is_none()` gate skips this block.
-            let _ = apply_compactor_setup(
-                &mut compaction,
-                &compactor_id,
-                load_window,
-                used_fallback,
-                ensure_model_loaded_at_ctx_from,
-            );
+            apply_compactor_setup(&mut compaction, &compactor_id, load_window, used_fallback, |pm, source| {
+                *hold.borrow_mut() = ensure_model_loaded_at_ctx_from(pm, source)?;
+                Ok(())
+            })?;
         } else if let Some(warning) = compaction.unset_compactor_warning() {
             // (MUST FIX 1, #2571 follow-up) `compactor_model` stayed `None`
             // all the way through `from_profile` + `apply_utility_model` —
@@ -8166,7 +8225,7 @@ fn prepare_compactor(
             eprintln!("{warning}");
         }
     }
-    Ok((compaction, compactor_auth))
+    Ok((compaction, compactor_auth, hold.into_inner()))
 }
 
 /// What the container mounts and is named, for [`container_run_config`].
@@ -10217,8 +10276,10 @@ fn stamping_emitter<'a>(
 /// container," so the resident model that produced the heat keeps holding
 /// the GPU. This unloads every `darkmux:`-namespaced resident on this host
 /// (via [`darkmux_profiles::ownership::eject_all_managed`] — the SAME mechanism
-/// `darkmux machine eject` uses, not a second unloader) so the machine can
-/// actually cool.
+/// `darkmux machine eject` uses, not a second unloader), then (#3450,
+/// operator "Stop all") stops every engine server darkmux started, held by a
+/// running dispatch or not (`ownership::stop_all_servers`; only a server
+/// whose record matches the live process), so the machine can actually cool.
 ///
 /// **Ordering, per the operator's own spec:** checkpoint first, eject
 /// second, where there is time for both — waits up to `bound` for the
@@ -10255,59 +10316,86 @@ fn tier5_eject_on_critical(host_out: &Path, trip_wall: SystemTime, emit: &dyn Fn
         }
         thread::sleep(POLL_INTERVAL);
     };
-    match darkmux_profiles::ownership::eject_all_managed(false) {
-        Ok(summary) => {
-            let ejected: Vec<EjectedModel> = summary
-                .ejected
-                .iter()
-                .map(|m| EjectedModel { identifier: m.identifier.clone(), context: m.context })
-                .collect();
-            emit(darkmux_flow::Payload::ThermalTier5Eject(ThermalTier5EjectPayload {
-                reached_checkpoint_boundary,
-                ejected,
-                user_loaded_count: summary.user_loaded_count as u64,
-                simulated_host_source: None,
-                step_id: None,
-                context: None,
-            }));
-            // (#2774 review C1) A model that refused to unload no longer
-            // aborts the sweep, so BOTH outcomes can be real on one trip:
-            // some residents released, some still holding the GPU. The
-            // failure record is emitted alongside the success one and
-            // names every model still resident — on the safety path the
-            // operator needs to know exactly which ones darkmux could not
-            // release, not just that something went wrong.
-            if !summary.failed.is_empty() {
-                let failed: Vec<EjectFailure> = summary
-                    .failed
-                    .iter()
-                    .map(|f| EjectFailure { identifier: f.identifier.clone(), error: f.error.clone() })
-                    .collect();
-                emit(darkmux_flow::Payload::ThermalTier5EjectFailed(ThermalTier5EjectFailedPayload {
-                    reached_checkpoint_boundary,
-                    failed: Some(failed),
-                    ejected_count: Some(summary.ejected.len() as u64),
-                    error: None,
-                    simulated_host_source: None,
-                    step_id: None,
-                    context: None,
-                }));
-            }
-        }
-        Err(e) => {
-            // Could not even LIST the residents — there is no per-model
-            // detail to report, only the enumeration failure.
-            emit(darkmux_flow::Payload::ThermalTier5EjectFailed(ThermalTier5EjectFailedPayload {
-                reached_checkpoint_boundary,
-                failed: None,
-                ejected_count: None,
-                error: Some(e.to_string()),
-                simulated_host_source: None,
-                step_id: None,
-                context: None,
-            }));
-        }
+    // (#3450, operator "Stop all") LM Studio first, then every engine server
+    // darkmux started, held ones included: at `critical` the heat source is
+    // whatever darkmux holds, and the turn boundary was already given its
+    // chance above.
+    let lms = darkmux_profiles::ownership::eject_all_managed(false);
+    let servers = darkmux_profiles::ownership::stop_all_servers();
+    for record in tier5_records(lms, &servers, reached_checkpoint_boundary) {
+        emit(record);
     }
+}
+
+/// The tier-5 records for one trip: `thermal.tier5_eject` naming what came
+/// out (LM Studio residents and, #3450, the engine servers stopped), and
+/// `thermal.tier5_eject_failed` naming what did not, or the failure to list
+/// LM Studio's residents at all.
+fn tier5_records(
+    lms: anyhow::Result<darkmux_profiles::ownership::EjectSummary>,
+    servers: &darkmux_profiles::ownership::ServerEjectSummary,
+    reached_checkpoint_boundary: bool,
+) -> Vec<darkmux_flow::Payload> {
+    let named = |list: &[darkmux_profiles::ownership::EjectedServer]| -> Option<Vec<StoppedServer>> {
+        let out: Vec<StoppedServer> = list
+            .iter()
+            .map(|s| StoppedServer { endpoint: s.endpoint.clone(), model: s.model.clone(), pid: s.pid, without_lock: s.without_lock.then_some(true) })
+            .collect();
+        (!out.is_empty()).then_some(out)
+    };
+    let (stopped, skipped) = (named(&servers.stopped), named(&servers.skipped));
+    let failed_servers: Option<Vec<EjectFailure>> = (!servers.failed.is_empty())
+        .then(|| servers.failed.iter().map(|f| EjectFailure { identifier: f.identifier.clone(), error: f.error.clone() }).collect());
+    let failed_record = |failed, ejected_count, error, stopped_servers, skipped_servers| {
+        darkmux_flow::Payload::ThermalTier5EjectFailed(ThermalTier5EjectFailedPayload {
+            reached_checkpoint_boundary,
+            failed,
+            ejected_count,
+            error,
+            failed_servers: failed_servers.clone(),
+            stopped_servers,
+            skipped_servers,
+            simulated_host_source: None,
+            step_id: None,
+            context: None,
+        })
+    };
+    let summary = match lms {
+        Ok(summary) => summary,
+        // Could not even LIST the residents: there is no per-model detail to
+        // report, only the enumeration failure, and the servers it stopped.
+        Err(e) => return vec![failed_record(None, None, Some(e.to_string()), stopped, skipped)],
+    };
+    let ejected: Vec<EjectedModel> = summary
+        .ejected
+        .iter()
+        .map(|m| EjectedModel { identifier: m.identifier.clone(), context: m.context })
+        .collect();
+    let mut out = vec![darkmux_flow::Payload::ThermalTier5Eject(ThermalTier5EjectPayload {
+        reached_checkpoint_boundary,
+        ejected,
+        user_loaded_count: summary.user_loaded_count as u64,
+        stopped_servers: stopped,
+        skipped_servers: skipped,
+        simulated_host_source: None,
+        step_id: None,
+        context: None,
+    })];
+    // (#2774 review C1) A model that refused to unload no longer aborts the
+    // sweep, so BOTH outcomes can be real on one trip: some residents
+    // released, some still holding the GPU. The failure record is emitted
+    // alongside the success one and names every model (and, #3450, every
+    // engine server) still resident: on the safety path the operator needs
+    // to know exactly which ones darkmux could not release.
+    if !summary.failed.is_empty() || failed_servers.is_some() {
+        let failed: Vec<EjectFailure> = summary
+            .failed
+            .iter()
+            .map(|f| EjectFailure { identifier: f.identifier.clone(), error: f.error.clone() })
+            .collect();
+        out.push(failed_record((!failed.is_empty()).then_some(failed), Some(summary.ejected.len() as u64), None, None, None));
+    }
+    out
 }
 
 /// (#557 slice 4 · #1064) Run the always-on lms + host-load telemetry
@@ -13940,6 +14028,8 @@ pub(crate) fn residency_lost_detail(wire_model: &str, detail: &str) -> Option<St
 struct ResolvedDispatch {
     wire_id: String,
     profile_name: String,
+    /// The lease on the model the preflight just loaded.
+    hold: PreflightHold,
 }
 
 fn resolve_dispatch_model_internal(
@@ -13961,15 +14051,20 @@ fn resolve_dispatch_internal(
     skip_lmstudio_residency: bool,
     allow_utility_model: bool,
 ) -> Result<ResolvedDispatch> {
-    resolve_dispatch_model_with_hosts(
+    let hold = std::cell::RefCell::new(None);
+    let resolved = resolve_dispatch_model_with_hosts(
         role,
         profile_override,
         config_path,
         skip_lmstudio_residency,
         allow_utility_model,
-        &ensure_model_loaded_at_ctx,
+        &|pm| {
+            *hold.borrow_mut() = ensure_model_loaded_at_ctx(pm)?;
+            Ok(())
+        },
         &|| engine::lmstudio().resident_ids(),
-    )
+    )?;
+    Ok(ResolvedDispatch { hold: hold.into_inner(), ..resolved })
 }
 
 /// (#2240) The host-effect seam for [`resolve_dispatch_model_internal`],
@@ -14156,7 +14251,7 @@ fn resolve_dispatch_model_with_hosts(
                  dispatching against darkmux's own resident instance `{wire_id}` (#2240)"
             );
         }
-        Ok(ResolvedDispatch { wire_id, profile_name: active_name })
+        Ok(ResolvedDispatch { wire_id, profile_name: active_name, hold: None })
 }
 
 /// (#590) Best-effort: the machine's registered utility model
@@ -14517,17 +14612,22 @@ pub(crate) fn utility_residency_pm(util_id: &str, context_window: u32) -> darkmu
 /// this one fails mid-run. The warning below is therefore an
 /// early-abort-worthy signal, not a footnote; whether it should abort here
 /// instead is a live question, not a settled design.
+///
+/// A load refused for memory (`busy`, `memory_in_use`, `wont_fit`) is the
+/// one failure that is not a warning: it is returned, code and all, and the
+/// dispatch ends before its container starts rather than at its first
+/// compaction.
 fn ensure_utility_resident(
     compactor_model: Option<&str>,
     context_window: Option<u32>,
     load: impl Fn(&darkmux_types::ProfileModel) -> Result<()>,
-) -> Option<String> {
-    let util_id = compactor_model?;
-    let window = context_window?;
+) -> Result<Option<String>> {
+    let (Some(util_id), Some(window)) = (compactor_model, context_window) else { return Ok(None) };
     let util_pm = utility_residency_pm(util_id, window);
     match load(&util_pm) {
-        Ok(()) => None,
-        Err(e) => Some(format!(
+        Ok(()) => Ok(None),
+        Err(e) if refused_for_memory(&e) => Err(e),
+        Err(e) => Ok(Some(format!(
             "darkmux dispatch: WARNING — utility/compactor model `{util_id}` could not be \
              ensured resident at n_ctx={window}: {e:#}. This dispatch still starts, but \
              compaction now addresses `{}` — darkmux's own instance, which this failed \
@@ -14535,8 +14635,14 @@ fn ensure_utility_resident(
              Fix the load (RAM, model id, LMStudio) before starting a long dispatch. \
              (#1280/#2536)",
             compactor_wire_model_id(util_id)
-        )),
+        ))),
     }
+}
+
+/// A load darkmux refused for memory, by its code: retrying later can help,
+/// starting the run without the model cannot.
+fn refused_for_memory(e: &anyhow::Error) -> bool {
+    matches!(crate::engine_dispatch::refusal_code(e), Some("busy" | "memory_in_use" | "wont_fit"))
 }
 
 /// (#2536) The wire `--compactor-model` id for a compactor darkmux actually
@@ -14598,7 +14704,7 @@ pub(crate) fn apply_compactor_setup(
     load_window: Option<u32>,
     used_fallback: bool,
     ensure_resident: impl Fn(&darkmux_types::ProfileModel, WindowSource) -> Result<()>,
-) -> Option<String> {
+) -> Result<Option<String>> {
     if let Some(window) = load_window {
         if used_fallback {
             eprintln!(
@@ -14619,11 +14725,11 @@ pub(crate) fn apply_compactor_setup(
             compactor_id,
             window,
             |pm| ensure_resident(pm, source),
-        );
+        )?;
         if let Some(w) = &warning {
             eprintln!("{w}");
         }
-        warning
+        Ok(warning)
     } else {
         compaction.compactor_model = None;
         let warning = format!(
@@ -14632,7 +14738,7 @@ pub(crate) fn apply_compactor_setup(
              refusing compaction for this dispatch. Declare `n_ctx` in ~/.darkmux/profiles.json. (#1616, #2914, #3074)"
         );
         eprintln!("{warning}");
-        Some(warning)
+        Ok(Some(warning))
     }
 }
 
@@ -14663,11 +14769,11 @@ fn apply_compactor_residency(
     compactor_id: &str,
     context_window: u32,
     ensure_resident: impl Fn(&darkmux_types::ProfileModel) -> Result<()>,
-) -> Option<String> {
+) -> Result<Option<String>> {
     let warning =
-        ensure_utility_resident(Some(compactor_id), Some(context_window), ensure_resident);
+        ensure_utility_resident(Some(compactor_id), Some(context_window), ensure_resident)?;
     compaction.compactor_model = Some(compactor_wire_model_id(compactor_id));
-    warning
+    Ok(warning)
 }
 
 /// (#3207) `dispatch()`'s setup of a compactor on an UNMANAGED utility
@@ -14896,9 +15002,15 @@ pub(crate) fn identifier_already_resident(detail: &str) -> bool {
     detail.contains("identifier") && detail.contains("already exists")
 }
 
-pub(crate) fn ensure_model_loaded_at_ctx(pm: &darkmux_types::ProfileModel) -> Result<()> {
+pub(crate) fn ensure_model_loaded_at_ctx(pm: &darkmux_types::ProfileModel) -> Result<PreflightHold> {
     ensure_model_loaded_at_ctx_from(pm, WindowSource::Profile)
 }
+
+/// The lease on a model a preflight just loaded (`None` when it reused one
+/// already resident): the caller keeps it until the dispatch that runs on
+/// the model holds it with its own ([`crate::lms_room::hold_dispatch_models`]),
+/// so the model never reads as idle in between.
+pub(crate) type PreflightHold = Option<darkmux_types::residency_lease::LeaseGuard>;
 
 /// (#2914 review, C5) Where the `n_ctx` a residency load is asked for came
 /// from, so the load message can say so: a work model's window is its
@@ -14977,15 +15089,33 @@ fn switch_notice_for(engine_id: &str, loading: engine::Loading, could_hold: Opti
 
 /// [`ensure_model_loaded_at_ctx`] with the window's source named in the
 /// load messages (#2914 review, C5).
-pub(crate) fn ensure_model_loaded_at_ctx_from(pm: &darkmux_types::ProfileModel, source: WindowSource) -> Result<()> {
-    let engine = engine::lmstudio();
+///
+/// (#3514) Its loads follow the residency protocol (lock, reservation),
+/// and a stale reload never unloads an instance a running dispatch holds.
+/// Each load makes a wave's memory decision first
+/// ([`crate::lms_room::load_reserved`]): it stops darkmux's idle engine
+/// servers and unloads its idle LM Studio loads to make room, or is refused
+/// `wont_fit`, `busy` or `memory_in_use`.
+pub(crate) fn ensure_model_loaded_at_ctx_from(pm: &darkmux_types::ProfileModel, source: WindowSource) -> Result<PreflightHold> {
+    preflight_load(pm, source, &crate::lms_room::ThisPreflight)
+}
+
+/// [`ensure_model_loaded_at_ctx_from`] against `gate`'s LM Studio and
+/// machine, so a test drives the preflight exactly as a dispatch does.
+pub(crate) fn preflight_load(pm: &darkmux_types::ProfileModel, source: WindowSource, gate: &dyn crate::lms_room::Preflight) -> Result<PreflightHold> {
+    let hold = std::cell::RefCell::new(None);
     ensure_model_resident_from(
         pm,
         source,
-        &|| engine.loaded().unwrap_or_default(),
-        &|identifier| engine.unload(identifier),
-        &|model_key, identifier, n_ctx| load_at_ctx_bounded(model_key, identifier, n_ctx),
-    )
+        &|| gate.loaded(),
+        &|identifier| crate::lms_room::unload_unless_held(gate, identifier, &|id| gate.unload(id)),
+        &|model_key, identifier, n_ctx| {
+            let lease = crate::lms_room::load_reserved(gate, model_key, identifier, n_ctx, &|k, id, ctx| gate.load(k, id, ctx))?;
+            *hold.borrow_mut() = Some(lease);
+            Ok(())
+        },
+    )?;
+    Ok(hold.into_inner())
 }
 
 /// (#1135/#2318) The residency preflight, pure over its host effects so the
@@ -15164,7 +15294,7 @@ fn ensure_model_resident_from(
 ///
 /// `model_key` must already be BARE (`ensure_model_loaded_at_ctx` normalizes it
 /// via [`bare_model_key`], #1615) — the namespace belongs only in `identifier`.
-fn load_at_ctx_bounded(model_key: &str, identifier: &str, n_ctx: u32) -> Result<()> {
+pub(crate) fn load_at_ctx_bounded(model_key: &str, identifier: &str, n_ctx: u32) -> Result<()> {
     use darkmux_gestalt::Deadline;
     // (#316) As `concurrent_dispatch::lms_host_factory`: a managed model
     // loads on LM Studio, which always has a load lifecycle.

@@ -257,6 +257,23 @@ pub struct WorkspaceInfo {
     pub fetch_error_code: Option<darkmux_types::client_code::ClientCode>,
 }
 
+/// `DELETE /client/workspaces/{name}`: what removing the workspace did.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct WorkspaceRemoved {
+    pub workspace: String,
+    /// `clone`, `template` or `worktree`.
+    pub kind: String,
+    /// The branch it was on, `null` when detached.
+    pub branch: Option<String>,
+    /// Whether that branch is gone: a clone's or a template project's goes
+    /// with it; a worktree's `mux/` branch in the user's checkout only once
+    /// merged into another branch, or with `force`; a branch of the user's
+    /// never.
+    pub branch_removed: bool,
+    /// Whether its live preview was stopped first.
+    pub preview_stopped: bool,
+}
+
 /// One file on the workspace's branch that origin's default branch lacks:
 /// its content (base64) and mode, or `deleted: true`.
 #[derive(Debug, Clone, Serialize, JsonSchema)]

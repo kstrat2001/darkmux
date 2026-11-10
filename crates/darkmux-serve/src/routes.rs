@@ -160,6 +160,7 @@ pub(crate) fn client_table() -> Vec<ClientRoute> {
         client_json!(get, RecipeReply, "/client/recipe", recipe_handler),
         client_json!(post, WorkspaceInfo, "/client/workspaces", workspace_create_handler),
         client_json!(get, WorkspaceInfo, "/client/workspaces/:name", workspace_status_handler),
+        client_json!(delete, WorkspaceRemoved, "/client/workspaces/:name", workspace_remove_handler),
         client_json!(get, BranchChanges, "/client/workspaces/:name/changes", workspace_changes_handler),
         client_json!(post, PreviewState, "/client/workspaces/:name/preview", preview_start_handler),
         client_json!(get, PreviewState, "/client/workspaces/:name/preview", preview_status_handler),
@@ -226,7 +227,7 @@ fn client_schemas() -> Vec<serde_json::Value> {
     vec![
         of::<ClientError>(), of::<PairAccepted>(), of::<PairPoll>(), of::<Whoami>(), of::<ClientProfiles>(),
         of::<WorkAccepted>(), of::<WorkState>(), of::<StatusWord>(), of::<KeepReply>(), of::<DiscardReply>(),
-        of::<UndoReply>(), of::<RecipeReply>(), of::<WorkspaceInfo>(), of::<BranchChanges>(), of::<PreviewState>(),
+        of::<UndoReply>(), of::<RecipeReply>(), of::<WorkspaceInfo>(), of::<WorkspaceRemoved>(), of::<BranchChanges>(), of::<PreviewState>(),
     ]
 }
 

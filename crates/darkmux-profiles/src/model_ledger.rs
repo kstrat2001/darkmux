@@ -65,7 +65,7 @@
 use crate::gestalt_host::lms_host::{run_bounded, StdoutMode};
 use crate::gestalt_host::{ArchFactsReader, GgufFactsReader};
 use darkmux_gestalt::{
-    ArchEstimator, ArchFacts, CatalogFact, Deadline, FootprintEstimator, V1Estimator,
+    ArchEstimator, ArchFacts, CatalogFact, Deadline, FootprintEstimator, ModelArch, V1Estimator,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -99,7 +99,14 @@ use std::time::Duration;
 /// field, not a shape change: the field's documented meaning ("the most
 /// this machine's residents will hold") is what it already claimed to be,
 /// and it was simply wrong whenever a resident had outgrown its price.
-pub const LEDGER_SCHEMA_VERSION: &str = "2.1";
+///
+/// 2.1 → 2.2 (#3450): additive. A server darkmux started (Tensorfold, rec's
+/// Flint) is a row of its own (`ModelRow::server`, owner `darkmux`), priced
+/// at its measured process memory (`PotentialSource::Measured`), and counted
+/// in `MachineTotals::current_bytes`, so it no longer reads as part of
+/// `other_used_bytes`. A 2.1 reader sees one more darkmux row and an unknown
+/// potential source, which it reads as `unknown`.
+pub const LEDGER_SCHEMA_VERSION: &str = "2.2";
 
 /// v1 KV-cache dtype width: 2 bytes/element (fp16 cache, the MLX default).
 /// Deliberately a named constant, not a guess from weight quantization —
@@ -428,6 +435,10 @@ pub enum PotentialSource {
     /// one — see [`V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN`] for the assumption
     /// this carries.
     Estimated,
+    /// (#3450) A server darkmux started: its measured process memory (every
+    /// process in the group it leads), not a price. Such a row's potential
+    /// and current are the same figure.
+    Measured,
     /// (#3035) A value a newer darkmux wrote that this build does not know.
     /// Never written by this build; read, never treated as any known value.
     #[serde(other)]
@@ -561,6 +572,12 @@ pub struct ModelRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub shrink_hint: Option<String>,
+    /// (#3450) The server darkmux started that holds this model, for a row
+    /// that is one (Tensorfold, rec's Flint); absent for an LM Studio
+    /// resident. Its `identifier` is the name the server answers to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub server: Option<crate::engine::server::EngineServer>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -622,7 +639,8 @@ pub struct MachineTotals {
     /// [`Self::estimated_models`] above (contract 5).
     #[serde(default)]
     pub over_price_models: u32,
-    /// Total inference-worker footprint; `None` under
+    /// Total inference-worker footprint, plus (#3450) the measured memory of
+    /// every server darkmux started; `None` under
     /// [`Attribution::Unavailable`].
     #[cfg_attr(feature = "ts-export", ts(type = "number | null"))]
     pub current_bytes: Option<u64>,
@@ -739,6 +757,15 @@ impl WorkerProc {
 }
 
 
+/// (#3450) A server darkmux started that is running now, and its measured
+/// memory ([`crate::engine::server::memory`]); `None` when it could not be
+/// measured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerInput {
+    pub server: crate::engine::server::EngineServer,
+    pub memory_bytes: Option<u64>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LedgerInputs {
     pub residents: Vec<ResidentInput>,
@@ -759,6 +786,9 @@ pub struct LedgerInputs {
     /// empty machine and the worker footprint is subtracted from used memory
     /// as if it were not darkmux's, which paints the ledger green.
     pub residents_unknown: bool,
+    /// (#3450) The servers darkmux started, from their records: each is a row
+    /// of its own, never part of the worker attribution.
+    pub servers: Vec<ServerInput>,
     /// Pre-populated `error`-severity messages from the gather stage (probe
     /// failures) — `compute_ledger` appends its own `warn`/`info` entries
     /// on top (#1821).
@@ -788,11 +818,9 @@ pub struct LedgerInputs {
 /// NEITHER reader could answer — a corrupt/unusual GGUF, an ambiguous
 /// multi-file directory, or a weights format neither reader understands.
 ///
-/// [`Self::estimate_with_source`] is the ONLY port this type exposes —
-/// there is no bare `FootprintEstimator::estimate_bytes` impl, because
-/// nothing in this module calls one and a private type gains no drop-in
-/// value from implementing a trait it has no consumer for; add it back if
-/// a real caller needs it.
+/// [`Self::estimate_with_source`] prices a resident with its source (the
+/// ledger shows which); its `FootprintEstimator` impl is the same figure
+/// without the source, which the LM Studio load path plans with (#3508).
 ///
 /// An ESTIMATED row's `kv_per_token_bytes` field stays `None` (the flat V1
 /// rate is never decomposed into a per-token figure written back onto the
@@ -805,7 +833,7 @@ pub struct LedgerInputs {
 /// which could render the FALSE claim "no shrinkable context" when the
 /// estimated resident was in fact the only one with room to shrink;
 /// `effective_kv_rate` closes that gap.
-struct ArchWithSizeFallback {
+pub struct ArchWithSizeFallback {
     arch: ArchEstimator,
     // No `fallback: V1Estimator` field: since the tiers landed, the fallback's
     // KV rate is chosen PER MODEL from its catalog size, so the estimator is
@@ -814,8 +842,16 @@ struct ArchWithSizeFallback {
     // exact shape that under-reserved large models and the merge gate caught.
 }
 
+/// (#3508) The ledger's pricing as the planner's estimator, so a load is
+/// planned at the figure `darkmux machine resources` shows for it resident.
+impl FootprintEstimator for ArchWithSizeFallback {
+    fn estimate_bytes(&self, model_key: &str, min_ctx: u32, catalog: Option<&[CatalogFact]>) -> Option<u64> {
+        self.estimate_with_source(model_key, min_ctx, catalog).map(|(bytes, _)| bytes)
+    }
+}
+
 impl ArchWithSizeFallback {
-    fn new(arch: BTreeMap<String, ArchFacts>) -> Self {
+    pub fn new(arch: BTreeMap<String, ArchFacts>) -> Self {
         ArchWithSizeFallback { arch: ArchEstimator::new(arch) }
     }
 
@@ -872,6 +908,7 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
         margin_percent,
         workers,
         residents_unknown,
+        servers,
         mut messages,
     } = inputs;
 
@@ -913,28 +950,17 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
                 state: LedgerState::Unknown,
                 over_price_bytes: None,
                 shrink_hint: None,
+                server: None,
             }
         })
         .collect();
+    // The LM Studio rows the worker attribution splits across; the servers'
+    // rows follow them and carry their own measured memory.
+    let lms_rows = rows.len();
+    let server_bytes: u64 = servers.iter().filter_map(|s| s.memory_bytes).sum();
+    rows.extend(servers.into_iter().map(server_row));
 
-    // Genuinely unpriceable: neither arch facts NOR a catalog size could
-    // answer — `potential_bytes` itself is `None`. Distinct from an
-    // ESTIMATED row (below), which DOES have a `potential_bytes`.
-    let unpriced: Vec<&str> = rows
-        .iter()
-        .filter(|r| r.potential_bytes.is_none())
-        .map(|r| r.model_key.as_str())
-        .collect();
-    if !unpriced.is_empty() {
-        // A real degradation — the sum undercounts by an uncounted amount —
-        // so `warn`, not `info` (#1821).
-        messages.push(LedgerMessage::warn(format!(
-            "{} resident model(s) unpriceable (no readable arch facts or catalog size): {} — machine potential UNDERCOUNTS by their commitment",
-            unpriced.len(),
-            unpriced.join(", ")
-        )));
-    }
-    let unpriced_models = unpriced.len() as u32;
+    let unpriced_models = unpriced_rows(&rows, &mut messages);
 
     // #1819: residents priced by the size-based FALLBACK rather than
     // measured arch facts. Counted separately from `unpriced` (they DO
@@ -993,11 +1019,12 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
 
     // Current-footprint attribution (#1286: the degradation ladder is
     // documented in the output itself, never silently precise).
-    let (attribution, attribution_note, current_total) = if residents_unknown {
+    let (attribution, attribution_note, lms_current) = if residents_unknown {
         unattributed_current(workers.as_deref())
     } else {
-        attribute_current(&mut rows, workers.as_deref())
+        attribute_current(&mut rows[..lms_rows], workers.as_deref())
     };
+    let current_total = lms_current.map(|c| c + server_bytes);
 
     // Limit: #1243 budget > physical pool capacity > none.
     let (limit_bytes, limit_source) = match (budget_bytes, pool) {
@@ -1030,8 +1057,9 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
     // (vm_stat failed): there is then no fit guarantee to give, so the
     // cascade below falls through to `Unknown` rather than silently
     // reusing the old darkmux-only comparison.
-    let other_used_bytes: Option<u64> =
-        pool.and_then(|p| p.used_bytes).map(|used| used.saturating_sub(current_total.unwrap_or(0)));
+    let other_used_bytes: Option<u64> = pool
+        .and_then(|p| p.used_bytes)
+        .map(|used| used.saturating_sub(lms_current.unwrap_or(0) + server_bytes));
     // (#1854) `potential` is the fit contract — "the most this resident will
     // ever hold". It can be WRONG, and measurably so: an idle MLX resident was
     // observed at 28.40 GiB against a priced potential of 22.88 GiB, steady to
@@ -1182,6 +1210,66 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
         attribution,
         attribution_note,
         messages,
+    }
+}
+
+/// The rows with no potential at all, each kind with its own warning:
+/// genuinely unpriceable residents, and (#3450) servers darkmux started that
+/// could not be measured. Both undercount the machine's potential.
+fn unpriced_rows(rows: &[ModelRow], messages: &mut Vec<LedgerMessage>) -> u32 {
+    // Genuinely unpriceable: neither arch facts NOR a catalog size could
+    // answer — `potential_bytes` itself is `None`. Distinct from an
+    // ESTIMATED row (below), which DOES have a `potential_bytes`.
+    let unpriced: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.potential_bytes.is_none() && r.server.is_none())
+        .map(|r| r.model_key.as_str())
+        .collect();
+    // (#3450) A server darkmux started is priced by measuring it, so one that
+    // could not be measured is unpriced for that reason, said as such.
+    let unmeasured: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.potential_bytes.is_none() && r.server.is_some())
+        .map(|r| r.model_key.as_str())
+        .collect();
+    if !unmeasured.is_empty() {
+        messages.push(LedgerMessage::warn(format!(
+            "{} server(s) darkmux started could not be measured (the process listing did not show them): {} — machine potential UNDERCOUNTS by their memory",
+            unmeasured.len(),
+            unmeasured.join(", ")
+        )));
+    }
+    if !unpriced.is_empty() {
+        // A real degradation — the sum undercounts by an uncounted amount —
+        // so `warn`, not `info` (#1821).
+        messages.push(LedgerMessage::warn(format!(
+            "{} resident model(s) unpriceable (no readable arch facts or catalog size): {} — machine potential UNDERCOUNTS by their commitment",
+            unpriced.len(),
+            unpriced.join(", ")
+        )));
+    }
+    (unpriced.len() + unmeasured.len()) as u32
+}
+
+/// (#3450) A server darkmux started, as a ledger row: owned by darkmux,
+/// priced at its measured memory (potential and current alike), or unpriced
+/// when that could not be measured.
+fn server_row(s: ServerInput) -> ModelRow {
+    ModelRow {
+        identifier: s.server.served_name.clone(),
+        model_key: s.server.model.clone(),
+        owner: Owner::Darkmux,
+        loaded_ctx: u64::from(s.server.n_ctx),
+        weights_bytes: None,
+        kv_per_token_bytes: None,
+        kv_bytes_at_ctx: None,
+        potential_bytes: s.memory_bytes,
+        potential_source: s.memory_bytes.map(|_| PotentialSource::Measured),
+        current_bytes: s.memory_bytes,
+        state: LedgerState::Unknown,
+        over_price_bytes: None,
+        shrink_hint: None,
+        server: Some(s.server),
     }
 }
 
@@ -1617,6 +1705,7 @@ pub fn gather_with_bin(lms_bin: &str) -> ModelLedger {
             margin_percent: machine.margin_percent,
             workers: machine.workers,
             residents_unknown: ps_rows.is_none(),
+            servers: machine.servers,
             messages,
         },
         now_ms(),
@@ -1658,6 +1747,7 @@ fn gather_residents_unknown_as(message: LedgerMessage, why: &str) -> ModelLedger
             margin_percent: machine.margin_percent,
             workers: machine.workers,
             residents_unknown: true,
+            servers: machine.servers,
             messages,
         },
         now_ms(),
@@ -1740,6 +1830,7 @@ struct MachineProbes {
     compressor_bytes: Option<u64>,
     margin_percent: Option<u64>,
     workers: Option<Vec<WorkerProc>>,
+    servers: Vec<ServerInput>,
 }
 
 /// The machine half of a gather: every probe bounded, each failure a message.
@@ -1767,7 +1858,8 @@ fn gather_machine(messages: &mut Vec<LedgerMessage>) -> MachineProbes {
         })
     });
 
-    MachineProbes { pool, swap_used_bytes, compressor_bytes, margin_percent, workers }
+    let servers = gather_servers(messages);
+    MachineProbes { pool, swap_used_bytes, compressor_bytes, margin_percent, workers, servers }
 }
 
 /// Resolves architecture facts for every distinct resident model key,
@@ -1784,20 +1876,86 @@ fn resolve_arch_facts(
     arch_reader: &ArchFactsReader,
     gguf_reader: &GgufFactsReader,
 ) -> BTreeMap<String, ArchFacts> {
-    let mut arch: BTreeMap<String, ArchFacts> = BTreeMap::new();
-    for r in residents {
-        if arch.contains_key(&r.model_key) {
+    resolve_arch_facts_of(residents.iter().map(|r| r.model_key.as_str()), arch_reader, gguf_reader).facts
+}
+
+/// [`resolve_arch_facts`] over model keys, saying which came from a GGUF
+/// header (the reader that answered names the format).
+fn resolve_arch_facts_of<'k>(
+    model_keys: impl Iterator<Item = &'k str>,
+    arch_reader: &ArchFactsReader,
+    gguf_reader: &GgufFactsReader,
+) -> ModelArch {
+    let mut arch = ModelArch::default();
+    for key in model_keys {
+        if arch.facts.contains_key(key) {
             continue;
         }
-        if let Some(raw) = arch_reader.read(&r.model_key) {
-            arch.insert(r.model_key.clone(), arch_facts_v1(&raw));
-            continue;
-        }
-        if let Some(raw) = gguf_reader.read(&r.model_key) {
-            arch.insert(r.model_key.clone(), arch_facts_v1(&raw));
+        if let Some(raw) = arch_reader.read(key) {
+            arch.facts.insert(key.to_string(), arch_facts_v1(&raw));
+        } else if let Some(raw) = gguf_reader.read(key) {
+            arch.facts.insert(key.to_string(), arch_facts_v1(&raw));
+            arch.kv_at_load.insert(key.to_string());
         }
     }
     arch
+}
+
+/// (#3508) Architecture facts for `model_keys`, read from the models
+/// `ls_rows` (`lms ls --json`) lists, in [`resolve_arch_facts`]'s order. A
+/// load is then priced as [`ModelLedger`] prices a resident.
+pub fn arch_facts_for(ls_rows: &[serde_json::Value], model_keys: &[&str]) -> ModelArch {
+    let arch_reader = ArchFactsReader::from_ls_entries(ls_rows);
+    let gguf_reader = GgufFactsReader::from_ls_entries(ls_rows);
+    resolve_arch_facts_of(model_keys.iter().copied(), &arch_reader, &gguf_reader)
+}
+
+/// (#3514) What a load costs, two ways.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoadFigures {
+    /// What the load takes the moment it is made: a GGUF model's weights,
+    /// its KV cache at the whole context and the margin (llama.cpp allocates
+    /// the cache at load); an MLX model's weights and the margin (MLX grows
+    /// the cache as the context fills). `None` when the architecture could
+    /// not be read: the size-based estimate is a guess, never a refusal.
+    pub commitment: Option<u64>,
+    /// What it can grow to with its whole context filled: the ledger's
+    /// potential, [`ArchWithSizeFallback`]'s figure.
+    pub potential: u64,
+}
+
+/// (#3514) Prices a load both ways: the commitment a refusal may rest on,
+/// and the potential eviction and wave packing aim for.
+pub struct LoadPricer {
+    estimator: ArchWithSizeFallback,
+    kv_at_load: std::collections::BTreeSet<String>,
+}
+
+impl LoadPricer {
+    pub fn new(arch: ModelArch) -> Self {
+        LoadPricer { estimator: ArchWithSizeFallback::new(arch.facts), kv_at_load: arch.kv_at_load }
+    }
+
+    /// `None` when the model cannot be priced at all.
+    pub fn figures(&self, model_key: &str, min_ctx: u32, catalog: Option<&[CatalogFact]>) -> Option<LoadFigures> {
+        let (potential, source) = self.estimator.estimate_with_source(model_key, min_ctx, catalog)?;
+        let weights = || catalog?.iter().find(|c| c.model_key == model_key)?.size_bytes;
+        let commitment = commitment_of(source, potential, self.kv_at_load.contains(model_key), weights);
+        Some(LoadFigures { commitment, potential })
+    }
+}
+
+/// A priced load's commitment, by where its potential came from: the whole
+/// potential when the cache is taken at load (GGUF) or (#3450) the figure is
+/// a measurement of memory already held (`Measured`, a server darkmux
+/// started); weights and the margin for an MLX model; none for a guess.
+fn commitment_of(source: PotentialSource, potential: u64, kv_at_load: bool, weights: impl FnOnce() -> Option<u64>) -> Option<u64> {
+    match source {
+        PotentialSource::Arch if kv_at_load => Some(potential),
+        PotentialSource::Arch => weights().map(|w| w + darkmux_gestalt::DEFAULT_TRANSIENT_MARGIN_BYTES),
+        PotentialSource::Measured => Some(potential),
+        PotentialSource::Estimated | PotentialSource::Unknown => None,
+    }
 }
 
 /// `ArchFactsRaw` → gestalt [`ArchFacts`] with the v1 KV dtype width. NOT a
@@ -2015,6 +2173,23 @@ fn parse_worker_rss(ps_out: &str) -> Vec<WorkerProc> {
         .collect()
 }
 
+/// (#3514) LM Studio's inference workers' memory now: the sum of their
+/// `phys_footprint`, never RSS (a server's RSS can read 0.1 GiB against a
+/// 24 GB footprint). `None` when `ps` or any worker's footprint cannot be
+/// read. Other apps and engine servers never move it.
+pub fn lmstudio_workers_footprint() -> Option<u64> {
+    let out = bounded_stdout("ps", &["-axo", "pid=,rss=,command="], "ps-workers", SYS_PROBE_BOUND, &mut Vec::new())?;
+    workers_footprint(&enrich_with_footprint(parse_worker_rss(&out), |pid| {
+        u32::try_from(pid).ok().and_then(|p| darkmux_platform::current().process_footprint(p))
+    }))
+}
+
+/// The sum of `workers`' footprints; `None` when any is unknown. No worker
+/// at all is 0: LM Studio holds no model yet.
+fn workers_footprint(workers: &[WorkerProc]) -> Option<u64> {
+    workers.iter().map(|w| w.footprint_bytes).sum()
+}
+
 /// Fills each worker's `footprint_bytes` from `probe`.
 ///
 /// Split out with the probe INJECTED rather than inlined at the gather so the
@@ -2028,6 +2203,26 @@ fn enrich_with_footprint(mut workers: Vec<WorkerProc>, probe: impl Fn(i64) -> Op
         w.footprint_bytes = probe(w.pid);
     }
     workers
+}
+
+/// (#3450) darkmux's servers running now and what each holds. One `ps` read
+/// for all of them, and none when darkmux runs no server.
+fn gather_servers(messages: &mut Vec<LedgerMessage>) -> Vec<ServerInput> {
+    let listed = crate::engine::server::listed(&crate::engine::server::Dirs::under_home());
+    if listed.is_empty() {
+        return Vec::new();
+    }
+    // One process listing for every server's group; each is measured as
+    // every surface measures it (`server::memory_in`: the group's footprint).
+    let ps = bounded_stdout("ps", &["-axo", "pid=,pgid="], "ps-servers", SYS_PROBE_BOUND, messages);
+    let host = darkmux_platform::current();
+    listed
+        .into_iter()
+        .map(|server| {
+            let memory_bytes = crate::engine::server::memory_in(server.pid, ps.as_deref(), &|p| host.process_footprint(p));
+            ServerInput { server, memory_bytes }
+        })
+        .collect()
 }
 
 /// True when a `ps` command line is an LMStudio inference worker: it runs the
@@ -2101,7 +2296,7 @@ fn severity_word(severity: Severity) -> &'static str {
 }
 
 /// One model's row of [`render_human`]'s table, with its footnotes.
-fn push_model_row(out: &mut String, m: &ModelRow) {
+fn push_model_row(out: &mut String, m: &ModelRow, now_ms: u64) {
     let ident = truncate_ident(&m.identifier, 46);
     // #1819: an ESTIMATED row's state carries the disclosure right next
     // to the figure it qualifies — provenance visible everywhere the
@@ -2139,6 +2334,14 @@ fn push_model_row(out: &mut String, m: &ModelRow) {
     if let Some(h) = &m.shrink_hint {
         out.push_str(&format!("  ↳ {h}\n"));
     }
+    if let Some(s) = &m.server {
+        let measured = if m.current_bytes.is_some() { "measured" } else { "not measured" };
+        let state = if s.answering { measured.to_string() } else { format!("{}, {measured}", s.silent_word(now_ms)) };
+        out.push_str(&format!(
+            "  ↳ {} server for `{}` on endpoint `{}` (port {}, pid {}), {state}\n",
+            s.engine, s.model, s.endpoint, s.port, s.pid
+        ));
+    }
 }
 
 /// What the machine line's limit is, in words.
@@ -2162,7 +2365,7 @@ pub fn render_human(ledger: &ModelLedger) -> String {
         out.push_str("  (no models loaded)\n");
     }
     for m in &ledger.models {
-        push_model_row(&mut out, m);
+        push_model_row(&mut out, m, ledger.generated_at_ms);
     }
     let limit_desc = limit_desc(&ledger.limit_source);
     // #1819: the machine-total parenthetical names BOTH gaps when both are
@@ -2323,8 +2526,204 @@ mod tests {
                 WorkerProc { pid: 2, rss_bytes: 15_000_000_000, footprint_bytes: None },
             ]),
             residents_unknown: false,
+            servers: Vec::new(),
             messages: Vec::new(),
         }
+    }
+
+    /// (#3450) One server darkmux started, at `memory` bytes measured.
+    fn tf_server(memory: Option<u64>) -> ServerInput {
+        ServerInput {
+            server: crate::engine::server::EngineServer {
+                endpoint: "tf".into(),
+                engine: "tensorfold".into(),
+                model: "TensorFold/q38".into(),
+                served_name: "darkmux:TensorFold/q38".into(),
+                n_ctx: 262_144,
+                port: 8091,
+                pid: 4242,
+                started_at_ms: 1_000,
+                answering: true,
+            },
+            memory_bytes: memory,
+        }
+    }
+
+    /// (#3450) A server darkmux started is darkmux's own resident: a row
+    /// owned by darkmux at its measured memory, counted in darkmux's current
+    /// and no longer in "other tenants".
+    #[test]
+    fn a_server_darkmux_started_is_its_own_row_and_not_another_tenant() {
+        let server = 20_000_000_000;
+        let mut inputs = base_inputs();
+        inputs.pool.as_mut().unwrap().used_bytes = Some(60_000_000_000);
+        inputs.servers = vec![tf_server(Some(server))];
+        let l = compute_ledger(inputs, 0);
+        assert_eq!(l.schema_version, "2.2");
+        let row = l.models.iter().find(|m| m.server.is_some()).expect("a row for the server");
+        assert_eq!(row.identifier, "darkmux:TensorFold/q38");
+        assert_eq!(row.model_key, "TensorFold/q38");
+        assert_eq!(row.owner, Owner::Darkmux);
+        assert_eq!(row.loaded_ctx, 262_144);
+        assert_eq!((row.current_bytes, row.potential_bytes), (Some(server), Some(server)), "measured, never the file size");
+        assert_eq!(row.potential_source, Some(PotentialSource::Measured));
+        assert_eq!(row.weights_bytes, None);
+        assert_eq!(row.server.as_ref().map(|s| s.endpoint.as_str()), Some("tf"));
+        // The two LM Studio workers (33 GB) plus the server.
+        assert_eq!(l.machine.current_bytes, Some(33_000_000_000 + server));
+        assert_eq!(l.machine.other_used_bytes, Some(60_000_000_000 - 33_000_000_000 - server), "the server is not another tenant");
+        assert_eq!(l.machine.unpriced_models, 0);
+    }
+
+    /// A measured server row earns the state its numbers earn, as every LM
+    /// Studio row does: on a machine that reads green, it reads green too,
+    /// never a bare "unknown" beside its measured bytes.
+    #[test]
+    fn a_measured_server_row_takes_the_machine_state_like_any_priced_row() {
+        let mut inputs = base_inputs();
+        inputs.servers = vec![tf_server(Some(5_000_000_000))];
+        let l = compute_ledger(inputs, 0);
+        assert_eq!(l.machine.state, LedgerState::Green, "fixture: a healthy machine");
+        let row = l.models.iter().find(|m| m.server.is_some()).unwrap();
+        assert_eq!(row.state, LedgerState::Green);
+        let lms = l.models.iter().find(|m| m.server.is_none()).unwrap();
+        assert_eq!(row.state, lms.state, "a server row and an LM Studio row read alike");
+    }
+
+    /// (#3450) A server row never takes part in the LM Studio worker
+    /// attribution: two workers for two LM Studio residents still pair one
+    /// to one beside a server.
+    #[test]
+    fn a_server_row_takes_no_lm_studio_worker() {
+        let mut inputs = base_inputs();
+        inputs.servers = vec![tf_server(Some(5_000_000_000))];
+        let l = compute_ledger(inputs, 0);
+        assert_eq!(l.attribution, Attribution::PerProcess, "{}", l.attribution_note);
+        let lms: u64 = l.models.iter().filter(|m| m.server.is_none()).filter_map(|m| m.current_bytes).sum();
+        assert_eq!(lms, 33_000_000_000);
+    }
+
+    /// (#3450) A server whose memory could not be measured is unpriced: no
+    /// guess stands in, and the machine cannot read green.
+    #[test]
+    fn an_unmeasured_server_is_unpriced_never_guessed() {
+        let mut inputs = base_inputs();
+        inputs.servers = vec![tf_server(None)];
+        let l = compute_ledger(inputs, 0);
+        let row = l.models.iter().find(|m| m.server.is_some()).unwrap();
+        assert_eq!((row.current_bytes, row.potential_bytes, row.potential_source), (None, None, None));
+        assert_eq!(l.machine.unpriced_models, 1);
+        assert_ne!(l.machine.state, LedgerState::Green);
+        let texts: Vec<&str> = l.messages.iter().map(|m| m.text.as_str()).collect();
+        assert!(texts.iter().any(|t| t.contains("could not be measured") && t.contains("TensorFold/q38")), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("arch facts")), "a server is never blamed on arch facts: {texts:?}");
+    }
+
+    /// (#3450) When `lms ps` fails, darkmux's servers are still known and
+    /// still not other tenants.
+    #[test]
+    fn a_failed_lms_listing_still_counts_darkmuxs_servers() {
+        let mut inputs = base_inputs();
+        inputs.residents = Vec::new();
+        inputs.residents_unknown = true;
+        inputs.servers = vec![tf_server(Some(5_000_000_000))];
+        let l = compute_ledger(inputs, 0);
+        assert_eq!(l.models.len(), 1);
+        assert_eq!(l.machine.other_used_bytes, Some(40_000_000_000 - 33_000_000_000 - 5_000_000_000));
+    }
+
+    /// (#3450) The ledger measures each running server as every other
+    /// surface does (`server::memory`: its whole group's footprint).
+    #[test]
+    #[serial_test::serial]
+    fn the_ledger_measures_a_server_with_the_shared_figure() {
+        let home = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("DARKMUX_HOME");
+        // SAFETY: #[serial]; restored below.
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "sleep 30 & sleep 30"]);
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        let mut child = cmd.spawn().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let pid = child.id();
+        let stamp = darkmux_platform::current().process_start_stamp(pid).expect("a start stamp");
+        let rec = darkmux_types::engine_record::EngineRecord {
+            schema: darkmux_types::engine_record::ENGINE_RECORD_SCHEMA,
+            endpoint: "tf".into(),
+            engine: "tensorfold".into(),
+            model: "m".into(),
+            n_ctx: 8192,
+            port: 1,
+            pid,
+            start_stamp: stamp,
+            owner_pid: std::process::id(),
+            argv: vec!["tf".into(), "--name".into(), "darkmux:m".into()],
+            log: home.path().join("tf.log"),
+            started_at_ms: 0,
+            engine_version: "fake".into(),
+        };
+        darkmux_types::engine_record::write_in(&darkmux_types::engine_record::dir(), &rec).unwrap();
+        let gathered = gather_servers(&mut Vec::new());
+        let shared = crate::engine::server::memory(pid);
+        let leader = darkmux_platform::current().process_footprint(pid);
+        let _ = darkmux_types::child_registry::kill_group(pid, darkmux_types::child_registry::SIGKILL);
+        let _ = child.wait();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        assert_eq!(gathered.len(), 1);
+        assert_eq!(gathered[0].memory_bytes, shared);
+        if let Some(leader) = leader {
+            assert!(gathered[0].memory_bytes.is_some_and(|m| m > leader), "the group, not the leader alone");
+        }
+    }
+
+    /// (#3450) A measured figure (a server darkmux started, priced at the
+    /// memory it holds) is a commitment a refusal may rest on, unlike a
+    /// size-based guess.
+    #[test]
+    fn a_measured_figure_is_its_own_commitment() {
+        let no_weights = || -> Option<u64> { None };
+        assert_eq!(commitment_of(PotentialSource::Measured, 24_000_000_000, false, no_weights), Some(24_000_000_000));
+        assert_eq!(commitment_of(PotentialSource::Estimated, 24_000_000_000, false, no_weights), None);
+        assert_eq!(commitment_of(PotentialSource::Arch, 9, true, no_weights), Some(9));
+    }
+
+    /// (#3450) The table names a server's engine and endpoint.
+    #[test]
+    fn the_table_names_a_servers_engine_and_endpoint() {
+        let mut inputs = base_inputs();
+        inputs.servers = vec![tf_server(Some(5_000_000_000))];
+        let text = render_human(&compute_ledger(inputs, 0));
+        let at = text.lines().position(|l| l.starts_with("darkmux:TensorFold/q38")).expect(&text);
+        let note = text.lines().nth(at + 1).unwrap_or_default();
+        assert_eq!(note, "  ↳ tensorfold server for `TensorFold/q38` on endpoint `tf` (port 8091, pid 4242), measured", "{text}");
+    }
+
+    /// The table's server note says what the server is doing: "starting the
+    /// model" only while its start is young (read on the ledger's own clock),
+    /// "not answering" after; and "not measured" when its memory could not
+    /// be read, never a bare "measured".
+    #[test]
+    fn the_table_says_not_answering_past_the_start_bound_and_not_measured() {
+        let note_for = |memory: Option<u64>, answering: bool, generated_at_ms: u64| {
+            let mut inputs = base_inputs();
+            let mut s = tf_server(memory);
+            s.server.answering = answering;
+            inputs.servers = vec![s];
+            let text = render_human(&compute_ledger(inputs, generated_at_ms));
+            let at = text.lines().position(|l| l.starts_with("darkmux:TensorFold/q38")).expect(&text);
+            text.lines().nth(at + 1).unwrap_or_default().to_string()
+        };
+        let bound = crate::engine::server::START_BOUND.as_millis() as u64;
+        // `tf_server` started at 1_000 ms.
+        assert!(note_for(Some(5), false, 1_000 + 60_000).ends_with("starting the model, measured"));
+        assert!(note_for(Some(5), false, 1_000 + bound + 1).ends_with("not answering, measured"));
+        assert!(note_for(None, true, 1_000).ends_with(", not measured"));
     }
 
     // Expected potentials from the probed arithmetic (same rows as the
@@ -2552,6 +2951,7 @@ mod tests {
             state: LedgerState::Green,
             over_price_bytes: None,
             shrink_hint: None,
+            server: None,
         };
         // Naive KV arithmetic: 163_840 x (32_768 - 4_096) = 4.70 GB.
         let naive = 163_840u64 * (32_768 - 4_096);
@@ -3556,6 +3956,78 @@ esac
         }
     }
 
+    /// (#3508) A load is priced from the model `lms ls` locates: its own
+    /// `config.json` under LM Studio's models root, read for each key asked
+    /// (a key no reader can answer is left out, for the size fallback). The
+    /// estimator then prices it with the KV term, as the ledger prices a
+    /// resident.
+    #[test]
+    #[serial_test::serial]
+    fn a_load_is_priced_from_the_architecture_lms_ls_locates() {
+        let home = tempfile::tempdir().unwrap();
+        write_fixture_config_json(&home.path().join(".lmstudio/models/org/m-4bit"), 32, 8, 128);
+        let prev = std::env::var_os("HOME");
+        // SAFETY: #[serial]; restored below.
+        unsafe { std::env::set_var("HOME", home.path()) };
+        let rows = [serde_json::json!({"modelKey": "m", "path": "org/m-4bit", "sizeBytes": 4_000_000_000u64})];
+        let arch = arch_facts_for(&rows, &["m", "absent"]).facts;
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        assert_eq!(arch.keys().collect::<Vec<_>>(), ["m"], "only the model on disk is read");
+        assert_eq!((arch["m"].total_layers, arch["m"].kv_heads, arch["m"].head_dim), (32, 8, 128));
+        let catalog = [CatalogFact { model_key: "m".into(), size_bytes: Some(4_000_000_000) }];
+        let est = ArchWithSizeFallback::new(arch);
+        let short = est.estimate_bytes("m", 4_096, Some(&catalog)).unwrap();
+        let long = est.estimate_bytes("m", 65_536, Some(&catalog)).unwrap();
+        assert!(short > 4_000_000_000, "weights plus KV and margin: {short}");
+        assert_eq!(long - short, 32 * 8 * 128 * 2 * 2 * (65_536 - 4_096), "the KV term grows with the context, per the architecture");
+    }
+
+    /// (#3514) The workers' footprint is their phys_footprint sum, never
+    /// RSS, and unknown when any worker's is.
+    #[test]
+    fn lm_studio_workers_footprint_sums_phys_footprint_never_rss() {
+        let w = |rss, fp| WorkerProc { pid: 1, rss_bytes: rss, footprint_bytes: fp };
+        assert_eq!(workers_footprint(&[w(100, Some(24_000)), w(5, Some(1_000))]), Some(25_000));
+        assert_eq!(workers_footprint(&[w(100, Some(24_000)), w(5, None)]), None, "one unreadable worker is no figure");
+        assert_eq!(workers_footprint(&[]), Some(0), "no worker holds nothing");
+    }
+
+    /// (#3514) The reader that answered names the format, and the format
+    /// what a load commits: a GGUF model pays its KV cache at load, an MLX
+    /// model (a `config.json`) only its weights, and a model neither reader
+    /// can answer has no commitment at all (its size-based guess is never a
+    /// refusal).
+    #[test]
+    fn a_load_commits_its_cache_only_when_its_weights_are_gguf() {
+        let root = TempTestRoot::new("commitment");
+        write_fixture_config_json(&root.0.join("mlx-model"), 32, 8, 128);
+        let gguf = root.0.join("gguf-model");
+        std::fs::create_dir_all(&gguf).unwrap();
+        std::fs::write(gguf.join("weights.gguf"), tiny_gguf_bytes(32, 32, 8, 4096)).unwrap();
+        let arch = resolve_arch_facts_of(
+            ["mlx-model", "gguf-model", "neither"].into_iter(),
+            &ArchFactsReader::with_root(&root.0),
+            &GgufFactsReader::with_root(&root.0),
+        );
+        assert_eq!(arch.kv_at_load.iter().collect::<Vec<_>>(), ["gguf-model"]);
+        let catalog: Vec<CatalogFact> = ["mlx-model", "gguf-model", "neither"]
+            .iter()
+            .map(|k| CatalogFact { model_key: k.to_string(), size_bytes: Some(4_000_000_000) })
+            .collect();
+        let pricer = LoadPricer::new(arch);
+        let at = |k: &str| pricer.figures(k, 100_000, Some(&catalog)).unwrap();
+        let margin = darkmux_gestalt::DEFAULT_TRANSIENT_MARGIN_BYTES;
+        assert_eq!(at("mlx-model").commitment, Some(4_000_000_000 + margin), "MLX: weights and the margin");
+        assert!(at("mlx-model").potential > 4_000_000_000 + margin, "its potential carries the cache");
+        assert_eq!(at("gguf-model").commitment, Some(at("gguf-model").potential), "GGUF: the cache at load");
+        assert_eq!(at("neither").commitment, None, "a guess commits nothing");
+    }
+
     #[test]
     fn resolve_arch_facts_prefers_config_json_over_gguf_when_both_present() {
         let root = TempTestRoot::new("precedence");
@@ -3973,6 +4445,7 @@ esac
             potential_source: Some(PotentialSource::Estimated),
             over_price_bytes: None,
             shrink_hint: None,
+            server: None,
         };
         assert_eq!(effective_kv_rate(&row), 327_680);
         assert_ne!(effective_kv_rate(&row), V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN);
@@ -4249,9 +4722,9 @@ esac
         );
         // A LITERAL, deliberately — the sibling assertion elsewhere compares
         // against the constant and so can never fail. This one is the pin
-        // that makes a schema bump a conscious edit; #1854 took it 2.0 → 2.1
-        //.
-        assert_eq!(v["schema_version"], "2.1");
+        // that makes a schema bump a conscious edit; #1854 took it 2.0 → 2.1,
+        // #3450 to 2.2.
+        assert_eq!(v["schema_version"], "2.2");
         assert_eq!(v["machine"]["estimated_models"], 1);
     }
 

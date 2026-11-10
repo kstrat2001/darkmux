@@ -229,6 +229,13 @@ pub fn alive(rec: &EngineRecord) -> bool {
     rec.state_now() == ServerState::Running && !is_zombie(rec.pid)
 }
 
+/// [`alive`] for a server known by its pid and start stamp alone (a memory
+/// reservation names its server so).
+pub fn process_alive(pid: u32, start_stamp: u64) -> bool {
+    reap_exited();
+    darkmux_platform::current().process_start_stamp(pid) == Some(start_stamp) && !is_zombie(pid)
+}
+
 fn reap_exited() {
     if let Ok(mut spawned) = SPAWNED.lock() {
         spawned.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
@@ -275,6 +282,152 @@ pub fn running_now(dirs: &Dirs, endpoint: &str) -> Option<EngineRecord> {
     engine_record::read_in(&dirs.records, endpoint).ok().flatten().filter(alive)
 }
 
+/// (#3450) One server darkmux started that is running now, as every machine
+/// surface lists it beside darkmux's LM Studio loads: `machine status`,
+/// `/machine/status`, `/machine/specs` (and so the machine card), and a row
+/// of the residency ledger.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
+pub struct EngineServer {
+    /// The `endpoints` id it serves.
+    pub endpoint: String,
+    /// The `managed` token (`tensorfold`, `flint`).
+    pub engine: String,
+    /// The model it was started with (a profile model's `id`).
+    pub model: String,
+    /// The model name it answers to on the wire: `darkmux:<id>` on
+    /// Tensorfold, `flint` on rec's Flint (which takes no name).
+    pub served_name: String,
+    pub n_ctx: u32,
+    pub port: u16,
+    pub pid: u32,
+    #[cfg_attr(feature = "ts-export", ts(type = "number"))]
+    pub started_at_ms: u64,
+    /// Whether it answered `GET /v1/models` under `served_name` when it was
+    /// listed. `false` while its model is still starting, or when it was too
+    /// busy to answer within a second.
+    pub answering: bool,
+}
+
+impl EngineServer {
+    /// What a server that does not answer is doing, in the words every
+    /// surface uses: "starting the model" while its start is inside
+    /// [`START_BOUND`] (darkmux stops a start that runs longer), "not
+    /// answering" after (a resident too busy to answer the listing, or one
+    /// that stopped answering). The viewer words it the same
+    /// (`ui/src/lib/engineServers.ts`).
+    pub fn silent_word(&self, now_ms: u64) -> &'static str {
+        if u128::from(now_ms.saturating_sub(self.started_at_ms)) < START_BOUND.as_millis() {
+            "starting the model"
+        } else {
+            "not answering"
+        }
+    }
+}
+
+/// How long a listing waits for a server to answer `GET /v1/models`. Every
+/// server is asked at the same time, so a listing waits about this long
+/// however many servers run: well inside the 2 s a peer gives a machine card,
+/// whose specs come from the same read.
+const LISTING_ANSWER_BOUND: Duration = Duration::from_millis(400);
+
+/// The model name darkmux's server `rec` answers to: `flint` for rec's (it
+/// has no `--name`, #3453), else the `--name` it was started under.
+pub fn served_name(rec: &EngineRecord) -> String {
+    if rec.engine == super::flint::ENGINE {
+        return super::flint::SERVED_NAME.to_string();
+    }
+    rec.argv.iter().skip_while(|a| *a != "--name").nth(1).cloned().unwrap_or_default()
+}
+
+/// (#3450) darkmux's servers running now, by endpoint id. Read only, like
+/// [`running_now`]: a stale record is left for a dispatch to clear, and an
+/// unreadable one claims nothing. Whether each answers is asked of all of
+/// them at once, within [`LISTING_ANSWER_BOUND`].
+pub fn listed(dirs: &Dirs) -> Vec<EngineServer> {
+    let live: Vec<EngineRecord> = engine_record::list_in(&dirs.records).0.into_iter().filter(alive).collect();
+    let mut out: Vec<EngineServer> = std::thread::scope(|scope| {
+        let asked: Vec<_> = live
+            .into_iter()
+            .map(|rec| {
+                let served_name = served_name(&rec);
+                let probe = {
+                    let name = served_name.clone();
+                    scope.spawn(move || answers_within(rec.port, &name, LISTING_ANSWER_BOUND))
+                };
+                (rec, served_name, probe)
+            })
+            .collect();
+        asked
+            .into_iter()
+            .map(|(rec, served_name, probe)| EngineServer {
+                answering: probe.join().unwrap_or(false),
+                endpoint: rec.endpoint,
+                engine: rec.engine,
+                model: rec.model,
+                served_name,
+                n_ctx: rec.n_ctx,
+                port: rec.port,
+                pid: rec.pid,
+                started_at_ms: rec.started_at_ms,
+            })
+            .collect()
+    });
+    out.sort_by(|a, b| a.endpoint.cmp(&b.endpoint));
+    out
+}
+
+/// (#3450) The memory darkmux's server `pid` holds: the one figure every
+/// surface uses (a ledger row, a dispatch's room decision, a start's
+/// reservation). It is the physical footprint of the process the server
+/// leads and of every process in the group it leads (it is spawned leading
+/// one; Tensorfold may fork workers), never RSS: both engines run on MLX,
+/// whose weights sit in Metal memory that only the footprint counts (a
+/// Flint server read live: 0.1 GiB RSS, a 24 GB footprint). `None` when the
+/// leader's footprint cannot be read (it exited, or the platform reads
+/// none).
+pub fn memory(pid: u32) -> Option<u64> {
+    let host = darkmux_platform::current();
+    memory_in(pid, group_listing().as_deref(), &|p| host.process_footprint(p))
+}
+
+/// [`memory`] over a `ps -axo pid=,pgid=` listing (`None` when it could not
+/// be read: the leader alone then) and a footprint reader.
+pub fn memory_in(pid: u32, ps_rows: Option<&str>, footprint: &dyn Fn(u32) -> Option<u64>) -> Option<u64> {
+    let leader = footprint(pid)?;
+    let workers: u64 = ps_rows
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let mut it = line.split_whitespace().map(str::parse::<u32>);
+            match (it.next(), it.next()) {
+                (Some(Ok(p)), Some(Ok(group))) if group == pid && p != pid => Some(p),
+                _ => None,
+            }
+        })
+        .filter_map(footprint)
+        .sum();
+    Some(leader + workers)
+}
+
+/// Every process and its group, as `ps -axo pid=,pgid=` lists them;
+/// `None` when the listing could not be read.
+pub fn group_listing() -> Option<String> {
+    let mut cmd = Command::new("ps");
+    cmd.args(["-axo", "pid=,pgid="]);
+    crate::process::pin_cwd(&mut cmd);
+    cmd.output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+/// (#3450) darkmux's live server serving `model` (a profile model on an
+/// endpoint darkmux starts servers for): the one on its endpoint, started
+/// with its id. The context is the caller's to compare. Read only.
+pub fn serving(dirs: &Dirs, model: &darkmux_types::ProfileModel) -> Option<EngineRecord> {
+    let endpoint = model.endpoint.as_ref().and_then(|e| e.named_id())?;
+    running_now(dirs, endpoint).filter(|r| r.model == model.id)
+}
+
 /// The reuse rule [`ensure`] applies, and a listing's `resident`: darkmux's
 /// server `rec` runs exactly `argv`, answers under `served_name` on `port`,
 /// and is what listens there (never a server darkmux did not start).
@@ -303,7 +456,10 @@ pub fn ensure(
 /// The endpoint's own lock, `<stem>.server.lock` (never a name the record's
 /// own `<stem>.json.lock` can take for another endpoint: holding both in one
 /// process would otherwise block on itself, since flock locks per open
-/// file). Waits for whoever holds it.
+/// file). Waits for whoever holds it, with no bound and deaf to a stop, and a
+/// start in flight holds it until its server answers (minutes, for a large
+/// model): a dispatch never takes it this way. It asks with
+/// [`try_endpoint_lock`] and waits on its own terms.
 pub fn endpoint_lock(dirs: &Dirs, endpoint: &str) -> Result<darkmux_types::flock::FlockGuard, ServerError> {
     darkmux_types::flock::lock_exclusive(&endpoint_lock_path(dirs, endpoint)).map_err(|e| lock_failed(dirs, endpoint, e))
 }
@@ -358,25 +514,13 @@ pub fn ensure_locked(
     Ok(Ensured::Started(rec))
 }
 
-/// (#3511) [`ensure`]'s reuse, never a start: darkmux's server on `spec`'s
-/// endpoint when it still runs this exact command (decided under the
-/// endpoint's lock, as `ensure` decides it), else `None` with any other
-/// server of darkmux's there stopped as `ensure` would stop it. A caller that
-/// judged the server reusable and then lost it (an evictor stopped it in
-/// between) gets `None`, and starts it through its memory decision rather
-/// than through `ensure` blind.
-pub fn reuse(
-    spec: &ServerSpec,
-    dirs: &Dirs,
-    bounds: Bounds,
-    held: Held<'_>,
-    progress: &mut dyn FnMut(Progress),
-) -> Result<Option<EngineRecord>, ServerError> {
-    let lock = endpoint_lock(dirs, &spec.endpoint)?;
-    reuse_locked(spec, dirs, bounds, held, progress, &lock)
-}
-
-/// [`reuse`] with the endpoint's lock already held.
+/// (#3511) [`ensure`]'s reuse, never a start, with the endpoint's lock
+/// already held: darkmux's server on `spec`'s endpoint when it still runs
+/// this exact command (decided as `ensure` decides it), else `None` with any
+/// other server of darkmux's there stopped as `ensure` would stop it. A
+/// caller that judged the server reusable and then lost it (an evictor
+/// stopped it in between) gets `None`, and starts it through its memory
+/// decision rather than through `ensure` blind.
 pub fn reuse_locked(
     spec: &ServerSpec,
     dirs: &Dirs,
@@ -561,19 +705,83 @@ fn log_tail(log: &Path) -> String {
 /// Stop darkmux's server `rec`, taking the endpoint's lock.
 pub fn stop(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds) -> Result<(), ServerError> {
     let _lock = lock_for_stop(dirs, rec)?;
-    stop_locked(dirs, rec, bounds)
+    stop_locked(dirs, rec, bounds).map(|_| ())
 }
 
 /// Stop darkmux's server `rec` to make room, unless `held` says a running
 /// dispatch uses it, asked under the endpoint's lock so a dispatch that took
 /// it up since the caller looked is seen. `Ok(false)`: held, left running.
 pub fn stop_unless_held(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds, held: Held<'_>) -> Result<bool, ServerError> {
+    stop_if_idle(dirs, rec, bounds, held).map(|o| o != StopOutcome::Held)
+}
+
+/// (#3450) What [`stop_if_idle`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopOutcome {
+    /// darkmux's server was signaled and is gone.
+    Stopped,
+    /// A running dispatch holds it: left running.
+    Held,
+    /// (#3450) The thermal stop signaled it without the endpoint's lock,
+    /// which a start in flight held past [`THERMAL_LOCK_WAIT`].
+    StoppedWithoutLock,
+    /// Nothing was signaled: the record no longer matched a live process of
+    /// darkmux's (it exited, or another process holds its pid or port). The
+    /// stale record is removed.
+    NotRunning,
+}
+
+/// (#3450, operator "Stop all") The thermal tier-5 stop: like
+/// [`stop_if_idle`] under the endpoint's lock, but asking no lease, so a
+/// server a running dispatch holds is stopped too. Still only a process its
+/// record matches is signaled (`NotRunning` otherwise). Never for `machine
+/// eject`, which keeps held servers.
+///
+/// A start holds the endpoint's lock until its model answers (up to
+/// [`START_BOUND`]), and a server still loading is the likeliest heat
+/// source, so the stop does not wait that out: it tries the lock for
+/// [`THERMAL_LOCK_WAIT`], then stops the server without it
+/// ([`StopOutcome::StoppedWithoutLock`]). The record and identity check
+/// (pid and start stamp) still decide what is signaled; the start in flight
+/// then fails with its own `dispatch.error`, the operator's chosen tradeoff
+/// at `critical`.
+pub fn stop_for_thermal(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds) -> Result<StopOutcome, ServerError> {
+    let lock_path = engine_record::path_in(&dirs.records, &rec.endpoint).with_extension("server.lock");
+    let lock = lock_within(&lock_path, THERMAL_LOCK_WAIT)
+        .map_err(|e| ServerError::StopFailed { endpoint: rec.endpoint.clone(), pid: rec.pid, detail: format!("{e:#}") })?;
+    let signaled = stop_locked(dirs, rec, bounds)?;
+    Ok(match (signaled, lock.is_some()) {
+        (false, _) => StopOutcome::NotRunning,
+        (true, true) => StopOutcome::Stopped,
+        (true, false) => StopOutcome::StoppedWithoutLock,
+    })
+}
+
+/// The lock at `path`, tried until `wait` passes; `None` when another
+/// holder kept it that long.
+fn lock_within(path: &Path, wait: Duration) -> anyhow::Result<Option<darkmux_types::flock::FlockGuard>> {
+    let until = Instant::now() + wait;
+    loop {
+        let lock = darkmux_types::flock::try_lock_exclusive(path)?;
+        if lock.is_some() || Instant::now() >= until {
+            return Ok(lock);
+        }
+        std::thread::sleep(THERMAL_LOCK_POLL);
+    }
+}
+
+/// How long the thermal stop tries for an endpoint's lock before it stops
+/// the server without it.
+pub const THERMAL_LOCK_WAIT: Duration = Duration::from_secs(2);
+const THERMAL_LOCK_POLL: Duration = Duration::from_millis(100);
+
+/// [`stop_unless_held`], saying which of the three it was.
+pub fn stop_if_idle(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds, held: Held<'_>) -> Result<StopOutcome, ServerError> {
     let _lock = lock_for_stop(dirs, rec)?;
     if held(rec) {
-        return Ok(false);
+        return Ok(StopOutcome::Held);
     }
-    stop_locked(dirs, rec, bounds)?;
-    Ok(true)
+    Ok(if stop_locked(dirs, rec, bounds)? { StopOutcome::Stopped } else { StopOutcome::NotRunning })
 }
 
 /// (#3509) [`stop_unless_held`] without waiting for the endpoint's lock:
@@ -600,8 +808,9 @@ fn lock_for_stop(dirs: &Dirs, rec: &EngineRecord) -> Result<darkmux_types::flock
 
 /// [`stop`] with the lock already held. Signals only a process the record
 /// still matches, or the workers its exited server left on the port
-/// ([`left_workers`]); a stale record is then removed.
-fn stop_locked(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds) -> Result<(), ServerError> {
+/// ([`left_workers`]); a stale record is then removed. `true` when anything
+/// was signaled.
+fn stop_locked(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds) -> Result<bool, ServerError> {
     use darkmux_types::child_registry::{SIGKILL, SIGTERM};
     let failed = |detail: String| ServerError::StopFailed { endpoint: rec.endpoint.clone(), pid: rec.pid, detail };
     let mut signaled = false;
@@ -636,7 +845,7 @@ fn stop_locked(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds) -> Result<(), Se
         port_closed_within(rec.port, bounds);
     }
     let _ = engine_record::remove_if_in(&dirs.records, rec);
-    Ok(())
+    Ok(signaled)
 }
 
 /// Wait up to the stop grace for nothing to accept connections on `port`.
@@ -759,7 +968,12 @@ pub fn listens_by(rec: &EngineRecord, host: &dyn darkmux_platform::Platform) -> 
 
 /// Whether the server on `port` lists `served_name` at `GET /v1/models`.
 fn answers(port: u16, served_name: &str) -> bool {
-    let agent = ureq::AgentBuilder::new().redirects(0).timeout(Duration::from_secs(2)).build();
+    answers_within(port, served_name, Duration::from_secs(2))
+}
+
+/// [`answers`], waiting at most `bound`.
+fn answers_within(port: u16, served_name: &str, bound: Duration) -> bool {
+    let agent = ureq::AgentBuilder::new().redirects(0).timeout(bound).build();
     let Ok(resp) = agent.get(&format!("http://127.0.0.1:{port}/v1/models")).call() else { return false };
     let Ok(text) = resp.into_string() else { return false };
     let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) else { return false };
@@ -1492,5 +1706,216 @@ S(("127.0.0.1", port), H).serve_forever()
         assert_eq!(ok_if_gone(err(EPERM), || false).unwrap_err().raw_os_error(), Some(EPERM), "EPERM for a live process");
         // EINVAL (an invalid signal number): 22 on macOS and Linux alike.
         assert_eq!(ok_if_gone(err(22), never).unwrap_err().raw_os_error(), Some(22));
+    }
+
+    /// A child leading its own group, killed with it and reaped when dropped.
+    struct Reaped(Child);
+
+    impl Drop for Reaped {
+        fn drop(&mut self) {
+            let _ = darkmux_types::child_registry::kill_group(self.0.id(), darkmux_types::child_registry::SIGKILL);
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A record for `pid` on `endpoint`, as darkmux writes one, read now.
+    fn record_of(f: &Fixture, endpoint: &str, engine: &str, pid: u32, port: u16, argv: &[&str]) -> EngineRecord {
+        let stamp = (0..50).find_map(|_| {
+            std::thread::sleep(Duration::from_millis(10));
+            darkmux_platform::current().process_start_stamp(pid)
+        });
+        EngineRecord {
+            schema: ENGINE_RECORD_SCHEMA,
+            endpoint: endpoint.into(),
+            engine: engine.into(),
+            model: "m/a".into(),
+            n_ctx: 8192,
+            port,
+            pid,
+            start_stamp: stamp.unwrap_or(1),
+            owner_pid: std::process::id(),
+            argv: argv.iter().map(|s| s.to_string()).collect(),
+            log: f.dirs.log_for(endpoint),
+            started_at_ms: 1_000,
+            engine_version: "fake 1.2.4".into(),
+        }
+    }
+
+    /// (#3450) A listing names darkmux's live servers, answering or still
+    /// starting, and never a stale record, which it leaves on disk for a
+    /// dispatch to clear.
+    #[test]
+    fn a_listing_names_darkmuxs_live_servers_and_changes_nothing() {
+        let f = fixture();
+        let s = spec(&f, "tf", "m/a", free_port(), &[]);
+        let up = ensure(&s, &f.dirs, quick(), &not_held, &mut no_progress()).unwrap();
+        // A server whose model is still starting: alive, not yet bound.
+        let mut starting = Command::new("sleep");
+        starting.arg("30");
+        std::os::unix::process::CommandExt::process_group(&mut starting, 0);
+        let starting = Reaped(starting.spawn().unwrap());
+        let starting_rec = record_of(&f, "zz", "tensorfold", starting.0.id(), free_port(), &["tf", "--name", "darkmux:m/a"]);
+        engine_record::write_in(&f.dirs.records, &starting_rec).unwrap();
+        // A stale record: its process exited.
+        let mut gone = Command::new("true").spawn().unwrap();
+        let gone_pid = gone.id();
+        gone.wait().unwrap();
+        let stale = EngineRecord { start_stamp: 7, ..record_of(&f, "old", "tensorfold", gone_pid, free_port(), &[]) };
+        engine_record::write_in(&f.dirs.records, &stale).unwrap();
+
+        let listed = listed(&f.dirs);
+        let rows: Vec<(&str, bool)> = listed.iter().map(|l| (l.endpoint.as_str(), l.answering)).collect();
+        assert_eq!(rows, vec![("tf", true), ("zz", false)], "{listed:?}");
+        let tf = &listed[0];
+        assert_eq!((tf.model.as_str(), tf.served_name.as_str(), tf.port, tf.pid), ("m/a", "darkmux:m/a", s.port, up.record().pid));
+        assert_eq!(tf.n_ctx, 8192);
+        assert_eq!(listed[1].served_name, "darkmux:m/a");
+        assert!(engine_record::read_in(&f.dirs.records, "old").unwrap().is_some(), "a listing removes nothing");
+        stop(&f.dirs, up.record(), quick()).unwrap();
+    }
+
+    /// (#3450) rec's Flint takes no name, so its server answers `flint`;
+    /// every other engine answers the `--name` darkmux started it under.
+    #[test]
+    fn a_servers_wire_name_is_flint_for_rec_and_its_name_flag_otherwise() {
+        let f = fixture();
+        let tf = record_of(&f, "tf", "tensorfold", 2, 1, &["tf", "serve", "m", "--name", "darkmux:m"]);
+        assert_eq!(served_name(&tf), "darkmux:m");
+        let fl = record_of(&f, "fl", "flint", 2, 1, &["rec-mlx", "serve", "flint", "--name", "x"]);
+        assert_eq!(served_name(&fl), "flint");
+        assert_eq!(served_name(&record_of(&f, "tf", "tensorfold", 2, 1, &["tf"])), "", "no name flag, no name");
+    }
+
+    /// (#3450) The server serving a profile model is the live one on its
+    /// endpoint started with its id, never another endpoint's or model's.
+    #[test]
+    fn the_server_serving_a_model_is_its_endpoints_with_its_id() {
+        let f = fixture();
+        let mut live = Command::new("sleep");
+        live.arg("30");
+        std::os::unix::process::CommandExt::process_group(&mut live, 0);
+        let live = Reaped(live.spawn().unwrap());
+        engine_record::write_in(&f.dirs.records, &record_of(&f, "tf", "tensorfold", live.0.id(), 1, &[])).unwrap();
+        let model = |id: &str, endpoint: &str| darkmux_types::ProfileModel {
+            id: id.into(),
+            endpoint: Some(darkmux_types::ModelEndpoint::reference(endpoint)),
+            ..Default::default()
+        };
+        assert_eq!(serving(&f.dirs, &model("m/a", "tf")).map(|r| r.pid), Some(live.0.id()));
+        assert_eq!(serving(&f.dirs, &model("m/b", "tf")), None, "another model on the endpoint");
+        assert_eq!(serving(&f.dirs, &model("m/a", "other")), None, "another endpoint");
+    }
+
+    /// (#3450 review) A stop says whether it stopped anything: a server it
+    /// stopped, one a running dispatch holds, and a record whose process is
+    /// gone (nothing signaled) are three answers, never all "stopped".
+    #[test]
+    fn a_stop_says_whether_it_stopped_held_or_found_nothing() {
+        let f = fixture();
+        let live = Reaped({
+            let mut c = Command::new("sleep");
+            c.arg("30");
+            std::os::unix::process::CommandExt::process_group(&mut c, 0);
+            c.spawn().unwrap()
+        });
+        let rec = record_of(&f, "tf", "tensorfold", live.0.id(), free_port(), &[]);
+        engine_record::write_in(&f.dirs.records, &rec).unwrap();
+        assert_eq!(stop_if_idle(&f.dirs, &rec, quick(), &|_| true), Ok(StopOutcome::Held));
+        assert_eq!(stop_if_idle(&f.dirs, &rec, quick(), &not_held), Ok(StopOutcome::Stopped));
+        assert_eq!(stop_if_idle(&f.dirs, &rec, quick(), &not_held), Ok(StopOutcome::NotRunning), "nothing left to signal");
+    }
+
+    /// (#3450, operator 2026-11-10 "Stop all") The thermal stop asks no
+    /// lease, so it stops a server a running dispatch holds; it still takes
+    /// the endpoint lock and signals only a process its record matches.
+    #[test]
+    fn a_thermal_stop_ignores_leases_never_a_process_its_record_does_not_match() {
+        let f = fixture();
+        let spawn = || {
+            let mut c = Command::new("sleep");
+            c.arg("30");
+            std::os::unix::process::CommandExt::process_group(&mut c, 0);
+            Reaped(c.spawn().unwrap())
+        };
+        let held = spawn();
+        let rec = record_of(&f, "tf", "tensorfold", held.0.id(), free_port(), &[]);
+        engine_record::write_in(&f.dirs.records, &rec).unwrap();
+        assert_eq!(stop_for_thermal(&f.dirs, &rec, quick()), Ok(StopOutcome::Stopped));
+        assert!(!alive(&rec), "stopped whatever leases it");
+        let stranger = spawn();
+        let reused = EngineRecord { start_stamp: 7, ..record_of(&f, "zz", "tensorfold", stranger.0.id(), free_port(), &[]) };
+        engine_record::write_in(&f.dirs.records, &reused).unwrap();
+        assert_eq!(stop_for_thermal(&f.dirs, &reused, quick()), Ok(StopOutcome::NotRunning));
+        assert!(darkmux_platform::current().process_start_stamp(stranger.0.id()).is_some(), "a reused pid is never signaled");
+    }
+
+    /// (#3450) A server's memory is one figure everywhere (the ledger, a
+    /// dispatch's room decision, a start's reservation): the physical
+    /// footprint of the process it leads and of every process in its group,
+    /// never RSS. Read live: a Flint server is one process with 0.1 GiB RSS
+    /// and a 24 GB footprint (its model in Metal memory), and a server's
+    /// leader can be tiny while a forked worker holds the weights.
+    #[test]
+    fn a_servers_memory_is_its_groups_footprint_never_rss() {
+        let flint = |pid: u32| (pid == 43963).then_some(24_000_000_000u64);
+        assert_eq!(memory_in(43963, Some("  43963  43963\n"), &flint), Some(24_000_000_000));
+        // A tiny leader, a worker holding the weights, a stranger's process.
+        let rows = "  100  100\n  101  100\n  300  300\n";
+        let fp = |pid: u32| match pid {
+            100 => Some(10 << 20),
+            101 => Some(20_000_000_000),
+            300 => Some(5_000_000_000),
+            _ => None,
+        };
+        assert_eq!(memory_in(100, Some(rows), &fp), Some((10 << 20) + 20_000_000_000));
+        assert_eq!(memory_in(100, None, &fp), Some(10 << 20), "no process listing: the leader alone");
+        assert_eq!(memory_in(100, Some(rows), &|p| (p != 100).then_some(1)), None, "no footprint for the leader: not measured");
+        // On this machine: a leader that forked a child holds both.
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 30 & sleep 30"]);
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        let group = Reaped(cmd.spawn().unwrap());
+        std::thread::sleep(Duration::from_millis(300));
+        let host = darkmux_platform::current();
+        if let Some(leader) = host.process_footprint(group.0.id()) {
+            let total = memory(group.0.id()).expect("measured");
+            assert!(total > leader, "the forked child counts too: {total} vs the leader's {leader}");
+        }
+    }
+
+    /// (#3450 review) The thermal stop does not wait out a start holding
+    /// the endpoint's lock (a start holds it through `wait_ready`, up to
+    /// START_BOUND): it tries for [`THERMAL_LOCK_WAIT`], then stops the
+    /// server without the lock, the record and identity check still
+    /// deciding what is signaled, and says it did.
+    #[test]
+    fn a_thermal_stop_does_not_wait_out_a_held_endpoint_lock() {
+        let f = fixture();
+        let server = Reaped({
+            let mut c = Command::new("sleep");
+            c.arg("30");
+            std::os::unix::process::CommandExt::process_group(&mut c, 0);
+            c.spawn().unwrap()
+        });
+        let rec = record_of(&f, "tf", "tensorfold", server.0.id(), free_port(), &[]);
+        engine_record::write_in(&f.dirs.records, &rec).unwrap();
+        let lock_path = engine_record::path_in(&f.dirs.records, "tf").with_extension("server.lock");
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _held = darkmux_types::flock::lock_exclusive(&lock_path).unwrap();
+            held_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_secs(10));
+        });
+        held_rx.recv().unwrap();
+        let started = Instant::now();
+        let outcome = stop_for_thermal(&f.dirs, &rec, quick());
+        let took = started.elapsed();
+        assert_eq!(outcome, Ok(StopOutcome::StoppedWithoutLock));
+        assert!(took < Duration::from_millis(3500), "the stop waited {took:?} on a held lock");
+        assert!(!alive(&rec), "the server is stopped");
+        let stranger = EngineRecord { start_stamp: 7, ..rec.clone() };
+        engine_record::write_in(&f.dirs.records, &stranger).unwrap();
+        assert_eq!(stop_for_thermal(&f.dirs, &stranger, quick()), Ok(StopOutcome::NotRunning), "identity still decides");
+        drop(holder);
     }
 }

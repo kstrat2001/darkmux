@@ -73,6 +73,8 @@ const REAP_GRACE: Duration = Duration::from_secs(1);
 
 /// Whether darkmux can make a model resident.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "snake_case")]
 pub enum AvailabilityState {
     /// Loaded or served now, at the profile's context.
@@ -84,13 +86,17 @@ pub enum AvailabilityState {
     /// An endpoint darkmux only sends requests to.
     External,
     /// A probe failed or ran out of time; the reason names which. Never read
-    /// as `unavailable`.
+    /// as `unavailable`. (#3450) Also a state a newer darkmux states that
+    /// this one does not know, as a peer's machine card may carry one.
+    #[serde(other)]
     Unknown,
 }
 
 /// A model's availability and, for every state but `resident`, `startable`
 /// and `external`, a one-line reason.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct Availability {
     pub state: AvailabilityState,
     pub reason: Option<String>,

@@ -36,7 +36,7 @@ function beat(overrides: Partial<PresenceBeat>): PresenceBeat {
 
 /** A fleet-view row's facts, as `viewRows.ts::rowFacts` would hand them to a card. */
 function rowFactsFor(overrides: Partial<RowFacts> = {}): RowFacts {
-  return { uid: "u1", known: true, name: null, names: [], spec: "", note: null, standing: "online", liveness: "live", isSelf: false, hub: false, servesRadio: false, servesProfiles: 0, utility: utilityReading(false, null), ...overrides };
+  return { uid: "u1", known: true, name: null, names: [], spec: "", note: null, standing: "online", liveness: "live", isSelf: false, hub: false, servesRadio: false, servesProfiles: 0, engineServers: [], utility: utilityReading(false, null), ...overrides };
 }
 
 function machineSpecs(overrides: Partial<MachineSpecsResponse> & Pick<MachineSpecsResponse, "machine_id">): MachineSpecsResponse {
@@ -49,6 +49,7 @@ function machineSpecs(overrides: Partial<MachineSpecsResponse> & Pick<MachineSpe
     ram_free_for_ai_bytes: null,
     cpu_brand: null,
     loaded_models: [],
+    engine_servers: [],
     lms_unreachable: false,
     engine: null,
     utility_model: null,
@@ -166,6 +167,7 @@ describe("specOf", () => {
     ram_free_for_ai_bytes: null,
     cpu_brand: "Apple M5 Max",
     loaded_models: [],
+    engine_servers: [],
     lms_unreachable: false,
     engine: null,
     utility_model: null,

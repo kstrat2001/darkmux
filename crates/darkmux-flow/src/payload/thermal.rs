@@ -24,6 +24,23 @@ pub struct EjectFailure {
     pub error: String,
 }
 
+/// (#3450) An engine server darkmux started that the tier-5 stop took down
+/// (Tensorfold, rec's Flint).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
+pub struct StoppedServer {
+    /// The `endpoints` id it served.
+    pub endpoint: String,
+    pub model: String,
+    pub pid: u32,
+    /// Stopped without the endpoint's lock, which a start still loading the
+    /// model held past the stop's short wait. Absent when the lock was taken.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub without_lock: Option<bool>,
+}
+
 /// The thermal breaker tripped and could not write or resolve the crawl STOP file: the payload of
 /// `thermal.stop_unresolved`. `state` is the host reading that tripped it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -77,6 +94,17 @@ pub struct ThermalTier5EjectPayload {
     /// Models the operator loaded, which darkmux never touches.
     #[cfg_attr(feature = "ts-export", ts(type = "number"))]
     pub user_loaded_count: u64,
+    /// (#3450) The engine servers darkmux started that the stop took down,
+    /// held by a running dispatch or not. A server darkmux did not start is
+    /// never one of them. Absent when there were none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub stopped_servers: Option<Vec<StoppedServer>>,
+    /// (#3450) Servers whose record no longer matched a live process of
+    /// darkmux's when the stop reached them: nothing signaled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub skipped_servers: Option<Vec<StoppedServer>>,
     /// The scenario file behind a record made on scripted readings; absent on a real run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
@@ -125,6 +153,22 @@ pub struct ThermalTier5EjectFailedPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub error: Option<String>,
+    /// (#3450) Engine servers darkmux started that would not stop; each
+    /// `identifier` is the server's endpoint id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub failed_servers: Option<Vec<EjectFailure>>,
+    /// (#3450) The engine servers the stop did take down, on the record of a
+    /// trip whose LM Studio residents could not be listed (no
+    /// `thermal.tier5_eject` record carries them then).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub stopped_servers: Option<Vec<StoppedServer>>,
+    /// (#3450) Servers whose record no longer matched a live process of
+    /// darkmux's when the stop reached them: nothing signaled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub skipped_servers: Option<Vec<StoppedServer>>,
     /// The scenario file behind a record made on scripted readings; absent on a real run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]

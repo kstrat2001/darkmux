@@ -1756,4 +1756,28 @@ pub enum ClientCmd {
         /// The client's name (from `client list`).
         client: String,
     },
+    /// The workspaces darkmux made for paired apps.
+    Workspace {
+        #[command(subcommand)]
+        sub: ClientWorkspaceCmd,
+    },
+}
+
+/// `darkmux client workspace` subcommands.
+#[derive(Subcommand)]
+pub enum ClientWorkspaceCmd {
+    /// Remove a workspace darkmux made for a paired app, and what darkmux
+    /// made for it: its folder, its records, a clone's repository, a
+    /// worktree's admin directory in your checkout, and that worktree's
+    /// `mux/` branch once another branch holds its commits. Refused while
+    /// a run, an Undo or a live preview is in it. Your own branches are
+    /// never touched.
+    Rm {
+        /// The workspace's name (a folder under the worktrees base).
+        name: String,
+        /// Also remove a `mux/` branch nothing else holds, and a clone or
+        /// template project whose commits are nowhere else.
+        #[arg(long)]
+        force: bool,
+    },
 }

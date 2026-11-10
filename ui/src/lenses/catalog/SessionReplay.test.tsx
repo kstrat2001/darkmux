@@ -1,3 +1,4 @@
+import { clkhm } from "../../lib/format";
 // See `sessionRun.test.ts`'s identical note: `clk()` reads the process
 // timezone, and the real-corpus test below asserts on a `clk()`-derived
 // value — pin it before anything runs.
@@ -633,6 +634,42 @@ describe("SessionReplay", () => {
       vi.advanceTimersByTime(5000);
     });
     expect(readWall()).not.toBe(before);
+    vi.useRealTimers();
+  });
+
+  // A frozen daemon: the run page kept counting ACTIVE TIME "so far" with
+  // nothing to count from. While the page has lost the daemon the counters
+  // stop at the last contact and the header says so; the status stays the
+  // one it had (its owner is the daemon, not this page).
+  it("while disconnected the live counters stop at the last contact, and the header says 'as of'", async () => {
+    vi.useFakeTimers();
+    const t0 = 1_800_000_000_000;
+    vi.setSystemTime(t0);
+    const lastContact = t0 - 2_000;
+    const records = [
+      { ts: new Date(t0 - 30_000).toISOString(), action: "dispatch.start", session_id: "s-live", machine_id: "M", payload: { role: "coder" } },
+      { ts: new Date(t0 - 3_000).toISOString(), action: "dispatch.turn.heartbeat", session_id: "s-live", machine_id: "M", payload: {} },
+    ];
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const page = () => (
+      <QueryClientProvider client={qc}>
+        <SessionReplay sessionId="s-live" connected={false} lastContactMs={lastContact} />
+      </QueryClientProvider>
+    );
+    const { rerender } = render(page());
+    await vi.waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+    const readWall = () => [...document.querySelectorAll('.metrics[data-scope="model"] .mv')].map((e) => e.textContent).join("");
+    const before = readWall();
+    act(() => {
+      vi.advanceTimersByTime(5000);
+    });
+    // Something else re-renders the page meanwhile (a presence poll does).
+    rerender(page());
+    expect(readWall(), "no counting while the page cannot see the run").toBe(before);
+    expect(before, "the counters read the last contact: 28 s after the start").toContain("00:28");
+    expect(document.querySelector(".session-run__header .session-run__asof")?.textContent).toBe(`as of ${clkhm(lastContact)}`);
+    expect(document.querySelector(".session-run__header .pill")?.textContent).toBe("running");
     vi.useRealTimers();
   });
 
@@ -1458,6 +1495,29 @@ describe("SessionReplay TOK/S tile — rendered-surface pinning (#2886 pass 5)",
     await vi.waitFor(() => expect(document.querySelector('[data-testid="run-token-scope"]')).toBeInTheDocument());
     // (#2890) The tube shows static (the `nosignal` state) with an empty
     // center, and the words sit under the lamps.
+    expect(latestTokenScopeProps()).toMatchObject({ state: "nosignal", centerLabel: null });
+    expect(document.querySelector('[data-testid="run-token-scope"] .modelbox__note')?.textContent).toBe("disconnected");
+  });
+
+  // A frozen daemon over a run whose last heartbeats were FRESH: the reading
+  // was "generating", never a stall, so only a downgrade of every state
+  // keeps the run page from animating a rate it can no longer see.
+  it("shows 'disconnected' over fresh heartbeats too, not the last rate it saw", async () => {
+    vi.useFakeTimers();
+    const t0 = 1_800_000_000_000;
+    vi.setSystemTime(t0);
+    const fresh = [
+      { ts: new Date(t0 - 10_000).toISOString(), action: "dispatch.start", session_id: "s-fresh", machine_id: "M", payload: { role: "coder" } },
+      { ts: new Date(t0 - 4_000).toISOString(), action: "dispatch.turn.heartbeat", session_id: "s-fresh", machine_id: "M", payload: { sampled_at_ms: t0 - 4_000, generated_chars: 40 } },
+      { ts: new Date(t0 - 2_000).toISOString(), action: "dispatch.turn.heartbeat", session_id: "s-fresh", machine_id: "M", payload: { sampled_at_ms: t0 - 2_000, generated_chars: 400 } },
+    ];
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records: fresh }), { status: 200 }))));
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <SessionReplay sessionId="s-fresh" connected={false} />
+      </QueryClientProvider>,
+    );
+    await vi.waitFor(() => expect(document.querySelector('[data-testid="run-token-scope"]')).toBeInTheDocument());
     expect(latestTokenScopeProps()).toMatchObject({ state: "nosignal", centerLabel: null });
     expect(document.querySelector('[data-testid="run-token-scope"] .modelbox__note')?.textContent).toBe("disconnected");
   });

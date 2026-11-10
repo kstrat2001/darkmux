@@ -10,15 +10,14 @@
 //! start is spawned. Holding it to the end of a start (minutes, for a large
 //! model) would serialize every start on the machine, so the lock is
 //! released once the start has been spawned, and the start's need stays
-//! counted through its lease's reservation instead
-//! ([`crate::residency_lease::LeaseGuard::write_starting`]): every decision
-//! subtracts the reservations of starts still in flight
-//! ([`crate::residency_lease::LeaseGuard::reserved_by_others`]) from the free
-//! figure it reads. A model that answers may not have paged its memory in
-//! yet, so its holder keeps the reservation past the answer
-//! ([`crate::residency_lease::LeaseGuard::mark_loaded_reserving`]) and
-//! shrinks it as the memory pages in; it ends then, or when the holder drops
-//! its lease.
+//! counted through its reservation instead
+//! ([`crate::residency_reservation`], one record per start): every decision
+//! subtracts what starts still paging in reserve
+//! ([`crate::residency_reservation::reserved`]) from the free figure it
+//! reads. A model that answers may not have paged its memory in yet, so the
+//! reservation outlives the answer and shrinks as the memory pages in. It
+//! is apart from the dispatch's lease: it never makes a model read as held,
+//! and it ends when the memory has paged in, not when the dispatch does.
 //!
 //! **The protocol, for every path that makes a model resident** (an engine
 //! server's start, an LM Studio load):
@@ -28,14 +27,20 @@
 //!    per-endpoint lock under it only WITHOUT waiting: when it is taken (a
 //!    start in flight there holds it until it answers), drop this lock,
 //!    wait for the endpoint's, let it go, and start again from 1. Never hold
-//!    this lock while waiting on anything another start holds.
-//! 2. Under both, read the endpoint, free memory and the leases again, and
-//!    decide: reuse what another start made in between, or evict.
-//! 3. Write the lease with its reservation (`write_starting`), then spawn
-//!    or begin the load.
+//!    this lock while waiting on anything another start holds. That wait
+//!    for an endpoint's lock is never a plain blocking one: it is bounded by
+//!    the dispatch's timeout, ends at its run's stop, and is `busy` at once
+//!    when the endpoint serves another command for a running dispatch.
+//! 2. Under both, read the endpoint, free memory, the leases and the
+//!    reservations again, and decide: reuse what another start made in
+//!    between, or evict.
+//! 3. Write the lease, and the start's reservation
+//!    ([`crate::residency_reservation::Reserved::begin`]), then spawn or
+//!    begin the load.
 //! 4. Drop this lock once the start is spawned, never later (a start takes
-//!    minutes). When the model answers, keep its reservation until its
-//!    memory pages in.
+//!    minutes); an engine server's reservation is bound to the server first
+//!    ([`crate::residency_reservation::Reserved::bind_server`]). When the
+//!    model answers, the reservation stays until its memory pages in.
 //!
 //! A caller that reuses what is already resident decides nothing about
 //! memory and need not take it. A dispatch waiting for a busy model
@@ -80,6 +85,12 @@ pub fn lock_path() -> PathBuf {
 /// Take the machine-wide residency lock, waiting for whoever holds it.
 pub fn acquire() -> Result<ResidencyLock> {
     Ok(ResidencyLock { _guard: crate::flock::lock_exclusive(&lock_path())? })
+}
+
+/// (#3514) The lock when nobody holds it, `None` at once when someone does:
+/// for a caller that need not wait (a reuse decides nothing about memory).
+pub fn try_acquire() -> Result<Option<ResidencyLock>> {
+    Ok(crate::flock::try_lock_exclusive(&lock_path())?.map(|g| ResidencyLock { _guard: g }))
 }
 
 #[cfg(test)]

@@ -291,7 +291,7 @@ fn harness() -> Harness {
             }
             Ok(())
         }),
-        workspace_lock: Arc::new(Mutex::new(())),
+        workspace_asks: Arc::new(crate::client_workspace::Asks::default()),
         // On the harness's clock, so a test moves idle time by hand.
         previews: Arc::new(
             crate::client_preview::Previews::new(dir.path().join("previews"), emu.clone())
@@ -1090,20 +1090,24 @@ fn an_unreadable_or_broken_config_refuses_client_work() {
     }
 }
 
-/// The store's rewrite replaces the whole file; one it cannot write fails
-/// rather than reporting the store saved.
+/// Replacing the store replaces the whole file; one it cannot write fails
+/// rather than reporting the store saved, and leaves the old store whole.
 #[test]
-fn the_store_rewrite_replaces_the_file_or_fails() {
+fn replacing_the_store_replaces_the_file_or_fails_and_keeps_the_old() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("clients.json");
     std::fs::write(&path, "x".repeat(4096)).unwrap();
     let doc = ClientsFile::default();
-    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
-    rewrite(&mut file, &doc).unwrap();
-    let text = std::fs::read_to_string(&path).unwrap();
-    assert_eq!(text, format!("{}\n", serde_json::to_string_pretty(&doc).unwrap()), "nothing of the old text is left");
-    let mut read_only = std::fs::File::open(&path).unwrap();
-    assert!(rewrite(&mut read_only, &doc).is_err());
+    replace_store(&path, &doc).unwrap();
+    let saved = format!("{}\n", serde_json::to_string_pretty(&doc).unwrap());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), saved, "nothing of the old text is left");
+    let mode = std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&path).unwrap().permissions());
+    assert_eq!(mode & 0o777, 0o600, "written owner-only, not made so afterward");
+    // A folder where its temp file goes: the new store cannot be written.
+    std::fs::create_dir_all(tmp.path().join("clients.json.tmp/held")).unwrap();
+    let changed = ClientsFile { legacy_owner: Some("c-1".into()), ..ClientsFile::default() };
+    assert!(replace_store(&path, &changed).is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), saved, "the old store is untouched");
 }
 
 // ─── Bind ────────────────────────────────────────────────────────────────
@@ -3525,6 +3529,434 @@ async fn changes_of(h: &Harness, token: &str, name: &str) -> (u16, Value) {
     call(h, get(&format!("/client/workspaces/{name}/changes"), &[("authorization", &bearer(token))])).await
 }
 
+// ---- workspace locking: one name at a time, never one for all --------------
+
+/// A clone that waits, for any URL naming `slow`, until the test opens its
+/// gate: (the state cloning that way, a flag set once it is waiting, the
+/// gate).
+fn slow_clone_state(h: &Harness) -> (ClientServerState, Arc<std::sync::atomic::AtomicBool>, Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::AtomicBool;
+    let (waiting, open) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    let (w, o, inner) = (waiting.clone(), open.clone(), h.state.clone_repo.clone());
+    let state = ClientServerState {
+        clone_repo: Arc::new(move |url, r, dest, gd| {
+            if url.contains("slow") {
+                w.store(true, Ordering::SeqCst);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !o.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            inner(url, r, dest, gd)
+        }),
+        ..h.state.clone()
+    };
+    (state, waiting, open)
+}
+
+/// Waits (up to 10 s) for `flag`.
+async fn until_set(flag: &std::sync::atomic::AtomicBool) {
+    for _ in 0..1000 {
+        if flag.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("never set");
+}
+
+/// A clone that takes its time (up to ten minutes, for a big repo) holds
+/// up nobody else: another bot's workspace, a reuse, a template project and
+/// a worktree are all made meanwhile.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_clone_never_holds_up_another_bots_workspace() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (state, waiting, open) = slow_clone_state(&h);
+    let ask = |body: Value| post("/client/workspaces", Some(&token), body);
+    let (code, v) = call_with(state.clone(), ask(serde_json::json!({"repo_url": HCR, "bot": "Quick"}))).await;
+    assert_eq!(code, 201, "{v}");
+    let slow = tokio::spawn(call_with(
+        state.clone(),
+        ask(serde_json::json!({"repo_url": "https://github.com/kstrat2001/slow", "bot": "Slow"})),
+    ));
+    until_set(&waiting).await;
+    let mine = h.dir.path().join("my-site");
+    fixture_repo(&mine);
+    for (body, want) in [
+        (serde_json::json!({"repo_url": HCR, "bot": "Other"}), 201),
+        (serde_json::json!({"repo_url": HCR, "bot": "Quick"}), 200),
+        (serde_json::json!({"repo_url": HCR, "template": true, "bot": "Baker"}), 201),
+        (serde_json::json!({"source_path": mine.to_str(), "bot": "Quick"}), 201),
+    ] {
+        let asked = tokio::time::timeout(std::time::Duration::from_secs(10), call_with(state.clone(), ask(body.clone())));
+        let (code, v) = asked.await.unwrap_or_else(|_| panic!("{body} waited for another bot's clone"));
+        assert_eq!(code, want, "{body}: {v}");
+    }
+    open.store(true, Ordering::SeqCst);
+    let (code, v) = slow.await.unwrap();
+    assert_eq!((code, v["workspace"].as_str()), (201, Some("slow")), "{v}");
+}
+
+/// One bot asking for one repo twice at once gets one workspace: the second
+/// request waits for the first's clone and reuses it, never a second clone.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_bot_asking_twice_at_once_gets_one_workspace() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (state, waiting, open) = slow_clone_state(&h);
+    let body = serde_json::json!({"repo_url": "https://github.com/kstrat2001/slow", "bot": "Slow"});
+    let first = tokio::spawn(call_with(state.clone(), post("/client/workspaces", Some(&token), body.clone())));
+    until_set(&waiting).await;
+    let second = tokio::spawn(call_with(state.clone(), post("/client/workspaces", Some(&token), body)));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!second.is_finished(), "the second waits for the first's clone");
+    open.store(true, Ordering::SeqCst);
+    let ((c1, v1), (c2, v2)) = (first.await.unwrap(), second.await.unwrap());
+    assert_eq!((c1, c2), (201, 200), "{v1} {v2}");
+    assert_eq!(v1["workspace"], v2["workspace"]);
+    assert_eq!(h.cloned.lock().unwrap().len(), 1);
+}
+
+/// Looking for a bot's workspace to reuse runs no git in a workspace its
+/// records give to another bot or another app: there, every git call would
+/// hang (its repository's config is a pipe nobody writes).
+#[tokio::test(flavor = "multi_thread")]
+async fn reuse_runs_no_git_in_another_bots_or_apps_workspace() {
+    let h = harness();
+    let token = paired(&h).await;
+    let ask = |bot: &str| post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR, "bot": bot}));
+    let (code, other) = call(&h, ask("Other")).await;
+    assert_eq!(code, 201, "{other}");
+    let (code, theirs) = call(&h, ask("Theirs")).await;
+    assert_eq!(code, 201, "{theirs}");
+    // Another app's, for a bot of the very name asking.
+    crate::client_workspace::record_owner(&h.base, theirs["workspace"].as_str().unwrap(), "c-someone-else").unwrap();
+    crate::client_workspace::record_bot(&h.base, theirs["workspace"].as_str().unwrap(), "Mine").unwrap();
+    let pipes: Vec<PathBuf> = [&other, &theirs]
+        .iter()
+        .map(|v| crate::client_git::clone_git_dir(&h.base, v["workspace"].as_str().unwrap()).join("config"))
+        .collect();
+    for config in &pipes {
+        std::fs::remove_file(config).unwrap();
+        let fifo = std::ffi::CString::new(config.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    }
+    let made = tokio::time::timeout(std::time::Duration::from_secs(10), call(&h, ask("Mine")));
+    let Ok((code, v)) = made.await else {
+        // Let a git waiting on a pipe go (it reads an empty config), so the
+        // failure is reported now rather than at the runner's bound.
+        for _ in 0..50 {
+            for config in &pipes {
+                use std::os::unix::fs::OpenOptionsExt;
+                let _ = std::fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(config);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!("git ran in another bot's or app's workspace");
+    };
+    assert_eq!(code, 201, "{v}");
+}
+
+/// (measurement, not a check) How long reusing a bot's clone takes with 1
+/// and with 21 workspaces of the repo under the base, 20 of them other
+/// bots'. `cargo nextest run -p darkmux-serve reuse_time --run-ignored only
+/// --no-capture`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn reuse_time_at_1_and_21_workspaces() {
+    let h = harness();
+    let token = paired(&h).await;
+    let ask = |bot: &str| post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR, "bot": bot}));
+    assert_eq!(call(&h, ask("Mine")).await.0, 201);
+    reuse_timed(&h, &token, "1 workspace").await;
+    for n in 0..20 {
+        assert_eq!(call(&h, ask(&format!("Other {n}"))).await.0, 201);
+    }
+    reuse_timed(&h, &token, "21 workspaces").await;
+}
+
+/// Prints the median of five reuses of bot `Mine`'s clone of HCR.
+async fn reuse_timed(h: &Harness, token: &str, label: &str) {
+    let mut took = Vec::new();
+    for _ in 0..5 {
+        let start = std::time::Instant::now();
+        let (code, v) = call(h, post("/client/workspaces", Some(token), serde_json::json!({"repo_url": HCR, "bot": "Mine"}))).await;
+        assert_eq!(code, 200, "{v}");
+        took.push(start.elapsed().as_millis());
+    }
+    took.sort();
+    eprintln!("reuse at {label}: median {} ms (of {took:?})", took[2]);
+}
+
+// ---- removing a workspace ---------------------------------------------------
+
+/// `DELETE /client/workspaces/{name}`, with `body` when given.
+async fn remove_ws(h: &Harness, token: &str, name: &str, body: Option<Value>) -> (u16, Value) {
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/client/workspaces/{name}"))
+        .header("authorization", bearer(token))
+        .header("content-type", "application/json")
+        .body(body.map(|b| Body::from(b.to_string())).unwrap_or_else(Body::empty))
+        .unwrap();
+    call(h, req).await
+}
+
+/// What darkmux keeps under the base for workspace `name`, by file name.
+fn kept_for(h: &Harness, name: &str) -> Vec<String> {
+    let mut kept: Vec<String> = std::fs::read_dir(&h.base)
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|f| f == name || f.starts_with(&format!(".{name}.")))
+        .collect();
+    kept.sort();
+    kept
+}
+
+/// An app removes its clone: the folder, its repository and every record
+/// beside it go, and asking for the repo again makes a new one under the
+/// same name.
+#[tokio::test]
+async fn an_app_removes_its_clone_and_its_name_is_free_again() {
+    let h = harness();
+    let token = paired(&h).await;
+    let ask = || post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR, "bot": "Bot A"}));
+    let (code, v) = call(&h, ask()).await;
+    assert_eq!(code, 201, "{v}");
+    assert!(!kept_for(&h, "hcr").is_empty());
+    let (code, gone) = remove_ws(&h, &token, "hcr", None).await;
+    assert_eq!(code, 200, "{gone}");
+    assert_eq!((gone["kind"].as_str(), gone["branch"].as_str()), (Some("clone"), v["branch"].as_str()), "{gone}");
+    assert_eq!((gone["branch_removed"].as_bool(), gone["preview_stopped"].as_bool()), (Some(true), Some(false)));
+    assert_eq!(kept_for(&h, "hcr"), Vec::<String>::new(), "nothing of it is left");
+    let (code, _) = call(&h, get("/client/workspaces/hcr", &[("authorization", &bearer(&token))])).await;
+    assert_eq!(code, 404);
+    let (code, again) = call(&h, ask()).await;
+    assert_eq!((code, again["workspace"].as_str()), (201, Some("hcr")), "{again}");
+}
+
+/// A bot's template projects take `<bot>`, `<bot>-2` ... `<bot>-99`; once
+/// all are taken the next is refused, and removing one frees its name.
+#[tokio::test]
+async fn a_template_name_is_free_again_once_its_project_is_removed() {
+    let h = harness();
+    let token = paired(&h).await;
+    for n in 2..100 {
+        std::fs::create_dir(h.base.join(format!("bakery-{n}"))).unwrap();
+    }
+    let ask = || post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR, "template": true, "bot": "Bakery"}));
+    let (code, v) = call(&h, ask()).await;
+    assert_eq!((code, v["workspace"].as_str()), (201, Some("bakery")), "{v}");
+    let (code, v) = call(&h, ask()).await;
+    assert_eq!((code, v["code"].as_str()), (409, Some("conflict")), "every name is taken: {v}");
+    let (code, gone) = remove_ws(&h, &token, "bakery", None).await;
+    assert_eq!((code, gone["kind"].as_str()), (200, Some("template")), "{gone}");
+    let (code, v) = call(&h, ask()).await;
+    assert_eq!((code, v["workspace"].as_str()), (201, Some("bakery")), "{v}");
+}
+
+/// A clone or a template project whose runs committed holds commits that
+/// are nowhere else: removing it is refused with `unsaved_commits` until
+/// the app says `force`.
+#[tokio::test]
+async fn a_workspace_holding_commits_nowhere_else_is_removed_only_with_force() {
+    let h = harness();
+    let token = paired(&h).await;
+    for body in [serde_json::json!({"repo_url": HCR}), serde_json::json!({"repo_url": HCR, "template": true, "bot": "Bakery"})] {
+        let (code, v) = call(&h, post("/client/workspaces", Some(&token), body)).await;
+        assert_eq!(code, 201, "{v}");
+        let name = v["workspace"].as_str().unwrap().to_string();
+        let _ = run_in(&h, &token, &name, "edit").await;
+        let (code, refused) = remove_ws(&h, &token, &name, None).await;
+        assert_eq!((code, refused["code"].as_str()), (409, Some("unsaved_commits")), "{refused}");
+        assert!(h.base.join(&name).join("made-by-run.txt").exists(), "nothing was removed");
+        let (code, gone) = remove_ws(&h, &token, &name, Some(serde_json::json!({"force": true}))).await;
+        assert_eq!(code, 200, "{gone}");
+        assert_eq!(kept_for(&h, &name), Vec::<String>::new());
+    }
+}
+
+/// Removing a worktree of the user's checkout takes its folder and its
+/// admin directory there. Its `mux/` branch goes once another branch holds
+/// its commits; one holding a run's commits nothing else holds stays
+/// (`force` takes it). The user's own branches and files never change.
+#[tokio::test]
+async fn removing_a_worktree_never_touches_the_users_branches() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (mine, name, _ws) = checkout_workspace(&h, &token).await;
+    let users = || (run_git(Some(&mine), &["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads/main", "refs/heads/dev"]), std::fs::read_to_string(mine.join("README.md")).unwrap());
+    let before = users();
+    let worktrees = || run_git(Some(&mine), &["worktree", "list", "--porcelain"]).matches("worktree ").count();
+    assert_eq!(worktrees(), 2);
+    let (code, gone) = remove_ws(&h, &token, &name, None).await;
+    assert_eq!((code, gone["kind"].as_str(), gone["branch_removed"].as_bool()), (200, Some("worktree"), Some(true)), "a branch main holds goes: {gone}");
+    let branch = gone["branch"].as_str().unwrap().to_string();
+    assert!(run_git(Some(&mine), &["branch", "--list", &branch]).is_empty(), "{branch} is gone");
+    assert_eq!(worktrees(), 1, "its admin directory is gone");
+    assert_eq!(kept_for(&h, &name), Vec::<String>::new());
+    for force in [false, true] {
+        let (code, v) = call(&h, post("/client/workspaces", Some(&token), serde_json::json!({"source_path": mine.to_str(), "bot": "b"}))).await;
+        assert_eq!(code, 201, "{v}");
+        let _ = run_in(&h, &token, &name, "edit").await;
+        let (code, gone) = remove_ws(&h, &token, &name, Some(serde_json::json!({"force": force}))).await;
+        assert_eq!((code, gone["branch_removed"].as_bool()), (200, Some(force)), "{gone}");
+        let listed = run_git(Some(&mine), &["branch", "--list", gone["branch"].as_str().unwrap()]);
+        assert_eq!(listed.is_empty(), force, "the run's commits stay on their branch unless forced: {listed:?}");
+        assert_eq!(worktrees(), 1);
+    }
+    assert_eq!(users(), before, "the user's branches and files are as they were");
+    // A worktree on a branch of the user's (moved there by hand): even with
+    // `force`, that branch stays.
+    let (code, v) = call(&h, post("/client/workspaces", Some(&token), serde_json::json!({"source_path": mine.to_str(), "bot": "b"}))).await;
+    assert_eq!(code, 201, "{v}");
+    run_git(Some(&mine), &["branch", "feature"]);
+    run_git(Some(&h.base.join(&name)), &["checkout", "--quiet", "feature"]);
+    let (code, gone) = remove_ws(&h, &token, &name, Some(serde_json::json!({"force": true}))).await;
+    assert_eq!((code, gone["branch"].as_str(), gone["branch_removed"].as_bool()), (200, Some("feature"), Some(false)), "{gone}");
+    assert!(!run_git(Some(&mine), &["branch", "--list", "feature"]).is_empty(), "the user's branch stays");
+}
+
+/// A workspace is not removed while something uses it: a run in it, or a
+/// hold another process took (`client workspace rm` holds it alone; a run
+/// in `client serve` shares it). Neither is anything started in one being
+/// removed. Only the app that owns it may remove it.
+#[tokio::test]
+async fn a_workspace_in_use_is_not_removed_nor_used_while_removed() {
+    use crate::client_workspace::{try_hold, Hold};
+    let h = harness();
+    let token = paired(&h).await;
+    let other = paired(&h).await;
+    let (code, v) = call(&h, post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR}))).await;
+    assert_eq!(code, 201, "{v}");
+    let edited = run_in(&h, &token, "hcr", "edit").await;
+    let id = start_in(&h, &token, "hcr", "wait").await;
+    assert!(try_hold(&h.base, "hcr", Hold::Sole).unwrap().is_none(), "a run holds its workspace's name");
+    let force = || Some(serde_json::json!({"force": true}));
+    let (code, refused) = remove_ws(&h, &token, "hcr", force()).await;
+    assert_eq!((code, refused["code"].as_str()), (409, Some("conflict")), "a run is in it: {refused}");
+    let _ = cancel(&h, Some(&token), &id).await;
+    let _ = wait_done(&h, &token, &id).await;
+    assert!(try_hold(&h.base, "hcr", Hold::Sole).unwrap().is_some(), "and lets go once it has ended");
+    let elsewhere = try_hold(&h.base, "hcr", Hold::Shared).unwrap().unwrap();
+    let (code, refused) = remove_ws(&h, &token, "hcr", force()).await;
+    assert_eq!((code, refused["code"].as_str()), (409, Some("conflict")), "held elsewhere: {refused}");
+    drop(elsewhere);
+    let removing = try_hold(&h.base, "hcr", Hold::Sole).unwrap().unwrap();
+    let body = serde_json::json!({"role": "coder", "message": "edit", "workspace": "hcr"});
+    let (code, refused) = call(&h, post("/client/work", Some(&token), body)).await;
+    assert_eq!((code, refused["code"].as_str()), (409, Some("conflict")), "no run starts in one being removed: {refused}");
+    let (code, refused) = call(&h, post(&format!("/client/work/{edited}/undo"), Some(&token), Value::Null)).await;
+    assert_eq!((code, refused["code"].as_str()), (409, Some("conflict")), "no Undo either: {refused}");
+    assert!(refused["error"].as_str().unwrap().contains("being made or removed"), "{refused}");
+    drop(removing);
+    let (code, _) = remove_ws(&h, &other, "hcr", None).await;
+    assert_eq!(code, 403, "another app's");
+    let (code, _) = remove_ws(&h, &token, "nope", None).await;
+    assert_eq!(code, 404);
+    let (code, _) = remove_ws(&h, &token, "..", None).await;
+    assert_eq!(code, 400);
+    let (code, refused) = remove_ws(&h, &token, "wt1", None).await;
+    assert_eq!(code, 403, "a folder darkmux holds no repository for: {refused}");
+    assert!(h.base.join("wt1").is_dir());
+    let (code, _) = remove_ws(&h, &token, "hcr", Some(serde_json::json!({"forse": true}))).await;
+    assert_eq!(code, 400, "an unknown key");
+    let (code, gone) = remove_ws(&h, &token, "hcr", Some(serde_json::json!({"force": true}))).await;
+    assert_eq!(code, 200, "{gone}");
+}
+
+/// A removed workspace's live preview is stopped first, and no preview
+/// starts in one being removed.
+#[tokio::test]
+async fn removing_a_workspace_stops_its_preview_first() {
+    use crate::client_workspace::{try_hold, Hold};
+    let h = harness();
+    let token = paired(&h).await;
+    let (mine, name, _ws) = served_workspace(&h, &token).await;
+    recipe(&mine, serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}, "ready": {"http": "/"}}));
+    let removing = try_hold(&h.base, &name, Hold::Sole).unwrap().unwrap();
+    let (code, refused) = start_preview(&h, &token, &name).await;
+    assert_eq!((code, refused["code"].as_str()), (409, Some("conflict")), "{refused}");
+    drop(removing);
+    let (code, v) = start_preview(&h, &token, &name).await;
+    assert_eq!(code, 202, "{v}");
+    let ready = preview_until(&h, &token, &name, &["ready", "failed"]).await;
+    assert_eq!(ready["status"], "ready", "{ready}");
+    let port = ready["port"].as_u64().unwrap();
+    let (code, gone) = remove_ws(&h, &token, &name, None).await;
+    assert_eq!((code, gone["preview_stopped"].as_bool()), (200, Some(true)), "{gone}");
+    assert!(!answers(port), "its dev server is gone");
+    assert!(!h.base.join(&name).exists());
+}
+
+/// A DELETE refused for commits nowhere else leaves the workspace's live
+/// preview running: the refusal is decided before anything is stopped.
+#[tokio::test]
+async fn a_refused_removal_leaves_the_preview_running() {
+    let h = harness();
+    let token = paired(&h).await;
+    let json = serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}, "ready": {"http": "/"}});
+    let (name, _ws) = template_project(&h, &token, Some(json)).await;
+    let _ = run_in(&h, &token, &name, "edit").await;
+    let (code, v) = start_preview(&h, &token, &name).await;
+    assert_eq!(code, 202, "{v}");
+    let ready = preview_until(&h, &token, &name, &["ready", "failed"]).await;
+    assert_eq!(ready["status"], "ready", "{ready}");
+    let (code, refused) = remove_ws(&h, &token, &name, None).await;
+    assert_eq!((code, refused["code"].as_str()), (409, Some("unsaved_commits")), "{refused}");
+    let still = preview_until(&h, &token, &name, &["ready", "stopped", "failed"]).await;
+    assert_eq!(still["status"], "ready", "the refused removal stopped nothing: {still}");
+    assert!(answers(ready["port"].as_u64().unwrap()));
+}
+
+/// A clone a stopped `client serve` left half done (`.<name>.partial` and
+/// the repository it was cloning into) is swept as `client serve` starts,
+/// so its name is free again; one with a workspace of that name keeps that
+/// workspace's repository, and one a request holds now is left.
+#[test]
+fn a_half_done_clone_is_swept_and_its_name_freed() {
+    use crate::client_workspace::{sweep_partials, try_hold, Hold};
+    let h = harness();
+    let base = &h.base;
+    for name in ["gone", "kept", "busy"] {
+        std::fs::create_dir_all(base.join(format!(".{name}.partial/half"))).unwrap();
+        std::fs::create_dir_all(crate::client_git::clone_git_dir(base, name)).unwrap();
+    }
+    std::fs::create_dir(base.join("kept")).unwrap();
+    let busy = try_hold(base, "busy", Hold::Sole).unwrap().unwrap();
+    assert_eq!(sweep_partials(base), ["gone", "kept"]);
+    std::fs::create_dir_all(base.join(".again.partial")).unwrap();
+    assert_eq!(swept_partials(&h.state), ["darkmux client serve: removed workspace again's unfinished clone (a stop interrupted it)"]);
+    assert!(!name_taken(base, "gone"), "its name is free again");
+    assert_eq!(kept_for(&h, "gone"), Vec::<String>::new());
+    let kept = kept_for(&h, "kept");
+    assert!(kept.contains(&".kept.git".to_string()) && kept.contains(&"kept".to_string()), "the workspace's repository stays: {kept:?}");
+    assert!(!kept.contains(&".kept.partial".to_string()), "{kept:?}");
+    assert!(base.join(".busy.partial").exists(), "a clone in progress is left");
+    drop(busy);
+}
+
+/// A branch whose files can't be read is a 500 that names nothing, or a
+/// 413 when they are too large to send.
+#[tokio::test]
+async fn an_unreadable_or_oversized_branch_is_refused_as_before() {
+    use crate::client_changes::ChangesError;
+    let cases = [
+        (ChangesError::Listing, 500, "internal"),
+        (ChangesError::Unreadable("a/b.txt".into()), 500, "internal"),
+        (ChangesError::TooLarge, 413, "payload_too_large"),
+    ];
+    for (e, status, code) in cases {
+        let resp = changes_refusal(e.clone());
+        assert_eq!(resp.status().as_u16(), status, "{e:?}");
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["code"], code, "{e:?}: {v}");
+        assert!(!v.to_string().contains("a/b.txt"), "a 500 names no path: {v}");
+    }
+}
+
 /// The fixture's clone, but of an empty repository (no commit, so `HEAD`
 /// is unborn).
 fn empty_repo_state(h: &Harness) -> ClientServerState {
@@ -3652,13 +4084,12 @@ async fn a_long_checkout_and_bot_name_still_fit_a_workspace_name() {
     let first = v["workspace"].as_str().unwrap().to_string();
     assert!(crate::client_workspace::valid_name(&first), "{first}");
     let source = mine.canonicalize().unwrap();
-    let base = h.base.canonicalize().unwrap();
-    let mut last = first.clone();
-    while let Some(n) = free_worktree_name(&base, &source, &bot) {
-        assert!(crate::client_workspace::valid_name(&n), "{n}");
-        std::fs::create_dir(base.join(&n)).unwrap();
-        last = n;
+    let names = worktree_names(&source, &bot);
+    assert_eq!(names[0], first);
+    for n in &names {
+        assert!(crate::client_workspace::valid_name(n), "{n}");
     }
+    let last = names.last().unwrap();
     assert!(last.ends_with("-99"), "every numbered name fits, the last too: {last}");
 }
 
@@ -6856,4 +7287,363 @@ fn a_store_that_cannot_be_locked_refuses() {
     assert!(store.read().is_err());
     assert!(store.update(|f| { f.legacy_owner = Some("x".into()); Ok(()) }).is_err());
     assert!(dir.path().join("clients.json").is_dir(), "nothing written");
+}
+
+// ─── Runs and previews end when they should ──────────────────────────────
+
+/// How one work item stands, read from the listener's own table (a revoked
+/// client can no longer ask).
+fn work_word(h: &Harness, id: &str) -> &'static str {
+    match h.state.works.lock().unwrap().get(id).map(|w| w.status.clone()) {
+        Some(WorkStatus::Running) => "running",
+        Some(WorkStatus::Done { .. }) => "done",
+        Some(WorkStatus::Error(_)) => "error",
+        Some(WorkStatus::Cancelled(_)) => "cancelled",
+        None => "unknown",
+    }
+}
+
+/// Waits (up to 5 s) for work `id` to stand at `word`.
+async fn work_reaches(h: &Harness, id: &str, word: &str) -> bool {
+    for _ in 0..500 {
+        if work_word(h, id) == word {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    false
+}
+
+/// An admission that takes `ms` (its role check reads the disk).
+fn slow_admission(h: &mut Harness, ms: u64) {
+    h.state.role_known = Arc::new(move |_role| {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+        Ok(true)
+    });
+}
+
+/// An app that hangs up while its work request is being admitted never
+/// leaves a run registered with nothing running it: the run it asked for
+/// runs to its end, so its work copy and its run slot come free again.
+#[tokio::test]
+async fn a_disconnect_during_admission_never_leaves_a_run_with_no_runner() {
+    let mut h = harness();
+    let token = paired(&h).await;
+    slow_admission(&mut h, 400);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    h.state.bound = Some(addr);
+    let app = router(h.state.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await
+    });
+    let body = work_for("coder").to_string();
+    let request = format!(
+        "POST /client/work HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let mut socket = std::net::TcpStream::connect(addr).unwrap();
+    std::io::Write::write_all(&mut socket, request.as_bytes()).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    drop(socket);
+    // Admission ends at 400 ms; the run itself is instant.
+    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+    let ids: Vec<String> = h.state.works.lock().unwrap().keys().cloned().collect();
+    assert_eq!(ids.len(), 1, "the request was admitted");
+    assert_eq!(h.ran.lock().unwrap().len(), 1, "its run has a runner");
+    assert!(work_reaches(&h, &ids[0], "done").await, "it stands at {}", work_word(&h, &ids[0]));
+    server.abort();
+}
+
+/// A work request still being admitted when `client serve` begins to stop
+/// is refused and registers nothing: the stop looks at the running work
+/// once, and nothing joins it afterward.
+#[tokio::test]
+async fn work_still_being_admitted_when_the_stop_begins_is_refused() {
+    let mut h = harness();
+    let token = paired(&h).await;
+    slow_admission(&mut h, 300);
+    let mut req = post("/client/work", Some(&token), work_for("coder"));
+    req.extensions_mut().insert(axum::extract::ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5555))));
+    req.headers_mut().insert(axum::http::header::HOST, BOUND.parse().unwrap());
+    let app = router(h.state.clone());
+    let asked = tokio::spawn(async move { app.oneshot(req).await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    h.state.previews.begin_shutdown();
+    let resp = asked.await.unwrap();
+    assert_eq!(resp.status().as_u16(), 503);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["code"], "unavailable", "{v}");
+    assert!(h.state.works.lock().unwrap().is_empty(), "nothing registered");
+    assert!(h.ran.lock().unwrap().is_empty(), "nothing ran");
+}
+
+/// A run in flight when `client serve` stops is canceled and ends as a
+/// canceled run does: in its terminal state, its edits committed as its
+/// own.
+#[tokio::test]
+async fn a_run_in_flight_at_shutdown_ends_canceled_with_its_commit() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = git_workspace(&h, "site");
+    let id = start_in(&h, &token, "site", "edit-wait").await;
+    for _ in 0..500 {
+        if wt.join("in-progress.txt").exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let began = begin_stop(&h.state.previews, &h.state.works);
+    let within = std::time::Duration::from_secs(5);
+    let left = finish_stop(h.state.previews.clone(), h.state.works.clone(), began + within).await;
+    assert_eq!(left, Vec::<String>::new(), "nothing is left running");
+    assert!(began.elapsed() < within, "it ended at its cancel, not at the bound");
+    let done = status(&h, &token, &id).await;
+    assert_eq!(done["status"], "cancelled", "{done}");
+    assert!(done["commit"].as_str().is_some(), "{done}");
+    assert_eq!(
+        run_git(Some(&wt), &["show", "--name-only", "--format=%s", "HEAD"]),
+        format!("coder: edit-wait (work {id}, cancelled)\n\nin-progress.txt")
+    );
+}
+
+/// A run that ignores its cancel never holds the exit: the wait for it ends
+/// at its bound and names it, and the runtime is left behind at its own
+/// bound while the run's thread is still going.
+#[test]
+fn shutdown_never_waits_past_its_bound_for_a_run_that_ignores_its_cancel() {
+    let mut h = harness();
+    h.state.execute = Arc::new(|_spec, _cancel| {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        Ok(serde_json::json!({"result": "stop"}))
+    });
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    let token = rt.block_on(paired(&h));
+    let (code, v) = rt.block_on(call(&h, post("/client/work", Some(&token), work_for("coder"))));
+    assert_eq!(code, 202, "{v}");
+    let began = std::time::Instant::now();
+    let bound = std::time::Duration::from_millis(200);
+    let left = end_running_work(&h.state.works, began + bound);
+    assert_eq!(left, vec![v["work_id"].as_str().unwrap().to_string()]);
+    assert!(began.elapsed() >= bound, "it waited its bound");
+    end_runtime(rt, bound);
+    let took = began.elapsed();
+    assert!(took < std::time::Duration::from_secs(2), "the exit waited {took:?} on a 3 s run");
+}
+
+/// A wedged docker (each `docker stop` and `rm` waiting out its own bound)
+/// never holds the exit past the stop's bound: the wait for the previews'
+/// containers ends there too, and the runtime is left at its own bound
+/// while their removal still runs.
+#[test]
+fn shutdown_never_waits_past_its_bound_for_a_wedged_preview_stop() {
+    let h = harness();
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    let token = rt.block_on(paired(&h));
+    let (mine, name, _ws) = rt.block_on(served_workspace(&h, &token));
+    recipe(&mine, serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}, "ready": {"http": "/"}}));
+    let (code, v) = rt.block_on(start_preview(&h, &token, &name));
+    assert_eq!(code, 202, "{v}");
+    let ready = rt.block_on(preview_until(&h, &token, &name, &["ready", "failed"]));
+    assert_eq!(ready["status"], "ready", "{ready}");
+    *h.containers.remove_delay.lock().unwrap() = std::time::Duration::from_secs(5);
+    let began = begin_stop(&h.state.previews, &h.state.works);
+    let bound = std::time::Duration::from_millis(300);
+    rt.block_on(finish_stop(h.state.previews.clone(), h.state.works.clone(), began + bound));
+    assert!(began.elapsed() < std::time::Duration::from_secs(2), "the stop waited {:?} on a wedged docker", began.elapsed());
+    end_runtime(rt, bound);
+    let took = began.elapsed();
+    assert!(took < std::time::Duration::from_secs(3), "the exit waited {took:?} on a wedged docker");
+}
+
+/// `client revoke` ends what the client started: at the next look its
+/// running work is canceled and its previews stopped, said once. Another
+/// client's work runs on.
+#[tokio::test]
+async fn a_revoked_clients_runs_are_canceled_and_its_previews_stopped() {
+    let h = harness();
+    let token = paired(&h).await;
+    let other = paired(&h).await;
+    let (mine, name, _ws) = served_workspace(&h, &token).await;
+    recipe(&mine, serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}));
+    let (code, v) = start_preview(&h, &token, &name).await;
+    assert_eq!(code, 202, "{v}");
+    let ready = preview_until(&h, &token, &name, &["ready", "failed"]).await;
+    assert_eq!(ready["status"], "ready", "{ready}");
+    let port = ready["port"].as_u64().unwrap();
+    let (_, v) = call(&h, post("/client/work", Some(&token), waiting_work())).await;
+    let revoked_run = v["work_id"].as_str().unwrap().to_string();
+    let (_, v) = call(&h, post("/client/work", Some(&other), waiting_work())).await;
+    let others_run = v["work_id"].as_str().unwrap().to_string();
+    assert!(unpaired_tick(&h.state).is_empty(), "both are paired: nothing ends");
+    assert_eq!(work_word(&h, &revoked_run), "running");
+
+    let revoked = list_clients(&h.store).unwrap()[0].name.clone();
+    assert!(revoke(&h.store, &revoked).unwrap());
+    let lines = unpaired_tick(&h.state);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines.iter().any(|l| l.contains(&revoked_run)), "{lines:?}");
+    assert!(lines.iter().any(|l| l.contains(&name)), "{lines:?}");
+    assert!(work_reaches(&h, &revoked_run, "cancelled").await, "it stands at {}", work_word(&h, &revoked_run));
+    assert_eq!(h.state.previews.status(&name).unwrap().status, "stopped");
+    for _ in 0..100 {
+        if !answers(port) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(!answers(port), "the dev server is gone");
+    assert_eq!(work_word(&h, &others_run), "running", "a paired client's run is left alone");
+    assert!(unpaired_tick(&h.state).is_empty(), "said once");
+    assert_eq!(cancel(&h, Some(&other), &others_run).await.0, 202);
+}
+
+/// A revoked client's run that is slow to end after its cancel is
+/// canceled, and said, once: later looks leave it to end.
+#[tokio::test]
+async fn a_revoked_clients_run_is_canceled_once_while_it_ends() {
+    let mut h = harness();
+    h.state.execute = Arc::new(|_spec, _cancel| {
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        Ok(serde_json::json!({"result": "stop"}))
+    });
+    let token = paired(&h).await;
+    let (_, v) = call(&h, post("/client/work", Some(&token), work_for("coder"))).await;
+    let id = v["work_id"].as_str().unwrap().to_string();
+    let name = list_clients(&h.store).unwrap()[0].name.clone();
+    assert!(revoke(&h.store, &name).unwrap());
+    assert_eq!(unpaired_tick(&h.state).len(), 1);
+    let again = unpaired_tick(&h.state);
+    assert_eq!(work_word(&h, &id), "running", "still ending");
+    assert_eq!(again, Vec::<String>::new(), "said once");
+}
+
+/// A store that cannot be read ends nothing: a client is unpaired only when
+/// the store says so.
+#[tokio::test]
+async fn an_unreadable_store_ends_no_ones_work() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (_, v) = call(&h, post("/client/work", Some(&token), waiting_work())).await;
+    let id = v["work_id"].as_str().unwrap().to_string();
+    let kept = std::fs::read(h.store.path()).unwrap();
+    std::fs::write(h.store.path(), "{ not json").unwrap();
+    assert!(unpaired_tick(&h.state).is_empty());
+    assert_eq!(work_word(&h, &id), "running");
+    std::fs::write(h.store.path(), kept).unwrap();
+    assert_eq!(cancel(&h, Some(&token), &id).await.0, 202);
+}
+
+/// The check's thread ends a revoked client's work on its own: soon after
+/// the store changes (well inside a long interval), and at its interval
+/// for a client revoked before it began to watch.
+#[tokio::test]
+async fn the_check_thread_ends_a_revoked_clients_work_on_its_own() {
+    for (interval_ms, revoke_first) in [(3_600_000, false), (20, true)] {
+        let h = harness();
+        let token = paired(&h).await;
+        let (_, v) = call(&h, post("/client/work", Some(&token), waiting_work())).await;
+        let id = v["work_id"].as_str().unwrap().to_string();
+        let name = list_clients(&h.store).unwrap()[0].name.clone();
+        if revoke_first {
+            assert!(revoke(&h.store, &name).unwrap());
+        }
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread = spawn_preview_idle_check(
+            h.state.clone(),
+            std::time::Duration::from_millis(interval_ms),
+            stop.clone(),
+        );
+        if !revoke_first {
+            // Its first look at the store is behind it.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert_eq!(work_word(&h, &id), "running");
+            assert!(revoke(&h.store, &name).unwrap());
+        }
+        let ended = work_reaches(&h, &id, "cancelled").await;
+        stop.store(true, Ordering::SeqCst);
+        thread.join().unwrap();
+        assert!(ended, "interval {interval_ms} ms: it stands at {}", work_word(&h, &id));
+    }
+}
+
+/// A change replaces the store in one rename: a reader that opened it
+/// before the change still reads the whole old store (it is never emptied
+/// in place), the new one is owner-only, and no temp file is left.
+#[test]
+fn the_store_is_replaced_whole_never_rewritten_in_place() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let store = ClientStore::at(dir.path().join("clients.json"));
+    store.update(|f| { f.legacy_owner = Some("before".into()); Ok(()) }).unwrap();
+    let mut opened_before = std::fs::File::open(store.path()).unwrap();
+    store.update(|f| { f.legacy_owner = Some("after".into()); Ok(()) }).unwrap();
+    let mut old = String::new();
+    opened_before.read_to_string(&mut old).unwrap();
+    let old: ClientsFile = serde_json::from_str(&old).expect("the old store, whole");
+    assert_eq!(old.legacy_owner.as_deref(), Some("before"));
+    assert_eq!(store.read().unwrap().legacy_owner.as_deref(), Some("after"));
+    assert_eq!(std::fs::metadata(store.path()).unwrap().permissions().mode() & 0o777, 0o600);
+    let names: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["clients.json"], "no temp file left");
+}
+
+/// A change that waited for the store's lock builds on the change made
+/// before it, never on the file that change replaced.
+#[test]
+fn a_change_that_waited_for_the_lock_builds_on_the_one_before_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(ClientStore::at(dir.path().join("clients.json")));
+    store.update(|f| { f.legacy_owner = Some("start".into()); Ok(()) }).unwrap();
+    let (first, holding) = (store.clone(), Arc::new(std::sync::Barrier::new(2)));
+    let held = holding.clone();
+    let a = std::thread::spawn(move || {
+        first
+            .update(|f| {
+                held.wait();
+                // The second change is waiting on the lock by now.
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                f.legacy_owner = Some("first".into());
+                Ok(())
+            })
+            .unwrap();
+    });
+    holding.wait();
+    let client = ApprovedClient { name: "second".into(), id: "c-2".into(), created: 1, token_hash: "h".into() };
+    store.update(|f| { f.clients.push(client.clone()); Ok(()) }).unwrap();
+    a.join().unwrap();
+    let now = store.read().unwrap();
+    assert_eq!(now.legacy_owner.as_deref(), Some("first"), "the first change survived the second");
+    assert_eq!(now.clients, vec![client]);
+}
+
+/// A read that waited for the store's lock reads the store as the change
+/// it waited on left it, never the file that change replaced.
+#[test]
+fn a_peek_that_waited_for_the_lock_reads_the_change_it_waited_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(ClientStore::at(dir.path().join("clients.json")));
+    store.update(|f| { f.legacy_owner = Some("start".into()); Ok(()) }).unwrap();
+    let (writer, holding) = (store.clone(), Arc::new(std::sync::Barrier::new(2)));
+    let held = holding.clone();
+    let a = std::thread::spawn(move || {
+        writer
+            .update(|f| {
+                held.wait();
+                // The read is waiting on the lock by now.
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                f.legacy_owner = Some("changed".into());
+                Ok(())
+            })
+            .unwrap();
+    });
+    holding.wait();
+    let seen = store.peek().unwrap();
+    a.join().unwrap();
+    assert_eq!(seen.legacy_owner.as_deref(), Some("changed"));
 }

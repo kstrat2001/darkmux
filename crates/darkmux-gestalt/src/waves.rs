@@ -500,6 +500,13 @@ fn pack_first_fit(survivors: &[(Placement, u64)], limit: Option<u64>) -> Vec<Vec
     // Running per-wave totals for the first-fit walk.
     let mut loads: Vec<u64> = Vec::new();
     for (p, cost) in survivors {
+        // (#3508) A sibling seat on an identifier a wave already loads
+        // shares that one instance: it rides there at no cost (the wave's
+        // loader collapses the two into one load at the larger context).
+        if let Some(w_idx) = waves.iter().position(|w| w.iter().any(|q| q.identifier == p.identifier)) {
+            waves[w_idx].push(p.clone());
+            continue;
+        }
         // A pool-bound survivor (refusal division, module docs) exceeds the
         // limit alone, so no wave fits it and first-fit never adds a
         // companion — it rides alone, with the executor's #1139 backstop
@@ -1231,6 +1238,23 @@ mod tests {
                 effective_limit_bytes: Some(5 * GB),
                 warnings: vec![],
             }
+        );
+    }
+
+    /// (#3508) Sibling seats placing the same identifier (a review's seats x
+    /// k fan-out) share one loaded instance: the second copy rides in the
+    /// first one's wave at no cost, so a pool that holds the model once runs
+    /// every sibling together instead of one wave each.
+    #[test]
+    fn sibling_seats_on_one_identifier_share_a_wave_at_no_cost() {
+        let f = Facts { pools: single_pool(20 * GB), ..Default::default() };
+        let seat = |s: &str| Placement { seat: s.into(), ..placement("devstral", 32_768) };
+        let placements = vec![seat("a"), seat("b"), seat("c"), placement("qwen-4b", 32_768)];
+        let schedule = plan_waves(&placements, &f, &probed(), WaveMode::Auto).unwrap();
+        assert_eq!(
+            schedule.waves,
+            vec![placements[..3].to_vec(), vec![placements[3].clone()]],
+            "the three siblings cost devstral once; qwen-4b on top of it would not fit 20 GB"
         );
     }
 
