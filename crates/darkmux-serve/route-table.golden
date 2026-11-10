@@ -45,6 +45,7 @@ GET /client/recipe  json RecipeReply (client listener: 127.0.0.1, this machine's
 POST /client/workspaces  json WorkspaceInfo (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
 GET /client/workspaces/:name  json WorkspaceInfo (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
 GET /client/workspaces/:name/changes  json BranchChanges (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
+POST /client/workspaces/:name/edit  json EditReply (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
 POST /client/workspaces/:name/preview  json PreviewState (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
 GET /client/workspaces/:name/preview  json PreviewState (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
 DELETE /client/workspaces/:name/preview  json StatusWord (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)

@@ -48,6 +48,7 @@ pub mod mission_graph;
 /// machine stats drawer's live `load` block — see the module's own doc.
 /// Client pairing: a loopback-only listener that pairs an app and runs its
 /// scoped work through `darkmux dispatch` (local prototype).
+pub mod client_edit;
 pub mod client_git;
 pub mod client_pairing;
 pub mod client_preview;

@@ -161,6 +161,7 @@ pub(crate) fn client_table() -> Vec<ClientRoute> {
         client_json!(post, WorkspaceInfo, "/client/workspaces", workspace_create_handler),
         client_json!(get, WorkspaceInfo, "/client/workspaces/:name", workspace_status_handler),
         client_json!(get, BranchChanges, "/client/workspaces/:name/changes", workspace_changes_handler),
+        client_json!(post, EditReply, "/client/workspaces/:name/edit", workspace_edit_handler),
         client_json!(post, PreviewState, "/client/workspaces/:name/preview", preview_start_handler),
         client_json!(get, PreviewState, "/client/workspaces/:name/preview", preview_status_handler),
         client_json!(delete, StatusWord, "/client/workspaces/:name/preview", preview_stop_handler),

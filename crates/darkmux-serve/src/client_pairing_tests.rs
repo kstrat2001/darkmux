@@ -7195,3 +7195,159 @@ fn a_peek_that_waited_for_the_lock_reads_the_change_it_waited_on() {
     a.join().unwrap();
     assert_eq!(seen.legacy_owner.as_deref(), Some("changed"));
 }
+
+// ─── Hand edits (#3533) ──────────────────────────────────────────────────
+
+/// A workspace with a page whose text wraps across lines, committed.
+fn page_workspace(h: &Harness) -> PathBuf {
+    let wt = git_workspace(h, "site");
+    std::fs::write(
+        wt.join("page.html"),
+        "<h1>Tea &amp; cake</h1>\n<p>\n  Build something\n  people love.\n</p>\n<a>Learn more</a><a>Learn more</a>\n",
+    )
+    .unwrap();
+    run_git(Some(&wt), &["add", "page.html"]);
+    run_git(Some(&wt), &["commit", "--quiet", "-m", "page"]);
+    wt
+}
+
+async fn edit(h: &Harness, token: &str, old: &str, new: &str) -> (u16, Value) {
+    call(
+        h,
+        post(
+            "/client/workspaces/site/edit",
+            Some(token),
+            serde_json::json!({"old": old, "new": new}),
+        ),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_hand_edit_changes_only_the_selected_words_and_commits_them() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = page_workspace(&h);
+    let (code, v) = edit(
+        &h,
+        &token,
+        "Build something people love.",
+        "Make a site you're proud of.",
+    )
+    .await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["matches"], 1);
+    assert_eq!(v["file"], "page.html");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("page.html")).unwrap(),
+        "<h1>Tea &amp; cake</h1>\n<p>\n  Make a site you're proud of.\n</p>\n<a>Learn more</a><a>Learn more</a>\n",
+        "the rest of the file is untouched"
+    );
+    let id = v["work_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        run_git(Some(&wt), &["log", "-1", "--format=%s"]),
+        format!("hand-edit: \"Build something people love.\" to \"Make a site you're proud of.\" (work {id})")
+    );
+    assert_eq!(
+        run_git(Some(&wt), &["status", "--porcelain"]),
+        "?? notes.txt",
+        "the owner's file stays out"
+    );
+    let done = status(&h, &token, &id).await;
+    assert_eq!(done["status"], "done", "{done}");
+    assert!(
+        done["changes"]["diff"]
+            .as_str()
+            .unwrap()
+            .contains("proud of"),
+        "{done}"
+    );
+    // Undo reverts it like a run.
+    let (code, v) = call(
+        &h,
+        post(
+            &format!("/client/work/{id}/undo"),
+            Some(&token),
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 200, "{v}");
+    assert!(std::fs::read_to_string(wt.join("page.html"))
+        .unwrap()
+        .contains("Build something\n  people love."));
+}
+
+#[tokio::test]
+async fn a_hand_edit_matches_the_entity_the_page_decoded() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = page_workspace(&h);
+    let (code, v) = edit(&h, &token, "Tea & cake", "Tea &amp; biscuits").await;
+    assert_eq!(code, 200, "{v}");
+    assert!(std::fs::read_to_string(wt.join("page.html"))
+        .unwrap()
+        .starts_with("<h1>Tea &amp; biscuits</h1>"));
+}
+
+#[tokio::test]
+async fn a_hand_edit_found_zero_or_several_times_changes_nothing() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = page_workspace(&h);
+    let head = run_git(Some(&wt), &["rev-parse", "HEAD"]);
+    for (old, n) in [("Learn more", 2), ("Not on the page", 0)] {
+        let (code, v) = edit(&h, &token, old, "x").await;
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(v["matches"], n, "{old}: {v}");
+        assert_eq!(v["work_id"], Value::Null);
+    }
+    assert_eq!(
+        run_git(Some(&wt), &["rev-parse", "HEAD"]),
+        head,
+        "no commit"
+    );
+    assert_eq!(
+        run_git(Some(&wt), &["status", "--porcelain"]),
+        "?? notes.txt"
+    );
+}
+
+#[tokio::test]
+async fn a_hand_edit_refuses_a_file_with_uncommitted_changes_and_bad_input() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = page_workspace(&h);
+    std::fs::write(
+        wt.join("page.html"),
+        "<h1>Tea &amp; cake</h1> edited by hand\n",
+    )
+    .unwrap();
+    let (code, v) = edit(&h, &token, "Tea & cake", "Coffee").await;
+    assert_eq!(code, 409, "{v}");
+    assert!(std::fs::read_to_string(wt.join("page.html"))
+        .unwrap()
+        .contains("edited by hand"));
+    let (code, _) = edit(&h, &token, "  \n ", "x").await;
+    assert_eq!(code, 400);
+    let (code, _) = call(
+        &h,
+        post(
+            "/client/workspaces/site/edit",
+            Some(&token),
+            serde_json::json!({"old": "a", "new": "b", "path": "x"}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 400, "unknown keys are refused");
+    let (code, _) = call(
+        &h,
+        post(
+            "/client/workspaces/site/edit",
+            None,
+            serde_json::json!({"old": "a", "new": "b"}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 401);
+}
