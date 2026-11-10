@@ -84,6 +84,11 @@ ClientScopes.profiles: ProfilesGrant
 ClientScopes.workspace: boolean
 DiscardReply.removed: Array<string>
 DiscardReply.restored: Array<string>
+EditReply.branch?: string | null
+EditReply.commit?: string | null
+EditReply.file?: string | null
+EditReply.matches: integer
+EditReply.work_id?: string | null
 FileChange.added?: integer | null
 FileChange.path: string
 FileChange.removed?: integer | null

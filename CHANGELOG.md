@@ -16,13 +16,6 @@ darkmux release.
 
 ### Added
 
-- **An app can hand-edit text in a workspace (#3533).** `POST /client/workspaces/{name}/edit`
-  with `{old, new}` finds the one place in the workspace's tracked files that holds the text a
-  person selected in the preview (whitespace runs read as one space, common HTML entities decoded),
-  replaces only that span, and commits the file as a work record with no model (role `hand-edit`),
-  so `/client/work/{id}/undo` reverts it like a run. Found zero times or more than once, nothing
-  changes and the reply says how many (`matches`). Refused while a run or an Undo is busy in that
-  work copy, or when the file has uncommitted changes.
 - **A preview's install is redone when its inputs change, and an app can ask for a clean restart
   (#3484).** `install.unless_exists: node_modules` skipped the install whenever `node_modules`
   existed, so an install broken on an older image, or a dependency a run added, stayed broken.

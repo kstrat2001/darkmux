@@ -18,7 +18,38 @@ const ENTITIES: &[(&str, char)] = &[
     ("&#39;", '\''),
     ("&apos;", '\''),
     ("&nbsp;", ' '),
+    ("&#123;", '{'),
+    ("&#125;", '}'),
 ];
+
+/// The file types whose source a page shows decoded, where `&`, `<`, `>`,
+/// `{` or `}` typed as text would read as markup or code: HTML, the
+/// templates and JSX built on it, and Markdown, which passes HTML through.
+const MARKUP: &[&str] = &["html", "htm", "vue", "svelte", "astro", "jsx", "tsx", "mdx", "md", "markdown"];
+
+/// `new`, the text a page is to show, as source for `file`. In a markup
+/// file ([`MARKUP`]) the characters that would read as markup or code are
+/// written as entities every one of those types decodes (and [`find`]
+/// reads back); quotes stay as typed, since in text they are only text.
+/// In any other file it is written as sent.
+pub fn as_source(file: &str, new: &str) -> String {
+    let ext = file.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    if !MARKUP.contains(&ext.as_str()) {
+        return new.to_string();
+    }
+    let mut out = String::with_capacity(new.len());
+    for c in new.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '{' => out.push_str("&#123;"),
+            '}' => out.push_str("&#125;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
 
 /// The text as the page reads it: whitespace runs (no-break spaces
 /// included) as one space, trimmed. Empty when it holds no words.
@@ -156,6 +187,24 @@ mod tests {
     #[test]
     fn text_split_by_markup_is_not_found() {
         assert_eq!(one("It is **really** good", "It is really good"), None);
+    }
+
+    #[test]
+    fn typed_text_is_written_as_text_in_markup_files_only() {
+        let typed = "Tea <b>&</b> {cake} \"it's\"";
+        let escaped = "Tea &lt;b&gt;&amp;&lt;/b&gt; &#123;cake&#125; \"it's\"";
+        for file in ["a.html", "b/c.HTM", "x.vue", "x.svelte", "x.astro", "App.jsx", "App.tsx", "p.mdx", "README.md", "n.markdown"] {
+            assert_eq!(as_source(file, typed), escaped, "{file}");
+        }
+        for file in ["a.txt", "app.js", "app.ts", "s.css", "d.json", "Makefile", "html"] {
+            assert_eq!(as_source(file, typed), typed, "{file}");
+        }
+    }
+
+    #[test]
+    fn escaped_text_is_found_by_what_the_page_shows() {
+        let src = format!("<p>{}</p>", as_source("a.html", "{a} & <b>"));
+        assert_eq!(one(&src, "{a} & <b>").as_deref(), Some("&#123;a&#125; &amp; &lt;b&gt;"));
     }
 
     #[test]

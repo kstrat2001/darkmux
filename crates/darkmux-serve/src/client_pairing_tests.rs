@@ -7735,11 +7735,42 @@ async fn a_hand_edit_matches_the_entity_the_page_decoded() {
     let h = harness();
     let token = paired(&h).await;
     let wt = page_workspace(&h);
-    let (code, v) = edit(&h, &token, "Tea & cake", "Tea &amp; biscuits").await;
+    let (code, v) = edit(&h, &token, "Tea & cake", "Tea & biscuits").await;
     assert_eq!(code, 200, "{v}");
     assert!(std::fs::read_to_string(wt.join("page.html"))
         .unwrap()
         .starts_with("<h1>Tea &amp; biscuits</h1>"));
+}
+
+/// `new` is the text the page is to show. In a markup file the characters
+/// that would read as markup or code are written as entities, and the next
+/// edit finds them by what the page shows; elsewhere it is written as sent.
+#[tokio::test]
+async fn a_hand_edit_writes_typed_markup_characters_as_text() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = page_workspace(&h);
+    std::fs::write(wt.join("App.tsx"), "export const A = () => <p>Hello there</p>;\n").unwrap();
+    std::fs::write(wt.join("plain.txt"), "Plain words\n").unwrap();
+    run_git(Some(&wt), &["add", "App.tsx", "plain.txt"]);
+    run_git(Some(&wt), &["commit", "--quiet", "-m", "more"]);
+    let typed = "Tea <b>&</b> {cake}";
+    let (code, v) = edit(&h, &token, "Tea & cake", typed).await;
+    assert_eq!(code, 200, "{v}");
+    let page = std::fs::read_to_string(wt.join("page.html")).unwrap();
+    assert!(page.starts_with("<h1>Tea &lt;b&gt;&amp;&lt;/b&gt; &#123;cake&#125;</h1>\n"), "{page}");
+    let (code, v) = edit(&h, &token, typed, "Tea & cake").await;
+    assert_eq!((code, &v["matches"]), (200, &Value::from(1)), "the edited text is found by what the page shows: {v}");
+    assert!(std::fs::read_to_string(wt.join("page.html")).unwrap().starts_with("<h1>Tea &amp; cake</h1>"));
+    let (code, v) = edit(&h, &token, "Hello there", "{name} <i>").await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("App.tsx")).unwrap(),
+        "export const A = () => <p>&#123;name&#125; &lt;i&gt;</p>;\n"
+    );
+    let (code, v) = edit(&h, &token, "Plain words", "<b>& {x}").await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(std::fs::read_to_string(wt.join("plain.txt")).unwrap(), "<b>& {x}\n");
 }
 
 #[tokio::test]
@@ -7802,4 +7833,163 @@ async fn a_hand_edit_refuses_a_file_with_uncommitted_changes_and_bad_input() {
     )
     .await;
     assert_eq!(code, 401);
+}
+
+/// Swaps `file` between a regular file holding `text` and a link to `host`,
+/// each swap one rename, until `stop` is set; leaves the regular file.
+fn swap_with_link(
+    file: PathBuf,
+    text: &'static str,
+    host: PathBuf,
+    scratch: PathBuf,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let (reg, lnk) = (scratch.join("reg"), scratch.join("lnk"));
+        loop {
+            std::fs::write(&reg, text).unwrap();
+            std::fs::rename(&reg, &file).unwrap();
+            if stop.load(Ordering::SeqCst) {
+                return;
+            }
+            let _ = std::fs::remove_file(&lnk);
+            std::os::unix::fs::symlink(&host, &lnk).unwrap();
+            std::fs::rename(&lnk, &file).unwrap();
+        }
+    })
+}
+
+const PAGE: &str = "<h1>Tea &amp; cake</h1>\n<p>\n  Build something\n  people love.\n</p>\n<a>Learn more</a><a>Learn more</a>\n";
+
+/// A folder outside the workspace holding `name` with `text`: a file of the
+/// host's that no edit may read or write.
+fn host_file(h: &Harness, name: &str, text: &str) -> PathBuf {
+    let dir = h.dir.path().join("host");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(name), text).unwrap();
+    dir.join(name)
+}
+
+#[tokio::test]
+async fn a_hand_edit_never_writes_through_a_file_swapped_for_a_link() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = page_workspace(&h);
+    let host = host_file(&h, "secret.html", PAGE);
+    let scratch = h.dir.path().join("swap");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let base = run_git(Some(&wt), &["rev-parse", "HEAD"]);
+    for attempt in 0..60 {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let swapper = swap_with_link(wt.join("page.html"), PAGE, host.clone(), scratch.clone(), stop.clone());
+        let (code, v) = edit(&h, &token, "Tea & cake", "Coffee").await;
+        stop.store(true, Ordering::SeqCst);
+        swapper.join().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&host).unwrap(),
+            PAGE,
+            "attempt {attempt}: the host file was written through the link ({code} {v})"
+        );
+        run_git(Some(&wt), &["reset", "--quiet", "--hard", &base]);
+    }
+}
+
+#[tokio::test]
+async fn a_hand_edit_never_reads_or_writes_through_a_linked_file_or_folder() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = page_workspace(&h);
+    std::fs::create_dir_all(wt.join("pages")).unwrap();
+    std::fs::write(wt.join("pages/index.html"), "<p>Only in pages</p>\n").unwrap();
+    run_git(Some(&wt), &["add", "pages/index.html"]);
+    run_git(Some(&wt), &["commit", "--quiet", "-m", "pages"]);
+    // The tracked file is a link to a host file holding the same text.
+    let host = host_file(&h, "page.html", PAGE);
+    std::fs::remove_file(wt.join("page.html")).unwrap();
+    std::os::unix::fs::symlink(&host, wt.join("page.html")).unwrap();
+    // The tracked folder is a link to a host folder holding the same file.
+    let host_pages = h.dir.path().join("host-pages");
+    std::fs::create_dir_all(&host_pages).unwrap();
+    std::fs::write(host_pages.join("index.html"), "<p>Only in pages</p>\n").unwrap();
+    std::fs::remove_dir_all(wt.join("pages")).unwrap();
+    std::os::unix::fs::symlink(&host_pages, wt.join("pages")).unwrap();
+    for old in ["Tea & cake", "Only in pages"] {
+        let (code, v) = edit(&h, &token, old, "Coffee").await;
+        assert_eq!((code, &v["matches"]), (200, &Value::from(0)), "{old}: never read through a link: {v}");
+    }
+    assert_eq!(std::fs::read_to_string(&host).unwrap(), PAGE);
+    assert_eq!(std::fs::read_to_string(host_pages.join("index.html")).unwrap(), "<p>Only in pages</p>\n");
+}
+
+#[tokio::test]
+async fn a_hand_edit_is_refused_while_its_workspace_is_being_removed() {
+    use crate::client_workspace::{try_hold, Hold};
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = page_workspace(&h);
+    let removing = try_hold(&h.base, "site", Hold::Sole).unwrap().unwrap();
+    let (code, v) = edit(&h, &token, "Tea & cake", "Coffee").await;
+    assert_eq!(code, 409, "{v}");
+    assert!(v["error"].as_str().unwrap_or_default().contains("being made or removed"), "{v}");
+    assert_eq!(std::fs::read_to_string(wt.join("page.html")).unwrap(), PAGE);
+    drop(removing);
+}
+
+/// Sets the test hook for `wt` ([`EDIT_HOOKS`]) to `f`.
+fn on_edit_commit(wt: &Path, f: impl Fn() + Send + Sync + 'static) {
+    let at = wt.canonicalize().unwrap();
+    let mut hooks = EDIT_HOOKS.lock().unwrap();
+    hooks.retain(|(p, _)| *p != at);
+    hooks.push((at, Arc::new(f)));
+}
+
+#[tokio::test]
+async fn a_hand_edit_holds_its_workspace_name_until_it_has_committed() {
+    use crate::client_workspace::{try_hold, Hold};
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = page_workspace(&h);
+    let seen = Arc::new(Mutex::new(None));
+    let (base, s) = (h.base.clone(), seen.clone());
+    on_edit_commit(&wt, move || {
+        *s.lock().unwrap() = Some(try_hold(&base, "site", Hold::Sole).unwrap().is_none());
+    });
+    let (code, v) = edit(&h, &token, "Tea & cake", "Coffee").await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(*seen.lock().unwrap(), Some(true), "a removal could take the name mid-edit");
+    assert!(try_hold(&h.base, "site", Hold::Sole).unwrap().is_some(), "and lets go once it has ended");
+}
+
+#[tokio::test]
+async fn a_hand_edit_that_panics_ends_its_record_and_frees_the_work_copy() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = page_workspace(&h);
+    std::fs::write(wt.join("about.html"), "<p>About us</p>\n").unwrap();
+    run_git(Some(&wt), &["add", "about.html"]);
+    run_git(Some(&wt), &["commit", "--quiet", "-m", "about"]);
+    on_edit_commit(&wt, || panic!("a hand edit panicking mid-way"));
+    let (code, v) = edit(&h, &token, "Tea & cake", "Coffee").await;
+    assert_eq!(code, 500, "{v}");
+    on_edit_commit(&wt, || {});
+    {
+        let works = h.state.works.lock().unwrap();
+        let ended: Vec<_> = works.values().filter(|e| e.role == "hand-edit").collect();
+        assert_eq!(ended.len(), 1);
+        assert!(
+            matches!(&ended[0].status, WorkStatus::Error(e) if e.reason == "panic"),
+            "the panicked edit ends as failed, as a run whose runner panicked does"
+        );
+        assert!(ended[0].finished.is_some());
+    }
+    let (code, v) = edit(&h, &token, "About us", "Who we are").await;
+    assert_eq!(code, 200, "the work copy is not held by an edit that ended: {v}");
+}
+
+#[test]
+fn a_file_whose_status_git_cannot_read_is_not_edited() {
+    let dir = tempfile::tempdir().unwrap();
+    let not_a_repo = WorkCopy { work_tree: dir.path().to_path_buf(), git_dir: dir.path().join("no-such-git-dir") };
+    let refused = refuse_unless_clean(&not_a_repo, "page.html").expect_err("an unreadable status is not clean");
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
 }
