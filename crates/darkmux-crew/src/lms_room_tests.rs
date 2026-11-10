@@ -404,7 +404,7 @@ fn a_refused_wave_runs_none_of_its_jobs_and_each_ends_in_an_error() {
     assert_eq!(ran.load(Ordering::SeqCst), 0, "no job of the refused wave ran");
     assert_eq!(results.len(), 2, "every job has its terminal result");
     for (_, r) in &results {
-        let e = r.as_ref().err().expect("an error");
+        let e = r.as_ref().expect_err("an error");
         assert!(format!("{e:#}").contains("[wont_fit]"), "the code reaches the step's error: {e:#}");
     }
     assert!(tf.running(), "a load larger than the machine stops nothing");
@@ -528,7 +528,8 @@ fn the_container_path_takes_the_dispatch_lease() {
         &src[start..start + src[start..].find("\n}\n").unwrap()]
     };
     let prepare = body("prepare_container_run");
-    assert!(prepare.find("resolve_container_model(").unwrap() < prepare.find("hold_dispatch_models(").unwrap());
+    assert!(prepare.find("resolve_container_model(").unwrap() < prepare.find("lease_lmstudio_job(").unwrap());
+    assert!(body("lease_lmstudio_job").contains("hold_dispatch_models("));
     let launch = body("launch_container");
     assert!(launch.find("prepare_compactor(").unwrap() < launch.find("hold_dispatch_models(").unwrap());
 }

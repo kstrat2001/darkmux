@@ -153,7 +153,7 @@ mod tests {
             let production = src.split("#[cfg(test)]\nmod tests").next().unwrap_or_default();
             for (n, line) in production.lines().enumerate() {
                 let code = line.split("//").next().unwrap_or_default();
-                for f in forbidden.iter().filter(|f| code.contains(**f)) {
+                if let Some(f) = forbidden.iter().find(|f| code.contains(**f)) {
                     panic!("{name}:{}: the pure core names `{f}`: {line}", n + 1);
                 }
             }

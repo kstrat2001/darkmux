@@ -6660,11 +6660,7 @@ fn prepare_container_run(
     let workspace_plan = plan_workspace(opts, unix_micros)?;
     let (model, resolved_profile, unmanaged_endpoint_raw_label) =
         resolve_container_model(&role, opts, brain.agentic_pm.as_ref())?;
-    // (#3507) The LM Studio route's job model is leased as soon as it is
-    // resident, for the life of the run.
-    let lease = darkmux_types::residency_lease::LeaseGuard::acquire();
-    let leased_job = (brain.agentic_pm.is_none() && opts.model_base_url_override.is_none()).then(|| model.clone());
-    crate::lms_room::hold_dispatch_models(&lease, leased_job.as_deref(), None)?;
+    let (lease, leased_job) = lease_lmstudio_job(opts, &brain, &model)?;
     record_split_gitdirs(opts, execution, &model, &workdir_split_gitdirs);
     let (workspace, workspace_cleanup, host_out) = materialize_dirs(
         opts,
@@ -6705,6 +6701,20 @@ fn prepare_container_run(
         lease,
         leased_job,
     })
+}
+
+/// (#3507) The LM Studio route's job model, leased as soon as it is
+/// resident, for the life of the run; on any other route the lease starts
+/// empty (the compactor may join it).
+fn lease_lmstudio_job(
+    opts: &DispatchOpts,
+    brain: &ContainerBrain,
+    model: &str,
+) -> Result<(darkmux_types::residency_lease::LeaseGuard, Option<String>)> {
+    let lease = darkmux_types::residency_lease::LeaseGuard::acquire();
+    let leased_job = (brain.agentic_pm.is_none() && opts.model_base_url_override.is_none()).then(|| model.to_string());
+    crate::lms_room::hold_dispatch_models(&lease, leased_job.as_deref(), None)?;
+    Ok((lease, leased_job))
 }
 
 /// (#2294) PREFLIGHT: does this workdir's git directory live outside

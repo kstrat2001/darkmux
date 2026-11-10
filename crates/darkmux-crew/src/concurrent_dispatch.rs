@@ -931,17 +931,20 @@ fn partial_execution_note(committed: &[String]) -> String {
 /// The #1487 addendum's feasibility guarantee: a mission always completes
 /// as long as every individual profile fits the machine alone, so RAM
 /// pressure between CONCURRENT commands is a scheduling question, never a
-/// mission failure. `plan_acquire` has no budget engaged on this path yet
-/// (see the PR body — #1243 isn't wired to a live config source), so a
-/// resource shortfall surfaces here as a live `HostError::InsufficientResources`
-/// (the #1139 fast-fail) rather than a typed `Block`. Two cases:
+/// mission failure. No #1243 budget is configured on this path, but since
+/// #3508 each load is priced and planned against the machine's reclaimable
+/// memory, and the room step ([`crate::lms_room::make_room`]) refuses a
+/// shortfall it can see with a code before anything loads. One LM Studio
+/// still refuses (a live `HostError::InsufficientResources`, the #1139
+/// fast-fail) is read two ways:
 ///
 ///   - A live PINNED holder explains the shortfall → transient contention,
 ///     not a failure: [`BLOCKED_BY_HOLDER_RETRY_ATTEMPTS`] bounded retries
 ///     (the holder may free) before surfacing loudly, naming the pinned
 ///     model(s) — never evicting them.
-///   - No pin explains it → this placement likely does not fit the machine
-///     AT ALL, alone; retrying can never help, so this fails immediately.
+///   - No pin explains it → memory darkmux did not take is short
+///     (`memory_in_use`, #3510): this fails at once, and the caller may
+///     retry later.
 ///
 /// A planning-level `Action::Block` is never retried EXCEPT for one reason:
 /// [`Reason::ClaimedResidentInsufficientCtx`] (#2669) — a resident sharing
@@ -1134,33 +1137,7 @@ fn settle_attempt(outcome: PlanExecOutcome, attempt: u32, pinned: &[String], com
     let retries_left = attempt < BLOCKED_BY_HOLDER_RETRY_ATTEMPTS;
     match outcome {
         PlanExecOutcome::Loaded => Ok(()),
-        PlanExecOutcome::Blocked { model_key, reason } => {
-            // (#2669; narrowed #2672 CONSIDER 3) The one Block reason
-            // that can genuinely resolve with time: the claimed
-            // resident's holder may finish and release its lease
-            // before the next attempt — but ONLY when `clearable` is
-            // true (the claim's origin is an external pin). A
-            // `clearable: false` claim (a same-plan collision — this
-            // SAME `desired` list already targeted the identical
-            // stale resident via an earlier decision) can never
-            // resolve by waiting: `plan_acquire` decides from one
-            // fixed `facts` snapshot, so retrying with the identical
-            // input regenerates the identical Block every time —
-            // burning the whole retry budget on a deterministic
-            // failure was the CONSIDER 3 finding this narrows. Same
-            // bounded hold-not-fail budget as the analogous
-            // HostFailed+pinned shortfall below for the clearable
-            // case — never an unbounded wait, never an eviction of
-            // the claimed resident either way.
-            if matches!(reason, Reason::ClaimedResidentInsufficientCtx { clearable: true, .. }) && retries_left {
-                return Ok(());
-            }
-            let message = format!(
-                "cannot load \"{model_key}\" for this wave after {attempt} attempt(s) — {reason}{}",
-                partial_execution_note(committed)
-            );
-            Err(wave_error(block_code(&reason), message))
-        }
+        PlanExecOutcome::Blocked { model_key, reason } => settle_blocked(&model_key, &reason, attempt, committed),
         PlanExecOutcome::Drifted { identifier, why } => {
             if retries_left {
                 return Ok(());
@@ -1171,32 +1148,59 @@ fn settle_attempt(outcome: PlanExecOutcome, attempt: u32, pinned: &[String], com
             );
             Err(wave_error(Some("busy"), message))
         }
-        PlanExecOutcome::HostFailed { detail, host_error } => {
-            let insufficient = matches!(host_error, HostError::InsufficientResources { .. });
-            if insufficient && !pinned.is_empty() {
-                if retries_left {
-                    return Ok(());
-                }
-                let message = format!(
-                    "could not load for this wave after {attempt} attempt(s) — \
-                     blocked by (a) concurrent live darkmux command holding {pinned:?} \
-                     ({detail}); this is transient contention, not a capacity failure — \
-                     retry once the other command frees its model{}",
-                    partial_execution_note(committed)
-                );
-                return Err(wave_error(Some("busy"), message));
-            }
-            let (code, why) = if insufficient {
-                (
-                    "memory_in_use",
-                    "no concurrent darkmux command has this RAM pinned: memory something other than darkmux holds",
-                )
-            } else {
-                ("model_start_failed", "the load failed")
-            };
-            Err(wave_error(Some(code), format!("could not load for this wave: {detail} ({why}){}", partial_execution_note(committed))))
-        }
+        PlanExecOutcome::HostFailed { detail, host_error } => settle_host_failed(&detail, &host_error, attempt, pinned, committed),
     }
+}
+
+/// [`settle_attempt`] for a planner refusal.
+fn settle_blocked(model_key: &str, reason: &Reason, attempt: u32, committed: &[String]) -> Result<()> {
+    // (#2669; narrowed #2672 CONSIDER 3) The one Block reason that can
+    // genuinely resolve with time: the claimed resident's holder may finish
+    // and release its lease before the next attempt — but ONLY when
+    // `clearable` is true (the claim's origin is an external pin). A
+    // `clearable: false` claim (a same-plan collision — this SAME `desired`
+    // list already targeted the identical stale resident via an earlier
+    // decision) can never resolve by waiting: `plan_acquire` decides from
+    // one fixed `facts` snapshot, so retrying with the identical input
+    // regenerates the identical Block every time — burning the whole retry
+    // budget on a deterministic failure was the CONSIDER 3 finding this
+    // narrows. Same bounded hold-not-fail budget as the analogous
+    // HostFailed+pinned shortfall for the clearable case — never an
+    // unbounded wait, never an eviction of the claimed resident either way.
+    if matches!(reason, Reason::ClaimedResidentInsufficientCtx { clearable: true, .. })
+        && attempt < BLOCKED_BY_HOLDER_RETRY_ATTEMPTS
+    {
+        return Ok(());
+    }
+    let message = format!(
+        "cannot load \"{model_key}\" for this wave after {attempt} attempt(s) — {reason}{}",
+        partial_execution_note(committed)
+    );
+    Err(wave_error(block_code(reason), message))
+}
+
+/// [`settle_attempt`] for a failed host call.
+fn settle_host_failed(detail: &str, host_error: &HostError, attempt: u32, pinned: &[String], committed: &[String]) -> Result<()> {
+    let insufficient = matches!(host_error, HostError::InsufficientResources { .. });
+    if insufficient && !pinned.is_empty() {
+        if attempt < BLOCKED_BY_HOLDER_RETRY_ATTEMPTS {
+            return Ok(());
+        }
+        let message = format!(
+            "could not load for this wave after {attempt} attempt(s) — \
+             blocked by (a) concurrent live darkmux command holding {pinned:?} \
+             ({detail}); this is transient contention, not a capacity failure — \
+             retry once the other command frees its model{}",
+            partial_execution_note(committed)
+        );
+        return Err(wave_error(Some("busy"), message));
+    }
+    let (code, why) = if insufficient {
+        ("memory_in_use", "no concurrent darkmux command has this RAM pinned: memory something other than darkmux holds")
+    } else {
+        ("model_start_failed", "the load failed")
+    };
+    Err(wave_error(Some(code), format!("could not load for this wave: {detail} ({why}){}", partial_execution_note(committed))))
 }
 
 /// (#3510) The stable code of a planner refusal, when its cause is one an
