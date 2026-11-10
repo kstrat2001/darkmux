@@ -109,3 +109,6 @@ mutants.out.old/
 # (world.json, sessions/, the scripts); everything derived from them is not,
 # so a re-shoot never shows up as a diff.
 /screenshots/
+
+# LLVM coverage raw profiles (cargo llvm-cov run at the repo root)
+*.profraw
