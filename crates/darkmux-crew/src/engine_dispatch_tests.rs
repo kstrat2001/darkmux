@@ -1356,8 +1356,11 @@ fn a_queued_dispatch_starts_once_the_holders_lease_goes_never_evicting_it_while_
     );
 }
 
-/// A machine whose leases are this process's real ones, with room to spare.
-struct RealLeases;
+/// A machine whose leases are this process's real ones, with room to spare
+/// and no pressure: what an end-to-end dispatch test stands in for the host
+/// ([`super::with_test_machine`]), so it never depends on the runner's
+/// memory.
+pub(crate) struct RealLeases;
 
 impl Machine for RealLeases {
     fn reclaimable(&self) -> Option<u64> {

@@ -419,12 +419,42 @@ pub fn prepare(
         }
     };
     let base = queue_payload(target);
-    crate::budget::with_env(|env| {
-        let machine = ThisMachine { profiles_file: wait.caller.profiles_file };
-        let mut attempt =
-            |patience: &Patience<'_>, note: &mut dyn FnMut(Note, DispatchModelPayload)| prepare_with(target, &dirs, engine.as_ref(), bounds, &machine, patience, note);
-        wait_while_busy(wait, env, &base, &mut attempt, note)
+    with_machine(wait.caller.profiles_file, |machine| {
+        crate::budget::with_env(|env| {
+            let mut attempt =
+                |patience: &Patience<'_>, note: &mut dyn FnMut(Note, DispatchModelPayload)| prepare_with(target, &dirs, engine.as_ref(), bounds, machine, patience, note);
+            wait_while_busy(wait, env, &base, &mut attempt, note)
+        })
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's stand-in for this machine in [`prepare`], so a test that
+    /// dispatches end to end through a real engine-server start never
+    /// prices it against the host's memory, capacity or pressure.
+    /// Thread-local: [`prepare`] runs on the dispatching thread.
+    static TEST_MACHINE: std::cell::RefCell<Option<std::rc::Rc<dyn Machine>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with `machine` standing in for [`ThisMachine`] in [`prepare`] on
+/// this thread.
+#[cfg(test)]
+pub(crate) fn with_test_machine<T>(machine: std::rc::Rc<dyn Machine>, f: impl FnOnce() -> T) -> T {
+    TEST_MACHINE.with(|m| *m.borrow_mut() = Some(machine));
+    let out = f();
+    TEST_MACHINE.with(|m| *m.borrow_mut() = None);
+    out
+}
+
+/// Run `f` with the machine [`prepare`] decides against: this one, or a
+/// test's stand-in ([`with_test_machine`]).
+fn with_machine<T>(profiles_file: Option<&str>, f: impl FnOnce(&dyn Machine) -> T) -> T {
+    #[cfg(test)]
+    if let Some(machine) = TEST_MACHINE.with(|m| m.borrow().clone()) {
+        return f(&*machine);
+    }
+    f(&ThisMachine { profiles_file })
 }
 
 /// What a `dispatch.queue.*` record names: the engine, endpoint and model.

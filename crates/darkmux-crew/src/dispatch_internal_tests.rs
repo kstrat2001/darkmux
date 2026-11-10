@@ -3683,7 +3683,11 @@ S(("127.0.0.1", port), H).serve_forever()
             opts.session = crate::mission_test_session("m-3448", &format!("tf-{name}-{}", std::process::id()));
             opts.json = false;
             let session = opts.session.wire();
-            let result = dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), "s", &Default::default(), &target, true);
+            // Priced against a stand-in with room, never the host's memory.
+            let roomy = std::rc::Rc::new(crate::engine_dispatch::tests::RealLeases);
+            let result = crate::engine_dispatch::with_test_machine(roomy, || {
+                dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), "s", &Default::default(), &target, true)
+            });
             (result, session)
         };
         let (first, first_session) = run("first");
@@ -3954,7 +3958,11 @@ S(("127.0.0.1", port), H).serve_forever()
             opts.session = crate::mission_test_session("m-3453", &format!("fl-{name}-{}", std::process::id()));
             opts.json = false;
             let session = opts.session.wire();
-            let result = dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), "s", &Default::default(), &target, true);
+            // Priced against a stand-in with room, never the host's memory.
+            let roomy = std::rc::Rc::new(crate::engine_dispatch::tests::RealLeases);
+            let result = crate::engine_dispatch::with_test_machine(roomy, || {
+                dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), "s", &Default::default(), &target, true)
+            });
             (result, session)
         };
         let (first, first_session) = run("first");

@@ -106,19 +106,11 @@ impl Platform for MacPlatform {
     /// prints as percentages of their limits.
     fn memory_pressure(&self) -> Option<crate::MemoryPressure> {
         let int = |name: &str| sysctl_bytes(name).and_then(|b| uint_from_sysctl(&b));
-        let level = int("kern.memorystatus_vm_pressure_level").and_then(pressure_level_from);
-        let swap = sysctl_bytes("vm.swapusage").and_then(|b| swap_from_xsw_usage(&b));
-        let segments = (int("vm.compressor.segment.total"), int("vm.compressor.segment.limit"));
-        let compressor_pct = fuller_pct(&[segments, (int("vm.compressor.pages_compressed"), int("vm.compressor.pages_compressed_limit"))]);
-        if level.is_none() && swap.is_none() && compressor_pct.is_none() {
-            return None;
-        }
-        Some(crate::MemoryPressure {
-            level,
-            swap_used_bytes: swap.map(|(used, _)| used),
-            swap_free_bytes: swap.map(|(_, free)| free),
-            compressor_pct,
-            compressor_segments_pct: fuller_pct(&[segments]),
+        pressure_from_sysctls(&PressureSysctls {
+            level: int("kern.memorystatus_vm_pressure_level"),
+            swapusage: sysctl_bytes("vm.swapusage"),
+            segments: (int("vm.compressor.segment.total"), int("vm.compressor.segment.limit")),
+            pages: (int("vm.compressor.pages_compressed"), int("vm.compressor.pages_compressed_limit")),
         })
     }
     /// `sysctl(CTL_KERN, KERN_PROC, KERN_PROC_PID, pid)`'s
@@ -581,6 +573,38 @@ pub(crate) fn uint_from_sysctl(bytes: &[u8]) -> Option<u64> {
         8 => Some(u64::from_ne_bytes(bytes.try_into().ok()?)),
         _ => None,
     }
+}
+
+/// The raw sysctl values a memory pressure reading is made of, each `None`
+/// when the kernel did not answer it.
+#[derive(Debug, Clone)]
+pub(crate) struct PressureSysctls {
+    /// `kern.memorystatus_vm_pressure_level`.
+    pub(crate) level: Option<u64>,
+    /// `vm.swapusage`'s `struct xsw_usage`, as read.
+    pub(crate) swapusage: Option<Vec<u8>>,
+    /// `vm.compressor.segment.total` and `.limit`.
+    pub(crate) segments: (Option<u64>, Option<u64>),
+    /// `vm.compressor.pages_compressed` and `.pages_compressed_limit`.
+    pub(crate) pages: (Option<u64>, Option<u64>),
+}
+
+/// The reading `raw` comes to: each figure the kernel answered, none made
+/// up. `None` when it answered no level, no swap and no compressor figure.
+pub(crate) fn pressure_from_sysctls(raw: &PressureSysctls) -> Option<crate::MemoryPressure> {
+    let level = raw.level.and_then(pressure_level_from);
+    let swap = raw.swapusage.as_deref().and_then(swap_from_xsw_usage);
+    let compressor_pct = fuller_pct(&[raw.segments, raw.pages]);
+    if level.is_none() && swap.is_none() && compressor_pct.is_none() {
+        return None;
+    }
+    Some(crate::MemoryPressure {
+        level,
+        swap_used_bytes: swap.map(|(used, _)| used),
+        swap_free_bytes: swap.map(|(_, free)| free),
+        compressor_pct,
+        compressor_segments_pct: fuller_pct(&[raw.segments]),
+    })
 }
 
 /// `kern.memorystatus_vm_pressure_level` to the level it names: 1 normal,

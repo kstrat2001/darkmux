@@ -1071,6 +1071,55 @@ fn the_compressor_figure_is_the_fuller_of_its_limits() {
     assert_eq!(macos::fuller_pct(&[(Some(30), Some(10))]), Some(100), "capped");
 }
 
+/// The raw sysctl values of the 11-10 panic: the kernel's level still
+/// normal, the compressor at 97% of its segments limit and 60% of its
+/// compressed-pages limit, 24 GiB of swap in use of 45 GiB allocated.
+fn panic_sysctls() -> macos::PressureSysctls {
+    let swap: Vec<u8> = [45u64 << 30, 21u64 << 30, 24u64 << 30, 0].iter().flat_map(|w| w.to_ne_bytes()).collect();
+    macos::PressureSysctls {
+        level: Some(1),
+        swapusage: Some(swap),
+        segments: (Some(2_450_000), Some(2_516_582)),
+        pages: (Some(24_159_187), Some(40_265_312)),
+    }
+}
+
+#[test]
+fn a_macs_raw_sysctls_become_its_pressure_reading() {
+    let p = macos::pressure_from_sysctls(&panic_sysctls()).expect("a reading");
+    assert_eq!(p.level, Some(crate::PressureLevel::Normal));
+    assert_eq!(p.compressor_segments_pct, Some(97), "the panic's segments figure, on its own");
+    assert_eq!(p.compressor_pct, Some(97), "the fuller of segments (97%) and pages (60%)");
+    assert_eq!((p.swap_used_bytes, p.swap_free_bytes), (Some(24 << 30), Some(21 << 30)));
+    // Pages fuller than segments: the fuller figure follows the pages, the
+    // segments figure stays the segments'.
+    let pages = macos::PressureSysctls { segments: (Some(10), Some(100)), pages: (Some(95), Some(100)), ..panic_sysctls() };
+    let p = macos::pressure_from_sysctls(&pages).unwrap();
+    assert_eq!((p.compressor_pct, p.compressor_segments_pct), (Some(95), Some(10)));
+}
+
+#[test]
+fn a_macs_missing_or_unknown_sysctls_are_no_figure_never_a_stand_in() {
+    let none = macos::PressureSysctls { level: None, swapusage: None, segments: (None, None), pages: (None, None) };
+    assert_eq!(macos::pressure_from_sysctls(&none), None, "nothing read is no reading");
+    // A level the kernel does not define, a zero limit and a short swap
+    // struct each leave their figure out; what was read stays.
+    let partial = macos::PressureSysctls {
+        level: Some(3),
+        swapusage: Some(vec![0u8; 20]),
+        segments: (Some(5), Some(0)),
+        pages: (Some(50), Some(100)),
+    };
+    let p = macos::pressure_from_sysctls(&partial).expect("the pages figure was read");
+    assert_eq!((p.level, p.swap_used_bytes, p.swap_free_bytes), (None, None, None));
+    assert_eq!((p.compressor_pct, p.compressor_segments_pct), (Some(50), None));
+    let swap_only = macos::PressureSysctls { swapusage: panic_sysctls().swapusage, ..none };
+    assert_eq!(macos::pressure_from_sysctls(&swap_only).and_then(|p| p.swap_used_bytes), Some(24 << 30));
+    // Saturating: a count past its limit is capped at 100%, never wraps.
+    let over = macos::PressureSysctls { level: None, swapusage: None, segments: (Some(u64::MAX), Some(3)), pages: (None, None) };
+    assert_eq!(macos::pressure_from_sysctls(&over).and_then(|p| p.compressor_segments_pct), Some(100));
+}
+
 #[test]
 fn linux_pressure_is_its_swap_and_no_level() {
     let meminfo = "MemTotal: 16000000 kB\nSwapTotal:  8000000 kB\nSwapFree:   6000000 kB\n";
