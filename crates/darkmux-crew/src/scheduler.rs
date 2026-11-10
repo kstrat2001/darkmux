@@ -5738,6 +5738,43 @@ mod tests {
         let loaded = loads.lock().unwrap().clone();
         assert!(loaded.contains(&"map-model".to_string()), "the wave loader loaded the map's model: {loaded:?}");
     }
+    /// (#3514) The scheduler plans a test double's wave without reading this
+    /// machine: a model priced past any machine's memory still loads on a
+    /// host whose loads take none of it. (Planned against this machine, the
+    /// wave would be `wont_fit`; that is what failed on a small CI runner.)
+    #[test]
+    #[serial_test::serial]
+    fn the_scheduler_never_plans_a_doubles_wave_against_this_machine() {
+        let loads: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let loads_for_factory = loads.clone();
+        let factory = move || -> Box<dyn ModelHost> {
+            Box::new(RecordingHost { loads: loads_for_factory.clone(), residents: vec![] })
+        };
+        let (t_src, s_src) = kinded_step("src", "test.emit-collection", json!({ "output_json": "[\"x\"]" }), &[]);
+        let (t_map, s_map) = kinded_step(
+            "map",
+            "dispatch.map",
+            json!({ "model": "map-model", "user_template": "check {item}", "n_ctx": 8000, "timeout_seconds": 1 }),
+            &["src"],
+        );
+        let (tasks, mut steps) = graph(vec![(t_src, s_src), (t_map, s_map)]);
+        let kinds = StepKindRegistry::with_builtins();
+        kinds.register(Arc::new(EmitCollectionKind)).unwrap();
+        let est = FixedEstimator(BTreeMap::from([("map-model".to_string(), 1u64 << 50)]));
+        let url_key = "DARKMUX_LMSTUDIO_URL";
+        let prev_url = std::env::var(url_key).ok();
+        unsafe { std::env::set_var(url_key, "http://127.0.0.1:1") };
+        run_step_graph(&crate::test_run(), &mut steps, &tasks, &kinds, &Facts::default(), &est, &factory, &mut |_r| {}, &mut |_s| {},
+            None, None, &[]).unwrap();
+        unsafe {
+            match prev_url {
+                Some(v) => std::env::set_var(url_key, v),
+                None => std::env::remove_var(url_key),
+            }
+        }
+        assert!(loads.lock().unwrap().contains(&"map-model".to_string()), "{:?}", loads.lock().unwrap());
+    }
+
     /// (#3514) A map step whose wave is refused never runs and is never
     /// silent: the step errors, its `step.error` names the refusal with its
     /// code, and nothing is loaded. Here the AI budget cannot hold the model.
