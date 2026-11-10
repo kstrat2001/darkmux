@@ -227,7 +227,7 @@ fn client_schemas() -> Vec<serde_json::Value> {
     vec![
         of::<ClientError>(), of::<PairAccepted>(), of::<PairPoll>(), of::<Whoami>(), of::<ClientProfiles>(),
         of::<WorkAccepted>(), of::<WorkState>(), of::<StatusWord>(), of::<KeepReply>(), of::<DiscardReply>(),
-        of::<UndoReply>(), of::<RecipeReply>(), of::<WorkspaceInfo>(), of::<BranchChanges>(), of::<PreviewState>(),
+        of::<UndoReply>(), of::<RecipeReply>(), of::<WorkspaceInfo>(), of::<WorkspaceRemoved>(), of::<BranchChanges>(), of::<PreviewState>(),
     ]
 }
 

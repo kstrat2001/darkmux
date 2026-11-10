@@ -4,7 +4,9 @@
 //! `POST /client/workspaces {repo_url, ref?, bot?}` reuses the bot's clone
 //! of that repo (fetching it), or clones it into a new one with the
 //! machine's own git credentials, on a new `mux/<bot>-<id>` branch.
-//! `GET /client/workspaces/{name}` reports it.
+//! `GET /client/workspaces/{name}` reports it; `DELETE` removes it
+//! ([`remove_workspace_within`]), as `darkmux client workspace rm` does.
+//! Each name is held on its own ([`try_hold`]), never all at once.
 //! `/client/work` and `/client/recipe` take `workspace` in place of a raw
 //! `workdir` and resolve it here, under the same containment check.
 //!
@@ -1016,40 +1018,49 @@ impl NameHold {
 /// is held in a way that excludes `how` (a [`Hold::Sole`] excludes every
 /// other hold). The lock file is opened without following a link.
 pub fn try_hold(base: &Path, name: &str, how: Hold) -> Result<Option<NameHold>, String> {
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::io::AsRawFd;
     if !valid_name(name) {
         return Err(format!("{name:?} is not a workspace name"));
     }
     let path = lock_record(base, name);
-    let op = match how {
-        Hold::Sole => libc::LOCK_EX,
-        Hold::Shared => libc::LOCK_SH,
-    };
     // Each look that loses to a removal ([`NameHold::forget`]) finds a new
     // file; a few are plenty.
     for _ in 0..8 {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-            .map_err(|e| format!("opening {}: {e}", path.display()))?;
-        if unsafe { libc::flock(file.as_raw_fd(), op | libc::LOCK_NB) } != 0 {
-            let e = std::io::Error::last_os_error();
-            return match e.kind() {
-                std::io::ErrorKind::WouldBlock => Ok(None),
-                _ => Err(format!("locking {}: {e}", path.display())),
-            };
-        }
+        let Some(file) = lock_file(&path, how)? else {
+            return Ok(None);
+        };
         if is_file_at(&file, &path)? {
             return Ok(Some(NameHold { _file: file, path }));
         }
     }
     Err(format!("{} kept being replaced while darkmux locked it", path.display()))
+}
+
+/// Opens (making it, owner-only, never through a link) and locks the lock
+/// file at `path` `how`, without waiting: `None` when it is held in a way
+/// that excludes `how`.
+fn lock_file(path: &Path, how: Hold) -> Result<Option<std::fs::File>, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    let op = match how {
+        Hold::Sole => libc::LOCK_EX,
+        Hold::Shared => libc::LOCK_SH,
+    };
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| format!("opening {}: {e}", path.display()))?;
+    if unsafe { libc::flock(file.as_raw_fd(), op | libc::LOCK_NB) } == 0 {
+        return Ok(Some(file));
+    }
+    match std::io::Error::last_os_error() {
+        e if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        e => Err(format!("locking {}: {e}", path.display())),
+    }
 }
 
 /// Whether `file` is the file now at `path` (not one removed or replaced

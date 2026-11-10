@@ -3630,7 +3630,9 @@ async fn reuse_runs_no_git_in_another_bots_or_apps_workspace() {
     assert_eq!(code, 201, "{other}");
     let (code, theirs) = call(&h, ask("Theirs")).await;
     assert_eq!(code, 201, "{theirs}");
+    // Another app's, for a bot of the very name asking.
     crate::client_workspace::record_owner(&h.base, theirs["workspace"].as_str().unwrap(), "c-someone-else").unwrap();
+    crate::client_workspace::record_bot(&h.base, theirs["workspace"].as_str().unwrap(), "Mine").unwrap();
     for v in [&other, &theirs] {
         let config = crate::client_git::clone_git_dir(&h.base, v["workspace"].as_str().unwrap()).join("config");
         std::fs::remove_file(&config).unwrap();
@@ -3671,6 +3673,222 @@ async fn reuse_timed(h: &Harness, token: &str, label: &str) {
     }
     took.sort();
     eprintln!("reuse at {label}: median {} ms (of {took:?})", took[2]);
+}
+
+// ---- removing a workspace ---------------------------------------------------
+
+/// `DELETE /client/workspaces/{name}`, with `body` when given.
+async fn remove_ws(h: &Harness, token: &str, name: &str, body: Option<Value>) -> (u16, Value) {
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/client/workspaces/{name}"))
+        .header("authorization", bearer(token))
+        .header("content-type", "application/json")
+        .body(body.map(|b| Body::from(b.to_string())).unwrap_or_else(Body::empty))
+        .unwrap();
+    call(h, req).await
+}
+
+/// What darkmux keeps under the base for workspace `name`, by file name.
+fn kept_for(h: &Harness, name: &str) -> Vec<String> {
+    let mut kept: Vec<String> = std::fs::read_dir(&h.base)
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|f| f == name || f.starts_with(&format!(".{name}.")))
+        .collect();
+    kept.sort();
+    kept
+}
+
+/// An app removes its clone: the folder, its repository and every record
+/// beside it go, and asking for the repo again makes a new one under the
+/// same name.
+#[tokio::test]
+async fn an_app_removes_its_clone_and_its_name_is_free_again() {
+    let h = harness();
+    let token = paired(&h).await;
+    let ask = || post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR, "bot": "Bot A"}));
+    let (code, v) = call(&h, ask()).await;
+    assert_eq!(code, 201, "{v}");
+    assert!(!kept_for(&h, "hcr").is_empty());
+    let (code, gone) = remove_ws(&h, &token, "hcr", None).await;
+    assert_eq!(code, 200, "{gone}");
+    assert_eq!((gone["kind"].as_str(), gone["branch"].as_str()), (Some("clone"), v["branch"].as_str()), "{gone}");
+    assert_eq!((gone["branch_removed"].as_bool(), gone["preview_stopped"].as_bool()), (Some(true), Some(false)));
+    assert_eq!(kept_for(&h, "hcr"), Vec::<String>::new(), "nothing of it is left");
+    let (code, _) = call(&h, get("/client/workspaces/hcr", &[("authorization", &bearer(&token))])).await;
+    assert_eq!(code, 404);
+    let (code, again) = call(&h, ask()).await;
+    assert_eq!((code, again["workspace"].as_str()), (201, Some("hcr")), "{again}");
+}
+
+/// A bot's template projects take `<bot>`, `<bot>-2` ... `<bot>-99`; once
+/// all are taken the next is refused, and removing one frees its name.
+#[tokio::test]
+async fn a_template_name_is_free_again_once_its_project_is_removed() {
+    let h = harness();
+    let token = paired(&h).await;
+    for n in 2..100 {
+        std::fs::create_dir(h.base.join(format!("bakery-{n}"))).unwrap();
+    }
+    let ask = || post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR, "template": true, "bot": "Bakery"}));
+    let (code, v) = call(&h, ask()).await;
+    assert_eq!((code, v["workspace"].as_str()), (201, Some("bakery")), "{v}");
+    let (code, v) = call(&h, ask()).await;
+    assert_eq!((code, v["code"].as_str()), (409, Some("conflict")), "every name is taken: {v}");
+    let (code, gone) = remove_ws(&h, &token, "bakery", None).await;
+    assert_eq!((code, gone["kind"].as_str()), (200, Some("template")), "{gone}");
+    let (code, v) = call(&h, ask()).await;
+    assert_eq!((code, v["workspace"].as_str()), (201, Some("bakery")), "{v}");
+}
+
+/// A clone or a template project whose runs committed holds commits that
+/// are nowhere else: removing it is refused with `unsaved_commits` until
+/// the app says `force`.
+#[tokio::test]
+async fn a_workspace_holding_commits_nowhere_else_is_removed_only_with_force() {
+    let h = harness();
+    let token = paired(&h).await;
+    for body in [serde_json::json!({"repo_url": HCR}), serde_json::json!({"repo_url": HCR, "template": true, "bot": "Bakery"})] {
+        let (code, v) = call(&h, post("/client/workspaces", Some(&token), body)).await;
+        assert_eq!(code, 201, "{v}");
+        let name = v["workspace"].as_str().unwrap().to_string();
+        let _ = run_in(&h, &token, &name, "edit").await;
+        let (code, refused) = remove_ws(&h, &token, &name, None).await;
+        assert_eq!((code, refused["code"].as_str()), (409, Some("unsaved_commits")), "{refused}");
+        assert!(h.base.join(&name).join("made-by-run.txt").exists(), "nothing was removed");
+        let (code, gone) = remove_ws(&h, &token, &name, Some(serde_json::json!({"force": true}))).await;
+        assert_eq!(code, 200, "{gone}");
+        assert_eq!(kept_for(&h, &name), Vec::<String>::new());
+    }
+}
+
+/// Removing a worktree of the user's checkout takes its folder and its
+/// admin directory there. Its `mux/` branch goes once another branch holds
+/// its commits; one holding a run's commits nothing else holds stays
+/// (`force` takes it). The user's own branches and files never change.
+#[tokio::test]
+async fn removing_a_worktree_never_touches_the_users_branches() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (mine, name, _ws) = checkout_workspace(&h, &token).await;
+    let users = || (run_git(Some(&mine), &["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads/main", "refs/heads/dev"]), std::fs::read_to_string(mine.join("README.md")).unwrap());
+    let before = users();
+    let worktrees = || run_git(Some(&mine), &["worktree", "list", "--porcelain"]).matches("worktree ").count();
+    assert_eq!(worktrees(), 2);
+    let (code, gone) = remove_ws(&h, &token, &name, None).await;
+    assert_eq!((code, gone["kind"].as_str(), gone["branch_removed"].as_bool()), (200, Some("worktree"), Some(true)), "a branch main holds goes: {gone}");
+    let branch = gone["branch"].as_str().unwrap().to_string();
+    assert!(run_git(Some(&mine), &["branch", "--list", &branch]).is_empty(), "{branch} is gone");
+    assert_eq!(worktrees(), 1, "its admin directory is gone");
+    assert_eq!(kept_for(&h, &name), Vec::<String>::new());
+    for force in [false, true] {
+        let (code, v) = call(&h, post("/client/workspaces", Some(&token), serde_json::json!({"source_path": mine.to_str(), "bot": "b"}))).await;
+        assert_eq!(code, 201, "{v}");
+        let _ = run_in(&h, &token, &name, "edit").await;
+        let (code, gone) = remove_ws(&h, &token, &name, Some(serde_json::json!({"force": force}))).await;
+        assert_eq!((code, gone["branch_removed"].as_bool()), (200, Some(force)), "{gone}");
+        let listed = run_git(Some(&mine), &["branch", "--list", gone["branch"].as_str().unwrap()]);
+        assert_eq!(listed.is_empty(), force, "the run's commits stay on their branch unless forced: {listed:?}");
+        assert_eq!(worktrees(), 1);
+    }
+    assert_eq!(users(), before, "the user's branches and files are as they were");
+}
+
+/// A workspace is not removed while something uses it: a run in it, or a
+/// hold another process took (`client workspace rm` holds it alone; a run
+/// in `client serve` shares it). Neither is anything started in one being
+/// removed. Only the app that owns it may remove it.
+#[tokio::test]
+async fn a_workspace_in_use_is_not_removed_nor_used_while_removed() {
+    use crate::client_workspace::{try_hold, Hold};
+    let h = harness();
+    let token = paired(&h).await;
+    let other = paired(&h).await;
+    let (code, v) = call(&h, post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR}))).await;
+    assert_eq!(code, 201, "{v}");
+    let edited = run_in(&h, &token, "hcr", "edit").await;
+    let id = start_in(&h, &token, "hcr", "wait").await;
+    assert!(try_hold(&h.base, "hcr", Hold::Sole).unwrap().is_none(), "a run holds its workspace's name");
+    let (code, refused) = remove_ws(&h, &token, "hcr", None).await;
+    assert_eq!((code, refused["code"].as_str()), (409, Some("conflict")), "a run is in it: {refused}");
+    let _ = cancel(&h, Some(&token), &id).await;
+    let _ = wait_done(&h, &token, &id).await;
+    assert!(try_hold(&h.base, "hcr", Hold::Sole).unwrap().is_some(), "and lets go once it has ended");
+    let elsewhere = try_hold(&h.base, "hcr", Hold::Shared).unwrap().unwrap();
+    let (code, refused) = remove_ws(&h, &token, "hcr", None).await;
+    assert_eq!((code, refused["code"].as_str()), (409, Some("conflict")), "held elsewhere: {refused}");
+    drop(elsewhere);
+    let removing = try_hold(&h.base, "hcr", Hold::Sole).unwrap().unwrap();
+    let body = serde_json::json!({"role": "coder", "message": "edit", "workspace": "hcr"});
+    let (code, refused) = call(&h, post("/client/work", Some(&token), body)).await;
+    assert_eq!((code, refused["code"].as_str()), (409, Some("conflict")), "no run starts in one being removed: {refused}");
+    let (code, refused) = call(&h, post(&format!("/client/work/{edited}/undo"), Some(&token), Value::Null)).await;
+    assert_eq!((code, refused["code"].as_str()), (409, Some("conflict")), "no Undo either: {refused}");
+    assert!(refused["error"].as_str().unwrap().contains("being made or removed"), "{refused}");
+    drop(removing);
+    let (code, _) = remove_ws(&h, &other, "hcr", None).await;
+    assert_eq!(code, 403, "another app's");
+    let (code, _) = remove_ws(&h, &token, "nope", None).await;
+    assert_eq!(code, 404);
+    let (code, _) = remove_ws(&h, &token, "..", None).await;
+    assert_eq!(code, 400);
+    let (code, refused) = remove_ws(&h, &token, "wt1", None).await;
+    assert_eq!(code, 403, "a folder darkmux holds no repository for: {refused}");
+    assert!(h.base.join("wt1").is_dir());
+    let (code, _) = remove_ws(&h, &token, "hcr", Some(serde_json::json!({"forse": true}))).await;
+    assert_eq!(code, 400, "an unknown key");
+    let (code, gone) = remove_ws(&h, &token, "hcr", Some(serde_json::json!({"force": true}))).await;
+    assert_eq!(code, 200, "{gone}");
+}
+
+/// A removed workspace's live preview is stopped first, and no preview
+/// starts in one being removed.
+#[tokio::test]
+async fn removing_a_workspace_stops_its_preview_first() {
+    use crate::client_workspace::{try_hold, Hold};
+    let h = harness();
+    let token = paired(&h).await;
+    let (mine, name, _ws) = served_workspace(&h, &token).await;
+    recipe(&mine, serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}, "ready": {"http": "/"}}));
+    let removing = try_hold(&h.base, &name, Hold::Sole).unwrap().unwrap();
+    let (code, refused) = start_preview(&h, &token, &name).await;
+    assert_eq!((code, refused["code"].as_str()), (409, Some("conflict")), "{refused}");
+    drop(removing);
+    let (code, v) = start_preview(&h, &token, &name).await;
+    assert_eq!(code, 202, "{v}");
+    let ready = preview_until(&h, &token, &name, &["ready", "failed"]).await;
+    assert_eq!(ready["status"], "ready", "{ready}");
+    let port = ready["port"].as_u64().unwrap();
+    let (code, gone) = remove_ws(&h, &token, &name, None).await;
+    assert_eq!((code, gone["preview_stopped"].as_bool()), (200, Some(true)), "{gone}");
+    assert!(!answers(port), "its dev server is gone");
+    assert!(!h.base.join(&name).exists());
+}
+
+/// A clone a stopped `client serve` left half done (`.<name>.partial` and
+/// the repository it was cloning into) is swept as `client serve` starts,
+/// so its name is free again; one with a workspace of that name keeps that
+/// workspace's repository, and one a request holds now is left.
+#[test]
+fn a_half_done_clone_is_swept_and_its_name_freed() {
+    use crate::client_workspace::{sweep_partials, try_hold, Hold};
+    let h = harness();
+    let base = &h.base;
+    for name in ["gone", "kept", "busy"] {
+        std::fs::create_dir_all(base.join(format!(".{name}.partial/half"))).unwrap();
+        std::fs::create_dir_all(crate::client_git::clone_git_dir(base, name)).unwrap();
+    }
+    std::fs::create_dir(base.join("kept")).unwrap();
+    let busy = try_hold(base, "busy", Hold::Sole).unwrap().unwrap();
+    assert_eq!(sweep_partials(base), ["gone", "kept"]);
+    assert!(!name_taken(base, "gone"), "its name is free again");
+    assert_eq!(kept_for(&h, "gone"), Vec::<String>::new());
+    let kept = kept_for(&h, "kept");
+    assert!(kept.contains(&".kept.git".to_string()) && kept.contains(&"kept".to_string()), "the workspace's repository stays: {kept:?}");
+    assert!(!kept.contains(&".kept.partial".to_string()), "{kept:?}");
+    assert!(base.join(".busy.partial").exists(), "a clone in progress is left");
+    drop(busy);
 }
 
 /// The fixture's clone, but of an empty repository (no commit, so `HEAD`
@@ -3800,13 +4018,12 @@ async fn a_long_checkout_and_bot_name_still_fit_a_workspace_name() {
     let first = v["workspace"].as_str().unwrap().to_string();
     assert!(crate::client_workspace::valid_name(&first), "{first}");
     let source = mine.canonicalize().unwrap();
-    let base = h.base.canonicalize().unwrap();
-    let mut last = first.clone();
-    while let Some(n) = free_worktree_name(&base, &source, &bot) {
-        assert!(crate::client_workspace::valid_name(&n), "{n}");
-        std::fs::create_dir(base.join(&n)).unwrap();
-        last = n;
+    let names = worktree_names(&source, &bot);
+    assert_eq!(names[0], first);
+    for n in &names {
+        assert!(crate::client_workspace::valid_name(n), "{n}");
     }
+    let last = names.last().unwrap();
     assert!(last.ends_with("-99"), "every numbered name fits, the last too: {last}");
 }
 
@@ -7148,6 +7365,31 @@ fn shutdown_never_waits_past_its_bound_for_a_run_that_ignores_its_cancel() {
     end_runtime(rt, bound);
     let took = began.elapsed();
     assert!(took < std::time::Duration::from_secs(2), "the exit waited {took:?} on a 3 s run");
+}
+
+/// A wedged docker (each `docker stop` and `rm` waiting out its own bound)
+/// never holds the exit past the stop's bound: the wait for the previews'
+/// containers ends there too, and the runtime is left at its own bound
+/// while their removal still runs.
+#[test]
+fn shutdown_never_waits_past_its_bound_for_a_wedged_preview_stop() {
+    let h = harness();
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    let token = rt.block_on(paired(&h));
+    let (mine, name, _ws) = rt.block_on(served_workspace(&h, &token));
+    recipe(&mine, serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}, "ready": {"http": "/"}}));
+    let (code, v) = rt.block_on(start_preview(&h, &token, &name));
+    assert_eq!(code, 202, "{v}");
+    let ready = rt.block_on(preview_until(&h, &token, &name, &["ready", "failed"]));
+    assert_eq!(ready["status"], "ready", "{ready}");
+    *h.containers.remove_delay.lock().unwrap() = std::time::Duration::from_secs(5);
+    let began = begin_stop(&h.state.previews, &h.state.works);
+    let bound = std::time::Duration::from_millis(300);
+    rt.block_on(finish_stop(h.state.previews.clone(), h.state.works.clone(), began + bound));
+    assert!(began.elapsed() < std::time::Duration::from_secs(2), "the stop waited {:?} on a wedged docker", began.elapsed());
+    end_runtime(rt, bound);
+    let took = began.elapsed();
+    assert!(took < std::time::Duration::from_secs(3), "the exit waited {took:?} on a wedged docker");
 }
 
 /// `client revoke` ends what the client started: at the next look its
