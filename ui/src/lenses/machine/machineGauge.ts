@@ -757,6 +757,12 @@ export function isEstimatedRow(m: Pick<ModelRow, "potential_source">): boolean {
  * text). Detail-layer precision (`memBytes()`, two decimals) — this is a
  * k/v row, not the glance layer. */
 export function modelKvLine(m: ModelRow): string {
+  // (#3450) A server darkmux started is priced at its measured memory: it
+  // has no weights or kv figure, and its potential IS its current.
+  if (m.server) {
+    const s = m.server;
+    return `ctx ${m.loaded_ctx} · ${s.engine} server for ${s.model} on endpoint ${s.endpoint}, port ${s.port} · measured ${memBytes(m.current_bytes)}`;
+  }
   const kv = m.kv_bytes_at_ctx != null ? `kv@ctx ${memBytes(m.kv_bytes_at_ctx)}` : "kv unknown (no arch facts)";
   // #1819: an ESTIMATED row's potential is a labeled guess, not a
   // measurement — the `~` and `(estimated)` suffix travel with the FIGURE

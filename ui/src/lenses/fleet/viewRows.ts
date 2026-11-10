@@ -10,6 +10,7 @@
 
 import { engineOf, engineSuffix, residentsKnown } from "../../lib/machineEngine";
 import type { CardOutcome } from "../../types/generated/CardOutcome";
+import type { EngineServer } from "../../types/generated/EngineServer";
 import type { FleetMachine } from "../../types/generated/FleetMachine";
 import type { Liveness } from "../../types/generated/Liveness";
 import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
@@ -160,6 +161,13 @@ export function rowServesProfiles(row: FleetMachine): number {
   return row.card.state === "available" ? (row.card.card.serves_profiles ?? 0) : 0;
 }
 
+/** (#3450) The servers the row's own card says its machine's darkmux started
+ * and runs now. None for a card that was not read, and for one from a
+ * darkmux before 5.10, which lists none. */
+export function rowEngineServers(row: FleetMachine): EngineServer[] {
+  return rowSpecs(row)?.engine_servers ?? [];
+}
+
 /** The view's row for the machine a page shows. `isLocal`: the page shows THIS
  * machine, whose row is the view's own. Any other machine is found by the
  * hardware uid its card carries or by its roster id, the two keys a machine
@@ -216,6 +224,8 @@ export interface RowFacts {
   servesRadio: boolean;
   /** How many profiles the row's card says its machine serves (0: none shown). */
   servesProfiles: number;
+  /** (#3450) The servers the row's card says its machine's darkmux runs. */
+  engineServers: EngineServer[];
   /** The row's card's own statement of its machine's utility model. */
   utility: UtilityReading;
 }
@@ -273,6 +283,7 @@ export function rowFacts(
     hub: rowIsHub(row),
     servesRadio: rowServesRadio(row),
     servesProfiles: rowServesProfiles(row),
+    engineServers: rowEngineServers(row),
     utility: rowUtility(row),
   };
 }

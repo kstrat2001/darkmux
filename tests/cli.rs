@@ -2145,7 +2145,7 @@ fn machine_list_builds_this_machines_row_from_a_local_card_and_never_dials_its_a
     assert_eq!(row["is_this_machine"], true);
     assert_eq!(row["liveness"], "live");
     assert_eq!(row["card"]["state"], "available", "{row}");
-    assert_eq!(row["card"]["card"]["card_schema_version"], "1.3");
+    assert_eq!(row["card"]["card"]["card_schema_version"], "1.4");
     assert_eq!(v["cache_ttl_ms"], 0, "the CLI's gather is not cached");
 }
 
@@ -15522,6 +15522,124 @@ fn machine_eject_fails_when_lms_cannot_say_what_is_loaded() {
     assert_ne!(code, Some(0), "an unknown resident set is not \"nothing to eject\"");
     assert_eq!(stdout, "", "{stdout}");
     assert!(stderr.contains("cannot tell whether any models are loaded"), "{stderr}");
+}
+
+/// (#3450) A process standing in for a server darkmux started, leading its
+/// own group, killed with it when dropped.
+struct StandInServer(std::process::Child);
+
+impl Drop for StandInServer {
+    fn drop(&mut self) {
+        let _ = darkmux_types::child_registry::kill_group(self.0.id(), darkmux_types::child_registry::SIGKILL);
+        let _ = self.0.wait();
+    }
+}
+
+impl StandInServer {
+    fn start() -> Self {
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        StandInServer(cmd.spawn().unwrap())
+    }
+
+    /// Whether it still runs (not a zombie).
+    fn alive(&self) -> bool {
+        let out = std::process::Command::new("ps").args(["-o", "stat=", "-p", &self.0.id().to_string()]).output().unwrap();
+        let stat = String::from_utf8_lossy(&out.stdout);
+        !stat.trim().is_empty() && !stat.trim_start().starts_with('Z')
+    }
+
+    /// darkmux's record of it on `endpoint` under `home`, with its real start
+    /// stamp, or `stamp` in its place (a record its process no longer matches).
+    fn record(&self, home: &std::path::Path, endpoint: &str, stamp: Option<u64>) {
+        let real = (0..50).find_map(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            darkmux_platform::current().process_start_stamp(self.0.id())
+        });
+        let rec = darkmux_types::engine_record::EngineRecord {
+            schema: darkmux_types::engine_record::ENGINE_RECORD_SCHEMA,
+            endpoint: endpoint.into(),
+            engine: "tensorfold".into(),
+            model: format!("TensorFold/{endpoint}"),
+            n_ctx: 8192,
+            port: 1,
+            pid: self.0.id(),
+            start_stamp: stamp.or(real).expect("a start stamp"),
+            owner_pid: std::process::id(),
+            argv: vec!["tensorfold-native".into(), "--name".into(), format!("darkmux:TensorFold/{endpoint}")],
+            log: home.join("logs").join(format!("{endpoint}.log")),
+            started_at_ms: 1_000,
+            engine_version: "tensorfold-native 1.2.4".into(),
+        };
+        darkmux_types::engine_record::write_in(&home.join("run").join("engines"), &rec).unwrap();
+    }
+}
+
+/// `darkmux <args>` against `lms`, with `home` as darkmux's home.
+fn run_with_lms_at(home: &std::path::Path, lms: &std::path::Path, args: &[&str]) -> (Option<i32>, String, String) {
+    let out = darkmux_cmd()
+        .env("DARKMUX_HOME", home)
+        .env("DARKMUX_LMS_BIN", lms)
+        .env("DARKMUX_SERVE_BIND", "127.0.0.1")
+        .env("DARKMUX_SERVE_PORT", "9")
+        .env_remove("DARKMUX_REDIS_URL")
+        .args(args)
+        .output()
+        .unwrap();
+    (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+/// (#3450) `machine eject` stops the servers darkmux started, before its
+/// LM Studio loads, and never a process its record no longer matches.
+#[test]
+fn machine_eject_stops_darkmuxs_engine_servers_and_no_other_process() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let ours = StandInServer::start();
+    let stranger = StandInServer::start();
+    ours.record(&home, "tf", None);
+    stranger.record(&home, "zz", Some(7));
+    let lms = fake_lms_with_loads(&tmp, &[("darkmux:a", 8192)]);
+    let (code, stdout, stderr) = run_with_lms_at(&home, &lms, &["machine", "eject", "--dry-run"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.starts_with(&format!("would stop engine server `tf` (TensorFold/tf, pid {})\n", ours.0.id())), "{stdout}");
+    assert!(ours.alive(), "a dry run stops nothing");
+    let (code, stdout, stderr) = run_with_lms_at(&home, &lms, &["machine", "eject"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(
+        stdout,
+        format!(
+            "stop engine server `tf` (TensorFold/tf, pid {})\nstopped 1 engine server(s)\n\
+             eject darkmux:a (ctx=8192)\nejected 1 model(s)\n",
+            ours.0.id()
+        )
+    );
+    assert!(!ours.alive(), "darkmux's server is stopped");
+    assert!(stranger.alive(), "a process its record does not match is never signaled");
+}
+
+/// (#3450) `machine status` lists darkmux's servers beside its LM Studio
+/// loads, in the table and in `--json`.
+#[test]
+fn machine_status_lists_darkmuxs_engine_servers() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let ours = StandInServer::start();
+    ours.record(&home, "tf", None);
+    let lms = fake_lms_with_loads(&tmp, &[("darkmux:a", 8192)]);
+    let (code, stdout, stderr) = run_with_lms_at(&home, &lms, &["machine", "status", "--json"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["engine_servers"][0]["endpoint"], "tf", "{json}");
+    assert_eq!(json["engine_servers"][0]["model"], "TensorFold/tf");
+    assert_eq!(json["engine_servers"][0]["pid"], ours.0.id());
+    assert_eq!(json["managed"][0]["identifier"], "darkmux:a");
+    let (code, stdout, stderr) = run_with_lms_at(&home, &lms, &["machine", "status"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.contains("darkmux engine servers (1):"), "{stdout}");
+    let line = stdout.lines().find(|l| l.contains("TensorFold/tf")).expect(&stdout);
+    assert!(line.contains("endpoint `tf`") && line.contains(&format!("pid {}", ours.0.id())), "{line}");
 }
 
 /// `machine resources` reads the local engine's ledger: every resident
