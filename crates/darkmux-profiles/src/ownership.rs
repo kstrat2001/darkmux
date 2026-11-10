@@ -182,13 +182,16 @@ pub struct ServerEjectSummary {
     pub stopped: Vec<EjectedServer>,
     /// Left running: a running dispatch holds it (its residency lease).
     pub held: Vec<EjectedServer>,
+    /// Nothing signaled: by the time the eject reached it, its record no
+    /// longer matched a live process of darkmux's (`StopOutcome::NotRunning`).
+    pub skipped: Vec<EjectedServer>,
     /// Would not stop; `identifier` is the endpoint id.
     pub failed: Vec<EjectFailure>,
 }
 
 impl ServerEjectSummary {
     pub fn is_empty(&self) -> bool {
-        self.stopped.is_empty() && self.held.is_empty() && self.failed.is_empty()
+        self.stopped.is_empty() && self.held.is_empty() && self.skipped.is_empty() && self.failed.is_empty()
     }
 }
 
@@ -220,7 +223,22 @@ pub(crate) fn eject_servers_in(
     bounds: crate::engine::server::Bounds,
     held: crate::engine::server::Held<'_>,
 ) -> ServerEjectSummary {
-    use crate::engine::server;
+    eject_servers_with(dirs, dry_run, held, &|rec| crate::engine::server::stop_if_idle(dirs, rec, bounds, held))
+}
+
+type StopOne<'a> = &'a dyn Fn(
+    &darkmux_types::engine_record::EngineRecord,
+) -> Result<crate::engine::server::StopOutcome, crate::engine::server::ServerError>;
+
+/// [`eject_servers_in`] with the stop given, so each outcome's report is
+/// testable without racing a process's exit.
+fn eject_servers_with(
+    dirs: &crate::engine::server::Dirs,
+    dry_run: bool,
+    held: crate::engine::server::Held<'_>,
+    stop: StopOne<'_>,
+) -> ServerEjectSummary {
+    use crate::engine::server::{self, StopOutcome};
     let mut summary = ServerEjectSummary::default();
     // darkmux's live servers, and those whose leader exited leaving workers
     // on the port (still darkmux's, and still holding memory).
@@ -230,14 +248,31 @@ pub(crate) fn eject_servers_in(
         .filter(|r| server::alive(r) || server::left_behind(dirs, &r.endpoint).is_some());
     for rec in ours {
         let entry = EjectedServer { endpoint: rec.endpoint.clone(), model: rec.model.clone(), pid: rec.pid };
-        let outcome = if dry_run { Ok(!held(&rec)) } else { server::stop_unless_held(dirs, &rec, bounds, held) };
-        match outcome {
-            Ok(true) => summary.stopped.push(entry),
-            Ok(false) => summary.held.push(entry),
-            Err(e) => summary.failed.push(EjectFailure { identifier: entry.endpoint, error: e.to_string() }),
-        }
+        let outcome = match dry_run {
+            true if held(&rec) => Ok(StopOutcome::Held),
+            true => Ok(StopOutcome::Stopped),
+            false => stop(&rec),
+        };
+        summary.file(entry, outcome);
     }
     summary
+}
+
+impl ServerEjectSummary {
+    /// File one server under what its stop did.
+    fn file(
+        &mut self,
+        entry: EjectedServer,
+        outcome: Result<crate::engine::server::StopOutcome, crate::engine::server::ServerError>,
+    ) {
+        use crate::engine::server::StopOutcome;
+        match outcome {
+            Ok(StopOutcome::Stopped) => self.stopped.push(entry),
+            Ok(StopOutcome::Held) => self.held.push(entry),
+            Ok(StopOutcome::NotRunning) => self.skipped.push(entry),
+            Err(e) => self.failed.push(EjectFailure { identifier: entry.endpoint, error: e.to_string() }),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -557,6 +592,21 @@ mod tests {
         assert!(alive(&busy), "a server a running dispatch holds is kept");
         assert!(alive(&stranger), "a process its record no longer matches is never signaled");
         assert!(darkmux_types::engine_record::read_in(&dirs.records, "idle").unwrap().is_none(), "its record is gone");
+    }
+
+    /// (#3450 review) A server whose process was gone by the time the eject
+    /// reached it (nothing was signaled) is reported as skipped, never as
+    /// stopped.
+    #[test]
+    fn eject_reports_a_server_it_found_gone_as_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = dirs_in(&tmp);
+        let s = stand_in();
+        record(&dirs, "tf", s.0.id(), None);
+        let gone = |_: &darkmux_types::engine_record::EngineRecord| Ok(crate::engine::server::StopOutcome::NotRunning);
+        let summary = eject_servers_with(&dirs, false, &|_| false, &gone);
+        assert!(summary.stopped.is_empty(), "{summary:?}");
+        assert_eq!(summary.skipped.iter().map(|e| e.endpoint.as_str()).collect::<Vec<_>>(), vec!["tf"]);
     }
 
     /// (#3450) What `machine eject` asks before it stops a server is the

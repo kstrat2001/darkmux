@@ -1843,7 +1843,7 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
     await waitFor(() => expect(document.querySelectorAll(".mach")).toHaveLength(2));
     const studio = [...document.querySelectorAll(".mach")].find((c) => c.querySelector(".mach-name")!.textContent === "studio")!;
     const line = studio.querySelector('[data-testid="engine-servers-line"]')!;
-    expect(line.textContent).toBe("starting the model flint-int4 · resident q38");
+    expect(line.textContent).toBe("2 servers · 1 starting · flint-int4, q38");
     expect(line.getAttribute("title")).toBe("TensorFold/q38 (tensorfold on tensorfold): resident\nflint-int4 (flint on flint): starting the model");
     const self = [...document.querySelectorAll(".mach")].find((c) => c !== studio)!;
     expect(self.querySelector('[data-testid="engine-servers-line"]')).toBeNull();

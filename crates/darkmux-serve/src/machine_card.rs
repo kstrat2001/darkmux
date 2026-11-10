@@ -111,9 +111,10 @@ pub struct CardModel {
     /// (#3450) Whether darkmux can make this model resident on this machine,
     /// as `darkmux profile list --json` states it for a local one. The
     /// serving machine lists it behind the card (every
-    /// [`CARD_AVAILABILITY_TTL`]), so it can be that much older than the
-    /// card. Absent until a listing has answered, and on a card before 1.4:
-    /// not stated, never guessed.
+    /// [`CARD_AVAILABILITY_TTL`]), so it can be up to
+    /// [`CARD_AVAILABILITY_MAX_AGE`] older than the card. Absent until a
+    /// listing has answered, when the last one is older than that, and on a
+    /// card before 1.4: not stated, never guessed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub availability: Option<Availability>,
@@ -502,6 +503,11 @@ pub(crate) fn state_availability(profiles: &mut [CardProfile], each: Option<&[Av
 /// for LM Studio, so it runs behind the card, never inside a card read.
 pub(crate) const CARD_AVAILABILITY_TTL: Duration = Duration::from_secs(30);
 
+/// The oldest availability listing a card states: two refresh periods and a
+/// listing's longest bound. Past it (refreshes failing, say) the card states
+/// none rather than an old answer as current.
+pub(crate) const CARD_AVAILABILITY_MAX_AGE: Duration = Duration::from_secs(2 * 30 + 15);
+
 type Listing = dyn Fn(&[darkmux_types::ProfileModel]) -> Vec<Availability> + Send + Sync;
 /// The last listing: the models it answered (their JSON), when, and its answers.
 type ListingSlot = Option<(String, std::time::SystemTime, Vec<Availability>)>;
@@ -512,6 +518,8 @@ type ListingSlot = Option<(String, std::time::SystemTime, Vec<Availability>)>;
 /// models listed, so a changed registry is never answered by another's.
 pub(crate) struct AvailabilityCache {
     ttl: Duration,
+    /// The oldest listing a non-waiting read still states.
+    max_age: Duration,
     list: std::sync::Arc<Listing>,
     slot: std::sync::Arc<std::sync::Mutex<ListingSlot>>,
     refreshing: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -524,10 +532,19 @@ impl AvailabilityCache {
     ) -> Self {
         Self {
             ttl,
+            max_age: CARD_AVAILABILITY_MAX_AGE,
             list: std::sync::Arc::new(list),
             slot: Default::default(),
             refreshing: Default::default(),
         }
+    }
+
+    /// The oldest listing a card states, past which it states none (while
+    /// one refresh runs behind it).
+    #[cfg(test)]
+    pub(crate) fn stated_for(mut self, max_age: Duration) -> Self {
+        self.max_age = max_age;
+        self
     }
 
     /// The listing for `models`. `wait`: list now when there is no fresh
@@ -553,7 +570,8 @@ impl AvailabilityCache {
             return Some(each);
         }
         self.refresh_behind(key, models.to_vec());
-        last.map(|(_, each)| each)
+        let now = std::time::SystemTime::now();
+        last.filter(|(at, _)| crate::wall_clock_cache_is_fresh(*at, now, self.max_age)).map(|(_, each)| each)
     }
 
     /// One listing on its own thread, unless one already runs.
@@ -564,13 +582,24 @@ impl AvailabilityCache {
         }
         let (list, slot, refreshing) = (self.list.clone(), self.slot.clone(), self.refreshing.clone());
         let spawned = std::thread::Builder::new().name("card-availability".into()).spawn(move || {
+            // Cleared on every exit, a panicking listing included, so the
+            // next stale read lists again.
+            let _done = Cleared(refreshing);
             let each = list(&models);
             *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some((key, std::time::SystemTime::now(), each));
-            refreshing.store(false, Ordering::SeqCst);
         });
         if spawned.is_err() {
             self.refreshing.store(false, Ordering::SeqCst);
         }
+    }
+}
+
+/// Clears a refresh's in-flight flag when the refresh ends, however it ends.
+struct Cleared(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for Cleared {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -1166,6 +1195,40 @@ pub(crate) mod tests {
         assert_eq!(fresh.get(&models, true).map(|a| a[0].state), Some(AvailabilityState::Resident));
         assert_eq!(fresh.get(&other, false), None, "another set's listing never answers");
         assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+    }
+
+    /// (#3450 review) A listing that panics does not stop the refreshes: the
+    /// next stale read lists again.
+    #[test]
+    fn a_listing_that_panics_is_retried_on_the_next_stale_read() {
+        let models = vec![ProfileModel { id: "m".into(), ..Default::default() }];
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = calls.clone();
+        let cache = AvailabilityCache::new(Duration::ZERO, move |m: &[ProfileModel]| {
+            if counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                panic!("the first listing panics");
+            }
+            listing_of(AvailabilityState::Startable)(m)
+        });
+        let answered = (0..300).find_map(|_| {
+            std::thread::sleep(Duration::from_millis(10));
+            cache.get(&models, false)
+        });
+        assert_eq!(answered.map(|a| a[0].state), Some(AvailabilityState::Startable), "a later read listed again");
+        assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+    }
+
+    /// (#3450 review) A listing older than the cache's bound is never stated
+    /// as current: a card read past it states none (and lists again behind).
+    #[test]
+    fn a_listing_past_its_bound_is_not_stated() {
+        let models = vec![ProfileModel { id: "m".into(), ..Default::default() }];
+        let cache = AvailabilityCache::new(Duration::ZERO, listing_of(AvailabilityState::Resident)).stated_for(Duration::ZERO);
+        assert!(cache.get(&models, true).is_some(), "a reader that waits gets its own listing");
+        assert_eq!(cache.get(&models, false), None, "a listing past its bound is not stated");
+        let kept = AvailabilityCache::new(Duration::ZERO, listing_of(AvailabilityState::Resident)).stated_for(Duration::from_secs(600));
+        kept.get(&models, true);
+        assert!(kept.get(&models, false).is_some(), "inside its bound, the last listing answers while one refreshes");
     }
 
     // ── the declared role (#3022) ──────────────────────────────────────

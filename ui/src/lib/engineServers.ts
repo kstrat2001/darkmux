@@ -25,20 +25,18 @@ function shortModel(model: string): string {
   return model.slice(model.lastIndexOf("/") + 1);
 }
 
-/** The fleet card's line for a machine's servers: the ones still starting
- * their model first (the fact a narrow card must not cut off), then the
- * resident ones, each by its model's short name. Empty when the machine runs
- * none (or its card is from a darkmux that lists none). */
+/** The fleet card's line for a machine's servers: the counts first, which a
+ * narrow card's ellipsis cannot cut off ("2 servers · 1 starting"), then the
+ * models by short name, the ones still starting first. Empty when the
+ * machine runs none (or its card is from a darkmux that lists none). */
 export function serversLine(servers: readonly EngineServer[] | null | undefined): string {
   const all = servers ?? [];
-  const starting = all.filter((s) => !s.answering).map((s) => shortModel(s.model));
-  const resident = all.filter((s) => s.answering).map((s) => shortModel(s.model));
-  return [
-    starting.length > 0 ? `${serverStateWord({ answering: false })} ${starting.join(", ")}` : "",
-    resident.length > 0 ? `resident ${resident.join(", ")}` : "",
-  ]
-    .filter(Boolean)
-    .join(" · ");
+  if (all.length === 0) return "";
+  const starting = all.filter((s) => !s.answering);
+  const names = [...starting, ...all.filter((s) => s.answering)].map((s) => shortModel(s.model));
+  const counts = [`${all.length} ${all.length === 1 ? "server" : "servers"}`];
+  if (starting.length > 0) counts.push(`${starting.length} starting`);
+  return [...counts, names.join(", ")].join(" · ");
 }
 
 /** The servers line's title: every server in full, with what it is doing. */

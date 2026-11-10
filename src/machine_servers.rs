@@ -63,33 +63,45 @@ pub(crate) fn on_a_server(m: &darkmux_types::ProfileModel) -> bool {
 /// `machine eject`'s lines for darkmux's servers, before the LM Studio half:
 /// stdout and stderr, and whether a stop failed. Nothing when none runs.
 pub(crate) fn eject_lines(summary: &ServerEjectSummary, dry_run: bool) -> (String, String, bool) {
-    let (mut out, mut err) = (String::new(), String::new());
     if summary.is_empty() {
-        return (out, err, false);
+        return (String::new(), String::new(), false);
     }
     let verb = if dry_run { "would stop" } else { "stop" };
+    let mut out = String::new();
     for s in &summary.stopped {
         out.push_str(&format!("{verb} engine server `{}` ({}, pid {})\n", s.endpoint, s.model, s.pid));
     }
     for s in &summary.held {
         out.push_str(&format!("kept engine server `{}` ({}): a running dispatch holds it\n", s.endpoint, s.model));
     }
-    for f in &summary.failed {
-        err.push_str(&format!("darkmux: ⚠ could not stop engine server `{}` — {}\n", f.identifier, f.error));
+    for s in &summary.skipped {
+        out.push_str(&format!("skipped engine server `{}` ({}): it was no longer running as darkmux's\n", s.endpoint, s.model));
     }
+    out.push_str(&summary_line(summary, dry_run));
+    let err: String = summary
+        .failed
+        .iter()
+        .map(|f| format!("darkmux: ⚠ could not stop engine server `{}` — {}\n", f.identifier, f.error))
+        .collect();
+    (out, err, !summary.failed.is_empty())
+}
+
+/// The eject's one summary line for the servers.
+fn summary_line(summary: &ServerEjectSummary, dry_run: bool) -> String {
     let mut line = format!("{} {} engine server(s)", if dry_run { "would stop" } else { "stopped" }, summary.stopped.len());
-    if !summary.held.is_empty() {
-        line.push_str(&format!(", kept {} a running dispatch holds", summary.held.len()));
-    }
-    if !summary.failed.is_empty() {
-        line.push_str(&format!(", {} FAILED to stop", summary.failed.len()));
+    let counts = [
+        (summary.held.len(), "kept {} a running dispatch holds"),
+        (summary.skipped.len(), "skipped {}"),
+        (summary.failed.len(), "{} FAILED to stop"),
+    ];
+    for (n, words) in counts.into_iter().filter(|(n, _)| *n > 0) {
+        line.push_str(&format!(", {}", words.replace("{}", &n.to_string())));
     }
     if dry_run {
         line.push_str(" [DRY RUN]");
     }
-    out.push_str(&line);
-    out.push('\n');
-    (out, err, !summary.failed.is_empty())
+    line.push('\n');
+    line
 }
 
 #[cfg(test)]
@@ -159,6 +171,7 @@ mod tests {
         let summary = ServerEjectSummary {
             stopped: vec![one("tf")],
             held: vec![one("busy")],
+            skipped: vec![one("gone")],
             failed: vec![EjectFailure { identifier: "stuck".into(), error: "boom".into() }],
         };
         let (out, err, failed) = eject_lines(&summary, false);
@@ -166,7 +179,8 @@ mod tests {
             out,
             "stop engine server `tf` (m/tf, pid 7)\n\
              kept engine server `busy` (m/busy): a running dispatch holds it\n\
-             stopped 1 engine server(s), kept 1 a running dispatch holds, 1 FAILED to stop\n"
+             skipped engine server `gone` (m/gone): it was no longer running as darkmux's\n\
+             stopped 1 engine server(s), kept 1 a running dispatch holds, skipped 1, 1 FAILED to stop\n"
         );
         assert_eq!(err, "darkmux: ⚠ could not stop engine server `stuck` — boom\n");
         assert!(failed);

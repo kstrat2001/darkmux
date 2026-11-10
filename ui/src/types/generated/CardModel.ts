@@ -15,8 +15,9 @@ n_ctx: number | null, endpoint_kind: CardEndpointKind,
  * (#3450) Whether darkmux can make this model resident on this machine,
  * as `darkmux profile list --json` states it for a local one. The
  * serving machine lists it behind the card (every
- * [`CARD_AVAILABILITY_TTL`]), so it can be that much older than the
- * card. Absent until a listing has answered, and on a card before 1.4:
- * not stated, never guessed.
+ * [`CARD_AVAILABILITY_TTL`]), so it can be up to
+ * [`CARD_AVAILABILITY_MAX_AGE`] older than the card. Absent until a
+ * listing has answered, when the last one is older than that, and on a
+ * card before 1.4: not stated, never guessed.
  */
 availability?: Availability, };

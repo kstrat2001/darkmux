@@ -299,8 +299,11 @@ pub struct EngineServer {
     pub answering: bool,
 }
 
-/// How long a listing waits for a server to answer `GET /v1/models`.
-const LISTING_ANSWER_BOUND: Duration = Duration::from_secs(1);
+/// How long a listing waits for a server to answer `GET /v1/models`. Every
+/// server is asked at the same time, so a listing waits about this long
+/// however many servers run: well inside the 2 s a peer gives a machine card,
+/// whose specs come from the same read.
+const LISTING_ANSWER_BOUND: Duration = Duration::from_millis(400);
 
 /// The model name darkmux's server `rec` answers to: `flint` for rec's (it
 /// has no `--name`, #3453), else the `--name` it was started under.
@@ -313,16 +316,26 @@ pub fn served_name(rec: &EngineRecord) -> String {
 
 /// (#3450) darkmux's servers running now, by endpoint id. Read only, like
 /// [`running_now`]: a stale record is left for a dispatch to clear, and an
-/// unreadable one claims nothing.
+/// unreadable one claims nothing. Whether each answers is asked of all of
+/// them at once, within [`LISTING_ANSWER_BOUND`].
 pub fn listed(dirs: &Dirs) -> Vec<EngineServer> {
-    let mut out: Vec<EngineServer> = engine_record::list_in(&dirs.records)
-        .0
-        .into_iter()
-        .filter(alive)
-        .map(|rec| {
-            let served_name = served_name(&rec);
-            EngineServer {
-                answering: answers_within(rec.port, &served_name, LISTING_ANSWER_BOUND),
+    let live: Vec<EngineRecord> = engine_record::list_in(&dirs.records).0.into_iter().filter(alive).collect();
+    let mut out: Vec<EngineServer> = std::thread::scope(|scope| {
+        let asked: Vec<_> = live
+            .into_iter()
+            .map(|rec| {
+                let served_name = served_name(&rec);
+                let probe = {
+                    let name = served_name.clone();
+                    scope.spawn(move || answers_within(rec.port, &name, LISTING_ANSWER_BOUND))
+                };
+                (rec, served_name, probe)
+            })
+            .collect();
+        asked
+            .into_iter()
+            .map(|(rec, served_name, probe)| EngineServer {
+                answering: probe.join().unwrap_or(false),
                 endpoint: rec.endpoint,
                 engine: rec.engine,
                 model: rec.model,
@@ -331,9 +344,9 @@ pub fn listed(dirs: &Dirs) -> Vec<EngineServer> {
                 port: rec.port,
                 pid: rec.pid,
                 started_at_ms: rec.started_at_ms,
-            }
-        })
-        .collect();
+            })
+            .collect()
+    });
     out.sort_by(|a, b| a.endpoint.cmp(&b.endpoint));
     out
 }
@@ -568,19 +581,36 @@ fn log_tail(log: &Path) -> String {
 /// Stop darkmux's server `rec`, taking the endpoint's lock.
 pub fn stop(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds) -> Result<(), ServerError> {
     let _lock = lock_for_stop(dirs, rec)?;
-    stop_locked(dirs, rec, bounds)
+    stop_locked(dirs, rec, bounds).map(|_| ())
 }
 
 /// Stop darkmux's server `rec` to make room, unless `held` says a running
 /// dispatch uses it, asked under the endpoint's lock so a dispatch that took
 /// it up since the caller looked is seen. `Ok(false)`: held, left running.
 pub fn stop_unless_held(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds, held: Held<'_>) -> Result<bool, ServerError> {
+    stop_if_idle(dirs, rec, bounds, held).map(|o| o != StopOutcome::Held)
+}
+
+/// (#3450) What [`stop_if_idle`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopOutcome {
+    /// darkmux's server was signaled and is gone.
+    Stopped,
+    /// A running dispatch holds it: left running.
+    Held,
+    /// Nothing was signaled: the record no longer matched a live process of
+    /// darkmux's (it exited, or another process holds its pid or port). The
+    /// stale record is removed.
+    NotRunning,
+}
+
+/// [`stop_unless_held`], saying which of the three it was.
+pub fn stop_if_idle(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds, held: Held<'_>) -> Result<StopOutcome, ServerError> {
     let _lock = lock_for_stop(dirs, rec)?;
     if held(rec) {
-        return Ok(false);
+        return Ok(StopOutcome::Held);
     }
-    stop_locked(dirs, rec, bounds)?;
-    Ok(true)
+    Ok(if stop_locked(dirs, rec, bounds)? { StopOutcome::Stopped } else { StopOutcome::NotRunning })
 }
 
 fn lock_for_stop(dirs: &Dirs, rec: &EngineRecord) -> Result<darkmux_types::flock::FlockGuard, ServerError> {
@@ -591,8 +621,9 @@ fn lock_for_stop(dirs: &Dirs, rec: &EngineRecord) -> Result<darkmux_types::flock
 
 /// [`stop`] with the lock already held. Signals only a process the record
 /// still matches, or the workers its exited server left on the port
-/// ([`left_workers`]); a stale record is then removed.
-fn stop_locked(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds) -> Result<(), ServerError> {
+/// ([`left_workers`]); a stale record is then removed. `true` when anything
+/// was signaled.
+fn stop_locked(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds) -> Result<bool, ServerError> {
     use darkmux_types::child_registry::{SIGKILL, SIGTERM};
     let failed = |detail: String| ServerError::StopFailed { endpoint: rec.endpoint.clone(), pid: rec.pid, detail };
     let mut signaled = false;
@@ -627,7 +658,7 @@ fn stop_locked(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds) -> Result<(), Se
         port_closed_within(rec.port, bounds);
     }
     let _ = engine_record::remove_if_in(&dirs.records, rec);
-    Ok(())
+    Ok(signaled)
 }
 
 /// Wait up to the stop grace for nothing to accept connections on `port`.
@@ -1586,5 +1617,24 @@ S(("127.0.0.1", port), H).serve_forever()
         assert_eq!(serving(&f.dirs, &model("m/a", "tf")).map(|r| r.pid), Some(live.0.id()));
         assert_eq!(serving(&f.dirs, &model("m/b", "tf")), None, "another model on the endpoint");
         assert_eq!(serving(&f.dirs, &model("m/a", "other")), None, "another endpoint");
+    }
+
+    /// (#3450 review) A stop says whether it stopped anything: a server it
+    /// stopped, one a running dispatch holds, and a record whose process is
+    /// gone (nothing signaled) are three answers, never all "stopped".
+    #[test]
+    fn a_stop_says_whether_it_stopped_held_or_found_nothing() {
+        let f = fixture();
+        let live = Reaped({
+            let mut c = Command::new("sleep");
+            c.arg("30");
+            std::os::unix::process::CommandExt::process_group(&mut c, 0);
+            c.spawn().unwrap()
+        });
+        let rec = record_of(&f, "tf", "tensorfold", live.0.id(), free_port(), &[]);
+        engine_record::write_in(&f.dirs.records, &rec).unwrap();
+        assert_eq!(stop_if_idle(&f.dirs, &rec, quick(), &|_| true), Ok(StopOutcome::Held));
+        assert_eq!(stop_if_idle(&f.dirs, &rec, quick(), &not_held), Ok(StopOutcome::Stopped));
+        assert_eq!(stop_if_idle(&f.dirs, &rec, quick(), &not_held), Ok(StopOutcome::NotRunning), "nothing left to signal");
     }
 }

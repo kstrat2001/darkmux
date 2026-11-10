@@ -27,10 +27,10 @@ describe("engine server words (#3450)", () => {
     expect(serverStateWord(server())).toBe("resident");
   });
 
-  it("puts a server still starting first, then the resident ones, by short name, and nothing for none", () => {
+  it("leads with counts a narrow card cannot cut off, then the names, starting ones first", () => {
     const flint = server({ endpoint: "flint", engine: "flint", model: "flint-int4", served_name: "flint", answering: false });
-    expect(serversLine([server(), flint])).toBe("starting the model flint-int4 · resident Qwen3.8-27B");
-    expect(serversLine([server()])).toBe("resident Qwen3.8-27B");
+    expect(serversLine([server(), flint])).toBe("2 servers · 1 starting · flint-int4, Qwen3.8-27B");
+    expect(serversLine([server()])).toBe("1 server · Qwen3.8-27B");
     expect(serversLine([])).toBe("");
     expect(serversLine(undefined)).toBe("");
     expect(serversTitle([server(), flint])).toBe(

@@ -1075,6 +1075,11 @@
 
     impl RecordedServer {
         pub(crate) fn start(endpoint: &str, engine: &str, model: &str, n_ctx: u32) -> Self {
+            Self::start_on(endpoint, engine, model, n_ctx, 1)
+        }
+
+        /// [`RecordedServer::start`], recorded on `port`.
+        pub(crate) fn start_on(endpoint: &str, engine: &str, model: &str, n_ctx: u32, port: u16) -> Self {
             let mut cmd = std::process::Command::new("sleep");
             cmd.arg("30");
             std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
@@ -1091,7 +1096,7 @@
                 engine: engine.into(),
                 model: model.into(),
                 n_ctx,
-                port: 1,
+                port,
                 pid: child.id(),
                 start_stamp: stamp,
                 owner_pid: std::process::id(),
@@ -1132,6 +1137,30 @@
         assert_eq!(status.engine_servers[0].served_name, "darkmux:TensorFold/q38");
         let specs = gather_specs_from(read);
         assert_eq!(specs.engine_servers.len(), 1);
+    }
+
+    /// (#3450 review) A peer reads this machine's card within
+    /// `PEER_CARD_TIMEOUT` (2 s), and the card's specs come from the one
+    /// residents read: asking each of darkmux's servers whether it answers
+    /// must not add up per server. Three servers that accept a connection and
+    /// never answer still leave the read well inside the peer's timeout.
+    #[test]
+    #[serial_test::serial]
+    fn a_card_read_with_silent_servers_returns_well_inside_a_peers_timeout() {
+        let _home = CrewDirGuard::new();
+        let tmp = TempDir::new().unwrap();
+        let silent: Vec<std::net::TcpListener> = (0..3).map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap()).collect();
+        let _servers: Vec<RecordedServer> = silent
+            .iter()
+            .enumerate()
+            .map(|(i, l)| RecordedServer::start_on(&format!("tf{i}"), "tensorfold", "TensorFold/q38", 8192, l.local_addr().unwrap().port()))
+            .collect();
+        let started = std::time::Instant::now();
+        let specs = with_lms_bin(&tmp.path().join("no-such-lms"), || gather_specs_from(ResidentsRead::now()));
+        let took = started.elapsed();
+        assert_eq!(specs.engine_servers.len(), 3);
+        assert!(specs.engine_servers.iter().all(|s| !s.answering), "a silent server is not answering");
+        assert!(took < std::time::Duration::from_secs(1), "the read took {took:?} with 3 silent servers");
     }
 
     /// Run `f` with each `(var, value)` set (`None` removes it), restoring after.
