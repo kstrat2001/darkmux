@@ -44,6 +44,9 @@ fn run_verb(sub: ClientCmd, here: &Here, input: &mut dyn BufRead, out: &mut dyn 
         ClientCmd::List => list_to(&here.store, here.now, &here.policy, out),
         ClientCmd::Claim { workspace, client } => claim(here, &workspace, &client, out, err),
         ClientCmd::Revoke { name } => revoke(here, &name, out, err),
+        ClientCmd::Workspace { sub: crate::cli::ClientWorkspaceCmd::Rm { name, force } } => {
+            remove_workspace(here, &name, force, out, err)
+        }
         ClientCmd::Serve { .. } => anyhow::bail!("`client serve` listens; it is not run as a verb here"),
     }
 }
@@ -56,6 +59,33 @@ fn revoke(here: &Here, name: &str, out: &mut dyn Write, err: &mut dyn Write) -> 
     }
     writeln!(err, "no paired client named {name} (see `darkmux client list`)")?;
     Ok(1)
+}
+
+/// `client workspace rm <name> [--force]`: a workspace darkmux made for a
+/// paired app, whoever owns it (or no one), removed with what darkmux made
+/// for it. A run, an Undo or a live preview in it (in `client serve`, which
+/// holds its name while it uses it) refuses it.
+fn remove_workspace(here: &Here, name: &str, force: bool, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32> {
+    use darkmux_serve::client_workspace as ws;
+    let base = match here.base.canonicalize() {
+        Ok(b) => b,
+        Err(e) => return writeln!(err, "no workspaces under {}: {e}", here.base.display()).map(|()| 1).map_err(Into::into),
+    };
+    match ws::remove_workspace_within(&base, name, force, std::time::Duration::ZERO) {
+        Ok(r) => {
+            let branch = match (&r.branch, r.branch_removed) {
+                (Some(b), true) => format!("; branch {b} removed"),
+                (Some(b), false) if b.starts_with("mux/") => format!(
+                    "; branch {b} kept (no other branch holds its commits: `--force` removes it)"
+                ),
+                (Some(b), false) => format!("; branch {b} left as it is"),
+                (None, _) => String::new(),
+            };
+            writeln!(out, "removed {} workspace {name}{branch}", r.kind.word())?;
+            Ok(0)
+        }
+        Err(e) => writeln!(err, "{e}").map(|()| 1).map_err(Into::into),
+    }
 }
 
 /// `client claim <workspace> <client>`.

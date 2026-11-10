@@ -99,15 +99,22 @@ pub fn valid_ref(r: &str) -> bool {
 /// repo's name is taken by another checkout, each cut short enough that a
 /// numbered fallback still fits.
 pub fn name_for(normalized: &str, taken: impl Fn(&str) -> bool) -> Option<String> {
+    name_candidates(normalized).into_iter().find(|n| valid_name(n) && !taken(n))
+}
+
+/// Every name [`name_for`] may give a new workspace of `normalized`, in
+/// the order it tries them.
+pub fn name_candidates(normalized: &str) -> Vec<String> {
     let mut parts = normalized.rsplit('/');
-    let repo = parts.next()?.to_ascii_lowercase();
-    let owner = parts.next()?.to_ascii_lowercase();
+    let (Some(repo), Some(owner)) = (parts.next(), parts.next()) else {
+        return Vec::new();
+    };
     let cut = |s: String| -> String { s.chars().take(MAX_NAME_LEN - NAME_SUFFIX_LEN).collect() };
-    let both = cut(format!("{owner}-{repo}"));
-    [cut(repo), both.clone()]
+    let both = cut(format!("{}-{}", owner.to_ascii_lowercase(), repo.to_ascii_lowercase()));
+    [cut(repo.to_ascii_lowercase()), both.clone()]
         .into_iter()
         .chain((2..100).map(|n| format!("{both}-{n}")))
-        .find(|n| valid_name(n) && !taken(n))
+        .collect()
 }
 
 fn git_out(wd: &Path, args: &[&str]) -> Option<String> {
@@ -162,29 +169,34 @@ pub struct BotName<'a> {
     pub exact: &'a str,
 }
 
-/// Whether workspace `name` (on branch `branch`) is `bot`'s: on one of its
-/// branches ([`is_bot_branch`]), and recorded for its exact name. A
-/// workspace from before the exact name was recorded goes by its branch.
-fn is_bots(base: &Path, name: &str, branch: &str, bot: BotName) -> bool {
-    is_bot_branch(branch, bot.slug) && bot_of(base, name).is_none_or(|b| b == bot.exact)
+/// The workspaces darkmux holds a repository for that its records alone
+/// could give paired client `client`'s bot `bot`: recorded for that client,
+/// and for that bot's exact name (or for none, from before the name was
+/// recorded). Read from the records beside each workspace, so no git runs
+/// in another bot's or another app's workspace while looking for one to
+/// reuse.
+fn held_for(base: &Path, bot: BotName, client: &str) -> Vec<(String, crate::client_git::WorkCopy)> {
+    held_workspaces(base)
+        .into_iter()
+        .filter(|(n, _)| owner_of(base, n).as_deref() == Some(client))
+        .filter(|(n, _)| bot_of(base, n).is_none_or(|b| b == bot.exact))
+        .collect()
 }
 
 /// Bot `bot`'s clone of the repo whose origin is `normalized`, among the
 /// workspaces darkmux holds a repository for, that paired client `client`
-/// may be handed ([`pick_for`]): one it owns, this bot's ([`is_bots`]), and a
-/// clone, never a worktree of a checkout (whose admin dir reads that
-/// checkout's `origin` too).
+/// may be handed: one it owns, this bot's (by its records, then on one of
+/// its branches, [`is_bot_branch`]), and a clone, never a worktree of a
+/// checkout (whose admin dir reads that checkout's `origin` too).
 pub fn find_by_origin(base: &Path, normalized: &str, bot: BotName, client: &str) -> Option<String> {
-    let names = held_workspaces(base)
+    held_for(base, bot, client)
         .into_iter()
-        .filter(|(n, wc)| {
+        .find(|(_, wc)| {
             origin_of(wc).as_deref() == Some(normalized)
                 && crate::client_git::common_of(&wc.git_dir).as_ref() == Some(&wc.git_dir)
-                && status_of(wc).is_some_and(|(branch, _)| is_bots(base, n, &branch, bot))
+                && status_of(wc).is_some_and(|(branch, _)| is_bot_branch(&branch, bot.slug))
         })
         .map(|(n, _)| n)
-        .collect();
-    pick_for(base, names, client)
 }
 
 /// Branch (empty when detached) and short head (empty while the branch has
@@ -614,19 +626,17 @@ pub fn common_dir(dir: &Path) -> Option<PathBuf> {
 }
 
 /// The workspace under `base` that is a worktree of the repo whose shared
-/// `.git` is `common`, this bot's ([`is_bots`]), judged by the repository
-/// darkmux recorded for it (never its own `.git`), that paired client
-/// `client` may be handed ([`pick_for`]).
+/// `.git` is `common`, judged by the repository darkmux recorded for it
+/// (never its own `.git`), that paired client `client`'s bot `bot` may be
+/// handed: by its records ([`held_for`]), then on one of the bot's branches.
 pub fn find_worktree_of(base: &Path, common: &Path, bot: BotName, client: &str) -> Option<String> {
-    let names = held_workspaces(base)
+    held_for(base, bot, client)
         .into_iter()
-        .filter(|(n, wc)| {
+        .find(|(_, wc)| {
             crate::client_git::common_of(&wc.git_dir).as_deref() == Some(common)
-                && status_of(wc).is_some_and(|(branch, _)| is_bots(base, n, &branch, bot))
+                && status_of(wc).is_some_and(|(branch, _)| is_bot_branch(&branch, bot.slug))
         })
         .map(|(n, _)| n)
-        .collect();
-    pick_for(base, names, client)
 }
 
 /// How many hex digits follow `mux/<bot>-` in a bot's branch name.
@@ -912,12 +922,6 @@ pub fn owner_of(base: &Path, name: &str) -> Option<String> {
     Some(text.trim_end_matches('\n').to_string()).filter(|t| !t.is_empty())
 }
 
-/// The first of `names` that paired client `client` owns. Another client's,
-/// or one no client owns, never.
-fn pick_for(base: &Path, names: Vec<String>, client: &str) -> Option<String> {
-    names.into_iter().find(|n| owner_of(base, n).as_deref() == Some(client))
-}
-
 /// The workspaces under `base` darkmux holds a repository for (made for a
 /// paired app), by name, sorted, with the client id each is recorded for.
 pub fn held_owners(base: &Path) -> Vec<(String, Option<String>)> {
@@ -966,6 +970,433 @@ pub fn own_checkout_of(base: &Path, name: &str, dir: &Path) -> Result<PathBuf, C
         )));
     }
     Ok(source)
+}
+
+// ─── Holding a workspace's name ──────────────────────────────────────────
+
+/// Where workspace `name`'s lock lives: beside it, like its records.
+fn lock_record(base: &Path, name: &str) -> PathBuf {
+    base.join(format!(".{name}.lock"))
+}
+
+/// How a workspace's name is held ([`try_hold`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hold {
+    /// Making a workspace under the name, or removing it: nothing else uses
+    /// the name meanwhile.
+    Sole,
+    /// Using the workspace as it is (a reuse and its fetch, a run, an Undo,
+    /// a live preview): any number at once, never while it is made or
+    /// removed.
+    Shared,
+}
+
+/// A hold on one workspace name, for every darkmux process on this machine
+/// (`client serve` and `darkmux client workspace rm`): an `flock` on
+/// `.<name>.lock` beside the workspace. Let go when dropped. One name's
+/// hold never waits on another's, so a ten-minute clone holds up only its
+/// own name.
+#[derive(Debug)]
+pub struct NameHold {
+    _file: std::fs::File,
+    path: PathBuf,
+}
+
+impl NameHold {
+    /// Removes the lock file, then lets go: for a name whose workspace is
+    /// gone, or was never made. A holder that opened the old file meanwhile
+    /// finds it is no longer the one at the path and looks again
+    /// ([`try_hold`]).
+    pub fn forget(self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Holds workspace `name`'s name `how`, without waiting: `Ok(None)` when it
+/// is held in a way that excludes `how` (a [`Hold::Sole`] excludes every
+/// other hold). The lock file is opened without following a link.
+pub fn try_hold(base: &Path, name: &str, how: Hold) -> Result<Option<NameHold>, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    if !valid_name(name) {
+        return Err(format!("{name:?} is not a workspace name"));
+    }
+    let path = lock_record(base, name);
+    let op = match how {
+        Hold::Sole => libc::LOCK_EX,
+        Hold::Shared => libc::LOCK_SH,
+    };
+    // Each look that loses to a removal ([`NameHold::forget`]) finds a new
+    // file; a few are plenty.
+    for _ in 0..8 {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|e| format!("opening {}: {e}", path.display()))?;
+        if unsafe { libc::flock(file.as_raw_fd(), op | libc::LOCK_NB) } != 0 {
+            let e = std::io::Error::last_os_error();
+            return match e.kind() {
+                std::io::ErrorKind::WouldBlock => Ok(None),
+                _ => Err(format!("locking {}: {e}", path.display())),
+            };
+        }
+        if is_file_at(&file, &path)? {
+            return Ok(Some(NameHold { _file: file, path }));
+        }
+    }
+    Err(format!("{} kept being replaced while darkmux locked it", path.display()))
+}
+
+/// Whether `file` is the file now at `path` (not one removed or replaced
+/// since it was opened; a path with no file is not it either).
+fn is_file_at(file: &std::fs::File, path: &Path) -> Result<bool, String> {
+    use std::os::unix::fs::MetadataExt;
+    let held = file.metadata().map_err(|e| format!("reading {}: {e}", path.display()))?;
+    match std::fs::symlink_metadata(path) {
+        Ok(there) => Ok((held.dev(), held.ino()) == (there.dev(), there.ino())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("reading {}: {e}", path.display())),
+    }
+}
+
+/// The first of `names` that is free under `base` (`taken` says it is not)
+/// and that this request now holds [`Hold::Sole`], looked at again once
+/// held, so two requests never make a workspace under one name. A name
+/// another request holds is passed over, never waited for.
+pub fn hold_free_name(
+    base: &Path,
+    names: impl IntoIterator<Item = String>,
+    taken: impl Fn(&str) -> bool,
+) -> Result<Option<(String, NameHold)>, String> {
+    for name in names {
+        if !valid_name(&name) || taken(&name) {
+            continue;
+        }
+        let Some(held) = try_hold(base, &name, Hold::Sole)? else { continue };
+        if taken(&name) {
+            continue;
+        }
+        return Ok(Some((name, held)));
+    }
+    Ok(None)
+}
+
+/// One request at a time for each thing a workspace is asked for (a bot's
+/// clone of one repo, its worktree of one checkout), so two asked at once
+/// make one workspace: the second waits for the first, then reuses what it
+/// made. Asks for different things never wait on each other. In `client
+/// serve`'s memory: it is the one process that makes workspaces.
+#[derive(Debug, Default)]
+pub struct Asks {
+    held: std::sync::Mutex<std::collections::HashSet<String>>,
+    freed: std::sync::Condvar,
+}
+
+/// One [`Asks`] key, held until dropped.
+pub struct AskHold<'a> {
+    asks: &'a Asks,
+    key: String,
+}
+
+impl Asks {
+    /// Waits until no other request holds `key`, then holds it.
+    pub fn hold(&self, key: String) -> AskHold<'_> {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        while held.contains(&key) {
+            held = self.freed.wait(held).unwrap_or_else(|e| e.into_inner());
+        }
+        held.insert(key.clone());
+        AskHold { asks: self, key }
+    }
+}
+
+impl Drop for AskHold<'_> {
+    fn drop(&mut self) {
+        self.asks.held.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.key);
+        self.asks.freed.notify_all();
+    }
+}
+
+// ─── Ending a workspace ──────────────────────────────────────────────────
+
+/// Removes what a clone a killed `client serve` left half done: each
+/// `.<name>.partial` under `base` (it counts its name as taken, so it
+/// would hold that name for good), and the repository it was cloning into
+/// when no workspace of that name holds it. One a request holds now is in
+/// progress, and left. Run as `client serve` starts. Returns the names.
+pub fn sweep_partials(base: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return Vec::new();
+    };
+    let mut swept: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            let file = e.file_name().into_string().ok()?;
+            let name = file.strip_prefix('.')?.strip_suffix(".partial")?.to_string();
+            valid_name(&name).then_some(name)
+        })
+        .filter(|name| sweep_partial(base, name))
+        .collect();
+    swept.sort();
+    swept
+}
+
+/// [`sweep_partials`] for one name; whether it removed anything.
+fn sweep_partial(base: &Path, name: &str) -> bool {
+    let Ok(Some(held)) = try_hold(base, name, Hold::Sole) else {
+        return false;
+    };
+    if remove_entry(&base.join(format!(".{name}.partial"))).is_err() {
+        return false;
+    }
+    if std::fs::symlink_metadata(base.join(name)).is_err() {
+        let _ = remove_entry(&crate::client_git::clone_git_dir(base, name));
+        held.forget();
+    }
+    true
+}
+
+/// Removes `path` without following a link: a link or a file is unlinked;
+/// a directory is removed with what it holds, whose links are unlinked,
+/// never followed. Nothing there is fine.
+fn remove_entry(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(path),
+        Ok(_) => std::fs::remove_file(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// What a workspace darkmux made is, read from where it keeps its
+/// repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceKind {
+    /// A clone of a repo, its repository `.<name>.git` beside it.
+    Clone,
+    /// A project made from a template (a clone started over), likewise.
+    Template,
+    /// A worktree of the user's own checkout, its repository that
+    /// checkout's admin directory for it.
+    Worktree,
+}
+
+impl WorkspaceKind {
+    /// Its wire spelling.
+    pub fn word(self) -> &'static str {
+        match self {
+            WorkspaceKind::Clone => "clone",
+            WorkspaceKind::Template => "template",
+            WorkspaceKind::Worktree => "worktree",
+        }
+    }
+}
+
+/// What removing a workspace did ([`remove_workspace`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Removal {
+    pub kind: WorkspaceKind,
+    /// The branch it was on (none when detached).
+    pub branch: Option<String>,
+    /// Whether that branch is gone: a clone's or a template project's goes
+    /// with its repository; a worktree's `mux/` branch in the user's
+    /// checkout only once merged, or when forced; a branch of the user's
+    /// never.
+    pub branch_removed: bool,
+}
+
+/// Removes workspace `name`, one darkmux made under `base` (it holds its
+/// repository), and everything darkmux made for it: the folder, the
+/// records beside it, a clone's repository, a worktree's admin directory
+/// in the user's checkout (`git worktree remove`) and its `mux/` branch
+/// there once merged into another branch or when `force` is set. A clone's
+/// (or template project's) branch lives only in its own repository, so
+/// one holding commits nothing else holds is removed only with `force`.
+/// A branch of the user's is never touched. Refused (`conflict`) while
+/// anything holds the name ([`Hold`]): a run, an Undo, a live preview, a
+/// workspace request; a hold let go within `wait` is waited for. Nothing
+/// is followed through a link. The caller checks who may remove it.
+pub fn remove_workspace_within(base: &Path, name: &str, force: bool, wait: Duration) -> Result<Removal, Coded> {
+    let dir = base.join(name);
+    let wc = removable(base, name, &dir)?;
+    let held = hold_alone_within(base, name, wait)?;
+    // Held now: look again, in case it went meanwhile.
+    let wc = removable(base, name, &dir).map(|_| wc)?;
+    let kind = kind_of(base, name, &wc)?;
+    let branch = status_of(&wc).map(|(b, _)| b).filter(|b| !b.is_empty());
+    let branch_removed = match kind {
+        WorkspaceKind::Clone | WorkspaceKind::Template => {
+            refuse_unsaved(base, name, kind, &wc, force)?;
+            remove_cloned(base, name, &dir).map(|()| branch.is_some())
+        }
+        WorkspaceKind::Worktree => remove_worktree_of(&wc, &dir, branch.as_deref(), force),
+    }
+    .map_err(|e| Coded::new(ClientCode::Internal, format!("removing workspace {name}: {e}")))?;
+    forget_records(base, name);
+    held.forget();
+    Ok(Removal { kind, branch, branch_removed })
+}
+
+/// Holds `name` alone ([`Hold::Sole`]), looking again until `wait` has
+/// passed; a `conflict` naming what may hold it when it stays held.
+fn hold_alone_within(base: &Path, name: &str, wait: Duration) -> Result<NameHold, Coded> {
+    let until = Instant::now() + wait;
+    loop {
+        match try_hold(base, name, Hold::Sole) {
+            Ok(Some(held)) => return Ok(held),
+            Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                return Err(Coded::new(
+                    ClientCode::Conflict,
+                    format!(
+                        "workspace {name} is in use (a run, an Undo, a live preview, or a request making or \
+                         reusing it); stop it or wait, then remove it"
+                    ),
+                ))
+            }
+            Err(e) => return Err(Coded::new(ClientCode::Internal, e)),
+        }
+    }
+}
+
+/// Workspace `name` at `dir` as removal sees it: a folder (never a link)
+/// whose repository darkmux holds; a 404 when there is none, a 403 for a
+/// folder darkmux did not make.
+fn removable(base: &Path, name: &str, dir: &Path) -> Result<crate::client_git::WorkCopy, Coded> {
+    if !valid_name(name) {
+        return Err(Coded::new(ClientCode::BadRequest, format!("{name:?} is not a workspace name")));
+    }
+    let not_ours = || {
+        Coded::new(
+            ClientCode::Forbidden,
+            format!("{name} is not a workspace darkmux made for an app; darkmux removes only those"),
+        )
+    };
+    match std::fs::symlink_metadata(dir) {
+        Err(_) => Err(Coded::new(ClientCode::NotFound, format!("no workspace named {name}"))),
+        Ok(m) if !m.is_dir() => Err(not_ours()),
+        Ok(_) => crate::client_git::work_copy_of(base, name, dir).ok_or_else(not_ours),
+    }
+}
+
+/// What workspace `name` is, from the repository darkmux recorded for it:
+/// the clone directory beside it (a template project when its first commit
+/// is recorded), or an admin directory under a checkout's
+/// `.git/worktrees/`. Anything else is refused.
+fn kind_of(base: &Path, name: &str, wc: &crate::client_git::WorkCopy) -> Result<WorkspaceKind, Coded> {
+    let common = crate::client_git::common_of(&wc.git_dir);
+    let cloned = crate::client_git::clone_git_dir(base, name).canonicalize().ok();
+    if common.as_ref() == Some(&wc.git_dir) && cloned.as_ref() == Some(&wc.git_dir) {
+        return Ok(match template_commit_of(base, name) {
+            Some(_) => WorkspaceKind::Template,
+            None => WorkspaceKind::Clone,
+        });
+    }
+    if common.is_some_and(|c| wc.git_dir.parent() == Some(c.join("worktrees").as_path())) {
+        return Ok(WorkspaceKind::Worktree);
+    }
+    Err(Coded::new(
+        ClientCode::Forbidden,
+        format!("darkmux does not recognize where workspace {name}'s repository is; refusing to remove it"),
+    ))
+}
+
+/// Refuses to remove a clone (or template project) whose repository holds
+/// commits nothing else does, unless `force`: for a clone, a `HEAD` no
+/// remote-tracking branch contains; for a template project, any commit
+/// after the first, darkmux's own.
+fn refuse_unsaved(
+    base: &Path,
+    name: &str,
+    kind: WorkspaceKind,
+    wc: &crate::client_git::WorkCopy,
+    force: bool,
+) -> Result<(), Coded> {
+    use crate::client_git::line;
+    if force {
+        return Ok(());
+    }
+    let Some(head) = line(wc, &["rev-parse", "--verify", "--quiet", "HEAD"]) else {
+        return Ok(());
+    };
+    let saved = match kind {
+        WorkspaceKind::Template => template_commit_of(base, name).is_some_and(|first| first == head),
+        _ => line(wc, &["for-each-ref", "--count=1", "--contains", &head, "--format=%(refname)", "refs/remotes/"])
+            .is_some_and(|r| !r.is_empty()),
+    };
+    if saved {
+        return Ok(());
+    }
+    Err(Coded::new(
+        ClientCode::UnsavedCommits,
+        format!(
+            "workspace {name} holds commits that are nowhere else (its {} would go with it); save them \
+             (a PR, a backup), then remove it with force",
+            if kind == WorkspaceKind::Template { "project's history" } else { "branch" }
+        ),
+    ))
+}
+
+/// Removes a clone's folder, then its repository beside it.
+fn remove_cloned(base: &Path, name: &str, dir: &Path) -> std::io::Result<()> {
+    remove_entry(dir)?;
+    remove_entry(&crate::client_git::clone_git_dir(base, name))
+}
+
+/// Removes a worktree of the user's checkout: `git worktree remove` there,
+/// or, when git refuses (a run replaced the worktree's `.git`), its folder
+/// and its admin directory by hand. Then its branch, when that is a `mux/`
+/// branch another branch holds, or `force`. Returns whether the branch went.
+fn remove_worktree_of(
+    wc: &crate::client_git::WorkCopy,
+    dir: &Path,
+    branch: Option<&str>,
+    force: bool,
+) -> std::io::Result<bool> {
+    let Some(common) = wc.git_dir.parent().and_then(Path::parent).map(Path::to_path_buf) else {
+        return Ok(false);
+    };
+    let git = darkmux_types::host_git::HostGit::held_git_dir(&common);
+    let removed = git
+        .command(&["worktree".as_ref(), "remove".as_ref(), "--force".as_ref(), dir.as_os_str()])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !removed {
+        remove_entry(dir)?;
+        remove_entry(&wc.git_dir)?;
+    }
+    let Some(branch) = branch.filter(|b| b.starts_with("mux/")) else {
+        return Ok(false);
+    };
+    if !force && !held_elsewhere(&git, branch) {
+        return Ok(false);
+    }
+    let deleted = git.command(&["branch", "-D", "--", branch]).stdin(std::process::Stdio::null()).output();
+    Ok(deleted.is_ok_and(|o| o.status.success()))
+}
+
+/// Whether `branch`'s commits are held by a branch other than darkmux's
+/// own `mux/` ones (merged into one of the user's, or a remote-tracking
+/// one).
+fn held_elsewhere(git: &darkmux_types::host_git::HostGit, branch: &str) -> bool {
+    let tip = format!("refs/heads/{branch}");
+    git.stdout(&["for-each-ref", "--contains", &tip, "--format=%(refname)", "refs/heads/", "refs/remotes/"])
+        .is_some_and(|refs| refs.lines().any(|r| !r.starts_with("refs/heads/mux/")))
+}
+
+/// Forgets every record darkmux keeps beside workspace `name`.
+fn forget_records(base: &Path, name: &str) {
+    forget_source(base, name);
+    forget_bot(base, name);
+    forget_owner(base, name);
+    crate::client_git::forget_git_dir(base, name);
+    let _ = remove_entry(&base.join(format!(".{name}.partial")));
 }
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

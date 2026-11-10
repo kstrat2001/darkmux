@@ -291,7 +291,7 @@ fn harness() -> Harness {
             }
             Ok(())
         }),
-        workspace_lock: Arc::new(Mutex::new(())),
+        workspace_asks: Arc::new(crate::client_workspace::Asks::default()),
         // On the harness's clock, so a test moves idle time by hand.
         previews: Arc::new(
             crate::client_preview::Previews::new(dir.path().join("previews"), emu.clone())
@@ -3523,6 +3523,150 @@ async fn a_clone_left_on_a_users_branch_moves_onto_a_bots_branch_before_a_run() 
 
 async fn changes_of(h: &Harness, token: &str, name: &str) -> (u16, Value) {
     call(h, get(&format!("/client/workspaces/{name}/changes"), &[("authorization", &bearer(token))])).await
+}
+
+// ---- workspace locking: one name at a time, never one for all --------------
+
+/// A clone that waits, for any URL naming `slow`, until the test opens its
+/// gate: (the state cloning that way, a flag set once it is waiting, the
+/// gate).
+fn slow_clone_state(h: &Harness) -> (ClientServerState, Arc<std::sync::atomic::AtomicBool>, Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::AtomicBool;
+    let (waiting, open) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    let (w, o, inner) = (waiting.clone(), open.clone(), h.state.clone_repo.clone());
+    let state = ClientServerState {
+        clone_repo: Arc::new(move |url, r, dest, gd| {
+            if url.contains("slow") {
+                w.store(true, Ordering::SeqCst);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !o.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            inner(url, r, dest, gd)
+        }),
+        ..h.state.clone()
+    };
+    (state, waiting, open)
+}
+
+/// Waits (up to 10 s) for `flag`.
+async fn until_set(flag: &std::sync::atomic::AtomicBool) {
+    for _ in 0..1000 {
+        if flag.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("never set");
+}
+
+/// A clone that takes its time (up to ten minutes, for a big repo) holds
+/// up nobody else: another bot's workspace, a reuse, a template project and
+/// a worktree are all made meanwhile.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_clone_never_holds_up_another_bots_workspace() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (state, waiting, open) = slow_clone_state(&h);
+    let ask = |body: Value| post("/client/workspaces", Some(&token), body);
+    let (code, v) = call_with(state.clone(), ask(serde_json::json!({"repo_url": HCR, "bot": "Quick"}))).await;
+    assert_eq!(code, 201, "{v}");
+    let slow = tokio::spawn(call_with(
+        state.clone(),
+        ask(serde_json::json!({"repo_url": "https://github.com/kstrat2001/slow", "bot": "Slow"})),
+    ));
+    until_set(&waiting).await;
+    let mine = h.dir.path().join("my-site");
+    fixture_repo(&mine);
+    for (body, want) in [
+        (serde_json::json!({"repo_url": HCR, "bot": "Other"}), 201),
+        (serde_json::json!({"repo_url": HCR, "bot": "Quick"}), 200),
+        (serde_json::json!({"repo_url": HCR, "template": true, "bot": "Baker"}), 201),
+        (serde_json::json!({"source_path": mine.to_str(), "bot": "Quick"}), 201),
+    ] {
+        let asked = tokio::time::timeout(std::time::Duration::from_secs(10), call_with(state.clone(), ask(body.clone())));
+        let (code, v) = asked.await.unwrap_or_else(|_| panic!("{body} waited for another bot's clone"));
+        assert_eq!(code, want, "{body}: {v}");
+    }
+    open.store(true, Ordering::SeqCst);
+    let (code, v) = slow.await.unwrap();
+    assert_eq!((code, v["workspace"].as_str()), (201, Some("slow")), "{v}");
+}
+
+/// One bot asking for one repo twice at once gets one workspace: the second
+/// request waits for the first's clone and reuses it, never a second clone.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_bot_asking_twice_at_once_gets_one_workspace() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (state, waiting, open) = slow_clone_state(&h);
+    let body = serde_json::json!({"repo_url": "https://github.com/kstrat2001/slow", "bot": "Slow"});
+    let first = tokio::spawn(call_with(state.clone(), post("/client/workspaces", Some(&token), body.clone())));
+    until_set(&waiting).await;
+    let second = tokio::spawn(call_with(state.clone(), post("/client/workspaces", Some(&token), body)));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!second.is_finished(), "the second waits for the first's clone");
+    open.store(true, Ordering::SeqCst);
+    let ((c1, v1), (c2, v2)) = (first.await.unwrap(), second.await.unwrap());
+    assert_eq!((c1, c2), (201, 200), "{v1} {v2}");
+    assert_eq!(v1["workspace"], v2["workspace"]);
+    assert_eq!(h.cloned.lock().unwrap().len(), 1);
+}
+
+/// Looking for a bot's workspace to reuse runs no git in a workspace its
+/// records give to another bot or another app: there, every git call would
+/// hang (its repository's config is a pipe nobody writes).
+#[tokio::test(flavor = "multi_thread")]
+async fn reuse_runs_no_git_in_another_bots_or_apps_workspace() {
+    let h = harness();
+    let token = paired(&h).await;
+    let ask = |bot: &str| post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR, "bot": bot}));
+    let (code, other) = call(&h, ask("Other")).await;
+    assert_eq!(code, 201, "{other}");
+    let (code, theirs) = call(&h, ask("Theirs")).await;
+    assert_eq!(code, 201, "{theirs}");
+    crate::client_workspace::record_owner(&h.base, theirs["workspace"].as_str().unwrap(), "c-someone-else").unwrap();
+    for v in [&other, &theirs] {
+        let config = crate::client_git::clone_git_dir(&h.base, v["workspace"].as_str().unwrap()).join("config");
+        std::fs::remove_file(&config).unwrap();
+        let fifo = std::ffi::CString::new(config.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    }
+    let made = tokio::time::timeout(std::time::Duration::from_secs(10), call(&h, ask("Mine")));
+    let (code, v) = made.await.expect("git ran in another bot's or app's workspace");
+    assert_eq!(code, 201, "{v}");
+}
+
+/// (measurement, not a check) How long reusing a bot's clone takes with 1
+/// and with 21 workspaces of the repo under the base, 20 of them other
+/// bots'. `cargo nextest run -p darkmux-serve reuse_time --run-ignored only
+/// --no-capture`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn reuse_time_at_1_and_21_workspaces() {
+    let h = harness();
+    let token = paired(&h).await;
+    let ask = |bot: &str| post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR, "bot": bot}));
+    assert_eq!(call(&h, ask("Mine")).await.0, 201);
+    reuse_timed(&h, &token, "1 workspace").await;
+    for n in 0..20 {
+        assert_eq!(call(&h, ask(&format!("Other {n}"))).await.0, 201);
+    }
+    reuse_timed(&h, &token, "21 workspaces").await;
+}
+
+/// Prints the median of five reuses of bot `Mine`'s clone of HCR.
+async fn reuse_timed(h: &Harness, token: &str, label: &str) {
+    let mut took = Vec::new();
+    for _ in 0..5 {
+        let start = std::time::Instant::now();
+        let (code, v) = call(h, post("/client/workspaces", Some(token), serde_json::json!({"repo_url": HCR, "bot": "Mine"}))).await;
+        assert_eq!(code, 200, "{v}");
+        took.push(start.elapsed().as_millis());
+    }
+    took.sort();
+    eprintln!("reuse at {label}: median {} ms (of {took:?})", took[2]);
 }
 
 /// The fixture's clone, but of an empty repository (no commit, so `HEAD`
