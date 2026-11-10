@@ -4130,6 +4130,391 @@ pub(crate) async fn cancel_handler(
     }
 }
 
+// ─── Hand edits ──────────────────────────────────────────────────────────
+
+/// The longest selection a hand edit replaces, and the longest replacement.
+pub const MAX_EDIT_OLD_CHARS: usize = 2_000;
+pub const MAX_EDIT_NEW_CHARS: usize = 10_000;
+/// A tracked file larger than this is not searched (a bundle, a lockfile).
+const MAX_EDIT_FILE_BYTES: u64 = 1024 * 1024;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EditBody {
+    /// The text as the page shows it (whitespace is collapsed for the match).
+    old: String,
+    /// The text the page is to show instead: written as sent, except that
+    /// in a markup file what would read as markup is written as text
+    /// ([`crate::client_edit::as_source`]).
+    new: String,
+}
+
+/// `POST /client/workspaces/{name}/edit` (#3533): a person's own edit to
+/// text they selected in the preview. darkmux finds the one place in the
+/// workspace's tracked files that holds it ([`crate::client_edit`]),
+/// replaces it, and commits the file as a work record with no model (role
+/// `hand-edit`), so `/client/work/{id}/undo` reverts it like a run. Found
+/// zero times or more than once: nothing changes, and the reply says how
+/// many. Not a dispatch: no model runs, so no `dispatch.*` records.
+pub(crate) async fn workspace_edit_handler(
+    State(state): State<ClientServerState>,
+    ClientPath(name): ClientPath<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let client = match authenticate(&state, &headers) {
+        Ok(c) => c,
+        Err(r) => return *r,
+    };
+    let req: EditBody = match json_body(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    let st = state.clone();
+    tokio::task::spawn_blocking(move || hand_edit(&st, &client, &name, &req))
+        .await
+        .unwrap_or_else(|e| internal(anyhow!("edit panicked: {e}")))
+}
+
+/// A hand edit, blocking: checked, the work copy held, the file changed and
+/// committed.
+fn hand_edit(
+    st: &ClientServerState,
+    client: &ApprovedClient,
+    name: &str,
+    req: &EditBody,
+) -> Response {
+    match edit_checked(st, client, name, req) {
+        Ok(reply) => Json(reply).into_response(),
+        Err(r) => *r,
+    }
+}
+
+/// [`hand_edit`] with every refusal an `Err`.
+fn edit_checked(
+    st: &ClientServerState,
+    client: &ApprovedClient,
+    name: &str,
+    req: &EditBody,
+) -> Result<EditReply, Refused> {
+    let old = edit_input(req)?;
+    let dir = owned_workspace(st, client, name)?;
+    let wc = work_copy_for(st, &dir).ok_or_else(|| {
+        refuse(
+            StatusCode::CONFLICT,
+            ClientCode::Conflict,
+            "darkmux holds no repository for this workspace",
+        )
+    })?;
+    // Held until the edit has committed, as a run holds it, so the
+    // workspace cannot be removed under it, by this process or
+    // `client workspace rm`.
+    let _in_use = held_work_copy(st, Some(&wc))?;
+    let work_id = format!("w-{}", random_hex(8).map_err(|e| Box::new(internal(e)))?);
+    let held = hold_for_edit(st, client, &dir, &wc, &work_id, edit_title(&old, &req.new))?;
+    let outcome = edit_in(st, &wc, &old, &req.new, &work_id);
+    held.finish(outcome)
+}
+
+/// A hand edit registered as running in its work copy ([`busy_copy`]), so
+/// no run or Undo starts there while it edits. Dropped without
+/// [`EditHold::finish`] (the edit panicked), its record ends as failed, as
+/// a run's does when its runner panics, so the copy is never held by an
+/// edit that has ended.
+struct EditHold {
+    works: Arc<Mutex<HashMap<String, WorkEntry>>>,
+    now: Arc<dyn Fn() -> u64 + Send + Sync>,
+    id: String,
+    ended: bool,
+}
+
+impl EditHold {
+    /// The edit's work record once [`edit_in`] ended: done with its commit,
+    /// or gone when nothing was edited.
+    fn finish(mut self, outcome: Result<EditDone, Refused>) -> Result<EditReply, Refused> {
+        let now = (self.now)();
+        let mut works = self.works.lock().unwrap();
+        self.ended = true;
+        let done = match outcome {
+            Ok(d) => d,
+            Err(r) => {
+                works.remove(&self.id);
+                return Err(r);
+            }
+        };
+        let reply = EditReply {
+            matches: 1,
+            work_id: Some(self.id.clone()),
+            file: Some(done.file.clone()),
+            commit: Some(short(&done.commit)),
+            branch: Some(done.branch.clone()),
+        };
+        if let Some(e) = works.get_mut(&self.id) {
+            record_edit(e, done, now);
+        }
+        Ok(reply)
+    }
+}
+
+impl Drop for EditHold {
+    fn drop(&mut self) {
+        if self.ended {
+            return;
+        }
+        let now = (self.now)();
+        if let Some(e) = self.works.lock().unwrap().get_mut(&self.id) {
+            e.status = WorkStatus::Error(RunError {
+                reason: "panic".to_string(),
+                error: "the hand edit panicked".to_string(),
+                code: None,
+            });
+            e.finished = Some(now);
+        }
+    }
+}
+
+/// The old text as the page reads it, once the body is checked.
+fn edit_input(req: &EditBody) -> Result<String, Refused> {
+    let old = crate::client_edit::normalize(&req.old);
+    if old.is_empty() || req.old.chars().count() > MAX_EDIT_OLD_CHARS {
+        return Err(refuse(
+            StatusCode::BAD_REQUEST,
+            ClientCode::BadRequest,
+            format!("`old` must hold text, at most {MAX_EDIT_OLD_CHARS} characters"),
+        ));
+    }
+    if req.new.chars().count() > MAX_EDIT_NEW_CHARS || req.new.contains('\0') {
+        return Err(refuse(
+            StatusCode::BAD_REQUEST,
+            ClientCode::BadRequest,
+            format!("`new` must be text, at most {MAX_EDIT_NEW_CHARS} characters"),
+        ));
+    }
+    Ok(old)
+}
+
+/// Registers the edit as running ([`EditHold`]), so no run or Undo starts
+/// in the copy while it edits; refused when one is busy there now.
+fn hold_for_edit(
+    st: &ClientServerState,
+    client: &ApprovedClient,
+    dir: &Path,
+    wc: &WorkCopy,
+    work_id: &str,
+    title: String,
+) -> Result<EditHold, Refused> {
+    let mut works = st.works.lock().unwrap();
+    if st.previews.stopping() {
+        return Err(Box::new(stopping_refusal()));
+    }
+    if let Some(r) = busy_copy(&works, &dir.to_path_buf()) {
+        return Err(r);
+    }
+    works.insert(
+        work_id.to_string(),
+        WorkEntry {
+            client_id: client.id.clone(),
+            created: (st.now)(),
+            finished: None,
+            status: WorkStatus::Running,
+            cancel: Arc::new(CancelFlag::default()),
+            git: Some(wc.clone()),
+            workdir: Some(dir.to_path_buf()),
+            baseline: None,
+            decided: None,
+            undoing: false,
+            continues: None,
+            title,
+            role: "hand-edit".to_string(),
+            commit: None,
+            files: Vec::new(),
+            branch: None,
+            commit_error: None,
+        },
+    );
+    Ok(EditHold { works: st.works.clone(), now: st.now.clone(), id: work_id.to_string(), ended: false })
+}
+
+/// The edit's work record once it landed: done, with its commit.
+fn record_edit(e: &mut WorkEntry, done: EditDone, now: u64) {
+    e.status = WorkStatus::Done {
+        result: serde_json::json!({"hand_edit": {"file": done.file}}),
+        changes: done.changes,
+        changes_error: done.changes_error,
+    };
+    e.finished = Some(now);
+    e.baseline = Some(done.baseline);
+    e.files = vec![done.file];
+    e.commit = Some(done.commit);
+    e.branch = Some(done.branch);
+}
+
+/// What a hand edit that landed did.
+struct EditDone {
+    file: String,
+    commit: String,
+    branch: String,
+    baseline: String,
+    changes: Option<RunChanges>,
+    changes_error: Option<String>,
+}
+
+/// One place `old` was found: the file, the span, and the file's text.
+type EditHit = (String, (usize, usize), String);
+
+/// Where `old` is in the work copy's tracked regular text files, counted up
+/// to two (more than one is already too many).
+fn find_in_tracked(wc: &WorkCopy, old: &str) -> Result<Vec<EditHit>, Refused> {
+    let listing = crate::client_git::run_or_why(wc, None, &["ls-files", "-z"]).map_err(|e| {
+        Box::new(internal(anyhow!(
+            "listing the workspace's files failed: {e}"
+        )))
+    })?;
+    let mut hits: Vec<EditHit> = Vec::new();
+    let paths = String::from_utf8_lossy(&listing.stdout).into_owned();
+    for path in paths.split('\0').filter(|p| !p.is_empty()) {
+        let Some(text) = tracked_text(wc, path) else {
+            continue;
+        };
+        for span in crate::client_edit::find(&text, old, 2 - hits.len()) {
+            hits.push((path.to_string(), span, text.clone()));
+        }
+        if hits.len() >= 2 {
+            break;
+        }
+    }
+    Ok(hits)
+}
+
+/// A tracked file's text: a regular file of at most
+/// [`MAX_EDIT_FILE_BYTES`], read as UTF-8, reached with no link followed at
+/// any name on the way ([`crate::client_preview::at`]).
+fn tracked_text(wc: &WorkCopy, path: &str) -> Option<String> {
+    use std::io::Read;
+    let (file, _) = crate::client_preview::at::open_regular(&wc.work_tree, path).ok()?;
+    if file.metadata().ok()?.len() > MAX_EDIT_FILE_BYTES {
+        return None;
+    }
+    let mut text = String::new();
+    file.take(MAX_EDIT_FILE_BYTES + 1).read_to_string(&mut text).ok()?;
+    (text.len() as u64 <= MAX_EDIT_FILE_BYTES).then_some(text)
+}
+
+/// Finds `old` once in the work copy's tracked files and writes `new` over
+/// it, committed; else the reply to send (a miss is a 200 naming the
+/// count, nothing changed).
+fn edit_in(
+    st: &ClientServerState,
+    wc: &WorkCopy,
+    old: &str,
+    new: &str,
+    work_id: &str,
+) -> Result<EditDone, Refused> {
+    let mut hits = find_in_tracked(wc, old)?;
+    if hits.len() != 1 {
+        return Err(Box::new(
+            Json(EditReply {
+                matches: hits.len() as u32,
+                work_id: None,
+                file: None,
+                commit: None,
+                branch: None,
+            })
+            .into_response(),
+        ));
+    }
+    let (file, span, text) = hits.remove(0);
+    refuse_unless_clean(wc, &file)?;
+    onto_own_branch(st, Some(wc))?;
+    let message = format!("hand-edit: {} (work {work_id})", edit_title(old, new));
+    let new = crate::client_edit::as_source(&file, new);
+    write_and_commit(wc, file, span, &text, &new, &message)
+}
+
+/// Refused unless `file` has no uncommitted change. A status git could not
+/// read counts as one: an edit never lands on changes it could not see.
+fn refuse_unless_clean(wc: &WorkCopy, file: &str) -> Result<(), Refused> {
+    let status = crate::client_git::run_or_why(wc, None, &["--literal-pathspecs", "status", "--porcelain", "--", file]);
+    let why = match status {
+        Ok(out) if out.stdout.iter().all(u8::is_ascii_whitespace) => return Ok(()),
+        Ok(_) => format!("{file} has changes that aren't committed, so darkmux won't edit it"),
+        Err(e) => format!("darkmux couldn't read whether {file} has uncommitted changes ({e}), so it won't edit it"),
+    };
+    Err(refuse(StatusCode::CONFLICT, ClientCode::Conflict, why))
+}
+
+/// Writes `new` over `span` of `file`, through the file read as `text` and
+/// never through a link ([`crate::client_preview::at::replace_regular`]),
+/// and commits the file; a failed commit puts the file back.
+fn write_and_commit(
+    wc: &WorkCopy,
+    file: String,
+    (start, end): (usize, usize),
+    text: &str,
+    new: &str,
+    message: &str,
+) -> Result<EditDone, Refused> {
+    let before = snapshot_tree(wc)
+        .map_err(|e| Box::new(internal(anyhow!("reading the work copy failed: {e}"))))?;
+    let edited = format!("{}{}{}", &text[..start], new, &text[end..]);
+    crate::client_preview::at::replace_regular(&wc.work_tree, &file, text.as_bytes(), edited.as_bytes()).map_err(|e| {
+        refuse(StatusCode::CONFLICT, ClientCode::Conflict, format!("darkmux didn't edit {file}: {e}"))
+    })?;
+    let (changes, changes_error) = match changes_since(wc, &before.tree) {
+        Ok(c) => (Some(c), None),
+        Err(e) => (None, Some(format!("reading the edit's changes failed: {e}"))),
+    };
+    #[cfg(test)]
+    before_edit_commit(wc);
+    let (commit, branch) = commit_run(wc, std::slice::from_ref(&file), message).map_err(|e| {
+        // From HEAD: `add` may have staged the edit before the commit failed.
+        let _ = git_quiet(wc, &["--literal-pathspecs", "checkout", "HEAD", "--", &file]);
+        refuse(
+            StatusCode::CONFLICT,
+            ClientCode::Conflict,
+            format!("couldn't commit the edit: {e}"),
+        )
+    })?;
+    Ok(EditDone {
+        file,
+        commit,
+        branch,
+        baseline: before.tree,
+        changes,
+        changes_error,
+    })
+}
+
+/// What a test runs inside a hand edit in a work tree, once the file is
+/// written and before it is committed.
+#[cfg(test)]
+type EditHook = (PathBuf, Arc<dyn Fn() + Send + Sync>);
+#[cfg(test)]
+pub(crate) static EDIT_HOOKS: Mutex<Vec<EditHook>> = Mutex::new(Vec::new());
+
+/// Runs the test hook for `wc`'s work tree, if one is set; outside the
+/// lock, so a hook that panics leaves the list usable.
+#[cfg(test)]
+fn before_edit_commit(wc: &WorkCopy) {
+    let hook = EDIT_HOOKS.lock().unwrap().iter().find(|(at, _)| *at == wc.work_tree).map(|(_, f)| f.clone());
+    if let Some(f) = hook {
+        f();
+    }
+}
+
+/// A hand edit's title: the old words and the new, shortened.
+fn edit_title(old: &str, new: &str) -> String {
+    let cut = |s: &str| {
+        let s = crate::client_edit::normalize(s);
+        if s.chars().count() > 30 {
+            format!("{}…", s.chars().take(30).collect::<String>())
+        } else {
+            s
+        }
+    };
+    format!("\"{}\" to \"{}\"", cut(old), cut(new))
+}
+
 // ─── Commits and Undo ────────────────────────────────────────────────────
 
 fn short(sha: &str) -> String {

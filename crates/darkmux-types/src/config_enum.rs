@@ -875,6 +875,9 @@ fn read_thermal_pause_at(c: &DarkmuxConfig) -> Option<&str> {
 fn read_thermal_resume_at(c: &DarkmuxConfig) -> Option<&str> {
     c.runtime.as_ref()?.thermal.as_ref()?.resume_at.as_deref()
 }
+fn read_memory_pressure_gate(c: &DarkmuxConfig) -> Option<&str> {
+    c.runtime.as_ref()?.memory.as_ref()?.pressure_gate.as_deref()
+}
 fn read_fleet_mode(c: &DarkmuxConfig) -> Option<&str> {
     c.fleet.as_ref()?.mode.as_deref()
 }
@@ -938,6 +941,15 @@ pub static ENUM_SETTINGS: &[EnumSetting] = &[
         "fair",
         DISPATCHING,
         read_thermal_resume_at,
+    ),
+    // Read by every start of an engine server and every LM Studio load a
+    // dispatch makes, so every dispatching entry point refuses a bad value.
+    EnumSetting::of::<crate::config::PressureGate>(
+        "runtime.memory.pressure_gate",
+        Some("DARKMUX_MEMORY_PRESSURE_GATE"),
+        "warning",
+        DISPATCHING,
+        read_memory_pressure_gate,
     ),
     EnumSetting::of::<crate::config::FleetMode>(
         "fleet.mode",

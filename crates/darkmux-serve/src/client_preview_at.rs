@@ -10,6 +10,7 @@ use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path};
 
 fn invalid(what: &str) -> io::Error {
@@ -224,9 +225,59 @@ pub(crate) fn create_new(root: &Path, rel: &str, mode: u32) -> io::Result<File> 
 /// it is known to be a regular file.
 pub(crate) fn open_regular(root: &Path, rel: &str) -> io::Result<(File, u32)> {
     let (dir, name) = parent_of(root, rel)?;
-    let file = File::from(open_at(dir.as_raw_fd(), &name, libc::O_RDONLY | libc::O_NONBLOCK, 0)?);
-    let meta = file.metadata()?;
-    if !meta.is_file() {
+    let file = regular_at(&dir, &name)?;
+    let mode = file.metadata()?.permissions().mode() & 0o777;
+    Ok((file, mode))
+}
+
+/// Replaces the regular file `rel` inside `root` with `new`, only while it
+/// still holds `expected`. The file is opened once, with no link followed
+/// at any name on the way, and read through that descriptor; `new` goes to
+/// a fresh file beside it, renamed over it in the folder the walk opened,
+/// so a link put there meanwhile is replaced, never written through. Its
+/// permission bits are kept.
+pub(crate) fn replace_regular(root: &Path, rel: &str, expected: &[u8], new: &[u8]) -> io::Result<()> {
+    use io::Read;
+    let (dir, name) = parent_of(root, rel)?;
+    let file = regular_at(&dir, &name)?;
+    let mode = file.metadata()?.mode() & 0o777;
+    let mut held = Vec::with_capacity(expected.len());
+    file.take(expected.len() as u64 + 1).read_to_end(&mut held)?;
+    if held != expected {
+        return Err(io::Error::other("it changed while darkmux read it"));
+    }
+    let mut temp = OsString::from(".");
+    temp.push(&name);
+    temp.push(".darkmux-edit");
+    let renamed = write_new_at(&dir, &temp, new, mode).and_then(|()| rename_in(&dir, &temp, &name));
+    if renamed.is_err() {
+        let _ = unlink_at(dir.as_raw_fd(), &temp, 0);
+    }
+    renamed
+}
+
+/// Writes `bytes` to a new file `name` in `dir` with permission bits
+/// `mode`, synced; one left there by an edit that never finished is
+/// unlinked first, never followed.
+fn write_new_at(dir: &OwnedFd, name: &OsStr, bytes: &[u8], mode: u32) -> io::Result<()> {
+    use io::Write;
+    if let Err(e) = unlink_at(dir.as_raw_fd(), name, 0) {
+        if e.kind() != io::ErrorKind::NotFound {
+            return Err(e);
+        }
+    }
+    let mut out = File::from(open_at(dir.as_raw_fd(), name, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, mode)?);
+    out.write_all(bytes)?;
+    // The umask may have narrowed the bits `O_CREAT` set.
+    out.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    out.sync_all()
+}
+
+/// The regular file `name` in `dir`, opened read-only without following a
+/// link and without waiting on a FIFO.
+fn regular_at(dir: &OwnedFd, name: &OsStr) -> io::Result<File> {
+    let file = File::from(open_at(dir.as_raw_fd(), name, libc::O_RDONLY | libc::O_NONBLOCK, 0)?);
+    if !file.metadata()?.is_file() {
         return Err(invalid("not a regular file"));
     }
     // SAFETY: an fd we own; reads its flags and clears one.
@@ -234,8 +285,17 @@ pub(crate) fn open_regular(root: &Path, rel: &str) -> io::Result<(File, u32)> {
     if flags < 0 || unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    use std::os::unix::fs::PermissionsExt;
-    Ok((file, meta.permissions().mode() & 0o777))
+    Ok(file)
+}
+
+/// `renameat(dir, from, dir, to)`: names in one folder, neither followed.
+fn rename_in(dir: &OwnedFd, from: &OsStr, to: &OsStr) -> io::Result<()> {
+    let (from, to) = (cstr(from)?, cstr(to)?);
+    // SAFETY: valid NUL-terminated names and an fd we own.
+    match unsafe { libc::renameat(dir.as_raw_fd(), from.as_ptr(), dir.as_raw_fd(), to.as_ptr()) } {
+        0 => Ok(()),
+        _ => Err(io::Error::last_os_error()),
+    }
 }
 
 #[cfg(test)]
@@ -266,9 +326,38 @@ mod tests {
             let err = create_new(&root, "a/b/new", 0o600).unwrap_err();
             assert!(err.to_string().contains("symlink"), "{at}: {err}");
             assert!(open_regular(&root, "a/b/c").is_err(), "{at}: read through the link");
+            assert!(replace_regular(&root, "a/b/c", b"x", b"y").is_err(), "{at}: replaced through the link");
+            assert_eq!(std::fs::read(outside.join("a/b/c")).unwrap(), b"x", "{at}: written outside");
             assert!(outside.join("a/b/c").exists(), "{at}: deleted outside");
             assert!(!outside.join("a/b/new").exists(), "{at}: created outside");
         }
+    }
+
+    #[test]
+    fn a_replace_writes_only_the_file_it_read_and_keeps_its_bits() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, outside) = (dir.path().join("root"), dir.path().join("outside"));
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::write(root.join("a/run.sh"), "old").unwrap();
+        std::fs::set_permissions(root.join("a/run.sh"), std::fs::Permissions::from_mode(0o766)).unwrap();
+        // A leftover temp file from an edit that never finished is replaced.
+        std::fs::write(root.join("a/.run.sh.darkmux-edit"), "stale").unwrap();
+        replace_regular(&root, "a/run.sh", b"old", b"new").unwrap();
+        assert_eq!(std::fs::read(root.join("a/run.sh")).unwrap(), b"new");
+        assert_eq!(std::fs::metadata(root.join("a/run.sh")).unwrap().permissions().mode() & 0o777, 0o766);
+        assert_eq!(std::fs::read_dir(root.join("a")).unwrap().count(), 1, "no temp file is left");
+        // Not what was read: nothing is written.
+        let err = replace_regular(&root, "a/run.sh", b"old", b"other").unwrap_err();
+        assert!(err.to_string().contains("changed"), "{err}");
+        assert_eq!(std::fs::read(root.join("a/run.sh")).unwrap(), b"new");
+        assert_eq!(std::fs::read_dir(root.join("a")).unwrap().count(), 1);
+        // A link at the last name is never written through.
+        std::fs::write(&outside, "new").unwrap();
+        std::fs::remove_file(root.join("a/run.sh")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("a/run.sh")).unwrap();
+        let err = replace_regular(&root, "a/run.sh", b"new", b"written").unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert_eq!(std::fs::read(&outside).unwrap(), b"new");
     }
 
     #[test]

@@ -1897,6 +1897,16 @@ pub fn detection_degeneracy_policy_with_source(
     resolve_enum("runtime.detection.degeneracy.policy")
 }
 
+/// The value an absent `runtime.memory.pressure_gate` resolves to.
+pub const MEMORY_PRESSURE_GATE_DEFAULT: &str = "warning";
+
+/// (#3538) The memory pressure at which a model's start or load is refused:
+/// `env(DARKMUX_MEMORY_PRESSURE_GATE) > config.runtime.memory.pressure_gate
+/// > warning`. An unregistered value is an error, never a fallback.
+pub fn memory_pressure_gate() -> Result<crate::config::PressureGate, crate::config_enum::BadEnumValue> {
+    resolve_enum("runtime.memory.pressure_gate").map(|(v, _)| v)
+}
+
 /// OS thermal state at or above which the governor pauses. Default
 /// `serious`. (#2947) An unrecognized state is an error: it used to pass
 /// through, and the governor disarmed its soft tiers on it, so a typo
@@ -2744,6 +2754,8 @@ mod location_guard {
         ("live_cadence", "milliseconds and a tier"),
         ("detection_degeneracy_policy", "an enum value"),
         ("thermal_pause_at", "an enum value"),
+        ("memory_pressure_gate", "an enum value"),
+        ("MEMORY_PRESSURE_GATE_DEFAULT", "the default memory pressure gate token, public in the source"),
         ("thermal_resume_at", "an enum value"),
         ("resolved_locations", "the union of LOCATION_ACCESSORS itself"),
         ("config", "the whole config.json document: its locations are read by the accessors named here and `panel_audience::config_scrub_values`"),
