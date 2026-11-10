@@ -3529,6 +3529,26 @@ async fn changes_of(h: &Harness, token: &str, name: &str) -> (u16, Value) {
     call(h, get(&format!("/client/workspaces/{name}/changes"), &[("authorization", &bearer(token))])).await
 }
 
+/// A branch whose files can't be read is a 500 that names nothing, or a
+/// 413 when they are too large to send.
+#[tokio::test]
+async fn an_unreadable_or_oversized_branch_is_refused_as_before() {
+    use crate::client_changes::ChangesError;
+    let cases = [
+        (ChangesError::Listing, 500, "internal"),
+        (ChangesError::Unreadable("a/b.txt".into()), 500, "internal"),
+        (ChangesError::TooLarge, 413, "payload_too_large"),
+    ];
+    for (e, status, code) in cases {
+        let resp = changes_refusal(e.clone());
+        assert_eq!(resp.status().as_u16(), status, "{e:?}");
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["code"], code, "{e:?}: {v}");
+        assert!(!v.to_string().contains("a/b.txt"), "a 500 names no path: {v}");
+    }
+}
+
 /// The fixture's clone, but of an empty repository (no commit, so `HEAD`
 /// is unborn).
 fn empty_repo_state(h: &Harness) -> ClientServerState {

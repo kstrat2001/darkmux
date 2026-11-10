@@ -49,6 +49,7 @@ pub mod mission_graph;
 /// Client pairing: a loopback-only listener that pairs an app and runs its
 /// scoped work through `darkmux dispatch` (local prototype).
 pub mod client_git;
+mod client_changes;
 pub mod client_pairing;
 pub mod client_preview;
 pub mod client_profiles;
