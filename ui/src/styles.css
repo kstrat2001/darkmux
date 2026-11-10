@@ -916,6 +916,11 @@ body {
      two — plus the pill's own right edge never crossing the viewport).
      Desktop has no matching rule: this is `.masthead__pilltext`'s ONLY
      `max-width`, scoped to this breakpoint. */
+  /* A dropped stream's "data as of" words: the time beside "reconnecting"
+     is what a phone keeps (`Masthead.tsx`'s `livePillText`). */
+  .masthead__asof {
+    display: none;
+  }
   .masthead__pilltext {
     display: inline-block;
     max-width: calc(100vw - 190px);

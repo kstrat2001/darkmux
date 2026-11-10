@@ -482,8 +482,10 @@ interface PillTransport {
  * never flashes them; the dot is still instant. */
 function livePillText(transport: PillTransport): string {
   if (transport.liveStatus === "live" || transport.announced === "live") return LIVE_CHIP;
-  return transport.dataAsOfMs != null ? `reconnecting · data as of ${clkhm(transport.dataAsOfMs)}` : "reconnecting";
+  return transport.dataAsOfMs != null ? `reconnecting · ${AS_OF}${clkhm(transport.dataAsOfMs)}` : "reconnecting";
 }
+
+const AS_OF = "data as of ";
 
 function pillLabel(route: Route, replayDate: string | null, transport: PillTransport): ReactNode {
   if (isLiveRoute(route) && replayDate == null) {
@@ -501,7 +503,18 @@ function pillLabel(route: Route, replayDate: string | null, transport: PillTrans
             {connected ? "●" : "◌"}
           </span>
           <span className="masthead__pilltext" title={text === LIVE_CHIP ? undefined : text}>
-            {text}
+            {/* A phone's pill has room for "reconnecting · 19:20" and not
+                the words between: they hide there, so the time is never the
+                part the ellipsis cuts. */}
+            {text.includes(AS_OF) ? (
+              <>
+                {text.slice(0, text.indexOf(AS_OF))}
+                <span className="masthead__asof">{AS_OF}</span>
+                {text.slice(text.indexOf(AS_OF) + AS_OF.length)}
+              </>
+            ) : (
+              text
+            )}
           </span>
         </span>
         <span className="mm-sr-only" aria-live="polite">
