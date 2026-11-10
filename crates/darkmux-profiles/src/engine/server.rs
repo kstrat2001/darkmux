@@ -229,6 +229,13 @@ pub fn alive(rec: &EngineRecord) -> bool {
     rec.state_now() == ServerState::Running && !is_zombie(rec.pid)
 }
 
+/// [`alive`] for a server known by its pid and start stamp alone (a memory
+/// reservation names its server so).
+pub fn process_alive(pid: u32, start_stamp: u64) -> bool {
+    reap_exited();
+    darkmux_platform::current().process_start_stamp(pid) == Some(start_stamp) && !is_zombie(pid)
+}
+
 fn reap_exited() {
     if let Ok(mut spawned) = SPAWNED.lock() {
         spawned.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
@@ -433,7 +440,10 @@ pub fn ensure(
 /// The endpoint's own lock, `<stem>.server.lock` (never a name the record's
 /// own `<stem>.json.lock` can take for another endpoint: holding both in one
 /// process would otherwise block on itself, since flock locks per open
-/// file). Waits for whoever holds it.
+/// file). Waits for whoever holds it, with no bound and deaf to a stop, and a
+/// start in flight holds it until its server answers (minutes, for a large
+/// model): a dispatch never takes it this way. It asks with
+/// [`try_endpoint_lock`] and waits on its own terms.
 pub fn endpoint_lock(dirs: &Dirs, endpoint: &str) -> Result<darkmux_types::flock::FlockGuard, ServerError> {
     darkmux_types::flock::lock_exclusive(&endpoint_lock_path(dirs, endpoint)).map_err(|e| lock_failed(dirs, endpoint, e))
 }
@@ -488,25 +498,13 @@ pub fn ensure_locked(
     Ok(Ensured::Started(rec))
 }
 
-/// (#3511) [`ensure`]'s reuse, never a start: darkmux's server on `spec`'s
-/// endpoint when it still runs this exact command (decided under the
-/// endpoint's lock, as `ensure` decides it), else `None` with any other
-/// server of darkmux's there stopped as `ensure` would stop it. A caller that
-/// judged the server reusable and then lost it (an evictor stopped it in
-/// between) gets `None`, and starts it through its memory decision rather
-/// than through `ensure` blind.
-pub fn reuse(
-    spec: &ServerSpec,
-    dirs: &Dirs,
-    bounds: Bounds,
-    held: Held<'_>,
-    progress: &mut dyn FnMut(Progress),
-) -> Result<Option<EngineRecord>, ServerError> {
-    let lock = endpoint_lock(dirs, &spec.endpoint)?;
-    reuse_locked(spec, dirs, bounds, held, progress, &lock)
-}
-
-/// [`reuse`] with the endpoint's lock already held.
+/// (#3511) [`ensure`]'s reuse, never a start, with the endpoint's lock
+/// already held: darkmux's server on `spec`'s endpoint when it still runs
+/// this exact command (decided as `ensure` decides it), else `None` with any
+/// other server of darkmux's there stopped as `ensure` would stop it. A
+/// caller that judged the server reusable and then lost it (an evictor
+/// stopped it in between) gets `None`, and starts it through its memory
+/// decision rather than through `ensure` blind.
 pub fn reuse_locked(
     spec: &ServerSpec,
     dirs: &Dirs,

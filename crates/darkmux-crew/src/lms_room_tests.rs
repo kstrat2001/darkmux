@@ -141,14 +141,34 @@ impl Rig {
     }
     fn room<'a>(&self, machine: &'a (dyn Machine + Sync)) -> ServerRoom<'a> {
         let bounds = server::Bounds { start: Duration::from_secs(5), stop_grace: Duration::from_secs(2), poll: Duration::from_millis(20) };
-        // A load's reservation is kept, as it is while memory pages in, until
-        // its lease drops.
-        ServerRoom { dirs: self.dirs(), bounds, machine, settle: |res, need, _| { res.set(need); }, workers: || Some(0) }
+        // A load's memory has paged in the moment it is loaded.
+        ServerRoom { dirs: self.dirs(), bounds, machine, settle: |res, _| drop(res), workers: || Some(0) }
     }
+    /// [`Self::room`], each load's reservation kept whole, as it is while
+    /// its memory pages in, until the test settles it ([`settle_all`]) or
+    /// the rig goes.
+    fn room_settling<'a>(&self, machine: &'a (dyn Machine + Sync)) -> ServerRoom<'a> {
+        ServerRoom { settle: |res, _| SETTLING.lock().unwrap().push(res), ..self.room(machine) }
+    }
+}
+
+/// The loads' reservations a [`Rig::room`] was handed to settle.
+static SETTLING: Mutex<Vec<Reserved>> = Mutex::new(Vec::new());
+
+/// Every load handed to settle has paged in: its reservation ends.
+fn settle_all() {
+    SETTLING.lock().unwrap().clear();
+}
+
+/// What starts still paging in reserve, every footprint unread.
+fn reserved_now() -> u64 {
+    use darkmux_types::residency_reservation::{reserved, Servers};
+    reserved(&Servers { alive: &server::process_alive, footprint: &|_| None })
 }
 
 impl Drop for Rig {
     fn drop(&mut self) {
+        settle_all();
         unsafe {
             match self.prev_home.take() {
                 Some(v) => std::env::set_var("DARKMUX_HOME", v),
@@ -272,6 +292,27 @@ fn an_idle_engine_server_counts_against_an_lm_studio_load_and_is_stopped_to_make
         [HostOp::ListResident, HostOp::ListCatalog, HostOp::Load { model_key: "m".into(), identifier: "darkmux:m".into(), min_ctx: 8_000 }],
         "the server stopped before anything loaded"
     );
+}
+
+/// An idle server stopped to make room reserves nothing once it is gone:
+/// its start's reservation (still paging in) is not held against the load
+/// that replaced it.
+#[test]
+#[serial_test::serial]
+fn stopping_an_idle_server_ends_what_its_start_reserved() {
+    let rig = Rig::new();
+    let mut tf = FakeServer::darkmux(&rig.dirs(), "tf", "TensorFold/q", 1_000);
+    let rec = tf.rec.clone();
+    let mut start = Reserved::begin(30 * GIB).unwrap();
+    start.bind_server(rec.pid, rec.start_stamp, darkmux_types::residency_reservation::now_ms() + 600_000).unwrap();
+    start.leave_to_server();
+    assert_eq!(reserved_now(), 30 * GIB);
+    let free = || Some(if server::alive(&rec) { 8 * GIB } else { 40 * GIB });
+    let machine = FakeMachine::new(&free);
+    let mut host = MockHost::new().cataloged("m", 20 * GIB);
+    load(&mut host, &wave("m"), &rig.room(&machine)).expect("the load fits the 40 GiB free once the server stopped");
+    assert!(!tf.running());
+    assert_eq!(reserved_now(), 0, "the stopped server reserves nothing");
 }
 
 /// Least recently started first, and no more than the load needs: two idle
@@ -787,7 +828,7 @@ impl ModelHost for LockProbe {
         self.inner.list_catalog()
     }
     fn load(&mut self, k: &str, id: &str, ctx: u32, d: darkmux_gestalt::Deadline) -> Result<darkmux_gestalt::LoadReport, darkmux_gestalt::HostError> {
-        self.at_load.push((residency_lock_is_free(), LeaseGuard::acquire().reserved_by_others()));
+        self.at_load.push((residency_lock_is_free(), reserved_now()));
         self.inner.load(k, id, ctx, d)
     }
     fn unload(&mut self, t: &darkmux_gestalt::OwnedTarget, d: darkmux_gestalt::Deadline) -> Result<(), darkmux_gestalt::HostError> {
@@ -815,14 +856,16 @@ fn a_wave_decides_under_the_residency_lock_and_loads_outside_it_with_a_reservati
         .on_this_machine_too();
     let mut host = LockProbe { inner, at_unload: Vec::new(), at_load: Vec::new() };
     let lease = LeaseGuard::acquire();
-    ensure_wave_loaded(&wave("m"), &FixedEstimator::default(), &mut host, &lease, None, &rig.room(&machine)).expect("loads");
+    ensure_wave_loaded(&wave("m"), &FixedEstimator::default(), &mut host, &lease, None, &rig.room_settling(&machine)).expect("loads");
     assert_eq!(host.at_unload, [false], "the orphan is unloaded under the lock");
     let (free_at_load, reserved_at_load) = host.at_load[0];
     assert!(free_at_load, "the lock is let go before the load begins");
     assert!(reserved_at_load > 20 * GIB, "the load's commitment is reserved while it loads: {reserved_at_load}");
-    assert_eq!(LeaseGuard::acquire().reserved_by_others(), reserved_at_load, "and kept past the load, while its memory pages in");
+    assert_eq!(reserved_now(), reserved_at_load, "and kept past the load, while its memory pages in");
     drop(lease);
-    assert_eq!(LeaseGuard::acquire().reserved_by_others(), 0, "until the dispatch's lease goes");
+    assert_eq!(reserved_now(), reserved_at_load, "apart from the dispatch's lease: it outlives it");
+    settle_all();
+    assert_eq!(reserved_now(), 0, "until it has paged in");
 }
 
 /// (#3509) A wave that does not load ends its reservation.
@@ -837,7 +880,35 @@ fn a_wave_that_fails_to_load_reserves_nothing_after() {
     let mut host = ArchHost::new(inner, Format::Gguf);
     let lease = LeaseGuard::acquire();
     ensure_wave_loaded(&wave("m"), &FixedEstimator::default(), &mut host, &lease, None, &rig.room(&machine)).expect_err("fails");
-    assert_eq!(LeaseGuard::acquire().reserved_by_others(), 0);
+    assert_eq!(reserved_now(), 0);
+}
+
+/// A wave, and a preflight load, whose reservation cannot be written loads
+/// nothing: a load no other decision counts would be admitted beside one it
+/// does not fit with.
+#[test]
+#[serial_test::serial]
+fn a_load_whose_reservation_cannot_be_written_is_refused_before_it_loads() {
+    let rig = Rig::new();
+    // The reservations directory's own name is a file.
+    std::fs::create_dir_all(rig.dir.path().join("home").join("run")).unwrap();
+    std::fs::write(rig.dir.path().join("home").join("run").join("reservations"), "").unwrap();
+    let free = || Some(64 * GIB);
+    let machine = FakeMachine::new(&free);
+    let mut host = MockHost::new().cataloged("m", 20 * GIB);
+    let err = load(&mut host, &wave("m"), &rig.room(&machine)).expect_err("refused");
+    assert_eq!(refusal_code(&err), Some("model_start_failed"), "{err:#}");
+    assert!(format!("{err:#}").contains("could not record this wave's reservation"), "{err:#}");
+    assert!(!loaded(&host), "nothing loaded");
+    let gate = FakePreflight { held: Vec::new(), commitment: Some(5 * GIB), settled: Default::default() };
+    let loads = std::cell::Cell::new(0);
+    let counting = |_: &str, _: &str, _: u32| -> anyhow::Result<()> {
+        loads.set(loads.get() + 1);
+        Ok(())
+    };
+    load_reserved(&gate, "util", "darkmux:util", 16_384, &counting).expect_err("refused");
+    assert_eq!(loads.get(), 0, "the preflight loaded nothing");
+    assert!(LeaseGuard::acquire().all_live_leased_models().is_empty(), "and holds no lease after");
 }
 
 /// (#3509) What starts still in flight reserve counts against the load:
@@ -849,8 +920,7 @@ fn another_dispatchs_starting_reservation_counts_against_the_load() {
     let rig = Rig::new();
     let free = || Some(64 * GIB);
     let machine = FakeMachine::new(&free);
-    let other = LeaseGuard::acquire();
-    other.write_starting(&["darkmux:TensorFold/big".to_string()], 50 * GIB).unwrap();
+    let other = Reserved::begin(50 * GIB).unwrap();
     let mut host = MockHost::new().cataloged("m", 20 * GIB);
     let err = load(&mut host, &wave("m"), &rig.room(&machine)).expect_err("refused");
     drop(other);
@@ -880,7 +950,8 @@ fn the_utility_binding_counts_as_held() {
 struct FakePreflight {
     held: Vec<String>,
     commitment: Option<u64>,
-    settled: std::sync::Mutex<Vec<u64>>,
+    /// The reservations handed on to settle, kept whole.
+    settled: std::sync::Mutex<Vec<Reserved>>,
 }
 
 impl Preflight for FakePreflight {
@@ -896,9 +967,8 @@ impl Preflight for FakePreflight {
     fn workers(&self) -> Option<u64> {
         Some(0)
     }
-    fn settle(&self, lease: LeaseGuard, res: Reservation, need: u64, _before: Option<u64>) {
-        self.settled.lock().unwrap().push(need);
-        drop((res, lease));
+    fn settle(&self, res: Reserved, _before: Option<u64>) {
+        self.settled.lock().unwrap().push(res);
     }
 }
 
@@ -912,15 +982,44 @@ fn a_preflight_load_reserves_under_the_lock_and_loads_outside_it() {
     let gate = FakePreflight { held: Vec::new(), commitment: Some(5 * GIB), settled: Default::default() };
     let seen = std::sync::Mutex::new(None);
     let load = |_: &str, _: &str, _: u32| -> anyhow::Result<()> {
-        *seen.lock().unwrap() = Some((residency_lock_is_free(), LeaseGuard::acquire().reserved_by_others()));
+        *seen.lock().unwrap() = Some((residency_lock_is_free(), reserved_now()));
         Ok(())
     };
     load_reserved(&gate, "util", "darkmux:util", 16_384, &load).unwrap();
     assert_eq!(*seen.lock().unwrap(), Some((true, 5 * GIB)), "loaded outside the lock, its 5 GiB reserved");
-    assert_eq!(*gate.settled.lock().unwrap(), [5 * GIB], "the reservation is kept until it settles");
+    let handed_on: Vec<u64> = gate.settled.lock().unwrap().iter().map(Reserved::need_bytes).collect();
+    assert_eq!(handed_on, [5 * GIB], "the reservation is kept until it settles");
     let failing = |_: &str, _: &str, _: u32| -> anyhow::Result<()> { anyhow::bail!("no") };
     load_reserved(&gate, "util", "darkmux:util", 16_384, &failing).unwrap_err();
-    assert_eq!(LeaseGuard::acquire().reserved_by_others(), 0, "a failed load reserves nothing after");
+    assert_eq!(reserved_now(), 5 * GIB, "a failed load reserves nothing after: only the first load's is left");
+}
+
+/// A model the preflight just loaded for nobody (the compactor, the utility
+/// model) counts against free memory while it pages in, and that is all: no
+/// lease outlives the load, so it reads as held by no dispatch, a reload of
+/// it is not `busy`, and it can be evicted.
+#[test]
+#[serial_test::serial]
+fn a_freshly_loaded_compactor_is_reserved_but_neither_held_nor_busy() {
+    let _rig = Rig::new();
+    let gate = FakePreflight { held: Vec::new(), commitment: Some(5 * GIB), settled: Default::default() };
+    let held_during_load = std::sync::Mutex::new(Vec::new());
+    let load = |_: &str, _: &str, _: u32| -> anyhow::Result<()> {
+        *held_during_load.lock().unwrap() = LeaseGuard::acquire().all_live_leased_models();
+        Ok(())
+    };
+    load_reserved(&gate, "util", "darkmux:util", 16_384, &load).unwrap();
+    assert_eq!(*held_during_load.lock().unwrap(), ["darkmux:util"], "held while a dispatch is loading it");
+    assert_eq!(reserved_now(), 5 * GIB, "still paging in: reserved");
+    let held = LeaseGuard::acquire().all_live_leased_models();
+    assert!(held.is_empty(), "and held by no dispatch: {held:?}");
+    let unloaded = std::cell::Cell::new(false);
+    unload_unless_held(&ThisPreflight, "darkmux:util", &|_| {
+        unloaded.set(true);
+        Ok(())
+    })
+    .expect("a reload is not `busy`: nothing runs on it");
+    assert!(unloaded.get());
 }
 
 /// (#3514) A preflight reload never unloads the stale instance while a
@@ -955,7 +1054,7 @@ fn a_reuse_only_wave_never_waits_on_the_residency_lock() {
     std::thread::spawn(move || {
         let free = || Some(64 * GIB);
         let machine = FakeMachine::new(&free);
-        let room = ServerRoom { dirs, bounds: server::Bounds::default(), machine: &machine, settle: |_, _, _| {}, workers: || None };
+        let room = ServerRoom { dirs, bounds: server::Bounds::default(), machine: &machine, settle: |_, _| {}, workers: || None };
         let inner = MockHost::new().resident("darkmux:m", "m", 8_000, Some(GIB)).cataloged("m", GIB);
         let mut host = ArchHost::new(inner, Format::Gguf).on_this_machine_too();
         let lease = LeaseGuard::acquire();
@@ -976,33 +1075,64 @@ fn a_reuse_only_wave_never_waits_on_the_residency_lock() {
 fn a_loads_reservation_is_measured_on_lm_studios_workers_not_free_memory() {
     let _rig = Rig::new();
     let need = 30 * GIB;
-    let reserve = |lease: &LeaseGuard| {
-        lease.write_starting(&["darkmux:a".to_string()], need).unwrap();
-        lease.mark_loaded_reserving(&["darkmux:a".to_string()], need).unwrap()
-    };
     let ticks = std::cell::Cell::new(0u64);
     let seen = std::cell::RefCell::new(Vec::new());
     let observe = |_: Duration| {
         ticks.set(ticks.get() + 1);
-        seen.borrow_mut().push(LeaseGuard::acquire().reserved_by_others());
+        seen.borrow_mut().push(reserved_now());
     };
     // The workers stay at 8 GiB; the free memory falls 10 GiB a tick.
-    let lease = LeaseGuard::acquire();
     let workers = || Some(8 * GIB);
-    settle_load(reserve(&lease), need, Some(8 * GIB), &workers, &observe, Duration::from_millis(2_000));
-    assert!(seen.borrow().iter().all(|r| *r == need), "held through every tick: {:?}", seen.borrow());
-    drop(lease);
+    settle_load(Reserved::begin(need).unwrap(), Some(8 * GIB), &workers, &observe, Duration::from_millis(2_000));
+    assert!(seen.borrow().iter().all(|r| *r == need) && seen.borrow().len() == 4, "held through every tick: {:?}", seen.borrow());
+    assert_eq!(reserved_now(), 0, "ended at the bound");
     // The workers grow 10 GiB a tick: the reservation shrinks to nothing.
     seen.borrow_mut().clear();
     ticks.set(0);
-    let lease = LeaseGuard::acquire();
     let growing = || Some(8 * GIB + ticks.get() * 10 * GIB);
-    settle_load(reserve(&lease), need, Some(8 * GIB), &growing, &observe, Duration::from_millis(5_000));
+    settle_load(Reserved::begin(need).unwrap(), Some(8 * GIB), &growing, &observe, Duration::from_millis(5_000));
     assert_eq!(*seen.borrow(), [need, 20 * GIB, 10 * GIB], "{:?}", seen.borrow());
-    assert_eq!(LeaseGuard::acquire().reserved_by_others(), 0, "ended once the workers grew by the need");
+    assert_eq!(reserved_now(), 0, "ended once the workers grew by the need");
     // Workers it cannot read keep the whole reservation.
     assert_eq!(grown_since(Some(GIB), None), None);
     assert_eq!(grown_since(None, Some(GIB)), None);
+}
+
+/// A local track makes several loads on one lease, each settling on a
+/// thread of its own. An earlier wave's settle never touches a later wave's
+/// reservation: while wave 1's 20 GiB settles (down to its end), wave 2's
+/// 40 GiB in flight stays whole.
+#[test]
+#[serial_test::serial]
+fn an_earlier_waves_settle_never_touches_a_later_waves_reservation() {
+    let _rig = Rig::new();
+    let wave_1 = Reserved::begin(20 * GIB).unwrap();
+    let wave_2 = Reserved::begin(40 * GIB).unwrap();
+    let ticks = std::cell::Cell::new(0u64);
+    let seen = std::cell::RefCell::new(Vec::new());
+    let observe = |_: Duration| {
+        ticks.set(ticks.get() + 1);
+        seen.borrow_mut().push(reserved_now());
+    };
+    let growing = || Some(ticks.get() * 10 * GIB);
+    settle_load(wave_1, Some(0), &growing, &observe, Duration::from_secs(120));
+    seen.borrow_mut().push(reserved_now());
+    let gib: Vec<u64> = seen.borrow().iter().map(|b| b / GIB).collect();
+    assert_eq!(gib, [60, 50, 40], "wave 1's shrinks and ends; wave 2's 40 GiB is whole throughout");
+    drop(wave_2);
+}
+
+/// A load's reservation only shrinks: workers that fall back (the model was
+/// unloaded while it settled) never bring back what had paged in.
+#[test]
+#[serial_test::serial]
+fn a_loads_reservation_never_grows_back() {
+    let _rig = Rig::new();
+    let readings = std::cell::RefCell::new(vec![Some(25 * GIB), Some(0), Some(0)].into_iter());
+    let seen = std::cell::RefCell::new(Vec::new());
+    let workers = || readings.borrow_mut().next().flatten();
+    settle_load(Reserved::begin(30 * GIB).unwrap(), Some(0), &workers, &|_| seen.borrow_mut().push(reserved_now() / GIB), Duration::from_millis(1_500));
+    assert_eq!(*seen.borrow(), [5, 5, 5], "5 GiB was left, and stays the most it reserves");
 }
 
 /// (#3514) Only a reuse goes ahead without the lock: a wave that loads
@@ -1017,7 +1147,7 @@ fn a_wave_that_loads_waits_for_the_residency_lock() {
     std::thread::spawn(move || {
         let free = || Some(64 * GIB);
         let machine = FakeMachine::new(&free);
-        let room = ServerRoom { dirs, bounds: server::Bounds::default(), machine: &machine, settle: |_, _, _| {}, workers: || None };
+        let room = ServerRoom { dirs, bounds: server::Bounds::default(), machine: &machine, settle: |_, _| {}, workers: || None };
         let mut host = ArchHost::new(MockHost::new().cataloged("m", GIB), Format::Gguf).on_this_machine_too();
         let lease = LeaseGuard::acquire();
         let _ = tx.send(ensure_wave_loaded(&wave("m"), &FixedEstimator::default(), &mut host, &lease, None, &room).map(|()| host.inner.ops));

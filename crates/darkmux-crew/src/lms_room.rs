@@ -46,7 +46,8 @@ use darkmux_gestalt::{
 };
 use darkmux_profiles::engine::server::{self, Dirs};
 use darkmux_profiles::model_ledger::{LoadFigures, LoadPricer};
-use darkmux_types::residency_lease::{LeaseGuard, Reservation};
+use darkmux_types::residency_lease::LeaseGuard;
+use darkmux_types::residency_reservation::Reserved;
 
 /// Where darkmux's engine servers are recorded, how long a stop may take,
 /// and the machine's memory and leases.
@@ -55,9 +56,9 @@ pub(crate) struct ServerRoom<'a> {
     pub(crate) bounds: server::Bounds,
     pub(crate) machine: &'a (dyn Machine + Sync),
     /// (#3509) Keeps a load's reservation until its memory pages in, given
-    /// the reservation, the need and LM Studio's workers' footprint read
-    /// before the load.
-    pub(crate) settle: fn(Reservation, u64, Option<u64>),
+    /// the reservation and LM Studio's workers' footprint read before the
+    /// load.
+    pub(crate) settle: fn(Reserved, Option<u64>),
     /// (#3514) LM Studio's workers' footprint now
     /// ([`darkmux_profiles::model_ledger::lmstudio_workers_footprint`]).
     pub(crate) workers: fn() -> Option<u64>,
@@ -82,15 +83,26 @@ impl ServerRoom<'static> {
 
 /// (#3509) A load answers before its memory has all paged in (MLX maps its
 /// weights and touches them on first use), so its reservation outlives the
-/// load: [`crate::engine_dispatch::settle_reservation`], on a thread of its
-/// own, with the growth of LM Studio's workers' footprint since the load
-/// began as the load's footprint (LM Studio names no process per model).
-/// (#3514) Not the fall in the machine's free memory: another app, an
-/// engine start or another load would end the reservation early. A
-/// concurrent LM Studio load does grow the workers, but holds its own
-/// reservation.
-fn settle_on_this_machine(res: Reservation, need: u64, before: Option<u64>) {
-    std::thread::spawn(move || settle_on_this_machine_now(res, need, before));
+/// load: [`settle_load`], on a thread of its own, with the growth of LM
+/// Studio's workers' footprint since the load began as the load's footprint
+/// (LM Studio names no process per model). (#3514) Not the fall in the
+/// machine's free memory: another app, an engine start or another load
+/// would end the reservation early. A concurrent LM Studio load does grow
+/// the workers, but holds its own reservation.
+///
+/// The thread owns that one load's reservation and nothing else: no lease
+/// (the model is held only while a dispatch runs on it), and no other
+/// load's reservation, though the same dispatch made it.
+fn settle_on_this_machine(res: Reserved, before: Option<u64>) {
+    std::thread::spawn(move || {
+        settle_load(
+            res,
+            before,
+            &darkmux_profiles::model_ledger::lmstudio_workers_footprint,
+            &std::thread::sleep,
+            crate::engine_dispatch::SETTLE_BOUND,
+        )
+    });
 }
 
 /// What a load has paged in: how far LM Studio's workers have grown since
@@ -111,7 +123,7 @@ impl ServerRoom<'_> {
     /// (#3509) Less what starts still in flight reserve: their memory has
     /// not paged in yet.
     fn pool_with(&self, credit: u64) -> Pools {
-        let reserved = self.machine.reserved(&LeaseGuard::acquire());
+        let reserved = self.machine.reserved(None);
         match (self.machine.capacity(), self.machine.reclaimable()) {
             (Some(capacity_bytes), Some(free)) => Pools::from([(
                 PoolId(darkmux_profiles::gestalt_host::UNIFIED_POOL.into()),
@@ -281,13 +293,14 @@ pub(crate) fn make_room(
         eprintln!("darkmux: warning: this machine's free memory is unreadable; loading unchecked and LM Studio decides");
         return Ok(());
     };
-    // (#3509) Starts still in flight count, though their memory has not
-    // paged in yet.
-    let reserved = room.machine.reserved(lease);
-    if target.fits(free.saturating_sub(reserved)) {
+    // (#3509) Starts still paging in count, though the OS does not show
+    // their memory as used yet.
+    if target.fits(free.saturating_sub(room.machine.reserved(None))) {
         return Ok(());
     }
-    let (free, held) = stop_idle_servers_toward(target, reserved, lease, pinned, plan, facts, room, stopped)?;
+    let (free, held) = stop_idle_servers_toward(target, lease, pinned, plan, facts, room, stopped)?;
+    // Read again: a server stopped just now reserves nothing.
+    let reserved = room.machine.reserved(None);
     match commitment {
         Some(c) if !c.fits(free.saturating_sub(reserved)) => Err(out_of_room(c, free, &held, reserved)),
         _ if target.fits(free.saturating_sub(reserved)) => Ok(()),
@@ -307,10 +320,8 @@ pub(crate) fn make_room(
 /// Stop darkmux's idle servers, the least recently started first, until
 /// `target` fits or none is left; returns the free memory then, and what a
 /// running dispatch holds.
-#[allow(clippy::too_many_arguments)]
 fn stop_idle_servers_toward(
     target: PlanRoom,
-    reserved: u64,
     lease: &LeaseGuard,
     pinned: &[String],
     plan: &Plan,
@@ -324,7 +335,7 @@ fn stop_idle_servers_toward(
     held.extend(held_loads(plan, facts, pinned));
     loop {
         let free = room.machine.reclaimable().unwrap_or(0);
-        if target.fits(free.saturating_sub(reserved)) {
+        if target.fits(free.saturating_sub(room.machine.reserved(None))) {
             return Ok((free, held));
         }
         let Some(next) = idle.pop() else { return Ok((free, held)) };
@@ -420,9 +431,10 @@ pub(crate) trait Preflight {
     fn commitment(&self, model_key: &str, n_ctx: u32) -> Option<u64>;
     /// LM Studio's workers' footprint now.
     fn workers(&self) -> Option<u64>;
-    /// Keep `res` until the load's memory pages in, holding `lease` that
-    /// long.
-    fn settle(&self, lease: LeaseGuard, res: Reservation, need: u64, before: Option<u64>);
+    /// Keep `res` until the load's memory pages in. The reservation alone:
+    /// no lease outlives the load, so the model reads as held only while a
+    /// dispatch runs on it.
+    fn settle(&self, res: Reserved, before: Option<u64>);
 }
 
 /// This machine's [`Preflight`].
@@ -444,38 +456,41 @@ impl Preflight for ThisPreflight {
     fn workers(&self) -> Option<u64> {
         darkmux_profiles::model_ledger::lmstudio_workers_footprint()
     }
-    fn settle(&self, lease: LeaseGuard, res: Reservation, need: u64, before: Option<u64>) {
-        std::thread::spawn(move || {
-            settle_on_this_machine_now(res, need, before);
-            drop(lease);
-        });
+    fn settle(&self, res: Reserved, before: Option<u64>) {
+        settle_on_this_machine(res, before);
     }
 }
 
-/// [`settle_on_this_machine`] on the calling thread.
-fn settle_on_this_machine_now(res: Reservation, need: u64, before: Option<u64>) {
-    settle_load(
-        res,
-        need,
-        before,
-        &darkmux_profiles::model_ledger::lmstudio_workers_footprint,
-        &std::thread::sleep,
-        crate::engine_dispatch::SETTLE_BOUND,
-    )
-}
+/// How often a load's reservation is shrunk to what has not paged in yet.
+const SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Keep a load's reservation of `need` until LM Studio's `workers` have
-/// grown by it since `before`, or `bound` passes
-/// ([`crate::engine_dispatch::settle_reservation`]).
+/// Keep a load's reservation until LM Studio's `workers` have grown by its
+/// need since `before`, or `bound` passes; then end it. Each
+/// [`SETTLE_POLL`] it is shrunk to what the workers have not grown by yet,
+/// and only ever shrunk: workers that fall back (the model was unloaded)
+/// never bring it back. Unreadable workers keep it whole until the bound.
+/// The reservation says when it ends, so a decision past the bound stops
+/// counting it even if this process stalls.
 pub(crate) fn settle_load(
-    res: Reservation,
-    need: u64,
+    mut res: Reserved,
     before: Option<u64>,
     workers: &dyn Fn() -> Option<u64>,
     sleep: &dyn Fn(std::time::Duration),
     bound: std::time::Duration,
 ) {
-    crate::engine_dispatch::settle_reservation(res, need, &|| grown_since(before, workers()), sleep, bound)
+    use darkmux_types::residency_reservation::now_ms;
+    let need = res.need_bytes();
+    let _ = res.settle_by(now_ms().saturating_add(bound.as_millis() as u64));
+    let mut waited = std::time::Duration::ZERO;
+    while waited < bound {
+        let left = grown_since(before, workers()).map_or(need, |grown| need.saturating_sub(grown));
+        if left == 0 {
+            break;
+        }
+        res.shrink_to(left);
+        sleep(SETTLE_POLL);
+        waited += SETTLE_POLL;
+    }
 }
 
 /// (#3514) A preflight reload's unload of the stale instance, refused
@@ -494,9 +509,16 @@ pub(crate) fn unload_unless_held(gate: &dyn Preflight, identifier: &str, unload:
 }
 
 /// (#3514) A preflight load in the residency protocol: under the lock, its
-/// lease with a reservation of what it commits; the lock let go before the
+/// lease and a reservation of what it commits; the lock let go before the
 /// load begins; the reservation kept past the load until its memory pages
 /// in. A load that cannot be priced is leased with no reservation.
+///
+/// The lease ends with the load: it says a dispatch is acquiring the model,
+/// and whichever dispatch then runs on it holds its own
+/// ([`hold_dispatch_models`]). The reservation is not a lease and outlives
+/// it, so a model just loaded for nobody (the compactor, the utility model)
+/// counts against free memory while it pages in, and is neither held nor
+/// `busy`.
 pub(crate) fn load_reserved(
     gate: &dyn Preflight,
     model_key: &str,
@@ -505,11 +527,12 @@ pub(crate) fn load_reserved(
     load: &dyn Fn(&str, &str, u32) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let models = [identifier.to_string()];
-    let (lease, need, before) = reserve_preflight(gate, model_key, &models, n_ctx)?;
+    let (lease, reserved, before) = reserve_preflight(gate, model_key, &models, n_ctx)?;
+    // A load that fails ends its reservation with `reserved`.
     load(model_key, identifier, n_ctx)?;
-    if let Some(bytes) = need {
-        let res = lease.mark_loaded_reserving(&models, bytes)?;
-        gate.settle(lease, res, bytes, before);
+    drop(lease);
+    if let Some(res) = reserved {
+        gate.settle(res, before);
     }
     Ok(())
 }
@@ -522,18 +545,15 @@ fn reserve_preflight(
     model_key: &str,
     models: &[String],
     n_ctx: u32,
-) -> anyhow::Result<(LeaseGuard, Option<u64>, Option<u64>)> {
+) -> anyhow::Result<(LeaseGuard, Option<Reserved>, Option<u64>)> {
     let _lock = gate.lock().map_err(|e| {
         refuse("model_start_failed", format!("could not take darkmux's residency lock ({e:#}); check that darkmux's home is writable"))
     })?;
     let lease = LeaseGuard::acquire();
-    let need = gate.commitment(model_key, n_ctx);
     let before = gate.workers();
-    match need {
-        Some(bytes) => lease.write_starting(models, bytes)?,
-        None => lease.write(models)?,
-    }
-    Ok((lease, need, before))
+    lease.write(models)?;
+    let reserved = gate.commitment(model_key, n_ctx).map(Reserved::begin).transpose()?;
+    Ok((lease, reserved, before))
 }
 
 /// (#3514) No machine: the room of a model host whose loads take none of
@@ -570,9 +590,7 @@ impl ServerRoom<'static> {
             dirs: Dirs { records: std::path::PathBuf::new(), logs: std::path::PathBuf::new() },
             bounds: server::Bounds::default(),
             machine: &NoMachine,
-            settle: |res, _, _| {
-                res.set(0);
-            },
+            settle: |res, _| drop(res),
             workers: || None,
         }
     }
