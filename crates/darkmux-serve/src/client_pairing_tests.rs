@@ -3833,13 +3833,14 @@ async fn a_workspace_in_use_is_not_removed_nor_used_while_removed() {
     let edited = run_in(&h, &token, "hcr", "edit").await;
     let id = start_in(&h, &token, "hcr", "wait").await;
     assert!(try_hold(&h.base, "hcr", Hold::Sole).unwrap().is_none(), "a run holds its workspace's name");
-    let (code, refused) = remove_ws(&h, &token, "hcr", None).await;
+    let force = || Some(serde_json::json!({"force": true}));
+    let (code, refused) = remove_ws(&h, &token, "hcr", force()).await;
     assert_eq!((code, refused["code"].as_str()), (409, Some("conflict")), "a run is in it: {refused}");
     let _ = cancel(&h, Some(&token), &id).await;
     let _ = wait_done(&h, &token, &id).await;
     assert!(try_hold(&h.base, "hcr", Hold::Sole).unwrap().is_some(), "and lets go once it has ended");
     let elsewhere = try_hold(&h.base, "hcr", Hold::Shared).unwrap().unwrap();
-    let (code, refused) = remove_ws(&h, &token, "hcr", None).await;
+    let (code, refused) = remove_ws(&h, &token, "hcr", force()).await;
     assert_eq!((code, refused["code"].as_str()), (409, Some("conflict")), "held elsewhere: {refused}");
     drop(elsewhere);
     let removing = try_hold(&h.base, "hcr", Hold::Sole).unwrap().unwrap();
@@ -3887,6 +3888,26 @@ async fn removing_a_workspace_stops_its_preview_first() {
     assert_eq!((code, gone["preview_stopped"].as_bool()), (200, Some(true)), "{gone}");
     assert!(!answers(port), "its dev server is gone");
     assert!(!h.base.join(&name).exists());
+}
+
+/// A DELETE refused for commits nowhere else leaves the workspace's live
+/// preview running: the refusal is decided before anything is stopped.
+#[tokio::test]
+async fn a_refused_removal_leaves_the_preview_running() {
+    let h = harness();
+    let token = paired(&h).await;
+    let json = serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}, "ready": {"http": "/"}});
+    let (name, _ws) = template_project(&h, &token, Some(json)).await;
+    let _ = run_in(&h, &token, &name, "edit").await;
+    let (code, v) = start_preview(&h, &token, &name).await;
+    assert_eq!(code, 202, "{v}");
+    let ready = preview_until(&h, &token, &name, &["ready", "failed"]).await;
+    assert_eq!(ready["status"], "ready", "{ready}");
+    let (code, refused) = remove_ws(&h, &token, &name, None).await;
+    assert_eq!((code, refused["code"].as_str()), (409, Some("unsaved_commits")), "{refused}");
+    let still = preview_until(&h, &token, &name, &["ready", "stopped", "failed"]).await;
+    assert_eq!(still["status"], "ready", "the refused removal stopped nothing: {still}");
+    assert!(answers(ready["port"].as_u64().unwrap()));
 }
 
 /// A clone a stopped `client serve` left half done (`.<name>.partial` and

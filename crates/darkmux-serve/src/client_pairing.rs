@@ -3904,6 +3904,11 @@ fn remove_owned(state: &ClientServerState, client: &ApprovedClient, name: &str, 
         Ok(b) => b,
         Err(e) => return internal(anyhow!(e)),
     };
+    // Refused for what the workspace is before anything is stopped: a
+    // refused removal leaves its preview running.
+    if let Err(e) = ws::check_removable(&base, name, force) {
+        return err(status_of_code(e.code()), e.code(), e.message);
+    }
     let preview_stopped = state.previews.stop(name);
     let wait = if preview_stopped { PREVIEW_LETGO_WAIT } else { std::time::Duration::ZERO };
     match ws::remove_workspace_within(&base, name, force, wait) {

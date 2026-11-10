@@ -1002,15 +1002,20 @@ pub enum Hold {
 pub struct NameHold {
     _file: std::fs::File,
     path: PathBuf,
+    how: Hold,
 }
 
 impl NameHold {
     /// Removes the lock file, then lets go: for a name whose workspace is
     /// gone, or was never made. A holder that opened the old file meanwhile
     /// finds it is no longer the one at the path and looks again
-    /// ([`try_hold`]).
+    /// ([`try_hold`]). Only a [`Hold::Sole`] removes it: under a shared
+    /// hold others may hold the same file, and a new one beside it would
+    /// let a sole hold in beside theirs. A shared hold just lets go.
     pub fn forget(self) {
-        let _ = std::fs::remove_file(&self.path);
+        if self.how == Hold::Sole {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -1029,7 +1034,7 @@ pub fn try_hold(base: &Path, name: &str, how: Hold) -> Result<Option<NameHold>, 
             return Ok(None);
         };
         if is_file_at(&file, &path)? {
-            return Ok(Some(NameHold { _file: file, path }));
+            return Ok(Some(NameHold { _file: file, path, how }));
         }
     }
     Err(format!("{} kept being replaced while darkmux locked it", path.display()))
@@ -1234,15 +1239,13 @@ pub struct Removal {
 /// is followed through a link. The caller checks who may remove it.
 pub fn remove_workspace_within(base: &Path, name: &str, force: bool, wait: Duration) -> Result<Removal, Coded> {
     let dir = base.join(name);
-    let wc = removable(base, name, &dir)?;
+    check_removable(base, name, force)?;
     let held = hold_alone_within(base, name, wait)?;
-    // Held now: look again, in case it went meanwhile.
-    let wc = removable(base, name, &dir).map(|_| wc)?;
-    let kind = kind_of(base, name, &wc)?;
+    // Held now: look again, in case it changed meanwhile.
+    let (wc, kind) = checked_removable(base, name, force)?;
     let branch = status_of(&wc).map(|(b, _)| b).filter(|b| !b.is_empty());
     let branch_removed = match kind {
         WorkspaceKind::Clone | WorkspaceKind::Template => {
-            refuse_unsaved(base, name, kind, &wc, force)?;
             remove_cloned(base, name, &dir).map(|()| branch.is_some())
         }
         WorkspaceKind::Worktree => remove_worktree_of(&wc, &dir, branch.as_deref(), force),
@@ -1251,6 +1254,25 @@ pub fn remove_workspace_within(base: &Path, name: &str, force: bool, wait: Durat
     forget_records(base, name);
     held.forget();
     Ok(Removal { kind, branch, branch_removed })
+}
+
+/// Whether workspace `name` could be removed (with `force` or not), read
+/// without holding or changing anything: what [`remove_workspace_within`]
+/// refuses for what the workspace is (missing, not darkmux's, holding
+/// commits nowhere else), never for what is using it. A caller decides
+/// with it before stopping anything.
+pub fn check_removable(base: &Path, name: &str, force: bool) -> Result<(), Coded> {
+    checked_removable(base, name, force).map(|_| ())
+}
+
+/// [`check_removable`], returning the workspace and what it is.
+fn checked_removable(base: &Path, name: &str, force: bool) -> Result<(crate::client_git::WorkCopy, WorkspaceKind), Coded> {
+    let wc = removable(base, name, &base.join(name))?;
+    let kind = kind_of(base, name, &wc)?;
+    if kind != WorkspaceKind::Worktree {
+        refuse_unsaved(base, name, kind, &wc, force)?;
+    }
+    Ok((wc, kind))
 }
 
 /// Holds `name` alone ([`Hold::Sole`]), looking again until `wait` has
@@ -2082,6 +2104,43 @@ mod tests {
         std::os::unix::fs::symlink(&target, base.join(".linked.lock")).unwrap();
         assert!(try_hold(base, "linked", Hold::Sole).is_err());
         assert!(!target.exists(), "nothing made through the link");
+    }
+
+    /// Holds stay exclusive while lock files are removed under them: many
+    /// threads taking sole and shared holds, forgetting and dropping them,
+    /// never see a sole hold beside any other. A hold taken on a file
+    /// removed since it was opened would be one.
+    #[test]
+    fn holds_stay_exclusive_while_lock_files_are_forgotten() {
+        use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        // Sole holders count as -1000, shared ones as +1: a sole hold beside
+        // any other shows as a sum that is neither -1000 alone nor >= 0.
+        let (inside, violations) = (AtomicI64::new(0), AtomicUsize::new(0));
+        let until = Instant::now() + Duration::from_millis(1500);
+        std::thread::scope(|scope| {
+            for t in 0..12 {
+                let (base, inside, violations) = (&base, &inside, &violations);
+                scope.spawn(move || {
+                    let mut i = 0u64;
+                    while Instant::now() < until {
+                        i += 1;
+                        let how = if (t + i).is_multiple_of(3) { Hold::Sole } else { Hold::Shared };
+                        let Ok(Some(held)) = try_hold(base, "site", how) else { continue };
+                        let weight = if how == Hold::Sole { -1000 } else { 1 };
+                        let now = inside.fetch_add(weight, Ordering::SeqCst) + weight;
+                        if !(now == -1000 || now > 0) {
+                            violations.fetch_add(1, Ordering::SeqCst);
+                        }
+                        std::thread::yield_now();
+                        inside.fetch_sub(weight, Ordering::SeqCst);
+                        if i.is_multiple_of(2) { held.forget() } else { drop(held) }
+                    }
+                });
+            }
+        });
+        assert_eq!(violations.load(Ordering::SeqCst), 0, "a sole hold was taken beside another");
     }
 
     /// A lock file removed (or replaced) since it was opened is not the one
