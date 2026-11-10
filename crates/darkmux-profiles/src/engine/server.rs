@@ -733,18 +733,27 @@ pub enum StopOutcome {
 /// at `critical`.
 pub fn stop_for_thermal(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds) -> Result<StopOutcome, ServerError> {
     let lock_path = engine_record::path_in(&dirs.records, &rec.endpoint).with_extension("server.lock");
-    let until = Instant::now() + THERMAL_LOCK_WAIT;
-    let failed = |e: anyhow::Error| ServerError::StopFailed { endpoint: rec.endpoint.clone(), pid: rec.pid, detail: format!("{e:#}") };
+    let lock = lock_within(&lock_path, THERMAL_LOCK_WAIT)
+        .map_err(|e| ServerError::StopFailed { endpoint: rec.endpoint.clone(), pid: rec.pid, detail: format!("{e:#}") })?;
+    let signaled = stop_locked(dirs, rec, bounds)?;
+    Ok(match (signaled, lock.is_some()) {
+        (false, _) => StopOutcome::NotRunning,
+        (true, true) => StopOutcome::Stopped,
+        (true, false) => StopOutcome::StoppedWithoutLock,
+    })
+}
+
+/// The lock at `path`, tried until `wait` passes; `None` when another
+/// holder kept it that long.
+fn lock_within(path: &Path, wait: Duration) -> anyhow::Result<Option<darkmux_types::flock::FlockGuard>> {
+    let until = Instant::now() + wait;
     loop {
-        if let Some(_lock) = darkmux_types::flock::try_lock_exclusive(&lock_path).map_err(failed)? {
-            return Ok(if stop_locked(dirs, rec, bounds)? { StopOutcome::Stopped } else { StopOutcome::NotRunning });
-        }
-        if Instant::now() >= until {
-            break;
+        let lock = darkmux_types::flock::try_lock_exclusive(path)?;
+        if lock.is_some() || Instant::now() >= until {
+            return Ok(lock);
         }
         std::thread::sleep(THERMAL_LOCK_POLL);
     }
-    Ok(if stop_locked(dirs, rec, bounds)? { StopOutcome::StoppedWithoutLock } else { StopOutcome::NotRunning })
 }
 
 /// How long the thermal stop tries for an endpoint's lock before it stops
