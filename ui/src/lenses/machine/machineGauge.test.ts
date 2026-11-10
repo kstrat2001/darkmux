@@ -476,6 +476,36 @@ describe("modelKvLine — unchanged from the retired modelLines()'s fourth eleme
   });
 });
 
+describe("modelKvLine for a server darkmux started (#3450)", () => {
+  it("names the engine, endpoint and port, and the measured memory, never a weights or kv figure", () => {
+    const server = {
+      endpoint: "tensorfold",
+      engine: "tensorfold",
+      model: "TensorFold/q38",
+      served_name: "darkmux:TensorFold/q38",
+      n_ctx: 262144,
+      port: 8091,
+      pid: 4242,
+      started_at_ms: 0,
+      answering: true,
+    };
+    const line = modelKvLine(
+      model({
+        identifier: "darkmux:TensorFold/q38",
+        loaded_ctx: 262144,
+        weights_bytes: null as unknown as number,
+        kv_per_token_bytes: null as unknown as number,
+        kv_bytes_at_ctx: null as unknown as number,
+        potential_bytes: 21474836480,
+        current_bytes: 21474836480,
+        potential_source: "measured",
+        server,
+      }),
+    );
+    expect(line).toBe("ctx 262144 · tensorfold server for TensorFold/q38 on endpoint tensorfold, port 8091 · measured 20.00 GiB");
+  });
+});
+
 describe("isEstimatedRow — the #1819 provenance predicate", () => {
   it("true only when potential_source is exactly 'estimated'", () => {
     expect(isEstimatedRow(model({ potential_source: "estimated" }))).toBe(true);

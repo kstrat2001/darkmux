@@ -7,4 +7,4 @@
  * Absent (not serialized) on a [`ModelRow`] with no potential at all —
  * see [`ModelRow::potential_source`].
  */
-export type PotentialSource = "arch" | "estimated" | "unknown";
+export type PotentialSource = "arch" | "estimated" | "measured" | "unknown";

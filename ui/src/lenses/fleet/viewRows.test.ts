@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import type { AcceptsState } from "../../types/generated/AcceptsState";
 import { UtilityResidency } from "../../lib/utilityJobs";
-import { machineIsHub, rowUtility, specsLine, rowServesProfiles, rowServesRadio, outcomeLine, rowFacts, rowIsHub, rowStanding, rowUid } from "./viewRows";
+import { machineIsHub, rowUtility, specsLine, rowServesProfiles, rowServesRadio, outcomeLine, rowFacts, rowIsHub, rowStanding, rowUid, rowEngineServers } from "./viewRows";
 import type { CardOutcome } from "../../types/generated/CardOutcome";
 import type { FleetMachine } from "../../types/generated/FleetMachine";
 import type { MachineCard } from "../../types/generated/MachineCard";
@@ -19,6 +19,7 @@ const SPECS: MachineSpecsResponse = {
   ram_free_for_ai_bytes: null,
   cpu_brand: "Apple M1 Max",
   loaded_models: [],
+  engine_servers: [],
   lms_unreachable: false,
   engine: null,
   utility_model: null,
@@ -263,6 +264,29 @@ describe("rowServesProfiles: only the row's own card says it", () => {
     expect(rowServesProfiles({ ...r, card: { ...r.card, card: { ...r.card.card, serves_profiles: 4 } } })).toBe(4);
     expect(rowServesProfiles({ ...r, card: { ...r.card, card: { ...r.card.card, serves_profiles: 0 } } })).toBe(0);
     expect(rowServesProfiles(row({ card: { state: "unreachable", reason: "listener_off", detail: null } }))).toBe(0);
+  });
+});
+
+describe("rowEngineServers (#3450): the servers the row's own card lists", () => {
+  it("the card's servers, and none for a card not read or one from a darkmux that lists none", () => {
+    const tf = {
+      endpoint: "tensorfold",
+      engine: "tensorfold",
+      model: "TensorFold/q38",
+      served_name: "darkmux:TensorFold/q38",
+      n_ctx: 262144,
+      port: 8091,
+      pid: 4242,
+      started_at_ms: 0,
+      answering: false,
+    };
+    const card = { specs: { ...SPECS, engine_servers: [tf] } } as unknown as MachineCard;
+    const r = row({ card: { state: "available", card, source: "listener" } });
+    expect(rowEngineServers(r)).toEqual([tf]);
+    expect(rowFacts(r, new Set(), null).engineServers).toEqual([tf]);
+    const older = { specs: { ...SPECS, engine_servers: undefined } } as unknown as MachineCard;
+    expect(rowEngineServers(row({ card: { state: "available", card: older, source: "listener" } }))).toEqual([]);
+    expect(rowEngineServers(row({ card: { state: "unreachable", reason: "listener_off", detail: null } }))).toEqual([]);
   });
 });
 

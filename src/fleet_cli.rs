@@ -2161,7 +2161,7 @@ mod trust_tests {
         body["darkmux_version"] = serde_json::json!("9.9.9");
         let out = peer_resources_view("studio", body, false).unwrap();
         assert!(out.contains("resources unreadable"), "{out}");
-        assert!(out.contains("schema_version 2.1") && out.contains("darkmux_version 9.9.9"), "{out}");
+        assert!(out.contains("schema_version 2.2") && out.contains("darkmux_version 9.9.9"), "{out}");
         assert!(out.contains("integer `12`"), "what could not be read is named: {out}");
     }
 
@@ -2170,11 +2170,11 @@ mod trust_tests {
         let mut body = peer_resources_body();
         body["limit_source"] = serde_json::json!(12);
         let err = peer_resources_view("studio", body.clone(), true).unwrap_err().to_string();
-        assert!(err.contains("schema_version 2.1") && err.contains("the schema matches"), "{err}");
+        assert!(err.contains("schema_version 2.2") && err.contains("the schema matches"), "{err}");
         assert!(!err.contains("differs"), "a version mismatch nobody observed is claimed: {err}");
         body["schema_version"] = serde_json::json!("3.0");
         let err = peer_resources_view("studio", body, true).unwrap_err().to_string();
-        assert!(err.contains("schema_version 3.0") && err.contains("reads ledger schema 2.1"), "{err}");
+        assert!(err.contains("schema_version 3.0") && err.contains("reads ledger schema 2.2"), "{err}");
     }
 
     #[test]
