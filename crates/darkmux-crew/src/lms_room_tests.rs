@@ -143,7 +143,7 @@ impl Rig {
         let bounds = server::Bounds { start: Duration::from_secs(5), stop_grace: Duration::from_secs(2), poll: Duration::from_millis(20) };
         // A load's reservation is kept, as it is while memory pages in, until
         // its lease drops.
-        ServerRoom { dirs: self.dirs(), bounds, machine, settle: |res, need, _| { res.set(need); } }
+        ServerRoom { dirs: self.dirs(), bounds, machine, settle: |res, need, _| { res.set(need); }, workers: || Some(0) }
     }
 }
 
@@ -882,10 +882,10 @@ impl Preflight for FakePreflight {
     fn commitment(&self, _model_key: &str, _n_ctx: u32) -> Option<u64> {
         self.commitment
     }
-    fn reclaimable(&self) -> Option<u64> {
-        Some(64 * GIB)
+    fn workers(&self) -> Option<u64> {
+        Some(0)
     }
-    fn settle(&self, lease: LeaseGuard, res: Reservation, need: u64, _free_before: u64) {
+    fn settle(&self, lease: LeaseGuard, res: Reservation, need: u64, _before: Option<u64>) {
         self.settled.lock().unwrap().push(need);
         drop((res, lease));
     }
@@ -929,4 +929,66 @@ fn a_preflight_reload_never_unloads_an_instance_a_dispatch_holds() {
     let idle = FakePreflight { held: Vec::new(), commitment: None, settled: Default::default() };
     unload_unless_held(&idle, "darkmux:util", &unload).unwrap();
     assert_eq!(*unloaded.lock().unwrap(), ["darkmux:util"]);
+}
+
+/// (#3514) A wave that only reuses what is resident takes no residency
+/// lock: a resident dispatch goes ahead while another dispatch's decision
+/// (which may wait on a slow `lms unload`) holds it.
+#[test]
+#[serial_test::serial]
+fn a_reuse_only_wave_never_waits_on_the_residency_lock() {
+    let rig = Rig::new();
+    let held = darkmux_types::residency_lock::acquire().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let dirs = rig.dirs();
+    std::thread::spawn(move || {
+        let free = || Some(64 * GIB);
+        let machine = FakeMachine::new(&free);
+        let room = ServerRoom { dirs, bounds: server::Bounds::default(), machine: &machine, settle: |_, _, _| {}, workers: || None };
+        let mut host = MockHost::new().resident("darkmux:m", "m", 8_000, Some(GIB)).cataloged("m", GIB);
+        let lease = LeaseGuard::acquire();
+        let _ = tx.send(ensure_wave_loaded(&wave("m"), &FixedEstimator::default(), &mut host, &lease, None, &room).map(|()| host.ops));
+    });
+    let reused = rx.recv_timeout(Duration::from_secs(5)).expect("the reuse did not wait on the lock");
+    drop(held);
+    assert_eq!(reused.unwrap(), [HostOp::ListResident], "reused, and nothing else asked");
+}
+
+/// (#3514) The reviewer's case: while a load's memory pages in, another
+/// consumer takes 10 GiB a tick and the load itself does not grow. Its
+/// reservation is measured on LM Studio's workers, which did not grow, so
+/// it holds; measured on the machine's falling free memory it would end.
+/// When the workers grow, it shrinks and ends.
+#[test]
+#[serial_test::serial]
+fn a_loads_reservation_is_measured_on_lm_studios_workers_not_free_memory() {
+    let _rig = Rig::new();
+    let need = 30 * GIB;
+    let reserve = |lease: &LeaseGuard| {
+        lease.write_starting(&["darkmux:a".to_string()], need).unwrap();
+        lease.mark_loaded_reserving(&["darkmux:a".to_string()], need).unwrap()
+    };
+    let ticks = std::cell::Cell::new(0u64);
+    let seen = std::cell::RefCell::new(Vec::new());
+    let observe = |_: Duration| {
+        ticks.set(ticks.get() + 1);
+        seen.borrow_mut().push(LeaseGuard::acquire().reserved_by_others());
+    };
+    // The workers stay at 8 GiB; the free memory falls 10 GiB a tick.
+    let lease = LeaseGuard::acquire();
+    let workers = || Some(8 * GIB);
+    settle_load(reserve(&lease), need, Some(8 * GIB), &workers, &observe, Duration::from_millis(2_000));
+    assert!(seen.borrow().iter().all(|r| *r == need), "held through every tick: {:?}", seen.borrow());
+    drop(lease);
+    // The workers grow 10 GiB a tick: the reservation shrinks to nothing.
+    seen.borrow_mut().clear();
+    ticks.set(0);
+    let lease = LeaseGuard::acquire();
+    let growing = || Some(8 * GIB + ticks.get() * 10 * GIB);
+    settle_load(reserve(&lease), need, Some(8 * GIB), &growing, &observe, Duration::from_millis(5_000));
+    assert_eq!(*seen.borrow(), [need, 20 * GIB, 10 * GIB], "{:?}", seen.borrow());
+    assert_eq!(LeaseGuard::acquire().reserved_by_others(), 0, "ended once the workers grew by the need");
+    // Workers it cannot read keep the whole reservation.
+    assert_eq!(grown_since(Some(GIB), None), None);
+    assert_eq!(grown_since(None, Some(GIB)), None);
 }

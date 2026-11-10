@@ -82,6 +82,12 @@ pub fn acquire() -> Result<ResidencyLock> {
     Ok(ResidencyLock { _guard: crate::flock::lock_exclusive(&lock_path())? })
 }
 
+/// (#3514) The lock when nobody holds it, `None` at once when someone does:
+/// for a caller that need not wait (a reuse decides nothing about memory).
+pub fn try_acquire() -> Result<Option<ResidencyLock>> {
+    Ok(crate::flock::try_lock_exclusive(&lock_path())?.map(|g| ResidencyLock { _guard: g }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

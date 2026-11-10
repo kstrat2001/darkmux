@@ -2078,6 +2078,23 @@ fn parse_worker_rss(ps_out: &str) -> Vec<WorkerProc> {
         .collect()
 }
 
+/// (#3514) LM Studio's inference workers' memory now: the sum of their
+/// `phys_footprint`, never RSS (a server's RSS can read 0.1 GiB against a
+/// 24 GB footprint). `None` when `ps` or any worker's footprint cannot be
+/// read. Other apps and engine servers never move it.
+pub fn lmstudio_workers_footprint() -> Option<u64> {
+    let out = bounded_stdout("ps", &["-axo", "pid=,rss=,command="], "ps-workers", SYS_PROBE_BOUND, &mut Vec::new())?;
+    workers_footprint(&enrich_with_footprint(parse_worker_rss(&out), |pid| {
+        u32::try_from(pid).ok().and_then(|p| darkmux_platform::current().process_footprint(p))
+    }))
+}
+
+/// The sum of `workers`' footprints; `None` when any is unknown. No worker
+/// at all is 0: LM Studio holds no model yet.
+fn workers_footprint(workers: &[WorkerProc]) -> Option<u64> {
+    workers.iter().map(|w| w.footprint_bytes).sum()
+}
+
 /// Fills each worker's `footprint_bytes` from `probe`.
 ///
 /// Split out with the probe INJECTED rather than inlined at the gather so the
@@ -3632,6 +3649,16 @@ esac
         let long = est.estimate_bytes("m", 65_536, Some(&catalog)).unwrap();
         assert!(short > 4_000_000_000, "weights plus KV and margin: {short}");
         assert_eq!(long - short, 32 * 8 * 128 * 2 * 2 * (65_536 - 4_096), "the KV term grows with the context, per the architecture");
+    }
+
+    /// (#3514) The workers' footprint is their phys_footprint sum, never
+    /// RSS, and unknown when any worker's is.
+    #[test]
+    fn lm_studio_workers_footprint_sums_phys_footprint_never_rss() {
+        let w = |rss, fp| WorkerProc { pid: 1, rss_bytes: rss, footprint_bytes: fp };
+        assert_eq!(workers_footprint(&[w(100, Some(24_000)), w(5, Some(1_000))]), Some(25_000));
+        assert_eq!(workers_footprint(&[w(100, Some(24_000)), w(5, None)]), None, "one unreadable worker is no figure");
+        assert_eq!(workers_footprint(&[]), Some(0), "no worker holds nothing");
     }
 
     /// (#3514) The reader that answered names the format, and the format

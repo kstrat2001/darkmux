@@ -55,8 +55,12 @@ pub(crate) struct ServerRoom<'a> {
     pub(crate) bounds: server::Bounds,
     pub(crate) machine: &'a (dyn Machine + Sync),
     /// (#3509) Keeps a load's reservation until its memory pages in, given
-    /// the reservation, the need and the free figure read before the load.
-    pub(crate) settle: fn(Reservation, u64, u64),
+    /// the reservation, the need and LM Studio's workers' footprint read
+    /// before the load.
+    pub(crate) settle: fn(Reservation, u64, Option<u64>),
+    /// (#3514) LM Studio's workers' footprint now
+    /// ([`darkmux_profiles::model_ledger::lmstudio_workers_footprint`]).
+    pub(crate) workers: fn() -> Option<u64>,
 }
 
 /// This machine, as the LM Studio path reads it: the wave already knows its
@@ -66,17 +70,34 @@ static THIS_MACHINE: ThisMachine<'static> = ThisMachine { profiles_file: None };
 impl ServerRoom<'static> {
     /// This machine: the records under darkmux's home, its real memory.
     pub(crate) fn this_machine() -> Self {
-        ServerRoom { dirs: Dirs::under_home(), bounds: server::Bounds::default(), machine: &THIS_MACHINE, settle: settle_on_this_machine }
+        ServerRoom {
+            dirs: Dirs::under_home(),
+            bounds: server::Bounds::default(),
+            machine: &THIS_MACHINE,
+            settle: settle_on_this_machine,
+            workers: darkmux_profiles::model_ledger::lmstudio_workers_footprint,
+        }
     }
 }
 
 /// (#3509) A load answers before its memory has all paged in (MLX maps its
 /// weights and touches them on first use), so its reservation outlives the
 /// load: [`crate::engine_dispatch::settle_reservation`], on a thread of its
-/// own, with what the machine's free figure has fallen by since the load
+/// own, with the growth of LM Studio's workers' footprint since the load
 /// began as the load's footprint (LM Studio names no process per model).
-fn settle_on_this_machine(res: Reservation, need: u64, free_before: u64) {
-    std::thread::spawn(move || settle_on_this_machine_now(res, need, free_before));
+/// (#3514) Not the fall in the machine's free memory: another app, an
+/// engine start or another load would end the reservation early. A
+/// concurrent LM Studio load does grow the workers, but holds its own
+/// reservation.
+fn settle_on_this_machine(res: Reservation, need: u64, before: Option<u64>) {
+    std::thread::spawn(move || settle_on_this_machine_now(res, need, before));
+}
+
+/// What a load has paged in: how far LM Studio's workers have grown since
+/// `before`. `None` when either reading is missing, which keeps the whole
+/// reservation until the bound (never ends it early).
+pub(crate) fn grown_since(before: Option<u64>, now: Option<u64>) -> Option<u64> {
+    Some(now?.saturating_sub(before?))
 }
 
 impl ServerRoom<'_> {
@@ -397,10 +418,11 @@ pub(crate) trait Preflight {
     fn lock(&self) -> anyhow::Result<darkmux_types::residency_lock::ResidencyLock>;
     /// What loading `model_key` at `n_ctx` commits, when it can be priced.
     fn commitment(&self, model_key: &str, n_ctx: u32) -> Option<u64>;
-    fn reclaimable(&self) -> Option<u64>;
+    /// LM Studio's workers' footprint now.
+    fn workers(&self) -> Option<u64>;
     /// Keep `res` until the load's memory pages in, holding `lease` that
     /// long.
-    fn settle(&self, lease: LeaseGuard, res: Reservation, need: u64, free_before: u64);
+    fn settle(&self, lease: LeaseGuard, res: Reservation, need: u64, before: Option<u64>);
 }
 
 /// This machine's [`Preflight`].
@@ -419,26 +441,41 @@ impl Preflight for ThisPreflight {
         let pricer = LoadPricer::new(host.arch_facts(&[model_key]));
         pricer.figures(model_key, n_ctx, Some(&catalog))?.commitment
     }
-    fn reclaimable(&self) -> Option<u64> {
-        darkmux_types::residency_lock::reclaimable_bytes()
+    fn workers(&self) -> Option<u64> {
+        darkmux_profiles::model_ledger::lmstudio_workers_footprint()
     }
-    fn settle(&self, lease: LeaseGuard, res: Reservation, need: u64, free_before: u64) {
+    fn settle(&self, lease: LeaseGuard, res: Reservation, need: u64, before: Option<u64>) {
         std::thread::spawn(move || {
-            settle_on_this_machine_now(res, need, free_before);
+            settle_on_this_machine_now(res, need, before);
             drop(lease);
         });
     }
 }
 
 /// [`settle_on_this_machine`] on the calling thread.
-fn settle_on_this_machine_now(res: Reservation, need: u64, free_before: u64) {
-    crate::engine_dispatch::settle_reservation(
+fn settle_on_this_machine_now(res: Reservation, need: u64, before: Option<u64>) {
+    settle_load(
         res,
         need,
-        &|| darkmux_types::residency_lock::reclaimable_bytes().map(|f| free_before.saturating_sub(f)),
+        before,
+        &darkmux_profiles::model_ledger::lmstudio_workers_footprint,
         &std::thread::sleep,
         crate::engine_dispatch::SETTLE_BOUND,
     )
+}
+
+/// Keep a load's reservation of `need` until LM Studio's `workers` have
+/// grown by it since `before`, or `bound` passes
+/// ([`crate::engine_dispatch::settle_reservation`]).
+pub(crate) fn settle_load(
+    res: Reservation,
+    need: u64,
+    before: Option<u64>,
+    workers: &dyn Fn() -> Option<u64>,
+    sleep: &dyn Fn(std::time::Duration),
+    bound: std::time::Duration,
+) {
+    crate::engine_dispatch::settle_reservation(res, need, &|| grown_since(before, workers()), sleep, bound)
 }
 
 /// (#3514) A preflight reload's unload of the stale instance, refused
@@ -468,34 +505,35 @@ pub(crate) fn load_reserved(
     load: &dyn Fn(&str, &str, u32) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let models = [identifier.to_string()];
-    let (lease, need, free_before) = reserve_preflight(gate, model_key, &models, n_ctx)?;
+    let (lease, need, before) = reserve_preflight(gate, model_key, &models, n_ctx)?;
     load(model_key, identifier, n_ctx)?;
     if let Some(bytes) = need {
         let res = lease.mark_loaded_reserving(&models, bytes)?;
-        gate.settle(lease, res, bytes, free_before);
+        gate.settle(lease, res, bytes, before);
     }
     Ok(())
 }
 
 /// [`load_reserved`]'s part under the lock: the lease and its reservation,
-/// and the free figure read before the load. The lock is let go on return.
+/// and LM Studio's workers' footprint read before the load. The lock is let
+/// go on return.
 fn reserve_preflight(
     gate: &dyn Preflight,
     model_key: &str,
     models: &[String],
     n_ctx: u32,
-) -> anyhow::Result<(LeaseGuard, Option<u64>, u64)> {
+) -> anyhow::Result<(LeaseGuard, Option<u64>, Option<u64>)> {
     let _lock = gate.lock().map_err(|e| {
         refuse("model_start_failed", format!("could not take darkmux's residency lock ({e:#}); check that darkmux's home is writable"))
     })?;
     let lease = LeaseGuard::acquire();
     let need = gate.commitment(model_key, n_ctx);
-    let free_before = gate.reclaimable().unwrap_or(0);
+    let before = gate.workers();
     match need {
         Some(bytes) => lease.write_starting(models, bytes)?,
         None => lease.write(models)?,
     }
-    Ok((lease, need, free_before))
+    Ok((lease, need, before))
 }
 
 /// A machine whose memory is unknown, for tests that plan without one.
@@ -529,7 +567,15 @@ impl ServerRoom<'static> {
     /// No machine figures: the planner plans with no pool, as it did before
     /// it read the machine.
     pub(crate) fn unknown_machine() -> Self {
-        ServerRoom { dirs: Dirs::under_home(), bounds: server::Bounds::default(), machine: &UnknownMachine, settle: |res, _, _| { res.set(0); } }
+        ServerRoom {
+            dirs: Dirs::under_home(),
+            bounds: server::Bounds::default(),
+            machine: &UnknownMachine,
+            settle: |res, _, _| {
+                res.set(0);
+            },
+            workers: || None,
+        }
     }
 }
 

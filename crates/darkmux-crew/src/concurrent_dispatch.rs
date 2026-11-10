@@ -1052,12 +1052,12 @@ pub(crate) fn ensure_wave_loaded(
     }
 }
 
-/// (#3509) What a wave reserved for its loads: their commitment, and the
-/// free figure read before they began.
+/// (#3509) What a wave reserved for its loads: their commitment, and LM
+/// Studio's workers' footprint read before they began.
 #[derive(Debug, Clone, Copy)]
 struct Starting {
     need: u64,
-    free_before: u64,
+    workers_before: Option<u64>,
 }
 
 /// One wave's load, as each attempt of [`ensure_wave_loaded`] decides and
@@ -1084,9 +1084,10 @@ impl WaveLoad<'_> {
     /// before the first `lms load` begins, never held across a load: from
     /// there the reservation counts the load.
     fn decide_and_load(&self, host: &mut dyn ModelHost, committed: &mut Vec<String>) -> Result<(PlanExecOutcome, Vec<String>, Option<Starting>)> {
-        let lock = darkmux_types::residency_lock::acquire().map_err(|e| {
-            wave_error(Some("model_start_failed"), format!("could not take darkmux's residency lock ({e:#}); check that darkmux's home is writable"))
-        })?;
+        let lock = match self.lock_unless_reused(host, committed)? {
+            Ok(lock) => lock,
+            Err(reused) => return Ok((PlanExecOutcome::Loaded, reused, None)),
+        };
         let residents = host
             .list_resident()
             .map_err(|e| anyhow!("darkmux: could not read LMStudio residents (`lms ps`): {e}{}", partial_execution_note(committed)))?;
@@ -1144,8 +1145,7 @@ impl WaveLoad<'_> {
         self.lease.write_starting(self.own_models, need.need_bytes).map_err(|e| {
             wave_error(Some("model_start_failed"), format!("could not record this wave's reservation ({e:#}); check that darkmux's home is writable"))
         })?;
-        let free_before = self.room.machine.reclaimable().unwrap_or(0);
-        Ok(Some(Starting { need: need.need_bytes, free_before }))
+        Ok(Some(Starting { need: need.need_bytes, workers_before: (self.room.workers)() }))
     }
 
     /// A wave that did not load ends its reservation.
@@ -1153,6 +1153,45 @@ impl WaveLoad<'_> {
         if starting.is_some() {
             let _ = self.lease.write_starting(self.own_models, 0);
         }
+    }
+
+    /// (#3514) The residency lock, or (`Err`, with the leases read) a wave
+    /// that only reuses what is resident. A reuse decides nothing about
+    /// memory and never waits on the lock, as the engine path's reuse takes
+    /// none: when another dispatch holds it (its decision may wait on a slow
+    /// `lms unload`), the wave reads without it, and only one that loads or
+    /// unloads waits for it and decides again under it. A free lock is taken
+    /// at once, and the wave decides under it, reading once.
+    fn lock_unless_reused(
+        &self,
+        host: &mut dyn ModelHost,
+        committed: &[String],
+    ) -> Result<std::result::Result<darkmux_types::residency_lock::ResidencyLock, Vec<String>>> {
+        let unlocked = |e: anyhow::Error| {
+            wave_error(Some("model_start_failed"), format!("could not take darkmux's residency lock ({e:#}); check that darkmux's home is writable"))
+        };
+        if let Some(lock) = darkmux_types::residency_lock::try_acquire().map_err(unlocked)? {
+            return Ok(Ok(lock));
+        }
+        if let Some(reused) = self.reuse_only(host, committed)? {
+            return Ok(Err(reused));
+        }
+        darkmux_types::residency_lock::acquire().map(Ok).map_err(unlocked)
+    }
+
+    /// (#3514) The leases read, when the wave only reuses what is resident
+    /// at its context: nothing loads, unloads or refuses, so nothing is
+    /// decided about memory. `None` when the wave must decide under the lock.
+    fn reuse_only(&self, host: &mut dyn ModelHost, committed: &[String]) -> Result<Option<Vec<String>>> {
+        let residents = host
+            .list_resident()
+            .map_err(|e| anyhow!("darkmux: could not read LMStudio residents (`lms ps`): {e}{}", partial_execution_note(committed)))?;
+        let facts = Facts { residents, utility_binding: self.utility_binding.map(str::to_string), ..Default::default() };
+        let pinned = self.held();
+        let opts = AcquireOpts { pinned: pinned.clone(), ..AcquireOpts::new(CallerIntent::Auto, AcquireScope::Exclusive) };
+        let plan = plan_acquire(self.unique, &facts, opts, self.est);
+        let reuses = plan.actions.iter().all(|a| matches!(a.action, Action::Reuse { .. }));
+        Ok(reuses.then_some(pinned))
     }
 
     /// What every other live darkmux dispatch holds, read now (the comment
@@ -1180,7 +1219,7 @@ impl WaveLoad<'_> {
     /// until its memory pages in ([`crate::lms_room::ServerRoom::settle`]).
     fn mark_loaded(&self, starting: Option<Starting>) {
         let marked = match starting {
-            Some(st) => self.lease.mark_loaded_reserving(self.own_models, st.need).map(|res| (self.room.settle)(res, st.need, st.free_before)),
+            Some(st) => self.lease.mark_loaded_reserving(self.own_models, st.need).map(|res| (self.room.settle)(res, st.need, st.workers_before)),
             None => self.lease.mark_loaded(self.own_models),
         };
         if let Err(e) = marked {
