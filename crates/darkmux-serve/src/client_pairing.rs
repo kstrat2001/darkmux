@@ -3387,7 +3387,6 @@ pub(crate) async fn workspace_changes_handler(
 
 /// `/changes`, blocking, for `client`'s workspace `name`.
 fn branch_changes(st: &ClientServerState, client: &ApprovedClient, name: &str) -> Response {
-    use crate::client_workspace as ws;
     let dir = match owned_workspace(st, client, name) {
         Ok(d) => d,
         Err(r) => return *r,
@@ -3406,44 +3405,10 @@ fn branch_changes(st: &ClientServerState, client: &ApprovedClient, name: &str) -
     let (Some(base), Some(head)) = (git_line(&dir, &["merge-base", "HEAD", &default]), git_line(&dir, &["rev-parse", "HEAD"])) else {
         return err(StatusCode::CONFLICT, ClientCode::Conflict, "couldn't find where this branch left the default branch");
     };
-    let Some(listing) = git(&dir, None, &["diff", "--no-renames", "--name-status", "-z", &base, &head]) else {
-        return internal(anyhow!("listing the branch's changes failed"));
+    let files = match crate::client_changes::branch_files(&dir, &base, &head, MAX_CHANGES_BYTES) {
+        Ok(f) => f,
+        Err(e) => return changes_refusal(e),
     };
-    let fields: Vec<String> = String::from_utf8_lossy(&listing.stdout)
-        .split('\0')
-        .filter(|f| !f.is_empty())
-        .map(str::to_string)
-        .collect();
-    let mut files = Vec::new();
-    let mut total = 0usize;
-    for pair in fields.chunks(2) {
-        let [status, path] = pair else { continue };
-        if status.starts_with('D') {
-            files.push(BranchFile {
-                path: path.clone(),
-                deleted: Some(true),
-                mode: None,
-                content: None,
-            });
-            continue;
-        }
-        let Some(blob) = git(&dir, None, &["show", &format!("{head}:{path}")]) else {
-            return internal(anyhow!("reading {path} failed"));
-        };
-        total += blob.stdout.len();
-        if total > MAX_CHANGES_BYTES {
-            return err(StatusCode::PAYLOAD_TOO_LARGE, ClientCode::PayloadTooLarge, "the branch's changes are too large to send");
-        }
-        let mode = git_line(&dir, &["--literal-pathspecs", "ls-tree", &head, "--", path])
-            .and_then(|l| l.split_whitespace().next().map(str::to_string))
-            .unwrap_or_else(|| "100644".to_string());
-        files.push(BranchFile {
-            path: path.clone(),
-            deleted: None,
-            mode: Some(mode),
-            content: Some(ws::base64_encode(&blob.stdout)),
-        });
-    }
     Json(BranchChanges {
         base,
         base_branch,
@@ -3452,6 +3417,18 @@ fn branch_changes(st: &ClientServerState, client: &ApprovedClient, name: &str) -
         files,
     })
     .into_response()
+}
+
+/// The reply for a branch whose files could not be read.
+fn changes_refusal(e: crate::client_changes::ChangesError) -> Response {
+    use crate::client_changes::ChangesError;
+    match e {
+        ChangesError::Listing => internal(anyhow!("listing the branch's changes failed")),
+        ChangesError::Unreadable(path) => internal(anyhow!("reading {path} failed")),
+        ChangesError::TooLarge => {
+            err(StatusCode::PAYLOAD_TOO_LARGE, ClientCode::PayloadTooLarge, "the branch's changes are too large to send")
+        }
+    }
 }
 
 /// The work copy must be on a branch, and (with an origin) on a `mux/`
