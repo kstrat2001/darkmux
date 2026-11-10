@@ -114,24 +114,29 @@ pub fn find(source: &str, wanted: &str, limit: usize) -> Vec<(usize, usize)> {
         if at < next || end > page.len() {
             continue;
         }
-        // Whole words only: "more" is not found inside "furthermore".
-        let alnum = |i: Option<usize>| {
-            i.and_then(|i| page.get(i))
-                .is_some_and(|(c, _, _)| c.is_alphanumeric())
-        };
-        let cut_word = (want[0].is_alphanumeric() && alnum(at.checked_sub(1)))
-            || (want[want.len() - 1].is_alphanumeric() && alnum(Some(end)));
-        if !cut_word
-            && page[at..end]
-                .iter()
-                .map(|(c, _, _)| *c)
-                .eq(want.iter().copied())
-        {
+        if matches_at(&page, &want, at) {
             found.push((page[at].1, page[end - 1].2));
             next = end;
         }
     }
     found
+}
+
+/// Whether `want` is the whole words of `page` starting at `at`.
+fn matches_at(page: &[(char, usize, usize)], want: &[char], at: usize) -> bool {
+    let end = at + want.len();
+    // Whole words only: "more" is not found inside "furthermore".
+    let alnum = |i: Option<usize>| {
+        i.and_then(|i| page.get(i))
+            .is_some_and(|(c, _, _)| c.is_alphanumeric())
+    };
+    let cut_word = (want[0].is_alphanumeric() && alnum(at.checked_sub(1)))
+        || (want[want.len() - 1].is_alphanumeric() && alnum(Some(end)));
+    !cut_word
+        && page[at..end]
+            .iter()
+            .map(|(c, _, _)| *c)
+            .eq(want.iter().copied())
 }
 
 #[cfg(test)]
