@@ -73,6 +73,20 @@ export function startFlowTail(
   handlers?: FlowTailHandlers,
 ): FlowTailHandle {
   let source: EventSource | null = null;
+  // Records parsed since the last cache write. Every write re-merges the
+  // whole 24h window downstream (`useFlowWindow`), so a burst of records is
+  // one write per animation frame, not one per record. A hidden tab runs no
+  // frames: its records wait here and land in one write when it returns.
+  let pending: NormRecord[] = [];
+  let frame: number | null = null;
+
+  const flush = () => {
+    frame = null;
+    if (!pending.length) return;
+    const batch = pending;
+    pending = [];
+    queryClient.setQueryData<NormRecord[]>(queryKey, (prev) => [...(prev ?? []), ...batch]);
+  };
 
   const appendRecord = (raw: string) => {
     let parsed: unknown;
@@ -85,7 +99,8 @@ export function startFlowTail(
     }
     const rec = ingestRecord(parsed);
     if (!rec) return;
-    queryClient.setQueryData<NormRecord[]>(queryKey, (prev) => [...(prev ?? []), rec]);
+    pending.push(rec);
+    frame ??= requestAnimationFrame(flush);
   };
 
   const open = () => {
@@ -114,6 +129,10 @@ export function startFlowTail(
 
   return {
     close: () => {
+      // What is still waiting for its frame belongs to this tail's day: write
+      // it now, so a rollover or an unmount loses nothing.
+      if (frame !== null) cancelAnimationFrame(frame);
+      flush();
       source?.close();
       source = null;
       document.removeEventListener("visibilitychange", onVisibilityChange);

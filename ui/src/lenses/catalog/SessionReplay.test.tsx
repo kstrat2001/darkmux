@@ -1462,6 +1462,29 @@ describe("SessionReplay TOK/S tile — rendered-surface pinning (#2886 pass 5)",
     expect(document.querySelector('[data-testid="run-token-scope"] .modelbox__note')?.textContent).toBe("disconnected");
   });
 
+  // A frozen daemon over a run whose last heartbeats were FRESH: the reading
+  // was "generating", never a stall, so only a downgrade of every state
+  // keeps the run page from animating a rate it can no longer see.
+  it("shows 'disconnected' over fresh heartbeats too, not the last rate it saw", async () => {
+    vi.useFakeTimers();
+    const t0 = 1_800_000_000_000;
+    vi.setSystemTime(t0);
+    const fresh = [
+      { ts: new Date(t0 - 10_000).toISOString(), action: "dispatch.start", session_id: "s-fresh", machine_id: "M", payload: { role: "coder" } },
+      { ts: new Date(t0 - 4_000).toISOString(), action: "dispatch.turn.heartbeat", session_id: "s-fresh", machine_id: "M", payload: { sampled_at_ms: t0 - 4_000, generated_chars: 40 } },
+      { ts: new Date(t0 - 2_000).toISOString(), action: "dispatch.turn.heartbeat", session_id: "s-fresh", machine_id: "M", payload: { sampled_at_ms: t0 - 2_000, generated_chars: 400 } },
+    ];
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records: fresh }), { status: 200 }))));
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <SessionReplay sessionId="s-fresh" connected={false} />
+      </QueryClientProvider>,
+    );
+    await vi.waitFor(() => expect(document.querySelector('[data-testid="run-token-scope"]')).toBeInTheDocument());
+    expect(latestTokenScopeProps()).toMatchObject({ state: "nosignal", centerLabel: null });
+    expect(document.querySelector('[data-testid="run-token-scope"] .modelbox__note')?.textContent).toBe("disconnected");
+  });
+
   // (finding F5, "effectiveConnected = connected") A SCRUBBED playhead must
   // read as connected REGARDLESS of the live `connected` prop — history is
   // not affected by whether the live page happens to be connected right

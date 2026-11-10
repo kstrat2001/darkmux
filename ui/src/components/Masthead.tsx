@@ -4,6 +4,7 @@ import { CatalogPanel } from "../lenses/catalog/CatalogPanel";
 import { openModalEl } from "../lib/dialogManager";
 import { isLiveRoute, type Route } from "../lib/route";
 import { todayUTC } from "../lib/flow";
+import { clkhm } from "../lib/format";
 import { injectedMeta } from "../lib/injectedMeta";
 // (#2022) The mark, from the SAME file the site and the icon generator read —
 // one source, so a future change to the identity cannot leave a stale copy
@@ -113,9 +114,14 @@ export function Masthead({
   liveStatus,
   replayDate = null,
   subject = "resolved",
+  dataAsOfMs = null,
 }: {
   route: Route;
   liveStatus: LiveTailStatus;
+  /** The last moment the daemon answered this page (`useLiveTail`'s
+   * contact). While the stream is down the pill says how old the page's
+   * data is; ignored while it is live. */
+  dataAsOfMs?: number | null;
   /** The day a daemon dispatch/mission page belongs to, once the shell has
    * derived it from the records; `null` until then and on every other route.
    * Read only once `subject` is `resolved`: before that the pill is neutral
@@ -245,7 +251,7 @@ export function Masthead({
           {srcbadgeText(route, replayDate)}
         </span>
       ) : (
-        <CatalogPanel label={mastheadPillLabel(route, replayDate, subject, liveStatus, announcedLiveStatus)} />
+        <CatalogPanel label={mastheadPillLabel(route, replayDate, subject, { liveStatus, announced: announcedLiveStatus, dataAsOfMs })} />
       )}
       <nav className="masthead__nav">
         <a href="https://darkmux.com/" target="_blank" rel="noopener">
@@ -350,14 +356,9 @@ function showsRefetch(route: Route, replayDate: string | null, subject: SubjectS
 /** (#2284) `pillLabel`, or the neutral label while the subject is not
  * resolved. The neutral label keeps the stream's own announcement: a dropped
  * stream is still announced as reconnecting. */
-function mastheadPillLabel(
-  route: Route,
-  replayDate: string | null,
-  subject: SubjectState,
-  liveStatus: LiveTailStatus,
-  announcedLiveStatus: "live" | "reconnecting",
-): ReactNode {
-  if (subject === "resolved") return pillLabel(route, replayDate, liveStatus, announcedLiveStatus);
+function mastheadPillLabel(route: Route, replayDate: string | null, subject: SubjectState, transport: PillTransport): ReactNode {
+  const announcedLiveStatus = transport.announced;
+  if (subject === "resolved") return pillLabel(route, replayDate, transport);
   const text = NEUTRAL_TEXT[subject];
   return (
     <>
@@ -464,14 +465,31 @@ function useAnnouncedLiveStatus(liveStatus: LiveTailStatus): "live" | "reconnect
   return announced;
 }
 
-function pillLabel(
-  route: Route,
-  replayDate: string | null,
-  liveStatus: LiveTailStatus,
-  announcedLiveStatus: "live" | "reconnecting",
-): ReactNode {
+/** What the pill knows about the transport: the stream's status, the
+ * debounced text a screen reader hears, and the last contact with the
+ * daemon (`null` when unknown). */
+interface PillTransport {
+  liveStatus: LiveTailStatus;
+  announced: "live" | "reconnecting";
+  dataAsOfMs: number | null;
+}
+
+/** The live pill's words. A dropped stream says so ON the pill, with the
+ * time of the page's last contact, so a frozen daemon cannot go on reading
+ * LIVE (the dot alone carried it before, with the word only in a tooltip).
+ * The words wait out the same hold the announcement does, so a page that
+ * has not opened its stream yet, or a hiccup that heals inside the hold,
+ * never flashes them; the dot is still instant. */
+function livePillText(transport: PillTransport): string {
+  if (transport.liveStatus === "live" || transport.announced === "live") return LIVE_CHIP;
+  return transport.dataAsOfMs != null ? `reconnecting · data as of ${clkhm(transport.dataAsOfMs)}` : "reconnecting";
+}
+
+function pillLabel(route: Route, replayDate: string | null, transport: PillTransport): ReactNode {
   if (isLiveRoute(route) && replayDate == null) {
+    const { liveStatus } = transport;
     const connected = liveStatus === "live";
+    const text = livePillText(transport);
     return (
       <>
         <span aria-hidden="true">
@@ -482,10 +500,12 @@ function pillLabel(
           >
             {connected ? "●" : "◌"}
           </span>
-          <span className="masthead__pilltext">{LIVE_CHIP}</span>
+          <span className="masthead__pilltext" title={text === LIVE_CHIP ? undefined : text}>
+            {text}
+          </span>
         </span>
         <span className="mm-sr-only" aria-live="polite">
-          {announcedLiveStatus}
+          {transport.announced}
         </span>
       </>
     );

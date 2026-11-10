@@ -2723,6 +2723,24 @@ describe("savings hero: nothing leaks while loading (#2830)", () => {
       expect(card.className, "the machine is still running").toContain("active");
       expect(latestTokenScopeProps()).toMatchObject({ state: "nosignal" });
     });
+
+    // A frozen daemon: the last heartbeat says the model is reading a big
+    // prompt, which stays a fresh PROMPT reading for minutes. With the page
+    // disconnected the card must not go on claiming it.
+    it("a card reading a prompt says 'disconnected' once the page loses the daemon, not 'processing'", async () => {
+      mockFleetFetch({
+        flowToday: [
+          { ts: t1a, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+          { ts: t2, machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: Date.parse(t2), generated_chars: 0, turn_seq: 1, prompt_chars: 144_000 } },
+        ],
+      });
+      renderFleetLens({ connected: false });
+      await waitFor(() => expect(document.querySelector('[data-testid="fleet-token-scope"]')).not.toBeNull());
+      const card = document.querySelector(".mach")!;
+      await waitFor(() => expect(card.querySelector(".stat")!.textContent).toBe("disconnected"));
+      expect(card.className).toContain("nosignal");
+      expect(latestTokenScopeProps()).toMatchObject({ state: "nosignal" });
+    });
   });
 });
 

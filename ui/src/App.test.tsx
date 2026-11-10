@@ -1496,7 +1496,9 @@ describe("App", () => {
       await waitFor(() => expect(calls()).toBeGreaterThan(before));
       await vi.advanceTimersByTimeAsync(100);
       expect(seen.filter((t) => t.includes("couldn't read"))).toEqual([]);
-      expect(document.querySelector(".catalog-toggle")?.textContent).toContain("LIVE");
+      // The live pill, by its transport dot: past the reconnect hold, jsdom's
+      // stream-less page reads "reconnecting" there rather than the word LIVE.
+      expect(document.querySelector(".catalog-toggle .masthead__pilldot[data-state]")).not.toBeNull();
     } finally {
       vi.useRealTimers();
     }
@@ -1511,7 +1513,8 @@ describe("App", () => {
       renderApp();
       await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toContain("couldn't read this run"), { timeout: 3000 });
       await vi.advanceTimersByTimeAsync(6000);
-      await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toContain("LIVE"), { timeout: 3000 });
+      // The live pill, by its transport dot (see the test above).
+      await waitFor(() => expect(document.querySelector(".catalog-toggle .masthead__pilldot[data-state]")).not.toBeNull(), { timeout: 3000 });
       expect(seen.filter((t) => t.includes("▣"))).toEqual([]);
     } finally {
       vi.useRealTimers();
