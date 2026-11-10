@@ -355,6 +355,48 @@ pub fn listed(dirs: &Dirs) -> Vec<EngineServer> {
     out
 }
 
+/// (#3450) The memory darkmux's server `pid` holds: the one figure every
+/// surface uses (a ledger row, a dispatch's room decision, a start's
+/// reservation). It is the physical footprint of the process the server
+/// leads and of every process in the group it leads (it is spawned leading
+/// one; Tensorfold may fork workers), never RSS: both engines run on MLX,
+/// whose weights sit in Metal memory that only the footprint counts (a
+/// Flint server read live: 0.1 GiB RSS, a 24 GB footprint). `None` when the
+/// leader's footprint cannot be read (it exited, or the platform reads
+/// none).
+pub fn memory(pid: u32) -> Option<u64> {
+    let host = darkmux_platform::current();
+    memory_in(pid, group_listing().as_deref(), &|p| host.process_footprint(p))
+}
+
+/// [`memory`] over a `ps -axo pid=,pgid=` listing (`None` when it could not
+/// be read: the leader alone then) and a footprint reader.
+pub fn memory_in(pid: u32, ps_rows: Option<&str>, footprint: &dyn Fn(u32) -> Option<u64>) -> Option<u64> {
+    let leader = footprint(pid)?;
+    let workers: u64 = ps_rows
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let mut it = line.split_whitespace().map(str::parse::<u32>);
+            match (it.next(), it.next()) {
+                (Some(Ok(p)), Some(Ok(group))) if group == pid && p != pid => Some(p),
+                _ => None,
+            }
+        })
+        .filter_map(footprint)
+        .sum();
+    Some(leader + workers)
+}
+
+/// Every process and its group, as `ps -axo pid=,pgid=` lists them;
+/// `None` when the listing could not be read.
+pub fn group_listing() -> Option<String> {
+    let mut cmd = Command::new("ps");
+    cmd.args(["-axo", "pid=,pgid="]);
+    crate::process::pin_cwd(&mut cmd);
+    cmd.output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
 /// (#3450) darkmux's live server serving `model` (a profile model on an
 /// endpoint darkmux starts servers for): the one on its endpoint, started
 /// with its id. The context is the caller's to compare. Read only.
@@ -1753,5 +1795,39 @@ S(("127.0.0.1", port), H).serve_forever()
         engine_record::write_in(&f.dirs.records, &reused).unwrap();
         assert_eq!(stop_for_thermal(&f.dirs, &reused, quick()), Ok(StopOutcome::NotRunning));
         assert!(darkmux_platform::current().process_start_stamp(stranger.0.id()).is_some(), "a reused pid is never signaled");
+    }
+
+    /// (#3450) A server's memory is one figure everywhere (the ledger, a
+    /// dispatch's room decision, a start's reservation): the physical
+    /// footprint of the process it leads and of every process in its group,
+    /// never RSS. Read live: a Flint server is one process with 0.1 GiB RSS
+    /// and a 24 GB footprint (its model in Metal memory), and a server's
+    /// leader can be tiny while a forked worker holds the weights.
+    #[test]
+    fn a_servers_memory_is_its_groups_footprint_never_rss() {
+        let flint = |pid: u32| (pid == 43963).then_some(24_000_000_000u64);
+        assert_eq!(memory_in(43963, Some("  43963  43963\n"), &flint), Some(24_000_000_000));
+        // A tiny leader, a worker holding the weights, a stranger's process.
+        let rows = "  100  100\n  101  100\n  300  300\n";
+        let fp = |pid: u32| match pid {
+            100 => Some(10 << 20),
+            101 => Some(20_000_000_000),
+            300 => Some(5_000_000_000),
+            _ => None,
+        };
+        assert_eq!(memory_in(100, Some(rows), &fp), Some((10 << 20) + 20_000_000_000));
+        assert_eq!(memory_in(100, None, &fp), Some(10 << 20), "no process listing: the leader alone");
+        assert_eq!(memory_in(100, Some(rows), &|p| (p != 100).then_some(1)), None, "no footprint for the leader: not measured");
+        // On this machine: a leader that forked a child holds both.
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 30 & sleep 30"]);
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        let group = Reaped(cmd.spawn().unwrap());
+        std::thread::sleep(Duration::from_millis(300));
+        let host = darkmux_platform::current();
+        if let Some(leader) = host.process_footprint(group.0.id()) {
+            let total = memory(group.0.id()).expect("measured");
+            assert!(total > leader, "the forked child counts too: {total} vs the leader's {leader}");
+        }
     }
 }

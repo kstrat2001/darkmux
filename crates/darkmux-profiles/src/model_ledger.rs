@@ -758,7 +758,8 @@ impl WorkerProc {
 
 
 /// (#3450) A server darkmux started that is running now, and its measured
-/// memory ([`server_memory`]); `None` when it could not be measured.
+/// memory ([`crate::engine::server::memory`]); `None` when it could not be
+/// measured.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerInput {
     pub server: crate::engine::server::EngineServer,
@@ -2115,32 +2116,6 @@ fn enrich_with_footprint(mut workers: Vec<WorkerProc>, probe: impl Fn(i64) -> Op
     workers
 }
 
-/// (#3450) The memory darkmux's server `pid` holds: itself and every process
-/// in the group it leads (it is spawned leading one; Tensorfold forks
-/// workers). Each process counts at its physical footprint where the
-/// platform reads one: a forked worker's RSS counts again every page it
-/// shares with its leader, its footprint does not, and both engines are MLX,
-/// whose memory is the footprint (see [`WorkerProc::memory_bytes`]). Where
-/// there is no footprint (Linux today) it counts at RSS, and the sum then
-/// overcounts the pages the group shares. `ps_rows` is
-/// `ps -axo pid=,pgid=,rss=`. `None` when `pid` is not in the listing (it
-/// exited).
-fn server_memory(pid: u32, ps_rows: &str, footprint: impl Fn(u32) -> Option<u64>) -> Option<u64> {
-    let mut seen_leader = false;
-    let mut total = 0;
-    for line in ps_rows.lines() {
-        let mut it = line.split_whitespace().map(str::parse::<u64>);
-        let (Some(Ok(p)), Some(Ok(group)), Some(Ok(rss_kib))) = (it.next(), it.next(), it.next()) else { continue };
-        let Ok(p) = u32::try_from(p) else { continue };
-        if p != pid && group != u64::from(pid) {
-            continue;
-        }
-        seen_leader |= p == pid;
-        total += footprint(p).unwrap_or(rss_kib * 1024);
-    }
-    seen_leader.then_some(total)
-}
-
 /// (#3450) darkmux's servers running now and what each holds. One `ps` read
 /// for all of them, and none when darkmux runs no server.
 fn gather_servers(messages: &mut Vec<LedgerMessage>) -> Vec<ServerInput> {
@@ -2148,13 +2123,14 @@ fn gather_servers(messages: &mut Vec<LedgerMessage>) -> Vec<ServerInput> {
     if listed.is_empty() {
         return Vec::new();
     }
-    let ps = bounded_stdout("ps", &["-axo", "pid=,pgid=,rss="], "ps-servers", SYS_PROBE_BOUND, messages);
+    // One process listing for every server's group; each is measured as
+    // every surface measures it (`server::memory_in`: the group's footprint).
+    let ps = bounded_stdout("ps", &["-axo", "pid=,pgid="], "ps-servers", SYS_PROBE_BOUND, messages);
+    let host = darkmux_platform::current();
     listed
         .into_iter()
         .map(|server| {
-            let memory_bytes = ps.as_deref().and_then(|rows| {
-                server_memory(server.pid, rows, |p| darkmux_platform::current().process_footprint(p))
-            });
+            let memory_bytes = crate::engine::server::memory_in(server.pid, ps.as_deref(), &|p| host.process_footprint(p));
             ServerInput { server, memory_bytes }
         })
         .collect()
@@ -2551,36 +2527,54 @@ mod tests {
         assert_eq!(l.machine.other_used_bytes, Some(40_000_000_000 - 33_000_000_000 - 5_000_000_000));
     }
 
-    /// (#3450) A server's memory is its whole process group's (Tensorfold
-    /// forks workers), and the server itself if it left the group, each at
-    /// `max(rss, footprint)`; nothing else on the machine.
+    /// (#3450) The ledger measures each running server as every other
+    /// surface does (`server::memory`: its whole group's footprint).
     #[test]
-    fn a_servers_memory_sums_the_group_it_leads() {
-        let ps = "  4242  4242  1024\n  4300  4242  2048\n  4301  9999  4096\n  4302  4242  8\n";
-        let footprint = |pid: u32| match pid {
-            4242 => Some(10 * 1024 * 1024),
-            4302 => Some(3 * 1024 * 1024),
-            _ => None,
+    #[serial_test::serial]
+    fn the_ledger_measures_a_server_with_the_shared_figure() {
+        let home = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("DARKMUX_HOME");
+        // SAFETY: #[serial]; restored below.
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "sleep 30 & sleep 30"]);
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        let mut child = cmd.spawn().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let pid = child.id();
+        let stamp = darkmux_platform::current().process_start_stamp(pid).expect("a start stamp");
+        let rec = darkmux_types::engine_record::EngineRecord {
+            schema: darkmux_types::engine_record::ENGINE_RECORD_SCHEMA,
+            endpoint: "tf".into(),
+            engine: "tensorfold".into(),
+            model: "m".into(),
+            n_ctx: 8192,
+            port: 1,
+            pid,
+            start_stamp: stamp,
+            owner_pid: std::process::id(),
+            argv: vec!["tf".into(), "--name".into(), "darkmux:m".into()],
+            log: home.path().join("tf.log"),
+            started_at_ms: 0,
+            engine_version: "fake".into(),
         };
-        // 4242: max(1 MiB rss, 10 MiB) + 4300: 2 MiB rss + 4302: max(8 KiB, 3 MiB).
-        assert_eq!(server_memory(4242, ps, footprint), Some(15 * 1024 * 1024));
-        assert_eq!(server_memory(7777, ps, footprint), None, "no such process: not measured");
-        // (#3450 review) A forked worker's RSS counts the pages it shares with
-        // its leader again; its footprint does not, so a footprint wins when
-        // there is one, larger RSS or not.
-        let shared = "  4242  4242  1024\n  4303  4242  51200\n";
-        let fp = |pid: u32| match pid {
-            4242 => Some(10 * 1024 * 1024),
-            4303 => Some(1024 * 1024),
-            _ => None,
-        };
-        assert_eq!(server_memory(4242, shared, fp), Some(11 * 1024 * 1024));
-        // A Flint server as read live: no children, RSS 0.1 GiB, its model in
-        // Metal memory, which only its footprint (24 GB) counts.
-        let flint = "  43963  43963  104858\n";
-        assert_eq!(server_memory(43963, flint, |_| Some(24_000_000_000)), Some(24_000_000_000));
-        let left = "  4242  1  1024\n  4300  4242  2048\n";
-        assert_eq!(server_memory(4242, left, |_| None), Some(3 * 1024 * 1024), "a leader outside its group still counts");
+        darkmux_types::engine_record::write_in(&darkmux_types::engine_record::dir(), &rec).unwrap();
+        let gathered = gather_servers(&mut Vec::new());
+        let shared = crate::engine::server::memory(pid);
+        let leader = darkmux_platform::current().process_footprint(pid);
+        let _ = darkmux_types::child_registry::kill_group(pid, darkmux_types::child_registry::SIGKILL);
+        let _ = child.wait();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        assert_eq!(gathered.len(), 1);
+        assert_eq!(gathered[0].memory_bytes, shared);
+        if let Some(leader) = leader {
+            assert!(gathered[0].memory_bytes.is_some_and(|m| m > leader), "the group, not the leader alone");
+        }
     }
 
     /// (#3450) The table names a server's engine and endpoint.
