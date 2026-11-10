@@ -34,6 +34,7 @@ pub mod paths;
 pub mod profile_address;
 pub mod residency_lease;
 pub mod residency_lock;
+pub mod residency_reservation;
 pub mod run_pause;
 pub mod session_id;
 pub mod shell;

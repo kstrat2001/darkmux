@@ -12,6 +12,10 @@
 //! actively dispatching to," fed into gestalt's `AcquireOpts.pinned` (#1487
 //! PR1) so a reconcile pass never touches a busy resident.
 //!
+//! A lease says a running dispatch holds a model, and nothing about memory:
+//! what a start reserves while its memory pages in is a record of its own
+//! ([`crate::residency_reservation`]), which never pins a model.
+//!
 //! # Location + format
 //!
 //! One JSON file per live process at `<darkmux-home>/residency/<pid>.lease`
@@ -147,16 +151,6 @@ struct LeaseFile {
     /// its pid. `None` where the start time could not be read; see the module doc's pid-liveness section.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     started: Option<u64>,
-    /// (#3509) The memory this process's starts still in flight need, bytes:
-    /// the sum of its holders' reservations ([`LeaseGuard::write_starting`]).
-    /// Absent (0) when nothing is starting. Every memory decision subtracts
-    /// it from the free figure it reads ([`crate::residency_lock`]).
-    #[serde(default, skip_serializing_if = "is_zero")]
-    need_bytes: u64,
-}
-
-fn is_zero(n: &u64) -> bool {
-    *n == 0
 }
 
 /// The process-wide same-process-aggregation registry (#2651): every
@@ -175,9 +169,6 @@ fn is_zero(n: &u64) -> bool {
 struct LeaseEntry {
     desired: Vec<String>,
     loaded: Vec<String>,
-    /// (#3509) What this holder's start still needs, bytes, until it marks
-    /// the model loaded; 0 when it is not starting anything.
-    need_bytes: u64,
 }
 
 /// Several accessors touch this mutex: [`LeaseGuard::write`] and
@@ -247,57 +238,8 @@ impl LeaseGuard {
             // `mark_loaded` again for a narrower re-`write`.
             entry.loaded.retain(|m| entry.desired.contains(m));
         }
-        let (desired, loaded, need) = union_of(&active);
-        write_lease_file(self.pid, &desired, &loaded, need)
-    }
-
-    /// (#3509) [`write`](Self::write) for a holder about to start its
-    /// model: `models` as its desired set, and `need_bytes` reserved until it
-    /// marks a model loaded ([`mark_loaded`](Self::mark_loaded)) or drops.
-    /// Written under the residency lock, right before the start is spawned
-    /// ([`crate::residency_lock`]'s protocol), so a decision made while the
-    /// start's memory has not paged in yet still counts it.
-    pub fn write_starting(&self, models: &[String], need_bytes: u64) -> Result<()> {
-        let mut active = ACTIVE_LEASES.lock().unwrap_or_else(|poison| poison.into_inner());
-        {
-            let entry = active.entry(self.token).or_default();
-            entry.desired = models.to_vec();
-            entry.loaded.retain(|m| entry.desired.contains(m));
-            entry.need_bytes = need_bytes;
-        }
-        let (desired, loaded, need) = union_of(&active);
-        write_lease_file(self.pid, &desired, &loaded, need)
-    }
-
-    /// (#3509) [`mark_loaded`](Self::mark_loaded) for a start whose memory
-    /// is still paging in after its model answers: `models` are marked
-    /// loaded and `still_needed` bytes stay reserved, in one write, so no
-    /// decision in between reads the start as uncounted. The returned
-    /// [`Reservation`] shrinks it as the memory pages in, and ends it.
-    pub fn mark_loaded_reserving(&self, models: &[String], still_needed: u64) -> Result<Reservation> {
-        let mut active = ACTIVE_LEASES.lock().unwrap_or_else(|poison| poison.into_inner());
-        {
-            let entry = active.entry(self.token).or_default();
-            for m in models {
-                if entry.desired.contains(m) && !entry.loaded.contains(m) {
-                    entry.loaded.push(m.clone());
-                }
-            }
-            entry.need_bytes = still_needed;
-        }
-        let (desired, loaded, need) = union_of(&active);
-        write_lease_file(self.pid, &desired, &loaded, need)?;
-        Ok(Reservation { pid: self.pid, token: self.token })
-    }
-
-    /// (#3509) The memory every OTHER holder's start still in flight has
-    /// reserved, bytes: other processes' leases and this process's other
-    /// guards, never this guard's own.
-    pub fn reserved_by_others(&self) -> u64 {
-        let foreign: u64 = live_foreign_leases(self.pid).iter().map(|f| f.lease.need_bytes).sum();
-        let active = ACTIVE_LEASES.lock().unwrap_or_else(|poison| poison.into_inner());
-        let siblings: u64 = active.iter().filter(|(t, _)| **t != self.token).map(|(_, e)| e.need_bytes).sum();
-        foreign.saturating_add(siblings)
+        let (desired, loaded) = union_of(&active);
+        write_lease_file(self.pid, &desired, &loaded)
     }
 
     /// (#2672) Mark `models` — a subset of THIS guard's own current
@@ -329,14 +271,9 @@ impl LeaseGuard {
                     entry.loaded.push(m.clone());
                 }
             }
-            // (#3509) Loaded: its memory is in the free figure now, so the
-            // reservation ends.
-            if models.iter().any(|m| entry.desired.contains(m)) {
-                entry.need_bytes = 0;
-            }
         }
-        let (desired, loaded, need) = union_of(&active);
-        write_lease_file(self.pid, &desired, &loaded, need)
+        let (desired, loaded) = union_of(&active);
+        write_lease_file(self.pid, &desired, &loaded)
     }
 
     /// This guard's own tie-break priority for [`identifiers_i_should_lead`]
@@ -493,32 +430,6 @@ impl LeaseGuard {
     }
 }
 
-/// (#3509) One guard's reservation, held apart from the guard so another
-/// thread can shrink it as the start's memory pages in
-/// ([`LeaseGuard::mark_loaded_reserving`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Reservation {
-    pid: u32,
-    token: u64,
-}
-
-impl Reservation {
-    /// Reserve `need_bytes` now (0 ends the reservation). `false` once the
-    /// guard is gone: a dropped guard reserves nothing, and is never brought
-    /// back.
-    pub fn set(&self, need_bytes: u64) -> bool {
-        let mut active = ACTIVE_LEASES.lock().unwrap_or_else(|poison| poison.into_inner());
-        let Some(entry) = active.get_mut(&self.token) else { return false };
-        if entry.need_bytes == need_bytes {
-            return true;
-        }
-        entry.need_bytes = need_bytes;
-        let (desired, loaded, need) = union_of(&active);
-        let _ = write_lease_file(self.pid, &desired, &loaded, need);
-        true
-    }
-}
-
 impl Drop for LeaseGuard {
     fn drop(&mut self) {
         let mut active = ACTIVE_LEASES.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -531,8 +442,8 @@ impl Drop for LeaseGuard {
         if active.is_empty() {
             let _ = remove_lease(self.pid);
         } else {
-            let (desired, loaded, need) = union_of(&active);
-            let _ = write_lease_file(self.pid, &desired, &loaded, need);
+            let (desired, loaded) = union_of(&active);
+            let _ = write_lease_file(self.pid, &desired, &loaded);
         }
     }
 }
@@ -541,15 +452,14 @@ impl Drop for LeaseGuard {
 /// `desired` set and, separately, `loaded` set — sorted so the on-disk file
 /// (and every test asserting its content) is deterministic regardless of
 /// token-insertion order or `HashMap` iteration order.
-fn union_of(active: &HashMap<u64, LeaseEntry>) -> (Vec<String>, Vec<String>, u64) {
+fn union_of(active: &HashMap<u64, LeaseEntry>) -> (Vec<String>, Vec<String>) {
     let mut desired: Vec<String> = active.values().flat_map(|e| e.desired.iter().cloned()).collect();
     desired.sort();
     desired.dedup();
     let mut loaded: Vec<String> = active.values().flat_map(|e| e.loaded.iter().cloned()).collect();
     loaded.sort();
     loaded.dedup();
-    let need = active.values().fold(0u64, |sum, e| sum.saturating_add(e.need_bytes));
-    (desired, loaded, need)
+    (desired, loaded)
 }
 
 /// Write `models`/`loaded` to `<pid>.lease`, wholesale — the shared private
@@ -557,7 +467,7 @@ fn union_of(active: &HashMap<u64, LeaseEntry>) -> (Vec<String>, Vec<String>, u64
 /// mark_loaded`], and `Drop`, all already holding [`ACTIVE_LEASES`]'s lock
 /// when they call this) use, so the serialize-atomic-rename mechanics live
 /// in exactly one place.
-fn write_lease_file(pid: u32, models: &[String], loaded: &[String], need_bytes: u64) -> Result<()> {
+fn write_lease_file(pid: u32, models: &[String], loaded: &[String]) -> Result<()> {
     let dir = residency_dir();
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = lease_path(&dir, pid);
@@ -567,7 +477,6 @@ fn write_lease_file(pid: u32, models: &[String], loaded: &[String], need_bytes: 
         models: models.to_vec(),
         loaded: loaded.to_vec(),
         started: process_start_stamp(pid),
-        need_bytes,
     };
     let json = serde_json::to_string_pretty(&payload).context("serializing residency lease")?;
     fs::write(&tmp, &json).with_context(|| format!("writing {}", tmp.display()))?;
@@ -818,49 +727,25 @@ mod tests {
         pid
     }
 
-    /// (#3509) A start's reservation counts for every other holder, in this
-    /// process and (through the file) in others, until the start marks its
-    /// model loaded or drops; never for the holder itself.
+    /// A reservation is not a lease: memory a start reserves makes no model
+    /// read as held, and a lease reserves no memory.
     #[serial_test::serial]
     #[test]
-    fn a_starting_reservation_counts_for_others_until_loaded_or_dropped() {
+    fn a_reservation_holds_no_model_and_a_lease_reserves_no_memory() {
         let tmp = TempDir::new().unwrap();
         let _env = EnvGuard::set(tmp.path());
-        let starting = LeaseGuard::acquire();
         let other = LeaseGuard::acquire();
-        starting.write_starting(&["darkmux:big".to_string()], 30 << 30).unwrap();
-        assert_eq!(other.reserved_by_others(), 30 << 30, "a sibling in this process counts it");
-        assert_eq!(starting.reserved_by_others(), 0, "never its own");
-        let file: LeaseFile =
-            serde_json::from_str(&fs::read_to_string(lease_path(&residency_dir(), std::process::id())).unwrap()).unwrap();
-        assert_eq!(file.need_bytes, 30 << 30, "another process reads it off the lease file");
-        starting.mark_loaded(&["darkmux:big".to_string()]).unwrap();
-        assert_eq!(other.reserved_by_others(), 0, "loaded: its memory is in the free figure now");
-        starting.write_starting(&["darkmux:big".to_string()], 8 << 30).unwrap();
-        drop(starting);
-        assert_eq!(other.reserved_by_others(), 0, "dropped: nothing is reserved");
-    }
-
-    /// (#3509) A start whose memory is still paging in when its model
-    /// answers stays reserved, shrinking as it pages in, until it is set to
-    /// 0 or its guard drops; a handle never brings a dropped guard back.
-    #[serial_test::serial]
-    #[test]
-    fn a_reservation_outlives_the_ready_until_it_is_settled() {
-        let tmp = TempDir::new().unwrap();
-        let _env = EnvGuard::set(tmp.path());
-        let starting = LeaseGuard::acquire();
-        let other = LeaseGuard::acquire();
-        starting.write_starting(&["darkmux:big".to_string()], 30 << 30).unwrap();
-        let res = starting.mark_loaded_reserving(&["darkmux:big".to_string()], 30 << 30).unwrap();
-        assert_eq!(other.reserved_by_others(), 30 << 30, "answering is not paged in");
-        assert!(res.set(10 << 30));
-        assert_eq!(other.reserved_by_others(), 10 << 30, "shrinks as it pages in");
-        assert!(res.set(0));
-        assert_eq!(other.reserved_by_others(), 0);
-        drop(starting);
-        assert!(!res.set(5 << 30), "a dropped guard reserves nothing");
-        assert_eq!(other.reserved_by_others(), 0);
+        let unread = crate::residency_reservation::Servers { alive: &crate::residency_reservation::same_process, footprint: &|_| None };
+        let start = crate::residency_reservation::Reserved::begin(30 << 30).unwrap();
+        assert!(other.all_live_leased_models().is_empty(), "a reservation pins nothing");
+        assert!(live_leased_models(0).is_empty(), "nor for another process");
+        let holder = LeaseGuard::acquire();
+        holder.write(&["darkmux:big".to_string()]).unwrap();
+        holder.mark_loaded(&["darkmux:big".to_string()]).unwrap();
+        assert_eq!(crate::residency_reservation::reserved(&unread), 30 << 30, "a lease adds nothing to what is reserved");
+        drop(holder);
+        assert_eq!(crate::residency_reservation::reserved(&unread), 30 << 30, "and a lease that ends takes no reservation with it");
+        drop(start);
     }
 
     #[serial_test::serial]
@@ -905,7 +790,7 @@ mod tests {
 
         let pid = dead_pid();
         let path = lease_path(&dir, pid);
-        let payload = LeaseFile { pid, models: vec!["darkmux:orphan".to_string()], loaded: vec![], started: None, need_bytes: 0 };
+        let payload = LeaseFile { pid, models: vec!["darkmux:orphan".to_string()], loaded: vec![], started: None };
         fs::write(&path, serde_json::to_string(&payload).unwrap()).unwrap();
         assert!(path.exists(), "precondition: the orphan lease file exists");
 
@@ -935,7 +820,6 @@ mod tests {
                 models: vec!["darkmux:m".to_string()],
                 loaded: vec!["darkmux:m".to_string()],
                 started,
-                need_bytes: 0,
             };
             fs::write(lease_path(&dir, p), serde_json::to_string(&lease).unwrap()).unwrap();
         }
@@ -967,7 +851,6 @@ mod tests {
             models: vec!["darkmux:m".to_string()],
             loaded: vec!["darkmux:m".to_string()],
             started: Some(now.wrapping_add(1)),
-            need_bytes: 0,
         };
         let path = lease_path(&dir, pid);
         fs::write(&path, serde_json::to_string(&lease).unwrap()).unwrap();
@@ -1042,7 +925,6 @@ mod tests {
             models: vec!["darkmux:m".to_string()],
             loaded: vec!["darkmux:m".to_string()],
             started: Some(real.wrapping_add(1)),
-            need_bytes: 0,
         };
         let path = lease_path(&dir, 1);
         fs::write(&path, serde_json::to_string(&lease).unwrap()).unwrap();
@@ -1068,7 +950,6 @@ mod tests {
             models: vec!["darkmux:m".to_string()],
             loaded: vec!["darkmux:m".to_string()],
             started: process_start_stamp(pid),
-            need_bytes: 0,
         };
         assert!(lease.started.is_some(), "a same-user pid's start time is readable");
         let path = lease_path(&dir, pid);
@@ -1102,7 +983,6 @@ mod tests {
             models: vec!["darkmux:old".to_string()],
             loaded: vec!["darkmux:old".to_string()],
             started: Some(now.wrapping_add(1)),
-            need_bytes: 0,
         };
         fs::write(&path, serde_json::to_string(&stale).unwrap()).unwrap();
         let fresh = LeaseFile {
@@ -1110,7 +990,6 @@ mod tests {
             models: vec!["darkmux:new".to_string()],
             loaded: vec!["darkmux:new".to_string()],
             started: Some(now),
-            need_bytes: 0,
         };
         let fresh_json = serde_json::to_string(&fresh).unwrap();
         let hook_path = path.clone();
@@ -1417,7 +1296,6 @@ mod tests {
             models: vec!["darkmux:cross-process".to_string()],
             loaded: vec![],
             started: None,
-            need_bytes: 0,
         };
         fs::write(lease_path(&dir, holder_pid), serde_json::to_string(&cross_process_lease).unwrap())
             .expect("hand-writing a lease for the external holder pid");
