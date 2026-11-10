@@ -617,6 +617,24 @@ mod tests {
         assert_eq!((name.as_str(), force), ("hcr", true));
     }
 
+    /// What `client workspace rm` says about the branch: removed, a `mux/`
+    /// branch kept (and how to remove it), a branch of the user's left as
+    /// it is, or nothing when detached.
+    #[test]
+    fn workspace_rm_says_what_became_of_the_branch() {
+        use darkmux_serve::client_workspace::{Removal, WorkspaceKind};
+        let said = |branch: Option<&str>, branch_removed: bool| {
+            branch_said(&Removal { kind: WorkspaceKind::Worktree, branch: branch.map(str::to_string), branch_removed })
+        };
+        assert_eq!(said(Some("mux/app-abc123"), true), "; branch mux/app-abc123 removed");
+        assert_eq!(
+            said(Some("mux/app-abc123"), false),
+            "; branch mux/app-abc123 kept (no other branch holds its commits: `--force` removes it)"
+        );
+        assert_eq!(said(Some("feature"), false), "; branch feature left as it is");
+        assert_eq!(said(None, false), "");
+    }
+
     /// `client list` with no clients says so and how to approve what waits;
     /// with nothing waiting it names no approve command; an unreadable store
     /// refuses.
