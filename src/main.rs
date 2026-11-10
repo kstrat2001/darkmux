@@ -105,6 +105,7 @@ mod radio_answer;
 mod radio_busy;
 mod radio_index;
 mod card_status;
+mod machine_servers;
 mod role_cli;
 // `darkmux client` (local prototype): pairing an app and its scoped work.
 mod client_cli;
@@ -1420,13 +1421,21 @@ fn machine_status_remote(id: &str, json: bool) -> Result<i32> {
     let value = fleet_cli::fetch_peer_json(id, "/machine/status")?;
     let (lms_unreachable, models) = peer_resident_list(id, &value)?;
     let engine = peer_engine(id, &value)?;
+    let servers = peer_engine_servers(&value);
     if let Some(e) = engine.as_ref().filter(|e| e.usable && !e.reports_residency) {
-        return residents_not_reported(e, json, Some(id));
+        return residents_not_reported(e, &servers, json, Some(id));
     }
     if lms_unreachable {
-        return peer_residents_unknown(id, engine, json);
+        return peer_residents_unknown(id, engine, &servers, json);
     }
-    render_peer_residents(id, &models, engine.as_ref(), json)
+    render_peer_residents(id, &models, &servers, engine.as_ref(), json)
+}
+
+/// (#3450) The servers a peer's darkmux started, from its `/machine/status`;
+/// none from a peer before 5.10, which did not list them, or one whose list
+/// this darkmux does not read.
+fn peer_engine_servers(value: &serde_json::Value) -> Vec<darkmux_serve::wire::EngineServer> {
+    value.get("engine_servers").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default()
 }
 
 /// A reachable peer's residents, rendered like a local read, then (in human
@@ -1434,10 +1443,11 @@ fn machine_status_remote(id: &str, json: bool) -> Result<i32> {
 fn render_peer_residents(
     id: &str,
     models: &[types::LoadedModel],
+    servers: &[darkmux_serve::wire::EngineServer],
     engine: Option<&darkmux_serve::wire::MachineEngine>,
     json: bool,
 ) -> Result<i32> {
-    let code = render_residents(models, None, None, json, Some(id), engine)?;
+    let code = render_residents(Residents { loaded: models, servers }, None, None, json, Some(id), engine)?;
     if !json {
         println!();
         println!("{}", peer_utility_line(id));
@@ -1489,11 +1499,17 @@ fn peer_utility_line(id: &str) -> String {
 
 /// A peer whose resident list is not known: the unknown shape (`--json`) or
 /// the line naming why, exit 2.
-fn peer_residents_unknown(id: &str, engine: Option<darkmux_serve::wire::MachineEngine>, json: bool) -> Result<i32> {
+fn peer_residents_unknown(
+    id: &str,
+    engine: Option<darkmux_serve::wire::MachineEngine>,
+    servers: &[darkmux_serve::wire::EngineServer],
+    json: bool,
+) -> Result<i32> {
     if json {
-        cli_json::emit(&cli_json::MachineStatusOutput::lms_unreachable(Some(id.to_string()), engine))?;
+        cli_json::emit(&cli_json::MachineStatusOutput::lms_unreachable(Some(id.to_string()), engine, servers))?;
     } else {
         eprintln!("{}", peer_unreachable_line(id, engine.as_ref()));
+        print!("{}", machine_servers::status_section(servers, darkmux_flow::presence::now_ms()));
     }
     Ok(2)
 }
@@ -1541,14 +1557,21 @@ fn residents_unknown_line(engine: &darkmux_serve::wire::MachineEngine, why: &str
 
 /// `machine status` when this machine's resident list is not known: the
 /// unknown shape (`--json`) or the line naming why, exit 2.
-fn local_residents_unknown(engine: darkmux_serve::wire::MachineEngine, why: &str, json: bool) -> Result<i32> {
+fn local_residents_unknown(
+    engine: darkmux_serve::wire::MachineEngine,
+    why: &str,
+    servers: &[darkmux_serve::wire::EngineServer],
+    json: bool,
+) -> Result<i32> {
     if json {
         cli_json::emit(&cli_json::MachineStatusOutput::lms_unreachable(
             darkmux_types::config_access::machine_id(),
             Some(engine),
+            servers,
         ))?;
     } else {
         eprintln!("{}", residents_unknown_line(&engine, why));
+        print!("{}", machine_servers::status_section(servers, darkmux_flow::presence::now_ms()));
     }
     Ok(2)
 }
@@ -1556,10 +1579,15 @@ fn local_residents_unknown(engine: darkmux_serve::wire::MachineEngine, why: &str
 /// (#316) `machine status` on an engine that does not report what it holds:
 /// said plainly, exit 0 (it is not a failure). The JSON is the unknown shape
 /// (`lms_unreachable: true`, empty lists) with the engine saying why.
-fn residents_not_reported(engine: &darkmux_serve::wire::MachineEngine, json: bool, remote_id: Option<&str>) -> Result<i32> {
+fn residents_not_reported(
+    engine: &darkmux_serve::wire::MachineEngine,
+    servers: &[darkmux_serve::wire::EngineServer],
+    json: bool,
+    remote_id: Option<&str>,
+) -> Result<i32> {
     if json {
         let machine_id = remote_id.map(str::to_string).or_else(darkmux_types::config_access::machine_id);
-        cli_json::emit(&cli_json::MachineStatusOutput::lms_unreachable(machine_id, Some(engine.clone())))?;
+        cli_json::emit(&cli_json::MachineStatusOutput::lms_unreachable(machine_id, Some(engine.clone()), servers))?;
         return Ok(0);
     }
     let who = remote_id.map_or("this machine".to_string(), |id| format!("machine `{id}`"));
@@ -1568,6 +1596,7 @@ fn residents_not_reported(engine: &darkmux_serve::wire::MachineEngine, json: boo
          It loads whichever model a request names.",
         engine.name
     );
+    print!("{}", machine_servers::status_section(servers, darkmux_flow::presence::now_ms()));
     Ok(0)
 }
 
@@ -1585,12 +1614,13 @@ fn cmd_machine_status(id: Option<&str>, config: Option<&str>, json: bool) -> Res
     // condition from a PEER gets a parseable object and rc 2. One host's
     // answer to "can you see LMStudio" should not depend on which side of
     // the fleet is asking. Same shape, same exit code, both branches.
-    let darkmux_serve::EngineResidents { engine: engine_view, models: loaded, unknown } = darkmux_serve::local_engine_residents();
+    let darkmux_serve::EngineResidents { engine: engine_view, models: loaded, unknown, servers } =
+        darkmux_serve::local_engine_residents();
     if engine_view.usable && !engine_view.reports_residency {
-        return residents_not_reported(&engine_view, json, None);
+        return residents_not_reported(&engine_view, &servers, json, None);
     }
     if let Some(why) = unknown {
-        return local_residents_unknown(engine_view, &why, json);
+        return local_residents_unknown(engine_view, &why, &servers, json);
     }
     // Which registered profile(s) does the loaded set match? (The retired
     // top-level `status` verb's one unique dimension.)
@@ -1602,7 +1632,7 @@ fn cmd_machine_status(id: Option<&str>, config: Option<&str>, json: bool) -> Res
                         .registry
                         .profiles
                         .iter()
-                        .filter(|(_, p)| profile_matches(p, &loaded))
+                        .filter(|(_, p)| profile_matches(p, &loaded, &servers))
                         .map(|(k, _)| k.clone())
                         .collect(),
                 ),
@@ -1618,7 +1648,8 @@ fn cmd_machine_status(id: Option<&str>, config: Option<&str>, json: bool) -> Res
             }
             Err(_) => (None, None),
         };
-    let code = render_residents(&loaded, matches.as_deref(), registry_path.as_deref(), json, None, Some(&engine_view))?;
+    let residents = Residents { loaded: &loaded, servers: &servers };
+    let code = render_residents(residents, matches.as_deref(), registry_path.as_deref(), json, None, Some(&engine_view))?;
     if !json {
         println!();
         println!("{}", card_status::utility_line(darkmux_serve::local_utility_model(&loaded).as_ref(), true));
@@ -1626,17 +1657,26 @@ fn cmd_machine_status(id: Option<&str>, config: Option<&str>, json: bool) -> Res
     Ok(code)
 }
 
+/// What `machine status` lists: the engine's residents, and (#3450) the
+/// servers darkmux started.
+#[derive(Clone, Copy)]
+struct Residents<'a> {
+    loaded: &'a [types::LoadedModel],
+    servers: &'a [darkmux_serve::wire::EngineServer],
+}
+
 /// Shared renderer for `machine status` (local + remote): residents grouped
 /// by ownership, and — for a local read — the registry provenance +
 /// matching-profile lines. (#1426)
 fn render_residents(
-    loaded: &[types::LoadedModel],
+    residents: Residents<'_>,
     matches: Option<&[String]>,
     registry_path: Option<&str>,
     json: bool,
     remote_id: Option<&str>,
     engine: Option<&darkmux_serve::wire::MachineEngine>,
 ) -> Result<i32> {
+    let Residents { loaded, servers } = residents;
     let (managed, user): (Vec<_>, Vec<_>) = loaded
         .iter()
         .partition(|m| ownership::is_darkmux_owned(&m.identifier));
@@ -1648,6 +1688,7 @@ fn render_residents(
             engine: engine.cloned(),
             managed,
             user_state: user,
+            engine_servers: servers,
             matching_profiles: matches,
             registry: registry_path,
         })?;
@@ -1677,6 +1718,7 @@ fn render_residents(
             );
         }
     }
+    print!("{}", machine_servers::status_section(servers, darkmux_flow::presence::now_ms()));
     println!();
     println!("{}", darkmux_types::style::header(&format!("user state ({}):", user.len())));
     if user.is_empty() {
@@ -1717,6 +1759,11 @@ fn cmd_model_eject(dry_run: bool) -> Result<i32> {
     // `lms::list_loaded()` call total: `summary.user_loaded_count` already
     // carries what the old "nothing to eject" message needed, so there is
     // no separate peek to keep in sync with it.
+    // (#3450) darkmux's engine servers first, so a machine whose LM Studio
+    // cannot be asked still has them stopped.
+    let (out, err, servers_failed) = machine_servers::eject_lines(&ownership::eject_servers(dry_run), dry_run);
+    print!("{out}");
+    eprint!("{err}");
     let summary = ownership::eject_all_managed(dry_run)?;
     // (#2774 review C1) A stuck resident no longer aborts the sweep, so
     // report what did NOT come out alongside what did — and exit non-zero,
@@ -1733,16 +1780,12 @@ fn cmd_model_eject(dry_run: bool) -> Result<i32> {
                 summary.user_loaded_count
             );
         }
-        return Ok(0);
+        return Ok(i32::from(servers_failed));
     }
+    let (each, verb) = if dry_run { ("would eject", "would eject") } else { ("eject", "ejected") };
     for m in &summary.ejected {
-        if dry_run {
-            println!("would eject {} (ctx={})", m.identifier, m.context);
-        } else {
-            println!("eject {} (ctx={})", m.identifier, m.context);
-        }
+        println!("{each} {} (ctx={})", m.identifier, m.context);
     }
-    let verb = if dry_run { "would eject" } else { "ejected" };
     let mut line = format!("{verb} {} model(s)", summary.ejected.len());
     if summary.user_loaded_count > 0 {
         line.push_str(&format!(", respected {} user-loaded model(s)", summary.user_loaded_count));
@@ -1754,7 +1797,7 @@ fn cmd_model_eject(dry_run: bool) -> Result<i32> {
         line.push_str(" [DRY RUN]");
     }
     println!("{line}");
-    Ok(i32::from(had_failures))
+    Ok(i32::from(had_failures || servers_failed))
 }
 
 fn cmd_profile(sub: ProfileCmd) -> Result<i32> {
@@ -2040,7 +2083,11 @@ fn cmd_init(opts: init::InitOptions) -> Result<i32> {
     Ok(0)
 }
 
-fn profile_matches(profile: &types::Profile, loaded: &[types::LoadedModel]) -> bool {
+fn profile_matches(
+    profile: &types::Profile,
+    loaded: &[types::LoadedModel],
+    servers: &[darkmux_serve::wire::EngineServer],
+) -> bool {
     // (#1282) Endpoint-bearing (remote) models are served by their provider —
     // they never appear in `lms ps` — so the comparison covers LOCAL models
     // only. A hybrid profile (local + endpoint) therefore matches on its
@@ -2051,13 +2098,22 @@ fn profile_matches(profile: &types::Profile, loaded: &[types::LoadedModel]) -> b
     // status` reports that state as the profile it is rather than "matches
     // no registered profile". Any local load means the state isn't this
     // profile's.
-    let local: Vec<&types::ProfileModel> =
-        profile.models.iter().filter(|m| m.is_managed()).collect();
-    if local.len() != loaded.len() {
+    //
+    // (#3450) A model on an endpoint darkmux starts servers for is loaded
+    // when darkmux's server there runs it at its context; every running
+    // server is part of what is loaded, as every LM Studio load is.
+    let (on_servers, on_lms): (Vec<&types::ProfileModel>, Vec<&types::ProfileModel>) =
+        profile.models.iter().filter(|m| m.is_managed()).partition(|m| machine_servers::on_a_server(m));
+    if on_lms.len() != loaded.len() || on_servers.len() != servers.len() {
         return false;
     }
-    for m in local {
-        let ident = m.identifier.clone().unwrap_or_else(|| m.id.clone());
+    if !on_servers.iter().all(|m| machine_servers::serves(servers, m)) {
+        return false;
+    }
+    for m in on_lms {
+        // (#1274) The identifier darkmux loads and dispatches to; a bare copy
+        // of the same model is user state.
+        let ident = ownership::namespaced_identifier(m);
         let Some(cur) = loaded.iter().find(|x| x.identifier == ident) else {
             return false;
         };
@@ -2314,15 +2370,15 @@ mod tests {
             local_model("worker", 32000),
             remote_model("gpt-remote", None),
         ]);
-        let loaded = vec![loaded_model("worker", 32000)];
-        assert!(profile_matches(&profile, &loaded));
+        let loaded = vec![loaded_model("darkmux:worker", 32000)];
+        assert!(profile_matches(&profile, &loaded, &[]));
         // A remote model with a DECLARED n_ctx ceiling is still skipped —
         // it's never locally loaded regardless.
         let profile = profile_of(vec![
             local_model("worker", 32000),
             remote_model("gpt-remote", Some(100000)),
         ]);
-        assert!(profile_matches(&profile, &loaded));
+        assert!(profile_matches(&profile, &loaded, &[]));
     }
 
     #[test]
@@ -2331,8 +2387,8 @@ mod tests {
         // loaded locally (what a swap to this profile produces); any local
         // load means the state isn't this profile's.
         let profile = profile_of(vec![remote_model("gpt-remote", None)]);
-        assert!(profile_matches(&profile, &[]));
-        assert!(!profile_matches(&profile, &[loaded_model("worker", 32000)]));
+        assert!(profile_matches(&profile, &[], &[]));
+        assert!(!profile_matches(&profile, &[loaded_model("darkmux:worker", 32000)], &[]));
     }
 
     #[test]
@@ -2342,9 +2398,66 @@ mod tests {
             remote_model("gpt-remote", None),
         ]);
         // Local model absent → no match.
-        assert!(!profile_matches(&profile, &[]));
+        assert!(!profile_matches(&profile, &[], &[]));
         // Local model loaded at the wrong context → no match.
-        assert!(!profile_matches(&profile, &[loaded_model("worker", 4096)]));
+        assert!(!profile_matches(&profile, &[loaded_model("darkmux:worker", 4096)], &[]));
+    }
+
+    fn tensorfold_model(endpoint: &str, id: &str, n_ctx: u32) -> types::ProfileModel {
+        types::ProfileModel {
+            id: id.to_string(),
+            n_ctx: Some(n_ctx),
+            endpoint: Some(types::ModelEndpoint {
+                managed: Some(types::ManagedBackend::Tensorfold.into()),
+                port: Some(8091),
+                source: types::EndpointSource::Named(endpoint.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn engine_server(endpoint: &str, model: &str, n_ctx: u32) -> darkmux_serve::wire::EngineServer {
+        darkmux_serve::wire::EngineServer {
+            endpoint: endpoint.into(),
+            engine: "tensorfold".into(),
+            model: model.into(),
+            served_name: format!("darkmux:{model}"),
+            n_ctx,
+            port: 8091,
+            pid: 4242,
+            started_at_ms: 0,
+            answering: true,
+        }
+    }
+
+    /// (#1274) darkmux loads and dispatches to `darkmux:<id>`, so that is
+    /// the load a profile matches; a bare copy of the same model is user
+    /// state and matches nothing.
+    #[test]
+    fn profile_matches_darkmuxs_namespaced_load_not_a_user_copy() {
+        let profile = profile_of(vec![local_model("worker", 32000)]);
+        assert!(profile_matches(&profile, &[loaded_model("darkmux:worker", 32000)], &[]));
+        assert!(!profile_matches(&profile, &[loaded_model("worker", 32000)], &[]), "a user-loaded copy");
+    }
+
+    /// (#3450) A profile on a server darkmux started is loaded when that
+    /// server runs its model at its context, beside its LM Studio models.
+    #[test]
+    fn profile_matches_counts_a_model_on_darkmuxs_engine_server() {
+        let tf = tensorfold_model("tf", "TensorFold/q38", 262_144);
+        let solo = profile_of(vec![tf.clone()]);
+        assert!(profile_matches(&solo, &[], &[engine_server("tf", "TensorFold/q38", 262_144)]));
+        assert!(!profile_matches(&solo, &[], &[]), "no server running");
+        assert!(!profile_matches(&solo, &[], &[engine_server("tf", "TensorFold/q38", 8192)]), "another context");
+        let hybrid = profile_of(vec![local_model("worker", 32000), tf]);
+        let lms = [loaded_model("darkmux:worker", 32000)];
+        assert!(profile_matches(&hybrid, &lms, &[engine_server("tf", "TensorFold/q38", 262_144)]));
+        assert!(!profile_matches(&hybrid, &lms, &[]), "the server half is missing");
+        // A server for another profile is part of what is loaded, as an
+        // extra LM Studio load is.
+        let lms_only = profile_of(vec![local_model("worker", 32000)]);
+        assert!(!profile_matches(&lms_only, &lms, &[engine_server("tf", "TensorFold/q38", 262_144)]));
     }
 
     #[test]

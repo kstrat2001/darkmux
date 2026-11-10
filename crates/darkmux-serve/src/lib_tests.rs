@@ -1039,6 +1039,7 @@
                 engine: wire::MachineEngine { name: "lmstudio".into(), reports_residency: true, usable: true },
                 models: Vec::new(),
                 unknown: None,
+                servers: Vec::new(),
             },
             ram_free_for_ai_bytes: Some(12_345),
             read_at_ms: 42,
@@ -1063,6 +1064,74 @@
         let failed = with_lms_bin(&tmp.path().join("no-such-lms"), gather_specs);
         assert!(failed.lms_unreachable);
         assert!(failed.loaded_models.is_empty());
+    }
+
+    /// (#3450) A process standing in for a server darkmux started: alive,
+    /// leading its own group, recorded under `<home>/run/engines/` as darkmux
+    /// records one. Killed with its group when dropped.
+    pub(crate) struct RecordedServer {
+        pub(crate) child: std::process::Child,
+    }
+
+    impl RecordedServer {
+        pub(crate) fn start(endpoint: &str, engine: &str, model: &str, n_ctx: u32) -> Self {
+            let mut cmd = std::process::Command::new("sleep");
+            cmd.arg("30");
+            std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+            let child = cmd.spawn().unwrap();
+            let stamp = (0..50)
+                .find_map(|_| {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    darkmux_platform::current().process_start_stamp(child.id())
+                })
+                .expect("a start stamp");
+            let rec = darkmux_types::engine_record::EngineRecord {
+                schema: darkmux_types::engine_record::ENGINE_RECORD_SCHEMA,
+                endpoint: endpoint.into(),
+                engine: engine.into(),
+                model: model.into(),
+                n_ctx,
+                port: 1,
+                pid: child.id(),
+                start_stamp: stamp,
+                owner_pid: std::process::id(),
+                argv: vec!["tensorfold-native".into(), "--name".into(), format!("darkmux:{model}")],
+                log: "/dev/null".into(),
+                started_at_ms: 1_000,
+                engine_version: "tensorfold-native 1.2.4".into(),
+            };
+            darkmux_types::engine_record::write_in(&darkmux_types::engine_record::dir(), &rec).unwrap();
+            RecordedServer { child }
+        }
+    }
+
+    impl Drop for RecordedServer {
+        fn drop(&mut self) {
+            let _ = darkmux_types::child_registry::kill_group(self.child.id(), darkmux_types::child_registry::SIGKILL);
+            let _ = self.child.wait();
+        }
+    }
+
+    /// (#3450) The one residents read lists the servers darkmux started from
+    /// their records, and `/machine/status` and the spec sheet (so the card)
+    /// carry them beside the engine's own residents, even when the engine
+    /// could not be asked.
+    #[test]
+    #[serial_test::serial]
+    fn the_residents_read_lists_darkmuxs_engine_servers() {
+        let _home = CrewDirGuard::new();
+        let tmp = TempDir::new().unwrap();
+        let _server = RecordedServer::start("tf", "tensorfold", "TensorFold/q38", 262_144);
+        let read = with_lms_bin(&tmp.path().join("no-such-lms"), ResidentsRead::now);
+        let listed: Vec<(&str, &str, u32)> =
+            read.residents.servers.iter().map(|s| (s.endpoint.as_str(), s.model.as_str(), s.n_ctx)).collect();
+        assert_eq!(listed, vec![("tf", "TensorFold/q38", 262_144)]);
+        assert!(read.residents.unknown.is_some(), "the fixture's lms cannot run");
+        let status = machine_status_body(read.residents.clone(), read.read_at_ms);
+        assert_eq!(status.engine_servers.len(), 1);
+        assert_eq!(status.engine_servers[0].served_name, "darkmux:TensorFold/q38");
+        let specs = gather_specs_from(read);
+        assert_eq!(specs.engine_servers.len(), 1);
     }
 
     /// Run `f` with each `(var, value)` set (`None` removes it), restoring after.

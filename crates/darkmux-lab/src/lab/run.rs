@@ -641,8 +641,14 @@ fn envelope_check(profile: &darkmux_types::Profile, profile_name: &str) -> Vec<S
     if !profile.models.iter().any(|m| m.is_managed()) {
         return Vec::new();
     }
+    // (#3450) A model on a server darkmux starts is checked against its
+    // record; `lms ps` is asked only when an LM Studio model needs it.
+    let servers = engine::server::listed(&engine::server::Dirs::under_home());
+    if !profile.models.iter().any(|m| m.is_managed() && !m.endpoint_kind().is_ok_and(|k| k.starts_servers())) {
+        return crate::lab::profile_check::envelope_warnings(profile, profile_name, &[], &servers);
+    }
     match engine::lmstudio().loaded() {
-        Ok(loaded) => crate::lab::profile_check::envelope_warnings(profile, profile_name, &loaded),
+        Ok(loaded) => crate::lab::profile_check::envelope_warnings(profile, profile_name, &loaded, &servers),
         Err(e) => vec![format!(
             "could not verify profile-load match: `lms ps` failed ({e}); \
              this run's `profile={profile_name}` tag is unverified. (#365)"

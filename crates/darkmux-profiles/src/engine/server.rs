@@ -271,6 +271,81 @@ pub fn running_now(dirs: &Dirs, endpoint: &str) -> Option<EngineRecord> {
     engine_record::read_in(&dirs.records, endpoint).ok().flatten().filter(alive)
 }
 
+/// (#3450) One server darkmux started that is running now, as every machine
+/// surface lists it beside darkmux's LM Studio loads: `machine status`,
+/// `/machine/status`, `/machine/specs` (and so the machine card), and a row
+/// of the residency ledger.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
+pub struct EngineServer {
+    /// The `endpoints` id it serves.
+    pub endpoint: String,
+    /// The `managed` token (`tensorfold`, `flint`).
+    pub engine: String,
+    /// The model it was started with (a profile model's `id`).
+    pub model: String,
+    /// The model name it answers to on the wire: `darkmux:<id>` on
+    /// Tensorfold, `flint` on rec's Flint (which takes no name).
+    pub served_name: String,
+    pub n_ctx: u32,
+    pub port: u16,
+    pub pid: u32,
+    #[cfg_attr(feature = "ts-export", ts(type = "number"))]
+    pub started_at_ms: u64,
+    /// Whether it answered `GET /v1/models` under `served_name` when it was
+    /// listed. `false` while its model is still starting, or when it was too
+    /// busy to answer within a second.
+    pub answering: bool,
+}
+
+/// How long a listing waits for a server to answer `GET /v1/models`.
+const LISTING_ANSWER_BOUND: Duration = Duration::from_secs(1);
+
+/// The model name darkmux's server `rec` answers to: `flint` for rec's (it
+/// has no `--name`, #3453), else the `--name` it was started under.
+pub fn served_name(rec: &EngineRecord) -> String {
+    if rec.engine == super::flint::ENGINE {
+        return super::flint::SERVED_NAME.to_string();
+    }
+    rec.argv.iter().skip_while(|a| *a != "--name").nth(1).cloned().unwrap_or_default()
+}
+
+/// (#3450) darkmux's servers running now, by endpoint id. Read only, like
+/// [`running_now`]: a stale record is left for a dispatch to clear, and an
+/// unreadable one claims nothing.
+pub fn listed(dirs: &Dirs) -> Vec<EngineServer> {
+    let mut out: Vec<EngineServer> = engine_record::list_in(&dirs.records)
+        .0
+        .into_iter()
+        .filter(alive)
+        .map(|rec| {
+            let served_name = served_name(&rec);
+            EngineServer {
+                answering: answers_within(rec.port, &served_name, LISTING_ANSWER_BOUND),
+                endpoint: rec.endpoint,
+                engine: rec.engine,
+                model: rec.model,
+                served_name,
+                n_ctx: rec.n_ctx,
+                port: rec.port,
+                pid: rec.pid,
+                started_at_ms: rec.started_at_ms,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.endpoint.cmp(&b.endpoint));
+    out
+}
+
+/// (#3450) darkmux's live server serving `model` (a profile model on an
+/// endpoint darkmux starts servers for): the one on its endpoint, started
+/// with its id. The context is the caller's to compare. Read only.
+pub fn serving(dirs: &Dirs, model: &darkmux_types::ProfileModel) -> Option<EngineRecord> {
+    let endpoint = model.endpoint.as_ref().and_then(|e| e.named_id())?;
+    running_now(dirs, endpoint).filter(|r| r.model == model.id)
+}
+
 /// The reuse rule [`ensure`] applies, and a listing's `resident`: darkmux's
 /// server `rec` runs exactly `argv`, answers under `served_name` on `port`,
 /// and is what listens there (never a server darkmux did not start).
@@ -675,7 +750,12 @@ pub fn listens_by(rec: &EngineRecord, host: &dyn darkmux_platform::Platform) -> 
 
 /// Whether the server on `port` lists `served_name` at `GET /v1/models`.
 fn answers(port: u16, served_name: &str) -> bool {
-    let agent = ureq::AgentBuilder::new().redirects(0).timeout(Duration::from_secs(2)).build();
+    answers_within(port, served_name, Duration::from_secs(2))
+}
+
+/// [`answers`], waiting at most `bound`.
+fn answers_within(port: u16, served_name: &str, bound: Duration) -> bool {
+    let agent = ureq::AgentBuilder::new().redirects(0).timeout(bound).build();
     let Ok(resp) = agent.get(&format!("http://127.0.0.1:{port}/v1/models")).call() else { return false };
     let Ok(text) = resp.into_string() else { return false };
     let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) else { return false };
@@ -1408,5 +1488,103 @@ S(("127.0.0.1", port), H).serve_forever()
         assert_eq!(ok_if_gone(err(EPERM), || false).unwrap_err().raw_os_error(), Some(EPERM), "EPERM for a live process");
         // EINVAL (an invalid signal number): 22 on macOS and Linux alike.
         assert_eq!(ok_if_gone(err(22), never).unwrap_err().raw_os_error(), Some(22));
+    }
+
+    /// A child leading its own group, killed with it and reaped when dropped.
+    struct Reaped(Child);
+
+    impl Drop for Reaped {
+        fn drop(&mut self) {
+            let _ = darkmux_types::child_registry::kill_group(self.0.id(), darkmux_types::child_registry::SIGKILL);
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A record for `pid` on `endpoint`, as darkmux writes one, read now.
+    fn record_of(f: &Fixture, endpoint: &str, engine: &str, pid: u32, port: u16, argv: &[&str]) -> EngineRecord {
+        let stamp = (0..50).find_map(|_| {
+            std::thread::sleep(Duration::from_millis(10));
+            darkmux_platform::current().process_start_stamp(pid)
+        });
+        EngineRecord {
+            schema: ENGINE_RECORD_SCHEMA,
+            endpoint: endpoint.into(),
+            engine: engine.into(),
+            model: "m/a".into(),
+            n_ctx: 8192,
+            port,
+            pid,
+            start_stamp: stamp.unwrap_or(1),
+            owner_pid: std::process::id(),
+            argv: argv.iter().map(|s| s.to_string()).collect(),
+            log: f.dirs.log_for(endpoint),
+            started_at_ms: 1_000,
+            engine_version: "fake 1.2.4".into(),
+        }
+    }
+
+    /// (#3450) A listing names darkmux's live servers, answering or still
+    /// starting, and never a stale record, which it leaves on disk for a
+    /// dispatch to clear.
+    #[test]
+    fn a_listing_names_darkmuxs_live_servers_and_changes_nothing() {
+        let f = fixture();
+        let s = spec(&f, "tf", "m/a", free_port(), &[]);
+        let up = ensure(&s, &f.dirs, quick(), &not_held, &mut no_progress()).unwrap();
+        // A server whose model is still starting: alive, not yet bound.
+        let mut starting = Command::new("sleep");
+        starting.arg("30");
+        std::os::unix::process::CommandExt::process_group(&mut starting, 0);
+        let starting = Reaped(starting.spawn().unwrap());
+        let starting_rec = record_of(&f, "zz", "tensorfold", starting.0.id(), free_port(), &["tf", "--name", "darkmux:m/a"]);
+        engine_record::write_in(&f.dirs.records, &starting_rec).unwrap();
+        // A stale record: its process exited.
+        let mut gone = Command::new("true").spawn().unwrap();
+        let gone_pid = gone.id();
+        gone.wait().unwrap();
+        let stale = EngineRecord { start_stamp: 7, ..record_of(&f, "old", "tensorfold", gone_pid, free_port(), &[]) };
+        engine_record::write_in(&f.dirs.records, &stale).unwrap();
+
+        let listed = listed(&f.dirs);
+        let rows: Vec<(&str, bool)> = listed.iter().map(|l| (l.endpoint.as_str(), l.answering)).collect();
+        assert_eq!(rows, vec![("tf", true), ("zz", false)], "{listed:?}");
+        let tf = &listed[0];
+        assert_eq!((tf.model.as_str(), tf.served_name.as_str(), tf.port, tf.pid), ("m/a", "darkmux:m/a", s.port, up.record().pid));
+        assert_eq!(tf.n_ctx, 8192);
+        assert_eq!(listed[1].served_name, "darkmux:m/a");
+        assert!(engine_record::read_in(&f.dirs.records, "old").unwrap().is_some(), "a listing removes nothing");
+        stop(&f.dirs, up.record(), quick()).unwrap();
+    }
+
+    /// (#3450) rec's Flint takes no name, so its server answers `flint`;
+    /// every other engine answers the `--name` darkmux started it under.
+    #[test]
+    fn a_servers_wire_name_is_flint_for_rec_and_its_name_flag_otherwise() {
+        let f = fixture();
+        let tf = record_of(&f, "tf", "tensorfold", 2, 1, &["tf", "serve", "m", "--name", "darkmux:m"]);
+        assert_eq!(served_name(&tf), "darkmux:m");
+        let fl = record_of(&f, "fl", "flint", 2, 1, &["rec-mlx", "serve", "flint", "--name", "x"]);
+        assert_eq!(served_name(&fl), "flint");
+        assert_eq!(served_name(&record_of(&f, "tf", "tensorfold", 2, 1, &["tf"])), "", "no name flag, no name");
+    }
+
+    /// (#3450) The server serving a profile model is the live one on its
+    /// endpoint started with its id, never another endpoint's or model's.
+    #[test]
+    fn the_server_serving_a_model_is_its_endpoints_with_its_id() {
+        let f = fixture();
+        let mut live = Command::new("sleep");
+        live.arg("30");
+        std::os::unix::process::CommandExt::process_group(&mut live, 0);
+        let live = Reaped(live.spawn().unwrap());
+        engine_record::write_in(&f.dirs.records, &record_of(&f, "tf", "tensorfold", live.0.id(), 1, &[])).unwrap();
+        let model = |id: &str, endpoint: &str| darkmux_types::ProfileModel {
+            id: id.into(),
+            endpoint: Some(darkmux_types::ModelEndpoint::reference(endpoint)),
+            ..Default::default()
+        };
+        assert_eq!(serving(&f.dirs, &model("m/a", "tf")).map(|r| r.pid), Some(live.0.id()));
+        assert_eq!(serving(&f.dirs, &model("m/b", "tf")), None, "another model on the endpoint");
+        assert_eq!(serving(&f.dirs, &model("m/a", "other")), None, "another endpoint");
     }
 }

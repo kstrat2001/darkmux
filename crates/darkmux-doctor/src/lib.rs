@@ -1391,7 +1391,10 @@ fn unpriceable_residents_status(models: &[darkmux_profiles::model_ledger::ModelR
     let name = "resident pricing".to_string();
     let unpriceable: Vec<&str> = models
         .iter()
-        .filter(|m| m.potential_bytes.is_none())
+        // (#3450) A server darkmux started is priced by measuring it, not
+        // from its weights: the ledger's own message covers one it could not
+        // measure, and this check's remedy is about weights files.
+        .filter(|m| m.potential_bytes.is_none() && m.server.is_none())
         .map(|m| m.model_key.as_str())
         .collect();
     if unpriceable.is_empty() {
@@ -14024,7 +14027,27 @@ mod tests {
             state: LedgerState::Unknown,
             over_price_bytes: None,
             shrink_hint: None,
+            server: None,
         }
+    }
+
+    /// (#3450) A server darkmux started that could not be measured is the
+    /// ledger's to report: this check's remedy (a weights file) is not its.
+    #[test]
+    fn an_unmeasured_engine_server_is_not_an_unpriceable_weights_file() {
+        let server = darkmux_profiles::engine::server::EngineServer {
+            endpoint: "tf".into(),
+            engine: "tensorfold".into(),
+            model: "TensorFold/q38".into(),
+            served_name: "darkmux:TensorFold/q38".into(),
+            n_ctx: 8192,
+            port: 8091,
+            pid: 4242,
+            started_at_ms: 0,
+            answering: true,
+        };
+        let rows = [darkmux_profiles::model_ledger::ModelRow { server: Some(server), ..row("TensorFold/q38", None) }];
+        assert_eq!(super::unpriceable_residents_status(&rows).status, Status::Pass);
     }
 
     #[test]

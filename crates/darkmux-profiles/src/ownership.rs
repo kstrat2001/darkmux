@@ -167,6 +167,79 @@ fn eject_each(
     (ejected, failed)
 }
 
+/// (#3450) One server darkmux started that an eject stopped, would stop
+/// (`dry_run`), or kept because a running dispatch holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EjectedServer {
+    pub endpoint: String,
+    pub model: String,
+    pub pid: u32,
+}
+
+/// (#3450) Outcome of an [`eject_servers`] sweep.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServerEjectSummary {
+    pub stopped: Vec<EjectedServer>,
+    /// Left running: a running dispatch holds it (its residency lease).
+    pub held: Vec<EjectedServer>,
+    /// Would not stop; `identifier` is the endpoint id.
+    pub failed: Vec<EjectFailure>,
+}
+
+impl ServerEjectSummary {
+    pub fn is_empty(&self) -> bool {
+        self.stopped.is_empty() && self.held.is_empty() && self.failed.is_empty()
+    }
+}
+
+/// (#3450) Stop every server darkmux started on this machine (Tensorfold,
+/// rec's Flint), the engine-server half of `darkmux machine eject`. A server
+/// is darkmux's only while its record matches the live process (contract
+/// 4), so a server darkmux did not start is never listed here, let alone
+/// stopped. One a running dispatch holds is kept: each stop asks the
+/// residency leases under the server's endpoint lock, as a dispatch's
+/// eviction does (`server::stop_unless_held`).
+pub fn eject_servers(dry_run: bool) -> ServerEjectSummary {
+    let probe = darkmux_types::residency_lease::LeaseGuard::acquire();
+    let dirs = crate::engine::server::Dirs::under_home();
+    let held = dispatch_holds(&probe);
+    eject_servers_in(&dirs, dry_run, crate::engine::server::Bounds::default(), &held)
+}
+
+/// Whether a running dispatch holds darkmux's server: its served name is in
+/// another live holder's residency lease. `probe` is a guard of this
+/// process's own that leases nothing, so every dispatch's lease counts,
+/// in this process or another.
+fn dispatch_holds(probe: &darkmux_types::residency_lease::LeaseGuard) -> impl Fn(&darkmux_types::engine_record::EngineRecord) -> bool + '_ {
+    move |rec| probe.all_live_leased_models().contains(&crate::engine::server::served_name(rec))
+}
+
+pub(crate) fn eject_servers_in(
+    dirs: &crate::engine::server::Dirs,
+    dry_run: bool,
+    bounds: crate::engine::server::Bounds,
+    held: crate::engine::server::Held<'_>,
+) -> ServerEjectSummary {
+    use crate::engine::server;
+    let mut summary = ServerEjectSummary::default();
+    // darkmux's live servers, and those whose leader exited leaving workers
+    // on the port (still darkmux's, and still holding memory).
+    let ours = darkmux_types::engine_record::list_in(&dirs.records)
+        .0
+        .into_iter()
+        .filter(|r| server::alive(r) || server::left_behind(dirs, &r.endpoint).is_some());
+    for rec in ours {
+        let entry = EjectedServer { endpoint: rec.endpoint.clone(), model: rec.model.clone(), pid: rec.pid };
+        let outcome = if dry_run { Ok(!held(&rec)) } else { server::stop_unless_held(dirs, &rec, bounds, held) };
+        match outcome {
+            Ok(true) => summary.stopped.push(entry),
+            Ok(false) => summary.held.push(entry),
+            Err(e) => summary.failed.push(EjectFailure { identifier: entry.endpoint, error: e.to_string() }),
+        }
+    }
+    summary
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,5 +469,109 @@ mod tests {
         assert_eq!(dry_unloads, "", "a dry run unloads nothing");
         assert_eq!(real.unwrap(), expected);
         assert_eq!(unloads, "darkmux:a\n", "only the darkmux: resident is unloaded; user state is never touched");
+    }
+
+    /// (#3450) A process standing in for a server darkmux started: it leads
+    /// its own group, as `server::ensure` spawns one. Killed when dropped.
+    struct Stand(std::process::Child);
+
+    impl Drop for Stand {
+        fn drop(&mut self) {
+            let _ = darkmux_types::child_registry::kill_group(self.0.id(), darkmux_types::child_registry::SIGKILL);
+            let _ = self.0.wait();
+        }
+    }
+
+    fn stand_in() -> Stand {
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        Stand(cmd.spawn().unwrap())
+    }
+
+    /// darkmux's record of `pid` on `endpoint`, with the process's real start
+    /// stamp, or `stamp` in its place.
+    fn record(dirs: &crate::engine::server::Dirs, endpoint: &str, pid: u32, stamp: Option<u64>) -> darkmux_types::engine_record::EngineRecord {
+        use darkmux_types::engine_record::{self, EngineRecord, ENGINE_RECORD_SCHEMA};
+        let real = (0..50).find_map(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            darkmux_platform::current().process_start_stamp(pid)
+        });
+        let rec = EngineRecord {
+            schema: ENGINE_RECORD_SCHEMA,
+            endpoint: endpoint.into(),
+            engine: "tensorfold".into(),
+            model: format!("m/{endpoint}"),
+            n_ctx: 8192,
+            port: 1,
+            pid,
+            start_stamp: stamp.or(real).expect("a start stamp"),
+            owner_pid: std::process::id(),
+            argv: vec!["tf".into(), "--name".into(), format!("darkmux:m/{endpoint}")],
+            log: dirs.log_for(endpoint),
+            started_at_ms: 0,
+            engine_version: "fake 1.2.4".into(),
+        };
+        engine_record::write_in(&dirs.records, &rec).unwrap();
+        rec
+    }
+
+    fn quick() -> crate::engine::server::Bounds {
+        crate::engine::server::Bounds {
+            start: std::time::Duration::from_secs(5),
+            stop_grace: std::time::Duration::from_secs(2),
+            poll: std::time::Duration::from_millis(50),
+        }
+    }
+
+    fn dirs_in(tmp: &tempfile::TempDir) -> crate::engine::server::Dirs {
+        crate::engine::server::Dirs { records: tmp.path().join("run"), logs: tmp.path().join("logs") }
+    }
+
+    /// (#3450) `machine eject` stops the servers darkmux started, keeps one a
+    /// running dispatch holds, and never signals a process its record no
+    /// longer matches (a reused pid is someone else's).
+    #[test]
+    fn eject_stops_darkmuxs_idle_servers_and_nothing_else() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = dirs_in(&tmp);
+        let idle = stand_in();
+        let busy = stand_in();
+        let stranger = stand_in();
+        record(&dirs, "idle", idle.0.id(), None);
+        record(&dirs, "busy", busy.0.id(), None);
+        record(&dirs, "reused", stranger.0.id(), Some(7));
+        let held = |r: &darkmux_types::engine_record::EngineRecord| r.endpoint == "busy";
+
+        let dry = eject_servers_in(&dirs, true, quick(), &held);
+        assert_eq!(dry.stopped.iter().map(|s| s.endpoint.as_str()).collect::<Vec<_>>(), vec!["idle"]);
+        assert_eq!(dry.held.iter().map(|s| s.endpoint.as_str()).collect::<Vec<_>>(), vec!["busy"]);
+        let alive = |s: &Stand| darkmux_platform::current().process_start_stamp(s.0.id()).is_some() && !std::process::Command::new("ps").args(["-o", "stat=", "-p", &s.0.id().to_string()]).output().unwrap().stdout.starts_with(b"Z");
+        assert!(alive(&idle), "a dry run stops nothing");
+
+        let real = eject_servers_in(&dirs, false, quick(), &held);
+        assert_eq!(real.stopped.iter().map(|s| (s.endpoint.as_str(), s.model.as_str())).collect::<Vec<_>>(), vec![("idle", "m/idle")]);
+        assert_eq!(real.held.len(), 1);
+        assert!(real.failed.is_empty(), "{:?}", real.failed);
+        assert!(!alive(&idle), "darkmux's idle server is stopped");
+        assert!(alive(&busy), "a server a running dispatch holds is kept");
+        assert!(alive(&stranger), "a process its record no longer matches is never signaled");
+        assert!(darkmux_types::engine_record::read_in(&dirs.records, "idle").unwrap().is_none(), "its record is gone");
+    }
+
+    /// (#3450) What `machine eject` asks before it stops a server is the
+    /// residency leases, as a dispatch's eviction asks them: a server whose
+    /// served name another dispatch leases is held.
+    #[test]
+    fn a_server_another_dispatch_leases_is_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = record(&dirs_in(&tmp), "tf", std::process::id(), None);
+        let probe = darkmux_types::residency_lease::LeaseGuard::acquire();
+        assert!(!dispatch_holds(&probe)(&rec), "nothing leases it yet");
+        let dispatch = darkmux_types::residency_lease::LeaseGuard::acquire();
+        dispatch.write(&["darkmux:m/tf".to_string()]).unwrap();
+        assert!(dispatch_holds(&probe)(&rec), "a running dispatch's lease holds it");
+        drop(dispatch);
+        assert!(!dispatch_holds(&probe)(&rec), "released with the dispatch");
     }
 }

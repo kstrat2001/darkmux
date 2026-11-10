@@ -51,6 +51,9 @@ ActiveWait
   resumes_in_secs: uint64 | null
   message: string
 Attribution = "per_process" | "estimated" | "unavailable" | "unknown"
+Availability
+  state: AvailabilityState
+  reason: string | null
 AvailabilityState = "resident" | "startable" | "unavailable" | "external" | "unknown"
 AvailableProfile
   name: string
@@ -132,6 +135,7 @@ CardModel
   id: string
   n_ctx: uint32 | null
   endpoint_kind: CardEndpointKind
+  availability?: Availability | null
 CardOutcome = { card: MachineCard; source: CardSource; state: "available" } | { why: UnavailableWhy; peer_version: string | null; peer_version_source: VersionSource | null; state: "unavailable" } | { answered_as: string | null; state: "mismatch" } | { reason: UnreachableReason; detail: string | null; state: "unreachable" } | { state: "unknown" }
 CardProfile
   name: string
@@ -310,6 +314,16 @@ EndpointAuth
   key_env?: string | null
 EndpointAuthType = "api-key" | "bearer"
 EndpointField = string
+EngineServer
+  endpoint: string
+  engine: string
+  model: string
+  served_name: string
+  n_ctx: uint32
+  port: uint16
+  pid: uint32
+  started_at_ms: uint64
+  answering: boolean
 EnvelopeHost
   cpu: MetricStats
   mem: MetricStats
@@ -637,6 +651,7 @@ MachineSpecsResponse
   ram_free_for_ai_bytes: uint64 | null
   cpu_brand: string | null
   loaded_models: LoadedModel[]
+  engine_servers: EngineServer[]
   lms_unreachable: boolean
   engine: MachineEngine | null
   utility_model: UtilityModel | null
@@ -648,6 +663,7 @@ MachineStatusOutput
   engine: MachineEngine | null
   managed: LoadedModel[]
   user_state: LoadedModel[]
+  engine_servers: EngineServer[]
   matching_profiles?: string[] | null
   registry?: string | null
 MachineTotals
@@ -781,6 +797,7 @@ ModelRow
   state: LedgerState
   over_price_bytes?: uint64 | null
   shrink_hint?: string | null
+  server?: EngineServer | null
 NodeKind = "phase" | "task"
 NodeStatus = "planned" | "running" | "complete" | "abandoned" | "error" | "unknown"
 Owner = "darkmux" | "user" | "unknown"
@@ -798,7 +815,7 @@ PoolSnapshot
   used_bytes: uint64 | null
   available_bytes: uint64 | null
   free_bytes: uint64 | null
-PotentialSource = "arch" | "estimated" | "unknown"
+PotentialSource = "arch" | "estimated" | "measured" | "unknown"
 PowerNow
   cpu: int64
   gpu: int64
