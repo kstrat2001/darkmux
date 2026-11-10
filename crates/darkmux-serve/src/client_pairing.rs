@@ -136,7 +136,7 @@ pub const PAIR_REQUESTS_PER_PROCESS: usize = 2;
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
 /// Work a single client may have running at once.
 const MAX_RUNNING_PER_CLIENT: usize = 2;
-/// Finished work is remembered this long for polls.
+/// Ended work is remembered this long after it ended, for polls.
 const KEEP_WORK_SECS: u64 = 3600;
 /// The `schema_version` this binary writes and reads.
 ///
@@ -696,6 +696,8 @@ pub struct WorkEntry {
     /// The client's id (never its name, which a later pairing can reuse).
     pub client_id: String,
     pub created: u64,
+    /// When it ended (`None` while it runs): what its keep time counts from.
+    pub finished: Option<u64>,
     pub status: WorkStatus,
     pub cancel: Arc<CancelFlag>,
     /// The canonical work copy, when the run has one.
@@ -703,14 +705,15 @@ pub struct WorkEntry {
     /// The work copy as host git may touch it: the repository darkmux holds
     /// for it, outside it (`None`: no workspace darkmux made, so no git).
     pub git: Option<WorkCopy>,
-    /// The work copy as a tree before the run (or before the first run of a
-    /// chain of tweaks): what Keep commits against and Discard restores to.
+    /// The work copy as a tree before the run: what its changes are read
+    /// against.
     pub baseline: Option<String>,
     /// Undone (its commit reverted): decided once.
     pub decided: Option<String>,
     /// Its Undo is reverting now: no run starts in its work copy meanwhile.
     pub undoing: bool,
-    /// The run this one follows up on (a Tweak).
+    /// The run this one follows up on (a Tweak), when darkmux still knew
+    /// it: a label only.
     pub continues: Option<String>,
     /// The commit message's title.
     pub title: String,
@@ -1869,6 +1872,7 @@ pub(crate) async fn work_handler(
     let profile = spec.profile.clone();
     let execute = state.execute.clone();
     let works = state.works.clone();
+    let now = state.now.clone();
     let Some(cancel) = works
         .lock()
         .unwrap()
@@ -1877,7 +1881,7 @@ pub(crate) async fn work_handler(
     else {
         return internal(anyhow!("work {work_id} was admitted but is not registered"));
     };
-    tokio::task::spawn_blocking(move || run_work(&execute, &works, spec, &cancel));
+    tokio::task::spawn_blocking(move || run_work(&execute, &works, spec, &cancel, &*now));
     (
         StatusCode::ACCEPTED,
         Json(WorkAccepted { work_id, profile }),
@@ -1911,14 +1915,14 @@ fn run_work(
     works: &Mutex<HashMap<String, WorkEntry>>,
     spec: WorkSpec,
     cancel: &Arc<CancelFlag>,
+    now: &(dyn Fn() -> u64 + Send + Sync),
 ) {
     let id = spec.work_id.clone();
     // Host git touches only the repository darkmux holds for the work copy.
     let git = works.lock().unwrap().get(&id).and_then(|e| e.git.clone());
     // The work copy as it is before the run, so what it held already is
-    // never reported as the run's change. A run in the same work copy
-    // as this client's undecided finished run continues it (a tweak):
-    // it inherits that run's baseline, and that run is folded into this.
+    // never reported as the run's change. Every earlier run's changes are
+    // committed by then, a tweak's included.
     let baseline = git.as_ref().map(snapshot_tree);
     if let Some(e) = works.lock().unwrap().get_mut(&id) {
         e.baseline = baseline.as_ref().and_then(|b| b.as_ref().ok()).map(|b| b.tree.clone());
@@ -1942,6 +1946,7 @@ fn run_work(
     };
     if let Some(w) = works.lock().unwrap().get_mut(&id) {
         w.status = status;
+        w.finished = Some(now());
         w.files = changed;
         w.commit_error = unread;
         match committed {
@@ -2051,22 +2056,25 @@ fn admit(
     let profile = admitted_profile(state, &req)?;
     let work_id = format!("w-{}", random_hex(8).map_err(internal)?);
     let now = (state.now)();
+    let git = workdir.as_deref().and_then(|w| work_copy_for(state, w));
     let mut works = state.works.lock().unwrap();
     check_capacity(&mut works, client, now)?;
     check_work_copy(&works, client, workdir.as_ref(), req.continues.as_deref())?;
+    let continues = req.continues.clone().filter(|c| works.contains_key(c));
     works.insert(
         work_id.clone(),
         WorkEntry {
             client_id: client.id.clone(),
             created: now,
+            finished: None,
             status: WorkStatus::Running,
             cancel: Arc::new(CancelFlag::default()),
-            git: workdir.as_deref().and_then(|w| work_copy_for(state, w)),
+            git: git.clone(),
             workdir: workdir.clone(),
             baseline: None,
             decided: None,
             undoing: false,
-            continues: req.continues.clone(),
+            continues,
             title: work_title(&req),
             role: req.role.clone(),
             commit: None,
@@ -2075,6 +2083,13 @@ fn admit(
             commit_error: None,
         },
     );
+    // Registered as running, so nothing else starts in the copy while it
+    // is moved off its base branch.
+    drop(works);
+    if let Err(r) = onto_own_branch(state, git.as_ref()) {
+        state.works.lock().unwrap().remove(&work_id);
+        return Err(r);
+    }
     Ok(WorkSpec {
         work_id,
         role: req.role,
@@ -2082,6 +2097,34 @@ fn admit(
         workdir,
         message: req.message,
     })
+}
+
+/// A work copy with an origin that is not on a `mux/` branch of its own (a
+/// clone made before clones got one, on the default branch or the ref it
+/// was cloned at, which an app still uses by name) is moved onto a new
+/// branch of its bot's before a run, so the run never commits to a branch
+/// of the user's and a PR never pushes onto one. The commits already on it
+/// go along. A template project has no origin, and stays on its own `main`.
+fn onto_own_branch(state: &ClientServerState, wc: Option<&WorkCopy>) -> Result<(), Refused> {
+    let Some(wc) = wc else { return Ok(()) };
+    let Some(on) = not_on_own_branch(wc) else { return Ok(()) };
+    let base = (state.worktrees_base)().map_err(|e| Box::new(internal(anyhow!(e))))?;
+    let name = wc.work_tree.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let branch = new_bot_branch(&bot_slug(crate::client_workspace::bot_of(&base, &name).as_deref()))?;
+    head_onto_new_branch(wc, &branch).map_err(|e| branch_failed(&format!("moving {name} off {on} onto {branch}: {e}")))
+}
+
+/// The branch `wc` is checked out on (empty when detached) when it has an
+/// origin and that is no `mux/` branch of darkmux's.
+fn not_on_own_branch(wc: &WorkCopy) -> Option<String> {
+    crate::client_workspace::remote_default_of(wc)?;
+    let branch = git_line(wc, &["branch", "--show-current"])?;
+    (!is_own_branch(&branch)).then_some(branch)
+}
+
+/// Whether `branch` is one darkmux made for a workspace's own work.
+fn is_own_branch(branch: &str) -> bool {
+    branch.starts_with("mux/")
 }
 
 /// The work copy host git may touch for a canonical workdir: a workspace
@@ -2182,15 +2225,16 @@ fn check_local(state: &ClientServerState, role: &str, profile: &str) -> Result<(
     }
 }
 
-/// Forgets finished work past its keep time, then refuses a client already
-/// at its cap of running work.
+/// Forgets ended work past its keep time (counted from when it ended), then
+/// refuses a client already at its cap of running work.
 fn check_capacity(
     works: &mut HashMap<String, WorkEntry>,
     client: &ApprovedClient,
     now: u64,
 ) -> Result<(), Refused> {
     works.retain(|_, w| {
-        matches!(w.status, WorkStatus::Running) || w.undoing || now.saturating_sub(w.created) <= KEEP_WORK_SECS
+        let ended = w.finished.unwrap_or(w.created);
+        matches!(w.status, WorkStatus::Running) || w.undoing || now.saturating_sub(ended) <= KEEP_WORK_SECS
     });
     let running = works
         .values()
@@ -2208,10 +2252,12 @@ fn check_capacity(
     Ok(())
 }
 
-/// One run at a time per work copy, and never two runs' uncommitted
-/// changes mixed: a Tweak names the finished run of yours it continues.
-/// Every finished run's changes are committed, so a new run needs no
-/// decision first.
+/// One run at a time per work copy. Every ended run's changes are
+/// committed, so a new run needs no decision first. A Tweak's `continues`
+/// is a label: one naming a run darkmux still knows must be this client's,
+/// in this work copy (however it ended: a failed or cancelled run's edits
+/// are committed like a finished one's); one it has forgotten (past its
+/// keep time, or before a restart) makes a plain new run.
 fn check_work_copy(
     works: &HashMap<String, WorkEntry>,
     client: &ApprovedClient,
@@ -2230,18 +2276,14 @@ fn check_work_copy(
     if let Some(r) = busy_copy(works, w) {
         return Err(r);
     }
-    if let Some(c) = continues {
-        let ok = works.get(c).is_some_and(|e| {
-            e.client_id == client.id
-                && e.workdir.as_ref() == Some(w)
-                && matches!(e.status, WorkStatus::Done { .. })
-        });
-        if !ok {
-            return Err(refuse(
-                StatusCode::CONFLICT, ClientCode::Conflict,
-                format!("run {c} isn't a finished run of yours in this work copy"),
-            ));
-        }
+    let foreign = continues
+        .and_then(|c| works.get(c).map(|e| (c, e)))
+        .filter(|(_, e)| e.client_id != client.id || e.workdir.as_ref() != Some(w));
+    if let Some((c, _)) = foreign {
+        return Err(refuse(
+            StatusCode::CONFLICT, ClientCode::Conflict,
+            format!("run {c} isn't a run of yours in this work copy"),
+        ));
     }
     Ok(())
 }
@@ -2497,11 +2539,12 @@ fn workspace_ask(req: &WorkspaceBody) -> Result<WorkspaceAsk, Refused> {
     }
 }
 
-/// `POST /client/workspaces`: `{repo_url}` reuses the workspace whose origin
-/// is that repo (fetching it) or clones it; `{source_path}` reuses this bot's
-/// worktree of that checkout or adds one on a new `mux/<bot>-<id>` branch, so
-/// the owner's own working tree is never touched. 201 when created, 200 when
-/// reused.
+/// `POST /client/workspaces`: `{repo_url}` reuses this bot's clone of that
+/// repo (fetching it) or clones it onto a new `mux/<bot>-<id>` branch;
+/// `{source_path}` reuses this bot's worktree of that checkout or adds one on
+/// a new `mux/<bot>-<id>` branch, so the owner's own working tree is never
+/// touched. Never another bot's workspace or branch. 201 when created, 200
+/// when reused.
 pub(crate) async fn workspace_create_handler(
     State(state): State<ClientServerState>,
     headers: HeaderMap,
@@ -2523,13 +2566,17 @@ pub(crate) async fn workspace_create_handler(
         );
     }
     let bot = bot_slug(req.bot.as_deref());
+    let exact = req.bot.clone().unwrap_or_default();
     let ask = match workspace_ask(&req) {
         Ok(ask) => ask,
         Err(r) => return *r,
     };
     let st = state.clone();
     let git_ref = req.git_ref;
-    tokio::task::spawn_blocking(move || make_workspace(&st, ask, git_ref.as_deref(), &bot, &client))
+    tokio::task::spawn_blocking(move || {
+        let bot = crate::client_workspace::BotName { slug: &bot, exact: &exact };
+        make_workspace(&st, ask, Made { git_ref: git_ref.as_deref(), client: &client, bot })
+    })
         .await
         .unwrap_or_else(|e| internal(anyhow!("workspace setup panicked: {e}")))
 }
@@ -2545,6 +2592,18 @@ fn bot_slug(bot: Option<&str>) -> String {
     }
 }
 
+/// A workspace reused with no bot's exact name recorded (made before the
+/// name was recorded, matched by its branch) becomes this bot's now, so a
+/// later bot whose name makes the same slug gets its own; then `reuse` it.
+fn claimed(base: &Path, name: &str, made: &Made, reuse: impl FnOnce() -> Response) -> Response {
+    if crate::client_workspace::bot_of(base, name).is_none() {
+        if let Err(e) = crate::client_workspace::record_bot(base, name, made.bot.exact) {
+            return internal(anyhow!(e));
+        }
+    }
+    reuse()
+}
+
 /// The client's own workspace `find` names, if any, after
 /// [`adopt_unowned`] has given out what it may.
 fn reusable(state: &ClientServerState, base: &Path, find: impl FnOnce() -> Option<String>) -> Result<Option<String>, Refused> {
@@ -2555,22 +2614,25 @@ fn reusable(state: &ClientServerState, base: &Path, find: impl FnOnce() -> Optio
 /// Makes (or hands back) a workspace for paired client `client`: every
 /// workspace darkmux makes records the client it was made for, and only
 /// that client may use it ([`owned_workspace`]).
-fn make_workspace(state: &ClientServerState, ask: WorkspaceAsk, git_ref: Option<&str>, bot: &str, client: &str) -> Response {
-    let made = Made { git_ref, client };
+fn make_workspace(state: &ClientServerState, ask: WorkspaceAsk, made: Made) -> Response {
     match ask {
         WorkspaceAsk::Clone { url, normalized } => clone_workspace(state, &url, &normalized, &made),
-        WorkspaceAsk::Template { url, normalized } => template_workspace(state, &url, &normalized, &made, bot),
-        WorkspaceAsk::Worktree { path } => worktree_workspace(state, Path::new(&path), &made, bot),
+        WorkspaceAsk::Template { url, normalized } => template_workspace(state, &url, &normalized, &made),
+        WorkspaceAsk::Worktree { path } => worktree_workspace(state, Path::new(&path), &made),
     }
 }
 
 /// What every way of making a workspace is asked with: the branch to start
-/// on, and the paired client it is for.
+/// on, the paired client it is for, and the bot asking.
 struct Made<'a> {
     git_ref: Option<&'a str>,
     client: &'a str,
+    bot: crate::client_workspace::BotName<'a>,
 }
 
+/// This bot's clone of the repo (fetched), else a new clone on a new
+/// `mux/<bot>-<id>` branch of its own, so its runs never commit to the
+/// branch the clone checked out.
 fn clone_workspace(state: &ClientServerState, url: &str, normalized: &str, made: &Made) -> Response {
     use crate::client_workspace as ws;
     let base = match (state.worktrees_base)() {
@@ -2578,47 +2640,107 @@ fn clone_workspace(state: &ClientServerState, url: &str, normalized: &str, made:
         Err(e) => return internal(anyhow!(e)),
     };
     let _one_at_a_time = state.workspace_lock.lock().unwrap();
-    match reusable(state, &base, || ws::find_by_origin(&base, normalized, made.client)) {
-        Ok(Some(name)) => return existing_clone(state, &name),
-        Ok(None) => {}
-        Err(r) => return *r,
-    }
-    let Some(name) = ws::name_for(normalized, |n| name_taken(&base, n)) else {
-        return err(StatusCode::CONFLICT, ClientCode::Conflict, "no free workspace name for this repo");
-    };
-    if let Err(r) = place_clone(state, url, normalized, made, &base, &name) {
-        return *r;
-    }
-    match workspace_dir(state, &name) {
-        Ok(dir) => (StatusCode::CREATED, Json(workspace_json(state, &name, &dir, true))).into_response(),
+    match reusable(state, &base, || ws::find_by_origin(&base, normalized, made.bot, made.client)) {
+        Ok(Some(name)) => claimed(&base, &name, made, || existing_clone(state, &name)),
+        Ok(None) => new_clone(state, &base, (url, normalized), made),
         Err(r) => *r,
     }
+}
+
+/// A new clone of the repo for `made`'s client, on a new branch of the bot's.
+fn new_clone(state: &ClientServerState, base: &Path, (url, normalized): (&str, &str), made: &Made) -> Response {
+    let Some(name) = crate::client_workspace::name_for(normalized, |n| name_taken(base, n)) else {
+        return err(StatusCode::CONFLICT, ClientCode::Conflict, "no free workspace name for this repo");
+    };
+    if let Err(r) = place_clone(state, url, normalized, made, base, &name) {
+        return *r;
+    }
+    let from = match start_bot_branch(state, base, &name, made.git_ref, made.bot.slug) {
+        Ok(from) => from,
+        Err(r) => {
+            forget_clone(base, &name);
+            return *r;
+        }
+    };
+    match workspace_dir(state, &name) {
+        Ok(dir) => {
+            let mut v = workspace_json(state, &name, &dir, true);
+            v.from = Some(from);
+            (StatusCode::CREATED, Json(v)).into_response()
+        }
+        Err(r) => *r,
+    }
+}
+
+/// Puts new clone `name` on a new branch of the bot's, at the commit the
+/// clone checked out (the ref asked for, else the default branch). Only
+/// `HEAD` moves: the files and the index are already that commit's.
+/// Returns where it started.
+fn start_bot_branch(state: &ClientServerState, base: &Path, name: &str, git_ref: Option<&str>, bot: &str) -> Result<String, Refused> {
+    let Some(wc) = work_copy_for(state, &base.join(name)) else {
+        return Err(Box::new(internal(anyhow!("darkmux holds no repository for {name}"))));
+    };
+    let from = git_ref
+        .map(str::to_string)
+        .or_else(|| crate::client_workspace::remote_default_of(&wc))
+        .unwrap_or_else(|| "HEAD".to_string());
+    let branch = new_bot_branch(bot)?;
+    head_onto_new_branch(&wc, &branch).map_err(|e| branch_failed(&format!("starting {name} on {branch}: {e}")))?;
+    Ok(from)
+}
+
+/// Why a workspace could not be put on a branch of its own (git's reason).
+fn branch_failed(why: &str) -> Refused {
+    refuse(StatusCode::UNPROCESSABLE_ENTITY, ClientCode::BranchFailed, why)
+}
+
+/// Moves `wc`'s `HEAD` onto new branch `branch`, made where `HEAD` is (with
+/// whatever commits it holds). Only `HEAD` moves, never a file or the index.
+/// On an unborn `HEAD` (an empty repo) there is no commit to make it at, so
+/// `HEAD` just names it, and the first commit makes it.
+fn head_onto_new_branch(wc: &WorkCopy, branch: &str) -> Result<(), String> {
+    if git_line(wc, &["rev-parse", "--verify", "--quiet", "HEAD"]).is_some() {
+        git_quiet(wc, &["branch", branch])?;
+    }
+    git_quiet(wc, &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")])
+}
+
+/// A new `mux/<bot>-<hex>` branch name: every workspace darkmux makes for a
+/// bot gets one of its own.
+fn new_bot_branch(bot: &str) -> Result<String, Refused> {
+    use crate::client_workspace as ws;
+    let short = random_hex(ws::BOT_BRANCH_SUFFIX_LEN / 2).map_err(|e| Box::new(internal(e)))?;
+    Ok(ws::bot_branch(bot, &short))
+}
+
+/// Takes back clone (or template project) `name`: its work tree, the
+/// repository darkmux holds for it and every record beside it.
+fn forget_clone(base: &Path, name: &str) {
+    let _ = std::fs::remove_dir_all(base.join(name));
+    let _ = std::fs::remove_dir_all(crate::client_git::clone_git_dir(base, name));
+    crate::client_git::forget_git_dir(base, name);
+    crate::client_workspace::forget_template_commit(base, name);
+    crate::client_workspace::forget_owner(base, name);
+    crate::client_workspace::forget_bot(base, name);
 }
 
 /// A new project from a template: cloned at `git_ref` beside its final
 /// name, its history and remote dropped, and started over as a fresh repo
 /// on `main` with one commit, so runs commit to it and nothing points back
 /// at the template. Named for the bot, never reused.
-fn template_workspace(
-    state: &ClientServerState,
-    url: &str,
-    normalized: &str,
-    made: &Made,
-    bot: &str,
-) -> Response {
+fn template_workspace(state: &ClientServerState, url: &str, normalized: &str, made: &Made) -> Response {
     let git_ref = made.git_ref;
     let base = match (state.worktrees_base)() {
         Ok(b) => b,
         Err(e) => return internal(anyhow!(e)),
     };
     let _one_at_a_time = state.workspace_lock.lock().unwrap();
-    let Some(name) = free_project_name(&base, bot) else {
+    let Some(name) = free_project_name(&base, made.bot.slug) else {
         return err(StatusCode::CONFLICT, ClientCode::Conflict, "no free workspace name for this project");
     };
     if let Err(r) = place_clone(state, url, normalized, made, &base, &name) {
         return *r;
     }
-    let dir = base.join(&name);
     let from = match git_ref {
         Some(r) => format!("{normalized}@{r}"),
         None => normalized.to_string(),
@@ -2628,11 +2750,7 @@ fn template_workspace(
     let started = start_fresh(&base, &name, &format!("Start from {from}"))
         .and_then(|commit| crate::client_workspace::record_template_commit(&base, &name, &commit));
     if let Err(e) = started {
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(crate::client_git::clone_git_dir(&base, &name));
-        crate::client_git::forget_git_dir(&base, &name);
-        crate::client_workspace::forget_template_commit(&base, &name);
-        crate::client_workspace::forget_owner(&base, &name);
+        forget_clone(&base, &name);
         return internal(anyhow!("starting {name} from the template: {e}"));
     }
     match workspace_dir(state, &name) {
@@ -2767,11 +2885,12 @@ fn place_clone(
     crate::client_workspace::forget_source(base, name);
     crate::client_workspace::forget_template_commit(base, name);
     cg::record_git_dir(base, name, &git_dir)
+        .and_then(|()| crate::client_workspace::record_bot(base, name, made.bot.exact))
         .and_then(|()| crate::client_workspace::record_owner(base, name, made.client))
         .map_err(|e| Box::new(internal(anyhow!(e))))
 }
 
-fn worktree_workspace(state: &ClientServerState, source: &Path, made: &Made, bot: &str) -> Response {
+fn worktree_workspace(state: &ClientServerState, source: &Path, made: &Made) -> Response {
     use crate::client_workspace as ws;
     let base = match (state.worktrees_base)() {
         Ok(b) => b,
@@ -2782,24 +2901,24 @@ fn worktree_workspace(state: &ClientServerState, source: &Path, made: &Made, bot
         Err(r) => return *r,
     };
     let _one_at_a_time = state.workspace_lock.lock().unwrap();
-    match reusable(state, &base, || ws::find_worktree_of(&base, &common, bot, made.client)) {
-        Ok(Some(name)) => reused_worktree(state, &base, &name, &source),
-        Ok(None) => new_worktree(state, &base, (&source, &common), made, bot),
+    match reusable(state, &base, || ws::find_worktree_of(&base, &common, made.bot, made.client)) {
+        Ok(Some(name)) => claimed(&base, &name, made, || reused_worktree(state, &base, &name, &source)),
+        Ok(None) => new_worktree(state, &base, (&source, &common), made),
         Err(r) => *r,
     }
 }
 
 /// A new worktree workspace of `source` (its git common dir beside it) for
 /// `made`'s client, recorded; taken back again if it cannot be recorded.
-fn new_worktree(state: &ClientServerState, base: &Path, (source, common): (&Path, &Path), made: &Made, bot: &str) -> Response {
-    let Some(name) = free_worktree_name(base, source, bot) else {
+fn new_worktree(state: &ClientServerState, base: &Path, (source, common): (&Path, &Path), made: &Made) -> Response {
+    let Some(name) = free_worktree_name(base, source, made.bot.slug) else {
         return err(
             StatusCode::CONFLICT, ClientCode::Conflict,
             "no free workspace name for this checkout",
         );
     };
-    match add_bot_worktree(state, source, made.git_ref, bot, &base.join(&name)) {
-        Ok(added) => match record_worktree(base, &name, source, common, made.client) {
+    match add_bot_worktree(state, source, made.git_ref, made.bot.slug, &base.join(&name)) {
+        Ok(added) => match record_worktree(base, &name, source, common, made) {
             Ok(()) => created_worktree(state, &name, added.0, added.1),
             Err(e) => {
                 remove_worktree(source, &base.join(&name), &added.2);
@@ -2828,13 +2947,14 @@ fn remove_worktree(source: &Path, dest: &Path, branch: &str) {
 
 /// Records a new worktree workspace: the user's checkout it was made from,
 /// its repository (the worktree's admin directory under that checkout's
-/// `.git/worktrees/`), read once now, before any run has been in it, and
-/// the paired client it is for.
-fn record_worktree(base: &Path, name: &str, source: &Path, common: &Path, client: &str) -> Result<(), String> {
+/// `.git/worktrees/`), read once now, before any run has been in it, the
+/// bot's exact name and the paired client it is for.
+fn record_worktree(base: &Path, name: &str, source: &Path, common: &Path, made: &Made) -> Result<(), String> {
     let admin = crate::client_git::worktree_admin_dir(&base.join(name), common)?;
     crate::client_git::record_git_dir(base, name, &admin)?;
     crate::client_workspace::record_source(base, name, source)?;
-    crate::client_workspace::record_owner(base, name, client)
+    crate::client_workspace::record_bot(base, name, made.bot.exact)?;
+    crate::client_workspace::record_owner(base, name, made.client)
 }
 
 /// This bot's existing worktree of the checkout (one of this client's), its
@@ -2862,8 +2982,7 @@ fn add_bot_worktree(
     dest: &Path,
 ) -> Result<(String, Option<crate::client_workspace::Coded>, String), Refused> {
     use crate::client_workspace as ws;
-    let short = random_hex(3).map_err(|e| Box::new(internal(e)))?;
-    let branch = format!("mux/{bot}-{short}");
+    let branch = new_bot_branch(bot)?;
     let fetch_error = (state.fetch_repo)(source).err();
     let start = git_ref
         .map(str::to_string)
@@ -2913,7 +3032,10 @@ fn worktree_source(source: &Path, base: &Path) -> Result<(PathBuf, PathBuf), Ref
     Ok((source, common))
 }
 
-/// `<repo>-<bot>`, or with a number after it, free under the base.
+/// `<repo>-<bot>`, or with a number after it, free under the base. The
+/// checkout's folder name is cut short enough that every one of them, the
+/// numbered ones included, is a valid name; the bot's (at most 32
+/// characters) is kept whole.
 fn free_worktree_name(base: &Path, source: &Path, bot: &str) -> Option<String> {
     use crate::client_workspace as ws;
     let repo = ws::slug(
@@ -2922,7 +3044,10 @@ fn free_worktree_name(base: &Path, source: &Path, bot: &str) -> Option<String> {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default(),
     );
-    let stem = format!("{}-{bot}", if repo.is_empty() { "repo" } else { &repo });
+    let room = ws::MAX_NAME_LEN.saturating_sub(ws::NAME_SUFFIX_LEN + 1 + bot.len());
+    let repo: String = repo.chars().take(room).collect();
+    let repo = repo.trim_end_matches('-');
+    let stem = format!("{}-{bot}", if repo.is_empty() { "repo" } else { repo });
     std::iter::once(stem.clone())
         .chain((2..100).map(|n| format!("{stem}-{n}")))
         .find(|n| ws::valid_name(n) && std::fs::symlink_metadata(base.join(n)).is_err())
@@ -3275,8 +3400,8 @@ fn branch_changes(st: &ClientServerState, client: &ApprovedClient, name: &str) -
         Err(r) => return *r,
     };
     let branch = git_line(&dir, &["branch", "--show-current"]).unwrap_or_default();
-    if branch.is_empty() {
-        return err(StatusCode::CONFLICT, ClientCode::Conflict, "the work copy isn't on a branch");
+    if let Err(r) = own_branch(name, &branch, &default) {
+        return *r;
     }
     let (Some(base), Some(head)) = (git_line(&dir, &["merge-base", "HEAD", &default]), git_line(&dir, &["rev-parse", "HEAD"])) else {
         return err(StatusCode::CONFLICT, ClientCode::Conflict, "couldn't find where this branch left the default branch");
@@ -3327,6 +3452,27 @@ fn branch_changes(st: &ClientServerState, client: &ApprovedClient, name: &str) -
         files,
     })
     .into_response()
+}
+
+/// The work copy must be on a branch, and (with an origin) on a `mux/`
+/// branch of its own: a PR or backup from the default branch, or from the
+/// ref an old clone was made at, would push its commits straight onto that
+/// branch of the user's. A template project's base is its own first commit
+/// (`default` is that commit, no `origin/` ref), so its `main` is its own.
+fn own_branch(name: &str, branch: &str, default: &str) -> Result<(), Refused> {
+    if branch.is_empty() {
+        return Err(refuse(StatusCode::CONFLICT, ClientCode::Conflict, "the work copy isn't on a branch"));
+    }
+    if default.starts_with("origin/") && !is_own_branch(branch) {
+        return Err(refuse(
+            StatusCode::CONFLICT, ClientCode::NoOwnBranch,
+            format!(
+                "workspace {name} is on {branch}, not a branch of its own, so a PR or backup from it \
+                 would push onto {branch}; the next run in it moves it onto one, its commits included"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// What `/changes` compares the work copy's branch with, and that base's

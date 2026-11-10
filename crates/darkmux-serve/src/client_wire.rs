@@ -244,7 +244,8 @@ pub struct WorkspaceInfo {
     pub repo: Option<String>,
     pub created: bool,
     /// Where a new workspace started (a ref, or `<repo>@<ref>` for a
-    /// template).
+    /// template). A clone or a worktree is on a new `mux/<bot>-<id>` branch
+    /// cut from there.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
     /// Why the fetch of a reused (or source) checkout failed.

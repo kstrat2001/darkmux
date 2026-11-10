@@ -1,9 +1,10 @@
 //! Workspaces for paired apps: a repo checkout darkmux owns under the
 //! worktrees base, named, never addressed by path from the app.
 //!
-//! `POST /client/workspaces {repo_url, ref?}` reuses the workspace whose
-//! `origin` is that repo (fetching it), or clones it into a new one with the
-//! machine's own git credentials. `GET /client/workspaces/{name}` reports it.
+//! `POST /client/workspaces {repo_url, ref?, bot?}` reuses the bot's clone
+//! of that repo (fetching it), or clones it into a new one with the
+//! machine's own git credentials, on a new `mux/<bot>-<id>` branch.
+//! `GET /client/workspaces/{name}` reports it.
 //! `/client/work` and `/client/recipe` take `workspace` in place of a raw
 //! `workdir` and resolve it here, under the same containment check.
 //!
@@ -16,9 +17,15 @@ use darkmux_types::client_code::ClientCode;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// The longest workspace name.
+pub const MAX_NAME_LEN: usize = 64;
+
+/// The longest numbered fallback a name gets (`<stem>-99`).
+pub const NAME_SUFFIX_LEN: usize = "-99".len();
+
 /// Workspace names: one path segment, lowercase, no leading dot.
 pub fn valid_name(name: &str) -> bool {
-    let len_ok = (1..=64).contains(&name.len());
+    let len_ok = (1..=MAX_NAME_LEN).contains(&name.len());
     let first_ok = name
         .chars()
         .next()
@@ -89,14 +96,17 @@ pub fn valid_ref(r: &str) -> bool {
 }
 
 /// The name a new workspace gets: the repo's name, or `owner-repo` when the
-/// repo's name is taken by another checkout.
+/// repo's name is taken by another checkout, each cut short enough that a
+/// numbered fallback still fits.
 pub fn name_for(normalized: &str, taken: impl Fn(&str) -> bool) -> Option<String> {
     let mut parts = normalized.rsplit('/');
     let repo = parts.next()?.to_ascii_lowercase();
     let owner = parts.next()?.to_ascii_lowercase();
-    [repo.clone(), format!("{owner}-{repo}")]
+    let cut = |s: String| -> String { s.chars().take(MAX_NAME_LEN - NAME_SUFFIX_LEN).collect() };
+    let both = cut(format!("{owner}-{repo}"));
+    [cut(repo), both.clone()]
         .into_iter()
-        .chain((2..100).map(|n| format!("{owner}-{repo}-{n}")))
+        .chain((2..100).map(|n| format!("{both}-{n}")))
         .find(|n| valid_name(n) && !taken(n))
 }
 
@@ -142,23 +152,47 @@ fn held_workspaces(base: &Path) -> Vec<(String, crate::client_git::WorkCopy)> {
         .collect()
 }
 
-/// The workspace under `base` whose origin is `normalized`, among those
-/// darkmux holds a repository for, that paired client `client` may be
-/// handed ([`pick_for`]): one it owns.
-pub fn find_by_origin(base: &Path, normalized: &str, client: &str) -> Option<String> {
+/// The bot a workspace is asked for: its name as it goes into branch names
+/// ([`slug`], `app` when it has none) and exactly as the app sent it (empty
+/// when it sent none). Two bots whose names make one slug are told apart by
+/// the exact name.
+#[derive(Debug, Clone, Copy)]
+pub struct BotName<'a> {
+    pub slug: &'a str,
+    pub exact: &'a str,
+}
+
+/// Whether workspace `name` (on branch `branch`) is `bot`'s: on one of its
+/// branches ([`is_bot_branch`]), and recorded for its exact name. A
+/// workspace from before the exact name was recorded goes by its branch.
+fn is_bots(base: &Path, name: &str, branch: &str, bot: BotName) -> bool {
+    is_bot_branch(branch, bot.slug) && bot_of(base, name).is_none_or(|b| b == bot.exact)
+}
+
+/// Bot `bot`'s clone of the repo whose origin is `normalized`, among the
+/// workspaces darkmux holds a repository for, that paired client `client`
+/// may be handed ([`pick_for`]): one it owns, this bot's ([`is_bots`]), and a
+/// clone, never a worktree of a checkout (whose admin dir reads that
+/// checkout's `origin` too).
+pub fn find_by_origin(base: &Path, normalized: &str, bot: BotName, client: &str) -> Option<String> {
     let names = held_workspaces(base)
         .into_iter()
-        .filter(|(_, wc)| origin_of(wc).as_deref() == Some(normalized))
+        .filter(|(n, wc)| {
+            origin_of(wc).as_deref() == Some(normalized)
+                && crate::client_git::common_of(&wc.git_dir).as_ref() == Some(&wc.git_dir)
+                && status_of(wc).is_some_and(|(branch, _)| is_bots(base, n, &branch, bot))
+        })
         .map(|(n, _)| n)
         .collect();
     pick_for(base, names, client)
 }
 
-/// Branch (empty when detached) and short head of a workspace.
+/// Branch (empty when detached) and short head (empty while the branch has
+/// no commit yet, as in a clone of an empty repo) of a workspace.
 pub fn status_of(wc: &crate::client_git::WorkCopy) -> Option<(String, String)> {
-    let head = crate::client_git::line(wc, &["rev-parse", "--short", "HEAD"])?;
-    let branch = crate::client_git::line(wc, &["branch", "--show-current"]).unwrap_or_default();
-    Some((branch, head))
+    let head = crate::client_git::line(wc, &["rev-parse", "--short", "HEAD"]);
+    let branch = crate::client_git::line(wc, &["branch", "--show-current"]);
+    (head.is_some() || branch.is_some()).then(|| (branch.unwrap_or_default(), head.unwrap_or_default()))
 }
 
 /// Runs git with no terminal (credential prompts fail instead of hanging),
@@ -580,20 +614,37 @@ pub fn common_dir(dir: &Path) -> Option<PathBuf> {
 }
 
 /// The workspace under `base` that is a worktree of the repo whose shared
-/// `.git` is `common`, on one of this bot's `mux/<bot>-` branches, judged
-/// by the repository darkmux recorded for it (never its own `.git`), that
-/// paired client `client` may be handed ([`pick_for`]).
-pub fn find_worktree_of(base: &Path, common: &Path, bot: &str, client: &str) -> Option<String> {
-    let prefix = format!("mux/{bot}-");
+/// `.git` is `common`, this bot's ([`is_bots`]), judged by the repository
+/// darkmux recorded for it (never its own `.git`), that paired client
+/// `client` may be handed ([`pick_for`]).
+pub fn find_worktree_of(base: &Path, common: &Path, bot: BotName, client: &str) -> Option<String> {
     let names = held_workspaces(base)
         .into_iter()
-        .filter(|(_, wc)| {
+        .filter(|(n, wc)| {
             crate::client_git::common_of(&wc.git_dir).as_deref() == Some(common)
-                && status_of(wc).is_some_and(|(branch, _)| branch.starts_with(&prefix))
+                && status_of(wc).is_some_and(|(branch, _)| is_bots(base, n, &branch, bot))
         })
         .map(|(n, _)| n)
         .collect();
     pick_for(base, names, client)
+}
+
+/// How many hex digits follow `mux/<bot>-` in a bot's branch name.
+pub const BOT_BRANCH_SUFFIX_LEN: usize = 6;
+
+/// A new branch of bot `bot`'s: `mux/<bot>-<suffix>`, `suffix` being
+/// [`BOT_BRANCH_SUFFIX_LEN`] random hex digits.
+pub fn bot_branch(bot: &str, suffix: &str) -> String {
+    format!("mux/{bot}-{suffix}")
+}
+
+/// Whether `branch` is one of bot `bot`'s ([`bot_branch`]): its prefix and
+/// exactly a suffix's worth of lowercase hex after it, so bot `bot` never
+/// claims bot `bot-a`'s `mux/bot-a-1f2e3d`.
+pub fn is_bot_branch(branch: &str, bot: &str) -> bool {
+    branch
+        .strip_prefix(&format!("mux/{bot}-"))
+        .is_some_and(|s| s.len() == BOT_BRANCH_SUFFIX_LEN && s.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')))
 }
 
 /// The remote default branch to start new work from, as a ref that
@@ -763,6 +814,48 @@ pub fn template_commit_of(base: &Path, name: &str) -> Option<String> {
     let text = std::fs::read_to_string(&path).ok()?;
     let commit = text.trim_end_matches('\n');
     is_commit_sha(commit).then(|| commit.to_string())
+}
+
+/// Where darkmux records the exact name of the bot workspace `name` was made
+/// for: beside the workspace, like [`source_record`], outside anything a run
+/// can write.
+fn bot_record(base: &Path, name: &str) -> PathBuf {
+    base.join(format!(".{name}.bot"))
+}
+
+/// Record that workspace `name` was made for the bot named exactly `bot`
+/// (empty: one with no name). Replaces any earlier record, never through a
+/// link.
+pub fn record_bot(base: &Path, name: &str, bot: &str) -> Result<(), String> {
+    use std::io::Write;
+    if !valid_name(name) {
+        return Err(format!("{name:?} is not a workspace name"));
+    }
+    let path = bot_record(base, name);
+    let _ = std::fs::remove_file(&path);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .and_then(|mut f| writeln!(f, "{bot}"))
+        .map_err(|e| format!("recording {}'s bot: {e}", path.display()))
+}
+
+/// Forget which bot workspace `name` was made for.
+pub fn forget_bot(base: &Path, name: &str) {
+    let _ = std::fs::remove_file(bot_record(base, name));
+}
+
+/// The exact name of the bot workspace `name` was made for (empty: one with
+/// no name), if darkmux recorded it: a plain file (a link is no record).
+/// `None` for a workspace made before the name was recorded.
+pub fn bot_of(base: &Path, name: &str) -> Option<String> {
+    let path = bot_record(base, name);
+    if !valid_name(name) || !std::fs::symlink_metadata(&path).ok()?.is_file() {
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    Some(text.strip_suffix('\n').unwrap_or(&text).to_string())
 }
 
 /// Where darkmux records the paired client workspace `name` was made for:
@@ -1371,6 +1464,34 @@ mod tests {
             .as_deref(),
             Some("owner-repo-2")
         );
+    }
+
+    /// A bot's branch is its prefix and exactly the random suffix darkmux
+    /// gives one: never another bot's whose name starts with this one's, nor
+    /// a branch someone named by hand.
+    #[test]
+    fn a_bots_branch_is_its_prefix_and_exactly_a_suffix() {
+        assert!(is_bot_branch(&bot_branch("bot", "1f2e3d"), "bot"));
+        assert!(is_bot_branch("mux/bot-a-1f2e3d", "bot-a"));
+        for (branch, bot) in [("mux/bot-a-1f2e3d", "bot"), ("mux/bot-cafe", "bot"), ("mux/bot-1f2e3d4", "bot"), ("mux/bot-1F2E3D", "bot"), ("main", "bot")] {
+            assert!(!is_bot_branch(branch, bot), "{branch} {bot}");
+        }
+    }
+
+    /// A repo whose name is longer than a workspace name may be still gets
+    /// one, numbered fallbacks included.
+    #[test]
+    fn a_long_repo_name_still_gets_a_workspace_name() {
+        let normalized = format!("github.com/{}/{}", "o".repeat(30), "r".repeat(70));
+        // The first `taken` names asked about are taken; the last is `-99`.
+        for taken in [0, 1, 2, 99] {
+            let asked = std::cell::Cell::new(0);
+            let n = name_for(&normalized, |_| {
+                asked.set(asked.get() + 1);
+                asked.get() <= taken
+            });
+            assert!(n.as_deref().is_some_and(valid_name), "{taken} taken: {n:?}");
+        }
     }
 
     /// A git repo at `dir` with two commits on `main`; returns the first

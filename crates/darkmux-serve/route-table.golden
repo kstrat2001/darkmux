@@ -62,7 +62,7 @@ BranchFile.content?: string | null
 BranchFile.deleted?: boolean | null
 BranchFile.mode?: string | null
 BranchFile.path: string
-ClientCode = "unsupported_media_type" | "bad_request" | "payload_too_large" | "method_not_allowed" | "not_local" | "not_found" | "unauthorized" | "forbidden" | "conflict" | "unprocessable" | "too_many_requests" | "unavailable" | "internal" | "preview_disabled" | "no_source_checkout" | "template_no_recipe" | "no_recipe" | "recipe_invalid" | "filter_in_repo_config" | "network_key_in_repo_config" | "fetch_failed" | "clone_failed" | "busy" | "wont_fit" | "memory_in_use" | "model_start_failed" | "model_stop_failed" | "port_in_use" | "engine_unavailable" | "engine_in_use" | "dispatch_failed"
+ClientCode = "unsupported_media_type" | "bad_request" | "payload_too_large" | "method_not_allowed" | "not_local" | "not_found" | "unauthorized" | "forbidden" | "conflict" | "unprocessable" | "too_many_requests" | "unavailable" | "internal" | "preview_disabled" | "no_source_checkout" | "template_no_recipe" | "no_recipe" | "recipe_invalid" | "filter_in_repo_config" | "network_key_in_repo_config" | "fetch_failed" | "clone_failed" | "no_own_branch" | "branch_failed" | "busy" | "wont_fit" | "memory_in_use" | "model_start_failed" | "model_stop_failed" | "port_in_use" | "engine_unavailable" | "engine_in_use" | "dispatch_failed"
 ClientError.code: ClientCode
 ClientError.error: string
 ClientMachine.id: string
