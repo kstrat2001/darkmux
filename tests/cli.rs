@@ -13148,8 +13148,46 @@ fn run_stats_json_shapes_are_pinned_by_golden() {
         serde_json::from_slice(&c.assert().success().get_output().stdout).unwrap()
     };
     let golden = |g: &str| -> serde_json::Value { serde_json::from_str(g).unwrap() };
-    assert_eq!(json(&[&a], None), golden(include_str!("fixtures/run-stats-single.golden.json")));
-    assert_eq!(json(&[&a, &b], Some(&b)), golden(include_str!("fixtures/run-stats-set.golden.json")));
+    // `gather_ms` is pinned present and an integer; its reading is the runner's.
+    let clock_free = |mut v: serde_json::Value| {
+        each_gather_ms(&mut v, &mut |x| {
+            assert!(x.is_u64(), "gather_ms is a whole number of ms: {x}");
+            *x = 0.into();
+        });
+        v
+    };
+    // A slow runner's reading, made deterministic: the comparison must not see it.
+    let slow = |mut v: serde_json::Value| {
+        each_gather_ms(&mut v, &mut |x| *x = 7.into());
+        v
+    };
+    let single_golden = golden(include_str!("fixtures/run-stats-single.golden.json"));
+    let set_golden = golden(include_str!("fixtures/run-stats-set.golden.json"));
+    let single = json(&[&a], None);
+    let set = json(&[&a, &b], Some(&b));
+    assert_eq!(clock_free(slow(single.clone())), single_golden);
+    assert_eq!(clock_free(slow(set.clone())), set_golden);
+    assert_eq!(clock_free(single), single_golden);
+    assert_eq!(clock_free(set), set_golden);
+}
+
+/// Every `gather_ms` in a `run stats` document: the flow scan's own
+/// wall-clock cost, so a slow runner reads 1 ms or more where a fast one
+/// reads 0.
+fn each_gather_ms(v: &mut serde_json::Value, f: &mut impl FnMut(&mut serde_json::Value)) {
+    match v {
+        serde_json::Value::Object(m) => {
+            for (k, x) in m.iter_mut() {
+                if k == "gather_ms" {
+                    f(x);
+                } else {
+                    each_gather_ms(x, f);
+                }
+            }
+        }
+        serde_json::Value::Array(a) => a.iter_mut().for_each(|x| each_gather_ms(x, f)),
+        _ => {}
+    }
 }
 
 /// A lab run dir the scanner recognizes: a lifecycle record (the marker) and a

@@ -3414,10 +3414,26 @@ esac
         let ls_count = || std::fs::read_to_string(&ls_calls).map(|s| s.lines().count()).unwrap_or(0);
 
         let first = gather_with_bin(&bin);
-        let second = gather_with_bin(&bin);
+        let mut second = gather_with_bin(&bin);
         assert_eq!(ls_count(), 1, "the second gather reuses the catalog");
         assert_eq!(second.models.len(), 1);
-        assert_eq!(first.models, second.models, "the reused catalog prices the resident the same");
+        // A row's state, footprint and overage are judged against the host's
+        // live memory and workers, which move between gathers; only what the
+        // catalog prices is compared. That movement, made deterministic:
+        let row = &mut second.models[0];
+        row.state = LedgerState::Red;
+        row.current_bytes = Some(1);
+        row.over_price_bytes = None;
+        row.shrink_hint = Some("moved".into());
+        let priced = |rows: &[ModelRow]| -> Vec<_> {
+            rows.iter()
+                .map(|r| {
+                    let catalog = (r.weights_bytes, r.kv_per_token_bytes, r.kv_bytes_at_ctx, r.potential_bytes);
+                    (r.identifier.clone(), r.model_key.clone(), r.owner, r.loaded_ctx, catalog, r.potential_source)
+                })
+                .collect()
+        };
+        assert_eq!(priced(&first.models), priced(&second.models), "the reused catalog prices the resident the same");
 
         std::fs::write(&resident, "n").unwrap();
         let third = gather_with_bin(&bin);
