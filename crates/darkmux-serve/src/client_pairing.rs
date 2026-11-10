@@ -673,7 +673,8 @@ pub struct RunError {
     pub reason: String,
     pub error: String,
     /// (#3468) The `code` its run's `dispatch.error` named, as written
-    /// (`busy`, `wont_fit`, ...): read from the flow, never from `error`.
+    /// (`busy`, `wont_fit`, ...): read from the flow, or (#3505) from the
+    /// refusal envelope the child printed, never from `error`.
     pub code: Option<String>,
 }
 
@@ -851,7 +852,7 @@ pub struct ClientServerState {
     pub execute: Execute,
     pub works: Arc<Mutex<HashMap<String, WorkEntry>>>,
     /// (#3467) What a running work item's dispatch is doing besides its
-    /// turns (`starting_model`), read per poll.
+    /// turns (`starting_model`, `queued`), read per poll.
     pub work_activity: WorkActivity,
     /// The canonical worktrees base workspaces live under.
     pub worktrees_base: PathSource,
@@ -3392,7 +3393,7 @@ static WORK_ACTIVITY_RECORDS: crate::flow_window::FlowRecordStore =
     crate::flow_window::FlowRecordStore::new(feeds_work_activity);
 
 /// Whether a record can change a client work item's activity: a dispatch
-/// bookend or `dispatch.model.*` record of a crew-of-one dispatch session
+/// bookend, `dispatch.model.*` or `dispatch.queue.*` record of a crew-of-one dispatch session
 /// (`darkmux dispatch <role> --name <work_id>` names it `.adhoc.<role>.<work_id>`).
 pub(crate) fn feeds_work_activity(v: &Value) -> bool {
     use darkmux_flow::FlowAction as A;
@@ -3400,7 +3401,16 @@ pub(crate) fn feeds_work_activity(v: &Value) -> bool {
     adhoc
         && matches!(
             darkmux_flow::reader::action_of(v),
-            Some(A::DispatchStart | A::DispatchModelStart | A::DispatchModelLoading | A::DispatchModelReady | A::DispatchComplete | A::DispatchError)
+            Some(
+                A::DispatchStart
+                    | A::DispatchModelStart
+                    | A::DispatchModelLoading
+                    | A::DispatchModelReady
+                    | A::DispatchQueueWait
+                    | A::DispatchQueueResume
+                    | A::DispatchComplete
+                    | A::DispatchError
+            )
         )
 }
 
@@ -3899,8 +3909,14 @@ pub(crate) fn run_dispatch_child(
     let stdout_bytes = out_reader.join().unwrap_or_default();
     let stderr_bytes = err_reader.join().unwrap_or_default();
     let stdout = String::from_utf8_lossy(&stdout_bytes);
+    // (#3505) A refused dispatch prints its refusal envelope: a failed run,
+    // carrying the envelope's code.
+    let mut refused_code = None;
     if let Ok(v @ Value::Object(_)) = serde_json::from_str::<Value>(stdout.trim()) {
-        return Ok(v);
+        if v.get("result").and_then(Value::as_str) != Some("refused") {
+            return Ok(v);
+        }
+        refused_code = v.get("code").and_then(Value::as_str).map(str::to_string);
     }
     let tail = stderr_tail(&stderr_bytes);
     #[cfg(unix)]
@@ -3908,7 +3924,7 @@ pub(crate) fn run_dispatch_child(
     #[cfg(not(unix))]
     let signal: Option<i32> = None;
     let mut e = failed(&exit_reason(status.code(), signal), tail);
-    e.code = teardown.dispatch_error_code(spec);
+    e.code = refused_code.or_else(|| teardown.dispatch_error_code(spec));
     Err(e)
 }
 

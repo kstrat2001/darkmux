@@ -70,6 +70,9 @@ pub enum ClientCode {
     Busy,
     /// The model does not fit this machine; retrying cannot help.
     WontFit,
+    /// (#3510) The memory is held by programs darkmux did not start; retry
+    /// once they free it.
+    MemoryInUse,
     /// The engine server would not start, or exited.
     ModelStartFailed,
     /// darkmux's own engine server would not stop to make way.
@@ -103,6 +106,7 @@ impl ClientCode {
         matches!(
             self,
             Busy | WontFit
+                | MemoryInUse
                 | ModelStartFailed
                 | ModelStopFailed
                 | PortInUse
@@ -137,6 +141,7 @@ mod tests {
             (RecipeInvalid, "recipe_invalid"),
             (Busy, "busy"),
             (WontFit, "wont_fit"),
+            (MemoryInUse, "memory_in_use"),
             (ModelStartFailed, "model_start_failed"),
             (PortInUse, "port_in_use"),
             (EngineUnavailable, "engine_unavailable"),
@@ -163,6 +168,7 @@ mod tests {
         for (raw, c) in [
             ("busy", Busy),
             ("wont_fit", WontFit),
+            ("memory_in_use", MemoryInUse),
             ("model_start_failed", ModelStartFailed),
             ("model_stop_failed", ModelStopFailed),
             ("port_in_use", PortInUse),

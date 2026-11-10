@@ -4728,7 +4728,10 @@ fn dispatch_unmanaged(
     // (#3448) A model on a server darkmux starts is made resident now,
     // between `dispatch.start` and the call, with its `dispatch.model.*`
     // records; a refusal is this execution's `dispatch.error`, with its code.
-    let resident = engine_resident(target, |p| {
+    // (#3504) A busy model waits as `fleet.busy_policy` says, at most the
+    // call's own timeout.
+    let wait = crate::engine_dispatch::BusyWait::configured(u64::from(opts.timeout_seconds), budget_caller);
+    let resident = engine_resident(target, &wait, |p| {
         let _ = darkmux_flow::record(build_unmanaged_record(&opts.role_id, session, execution, &pm.id, phase, p));
     });
     let _engine = match resident {
@@ -4745,13 +4748,13 @@ fn dispatch_unmanaged(
                         phase,
                         darkmux_flow::Payload::DispatchError(DispatchEndPayload {
                             endpoint: Some(label.clone()),
-                            error: Some(refusal.message.clone()),
-                            code: Some(refusal.code.to_string()),
+                            error: Some(refusal.message().to_string()),
+                            code: refusal.code().map(str::to_string),
                             ..DispatchEndPayload::new(0)
                         }),
                     ),
                 );
-            return Err(refusal.into());
+            return Err(refusal.into_error());
         }
     };
 
@@ -6464,29 +6467,32 @@ type HostedRoute = (crate::types::Role, String, crate::target::Target, crate::ro
 
 /// [`DispatchRoute`] as its hosted and managed halves (at most one is set).
 /// (#3448) Make `target`'s model resident when it runs on a server darkmux
-/// starts, recording each `dispatch.model.*` step through `record`; `None`
-/// for any other target.
+/// starts, recording each `dispatch.model.*` (and `dispatch.queue.*`) step
+/// through `record`; `None` for any other target. (#3504) A busy model
+/// waits as `wait` says.
 fn engine_resident(
     target: &crate::target::Target,
+    wait: &crate::engine_dispatch::BusyWait<'_>,
     mut record: impl FnMut(darkmux_flow::Payload),
-) -> Result<Option<crate::engine_dispatch::EngineReady>, crate::engine_dispatch::EngineRefusal> {
+) -> Result<Option<crate::engine_dispatch::EngineReady>, crate::engine_dispatch::NotResident> {
     if !crate::engine_dispatch::is_engine_server(target) {
         return Ok(None);
     }
-    crate::engine_dispatch::prepare(target, &mut |n, p| record(model_record(n, p))).map(Some)
+    crate::engine_dispatch::prepare(target, wait, &mut |n, p| record(model_record(n, p))).map(Some)
 }
 
 /// (#3448) The `dispatch.error` payload of a container dispatch whose model
-/// could not be made resident, carrying the refusal's code.
+/// could not be made resident, carrying the refusal's code (none for a
+/// queued wait its run's stop ended).
 fn refusal_terminal(
-    refusal: &crate::engine_dispatch::EngineRefusal,
+    refusal: &crate::engine_dispatch::NotResident,
     wall_ms: u64,
     endpoint: Option<&str>,
     resume_from: Option<&std::path::Path>,
 ) -> darkmux_flow::Payload {
-    let (mut payload, _) = ended_mid_run_terminal(&refusal.message, wall_ms, &TrajectorySummary::default(), endpoint, resume_from);
+    let (mut payload, _) = ended_mid_run_terminal(refusal.message(), wall_ms, &TrajectorySummary::default(), endpoint, resume_from);
     if let darkmux_flow::Payload::DispatchError(p) = &mut payload {
-        p.code = Some(refusal.code.to_string());
+        p.code = refusal.code().map(str::to_string);
     }
     payload
 }
@@ -6498,6 +6504,8 @@ fn model_record(note: crate::engine_dispatch::Note, p: darkmux_flow::payload::Di
         Note::Start => darkmux_flow::Payload::DispatchModelStart(p),
         Note::Loading => darkmux_flow::Payload::DispatchModelLoading(p),
         Note::Ready => darkmux_flow::Payload::DispatchModelReady(p),
+        Note::Queued => darkmux_flow::Payload::DispatchQueueWait(p),
+        Note::Resumed => darkmux_flow::Payload::DispatchQueueResume(p),
     }
 }
 
@@ -7504,8 +7512,22 @@ fn container_model_resident(
     let record = |level: darkmux_flow::Level, p: darkmux_flow::Payload| {
         crate::dispatch::build_dispatch_record(level, &opts.role_id, &opts.session, execution, Some(model), opts.phase_id.as_deref(), p)
     };
+    // (#3504) A busy model waits as `fleet.busy_policy` says, at most the
+    // dispatch's inactivity budget, the container path's timeout.
+    let caller = crate::budget::BudgetCaller {
+        session: &opts.session,
+        execution,
+        role_id: Some(&opts.role_id),
+        model: Some(model),
+        phase_id: opts.phase_id.as_deref(),
+        profiles_file: opts.config_path.as_deref(),
+    };
+    let wait = crate::engine_dispatch::BusyWait::configured(
+        effective_inactivity_timeout_seconds(opts.timeout_override_seconds).0,
+        caller,
+    );
     let resident = brain.map_or(Ok(None), |t| {
-        engine_resident(t, |p| {
+        engine_resident(t, &wait, |p| {
             let _ = darkmux_flow::record(record(darkmux_flow::Level::Info, p));
         })
     });
@@ -7514,7 +7536,7 @@ fn container_model_resident(
             refusal_terminal(&refusal, started.elapsed().as_millis() as u64, endpoint_label, opts.resume_from.as_deref());
         merge_record_context(&mut payload, &opts.record_context);
         bookend.close(record(darkmux_flow::Level::Error, payload));
-        anyhow::Error::from(refusal)
+        refusal.into_error()
     })
 }
 

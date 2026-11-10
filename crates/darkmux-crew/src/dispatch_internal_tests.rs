@@ -3829,6 +3829,24 @@ S(("127.0.0.1", port), H).serve_forever()
         assert_eq!(records[1]["level"], "error", "{}", records[1]);
     }
 
+    /// (#3504) The terminal of a dispatch that made no model resident: a
+    /// refusal carries its code (a queued wait that timed out is `busy`),
+    /// and a queued wait its run's stop ended is a `dispatch.error` with no
+    /// code (the stop is named by its own rule), never a refusal.
+    #[test]
+    fn a_dispatch_whose_wait_was_stopped_ends_in_dispatch_error_with_no_code() {
+        use crate::engine_dispatch::{EngineRefusal, NotResident};
+        let code_of = |nr: &NotResident| match refusal_terminal(nr, 5, None, None) {
+            darkmux_flow::Payload::DispatchError(p) => (p.code, p.error),
+            other => panic!("not a dispatch.error: {other:?}"),
+        };
+        let timed_out = NotResident::Refused(EngineRefusal { code: "busy", message: "still busy".into(), waiting_on: None });
+        assert_eq!(code_of(&timed_out), (Some("busy".into()), Some("still busy".into())));
+        let stopped = NotResident::Stopped("stopped waiting".into());
+        assert_eq!(code_of(&stopped), (None, Some("stopped waiting".into())));
+        assert_eq!(crate::engine_dispatch::refusal_code(&stopped.into_error()), None);
+    }
+
     /// (#3448 PR 4 review) The container path names the model the way the
     /// server answers to it: `darkmux:<id>` on a Tensorfold endpoint.
     #[test]

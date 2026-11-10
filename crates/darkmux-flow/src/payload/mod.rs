@@ -284,6 +284,8 @@ flow_payloads! {
     DispatchModelStart => DispatchModelPayload;
     DispatchModelLoading => DispatchModelPayload;
     DispatchModelReady => DispatchModelPayload;
+    DispatchQueueWait => DispatchModelPayload;
+    DispatchQueueResume => DispatchModelPayload;
     GhVerbExecuted => GhVerbExecutedPayload;
     HookFired => HookDeliveryPayload;
     HookFailed => HookFailedPayload;

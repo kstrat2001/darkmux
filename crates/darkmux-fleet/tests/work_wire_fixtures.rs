@@ -1,5 +1,7 @@
 //! The work wire at its frozen version: committed fixtures written by this
 //! release's writer, and a shape hash tied to `WORK_JOB_SCHEMA_VERSION`.
+//! (#3505) 8.2 adds only the reply's `code`, so the 8.1 fixtures are still
+//! this writer's output beside the one 8.2 fixture.
 //!
 //! From this release the wire grows only by a minor bump (a receiver takes
 //! the same major with a minor at or below its own), so a later build must
@@ -108,6 +110,17 @@ fn writers() -> Vec<(&'static str, serde_json::Value)> {
             "reply-queued-8.1.json",
             v(&SubmissionReply { reason: Some("studio is busy; the job is queued".into()), ..base_reply(ReplyStatus::Queued) }),
         ),
+        // (#3505) 8.2: an `error` reply carries the refused dispatch's code.
+        // Every 8.1 fixture above is still written byte for byte: the job is
+        // unchanged and a reply with no code writes none.
+        (
+            "reply-error-8.2.json",
+            v(&SubmissionReply {
+                reason: Some("darkmux dispatch: endpoint `tf` is serving `a` for a running dispatch; retry when it finishes [busy]".into()),
+                code: Some("busy".into()),
+                ..base_reply(ReplyStatus::Error)
+            }),
+        ),
     ]
 }
 
@@ -120,7 +133,7 @@ fn committed(name: &str) -> serde_json::Value {
 /// The promise: this build's writer still produces the committed fixtures. A
 /// change to what the wire says is a change to `WORK_JOB_SCHEMA_VERSION`.
 #[test]
-fn the_writer_produces_the_committed_8_1_fixtures() {
+fn the_writer_produces_the_committed_8_1_and_8_2_fixtures() {
     for (name, written) in writers() {
         if regenerating() {
             std::fs::create_dir_all(fixtures_dir()).unwrap();
@@ -141,7 +154,7 @@ fn the_writer_produces_the_committed_8_1_fixtures() {
 /// receiver's own parse (version, shape, validation), the replies through the
 /// sender's reader.
 #[test]
-fn the_committed_8_1_fixtures_still_parse() {
+fn the_committed_8_1_and_8_2_fixtures_still_parse() {
     for name in ["submission-run-8.1.json", "submission-check-8.1.json"] {
         let body = std::fs::read(fixtures_dir().join(name)).unwrap();
         let sub = WorkSubmission::parse(&body).unwrap_or_else(|r| panic!("{name}: {r:?}"));
@@ -152,7 +165,10 @@ fn the_committed_8_1_fixtures_still_parse() {
     for name in ["reply-completed-8.1.json", "reply-refused-8.1.json", "reply-checked-8.1.json", "reply-queued-8.1.json"] {
         let reply: SubmissionReply = serde_json::from_value(committed(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
         assert_ne!(reply.status, ReplyStatus::Unknown, "{name}");
+        assert_eq!(reply.code, None, "{name}: an 8.1 reply carries no code");
     }
+    let error: SubmissionReply = serde_json::from_value(committed("reply-error-8.2.json")).unwrap();
+    assert_eq!((error.status, error.code.as_deref()), (ReplyStatus::Error, Some("busy")));
 }
 
 /// (#3028) The 8.0 fixtures are frozen, written by the 8.0 release's writer
