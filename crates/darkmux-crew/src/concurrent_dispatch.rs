@@ -821,15 +821,16 @@ fn run_unload(
     held: &dyn Fn() -> Vec<String>,
 ) -> Option<PlanExecOutcome> {
     let identifier = target.identifier().to_string();
-    if held().contains(&identifier) {
-        return Some(PlanExecOutcome::Drifted { identifier, why: "a running dispatch took it up".into() });
-    }
     if let darkmux_gestalt::Precondition::ResidentPresent { at_ctx, .. } = precondition {
         let residents = host.list_resident().unwrap_or_default();
         let present = residents.iter().any(|r| r.identifier == identifier && at_ctx.is_none_or(|c| r.ctx == c));
         if !present {
             return Some(PlanExecOutcome::Drifted { identifier, why: "it is no longer resident as planned".into() });
         }
+    }
+    // The leases last, nearest the unload.
+    if held().contains(&identifier) {
+        return Some(PlanExecOutcome::Drifted { identifier, why: "a running dispatch took it up".into() });
     }
     if let Err(host_error) = host.unload(target, deadline) {
         return Some(PlanExecOutcome::HostFailed { detail: format!("unload failed for \"{identifier}\": {host_error}"), host_error });
@@ -2087,6 +2088,52 @@ mod tests {
         settle_attempt(drift(), 1, &[], &[]).expect("the first drift replans");
         let err = settle_attempt(drift(), BLOCKED_BY_HOLDER_RETRY_ATTEMPTS, &[], &[]).expect_err("spent");
         assert_eq!(crate::engine_dispatch::refusal_code(&err), Some("busy"), "{err:#}");
+    }
+
+    /// A host whose second `lms ps` (the re-read before the first unload)
+    /// is when another dispatch takes the orphan up.
+    struct TakenUpMidPlan {
+        inner: MockHost,
+        lists: u32,
+        sibling: Option<residency_lease::LeaseGuard>,
+    }
+
+    impl ModelHost for TakenUpMidPlan {
+        fn list_resident(&mut self) -> Result<Vec<ResidentFact>, HostError> {
+            self.lists += 1;
+            if self.lists == 2 {
+                let g = residency_lease::LeaseGuard::acquire();
+                g.write(&["darkmux:orphan".to_string()]).unwrap();
+                g.mark_loaded(&["darkmux:orphan".to_string()]).unwrap();
+                self.sibling = Some(g);
+            }
+            self.inner.list_resident()
+        }
+        fn list_catalog(&mut self) -> Result<Vec<darkmux_gestalt::CatalogFact>, HostError> {
+            self.inner.list_catalog()
+        }
+        fn load(&mut self, model_key: &str, identifier: &str, min_ctx: u32, deadline: Deadline) -> Result<darkmux_gestalt::LoadReport, HostError> {
+            self.inner.load(model_key, identifier, min_ctx, deadline)
+        }
+        fn unload(&mut self, target: &darkmux_gestalt::OwnedTarget, deadline: Deadline) -> Result<(), HostError> {
+            self.inner.unload(target, deadline)
+        }
+    }
+
+    /// (#3511) Through the wave: an orphan a dispatch takes up between the
+    /// plan and its unload is kept, and the wave plans again around it.
+    #[serial_test::serial]
+    #[test]
+    fn ensure_wave_loaded_replans_around_a_resident_taken_up_mid_plan() {
+        let _env = LeaseTestEnv::new();
+        let est = FixedEstimator(BTreeMap::from([("m".to_string(), 1_000u64)]));
+        let inner = MockHost::new().resident("darkmux:orphan", "orphan", 8_000, Some(1_000));
+        let mut host = TakenUpMidPlan { inner, lists: 0, sibling: None };
+        let lease_guard = residency_lease::LeaseGuard::acquire();
+        ensure_wave_loaded(&[placement("m", 8_000)], &est, &mut host, &lease_guard, None).expect("loads beside it");
+        let unloaded = host.inner.ops.iter().any(|op| matches!(op, darkmux_gestalt::mock::HostOp::Unload { .. }));
+        assert!(!unloaded, "the orphan a dispatch took up was never unloaded: {:?}", host.inner.ops);
+        drop(host.sibling.take());
     }
 
     /// (#3510) An LM Studio wave's memory refusals carry the engine path's

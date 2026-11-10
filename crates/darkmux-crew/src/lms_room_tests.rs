@@ -501,7 +501,9 @@ fn a_running_dispatch_holds_its_job_model_and_its_compactor() {
     let _rig = Rig::new();
     let lab_run = LeaseGuard::acquire();
     hold_dispatch_models(&lab_run, Some("darkmux:job"), Some("darkmux:qwen/qwen3-4b-2507")).unwrap();
-    hold_dispatch_models(&LeaseGuard::acquire(), Some("user-loaded"), None).unwrap();
+    let user = LeaseGuard::acquire();
+    hold_dispatch_models(&user, Some("user-loaded"), None).unwrap();
+    assert!(!LeaseGuard::acquire().all_live_leased_models().contains(&"user-loaded".to_string()), "a load darkmux did not make is not leased");
     let mut host = MockHost::new()
         .resident("darkmux:job", "job", 8_000, Some(GIB))
         .resident("darkmux:qwen/qwen3-4b-2507", "qwen/qwen3-4b-2507", 8_000, Some(GIB))
@@ -529,4 +531,19 @@ fn the_container_path_takes_the_dispatch_lease() {
     assert!(prepare.find("resolve_container_model(").unwrap() < prepare.find("hold_dispatch_models(").unwrap());
     let launch = body("launch_container");
     assert!(launch.find("prepare_compactor(").unwrap() < launch.find("hold_dispatch_models(").unwrap());
+}
+
+/// (#3508) The planner plans against the machine's memory too: a copy of a
+/// model a user loaded that darkmux's own copy cannot sit beside is refused
+/// naming the user's instance, `memory_in_use`.
+#[test]
+#[serial_test::serial]
+fn the_planner_names_a_user_load_whose_memory_darkmux_cannot_free() {
+    let rig = Rig::new();
+    let free = || Some(8 * GIB);
+    let machine = FakeMachine::new(&free);
+    let mut host = MockHost::new().resident("m", "m", 8_000, Some(20 * GIB)).cataloged("m", 20 * GIB);
+    let err = load(&mut host, &wave("m"), &rig.room(&machine)).expect_err("refused");
+    assert_eq!(refusal_code(&err), Some("memory_in_use"), "{err:#}");
+    assert!(format!("{err:#}").contains("user-loaded instance \"m\""), "the planner's pool arm names it: {err:#}");
 }
