@@ -613,14 +613,16 @@ pub struct DispatchEndPayload {
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub stop_reason: Option<String>,
     /// (#3448) On a `dispatch.error` only: a stable code an app branches on,
-    /// beside `error` for a person: `busy` (the memory is held by a running
-    /// dispatch; retry later), `wont_fit` (the model does not fit even with
-    /// every darkmux resident evicted), `model_start_failed`,
+    /// beside `error` for a person: `busy` (the endpoint or the memory is
+    /// held by a running dispatch, or a start in flight; retry later),
+    /// `wont_fit` (the model is larger than the machine), `model_start_failed`,
     /// `model_stop_failed` (darkmux's own server would not stop when it was
     /// replaced or evicted), `port_in_use`, `engine_unavailable`,
     /// `engine_in_use` (#3453: the engine's own server, one darkmux did not
-    /// start, is running, as rec's can be). Absent when the failure has no
-    /// code.
+    /// start, is running, as rec's can be), and (#3510) `memory_in_use`
+    /// (held by programs darkmux did not start; retry later). Absent when
+    /// the failure has no code, and on a queued wait its run's stop ended
+    /// (#3504).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub code: Option<String>,
@@ -1269,7 +1271,9 @@ impl Attribution for DispatchWorkdirGitUnavailablePayload {
 /// (#3448) The payload of `dispatch.model.start`, `.loading` and `.ready`: a
 /// dispatch making its model resident on an engine darkmux starts servers
 /// for. Written between `dispatch.start` and the first turn, only when the
-/// model was not already resident.
+/// model was not already resident. (#3504) Also the payload of
+/// `dispatch.queue.wait` and `.resume`, a dispatch waiting for its model's
+/// endpoint or memory to free.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
@@ -1289,10 +1293,22 @@ pub struct DispatchModelPayload {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "ts-export", ts(as = "Option<Vec<String>>", optional))]
     pub evicted: Vec<String>,
-    /// On `loading` and `ready`: how long the start has taken.
+    /// On `loading` and `ready`: how long the start has taken. (#3504) On
+    /// `dispatch.queue.wait` and `.resume`: how long the dispatch has waited.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
     pub elapsed_ms: Option<u64>,
+    /// (#3504) On `dispatch.queue.wait`: what the dispatch waits on (the
+    /// endpoint serving another model, or the memory running dispatches
+    /// hold), in the words its `busy` refusal would use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub waiting_on: Option<String>,
+    /// (#3504) On `dispatch.queue.wait`: the longest the dispatch waits (its
+    /// timeout), ms; absent when its timeout is unbounded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
+    pub wait_bound_ms: Option<u64>,
     /// The graph step the record belongs to, when its session is a step's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]

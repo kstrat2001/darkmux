@@ -79,18 +79,20 @@ struct Folded {
     /// A `step.complete` that names a later step of its task still planned: the task's session
     /// goes on (#3074).
     later_step_planned: bool,
-    /// (#3467) A `dispatch.model.loading`'s time so far, milliseconds.
+    /// (#3467) A `dispatch.model.loading`'s time so far, or (#3504) a
+    /// `dispatch.queue.wait`'s time waited, milliseconds.
     model_elapsed_ms: Option<u64>,
 }
 
-/// (#3467) A `dispatch.model.loading`'s time so far, ms. Read only off a
-/// `.loading`, so no other record pays for the payload parse.
+/// (#3467) A `dispatch.model.loading`'s time so far, ms; (#3504) a
+/// `dispatch.queue.wait`'s time waited. Read only off those two, so no other
+/// record pays for the payload parse.
 fn model_elapsed_of(action: Option<&FlowAction>, v: &serde_json::Value) -> Option<u64> {
-    if action != Some(&FlowAction::DispatchModelLoading) {
+    if !matches!(action, Some(FlowAction::DispatchModelLoading | FlowAction::DispatchQueueWait)) {
         return None;
     }
     match darkmux_flow::reader::payload_of(v) {
-        Some(darkmux_flow::Payload::DispatchModelLoading(p)) => p.elapsed_ms,
+        Some(darkmux_flow::Payload::DispatchModelLoading(p) | darkmux_flow::Payload::DispatchQueueWait(p)) => p.elapsed_ms,
         _ => None,
     }
 }
@@ -252,6 +254,10 @@ pub(crate) struct Attempt {
     /// `dispatch.model.start` until `.ready`): the latest `.loading`'s time
     /// so far, ms (0 before the first).
     model_starting: Option<u64>,
+    /// (#3504) While its dispatch waits for a busy endpoint or memory (from
+    /// `dispatch.queue.wait` until `.resume`): the latest wait record's time
+    /// waited, ms.
+    queued: Option<u64>,
 }
 
 impl Attempt {
@@ -266,6 +272,14 @@ impl Attempt {
     /// (0 before the first). The one reading every run surface takes.
     pub fn starting_model(&self) -> Option<u64> {
         self.model_starting.filter(|_| self.fold.close.is_none())
+    }
+
+    /// (#3504) While the attempt is open and its dispatch is queued (between
+    /// `dispatch.queue.wait` and `dispatch.queue.resume`): how long it has
+    /// waited, from the latest wait record. The one reading every run surface
+    /// takes.
+    pub fn queued(&self) -> Option<u64> {
+        self.queued.filter(|_| self.fold.close.is_none())
     }
 
     fn add(&mut self, r: &Folded) {
@@ -300,6 +314,8 @@ impl Attempt {
             // `.start` may sit in a day file the window no longer reads).
             FlowAction::DispatchModelLoading => self.model_starting = r.model_elapsed_ms.or(self.model_starting),
             FlowAction::DispatchModelReady => self.model_starting = None,
+            FlowAction::DispatchQueueWait => self.queued = r.model_elapsed_ms.or(self.queued).or(Some(0)),
+            FlowAction::DispatchQueueResume => self.queued = None,
             _ => {}
         }
     }

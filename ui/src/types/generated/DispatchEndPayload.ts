@@ -55,14 +55,16 @@ error?: string,
 stop_reason?: string, 
 /**
  * (#3448) On a `dispatch.error` only: a stable code an app branches on,
- * beside `error` for a person: `busy` (the memory is held by a running
- * dispatch; retry later), `wont_fit` (the model does not fit even with
- * every darkmux resident evicted), `model_start_failed`,
+ * beside `error` for a person: `busy` (the endpoint or the memory is
+ * held by a running dispatch, or a start in flight; retry later),
+ * `wont_fit` (the model is larger than the machine), `model_start_failed`,
  * `model_stop_failed` (darkmux's own server would not stop when it was
  * replaced or evicted), `port_in_use`, `engine_unavailable`,
  * `engine_in_use` (#3453: the engine's own server, one darkmux did not
- * start, is running, as rec's can be). Absent when the failure has no
- * code.
+ * start, is running, as rec's can be), and (#3510) `memory_in_use`
+ * (held by programs darkmux did not start; retry later). Absent when
+ * the failure has no code, and on a queued wait its run's stop ended
+ * (#3504).
  */
 code?: string, 
 /**

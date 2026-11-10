@@ -242,6 +242,32 @@ impl CheckpointSummary {
     }
 }
 
+/// (#3505) What `dispatch --json` prints for a dispatch refused before its
+/// role ran: the refusal's stable `code` beside the sentence for a person,
+/// the same code its `dispatch.error` record carries. An app retries `busy`
+/// (running dispatches hold what it needs) and `memory_in_use` (programs
+/// darkmux did not start hold the memory), gives up on `wont_fit` (the
+/// model is larger than the machine), and treats every other code, and a
+/// failure with no envelope, as a failure. The exit code is non-zero, as for
+/// every failed dispatch.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct DispatchRefusedEnvelope {
+    /// Always `refused`.
+    pub result: String,
+    /// `busy`, `memory_in_use`, `wont_fit`, `model_start_failed`,
+    /// `model_stop_failed`, `port_in_use`, `engine_unavailable`,
+    /// `engine_in_use`; a code a newer darkmux adds is passed as written.
+    pub code: String,
+    /// Why, for a person. Never parsed.
+    pub error: String,
+}
+
+impl DispatchRefusedEnvelope {
+    pub fn new(code: impl Into<String>, error: impl Into<String>) -> Self {
+        Self { result: "refused".to_string(), code: code.into(), error: error.into() }
+    }
+}
+
 /// The envelope of a role execution staffed by a hosted endpoint: one call, no
 /// container, so no trajectory and no host blocks.
 #[derive(Debug, Clone, Serialize, JsonSchema)]

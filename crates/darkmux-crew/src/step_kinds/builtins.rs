@@ -681,7 +681,13 @@ impl StepKind for DispatchInternalStepKind {
         // so a field can no longer be dropped on this hop while the suite
         // stays green. Everything below is post-dispatch handling.
         let opts = dispatch_opts_for(step, task, input, ctx)?;
+        let session = opts.session.clone();
         let result = dispatch(opts).map_err(|e| {
+            // (#3505) The crew-of-one reads a refusal's code back by session:
+            // the step graph carries only the error's text.
+            if preserve_dispatch_result {
+                crate::engine_dispatch::stash_refusal(&session, &e);
+            }
             crate::dispatch_internal::with_step_context(e, || format!("step `{}` dispatch.internal", step.id))
         })?;
 

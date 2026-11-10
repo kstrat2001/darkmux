@@ -1,6 +1,7 @@
 # verbs: what each prints under --json
 dispatch <role> (a container execution)  DispatchEnvelope
 dispatch <role> (a hosted-endpoint execution)  DirectDispatchEnvelope
+dispatch <role> (refused before its role ran)  DispatchRefusedEnvelope
 finding list  FindingList
 finding show  FindingRecord
 finding sync  SyncReport
@@ -282,6 +283,10 @@ DispatchEnvelope
   findings?: FindingsSummary | null
   degeneracy_warnings?: uint32 | null
   checkpoints?: CheckpointSummary | null
+DispatchRefusedEnvelope
+  result: string
+  code: string
+  error: string
 DraftCompaction
   custom_instructions: string
 DraftModel
@@ -974,7 +979,7 @@ Run
   not_reporting?: boolean
   activity?: RunActivity | null
   activity_elapsed_ms?: uint64 | null
-RunActivity = "starting_model"
+RunActivity = "starting_model" | "queued"
 RunChecks
   telemetry_covers_run: boolean
   policy_consistent: boolean | null

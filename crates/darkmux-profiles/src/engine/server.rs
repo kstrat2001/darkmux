@@ -99,6 +99,10 @@ pub enum Progress {
     /// model or context.
     Replacing { model: String },
     Starting,
+    /// (#3509) The server process is spawned and recorded; its start goes on.
+    /// A caller holding the machine-wide residency lock across the spawn
+    /// releases it here.
+    Spawned,
     /// Still waiting; how long so far.
     Waiting { elapsed: Duration },
     Ready { elapsed: Duration },
@@ -310,6 +314,7 @@ pub fn ensure(
     }
     progress(Progress::Starting);
     let rec = spawn_and_record(spec, dirs).map_err(start_failed)?;
+    progress(Progress::Spawned);
     wait_ready(spec, dirs, &rec, bounds, progress).map_err(|fail| {
         let _ = stop_locked(dirs, &rec, bounds);
         match fail {
@@ -318,6 +323,29 @@ pub fn ensure(
         }
     })?;
     Ok(Ensured::Started(rec))
+}
+
+/// (#3511) [`ensure`]'s reuse, never a start: darkmux's server on `spec`'s
+/// endpoint when it still runs this exact command (decided under the
+/// endpoint's lock, as `ensure` decides it), else `None` with any other
+/// server of darkmux's there stopped as `ensure` would stop it. A caller that
+/// judged the server reusable and then lost it (an evictor stopped it in
+/// between) gets `None`, and starts it through its memory decision rather
+/// than through `ensure` blind.
+pub fn reuse(
+    spec: &ServerSpec,
+    dirs: &Dirs,
+    bounds: Bounds,
+    held: Held<'_>,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<Option<EngineRecord>, ServerError> {
+    let lock_path = engine_record::path_in(&dirs.records, &spec.endpoint).with_extension("server.lock");
+    let _lock = darkmux_types::flock::lock_exclusive(&lock_path).map_err(|e| ServerError::StartFailed {
+        endpoint: spec.endpoint.clone(),
+        log: dirs.log_for(&spec.endpoint),
+        detail: format!("{e:#}"),
+    })?;
+    reuse_or_stop(spec, dirs, bounds, held, progress)
 }
 
 /// darkmux's running server on `spec`'s endpoint when it runs this exact

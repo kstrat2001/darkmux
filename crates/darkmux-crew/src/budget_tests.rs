@@ -115,6 +115,14 @@ impl FakeEnv {
     pub(crate) fn payload(&self, action: darkmux_flow::FlowAction) -> serde_json::Value {
         self.emitted.borrow().iter().find(|r| r.action == action).map(|r| r.payload_json()).unwrap()
     }
+    /// Every operator line said, in order.
+    pub(crate) fn said(&self) -> Vec<String> {
+        self.said.borrow().clone()
+    }
+    /// The pause recorded so far, ms ([`BudgetEnv::paused`]).
+    pub(crate) fn paused_total(&self) -> u64 {
+        self.paused_ms.get()
+    }
     /// The first record emitted with `action`.
     pub(crate) fn record(&self, action: darkmux_flow::FlowAction) -> Option<darkmux_flow::FlowRecord> {
         self.emitted.borrow().iter().find(|r| r.action == action).cloned()
