@@ -3984,98 +3984,136 @@ fn hand_edit(
     name: &str,
     req: &EditBody,
 ) -> Response {
-    let old = crate::client_edit::normalize(&req.old);
-    if old.is_empty() || req.old.chars().count() > MAX_EDIT_OLD_CHARS {
-        return err(
-            StatusCode::BAD_REQUEST,
-            ClientCode::BadRequest,
-            format!("`old` must hold text, at most {MAX_EDIT_OLD_CHARS} characters"),
-        );
+    match edit_checked(st, client, name, req) {
+        Ok(reply) => Json(reply).into_response(),
+        Err(r) => *r,
     }
-    if req.new.chars().count() > MAX_EDIT_NEW_CHARS || req.new.contains('\0') {
-        return err(
-            StatusCode::BAD_REQUEST,
-            ClientCode::BadRequest,
-            format!("`new` must be text, at most {MAX_EDIT_NEW_CHARS} characters"),
-        );
-    }
-    let dir = match owned_workspace(st, client, name) {
-        Ok(d) => d,
-        Err(r) => return *r,
-    };
-    let Some(wc) = work_copy_for(st, &dir) else {
-        return err(
+}
+
+/// [`hand_edit`] with every refusal an `Err`.
+fn edit_checked(
+    st: &ClientServerState,
+    client: &ApprovedClient,
+    name: &str,
+    req: &EditBody,
+) -> Result<EditReply, Refused> {
+    let old = edit_input(req)?;
+    let dir = owned_workspace(st, client, name)?;
+    let wc = work_copy_for(st, &dir).ok_or_else(|| {
+        refuse(
             StatusCode::CONFLICT,
             ClientCode::Conflict,
             "darkmux holds no repository for this workspace",
-        );
-    };
-    let work_id = match random_hex(8) {
-        Ok(h) => format!("w-{h}"),
-        Err(e) => return internal(e),
-    };
-    // Registered as running while it edits, so no run or Undo starts in the
-    // copy meanwhile, and none is running now.
-    {
-        let mut works = st.works.lock().unwrap();
-        if st.previews.stopping() {
-            return stopping_refusal();
-        }
-        if let Some(r) = busy_copy(&works, &dir) {
-            return *r;
-        }
-        works.insert(
-            work_id.clone(),
-            WorkEntry {
-                client_id: client.id.clone(),
-                created: (st.now)(),
-                finished: None,
-                status: WorkStatus::Running,
-                cancel: Arc::new(CancelFlag::default()),
-                git: Some(wc.clone()),
-                workdir: Some(dir.clone()),
-                baseline: None,
-                decided: None,
-                undoing: false,
-                continues: None,
-                title: edit_title(&old, &req.new),
-                role: "hand-edit".to_string(),
-                commit: None,
-                files: Vec::new(),
-                branch: None,
-                commit_error: None,
-            },
-        );
-    }
+        )
+    })?;
+    let work_id = format!("w-{}", random_hex(8).map_err(|e| Box::new(internal(e)))?);
+    hold_for_edit(st, client, &dir, &wc, &work_id, edit_title(&old, &req.new))?;
     let outcome = edit_in(st, &wc, &old, &req.new, &work_id);
+    finish_edit(st, &work_id, outcome)
+}
+
+/// The edit's work record once [`edit_in`] ended: done with its commit,
+/// or gone when nothing was edited.
+fn finish_edit(
+    st: &ClientServerState,
+    work_id: &str,
+    outcome: Result<EditDone, Refused>,
+) -> Result<EditReply, Refused> {
     let mut works = st.works.lock().unwrap();
     let done = match outcome {
         Ok(d) => d,
-        Err(reply) => {
-            works.remove(&work_id);
-            return *reply;
+        Err(r) => {
+            works.remove(work_id);
+            return Err(r);
         }
     };
     let reply = EditReply {
         matches: 1,
-        work_id: Some(work_id.clone()),
+        work_id: Some(work_id.to_string()),
         file: Some(done.file.clone()),
         commit: Some(short(&done.commit)),
         branch: Some(done.branch.clone()),
     };
-    if let Some(e) = works.get_mut(&work_id) {
-        e.status = WorkStatus::Done {
-            result: serde_json::json!({"hand_edit": {"file": done.file}}),
-            changes: done.changes,
-            changes_error: done.changes_error,
-        };
-        e.finished = Some((st.now)());
-        e.baseline = Some(done.baseline);
-        e.files = vec![done.file];
-        e.commit = Some(done.commit);
-        e.branch = Some(done.branch);
+    if let Some(e) = works.get_mut(work_id) {
+        record_edit(e, done, (st.now)());
     }
-    Json(reply).into_response()
+    Ok(reply)
+}
+
+/// The old text as the page reads it, once the body is checked.
+fn edit_input(req: &EditBody) -> Result<String, Refused> {
+    let old = crate::client_edit::normalize(&req.old);
+    if old.is_empty() || req.old.chars().count() > MAX_EDIT_OLD_CHARS {
+        return Err(refuse(
+            StatusCode::BAD_REQUEST,
+            ClientCode::BadRequest,
+            format!("`old` must hold text, at most {MAX_EDIT_OLD_CHARS} characters"),
+        ));
+    }
+    if req.new.chars().count() > MAX_EDIT_NEW_CHARS || req.new.contains('\0') {
+        return Err(refuse(
+            StatusCode::BAD_REQUEST,
+            ClientCode::BadRequest,
+            format!("`new` must be text, at most {MAX_EDIT_NEW_CHARS} characters"),
+        ));
+    }
+    Ok(old)
+}
+
+/// Registers the edit as running, so no run or Undo starts in the copy
+/// while it edits; refused when one is busy there now.
+fn hold_for_edit(
+    st: &ClientServerState,
+    client: &ApprovedClient,
+    dir: &Path,
+    wc: &WorkCopy,
+    work_id: &str,
+    title: String,
+) -> Result<(), Refused> {
+    let mut works = st.works.lock().unwrap();
+    if st.previews.stopping() {
+        return Err(Box::new(stopping_refusal()));
+    }
+    if let Some(r) = busy_copy(&works, &dir.to_path_buf()) {
+        return Err(r);
+    }
+    works.insert(
+        work_id.to_string(),
+        WorkEntry {
+            client_id: client.id.clone(),
+            created: (st.now)(),
+            finished: None,
+            status: WorkStatus::Running,
+            cancel: Arc::new(CancelFlag::default()),
+            git: Some(wc.clone()),
+            workdir: Some(dir.to_path_buf()),
+            baseline: None,
+            decided: None,
+            undoing: false,
+            continues: None,
+            title,
+            role: "hand-edit".to_string(),
+            commit: None,
+            files: Vec::new(),
+            branch: None,
+            commit_error: None,
+        },
+    );
+    Ok(())
+}
+
+/// The edit's work record once it landed: done, with its commit.
+fn record_edit(e: &mut WorkEntry, done: EditDone, now: u64) {
+    e.status = WorkStatus::Done {
+        result: serde_json::json!({"hand_edit": {"file": done.file}}),
+        changes: done.changes,
+        changes_error: done.changes_error,
+    };
+    e.finished = Some(now);
+    e.baseline = Some(done.baseline);
+    e.files = vec![done.file];
+    e.commit = Some(done.commit);
+    e.branch = Some(done.branch);
 }
 
 /// What a hand edit that landed did.
@@ -4088,6 +4126,44 @@ struct EditDone {
     changes_error: Option<String>,
 }
 
+/// One place `old` was found: the file, the span, and the file's text.
+type EditHit = (String, (usize, usize), String);
+
+/// Where `old` is in the work copy's tracked regular text files, counted up
+/// to two (more than one is already too many).
+fn find_in_tracked(wc: &WorkCopy, old: &str) -> Result<Vec<EditHit>, Refused> {
+    let listing = crate::client_git::run_or_why(wc, None, &["ls-files", "-z"]).map_err(|e| {
+        Box::new(internal(anyhow!(
+            "listing the workspace's files failed: {e}"
+        )))
+    })?;
+    let mut hits: Vec<EditHit> = Vec::new();
+    let paths = String::from_utf8_lossy(&listing.stdout).into_owned();
+    for path in paths.split('\0').filter(|p| !p.is_empty()) {
+        let Some(text) = tracked_text(wc, path) else {
+            continue;
+        };
+        for span in crate::client_edit::find(&text, old, 2 - hits.len()) {
+            hits.push((path.to_string(), span, text.clone()));
+        }
+        if hits.len() >= 2 {
+            break;
+        }
+    }
+    Ok(hits)
+}
+
+/// A tracked file's text: a regular file (never a link out of the work
+/// copy) of at most [`MAX_EDIT_FILE_BYTES`], read as UTF-8.
+fn tracked_text(wc: &WorkCopy, path: &str) -> Option<String> {
+    let full = wc.work_tree.join(path);
+    let meta = std::fs::symlink_metadata(&full).ok()?;
+    if !meta.is_file() || meta.len() > MAX_EDIT_FILE_BYTES {
+        return None;
+    }
+    std::fs::read_to_string(&full).ok()
+}
+
 /// Finds `old` once in the work copy's tracked files and writes `new` over
 /// it, committed; else the reply to send (a miss is a 200 naming the
 /// count, nothing changed).
@@ -4098,34 +4174,7 @@ fn edit_in(
     new: &str,
     work_id: &str,
 ) -> Result<EditDone, Refused> {
-    let mut hits: Vec<(String, (usize, usize), String)> = Vec::new();
-    let listing = crate::client_git::run_or_why(wc, None, &["ls-files", "-z"]).map_err(|e| {
-        Box::new(internal(anyhow!(
-            "listing the workspace's files failed: {e}"
-        )))
-    })?;
-    for path in String::from_utf8_lossy(&listing.stdout)
-        .split('\0')
-        .filter(|p| !p.is_empty())
-    {
-        let full = wc.work_tree.join(path);
-        // Regular files only: never through a link out of the work copy.
-        let Ok(meta) = std::fs::symlink_metadata(&full) else {
-            continue;
-        };
-        if !meta.is_file() || meta.len() > MAX_EDIT_FILE_BYTES {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(&full) else {
-            continue;
-        };
-        for span in crate::client_edit::find(&text, old, 2 - hits.len().min(2)) {
-            hits.push((path.to_string(), span, text.clone()));
-        }
-        if hits.len() >= 2 {
-            break;
-        }
-    }
+    let mut hits = find_in_tracked(wc, old)?;
     if hits.len() != 1 {
         return Err(Box::new(
             Json(EditReply {
@@ -4138,7 +4187,7 @@ fn edit_in(
             .into_response(),
         ));
     }
-    let (file, (start, end), text) = hits.remove(0);
+    let (file, span, text) = hits.remove(0);
     let dirty = git_line(
         wc,
         &["--literal-pathspecs", "status", "--porcelain", "--", &file],
@@ -4152,6 +4201,20 @@ fn edit_in(
         ));
     }
     onto_own_branch(st, Some(wc))?;
+    let message = format!("hand-edit: {} (work {work_id})", edit_title(old, new));
+    write_and_commit(wc, file, span, &text, new, &message)
+}
+
+/// Writes `new` over `span` of `file` and commits the file; a failed commit
+/// puts the file back.
+fn write_and_commit(
+    wc: &WorkCopy,
+    file: String,
+    (start, end): (usize, usize),
+    text: &str,
+    new: &str,
+    message: &str,
+) -> Result<EditDone, Refused> {
     let before = snapshot_tree(wc)
         .map_err(|e| Box::new(internal(anyhow!("reading the work copy failed: {e}"))))?;
     let edited = format!("{}{}{}", &text[..start], new, &text[end..]);
@@ -4159,18 +4222,9 @@ fn edit_in(
         .map_err(|e| Box::new(internal(anyhow!("writing {file} failed: {e}"))))?;
     let (changes, changes_error) = match changes_since(wc, &before.tree) {
         Ok(c) => (Some(c), None),
-        Err(e) => (
-            None,
-            Some(format!("reading the edit's changes failed: {e}")),
-        ),
+        Err(e) => (None, Some(format!("reading the edit's changes failed: {e}"))),
     };
-    let title = edit_title(old, new);
-    let (commit, branch) = commit_run(
-        wc,
-        std::slice::from_ref(&file),
-        &format!("hand-edit: {title} (work {work_id})"),
-    )
-    .map_err(|e| {
+    let (commit, branch) = commit_run(wc, std::slice::from_ref(&file), message).map_err(|e| {
         let _ = git_quiet(wc, &["--literal-pathspecs", "checkout", "--", &file]);
         refuse(
             StatusCode::CONFLICT,
