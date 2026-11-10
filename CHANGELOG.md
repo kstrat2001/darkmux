@@ -14,13 +14,22 @@ darkmux release.
 
 ## [Unreleased]
 
+## [5.10.0] - 2026-11-10
+
+The Mux Bot release: darkmux starts the Tensorfold and Flint servers it dispatches to, and a paired
+app (`darkmux client serve`) gets its own workspaces, git history and container previews.
+
+**Upgrading:** restart `darkmux client serve` (and a `brew services` daemon) right after you
+install 5.10, before any `darkmux client` command. The first such command moves `clients.json` to
+schema 1.2, which an older `client serve` refuses, so every request it handles would fail.
+
 ### Added
 
 - **A preview's install is redone when its inputs change, and an app can ask for a clean restart
   (#3484).** `install.unless_exists: node_modules` skipped the install whenever `node_modules`
   existed, so an install broken on an older image, or a dependency a run added, stayed broken.
   After a successful install darkmux records a fingerprint beside the workspace (the runtime image
-  id, the install command, and the lockfiles present, else `package.json`; a symlinked lockfile
+  id, the install command, and `package.json` and the lockfiles present, `bun.lock`/`bun.lockb` included; a symlinked lockfile
   counts as its link text and is never followed), and skips the install only while it matches. A
   failed install records nothing, so the next start retries. `POST
   /client/workspaces/{name}/preview` takes an optional body, `{"clean": true}`: it stops the preview,
@@ -198,14 +207,92 @@ darkmux release.
   `~/.darkmux`, a `brew services` daemon included (`brew services restart darkmux`), or the older
   one shows this one's missions without their tasks.
 
+- **`clients.json` moves to schema 1.2: each paired app has a stable id.** An app's workspaces and
+  runs belong to an id minted when you approve it, never its display name, so a later pairing given
+  a revoked app's name inherits neither. A 1.1 store gets ids the first time it is read. The one app
+  paired at that moment keeps the workspaces it had from before owners existed, while it stays
+  paired; any other workspace no paired app owns waits for `darkmux client claim <workspace>
+  <client>`, and `darkmux doctor` lists them. An older darkmux refuses a 1.2 store (see Upgrading
+  above).
+
+- **`port_in_use` says which check found the port held** (before the start, a process darkmux did
+  not start, or nothing it could read), and an unreadable listener lookup is retried once (#3488).
+
 - **The minimum supported Rust is 1.89** for the `darkmux` binary and the crates that reach
   SQLite (`darkmux-crew`, `-doctor`, `-fleet`, `-lab`, `-serve`), up from 1.88 and 1.86:
   `rusqlite` 0.41 (below) needs it.
 
+### Security
+
+- **Nothing a run writes into a workspace makes darkmux run code on the host.** A run's commit never
+  hands git a submodule or nested repository, so a planted submodule's filter or fsmonitor no longer
+  runs; host git always runs with submodule diffs, status summaries and recursion off; a workspace
+  fetch refuses a checkout-set `core.alternateRefsCommand` or `remote.<name>.uploadpack` and never
+  recurses into submodules; and host git clears an inherited `GIT_CONFIG`.
+
+- **Nothing a run plants makes darkmux read, write or delete outside the workspace.** A preview's
+  clean restart and `env_from_source` walk the path from the workspace's own folder without
+  following a link at any step, so neither a trailing `/` in `unless_exists` nor a folder swapped for
+  a link mid-delete reaches outside; `env_from_source` never copies through a link in your checkout,
+  and a FIFO there is refused instead of hanging the preview.
+
 ### Fixed
 
-<!-- 5.10 fix PRs in flight: engine hardening, client git/preview hardening, client work/pairing.
-     The orchestrator adds their Fixed lines here, above this release's earlier entries. -->
+- **A dispatch never stops, replaces or evicts an engine server another running dispatch holds.**
+  Whether the server is held is decided under the endpoint's lock, together with the decision to
+  stop it: a held server running the same model is reused even when it is too busy to answer in
+  time, a dispatch for another model on that endpoint is refused `busy`, and an eviction reads the
+  leases again before each server or LM Studio load it unloads. Before, two dispatches on one
+  endpoint could replace each other's server (on Flint, a dispatch was then answered by the other
+  model). A server whose leader exited while its workers still serve is kept the same way, and
+  otherwise cleared with its workers instead of later reading as `port_in_use`. A dispatch whose
+  residency lease cannot be written is refused (`model_start_failed`) instead of running without
+  that protection.
+
+- **Tensorfold `engine_args` are checked against the installed engine on every dispatch**, including
+  whether a flag takes a value; `--alias`, `--api-key-file` and abbreviations of the flags darkmux
+  sets are refused. An engine endpoint whose `port` another engine endpoint, LM Studio or darkmux's
+  daemon uses is refused at preflight and failed by `darkmux doctor`, naming both.
+
+- **Availability reads what a dispatch would do.** A model reads `resident` only when a dispatch would
+  use it: an unverified or missing engine binary, bad `engine_args`, or rec's own server beside
+  darkmux's now read `unavailable`. A probe cut at the listing bound keeps the answers it already had
+  (a slow `lms ls` no longer turns a loaded model `unknown`).
+
+- **Single-shot dispatches to Tensorfold or Flint are labeled `openai:127.0.0.1:<port>/<model>`**, not
+  `openai:remote/…` or "hosted".
+
+- **A paired app works only in workspaces darkmux made for it.** A mission's worktrees, other apps'
+  workspaces and folders no app asked for are refused `forbidden`, and two apps asking for one
+  repository get separate workspaces.
+
+- **A work copy's history stays honest.** Undo is refused (`conflict`) while another run works in the
+  same copy, and no run starts while an Undo reverts. A failed or cancelled run's edits are committed
+  as that run's own commit, which Undo can revert, instead of riding along in the next run's commit,
+  and a cancel that lands after a run finished no longer marks it cancelled.
+
+- **Pairing.** `darkmux client revoke <name>` (or a deny) takes back an approval the app has not
+  collected yet, and `client list` shows such approvals. No one process on this machine may have more
+  than two pairing requests waiting, so a container cannot fill the queue, and finding which process
+  sent a request costs one lookup per round however many are waiting. `darkmux client approve
+  <CODE>` works beside `--code <CODE>`, and every message names the command that works.
+
+- **`darkmux doctor` shows the `clients.*` settings and where each came from**, and `client list`
+  credits `clients.profiles` to the environment or `config.json` correctly.
+
+- **Private HTTPS clones and fetches use your own credential helpers again**: the system `osxkeychain`
+  helper (Xcode's git config) and gh's per-host helper. A checkout's own helpers are still never run.
+
+- **A preview's install fingerprint covers `package.json` beside the lockfiles** and counts
+  `bun.lock`/`bun.lockb`, so each workspace reinstalls once after the upgrade.
+
+- **`client serve` stops cleanly.** SIGTERM (launchd) and SIGHUP stop its previews as Ctrl-C does; it
+  waits at most 5 s for open connections, refuses anything they ask to start (`unavailable`), stops
+  the previews in parallel, and a second signal stops it at once. A stale preview whose shell ignores
+  TERM is killed after 5 s.
+
+- **A preview's clean restart refuses a folder tree deeper than 128 levels**, with a reason, instead
+  of running out of file descriptors.
 
 - **A coder phase whose task names no branch is torn down by the branch its worktree has checked
   out, never one the conventions derive (#3457 follow-up).** A worktree task written before this
@@ -227,6 +314,7 @@ darkmux release.
   workspace's preview is live already joins it (200), checked and registered under one lock.
 
 - **The runtime image carries Node 22 (#3482).** It moves from Alpine 3.20 (Node 20.15) to Alpine 3.22 (Node 22.23 LTS, npm 11). Client previews run a project's dev server in this image, and current Vite, rolldown and @vitejs/plugin-react need `^20.19 || >=22.12`: on 20.15, `npm ci` skipped their native bindings and the dev server could not start. Dispatches run in the same image, so their tools move with it (git 2.49, Python 3.12).
+
 - **The bundled SQLite is patched (RUSTSEC-2026-0459).** `rusqlite` 0.31 -> 0.41, which bundles
   `libsqlite3-sys` 0.39 and with it a SQLite past the CVE the advisory names. It raises the
   minimum supported Rust (see Changed).
@@ -4555,6 +4643,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   does. `FLOW_SCHEMA_VERSION` unchanged at 1.52.0; `RULES_SCHEMA_VERSION`
   unchanged at 3.0.0.
 
+[5.10.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.10.0
 [5.9.3]: https://github.com/kstrat2001/darkmux/releases/tag/v5.9.3
 [5.9.2]: https://github.com/kstrat2001/darkmux/releases/tag/v5.9.2
 [5.9.1]: https://github.com/kstrat2001/darkmux/releases/tag/v5.9.1
