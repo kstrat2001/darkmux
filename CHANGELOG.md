@@ -194,6 +194,13 @@ schema 1.2, which an older `client serve` refuses, so every request it handles w
   running dispatch holds or one it did not start. `mission config show` and the lab profile check
   read a server model's residency from darkmux's record.
 
+- **A client workspace can be deleted (#3536).** `DELETE /client/workspaces/{name}` (the owning app;
+  optional `{"force": true}`) and `darkmux client workspace rm <name> [--force]` remove a workspace and
+  what darkmux made for it: its folder and records, a clone's repository, a worktree's admin dir in your
+  checkout, and its `mux/` branch once another branch holds it (or with `force`). Your own branches are
+  never touched. Work held nowhere else is refused with the new code `unsaved_commits` until `force`,
+  and a refused removal leaves a live preview running.
+
 ### Changed
 
 - **A `--workdir` checkout's `.git` is mounted read-only by default (#3461).** When the workdir's
@@ -264,6 +271,18 @@ schema 1.2, which an older `client serve` refuses, so every request it handles w
   bot's own clone, by the bot's exact name (recorded beside the workspace), never another bot's
   worktree or a bot whose name makes the same slug. A branch darkmux cannot create is `branch_failed`
   (422) with git's reason.
+
+- **The daemon refuses a request whose `Host` is not this machine (#3534).** A request naming no
+  address of this machine (an IP literal, `localhost`, its host and tailnet names, a roster machine) gets
+  421, which closes DNS-rebinding reads of flow records and panels when read auth is off. `tailscale
+  serve` and peers keep working; a reverse proxy under a custom name is refused.
+
+- **`dispatch.model` waits and memory reservations (#3522, #3523).** A dispatch for another model while
+  a start is in flight on its endpoint is refused `busy` at once instead of after that start (up to 15
+  min); a dispatch waiting for the same model's start honors its timeout, Ctrl-C, a client's cancel and
+  `mission abort`, and writes `dispatch.model.loading`. Memory reservations are one record per start
+  (`<home>/run/reservations/`), apart from leases, so a fresh compactor never reads as held and an
+  earlier wave never erases a later wave's reservation.
 
 ### Security
 
@@ -432,6 +451,35 @@ schema 1.2, which an older `client serve` refuses, so every request it handles w
   the rest reuse its stamped copy (#3410). XML-format tool calls drop the newlines that wrap a value
   on its own line, so a path no longer fails `read`; `write`/`edit` content keeps its whitespace
   (#3417).
+
+- **Preflight loads make the memory decision (#3537).** A lab run's model, the compactor and the
+  utility model now stop darkmux's idle engine servers and unload its idle LM Studio loads to make room,
+  or are refused `wont_fit`, `busy` or `memory_in_use`, instead of loading on top of them. A compactor
+  refused for memory fails the dispatch before its container starts, with the code; a model a preflight
+  just loaded stays leased until its dispatch holds it.
+
+- **`client serve` lifecycle (#3521, #3524, #3525, #3536).** An app that disconnects while its run is
+  admitted no longer leaves the run stuck `running`. Stopping `client serve` cancels running work and
+  waits up to 15 s for each run's record and commit, and no longer waits on a wedged docker past that. A
+  revoked client's runs are canceled and its previews stopped. `clients.json` is replaced by an atomic
+  rename. Each workspace name has its own lock, so a slow clone holds up only its own name (reuse at 21
+  workspaces: 1.76 s to 0.15 s), and a clone interrupted by a stop no longer holds its name.
+
+- **`/changes` reads a branch's files in two git calls (#3531)**, not four per file (330 files: about
+  15 s to under 0.1 s). A submodule whose commit the repository holds is refused like any other.
+
+- **The daemon (#3534).** The live tail no longer delivers a record twice; panels are cached per width
+  (one of a few fixed widths, and a remote reader is served the last answer, never refused); the replay
+  routes, `/flow-days` and the roster's uid backfill read a kept per-day index instead of all history on
+  every poll (0.6 s to about 10 ms on a 735k-record history); `/runs` no longer waits for a fleet-view
+  gather on every poll.
+
+- **The viewer (#3532).** A lost stream reads "reconnecting · data as of HH:MM", every fleet card and
+  the run page header show "as of" and the run page's counters stop; the reconcile poll reaches back a
+  minute while live, not thirty (about 660 KB less per poll); streamed records are batched per frame and
+  inserted into the window (about 50 ms to under 0.1 ms per record at 30k); an engine server that does
+  not answer reads "starting the model" only within the start bound, else "not answering"; two Flint
+  servers are two rows; an unmeasured server reads "not measured".
 
 ## [5.9.3] - 2026-10-29
 
