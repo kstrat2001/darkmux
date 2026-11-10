@@ -1024,6 +1024,25 @@ fn a_model_that_is_not_resident_is_loaded_namespaced_at_its_context() {
     assert!(lms.contains(&"load model-a --context-length 32000 --identifier darkmux:model-a -y".to_string()), "{lms:?}");
 }
 
+/// (#3514) The same reload while another dispatch holds that instance (its
+/// lease names it): it is serving that dispatch at its own context, so it
+/// is never unloaded under it, and the dispatch is refused `busy`.
+#[test]
+#[serial]
+fn a_model_another_dispatch_holds_at_the_wrong_context_is_never_unloaded() {
+    own_process!();
+    let rig = Rig::new();
+    rig.resident(&[("darkmux:model-a", "model-a", 4096)]);
+    rig.container(ONE_TURN, ENVELOPE, "", 0);
+    let other = darkmux_types::residency_lease::LeaseGuard::acquire();
+    other.write(&["darkmux:model-a".to_string()]).unwrap();
+    let (res, _) = run(&rig, rig.opts());
+    drop(other);
+    let err = res.expect_err("refused");
+    assert_eq!(darkmux_crew::engine_dispatch::refusal_code(&err), Some("busy"), "{err:#}");
+    assert!(rig.lms_log().iter().all(|l| !l.starts_with("unload")), "{:?}", rig.lms_log());
+}
+
 #[test]
 #[serial]
 fn a_model_resident_at_the_wrong_context_is_unloaded_then_loaded_at_its_own() {
