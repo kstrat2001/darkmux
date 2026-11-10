@@ -40,6 +40,7 @@
 
 use crate::wire::MachineSpecsResponse;
 use darkmux_crew::power_policy::{self, PowerPolicyConfig, StartDecision};
+use darkmux_profiles::engine::availability::Availability;
 use darkmux_fleet::{Admitted, SeatSnapshot};
 use darkmux_flow::payload::{BatteryCharge, ChargeState, HostSampleNow, ThermalNow};
 use darkmux_types::config::{BusyPolicy, DeclaredFleetMode};
@@ -67,7 +68,13 @@ use std::time::Duration;
 /// whose engine is LM Studio. `specs.lms_unreachable` now means the resident
 /// list is not known for any of those reasons, so a 1.2 reader shows an
 /// engine that does not report residency as unknown, never as empty.
-pub const CARD_SCHEMA_VERSION: &str = "1.3";
+///
+/// 1.4 (#3450): additive. Each `profiles[].models[]` entry carries its
+/// `availability` (DESIGN.md, "What an app reads"), absent when no listing
+/// has answered yet, and `specs.engine_servers` lists the servers darkmux
+/// started that are running now (Tensorfold, rec's Flint), darkmux's own
+/// residents beside `specs.loaded_models`. A 1.3 reader ignores both.
+pub const CARD_SCHEMA_VERSION: &str = "1.4";
 
 /// What darkmux does at an endpoint (darkmux's own action, never a location
 /// or a cost), for a model, and for a profile as the sum of its models.
@@ -101,6 +108,16 @@ pub struct CardModel {
     /// ceiling on an unmanaged one; `null` when none is declared.
     pub n_ctx: Option<u32>,
     pub endpoint_kind: CardEndpointKind,
+    /// (#3450) Whether darkmux can make this model resident on this machine,
+    /// as `darkmux profile list --json` states it for a local one. The
+    /// serving machine lists it behind the card (every
+    /// [`CARD_AVAILABILITY_TTL`]), so it can be up to
+    /// [`CARD_AVAILABILITY_MAX_AGE`] older than the card. Absent until a
+    /// listing has answered, when the last one is older than that, and on a
+    /// card before 1.4: not stated, never guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub availability: Option<Availability>,
 }
 
 /// One profile in this machine's registry.
@@ -447,7 +464,12 @@ pub(crate) fn card_profiles(registry: &ProfileRegistry) -> Vec<CardProfile> {
             let models: Vec<CardModel> = profile
                 .models
                 .iter()
-                .map(|m| CardModel { id: m.id.clone(), n_ctx: m.n_ctx, endpoint_kind: kind_of(name, profile, m) })
+                .map(|m| CardModel {
+                    id: m.id.clone(),
+                    n_ctx: m.n_ctx,
+                    endpoint_kind: kind_of(name, profile, m),
+                    availability: None,
+                })
                 .collect();
             CardProfile {
                 name: name.clone(),
@@ -458,6 +480,143 @@ pub(crate) fn card_profiles(registry: &ProfileRegistry) -> Vec<CardProfile> {
             }
         })
         .collect()
+}
+
+/// (#3450) Every model the card states, in [`card_profiles`]' order: the
+/// list an availability listing answers, one entry each.
+pub(crate) fn card_models(registry: &ProfileRegistry) -> Vec<darkmux_types::ProfileModel> {
+    registry.profiles.values().flat_map(|p| p.models.iter().cloned()).collect()
+}
+
+/// (#3450) Put a listing's answers (one per [`card_models`] entry) on the
+/// card's models; `None` states none.
+pub(crate) fn state_availability(profiles: &mut [CardProfile], each: Option<&[Availability]>) {
+    let mut answers = each.unwrap_or_default().iter();
+    for m in profiles.iter_mut().flat_map(|p| p.models.iter_mut()) {
+        m.availability = each.and_then(|_| answers.next().cloned());
+    }
+}
+
+/// (#3450) How often the serving machine lists its models' availability for
+/// its card. A listing asks each engine its read-only questions (`lms ps`
+/// and `lms ls`, a server binary's `--version` and model list), up to 10 s
+/// for LM Studio, so it runs behind the card, never inside a card read.
+pub(crate) const CARD_AVAILABILITY_TTL: Duration = Duration::from_secs(30);
+
+/// The oldest availability listing a card states: two refresh periods and a
+/// listing's longest bound. Past it (refreshes failing, say) the card states
+/// none rather than an old answer as current.
+pub(crate) const CARD_AVAILABILITY_MAX_AGE: Duration = Duration::from_secs(2 * 30 + 15);
+
+type Listing = dyn Fn(&[darkmux_types::ProfileModel]) -> Vec<Availability> + Send + Sync;
+/// The last listing: the models it answered (their JSON), when, and its answers.
+type ListingSlot = Option<(String, std::time::SystemTime, Vec<Availability>)>;
+
+/// (#3450) The last availability listing of the card's models, refreshed
+/// behind the card: a stale or absent one starts one refresh and answers
+/// with what it has, so a card read never waits on an engine. Keyed by the
+/// models listed, so a changed registry is never answered by another's.
+pub(crate) struct AvailabilityCache {
+    ttl: Duration,
+    /// The oldest listing a non-waiting read still states.
+    max_age: Duration,
+    list: std::sync::Arc<Listing>,
+    slot: std::sync::Arc<std::sync::Mutex<ListingSlot>>,
+    refreshing: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl AvailabilityCache {
+    pub(crate) fn new(
+        ttl: Duration,
+        list: impl Fn(&[darkmux_types::ProfileModel]) -> Vec<Availability> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            ttl,
+            max_age: CARD_AVAILABILITY_MAX_AGE,
+            list: std::sync::Arc::new(list),
+            slot: Default::default(),
+            refreshing: Default::default(),
+        }
+    }
+
+    /// The oldest listing a card states, past which it states none (while
+    /// one refresh runs behind it).
+    #[cfg(test)]
+    pub(crate) fn stated_for(mut self, max_age: Duration) -> Self {
+        self.max_age = max_age;
+        self
+    }
+
+    /// The listing for `models`. `wait`: list now when there is no fresh
+    /// one (a CLI reader); otherwise answer with the last listing of these
+    /// models, or `None`, and refresh behind.
+    pub(crate) fn get(&self, models: &[darkmux_types::ProfileModel], wait: bool) -> Option<Vec<Availability>> {
+        if models.is_empty() {
+            return Some(Vec::new());
+        }
+        let key = serde_json::to_string(models).unwrap_or_default();
+        let last = {
+            let slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+            slot.as_ref().filter(|(k, ..)| *k == key).map(|(_, at, each)| (*at, each.clone()))
+        };
+        if let Some((at, each)) = &last {
+            if crate::wall_clock_cache_is_fresh(*at, std::time::SystemTime::now(), self.ttl) {
+                return Some(each.clone());
+            }
+        }
+        if wait {
+            let each = (self.list)(models);
+            *self.slot.lock().unwrap_or_else(|p| p.into_inner()) = Some((key, std::time::SystemTime::now(), each.clone()));
+            return Some(each);
+        }
+        self.refresh_behind(key, models.to_vec());
+        let now = std::time::SystemTime::now();
+        last.filter(|(at, _)| crate::wall_clock_cache_is_fresh(*at, now, self.max_age)).map(|(_, each)| each)
+    }
+
+    /// One listing on its own thread, unless one already runs.
+    fn refresh_behind(&self, key: String, models: Vec<darkmux_types::ProfileModel>) {
+        use std::sync::atomic::Ordering;
+        if self.refreshing.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let (list, slot, refreshing) = (self.list.clone(), self.slot.clone(), self.refreshing.clone());
+        let spawned = std::thread::Builder::new().name("card-availability".into()).spawn(move || {
+            // Cleared on every exit, a panicking listing included, so the
+            // next stale read lists again.
+            let _done = Cleared(refreshing);
+            let each = list(&models);
+            *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some((key, std::time::SystemTime::now(), each));
+        });
+        if spawned.is_err() {
+            self.refreshing.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Clears a refresh's in-flight flag when the refresh ends, however it ends.
+struct Cleared(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for Cleared {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The listing a card's availability comes from: the one `profile list
+/// --json` gives, after the preflight every dispatch runs. A unit test asks
+/// no engine.
+fn production_listing(models: &[darkmux_types::ProfileModel]) -> Vec<Availability> {
+    if cfg!(test) {
+        return models.iter().map(|_| Availability::unknown("no engine is asked in a unit test")).collect();
+    }
+    darkmux_profiles::engine::availability::list(models, darkmux_crew::user_files::dispatch_refusal(None)).each
+}
+
+/// The one availability cache of a process.
+fn process_availability_cache() -> &'static AvailabilityCache {
+    static CACHE: std::sync::OnceLock<AvailabilityCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| AvailabilityCache::new(CARD_AVAILABILITY_TTL, production_listing))
 }
 
 /// A profile whose every model is the utility model: the listener refuses it
@@ -571,13 +730,27 @@ pub(crate) fn stated_work_version() -> String {
     darkmux_fleet::WORK_JOB_SCHEMA_VERSION.to_string()
 }
 
-/// This machine's card. Blocking: the specs gather shells out.
+/// This machine's card, as the daemon serves it: its models' availability
+/// is the last listing, refreshed behind the card. Blocking: the specs
+/// gather shells out.
 pub(crate) fn gather_local_card() -> MachineCard {
+    gather_card(false)
+}
+
+/// (#3450) This machine's card for a reader with no daemon behind it (the
+/// CLI): its models' availability is listed now when none is fresh.
+pub(crate) fn gather_local_card_now() -> MachineCard {
+    gather_card(true)
+}
+
+fn gather_card(wait_for_availability: bool) -> MachineCard {
     let started = std::time::Instant::now();
     let specs = crate::gather_served_specs();
     let (profiles, default_profile, utility, profiles_error) = match darkmux_profiles::profiles::load_registry(None) {
         Ok(loaded) => {
-            let profiles = card_profiles(&loaded.registry);
+            let mut profiles = card_profiles(&loaded.registry);
+            let each = process_availability_cache().get(&card_models(&loaded.registry), wait_for_availability);
+            state_availability(&mut profiles, each.as_deref());
             let default = loaded
                 .registry
                 .default_profile
@@ -677,6 +850,7 @@ pub(crate) fn process_card_cache() -> std::sync::Arc<CardCache> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use darkmux_profiles::engine::availability::AvailabilityState;
     use darkmux_types::{Profile, ProfileModel};
 
     fn registry(json: serde_json::Value) -> ProfileRegistry {
@@ -962,6 +1136,101 @@ pub(crate) mod tests {
         assert_eq!(gathers.load(std::sync::atomic::Ordering::SeqCst), 3, "a zero TTL never serves a cached card");
     }
 
+    // ── availability (#3450) ───────────────────────────────────────────
+
+    /// The promise: each card model states the availability its listing
+    /// gave it, in the registry's order, and states none when no listing
+    /// has answered yet (absent is "not stated", never a guess).
+    #[test]
+    fn each_card_model_states_its_availability() {
+        let reg = mixed_registry();
+        let mut cards = card_profiles(&reg);
+        let models = card_models(&reg);
+        assert_eq!(models.len(), cards.iter().map(|c| c.models.len()).sum::<usize>());
+        let each: Vec<Availability> = models.iter().map(|m| Availability::unavailable(format!("{} is off", m.id))).collect();
+        state_availability(&mut cards, Some(&each));
+        for card in &cards {
+            for m in &card.models {
+                assert_eq!(m.availability.as_ref().and_then(|a| a.reason.clone()), Some(format!("{} is off", m.id)));
+            }
+        }
+        let mut none = card_profiles(&reg);
+        state_availability(&mut none, None);
+        assert!(none.iter().flat_map(|c| &c.models).all(|m| m.availability.is_none()));
+        let json = serde_json::to_value(&none[0].models[0]).unwrap();
+        assert!(json.get("availability").is_none(), "not stated is absent: {json}");
+    }
+
+    fn listing_of(state: AvailabilityState) -> impl Fn(&[ProfileModel]) -> Vec<Availability> + Send + Sync + 'static {
+        move |models: &[ProfileModel]| models.iter().map(|_| Availability { state, reason: None }).collect()
+    }
+
+    /// The promise: the card never waits on a listing. Inside the TTL the
+    /// last listing answers; past it, the last listing still answers while
+    /// one refresh runs behind it; a changed model set is never answered by
+    /// another set's listing; and a reader that can wait (the CLI) lists.
+    #[test]
+    fn the_cards_availability_is_listed_behind_it_never_inline() {
+        let models = vec![ProfileModel { id: "m".into(), n_ctx: Some(8), ..Default::default() }];
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = calls.clone();
+        let gate = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let held = gate.clone();
+        let cache = AvailabilityCache::new(Duration::ZERO, move |m: &[ProfileModel]| {
+            let _wait = held.lock().unwrap();
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            listing_of(AvailabilityState::Startable)(m)
+        });
+        let blocked = gate.lock().unwrap();
+        assert_eq!(cache.get(&models, false), None, "nothing listed yet: nothing stated, and no wait");
+        drop(blocked);
+        let first = (0..200).find_map(|_| {
+            std::thread::sleep(Duration::from_millis(10));
+            cache.get(&models, false)
+        });
+        assert_eq!(first.map(|a| a[0].state), Some(AvailabilityState::Startable), "the refresh landed behind the card");
+        let other = vec![ProfileModel { id: "other".into(), ..Default::default() }];
+        assert_eq!(cache.get(&other, true).map(|a| a.len()), Some(1), "a reader that waits lists its own set");
+        let fresh = AvailabilityCache::new(Duration::from_secs(60), listing_of(AvailabilityState::Resident));
+        assert_eq!(fresh.get(&models, true).map(|a| a[0].state), Some(AvailabilityState::Resident));
+        assert_eq!(fresh.get(&other, false), None, "another set's listing never answers");
+        assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+    }
+
+    /// (#3450 review) A listing that panics does not stop the refreshes: the
+    /// next stale read lists again.
+    #[test]
+    fn a_listing_that_panics_is_retried_on_the_next_stale_read() {
+        let models = vec![ProfileModel { id: "m".into(), ..Default::default() }];
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = calls.clone();
+        let cache = AvailabilityCache::new(Duration::ZERO, move |m: &[ProfileModel]| {
+            if counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                panic!("the first listing panics");
+            }
+            listing_of(AvailabilityState::Startable)(m)
+        });
+        let answered = (0..300).find_map(|_| {
+            std::thread::sleep(Duration::from_millis(10));
+            cache.get(&models, false)
+        });
+        assert_eq!(answered.map(|a| a[0].state), Some(AvailabilityState::Startable), "a later read listed again");
+        assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+    }
+
+    /// (#3450 review) A listing older than the cache's bound is never stated
+    /// as current: a card read past it states none (and lists again behind).
+    #[test]
+    fn a_listing_past_its_bound_is_not_stated() {
+        let models = vec![ProfileModel { id: "m".into(), ..Default::default() }];
+        let cache = AvailabilityCache::new(Duration::ZERO, listing_of(AvailabilityState::Resident)).stated_for(Duration::ZERO);
+        assert!(cache.get(&models, true).is_some(), "a reader that waits gets its own listing");
+        assert_eq!(cache.get(&models, false), None, "a listing past its bound is not stated");
+        let kept = AvailabilityCache::new(Duration::ZERO, listing_of(AvailabilityState::Resident)).stated_for(Duration::from_secs(600));
+        kept.get(&models, true);
+        assert!(kept.get(&models, false).is_some(), "inside its bound, the last listing answers while one refreshes");
+    }
+
     // ── the declared role (#3022) ──────────────────────────────────────
 
     fn card_declaring(mode: DeclaredFleetMode, defaults: Option<CardFleetDefaults>) -> MachineCard {
@@ -1066,6 +1335,17 @@ pub(crate) mod tests {
                     context: 65536,
                     queued: Some(0),
                 }],
+                engine_servers: vec![crate::wire::EngineServer {
+                    endpoint: "tensorfold".into(),
+                    engine: "tensorfold".into(),
+                    model: "TensorFold/Qwen3.8-27B-MLX-4bit".into(),
+                    served_name: "darkmux:TensorFold/Qwen3.8-27B-MLX-4bit".into(),
+                    n_ctx: 262_144,
+                    port: 8091,
+                    pid: 4242,
+                    started_at_ms: 1_700_000_000_000,
+                    answering: true,
+                }],
                 lms_unreachable: false,
                 engine: Some(crate::wire::MachineEngine { name: darkmux_types::default_engine::LMSTUDIO.into(), reports_residency: true, usable: true }),
                 utility_model: None,
@@ -1078,14 +1358,24 @@ pub(crate) mod tests {
                     description: Some("the big local model".into()),
                     is_default: true,
                     endpoint_kind: CardEndpointKind::Managed,
-                    models: vec![CardModel { id: "qwen".into(), n_ctx: Some(65536), endpoint_kind: CardEndpointKind::Managed }],
+                    models: vec![CardModel {
+                        id: "qwen".into(),
+                        n_ctx: Some(65536),
+                        endpoint_kind: CardEndpointKind::Managed,
+                        availability: Some(Availability::resident()),
+                    }],
                 },
                 CardProfile {
                     name: "cloud".into(),
                     description: None,
                     is_default: false,
                     endpoint_kind: CardEndpointKind::Unmanaged,
-                    models: vec![CardModel { id: "gpt".into(), n_ctx: None, endpoint_kind: CardEndpointKind::Unmanaged }],
+                    models: vec![CardModel {
+                        id: "gpt".into(),
+                        n_ctx: None,
+                        endpoint_kind: CardEndpointKind::Unmanaged,
+                        availability: Some(Availability::external()),
+                    }],
                 },
             ],
             default_profile: Some("deep".into()),
@@ -1218,7 +1508,7 @@ pub(crate) mod tests {
                 description: None,
                 is_default: false,
                 endpoint_kind: CardEndpointKind::Managed,
-                models: vec![CardModel { id: model.to_string(), n_ctx: None, endpoint_kind: CardEndpointKind::Managed }],
+                models: vec![CardModel { id: model.to_string(), n_ctx: None, endpoint_kind: CardEndpointKind::Managed, availability: None }],
             })
             .collect()
     }
