@@ -180,6 +180,9 @@ pub(crate) struct ArchHost {
     pub(crate) inner: MockHost,
     format: Format,
     arch: darkmux_gestalt::ArchFacts,
+    /// Answers as LM Studio would, that its loads take this machine's
+    /// memory (so a wave takes the residency lock for them).
+    on_machine: bool,
 }
 
 /// A dense model's KV per token: 48 layers x 8 KV heads x 128 x 2 (K, V)
@@ -189,7 +192,13 @@ const DENSE: darkmux_gestalt::ArchFacts =
 
 impl ArchHost {
     pub(crate) fn new(inner: MockHost, format: Format) -> Self {
-        ArchHost { inner, format, arch: DENSE }
+        ArchHost { inner, format, arch: DENSE, on_machine: false }
+    }
+
+    /// As LM Studio: its loads take this machine's memory.
+    fn on_this_machine_too(mut self) -> Self {
+        self.on_machine = true;
+        self
     }
 }
 
@@ -205,6 +214,9 @@ impl ModelHost for ArchHost {
     }
     fn unload(&mut self, t: &darkmux_gestalt::OwnedTarget, d: darkmux_gestalt::Deadline) -> Result<(), darkmux_gestalt::HostError> {
         self.inner.unload(t, d)
+    }
+    fn on_this_machine(&self) -> bool {
+        self.on_machine
     }
     fn arch_facts(&mut self, keys: &[&str]) -> darkmux_gestalt::ModelArch {
         let mut arch = darkmux_gestalt::ModelArch::default();
@@ -756,14 +768,7 @@ fn a_wave_is_refused_only_on_the_commitment() {
 /// a short wait (the lock is per open file, so a thread of this process
 /// excludes as another process would).
 fn residency_lock_is_free() -> bool {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        if let Ok(lock) = darkmux_types::residency_lock::acquire() {
-            let _ = tx.send(());
-            drop(lock);
-        }
-    });
-    rx.recv_timeout(Duration::from_millis(400)).is_ok()
+    darkmux_types::residency_lock::try_acquire().unwrap().is_some()
 }
 
 /// A mock LM Studio that notes, at each unload and load, whether the
@@ -792,6 +797,9 @@ impl ModelHost for LockProbe {
     fn arch_facts(&mut self, keys: &[&str]) -> darkmux_gestalt::ModelArch {
         self.inner.arch_facts(keys)
     }
+    fn on_this_machine(&self) -> bool {
+        self.inner.on_this_machine()
+    }
 }
 
 /// (#3509) An LM Studio wave decides, evicts and unloads under the
@@ -803,7 +811,8 @@ fn a_wave_decides_under_the_residency_lock_and_loads_outside_it_with_a_reservati
     let rig = Rig::new();
     let free = || Some(64 * GIB);
     let machine = FakeMachine::new(&free);
-    let inner = ArchHost::new(MockHost::new().resident("darkmux:orphan", "orphan", 8_000, Some(GIB)).cataloged("m", 20 * GIB), Format::Gguf);
+    let inner = ArchHost::new(MockHost::new().resident("darkmux:orphan", "orphan", 8_000, Some(GIB)).cataloged("m", 20 * GIB), Format::Gguf)
+        .on_this_machine_too();
     let mut host = LockProbe { inner, at_unload: Vec::new(), at_load: Vec::new() };
     let lease = LeaseGuard::acquire();
     ensure_wave_loaded(&wave("m"), &FixedEstimator::default(), &mut host, &lease, None, &rig.room(&machine)).expect("loads");
@@ -947,9 +956,10 @@ fn a_reuse_only_wave_never_waits_on_the_residency_lock() {
         let free = || Some(64 * GIB);
         let machine = FakeMachine::new(&free);
         let room = ServerRoom { dirs, bounds: server::Bounds::default(), machine: &machine, settle: |_, _, _| {}, workers: || None };
-        let mut host = MockHost::new().resident("darkmux:m", "m", 8_000, Some(GIB)).cataloged("m", GIB);
+        let inner = MockHost::new().resident("darkmux:m", "m", 8_000, Some(GIB)).cataloged("m", GIB);
+        let mut host = ArchHost::new(inner, Format::Gguf).on_this_machine_too();
         let lease = LeaseGuard::acquire();
-        let _ = tx.send(ensure_wave_loaded(&wave("m"), &FixedEstimator::default(), &mut host, &lease, None, &room).map(|()| host.ops));
+        let _ = tx.send(ensure_wave_loaded(&wave("m"), &FixedEstimator::default(), &mut host, &lease, None, &room).map(|()| host.inner.ops));
     });
     let reused = rx.recv_timeout(Duration::from_secs(5)).expect("the reuse did not wait on the lock");
     drop(held);
@@ -1008,7 +1018,7 @@ fn a_wave_that_loads_waits_for_the_residency_lock() {
         let free = || Some(64 * GIB);
         let machine = FakeMachine::new(&free);
         let room = ServerRoom { dirs, bounds: server::Bounds::default(), machine: &machine, settle: |_, _, _| {}, workers: || None };
-        let mut host = ArchHost::new(MockHost::new().cataloged("m", GIB), Format::Gguf);
+        let mut host = ArchHost::new(MockHost::new().cataloged("m", GIB), Format::Gguf).on_this_machine_too();
         let lease = LeaseGuard::acquire();
         let _ = tx.send(ensure_wave_loaded(&wave("m"), &FixedEstimator::default(), &mut host, &lease, None, &room).map(|()| host.inner.ops));
     });
@@ -1028,4 +1038,20 @@ fn only_a_host_on_this_machine_is_planned_against_its_memory() {
     let room = ServerRoom::for_host(&MockHost::new());
     assert_eq!((room.machine.capacity(), room.machine.reclaimable(), (room.workers)()), (None, None, None));
     assert!(room.pools().is_empty(), "no pool: the planner plans as the test's facts say");
+}
+
+/// (#3514) A wave on a host whose loads take none of this machine's memory
+/// (a test's double) decides nothing about it: it never takes the
+/// residency lock, nor creates its file.
+#[test]
+#[serial_test::serial]
+fn a_doubles_wave_never_creates_the_residency_lock() {
+    let rig = Rig::new();
+    let lock = darkmux_types::residency_lock::lock_path();
+    assert!(lock.starts_with(rig.dir.path()), "{}", lock.display());
+    let mut host = MockHost::new().resident("darkmux:orphan", "orphan", 8_000, Some(GIB)).cataloged("m", GIB);
+    let lease = LeaseGuard::acquire();
+    ensure_wave_loaded(&wave("m"), &FixedEstimator::default(), &mut host, &lease, None, &ServerRoom::without_machine()).expect("loads");
+    assert!(host.ops.iter().any(|op| matches!(op, HostOp::Load { .. })));
+    assert!(!lock.exists(), "no lock file: {}", lock.display());
 }

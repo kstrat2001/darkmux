@@ -1139,7 +1139,7 @@ impl WaveLoad<'_> {
         crate::lms_room::make_room(&plan, &facts, &pricing, self.lease, &pinned, self.room, committed)
             .map_err(|refusal| room_refused(refusal, committed))?;
         let starting = self.reserve(&plan, &facts, &pricing)?;
-        let mut lock = Some(lock);
+        let mut lock = lock;
         let outcome = execute_plan(&plan, host, self.deadline, committed, &|| self.held(), &mut || drop(lock.take()));
         Ok((outcome, pinned, starting))
     }
@@ -1169,22 +1169,27 @@ impl WaveLoad<'_> {
     /// none: when another dispatch holds it (its decision may wait on a slow
     /// `lms unload`), the wave reads without it, and only one that loads or
     /// unloads waits for it and decides again under it. A free lock is taken
-    /// at once, and the wave decides under it, reading once.
+    /// at once, and the wave decides under it, reading once. A host whose
+    /// loads take none of this machine's memory (a test's double) decides
+    /// nothing about it, and never takes the lock or creates its file.
     fn lock_unless_reused(
         &self,
         host: &mut dyn ModelHost,
         committed: &[String],
-    ) -> Result<std::result::Result<darkmux_types::residency_lock::ResidencyLock, Vec<String>>> {
+    ) -> Result<std::result::Result<Option<darkmux_types::residency_lock::ResidencyLock>, Vec<String>>> {
+        if !host.on_this_machine() {
+            return Ok(Ok(None));
+        }
         let unlocked = |e: anyhow::Error| {
             wave_error(Some("model_start_failed"), format!("could not take darkmux's residency lock ({e:#}); check that darkmux's home is writable"))
         };
         if let Some(lock) = darkmux_types::residency_lock::try_acquire().map_err(unlocked)? {
-            return Ok(Ok(lock));
+            return Ok(Ok(Some(lock)));
         }
         if let Some(reused) = self.reuse_only(host, committed)? {
             return Ok(Err(reused));
         }
-        darkmux_types::residency_lock::acquire().map(Ok).map_err(unlocked)
+        darkmux_types::residency_lock::acquire().map(|l| Ok(Some(l))).map_err(unlocked)
     }
 
     /// (#3514) The leases read, when the wave only reuses what is resident
