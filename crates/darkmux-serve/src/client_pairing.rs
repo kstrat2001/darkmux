@@ -2055,6 +2055,7 @@ fn admit(
     let profile = admitted_profile(state, &req)?;
     let work_id = format!("w-{}", random_hex(8).map_err(internal)?);
     let now = (state.now)();
+    let git = workdir.as_deref().and_then(|w| work_copy_for(state, w));
     let mut works = state.works.lock().unwrap();
     check_capacity(&mut works, client, now)?;
     check_work_copy(&works, client, workdir.as_ref(), req.continues.as_deref())?;
@@ -2067,7 +2068,7 @@ fn admit(
             finished: None,
             status: WorkStatus::Running,
             cancel: Arc::new(CancelFlag::default()),
-            git: workdir.as_deref().and_then(|w| work_copy_for(state, w)),
+            git: git.clone(),
             workdir: workdir.clone(),
             baseline: None,
             decided: None,
@@ -2081,6 +2082,13 @@ fn admit(
             commit_error: None,
         },
     );
+    // Registered as running, so nothing else starts in the copy while it
+    // is moved off its base branch.
+    drop(works);
+    if let Err(r) = onto_own_branch(state, git.as_ref()) {
+        state.works.lock().unwrap().remove(&work_id);
+        return Err(r);
+    }
     Ok(WorkSpec {
         work_id,
         role: req.role,
@@ -2088,6 +2096,35 @@ fn admit(
         workdir,
         message: req.message,
     })
+}
+
+/// A work copy with an origin that is not on a `mux/` branch of its own (a
+/// clone made before clones got one, on the default branch or the ref it
+/// was cloned at, which an app still uses by name) is moved onto a new
+/// branch of its bot's before a run, so the run never commits to a branch
+/// of the user's and a PR never pushes onto one. The commits already on it
+/// go along. A template project has no origin, and stays on its own `main`.
+fn onto_own_branch(state: &ClientServerState, wc: Option<&WorkCopy>) -> Result<(), Refused> {
+    let Some(wc) = wc else { return Ok(()) };
+    let Some(on) = not_on_own_branch(wc) else { return Ok(()) };
+    let base = (state.worktrees_base)().map_err(|e| Box::new(internal(anyhow!(e))))?;
+    let name = wc.work_tree.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let branch = new_bot_branch(&bot_slug(crate::client_workspace::bot_of(&base, &name).as_deref()))?;
+    head_onto_new_branch(wc, &branch)
+        .map_err(|e| Box::new(internal(anyhow!("moving {name} off {on} onto {branch}: {e}"))))
+}
+
+/// The branch `wc` is checked out on (empty when detached) when it has an
+/// origin and that is no `mux/` branch of darkmux's.
+fn not_on_own_branch(wc: &WorkCopy) -> Option<String> {
+    crate::client_workspace::remote_default_of(wc)?;
+    let branch = git_line(wc, &["branch", "--show-current"])?;
+    (!is_own_branch(&branch)).then_some(branch)
+}
+
+/// Whether `branch` is one darkmux made for a workspace's own work.
+fn is_own_branch(branch: &str) -> bool {
+    branch.starts_with("mux/")
 }
 
 /// The work copy host git may touch for a canonical workdir: a workspace
@@ -2529,13 +2566,17 @@ pub(crate) async fn workspace_create_handler(
         );
     }
     let bot = bot_slug(req.bot.as_deref());
+    let exact = req.bot.clone().unwrap_or_default();
     let ask = match workspace_ask(&req) {
         Ok(ask) => ask,
         Err(r) => return *r,
     };
     let st = state.clone();
     let git_ref = req.git_ref;
-    tokio::task::spawn_blocking(move || make_workspace(&st, ask, git_ref.as_deref(), &bot, &client))
+    tokio::task::spawn_blocking(move || {
+        let bot = crate::client_workspace::BotName { slug: &bot, exact: &exact };
+        make_workspace(&st, ask, Made { git_ref: git_ref.as_deref(), client: &client, bot })
+    })
         .await
         .unwrap_or_else(|e| internal(anyhow!("workspace setup panicked: {e}")))
 }
@@ -2561,48 +2602,48 @@ fn reusable(state: &ClientServerState, base: &Path, find: impl FnOnce() -> Optio
 /// Makes (or hands back) a workspace for paired client `client`: every
 /// workspace darkmux makes records the client it was made for, and only
 /// that client may use it ([`owned_workspace`]).
-fn make_workspace(state: &ClientServerState, ask: WorkspaceAsk, git_ref: Option<&str>, bot: &str, client: &str) -> Response {
-    let made = Made { git_ref, client };
+fn make_workspace(state: &ClientServerState, ask: WorkspaceAsk, made: Made) -> Response {
     match ask {
-        WorkspaceAsk::Clone { url, normalized } => clone_workspace(state, &url, &normalized, &made, bot),
-        WorkspaceAsk::Template { url, normalized } => template_workspace(state, &url, &normalized, &made, bot),
-        WorkspaceAsk::Worktree { path } => worktree_workspace(state, Path::new(&path), &made, bot),
+        WorkspaceAsk::Clone { url, normalized } => clone_workspace(state, &url, &normalized, &made),
+        WorkspaceAsk::Template { url, normalized } => template_workspace(state, &url, &normalized, &made),
+        WorkspaceAsk::Worktree { path } => worktree_workspace(state, Path::new(&path), &made),
     }
 }
 
 /// What every way of making a workspace is asked with: the branch to start
-/// on, and the paired client it is for.
+/// on, the paired client it is for, and the bot asking.
 struct Made<'a> {
     git_ref: Option<&'a str>,
     client: &'a str,
+    bot: crate::client_workspace::BotName<'a>,
 }
 
 /// This bot's clone of the repo (fetched), else a new clone on a new
 /// `mux/<bot>-<id>` branch of its own, so its runs never commit to the
 /// branch the clone checked out.
-fn clone_workspace(state: &ClientServerState, url: &str, normalized: &str, made: &Made, bot: &str) -> Response {
+fn clone_workspace(state: &ClientServerState, url: &str, normalized: &str, made: &Made) -> Response {
     use crate::client_workspace as ws;
     let base = match (state.worktrees_base)() {
         Ok(b) => b,
         Err(e) => return internal(anyhow!(e)),
     };
     let _one_at_a_time = state.workspace_lock.lock().unwrap();
-    match reusable(state, &base, || ws::find_by_origin(&base, normalized, bot, made.client)) {
+    match reusable(state, &base, || ws::find_by_origin(&base, normalized, made.bot, made.client)) {
         Ok(Some(name)) => existing_clone(state, &name),
-        Ok(None) => new_clone(state, &base, (url, normalized), made, bot),
+        Ok(None) => new_clone(state, &base, (url, normalized), made),
         Err(r) => *r,
     }
 }
 
 /// A new clone of the repo for `made`'s client, on a new branch of the bot's.
-fn new_clone(state: &ClientServerState, base: &Path, (url, normalized): (&str, &str), made: &Made, bot: &str) -> Response {
+fn new_clone(state: &ClientServerState, base: &Path, (url, normalized): (&str, &str), made: &Made) -> Response {
     let Some(name) = crate::client_workspace::name_for(normalized, |n| name_taken(base, n)) else {
         return err(StatusCode::CONFLICT, ClientCode::Conflict, "no free workspace name for this repo");
     };
     if let Err(r) = place_clone(state, url, normalized, made, base, &name) {
         return *r;
     }
-    let from = match start_bot_branch(state, base, &name, made.git_ref, bot) {
+    let from = match start_bot_branch(state, base, &name, made.git_ref, made.bot.slug) {
         Ok(from) => from,
         Err(r) => {
             forget_clone(base, &name);
@@ -2632,10 +2673,19 @@ fn start_bot_branch(state: &ClientServerState, base: &Path, name: &str, git_ref:
         .or_else(|| crate::client_workspace::remote_default_of(&wc))
         .unwrap_or_else(|| "HEAD".to_string());
     let branch = new_bot_branch(bot)?;
-    git_quiet(&wc, &["branch", &branch])
-        .and_then(|()| git_quiet(&wc, &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")]))
-        .map_err(|e| Box::new(internal(anyhow!("starting {name} on {branch}: {e}"))))?;
+    head_onto_new_branch(&wc, &branch).map_err(|e| Box::new(internal(anyhow!("starting {name} on {branch}: {e}"))))?;
     Ok(from)
+}
+
+/// Moves `wc`'s `HEAD` onto new branch `branch`, made where `HEAD` is (with
+/// whatever commits it holds). Only `HEAD` moves, never a file or the index.
+/// On an unborn `HEAD` (an empty repo) there is no commit to make it at, so
+/// `HEAD` just names it, and the first commit makes it.
+fn head_onto_new_branch(wc: &WorkCopy, branch: &str) -> Result<(), String> {
+    if git_line(wc, &["rev-parse", "--verify", "--quiet", "HEAD"]).is_some() {
+        git_quiet(wc, &["branch", branch])?;
+    }
+    git_quiet(wc, &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")])
 }
 
 /// A new `mux/<bot>-<hex>` branch name: every workspace darkmux makes for a
@@ -2654,26 +2704,21 @@ fn forget_clone(base: &Path, name: &str) {
     crate::client_git::forget_git_dir(base, name);
     crate::client_workspace::forget_template_commit(base, name);
     crate::client_workspace::forget_owner(base, name);
+    crate::client_workspace::forget_bot(base, name);
 }
 
 /// A new project from a template: cloned at `git_ref` beside its final
 /// name, its history and remote dropped, and started over as a fresh repo
 /// on `main` with one commit, so runs commit to it and nothing points back
 /// at the template. Named for the bot, never reused.
-fn template_workspace(
-    state: &ClientServerState,
-    url: &str,
-    normalized: &str,
-    made: &Made,
-    bot: &str,
-) -> Response {
+fn template_workspace(state: &ClientServerState, url: &str, normalized: &str, made: &Made) -> Response {
     let git_ref = made.git_ref;
     let base = match (state.worktrees_base)() {
         Ok(b) => b,
         Err(e) => return internal(anyhow!(e)),
     };
     let _one_at_a_time = state.workspace_lock.lock().unwrap();
-    let Some(name) = free_project_name(&base, bot) else {
+    let Some(name) = free_project_name(&base, made.bot.slug) else {
         return err(StatusCode::CONFLICT, ClientCode::Conflict, "no free workspace name for this project");
     };
     if let Err(r) = place_clone(state, url, normalized, made, &base, &name) {
@@ -2823,11 +2868,12 @@ fn place_clone(
     crate::client_workspace::forget_source(base, name);
     crate::client_workspace::forget_template_commit(base, name);
     cg::record_git_dir(base, name, &git_dir)
+        .and_then(|()| crate::client_workspace::record_bot(base, name, made.bot.exact))
         .and_then(|()| crate::client_workspace::record_owner(base, name, made.client))
         .map_err(|e| Box::new(internal(anyhow!(e))))
 }
 
-fn worktree_workspace(state: &ClientServerState, source: &Path, made: &Made, bot: &str) -> Response {
+fn worktree_workspace(state: &ClientServerState, source: &Path, made: &Made) -> Response {
     use crate::client_workspace as ws;
     let base = match (state.worktrees_base)() {
         Ok(b) => b,
@@ -2838,24 +2884,24 @@ fn worktree_workspace(state: &ClientServerState, source: &Path, made: &Made, bot
         Err(r) => return *r,
     };
     let _one_at_a_time = state.workspace_lock.lock().unwrap();
-    match reusable(state, &base, || ws::find_worktree_of(&base, &common, bot, made.client)) {
+    match reusable(state, &base, || ws::find_worktree_of(&base, &common, made.bot, made.client)) {
         Ok(Some(name)) => reused_worktree(state, &base, &name, &source),
-        Ok(None) => new_worktree(state, &base, (&source, &common), made, bot),
+        Ok(None) => new_worktree(state, &base, (&source, &common), made),
         Err(r) => *r,
     }
 }
 
 /// A new worktree workspace of `source` (its git common dir beside it) for
 /// `made`'s client, recorded; taken back again if it cannot be recorded.
-fn new_worktree(state: &ClientServerState, base: &Path, (source, common): (&Path, &Path), made: &Made, bot: &str) -> Response {
-    let Some(name) = free_worktree_name(base, source, bot) else {
+fn new_worktree(state: &ClientServerState, base: &Path, (source, common): (&Path, &Path), made: &Made) -> Response {
+    let Some(name) = free_worktree_name(base, source, made.bot.slug) else {
         return err(
             StatusCode::CONFLICT, ClientCode::Conflict,
             "no free workspace name for this checkout",
         );
     };
-    match add_bot_worktree(state, source, made.git_ref, bot, &base.join(&name)) {
-        Ok(added) => match record_worktree(base, &name, source, common, made.client) {
+    match add_bot_worktree(state, source, made.git_ref, made.bot.slug, &base.join(&name)) {
+        Ok(added) => match record_worktree(base, &name, source, common, made) {
             Ok(()) => created_worktree(state, &name, added.0, added.1),
             Err(e) => {
                 remove_worktree(source, &base.join(&name), &added.2);
@@ -2884,13 +2930,14 @@ fn remove_worktree(source: &Path, dest: &Path, branch: &str) {
 
 /// Records a new worktree workspace: the user's checkout it was made from,
 /// its repository (the worktree's admin directory under that checkout's
-/// `.git/worktrees/`), read once now, before any run has been in it, and
-/// the paired client it is for.
-fn record_worktree(base: &Path, name: &str, source: &Path, common: &Path, client: &str) -> Result<(), String> {
+/// `.git/worktrees/`), read once now, before any run has been in it, the
+/// bot's exact name and the paired client it is for.
+fn record_worktree(base: &Path, name: &str, source: &Path, common: &Path, made: &Made) -> Result<(), String> {
     let admin = crate::client_git::worktree_admin_dir(&base.join(name), common)?;
     crate::client_git::record_git_dir(base, name, &admin)?;
     crate::client_workspace::record_source(base, name, source)?;
-    crate::client_workspace::record_owner(base, name, client)
+    crate::client_workspace::record_bot(base, name, made.bot.exact)?;
+    crate::client_workspace::record_owner(base, name, made.client)
 }
 
 /// This bot's existing worktree of the checkout (one of this client's), its
@@ -3336,8 +3383,8 @@ fn branch_changes(st: &ClientServerState, client: &ApprovedClient, name: &str) -
         Err(r) => return *r,
     };
     let branch = git_line(&dir, &["branch", "--show-current"]).unwrap_or_default();
-    if branch.is_empty() {
-        return err(StatusCode::CONFLICT, ClientCode::Conflict, "the work copy isn't on a branch");
+    if let Err(r) = own_branch(name, &branch, &default) {
+        return *r;
     }
     let (Some(base), Some(head)) = (git_line(&dir, &["merge-base", "HEAD", &default]), git_line(&dir, &["rev-parse", "HEAD"])) else {
         return err(StatusCode::CONFLICT, ClientCode::Conflict, "couldn't find where this branch left the default branch");
@@ -3388,6 +3435,27 @@ fn branch_changes(st: &ClientServerState, client: &ApprovedClient, name: &str) -
         files,
     })
     .into_response()
+}
+
+/// The work copy must be on a branch, and (with an origin) on a `mux/`
+/// branch of its own: a PR or backup from the default branch, or from the
+/// ref an old clone was made at, would push its commits straight onto that
+/// branch of the user's. A template project's base is its own first commit
+/// (`default` is that commit, no `origin/` ref), so its `main` is its own.
+fn own_branch(name: &str, branch: &str, default: &str) -> Result<(), Refused> {
+    if branch.is_empty() {
+        return Err(refuse(StatusCode::CONFLICT, ClientCode::Conflict, "the work copy isn't on a branch"));
+    }
+    if default.starts_with("origin/") && !is_own_branch(branch) {
+        return Err(refuse(
+            StatusCode::CONFLICT, ClientCode::NoOwnBranch,
+            format!(
+                "workspace {name} is on {branch}, not a branch of its own, so a PR or backup from it \
+                 would push onto {branch}; the next run in it moves it onto one, its commits included"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// What `/changes` compares the work copy's branch with, and that base's

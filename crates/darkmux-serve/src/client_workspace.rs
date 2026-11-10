@@ -152,29 +152,47 @@ fn held_workspaces(base: &Path) -> Vec<(String, crate::client_git::WorkCopy)> {
         .collect()
 }
 
+/// The bot a workspace is asked for: its name as it goes into branch names
+/// ([`slug`], `app` when it has none) and exactly as the app sent it (empty
+/// when it sent none). Two bots whose names make one slug are told apart by
+/// the exact name.
+#[derive(Debug, Clone, Copy)]
+pub struct BotName<'a> {
+    pub slug: &'a str,
+    pub exact: &'a str,
+}
+
+/// Whether workspace `name` (on branch `branch`) is `bot`'s: on one of its
+/// branches ([`is_bot_branch`]), and recorded for its exact name. A
+/// workspace from before the exact name was recorded goes by its branch.
+fn is_bots(base: &Path, name: &str, branch: &str, bot: BotName) -> bool {
+    is_bot_branch(branch, bot.slug) && bot_of(base, name).is_none_or(|b| b == bot.exact)
+}
+
 /// Bot `bot`'s clone of the repo whose origin is `normalized`, among the
 /// workspaces darkmux holds a repository for, that paired client `client`
-/// may be handed ([`pick_for`]): one it owns, on one of this bot's branches
-/// ([`is_bot_branch`]), and a clone, never a worktree of a checkout (whose
-/// admin dir reads that checkout's `origin` too).
-pub fn find_by_origin(base: &Path, normalized: &str, bot: &str, client: &str) -> Option<String> {
+/// may be handed ([`pick_for`]): one it owns, this bot's ([`is_bots`]), and a
+/// clone, never a worktree of a checkout (whose admin dir reads that
+/// checkout's `origin` too).
+pub fn find_by_origin(base: &Path, normalized: &str, bot: BotName, client: &str) -> Option<String> {
     let names = held_workspaces(base)
         .into_iter()
-        .filter(|(_, wc)| {
+        .filter(|(n, wc)| {
             origin_of(wc).as_deref() == Some(normalized)
                 && crate::client_git::common_of(&wc.git_dir).as_ref() == Some(&wc.git_dir)
-                && status_of(wc).is_some_and(|(branch, _)| is_bot_branch(&branch, bot))
+                && status_of(wc).is_some_and(|(branch, _)| is_bots(base, n, &branch, bot))
         })
         .map(|(n, _)| n)
         .collect();
     pick_for(base, names, client)
 }
 
-/// Branch (empty when detached) and short head of a workspace.
+/// Branch (empty when detached) and short head (empty while the branch has
+/// no commit yet, as in a clone of an empty repo) of a workspace.
 pub fn status_of(wc: &crate::client_git::WorkCopy) -> Option<(String, String)> {
-    let head = crate::client_git::line(wc, &["rev-parse", "--short", "HEAD"])?;
-    let branch = crate::client_git::line(wc, &["branch", "--show-current"]).unwrap_or_default();
-    Some((branch, head))
+    let head = crate::client_git::line(wc, &["rev-parse", "--short", "HEAD"]);
+    let branch = crate::client_git::line(wc, &["branch", "--show-current"]);
+    (head.is_some() || branch.is_some()).then(|| (branch.unwrap_or_default(), head.unwrap_or_default()))
 }
 
 /// Runs git with no terminal (credential prompts fail instead of hanging),
@@ -596,15 +614,15 @@ pub fn common_dir(dir: &Path) -> Option<PathBuf> {
 }
 
 /// The workspace under `base` that is a worktree of the repo whose shared
-/// `.git` is `common`, on one of this bot's branches ([`is_bot_branch`]),
-/// judged by the repository darkmux recorded for it (never its own `.git`),
-/// that paired client `client` may be handed ([`pick_for`]).
-pub fn find_worktree_of(base: &Path, common: &Path, bot: &str, client: &str) -> Option<String> {
+/// `.git` is `common`, this bot's ([`is_bots`]), judged by the repository
+/// darkmux recorded for it (never its own `.git`), that paired client
+/// `client` may be handed ([`pick_for`]).
+pub fn find_worktree_of(base: &Path, common: &Path, bot: BotName, client: &str) -> Option<String> {
     let names = held_workspaces(base)
         .into_iter()
-        .filter(|(_, wc)| {
+        .filter(|(n, wc)| {
             crate::client_git::common_of(&wc.git_dir).as_deref() == Some(common)
-                && status_of(wc).is_some_and(|(branch, _)| is_bot_branch(&branch, bot))
+                && status_of(wc).is_some_and(|(branch, _)| is_bots(base, n, &branch, bot))
         })
         .map(|(n, _)| n)
         .collect();
@@ -796,6 +814,48 @@ pub fn template_commit_of(base: &Path, name: &str) -> Option<String> {
     let text = std::fs::read_to_string(&path).ok()?;
     let commit = text.trim_end_matches('\n');
     is_commit_sha(commit).then(|| commit.to_string())
+}
+
+/// Where darkmux records the exact name of the bot workspace `name` was made
+/// for: beside the workspace, like [`source_record`], outside anything a run
+/// can write.
+fn bot_record(base: &Path, name: &str) -> PathBuf {
+    base.join(format!(".{name}.bot"))
+}
+
+/// Record that workspace `name` was made for the bot named exactly `bot`
+/// (empty: one with no name). Replaces any earlier record, never through a
+/// link.
+pub fn record_bot(base: &Path, name: &str, bot: &str) -> Result<(), String> {
+    use std::io::Write;
+    if !valid_name(name) {
+        return Err(format!("{name:?} is not a workspace name"));
+    }
+    let path = bot_record(base, name);
+    let _ = std::fs::remove_file(&path);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .and_then(|mut f| writeln!(f, "{bot}"))
+        .map_err(|e| format!("recording {}'s bot: {e}", path.display()))
+}
+
+/// Forget which bot workspace `name` was made for.
+pub fn forget_bot(base: &Path, name: &str) {
+    let _ = std::fs::remove_file(bot_record(base, name));
+}
+
+/// The exact name of the bot workspace `name` was made for (empty: one with
+/// no name), if darkmux recorded it: a plain file (a link is no record).
+/// `None` for a workspace made before the name was recorded.
+pub fn bot_of(base: &Path, name: &str) -> Option<String> {
+    let path = bot_record(base, name);
+    if !valid_name(name) || !std::fs::symlink_metadata(&path).ok()?.is_file() {
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    Some(text.strip_suffix('\n').unwrap_or(&text).to_string())
 }
 
 /// Where darkmux records the paired client workspace `name` was made for:

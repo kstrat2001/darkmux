@@ -3421,6 +3421,146 @@ async fn two_bots_of_one_app_get_their_own_workspace_and_branch_of_a_repo() {
     assert_eq!(distinct.len(), names.len(), "{names:?}");
 }
 
+/// Bots whose names make the same slug ("Bot A" and "bot_a"; names of no
+/// Latin letters, and no name at all, which all make `app`; long names that
+/// cut to the same 32 characters) each get a workspace and branch of their
+/// own, from a repo link or a local checkout; each gets its own back.
+#[tokio::test]
+async fn bots_whose_names_make_the_same_slug_get_their_own_workspaces() {
+    let h = harness();
+    let token = paired(&h).await;
+    let mine = h.dir.path().join("my-site");
+    fixture_repo(&mine);
+    let long = |tail: &str| format!("{}{tail}", "x".repeat(32));
+    let pairs: [(Option<String>, String); 4] = [
+        (Some("Bot A".into()), "bot_a".into()),
+        (Some("日本".into()), "中文".into()),
+        (None, "русский".into()),
+        (Some(long(" one")), long(" two")),
+    ];
+    for (first, second) in pairs {
+        for source in [serde_json::json!({"repo_url": HCR}), serde_json::json!({"source_path": mine.to_str()})] {
+            let ask = |bot: Option<&String>| {
+                let mut body = source.clone();
+                if let Some(b) = bot {
+                    body["bot"] = b.as_str().into();
+                }
+                post("/client/workspaces", Some(&token), body)
+            };
+            let (code, a) = call(&h, ask(first.as_ref())).await;
+            assert_eq!(code, 201, "{first:?} {source}: {a}");
+            let (code, b) = call(&h, ask(Some(&second))).await;
+            assert_eq!(code, 201, "{second} gets its own, not {first:?}'s: {b}");
+            assert_ne!((&a["workspace"], &a["branch"]), (&b["workspace"], &b["branch"]));
+            for (bot, made) in [(first.as_ref(), &a), (Some(&second), &b)] {
+                let (code, again) = call(&h, ask(bot)).await;
+                assert_eq!((code, &again["workspace"]), (200, &made["workspace"]), "{bot:?} gets its own back: {again}");
+            }
+        }
+    }
+}
+
+/// A clone left on a branch of the user's (as clones were made before they
+/// got a branch of their own: on the default branch, or on the ref asked
+/// for, which an app keeps using by name) is moved onto a bot's branch
+/// before a run starts in it, taking what it already holds along: that
+/// branch never moves again. Until then `/changes` refuses it, since a PR
+/// or backup from it would push the bot's commits straight onto it.
+#[tokio::test]
+async fn a_clone_left_on_a_users_branch_moves_onto_a_bots_branch_before_a_run() {
+    for (git_ref, old_branch) in [(None, "main"), (Some("dev"), "dev")] {
+        let h = harness();
+        let token = paired(&h).await;
+        let mut body = serde_json::json!({"repo_url": HCR});
+        if let Some(r) = git_ref {
+            body["ref"] = r.into();
+        }
+        let (code, v) = call(&h, post("/client/workspaces", Some(&token), body)).await;
+        assert_eq!(code, 201, "{v}");
+        // The old shape: a run already committed on the user's branch, which
+        // is checked out.
+        let first = run_in(&h, &token, "hcr", "edit-readme").await;
+        let earlier = held_git(&h, "hcr", &["rev-parse", "HEAD"]);
+        held_git(&h, "hcr", &["update-ref", &format!("refs/heads/{old_branch}"), &earlier]);
+        held_git(&h, "hcr", &["symbolic-ref", "HEAD", &format!("refs/heads/{old_branch}")]);
+        let (code, c) = changes_of(&h, &token, "hcr").await;
+        assert_eq!((code, c["code"].as_str()), (409, Some("no_own_branch")), "{old_branch}: {c}");
+        assert!(c["error"].as_str().unwrap().contains(old_branch), "{c}");
+        let id = run_after(&h, &token, "hcr", "edit-other", Some(&first)).await;
+        let done = status(&h, &token, &id).await;
+        let branch = done["branch"].as_str().unwrap().to_string();
+        assert!(crate::client_workspace::is_bot_branch(&branch, "app"), "{old_branch}: {done}");
+        assert_eq!(held_git(&h, "hcr", &["rev-parse", old_branch]), earlier, "{old_branch} never moves again");
+        let (code, info) = call(&h, get("/client/workspaces/hcr", &[("authorization", &bearer(&token))])).await;
+        assert_eq!((code, info["branch"].as_str()), (200, Some(branch.as_str())), "{info}");
+        let (code, c) = changes_of(&h, &token, "hcr").await;
+        assert_eq!((code, c["branch"].as_str(), c["base_branch"].as_str()), (200, Some(branch.as_str()), Some("main")), "{c}");
+        let mut files: Vec<&str> = c["files"].as_array().unwrap().iter().map(|f| f["path"].as_str().unwrap()).collect();
+        files.sort();
+        assert_eq!(files, ["README.md", "other.txt"], "what {old_branch} already held rides along: {c}");
+    }
+}
+
+async fn changes_of(h: &Harness, token: &str, name: &str) -> (u16, Value) {
+    call(h, get(&format!("/client/workspaces/{name}/changes"), &[("authorization", &bearer(token))])).await
+}
+
+/// The fixture's clone, but of an empty repository (no commit, so `HEAD`
+/// is unborn).
+fn empty_repo_state(h: &Harness) -> ClientServerState {
+    let empty = h.dir.path().join("empty.git");
+    run_git(None, &["init", "--quiet", "--bare", empty.to_str().unwrap()]);
+    ClientServerState {
+        clone_repo: Arc::new(move |url, _r, dest, gd| {
+            run_git(None, &["clone", "--quiet", "--separate-git-dir", gd.to_str().unwrap(), empty.to_str().unwrap(), dest.to_str().unwrap()]);
+            run_git(Some(dest), &["remote", "set-url", "origin", url]);
+            run_git(Some(dest), &["config", "user.name", "Owner"]);
+            run_git(Some(dest), &["config", "user.email", "owner@example.com"]);
+            Ok(())
+        }),
+        ..h.state.clone()
+    }
+}
+
+/// An empty repository clones onto a bot's branch too (its `HEAD` is unborn,
+/// so the branch is born with the first run's commit), and is reused.
+#[tokio::test]
+async fn an_empty_repo_clones_onto_a_bots_branch() {
+    let h = harness();
+    let token = paired(&h).await;
+    let state = empty_repo_state(&h);
+    let ask = || post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR, "bot": "Bot A"}));
+    let (code, v) = call_with(state.clone(), ask()).await;
+    assert_eq!(code, 201, "{v}");
+    let branch = v["branch"].as_str().unwrap().to_string();
+    assert!(crate::client_workspace::is_bot_branch(&branch, "bot-a"), "{v}");
+    let (code, again) = call_with(state, ask()).await;
+    assert_eq!((code, &again["workspace"]), (200, &v["workspace"]), "{again}");
+    let id = run_in(&h, &token, "hcr", "edit").await;
+    let done = status(&h, &token, &id).await;
+    assert_eq!(done["branch"], branch.as_str(), "{done}");
+    assert!(done["commit"].is_string(), "{done}");
+}
+
+/// A clone that cannot be put on a bot's branch (its repo has a branch
+/// named `mux`, so no `mux/...` branch can exist) fails and leaves nothing
+/// behind: no folder, no repository, no records.
+#[tokio::test]
+async fn a_clone_that_cannot_get_a_bots_branch_leaves_nothing_behind() {
+    let h = harness();
+    let token = paired(&h).await;
+    run_git(Some(&h.fixture), &["branch", "mux"]);
+    let (code, v) = call(&h, post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR, "ref": "mux"}))).await;
+    assert_eq!((code, v["code"].as_str()), (500, Some("internal")), "{v}");
+    let left: Vec<String> = std::fs::read_dir(&h.base)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("hcr"))
+        .collect();
+    assert!(left.is_empty(), "left behind: {left:?}");
+}
+
 /// A checkout folder of 40 characters and a 32-character bot still make a
 /// valid workspace name, its numbered fallbacks included.
 #[tokio::test]
