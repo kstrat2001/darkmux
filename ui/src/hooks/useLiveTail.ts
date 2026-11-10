@@ -57,10 +57,19 @@ import { ingest, latestByTime, type NormRecord } from "../lib/ingest";
  */
 export type LiveTailStatus = "live" | "reconnecting";
 
-/** `RECONCILE_OVERLAP_MS`. Safety margin the reconcile
- * backstop's `?since=` subtracts from the newest record already held, so a
- * brief reconnect gap is still caught without re-pulling the whole day. */
+/** `RECONCILE_OVERLAP_MS`. Safety margin the reconcile's `?since=`
+ * subtracts from the newest record already held, so a reconnect gap is still
+ * caught without re-pulling the whole day. Used when the stream is NOT
+ * carrying records: the self-heal after a reconnect, and every backstop poll
+ * while the stream is down. */
 const RECONCILE_OVERLAP_MS = 30 * 60 * 1000;
+
+/** The backstop's overlap while the stream is live. The stream already
+ * delivers every line the daemon appends, so the poll only has to catch a
+ * record that lands at the edge of the newest one held. The 30-minute margin
+ * on every 20s poll re-downloaded about 660 KB of records a healthy stream
+ * had already delivered. */
+const LIVE_RECONCILE_OVERLAP_MS = 60 * 1000;
 
 /** Injectable seams for testing — `eventSourceFactory`/`fetchImpl`/`tickMs`
  * are never passed in production (`App.tsx` calls `useLiveTail(enabled)`
@@ -107,6 +116,7 @@ async function reconcile(
   queryClient: QueryClient,
   date: string,
   fetchImpl: typeof fetchJson,
+  overlapMs: number,
 ): Promise<boolean> {
   // (#2683) Returns whether the daemon ANSWERED — at least one of the two
   // days' reads came back `ok`. Deliberately not "did records arrive": an
@@ -122,7 +132,7 @@ async function reconcile(
     const dayResult = queryClient.getQueryData<{ ok: boolean; data?: unknown }>(dayKey);
     const existingDay = dayResult && dayResult.ok ? ingest(dayResult.data) : [];
     const newest = latestByTime([...existingDay, ...existingTail])?.tMs ?? 0;
-    const sinceMs = newest ? Math.max(cutMs, newest - RECONCILE_OVERLAP_MS) : cutMs;
+    const sinceMs = newest ? Math.max(cutMs, newest - overlapMs) : cutMs;
     const sinceIso = new Date(sinceMs).toISOString().replace(/\.\d+Z$/, "Z");
     let res;
     try {
@@ -185,8 +195,8 @@ export function useLiveTail(enabled: boolean, deps: UseLiveTailDeps = {}): LiveT
       lastContactMs = Date.now();
       onContact?.(lastContactMs);
     };
-    const runReconcile = (date: string) => {
-      void reconcile(queryClient, date, doFetch).then((contacted) => {
+    const runReconcile = (date: string, overlapMs: number) => {
+      void reconcile(queryClient, date, doFetch, overlapMs).then((contacted) => {
         if (!cancelled && contacted) markContact();
       });
     };
@@ -201,7 +211,7 @@ export function useLiveTail(enabled: boolean, deps: UseLiveTailDeps = {}): LiveT
           // (#1480 part 1) Self-heal on RECONNECT (not the initial connect)
           // — a reconnected EventSource tails from NOW, silently dropping
           // whatever was emitted during the gap. Reconcile pulls it back in.
-          if (everOpened) runReconcile(date);
+          if (everOpened) runReconcile(date, RECONCILE_OVERLAP_MS);
           everOpened = true;
         },
         onError: () => {
@@ -239,7 +249,7 @@ export function useLiveTail(enabled: boolean, deps: UseLiveTailDeps = {}): LiveT
         if (canStream) openTail(nd);
       }
       tick += 1;
-      if (tick % 4 === 0) runReconcile(tailDate);
+      if (tick % 4 === 0) runReconcile(tailDate, liveNow ? LIVE_RECONCILE_OVERLAP_MS : RECONCILE_OVERLAP_MS);
       // (#2683) The silence watchdog. `EventSource` only reports a drop it
       // NOTICES: a half-open TCP connection (the host slept, the path went
       // away without an RST) delivers no `error` event at all, so `onError`

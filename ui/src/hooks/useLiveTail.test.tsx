@@ -119,6 +119,8 @@ describe("useLiveTail", () => {
 
     act(() => {
       MockEventSource.instances[0].emit(JSON.stringify({ action: "dispatch.start", ts: "2026-08-09T12:00:01Z", execution_id: "exec-1" }));
+      // Appends land once per animation frame (`lib/sse.ts`).
+      vi.advanceTimersToNextFrame();
     });
 
     expect(queryClient.getQueryData(queryKeys.flowTail("2026-08-09"))).toEqual([
@@ -239,6 +241,69 @@ describe("useLiveTail", () => {
     expect(calls.some((c) => c.includes("/flow/2026-08-09?since="))).toBe(true);
 
     unmount();
+  });
+
+  // The backstop's `?since=` overlap: a minute behind the newest record held
+  // while the stream is live (the stream already delivers everything; the
+  // poll only has to catch what lands at the boundary), 30 minutes only when
+  // the stream dropped and a gap may hold records the push path never sent.
+  describe("the reconcile overlap", () => {
+    const held = { action: "dispatch.start", ts: "2026-08-09T11:59:00Z", execution_id: "exec-held" };
+    const sinceOf = (calls: string[], date: string) => {
+      const call = calls.find((c) => c.startsWith(`/flow/${date}?since=`));
+      return call ? decodeURIComponent(call.split("since=")[1]) : null;
+    };
+    const seeded = () => {
+      const queryClient = new QueryClient();
+      queryClient.setQueryData(queryKeys.flowTail("2026-08-09"), [{ ...held, tMs: Date.parse(held.ts) }]);
+      return queryClient;
+    };
+
+    it("a healthy live stream polls one minute behind the newest record, not thirty", async () => {
+      const queryClient = seeded();
+      const { calls, impl } = makeFetchImpl(() => ({ ok: true, data: envelope([]) }));
+      const { unmount } = renderHook(() => useLiveTail(true, { eventSourceFactory: factory, fetchImpl: impl, tickMs: 5000 }), {
+        wrapper: wrapper(queryClient),
+      });
+      act(() => {
+        MockEventSource.instances[0].open();
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5000 * 4);
+      });
+      expect(sinceOf(calls, "2026-08-09")).toBe("2026-08-09T11:58:00Z");
+      unmount();
+    });
+
+    it("the reconcile after a reconnect still reaches back thirty minutes", async () => {
+      const queryClient = seeded();
+      const { calls, impl } = makeFetchImpl(() => ({ ok: true, data: envelope([]) }));
+      const { unmount } = renderHook(() => useLiveTail(true, { eventSourceFactory: factory, fetchImpl: impl, tickMs: 5000 }), {
+        wrapper: wrapper(queryClient),
+      });
+      await act(async () => {
+        MockEventSource.instances[0].open();
+        MockEventSource.instances[0].error();
+        MockEventSource.instances[0].open();
+        await Promise.resolve();
+      });
+      expect(sinceOf(calls, "2026-08-09")).toBe("2026-08-09T11:29:00Z");
+      unmount();
+    });
+
+    it("a poll while the stream is down reaches back thirty minutes too", async () => {
+      const queryClient = seeded();
+      const { calls, impl } = makeFetchImpl(() => ({ ok: true, data: envelope([]) }));
+      const { unmount } = renderHook(() => useLiveTail(true, { eventSourceFactory: factory, fetchImpl: impl, tickMs: 5000 }), {
+        wrapper: wrapper(queryClient),
+      });
+      // Never opened: the push path is not carrying anything.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5000 * 4);
+      });
+      expect(sinceOf(calls, "2026-08-09")).toBe("2026-08-09T11:29:00Z");
+      unmount();
+    });
   });
 
   it("merges reconciled records into the flowTail cache, deduped against what's already there", async () => {

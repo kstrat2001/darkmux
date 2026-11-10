@@ -158,8 +158,9 @@ describe("ingest: one test per entry point", () => {
     sources[0].onmessage?.({ data: JSON.stringify(raw("dispatch.start", 0)) } as MessageEvent<string>);
     sources[0].onmessage?.({ data: JSON.stringify({ _type: "schema" }) } as MessageEvent<string>);
     sources[0].onmessage?.({ data: "{not json" } as MessageEvent<string>);
-    const cached = qc.getQueryData<NormRecord[]>(["tail"]) ?? [];
+    // Appends batch per animation frame; closing writes what is waiting.
     handle.close();
+    const cached = qc.getQueryData<NormRecord[]>(["tail"]) ?? [];
     expect(cached).toHaveLength(1);
     expect(cached[0].tMs).toBe(T0);
     expect(cached[0].action).toBe(ACTION.DispatchStart);

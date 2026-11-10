@@ -133,7 +133,11 @@ export function mergeTailRecords(existing: readonly NormRecord[], incoming: read
     seen.add(k);
     merged.push(r);
   }
-  return recordsSince(merged, cutMs);
+  const kept = recordsSince(merged, cutMs);
+  // A poll that brought nothing new and aged nothing out returns the held
+  // array itself: the cache then sees no change, and the window downstream
+  // does not re-merge for it.
+  return kept.length === existing.length && merged.length === existing.length ? (existing as NormRecord[]) : kept;
 }
 
 /** The view-model half of `flowToRenderModel()`:
@@ -169,35 +173,57 @@ export function shapeRecords(records: readonly NormRecord[]): NormRecord[] {
  * own concern. Each row goes through `ingestRecord` like any other record, so
  * its `tMs` obeys the one bad-timestamp policy. */
 function perSessionRuntimeRecords(records: readonly NormRecord[]): NormRecord[] {
-  const perSession = new Map<string, { turns: number; ts: string; machineId?: string; machineUid?: string }>();
-  for (const r of records) {
-    if (r.action !== ACTION.DispatchTurn || !r.session_id) continue;
-    const seq = Number(payloadOf(r, ACTION.DispatchTurn)?.turn_seq) || 0;
-    const prev = perSession.get(r.session_id);
-    const entry = prev ?? { turns: 0, ts: r.ts };
-    entry.turns = Math.max(entry.turns, seq);
-    // `e.ts=r.ts` unconditionally — the LAST turn's timestamp, not the max.
-    // Records arrive in ts order, so these agree; keeping legacy's form means
-    // they keep agreeing if that ever stops being true.
-    entry.ts = r.ts;
-    if (r.machine_id) entry.machineId = r.machine_id;
-    if (r.machine_uid) entry.machineUid = r.machine_uid;
-    perSession.set(r.session_id, entry);
-  }
+  const perSession = new Map<string, SessionTurns>();
+  for (const r of records) foldSessionTurn(perSession, r);
   const out: NormRecord[] = [];
   for (const [sessionId, e] of perSession) {
-    const row = ingestRecord({
-      ts: e.ts,
-      category: CATEGORY.Telemetry,
-      source: "runtime",
-      machine_id: e.machineId,
-      machine_uid: e.machineUid,
-      session_id: sessionId,
-      fields: { turns: e.turns },
-    });
+    const row = sessionRuntimeRow(sessionId, e);
     if (row) out.push(row);
   }
   return out;
+}
+
+/** One session's fold for its synthetic runtime row: the max `turn_seq`, the
+ *  LAST turn's timestamp, its machine. `order` is the session's place in
+ *  first-seen order, which is the synthetic rows' order among equal times. */
+export interface SessionTurns {
+  turns: number;
+  ts: string;
+  machineId?: string;
+  machineUid?: string;
+  order: number;
+}
+
+/** Folds one record into `perSession` (a new entry object, never a mutated
+ *  one, so a caller holding the previous map keeps its values). Returns the
+ *  session id it changed, or null for a record that is not a turn. */
+export function foldSessionTurn(perSession: Map<string, SessionTurns>, r: NormRecord): string | null {
+  if (r.action !== ACTION.DispatchTurn || !r.session_id) return null;
+  const seq = Number(payloadOf(r, ACTION.DispatchTurn)?.turn_seq) || 0;
+  const prev = perSession.get(r.session_id) ?? { turns: 0, ts: r.ts, order: perSession.size };
+  // `e.ts=r.ts` unconditionally — the LAST turn's timestamp, not the max.
+  // Records arrive in ts order, so these agree; keeping legacy's form means
+  // they keep agreeing if that ever stops being true.
+  perSession.set(r.session_id, { ...prev, ...turnMachine(r, prev), turns: Math.max(prev.turns, seq), ts: r.ts });
+  return r.session_id;
+}
+
+/** A turn's machine, where it names one; otherwise the session's last. */
+function turnMachine(r: NormRecord, prev: SessionTurns): Pick<SessionTurns, "machineId" | "machineUid"> {
+  return { machineId: r.machine_id || prev.machineId, machineUid: r.machine_uid || prev.machineUid };
+}
+
+/** The synthetic `source:"runtime"` row for one session's fold. */
+export function sessionRuntimeRow(sessionId: string, e: SessionTurns): NormRecord | null {
+  return ingestRecord({
+    ts: e.ts,
+    category: CATEGORY.Telemetry,
+    source: "runtime",
+    machine_id: e.machineId,
+    machine_uid: e.machineUid,
+    session_id: sessionId,
+    fields: { turns: e.turns },
+  });
 }
 
 /** `loadLiveWindow()` + the dispatch-action slice of `flowToRenderModel()` —

@@ -141,6 +141,14 @@ pub fn standing_facts(config_path: Option<&str>) -> Facts {
     Facts { utility_binding: standing_utility_binding(config_path), ..Facts::default() }
 }
 
+/// One reconcile's snapshot: LM Studio's `residents` read now, and the
+/// utility binding the caller was handed, which it must name (a snapshot
+/// without it forfeits the utility hold). A wave's reuse check and a
+/// preflight load's memory decision are built here.
+pub(crate) fn reconcile_facts(residents: Vec<darkmux_gestalt::ResidentFact>, utility_binding: Option<String>) -> Facts {
+    Facts { residents, utility_binding, ..Facts::default() }
+}
+
 /// One job's completed outcome: its own value plus every flow record it
 /// produced (see the module doc's "Flow-record ordering" section).
 pub type JobOutcome<T> = Result<(T, Vec<FlowRecord>)>;
@@ -1054,17 +1062,19 @@ pub(crate) fn ensure_wave_loaded(
             wave.mark_loaded(starting);
             return Ok(());
         }
-        wave.unreserve(starting);
+        // A try that did not load ends its reservation.
+        drop(starting);
         settle_attempt(outcome, attempt, &pinned, &committed)?;
         std::thread::sleep(BLOCKED_BY_HOLDER_RETRY_DELAY);
     }
 }
 
-/// (#3509) What a wave reserved for its loads: their commitment, and LM
-/// Studio's workers' footprint read before they began.
-#[derive(Debug, Clone, Copy)]
+/// (#3509) What one try of a wave reserved for its loads: their commitment
+/// (a reservation of this try's own, ended when dropped), and LM Studio's
+/// workers' footprint read before they began.
+#[derive(Debug)]
 struct Starting {
-    need: u64,
+    reserved: darkmux_types::residency_reservation::Reserved,
     workers_before: Option<u64>,
 }
 
@@ -1136,7 +1146,8 @@ impl WaveLoad<'_> {
         // (#3506) darkmux's idle engine servers count in the machine's one
         // memory budget: stopped to make room before anything is unloaded
         // or loaded, or the wave is refused with a code.
-        crate::lms_room::make_room(&plan, &facts, &pricing, self.lease, &pinned, self.room, committed)
+        let evict = crate::lms_room::Evict { lease: self.lease, pinned: &pinned, loads: Vec::new() };
+        crate::lms_room::make_room(&plan, &facts, &pricing, &evict, self.room, committed)
             .map_err(|refusal| room_refused(refusal, committed))?;
         let starting = self.reserve(&plan, &facts, &pricing)?;
         let mut lock = lock;
@@ -1150,17 +1161,10 @@ impl WaveLoad<'_> {
     /// loads nothing, or its commitment is unknown.
     fn reserve(&self, plan: &Plan, facts: &Facts, pricing: &crate::lms_room::LoadPricing<'_>) -> Result<Option<Starting>> {
         let Some(need) = darkmux_gestalt::plan_room(plan, facts, &pricing.commitment()) else { return Ok(None) };
-        self.lease.write_starting(self.own_models, need.need_bytes).map_err(|e| {
+        let reserved = darkmux_types::residency_reservation::Reserved::begin(need.need_bytes).map_err(|e| {
             wave_error(Some("model_start_failed"), format!("could not record this wave's reservation ({e:#}); check that darkmux's home is writable"))
         })?;
-        Ok(Some(Starting { need: need.need_bytes, workers_before: (self.room.workers)() }))
-    }
-
-    /// A wave that did not load ends its reservation.
-    fn unreserve(&self, starting: Option<Starting>) {
-        if starting.is_some() {
-            let _ = self.lease.write_starting(self.own_models, 0);
-        }
+        Ok(Some(Starting { reserved, workers_before: (self.room.workers)() }))
     }
 
     /// (#3514) The residency lock, or (`Err`, with the leases read) a wave
@@ -1199,7 +1203,7 @@ impl WaveLoad<'_> {
         let residents = host
             .list_resident()
             .map_err(|e| anyhow!("darkmux: could not read LMStudio residents (`lms ps`): {e}{}", partial_execution_note(committed)))?;
-        let facts = Facts { residents, utility_binding: self.utility_binding.map(str::to_string), ..Default::default() };
+        let facts = reconcile_facts(residents, self.utility_binding.map(str::to_string));
         let pinned = self.held();
         let opts = AcquireOpts { pinned: pinned.clone(), ..AcquireOpts::new(CallerIntent::Auto, AcquireScope::Exclusive) };
         let plan = plan_acquire(self.unique, &facts, opts, self.est);
@@ -1229,13 +1233,14 @@ impl WaveLoad<'_> {
     /// is actually loaded).
     ///
     /// (#3509) A wave that reserved keeps its reservation past the load,
-    /// until its memory pages in ([`crate::lms_room::ServerRoom::settle`]).
+    /// until its memory pages in ([`crate::lms_room::ServerRoom::settle`]):
+    /// the reservation of this load alone, apart from the lease, so a later
+    /// wave of the same track reserves beside it, never over it.
     fn mark_loaded(&self, starting: Option<Starting>) {
-        let marked = match starting {
-            Some(st) => self.lease.mark_loaded_reserving(self.own_models, st.need).map(|res| (self.room.settle)(res, st.need, st.workers_before)),
-            None => self.lease.mark_loaded(self.own_models),
-        };
-        if let Err(e) = marked {
+        if let Some(st) = starting {
+            (self.room.settle)(st.reserved, st.workers_before);
+        }
+        if let Err(e) = self.lease.mark_loaded(self.own_models) {
             eprintln!("darkmux: could not mark this wave's residency lease as loaded (non-fatal): {e}");
         }
     }

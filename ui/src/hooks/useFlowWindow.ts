@@ -2,7 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import { skipToken, useQueries, useQuery } from "@tanstack/react-query";
 import { fetchJson, type FetchResult } from "../lib/fetcher";
 import { DATE_ROLLOVER_CHECK_MS, RECONCILE_BACKSTOP_MS, queryKeys } from "../lib/queryKeys";
-import { buildFlowWindow, computeTMax, prevDateUTC, todayUTC } from "../lib/flow";
+import { computeTMax, prevDateUTC, todayUTC } from "../lib/flow";
+import { nextFlowWindow, type FlowWindowState } from "../lib/flowWindow";
 import { getSource } from "../lib/source";
 import { ingest, type NormRecord } from "../lib/ingest";
 import type { FlowRecordsResponse } from "../types/generated/FlowRecordsResponse";
@@ -45,6 +46,10 @@ function isFailedRead(r: FetchResult<unknown> | undefined): r is Extract<FetchRe
   return r.status !== 404;
 }
 
+/** One empty record list, so an absent input keeps its identity across
+ *  renders (`nextFlowWindow` compares its inputs by identity). */
+const NO_RECORDS: NormRecord[] = [];
+
 /** (#2911) How finely the flow window's trailing edge follows the clock. */
 export const FLOW_WINDOW_EDGE_GRAIN_MS = 60_000;
 
@@ -58,7 +63,8 @@ export function flowWindowEdgeMs(nowMs: number): number {
 /** `loadLiveWindow()` as a query hook: fetches
  * `[prevDate, today]` (that exact order — see `lib/flow.ts`'s module doc
  * for the fetch-order subtlety that makes the two-day merge order
- * load-bearing) and folds the result through `buildFlowWindow`. A day that
+ * load-bearing) and folds the result through `nextFlowWindow` (`lib/flowWindow.ts`), which
+ * agrees with `buildFlowWindow` exactly. A day that
  * 404s or otherwise fails contributes no records — `loadLiveWindow`'s own
  * `anyOk` tolerance, not a hard error (the other day's records still
  * render).
@@ -161,13 +167,24 @@ export function useFlowWindow(nowMs: number): FlowWindowResult {
   // one grain longer, never drops one early. A new record still lands at
   // once: it arrives as new query data, which is a dependency here.
   const windowEdgeMs = flowWindowEdgeMs(nowMs);
+  const yDay = useMemo(() => (yQuery.data?.ok ? ingest(yQuery.data.data) : NO_RECORDS), [yQuery.data]);
+  const tDay = useMemo(() => (tQuery.data?.ok ? ingest(tQuery.data.data) : NO_RECORDS), [tQuery.data]);
+  // Each streamed batch used to rebuild the whole window (copy, shape, sort,
+  // dedup: ~20-40 ms at 30k records). `nextFlowWindow` inserts an appended
+  // tail into the window it built last and rebuilds only when anything else
+  // changed; the cell holds that last window across renders.
+  const [windowCell] = useState<{ last: FlowWindowState | null }>(() => ({ last: null }));
   const data = useMemo(() => {
-    const yData = yQuery.data?.ok ? ingest(yQuery.data.data) : [];
-    const tData = tQuery.data?.ok ? ingest(tQuery.data.data) : [];
-    const yMerged = yTailQuery.data?.length ? [...yData, ...yTailQuery.data] : yData;
-    const tMerged = tTailQuery.data?.length ? [...tData, ...tTailQuery.data] : tData;
-    return buildFlowWindow(yMerged, tMerged, windowEdgeMs);
-  }, [yQuery.data, tQuery.data, yTailQuery.data, tTailQuery.data, windowEdgeMs]);
+    const next = nextFlowWindow(windowCell.last, {
+      yDay,
+      yTail: yTailQuery.data ?? NO_RECORDS,
+      tDay,
+      tTail: tTailQuery.data ?? NO_RECORDS,
+      edgeMs: windowEdgeMs,
+    });
+    windowCell.last = next;
+    return next.data;
+  }, [windowCell, yDay, tDay, yTailQuery.data, tTailQuery.data, windowEdgeMs]);
 
   const tMax = useMemo(() => computeTMax(data), [data]);
 

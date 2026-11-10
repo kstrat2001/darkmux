@@ -1867,6 +1867,35 @@
         assert_eq!(records[1]["ts"], "2026-05-14T09:00:00Z");
     }
 
+    /// The replay routes poll every 5 s, and used to parse the whole flow
+    /// history on every poll. Only the day files that hold the id are parsed
+    /// now; an id no day holds parses none.
+    #[test]
+    fn a_replay_parses_only_the_day_files_that_hold_its_id() {
+        let tmp = TempDir::new().unwrap();
+        let day = |date: &str, mission: &str, session: &str, n: usize| {
+            let line = format!("{{\"session_id\":\"{session}\",\"mission_id\":\"{mission}\",\"ts\":\"{date}T10:00:00Z\"}}\n");
+            fs::write(tmp.path().join(format!("{date}.jsonl")), line.repeat(n)).unwrap();
+        };
+        day("2026-05-12", "m-old", "s-old", 50);
+        day("2026-05-13", "m1", "s1", 3);
+        day("2026-05-14", "m-new", "s-new", 70);
+        let empty = crate::FleetRecords::default();
+        for (field, id) in [("mission_id", "m1"), ("session_id", "s1")] {
+            let (records, truncated, scanned) = super::collect_records_by_field(tmp.path(), empty.clone(), field, id);
+            assert_eq!((records.len(), truncated), (3, false), "{field}");
+            assert_eq!(scanned, 3, "{field}: only the day that holds {id} is parsed");
+        }
+        let (records, _, scanned) = super::collect_records_by_field(tmp.path(), empty.clone(), "session_id", "s-nowhere");
+        assert_eq!((records.len(), scanned), (0, 0), "an id no day holds parses nothing");
+        // A record for the id appended to another day is found on the next poll.
+        let mut f = fs::OpenOptions::new().append(true).open(tmp.path().join("2026-05-14.jsonl")).unwrap();
+        std::io::Write::write_all(&mut f, b"{\"session_id\":\"s1\",\"mission_id\":\"m1\",\"ts\":\"2026-05-14T11:00:00Z\"}\n").unwrap();
+        let (records, _, _) = super::collect_records_by_field(tmp.path(), empty, "session_id", "s1");
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[3]["ts"], "2026-05-14T11:00:00Z");
+    }
+
     /// A mission's records reach the viewer with their step named as
     /// `payload.step_id`, read from the session string here, since the
     /// viewer never parses a session id.
@@ -2037,7 +2066,7 @@
         let arr = body["records"].clone();
         // (found live 2026-09-06) The day file's `{"_type":"schema",…}`
         // header line is NOT a flow record — `push_flow_line` now skips it,
-        // same as `for_each_flow_record_across_days` always has, so it no
+        // same as `for_each_record_in_day_file` always has, so it no
         // longer shows up as a headerless "record 0" in this response.
         let items = arr.as_array().expect("expected a JSON array");
         assert_eq!(items.len(), 1, "the schema header is excluded — only the real record remains");
@@ -2678,18 +2707,61 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn auth_on_loopback_with_a_rebinding_host_and_no_token_is_refused() {
-        assert_eq!(loopback_flow_status(AuthEnv::ReadAuth, REBOUND).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(loopback_flow_status(AuthEnv::ReadAuth, REBOUND).await, StatusCode::MISDIRECTED_REQUEST);
     }
 
+    /// A page cannot hold the token, so a token beside a foreign `Host` is
+    /// not a reason to answer it.
     #[tokio::test]
     #[serial_test::serial]
-    async fn auth_on_loopback_with_a_rebinding_host_and_the_token_is_allowed() {
+    async fn auth_on_loopback_with_a_rebinding_host_and_the_token_is_still_refused() {
         let status = loopback_flow_status(
             AuthEnv::ReadAuth,
             &[("Host", "attacker.example:8765"), ("Authorization", BEARER)],
         )
         .await;
-        assert_ne!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(status, StatusCode::MISDIRECTED_REQUEST);
+    }
+
+    /// (DNS rebinding) With read auth off, the default install, a page whose
+    /// name was re-resolved to 127.0.0.1 used to be served like a tailnet
+    /// peer: redacted, but every flow record's content intact. Whatever the
+    /// posture and the peer, a `Host` that names no address of this machine
+    /// is refused, on every route, before anything is read.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_foreign_host_is_refused_whatever_the_read_posture() {
+        for auth in [AuthEnv::Off, AuthEnv::TokenOnly, AuthEnv::ReadAuth] {
+            for path in ["/flow-days", "/flow/2026-05-14", "/runs", "/health", "/fleet/roster"] {
+                for peer in [loopback_peer(), remote_peer()] {
+                    for host in ["attacker.example:8765", "attacker.example", "localhost.attacker.example", "127.0.0.1.nip.io:8765"] {
+                        let status = read_status(auth, peer, path, &[("Host", host), ("Origin", "http://attacker.example:8765")]).await;
+                        assert_eq!(status, StatusCode::MISDIRECTED_REQUEST, "{path} Host {host} from {:?}", peer.0);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The names this machine answers to keep working: loopback, any IP
+    /// literal (a tailnet or LAN address), and this machine's own names
+    /// (the test router knows one, `host_gate::TEST_MACHINE_NAME`).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn every_name_this_machine_answers_to_passes_the_host_gate() {
+        let tailnet = crate::host_gate::TEST_MACHINE_NAME;
+        let tailnet_port = format!("{tailnet}:8090");
+        let tailnet_dot = format!("{}.", tailnet.to_ascii_uppercase());
+        let hosts = [
+            "localhost", "localhost:8765", "127.0.0.1:8765", "[::1]:8765", "100.64.0.7:8090", "192.168.1.20", "[fd7a:115c:a1e0::1]:8090",
+            tailnet, tailnet_port.as_str(), tailnet_dot.as_str(),
+        ];
+        for host in hosts {
+            let off = read_status(AuthEnv::Off, remote_peer(), "/flow-days", &[("Host", host)]).await;
+            assert_eq!(off, StatusCode::OK, "Host {host} with read auth off");
+            let local = loopback_flow_status(AuthEnv::ReadAuth, &[("Host", host)]).await;
+            assert_ne!(local, StatusCode::MISDIRECTED_REQUEST, "Host {host} with read auth on");
+        }
     }
 
     #[tokio::test]
@@ -2789,15 +2861,15 @@
         assert_ne!(right_port, StatusCode::UNAUTHORIZED);
     }
 
-    /// `/health`'s this-machine fields follow the same predicate.
+    /// `/health`'s this-machine fields follow the same predicate; a rebound
+    /// request is refused before `/health` answers at all.
     #[tokio::test]
     #[serial_test::serial]
     async fn health_withholds_this_machine_fields_from_a_rebound_or_hostless_request() {
         *crate::fleet_listener::LISTENER_BUSY.lock().unwrap() =
             Some(darkmux_types::config::BusyPolicy::Queue);
-        let rebound = loopback_health(REBOUND).await;
-        assert!(rebound["open_file_limit"].is_null(), "{rebound}");
-        assert!(rebound["fleet_busy"].is_null(), "{rebound}");
+        let rebound = read_status(AuthEnv::Off, loopback_peer(), "/health", REBOUND).await;
+        assert_eq!(rebound, StatusCode::MISDIRECTED_REQUEST);
         let app = build_router(PathBuf::new());
         let mut req = Request::builder().uri("/health").body(Body::empty()).unwrap();
         req.extensions_mut().insert(loopback_peer());
@@ -2838,10 +2910,10 @@
 
     /// Every panel, including the three that print the execution surface
     /// (`doctor`, `config-list`, `flow-status`; they used to need this machine
-    /// or the token whatever the posture): with read auth off a tailnet peer,
-    /// a proxied request and a rebinding Host all pass the gate (and are
-    /// served the redacted form); with read auth on, a caller with no token is
-    /// refused, as on every read route.
+    /// or the token whatever the posture): with read auth off a tailnet peer
+    /// and a proxied request pass the gate (and are served the redacted
+    /// form), and a rebinding Host is refused by the host gate; with read
+    /// auth on, a caller with no token is refused, as on every read route.
     #[tokio::test]
     #[serial_test::serial]
     async fn every_panel_follows_the_read_posture() {
@@ -2853,7 +2925,7 @@
             let proxied = panel_status(AuthEnv::Off, loopback_peer(), id, &[("X-Forwarded-For", "100.64.0.7")]).await;
             assert_eq!(proxied, StatusCode::BAD_REQUEST, "{id} through a proxy");
             let rebound = panel_status(AuthEnv::Off, loopback_peer(), id, &[("Host", "attacker.example:8765")]).await;
-            assert_eq!(rebound, StatusCode::BAD_REQUEST, "{id} with a rebinding Host");
+            assert_eq!(rebound, StatusCode::MISDIRECTED_REQUEST, "{id}: a rebinding Host is refused");
             let s = panel_status(AuthEnv::ReadAuth, remote_peer(), id, &[]).await;
             assert_eq!(s, StatusCode::UNAUTHORIZED, "{id} with read auth on, no token");
         }
@@ -3856,6 +3928,87 @@
         assert_eq!(got.as_deref(), Some(r#"{"late":1}"#));
     }
 
+    /// A writer that appends between the tail's stat and its read: the read
+    /// takes the new bytes too, so the offset must move past them, not to
+    /// the length it stat'd, or the next poll delivers them a second time.
+    #[tokio::test]
+    async fn a_line_appended_between_the_stat_and_the_read_is_delivered_once() {
+        use std::io::Write;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("race.jsonl");
+        std::fs::write(&path, "a\n").unwrap();
+        let stale = std::fs::metadata(&path).unwrap().len();
+        std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"b\n").unwrap();
+        let mut tail = super::TailState { path: path.clone(), offset: 0, partial: Vec::new(), pending: VecDeque::new() };
+        tail.read_new(stale).await;
+        std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"c\n").unwrap();
+        tail.read_new(std::fs::metadata(&path).unwrap().len()).await;
+        assert_eq!(Vec::from(tail.pending), ["a", "b", "c"], "every line once, in order");
+    }
+
+    /// The same promise under a real writer: lines appended steadily through
+    /// several of the tail's polls, so appends land between a poll's stat and
+    /// its read, arrive exactly once each.
+    #[tokio::test]
+    async fn the_tail_delivers_each_line_once_under_concurrent_appends() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("busy.jsonl");
+        std::fs::File::create(&path).unwrap();
+        let stream = tail_lines(path.clone(), 0);
+        tokio::pin!(stream);
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&writer_path).unwrap();
+            let started = std::time::Instant::now();
+            let mut n = 0usize;
+            while started.elapsed() < Duration::from_millis(1200) {
+                writeln!(f, "{{\"n\":{n},\"pad\":\"{}\"}}", "x".repeat(64)).unwrap();
+                n += 1;
+                if n.is_multiple_of(4) {
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+            }
+            n
+        });
+        let mut got = Vec::new();
+        while !writer.is_finished() {
+            match next_line(&mut stream, Duration::from_secs(3)).await {
+                Some(line) => got.push(line),
+                None => break,
+            }
+        }
+        let n = writer.join().unwrap();
+        while got.len() < n {
+            match next_line(&mut stream, Duration::from_secs(3)).await {
+                Some(line) => got.push(line),
+                None => break,
+            }
+        }
+        // Anything delivered twice would arrive after the n-th line.
+        let extra = next_line(&mut stream, Duration::from_millis(800)).await;
+        assert_eq!(extra, None, "a line was delivered twice ({} of {n} read first)", got.len());
+        let want: Vec<String> = (0..n).map(|i| format!("{{\"n\":{i},\"pad\":\"{}\"}}", "x".repeat(64))).collect();
+        assert_eq!(got.len(), n, "every line once");
+        assert!(got == want, "every line once, in order");
+    }
+
+    /// A multi-byte character split across two reads is decoded whole.
+    #[tokio::test]
+    async fn a_character_split_across_two_reads_is_kept_whole() {
+        use std::io::Write;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("utf8.jsonl");
+        let line = "{\"s\":\"caf\u{e9}\"}\n".as_bytes().to_vec();
+        let cut = line.len() - 4; // between the two bytes of the e-acute
+        std::fs::write(&path, &line[..cut]).unwrap();
+        let mut tail = super::TailState { path: path.clone(), offset: 0, partial: Vec::new(), pending: VecDeque::new() };
+        tail.read_new(std::fs::metadata(&path).unwrap().len()).await;
+        std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(&line[cut..]).unwrap();
+        tail.read_new(std::fs::metadata(&path).unwrap().len()).await;
+        assert_eq!(Vec::from(tail.pending), ["{\"s\":\"caf\u{e9}\"}"]);
+    }
+
     #[tokio::test]
     async fn tail_stream_emits_multiple_lines_from_single_append() {
         // Regression: ensure pending VecDeque drains across multiple
@@ -4573,7 +4726,7 @@
         }
 
         /// (found live 2026-09-06) A day file's own `{"_type":"schema",…}`
-        /// header line is not a flow record — `for_each_flow_record_across_days`
+        /// header line is not a flow record — `for_each_record_in_day_file`
         /// already skipped it, but `push_flow_line` (the reader behind
         /// `GET /flow/<date>`) did not, so it surfaced as a headerless
         /// "record 0" with no `ts`/`action`.
@@ -7162,6 +7315,30 @@
             kept,
             "the superseded rebuild replaced the foreground build"
         );
+    }
+
+    /// `/runs` rebuilds when what it reads changes. The daemon appends its
+    /// own host telemetry to today's file all day, and `/runs` folds none of
+    /// it, so such a record must not count as new input (it used to: the key
+    /// was each day file's length and mtime, so the 14-day fold re-ran after
+    /// every telemetry write). A record the build folds still does.
+    #[test]
+    #[serial_test::serial]
+    fn runs_inputs_change_only_with_what_runs_folds() {
+        unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
+        let flows = TempDir::new().unwrap();
+        let now = darkmux_flow::ts_utc_at(now_unix() as i64);
+        let today = flows.path().join(format!("{}.jsonl", &now[..10]));
+        let append = |line: String| {
+            let mut f = fs::OpenOptions::new().create(true).append(true).open(&today).unwrap();
+            std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes()).unwrap();
+        };
+        append(format!("{{\"action\":\"dispatch.start\",\"session_id\":\"S-1\",\"ts\":\"{now}\"}}"));
+        let before = super::runs_inputs(flows.path());
+        append(format!("{{\"action\":\"machine.telemetry\",\"machine_id\":\"laptop\",\"ts\":\"{now}\",\"payload\":{{\"cpu_pct\":3}}}}"));
+        assert_eq!(super::runs_inputs(flows.path()), before, "host telemetry is not an input to /runs");
+        append(format!("{{\"action\":\"dispatch.complete\",\"session_id\":\"S-1\",\"ts\":\"{now}\"}}"));
+        assert_ne!(super::runs_inputs(flows.path()), before, "a record /runs folds is");
     }
 
     /// (#3428) The first `/runs` poll after an idle stretch waits for a new
@@ -10108,19 +10285,17 @@ mod fleet_cache_wall_clock {
         // flow-action-guard:allow-end
     }
 
-    /// The promise: the flow-history scan runs once per TTL, not once per
-    /// caller. A pairing that appears in history after a scan is not seen
-    /// until the TTL passes; a zero TTL always rescans.
+    /// The uid history is read through the daemon's day index: a pairing
+    /// written after the last read is seen on the next call, with no TTL to
+    /// wait out and no rescan of what was already read (the index's own
+    /// tests prove the incremental read).
     ///
-    /// Serial, with every other test that reaches `history_uids` (the backfill
-    /// tests here, and the `/fleet/roster` and fleet-view tests). The cache is
-    /// ONE process-global slot keyed by directory, so another test's scan
-    /// between this test's calls replaced the slot and the second call
-    /// rescanned, under plain `cargo test`. Production keeps one slot: both
-    /// callers pass the daemon's own `flows_dir()`.
+    /// Serial, with every other test that reaches the daemon's one index
+    /// slot (the backfill tests here, and the `/fleet/roster` and fleet-view
+    /// tests): the slot is keyed by directory.
     #[test]
     #[serial_test::serial]
-    fn the_uid_history_is_scanned_once_per_ttl() {
+    fn a_uid_pairing_written_after_a_read_is_seen_on_the_next() {
         let tmp = TempDir::new().unwrap();
         let day = tmp.path().join("2026-09-30.jsonl");
         let pair = |id: &str, uid: &str| format!("{{\"action\":\"dispatch.start\",\"machine_id\":\"{id}\",\"machine_uid\":\"{uid}\"}}\n");
@@ -10135,18 +10310,20 @@ mod fleet_cache_wall_clock {
             current_name: None,
             extras: Default::default(),
         };
-        let uid_of = |id: &str, ttl: std::time::Duration| {
+        let uid_of = |id: &str| {
             let mut m = vec![entry(id)];
-            let filled = super::backfill_with_ttl(&mut m, tmp.path(), ttl);
+            let filled = super::backfill_roster_machine_uids(&mut m, tmp.path());
             (m[0].machine_uid.clone(), filled.contains(id))
         };
-        let long = std::time::Duration::from_secs(600);
         fs::write(&day, pair("laptop", "UID-L")).unwrap();
-        assert_eq!(uid_of("laptop", long), (Some("UID-L".into()), true), "a filled uid says so");
-        // A new machine appears in history; the cached scan does not see it.
-        fs::write(&day, format!("{}{}", pair("laptop", "UID-L"), pair("studio", "UID-S"))).unwrap();
-        assert_eq!(uid_of("studio", long), (None, false), "served from the scan a TTL ago");
-        assert_eq!(uid_of("studio", std::time::Duration::ZERO), (Some("UID-S".into()), true), "an expired scan reads history again");
+        assert_eq!(uid_of("laptop"), (Some("UID-L".into()), true), "a filled uid says so");
+        assert_eq!(uid_of("studio"), (None, false));
+        let mut f = fs::OpenOptions::new().append(true).open(&day).unwrap();
+        std::io::Write::write_all(&mut f, pair("studio", "UID-S").as_bytes()).unwrap();
+        assert_eq!(uid_of("studio"), (Some("UID-S".into()), true), "the new pairing is read at once");
+        // The oldest day's pairing wins over a later one.
+        fs::write(tmp.path().join("2026-10-01.jsonl"), pair("laptop", "UID-LATER")).unwrap();
+        assert_eq!(uid_of("laptop").0.as_deref(), Some("UID-L"));
     }
 }
 

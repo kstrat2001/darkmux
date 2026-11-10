@@ -1,3 +1,4 @@
+import { clkhm } from "../../lib/format";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -1820,7 +1821,9 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
       n_ctx: 262144,
       port: 8091,
       pid: 4242,
-      started_at_ms: 0,
+      // A minute old, measured on the clock the card reads: a start that is
+      // still inside its bound.
+      started_at_ms: Date.now() - 60_000,
       answering,
     });
     mockFleetFetch({
@@ -2763,6 +2766,47 @@ describe("savings hero: nothing leaks while loading (#2830)", () => {
       expect(card.querySelector(".mach-scope__rate"), "not the reading style").toBeNull();
       expect(card.className, "the dim dot").toContain("nosignal");
       expect(card.className, "the machine is still running").toContain("active");
+      expect(latestTokenScopeProps()).toMatchObject({ state: "nosignal" });
+    });
+
+    // Every card, idle ones included, is a claim about now. While the page
+    // has lost the daemon each says how old it is, without changing what it
+    // says the machine is doing (an idle machine may really be idle).
+    it("every card reads as not current while disconnected: marked with its as-of time, its words unchanged", async () => {
+      const asOf = Date.parse(t1c);
+      mockFleetFetch({
+        flowToday: [{ ts: t1a, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.complete", handle: "coder" }],
+      });
+      const { unmount } = renderFleetLens({ connected: false, lastContactMs: asOf });
+      await waitFor(() => expect(document.querySelectorAll(".mach").length).toBeGreaterThan(0));
+      for (const card of document.querySelectorAll(".mach")) {
+        expect(card.getAttribute("data-current"), "every card").toBe("false");
+        expect(card.querySelector(".mach-asof")?.textContent).toBe(`as of ${clkhm(asOf)}`);
+        expect(card.querySelector(".stat")?.textContent).not.toBe("disconnected");
+      }
+      unmount();
+      // The inverted case: connected, no card carries the mark.
+      renderFleetLens({ connected: true, lastContactMs: asOf });
+      await waitFor(() => expect(document.querySelectorAll(".mach").length).toBeGreaterThan(0));
+      expect(document.querySelector('.mach[data-current="false"]')).toBeNull();
+      expect(document.querySelector(".mach-asof")).toBeNull();
+    });
+
+    // A frozen daemon: the last heartbeat says the model is reading a big
+    // prompt, which stays a fresh PROMPT reading for minutes. With the page
+    // disconnected the card must not go on claiming it.
+    it("a card reading a prompt says 'disconnected' once the page loses the daemon, not 'processing'", async () => {
+      mockFleetFetch({
+        flowToday: [
+          { ts: t1a, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+          { ts: t2, machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: Date.parse(t2), generated_chars: 0, turn_seq: 1, prompt_chars: 144_000 } },
+        ],
+      });
+      renderFleetLens({ connected: false });
+      await waitFor(() => expect(document.querySelector('[data-testid="fleet-token-scope"]')).not.toBeNull());
+      const card = document.querySelector(".mach")!;
+      await waitFor(() => expect(card.querySelector(".stat")!.textContent).toBe("disconnected"));
+      expect(card.className).toContain("nosignal");
       expect(latestTokenScopeProps()).toMatchObject({ state: "nosignal" });
     });
   });

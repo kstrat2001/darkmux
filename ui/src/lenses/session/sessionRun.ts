@@ -925,10 +925,10 @@ interface ScopeInputs {
  *  among the run's executions wins) and the rate. `stalled` is DERIVED from
  *  the state, so the two cannot disagree.
  *
- *  (#2886 pass 3/4) A stall is downgraded to no reading when the page has
+ *  (#2886 pass 3/4) Every reading is downgraded to none when the page has
  *  lost the daemon (`liveStateWhileConnected`): no record could have arrived
- *  either way, and a false STALL is worse than saying nothing. `lastContactMs`
- *  closes the half-open gap. `noSignal` is true ONLY when that downgrade is
+ *  either way, and a reading the page cannot see is worse than saying
+ *  nothing. `lastContactMs` closes the half-open gap for a stall. `noSignal` is true ONLY when that downgrade is
  *  what produced the empty reading: a genuinely idle run (a mission between
  *  model steps) must not read "no signal". */
 function scopeReadings(sets: NormRecord[][], nowMs: number, inp: ScopeInputs) {
@@ -938,7 +938,7 @@ function scopeReadings(sets: NormRecord[][], nowMs: number, inp: ScopeInputs) {
   return {
     tokRateLiveState: state,
     tokRateStalled: state?.state === "stalled",
-    tokRateNoSignal: raw?.state === "stalled" && state === null,
+    tokRateNoSignal: raw !== null && state === null,
     liveTokRate: aggregateTokenRate(sets, nowMs, inp.policy, inp.presence),
   };
 }

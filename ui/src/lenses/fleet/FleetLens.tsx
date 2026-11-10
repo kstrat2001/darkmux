@@ -947,6 +947,7 @@ export function FleetLens({
               machineKey={encodeMachineKey(machineKeyCtx, card.uid)}
               clock={{ playhead: playhead ?? null, livePolling, playbackClock, playheadT }}
               onShowExecution={showExecution}
+              notCurrentAsOf={connected ? undefined : lastContactMs}
             />
           );
         })}

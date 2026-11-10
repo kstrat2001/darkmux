@@ -55,6 +55,14 @@ use std::time::Duration;
 /// Recorded in every view as `cache_ttl_ms`.
 pub(crate) const FLEET_VIEW_CACHE_TTL: Duration = Duration::from_secs(5);
 
+/// The oldest a view is served to `/runs` while a new one is gathered behind
+/// it ([`ViewCache::get_behind`]). `/runs` polls at the TTL, so without it
+/// every poll while a run is running found the view just expired and waited
+/// for a gather. Three TTLs, not two: a poll can find the view a moment
+/// short of the TTL (so it starts no refresh), and the next one then finds
+/// it a moment past two TTLs.
+pub(crate) const FLEET_VIEW_STALE_BOUND: Duration = Duration::from_secs(3 * FLEET_VIEW_CACHE_TTL.as_secs());
+
 /// The longest ONE card request to a peer may take, overall: connecting,
 /// sending and reading the answer. The identity check and DNS before it are
 /// bounded by their own limits, not by this one.
@@ -685,9 +693,47 @@ pub(crate) struct ViewCache {
 
 impl ViewCache {
     fn fresh(&self) -> Option<FleetView> {
+        self.younger_than(FLEET_VIEW_CACHE_TTL)
+    }
+
+    fn younger_than(&self, age: Duration) -> Option<FleetView> {
         let guard = self.slot.lock().ok()?;
         let (at, view) = guard.as_ref()?;
-        crate::wall_clock_cache_is_fresh(*at, std::time::SystemTime::now(), FLEET_VIEW_CACHE_TTL).then(|| view.clone())
+        crate::wall_clock_cache_is_fresh(*at, std::time::SystemTime::now(), age).then(|| view.clone())
+    }
+
+    fn store(&self, view: &FleetView) {
+        if let Ok(mut guard) = self.slot.lock() {
+            *guard = Some((std::time::SystemTime::now(), view.clone()));
+        }
+    }
+
+    /// Like [`ViewCache::get`], but a view past the TTL and younger than
+    /// `stale_bound` is served at once while ONE gather refreshes it in the
+    /// background; only a view older than that (or none) waits for a gather.
+    pub(crate) async fn get_behind(
+        self: &Arc<Self>,
+        gather: impl FnOnce() -> FleetView + Send + 'static,
+        stale_bound: Duration,
+    ) -> Result<FleetView, tokio::task::JoinError> {
+        if let Some(view) = self.fresh() {
+            return Ok(view);
+        }
+        let Some(view) = self.younger_than(stale_bound) else {
+            return self.get(gather).await;
+        };
+        let me = self.clone();
+        tokio::spawn(async move {
+            // A gather already running (here or in `get`) refreshes it.
+            let Ok(_permit) = me.gate.try_lock() else { return };
+            if me.fresh().is_some() {
+                return;
+            }
+            if let Ok(view) = tokio::task::spawn_blocking(gather).await {
+                me.store(&view);
+            }
+        });
+        Ok(view)
     }
 
     /// The cached view, or the result of `gather` (run once for every
@@ -704,9 +750,7 @@ impl ViewCache {
             return Ok(view);
         }
         let view = tokio::task::spawn_blocking(gather).await?;
-        if let Ok(mut guard) = self.slot.lock() {
-            *guard = Some((std::time::SystemTime::now(), view.clone()));
-        }
+        self.store(&view);
         Ok(view)
     }
 }
@@ -1032,13 +1076,19 @@ fn attribute(entry: &MachineEntry, card: MachineCard, source: CardSource, grant:
 pub(crate) struct FleetContext {
     pub sources: Arc<dyn FleetSources>,
     pub cache: Arc<ViewCache>,
+    /// The names a request's `Host` may give this machine (`host_gate`).
+    pub hosts: Arc<crate::host_gate::HostNames>,
 }
 
 impl FleetContext {
     pub(crate) fn production() -> Self {
         let provider: Arc<dyn IdentityProvider> = Arc::from(darkmux_fleet::configured_provider_or_unavailable());
         let sources = ProcessSources::new(provider, GatheredBy::Daemon, Some(crate::machine_card::process_card_cache()));
-        Self { sources: Arc::new(sources), cache: Arc::new(ViewCache::default()) }
+        Self {
+            sources: Arc::new(sources),
+            cache: Arc::new(ViewCache::default()),
+            hosts: Arc::new(crate::host_gate::HostNames::production()),
+        }
     }
 
     /// A context that reads nothing outside the process: no roster and no
@@ -1051,8 +1101,22 @@ impl FleetContext {
 
     #[cfg(test)]
     pub(crate) fn with_sources(sources: Arc<dyn FleetSources>) -> Self {
-        Self { sources, cache: Arc::new(ViewCache::default()) }
+        let hosts = Arc::new(crate::host_gate::HostNames::fixed(&[crate::host_gate::TEST_MACHINE_NAME]));
+        Self { sources, cache: Arc::new(ViewCache::default()), hosts }
     }
+}
+
+/// The daemon's view for `/runs`: [`cached_view`], except that a view up to
+/// [`FLEET_VIEW_STALE_BOUND`] old is served at once and refreshed behind the
+/// poll ([`ViewCache::get_behind`]).
+pub(crate) async fn cached_view_behind(state: &crate::AppState) -> Result<FleetView, (axum::http::StatusCode, &'static str)> {
+    let sources = state.fleet.sources.clone();
+    state
+        .fleet
+        .cache
+        .get_behind(move || gather_view(sources.as_ref(), FLEET_VIEW_CACHE_TTL), FLEET_VIEW_STALE_BOUND)
+        .await
+        .map_err(|_| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "darkmux serve: fleet view gather panicked\n"))
 }
 
 /// The daemon's view, from its cache or one gather (shared by every reader in
@@ -2472,6 +2536,42 @@ pub(crate) mod tests {
         }
         assert_eq!(gathers.load(Ordering::SeqCst), 1);
     }
+    /// `/runs` polls at the TTL, so a view it reads has usually just expired.
+    /// One past the TTL and inside the stale bound is served at once while a
+    /// single gather refreshes it behind the poll; one older waits.
+    #[tokio::test]
+    async fn a_view_past_its_ttl_is_served_at_once_and_refreshed_behind_the_poll() {
+        let cache = Arc::new(ViewCache::default());
+        let gathers = Arc::new(AtomicUsize::new(0));
+        let slow_gather = |gathers: Arc<AtomicUsize>| {
+            move || {
+                gathers.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(400));
+                gather_view(&Scripted::default(), FLEET_VIEW_CACHE_TTL)
+            }
+        };
+        let old = gather_view(&Scripted::default(), Duration::from_millis(1));
+        let seed = |age: Duration| {
+            *cache.slot.lock().unwrap() = Some((std::time::SystemTime::now() - age, old.clone()));
+        };
+        seed(FLEET_VIEW_CACHE_TTL + Duration::from_secs(1));
+        let started = std::time::Instant::now();
+        let mut served = Vec::new();
+        for _ in 0..4 {
+            served.push(cache.get_behind(slow_gather(gathers.clone()), FLEET_VIEW_STALE_BOUND).await.unwrap());
+        }
+        assert!(started.elapsed() < Duration::from_millis(200), "a poll waited for the gather: {:?}", started.elapsed());
+        assert!(served.iter().all(|v| v.cache_ttl_ms == 1), "the stale view is what was served");
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(gathers.load(Ordering::SeqCst), 1, "one gather behind the polls");
+        assert_eq!(cache.fresh().map(|v| v.cache_ttl_ms), Some(5000), "the refreshed view replaced it");
+
+        seed(FLEET_VIEW_STALE_BOUND + Duration::from_secs(1));
+        let view = cache.get_behind(slow_gather(gathers.clone()), FLEET_VIEW_STALE_BOUND).await.unwrap();
+        assert_eq!(view.cache_ttl_ms, 5000, "a view past the bound waits for a new one");
+        assert_eq!(gathers.load(Ordering::SeqCst), 2);
+    }
+
     /// 5.0: the legal names for a machine selector are the view's own row
     /// names: every roster id, and this machine's name for its own row when
     /// the roster does not list it. One set for the CLI and the panel.

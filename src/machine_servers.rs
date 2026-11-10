@@ -17,11 +17,7 @@ pub(crate) fn status_section(servers: &[EngineServer], now_ms: u64) -> String {
     }
     let mut out = format!("\n{}\n", style::header(&format!("darkmux engine servers ({}):", servers.len())));
     for s in servers {
-        let state = if s.answering {
-            format!("up {}", uptime(now_ms.saturating_sub(s.started_at_ms)))
-        } else {
-            "starting the model".to_string()
-        };
+        let state = state_words(s, now_ms);
         out.push_str(&format!(
             "  {} ctx={:<8} {} endpoint `{}` port {} pid {}  {}\n",
             style::accent(&format!("{:<46}", s.model)),
@@ -34,6 +30,16 @@ pub(crate) fn status_section(servers: &[EngineServer], now_ms: u64) -> String {
         ));
     }
     out
+}
+
+/// What a server is doing: its uptime when it answers, else what its
+/// silence means (`EngineServer::silent_word`: starting, or not answering).
+fn state_words(s: &EngineServer, now_ms: u64) -> String {
+    if s.answering {
+        format!("up {}", uptime(now_ms.saturating_sub(s.started_at_ms)))
+    } else {
+        s.silent_word(now_ms).to_string()
+    }
 }
 
 /// An uptime in its two largest units: `45s`, `12m`, `3h12m`, `2d4h`.
@@ -137,13 +143,39 @@ mod tests {
     #[test]
     fn the_status_section_names_each_server_and_its_uptime() {
         let now = 1_000_000 + (3 * 3600 + 12 * 60 + 5) * 1000;
-        let text = status_section(&[server("tf", "TensorFold/q38", 262_144, true), server("tg", "TensorFold/b", 8192, false)], now);
+        // `tg` started a minute ago: its start is young.
+        let young = EngineServer { started_at_ms: now - 60_000, ..server("tg", "TensorFold/b", 8192, false) };
+        let text = status_section(&[server("tf", "TensorFold/q38", 262_144, true), young], now);
         assert!(text.contains("darkmux engine servers (2):"), "{text}");
         let tf = text.lines().find(|l| l.contains("TensorFold/q38")).unwrap();
         assert!(tf.contains("ctx=262144") && tf.contains("tensorfold endpoint `tf` port 8091 pid 4242") && tf.contains("up 3h12m"), "{tf}");
         let tg = text.lines().find(|l| l.contains("TensorFold/b")).unwrap();
         assert!(tg.contains("starting the model") && !tg.contains("up "), "{tg}");
         assert_eq!(status_section(&[], now), "", "no server, no section");
+    }
+
+    /// A resident server too busy to answer the listing read "starting the
+    /// model" hours after it started. Past the start bound no start is still
+    /// running, so it does not answer.
+    #[test]
+    fn a_server_silent_past_the_start_bound_reads_not_answering() {
+        let bound = darkmux_profiles::engine::server::START_BOUND.as_millis() as u64;
+        let busy = server("tf", "TensorFold/q38", 262_144, false);
+        let line = |now: u64| status_section(std::slice::from_ref(&busy), now);
+        let late = line(busy.started_at_ms + bound + 1);
+        assert!(late.contains("not answering") && !late.contains("starting"), "{late}");
+        let early = line(busy.started_at_ms + bound - 1);
+        assert!(early.contains("starting the model"), "{early}");
+    }
+
+    /// The viewer words a silent server on the same bound: its mirror of
+    /// `START_BOUND` must say the same number of minutes.
+    #[test]
+    fn the_viewer_mirrors_the_start_bound() {
+        let ts = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/src/lib/engineServers.ts")).unwrap();
+        let minutes = darkmux_profiles::engine::server::START_BOUND.as_secs() / 60;
+        let want = format!("export const ENGINE_START_BOUND_MS = {minutes} * 60 * 1000;");
+        assert!(ts.contains(&want), "ui/src/lib/engineServers.ts must declare `{want}`");
     }
 
     #[test]

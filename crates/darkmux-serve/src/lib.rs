@@ -5,7 +5,7 @@ use darkmux_profiles::engine;
 use axum::{
     extract::{ConnectInfo, Path, Query, Request, State},
     http::StatusCode,
-    middleware::{from_fn, Next},
+    middleware::{from_fn, from_fn_with_state, Next},
     response::{IntoResponse, Response, sse::{Event, KeepAlive, Sse}},
     routing::get,
     Router,
@@ -50,6 +50,7 @@ pub mod mission_graph;
 /// scoped work through `darkmux dispatch` (local prototype).
 pub mod client_edit;
 pub mod client_git;
+mod client_changes;
 pub mod client_pairing;
 pub mod client_preview;
 pub mod client_profiles;
@@ -72,6 +73,8 @@ mod redaction_stream;
 mod peer_graph;
 mod fleet_window;
 mod flow_window;
+mod day_index;
+mod host_gate;
 pub use fleet_window::{FleetRecord, FleetRecords, RecordIdentity};
 pub(crate) use fleet_window::{read_fleet_cached, FleetCaches, FleetScope};
 mod routes;
@@ -407,6 +410,9 @@ pub(crate) fn build_router_full(
     if read_auth {
         router = router.layer(from_fn(auth_mw));
     }
+    // Outside the read gate and whatever the read posture: a `Host` that
+    // names no address of this machine is a DNS-rebound page (`host_gate`).
+    router = router.layer(from_fn_with_state(state.fleet.hosts.clone(), host_gate::host_gate_mw));
 
     router.layer(local_only_cors()).with_state(state)
 }
@@ -846,6 +852,21 @@ const PRESENCE_READ_FAILED: &str = "could not read presence beats from Redis";
 /// still goes to stderr, where the operator already looks for it.
 const ROSTER_READ_FAILED: &str = "the fleet roster file exists but could not be parsed";
 
+/// Every id -> uid pairing in `flows_dir`'s day files, the oldest day's
+/// first. Read through the daemon's [`day_index::DAY_INDEX`]: the first call
+/// reads the history once, and every later one only what was appended since,
+/// so `/fleet/roster` and every fleet-view gather (about every 5 s while
+/// anything watches) see a new pairing at once without a rescan.
+fn history_uids(flows_dir: &std::path::Path) -> std::collections::BTreeMap<String, String> {
+    let mut by_id = std::collections::BTreeMap::new();
+    for day in day_index::DAY_INDEX.days(flows_dir) {
+        for (id, uid) in &day.summary.uids {
+            by_id.entry(id.clone()).or_insert_with(|| uid.clone());
+        }
+    }
+    by_id
+}
+
 /// (#2796) Resolve each roster entry's `machine_uid` from the daemon's OWN
 /// flow history when the entry does not declare one.
 ///
@@ -886,78 +907,11 @@ fn backfill_roster_machine_uids(
     machines: &mut [darkmux_fleet::MachineEntry],
     flows_dir: &std::path::Path,
 ) -> std::collections::BTreeSet<String> {
-    backfill_with_ttl(machines, flows_dir, UID_HISTORY_TTL)
-}
-
-/// How long the id -> uid pairings read from flow history are kept. The
-/// pairing of a machine name with its hardware uid does not change while the
-/// machine exists, and reading it is a scan of every flow file: measured
-/// 2026-09-30 at 10.2 s (debug build) over 306 MB of real history, on a path
-/// that `/fleet/roster` and every fleet-view gather (about every 5 s while
-/// anything watches) both take. A scan per TTL bounds the observer's cost.
-const UID_HISTORY_TTL: std::time::Duration = std::time::Duration::from_secs(300);
-
-/// The id -> uid pairings from `flows_dir`, scanned at most once per `ttl`.
-/// Single-flight: the lock is held across the scan, so concurrent callers
-/// wait for one scan instead of each running their own. The one slot is
-/// keyed by directory.
-fn history_uids(
-    flows_dir: &std::path::Path,
-    ttl: std::time::Duration,
-) -> std::sync::Arc<std::collections::HashMap<String, String>> {
-    type Slot = Option<(std::path::PathBuf, std::time::Instant, std::sync::Arc<std::collections::HashMap<String, String>>)>;
-    static CACHE: std::sync::Mutex<Slot> = std::sync::Mutex::new(None);
-    let mut slot = CACHE.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some((dir, at, map)) = slot.as_ref() {
-        if dir == flows_dir && at.elapsed() < ttl {
-            return map.clone();
-        }
-    }
-    let map = std::sync::Arc::new(scan_history_uids(flows_dir));
-    *slot = Some((flows_dir.to_path_buf(), std::time::Instant::now(), map.clone()));
-    map
-}
-
-/// Every id -> uid pairing in `flows_dir`'s day files, first seen wins.
-fn scan_history_uids(flows_dir: &std::path::Path) -> std::collections::HashMap<String, String> {
-    use std::io::BufRead;
-    let mut by_id: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let Ok(entries) = std::fs::read_dir(flows_dir) else {
-        return by_id;
-    };
-    for entry in entries.flatten() {
-        if !entry.file_name().to_string_lossy().ends_with(".jsonl") {
-            continue;
-        }
-        let Ok(file) = std::fs::File::open(entry.path()) else {
-            continue;
-        };
-        for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
-            let Some(v) = darkmux_flow::reader::parse_value(&line) else {
-                continue;
-            };
-            let (Some(id), Some(uid)) = (
-                v.get("machine_id").and_then(|x| x.as_str()),
-                v.get("machine_uid").and_then(|x| x.as_str()),
-            ) else {
-                continue;
-            };
-            by_id.entry(id.to_string()).or_insert_with(|| uid.to_string());
-        }
-    }
-    by_id
-}
-
-fn backfill_with_ttl(
-    machines: &mut [darkmux_fleet::MachineEntry],
-    flows_dir: &std::path::Path,
-    ttl: std::time::Duration,
-) -> std::collections::BTreeSet<String> {
     let mut filled = std::collections::BTreeSet::new();
     if machines.iter().all(|m| m.machine_uid.is_some()) {
         return filled;
     }
-    let by_id = history_uids(flows_dir, ttl);
+    let by_id = history_uids(flows_dir);
     for m in machines.iter_mut() {
         if m.machine_uid.is_none() {
             if let Some(uid) = by_id.get(&m.id) {
@@ -2156,20 +2110,18 @@ fn runs_cache() -> &'static tokio::sync::Mutex<RunsCache> {
 
 /// A digest of what a `/runs` build reads that changes when new work is
 /// recorded: the fleet window (its length and newest hub id) and the local
-/// day files (each one's name, length and modification time). Cheap: the
-/// window is shared and cached, and a stat per day file. Blocking.
+/// records the build folds (`runs::hash_daemon_runs_records`: the lines the
+/// build's own store keeps over its window). A record the build skips, such
+/// as this daemon's own host telemetry, changes neither, so it does not
+/// cost a rebuild. Cheap: the window is shared and cached, and the store
+/// reads only what was appended since its last read. Blocking.
 fn runs_inputs(flows_dir: &StdPath) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     let fleet = fleet_flow_records();
     fleet.records.len().hash(&mut h);
     fleet.records.values().last().and_then(|v| v.get("hub_id")).and_then(|v| v.as_str()).hash(&mut h);
-    for (date, path) in flow_day_files(flows_dir) {
-        date.hash(&mut h);
-        let meta = std::fs::metadata(&path).ok();
-        meta.as_ref().map(|m| m.len()).hash(&mut h);
-        meta.and_then(|m| m.modified().ok()).hash(&mut h);
-    }
+    runs::hash_daemon_runs_records(flows_dir, &mut h);
     h.finish()
 }
 
@@ -2267,7 +2219,7 @@ async fn runs_handler(State(state): State<AppState>) -> axum::Json<wire::RunsRes
     // reporting, so a board with none reads neither: a gather is every peer's
     // card over the tailnet, a beat read a bounded hub connect.
     let rows = if rows.iter().any(|r| r.status == runs::RunStatus::Running) {
-        let view = fleet_view::cached_view(&state).await.ok();
+        let view = fleet_view::cached_view_behind(&state).await.ok();
         let marked = tokio::task::spawn_blocking(move || {
             let live = live_session_ids();
             log_beat_read_once(live.is_none());
@@ -3823,9 +3775,8 @@ struct FlowQuery {
 /// Deliberately **disk-backed** (the durable per-day files), distinct from the
 /// live view's Redis-fed rolling window: the catalog is "everything, by day",
 /// the live view is "now-ish on present machines". Storage stays per-day append;
-/// this is the navigation layer over it. A `mission_id`/`session_id` cross-day
-/// index is the scale path (not built here) — scanning day files is fine at the
-/// per-operator scale this serves.
+/// this is the navigation layer over it, read through the daemon's day index
+/// ([`day_index`]), so a poll reads only what was appended since the last.
 async fn flow_days_handler(State(state): State<AppState>) -> axum::Json<wire::FlowDaysResponse> {
     let dir = state.flows_dir.clone();
     let days = tokio::task::spawn_blocking(move || scan_flow_days(&dir))
@@ -3834,63 +3785,23 @@ async fn flow_days_handler(State(state): State<AppState>) -> axum::Json<wire::Fl
     axum::Json(wire::FlowDaysResponse { days, generated_at_ms: current_millis() })
 }
 
-/// Scan `flows_dir` for `YYYY-MM-DD.jsonl` files and summarize each. Newest day
-/// first. Unreadable / malformed files are skipped (best-effort catalog, never
-/// an error that hides the days that DO parse). Schema-header lines (`_type ==
-/// "schema"`) don't count as records.
+/// Every `YYYY-MM-DD.jsonl` file in `flows_dir`, summarized, newest day
+/// first. Unreadable / malformed files are skipped (best-effort catalog,
+/// never an error that hides the days that DO parse). Schema-header lines
+/// (`_type == "schema"`) don't count as records. Read through the daemon's
+/// [`day_index::DAY_INDEX`], so a repeat request reads only what was appended.
 fn scan_flow_days(flows_dir: &std::path::Path) -> Vec<wire::FlowDay> {
-    use std::io::BufRead;
-    let mut days: Vec<wire::FlowDay> = Vec::new();
-    let Ok(entries) = std::fs::read_dir(flows_dir) else {
-        return days;
-    };
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let name = file_name.to_string_lossy();
-        let Some(date) = name.strip_suffix(".jsonl") else {
-            continue;
-        };
-        if is_valid_date(date).is_none() {
-            continue;
-        }
-        // Stream the file line-by-line (the catalog needs only counts + ids, not
-        // the parsed content) so a large day file is never held whole in memory.
-        let Ok(file) = std::fs::File::open(entry.path()) else {
-            continue;
-        };
-        let reader = std::io::BufReader::new(file);
-        let mut records: u64 = 0;
-        let mut missions: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        let mut dispatches: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for line in reader.lines() {
-            let Ok(line) = line else { break };
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let Some(v) = darkmux_flow::reader::parse_value(line) else {
-                continue;
-            };
-            if v.get("_type").and_then(|t| t.as_str()) == Some("schema") {
-                continue;
-            }
-            records += 1;
-            if let Some(m) = v.get("mission_id").and_then(|m| m.as_str()) {
-                missions.insert(m.to_string());
-            }
-            // A dispatch = a dispatch.start edge.
-            if darkmux_flow::reader::action_of(&v) == Some(darkmux_flow::FlowAction::DispatchStart) {
-                dispatches.extend(darkmux_flow::reader::execution_id_of(&v).map(|id| id.to_string()));
-            }
-        }
-        days.push(wire::FlowDay {
-            date: date.to_string(),
-            records,
-            missions: missions.into_iter().collect(),
-            dispatches: dispatches.len(),
-        });
-    }
-    days.sort_by(|a, b| b.date.cmp(&a.date));
+    let mut days: Vec<wire::FlowDay> = day_index::DAY_INDEX
+        .days(flows_dir)
+        .into_iter()
+        .map(|d| wire::FlowDay {
+            date: d.date,
+            records: d.summary.records,
+            missions: d.summary.missions.iter().cloned().collect(),
+            dispatches: d.summary.dispatches.len(),
+        })
+        .collect();
+    days.reverse();
     days
 }
 
@@ -3899,9 +3810,9 @@ fn scan_flow_days(flows_dir: &std::path::Path) -> Vec<wire::FlowDay> {
 // missions and dispatch sessions — by scanning ACROSS day files. A mission that
 // spans midnight is one filtered view, not two unrelated day rows. Deliberately
 // DISK-backed (the durable per-day files), the same source seam as scan_flow_days
-// and distinct from the live view's Redis-fed rolling window. A mission_id /
-// session_id index is the scale path (not built here); streaming day files is
-// fine at per-operator scale.
+// and distinct from the live view's Redis-fed rolling window. Which day files
+// hold an id comes from the daemon's day index ([`day_index`]), so a replay
+// parses only those.
 
 /// Max records returned by a single by-mission / by-session catalog fetch. A
 /// mission spanning many days could otherwise return an unbounded array; the cap
@@ -3919,35 +3830,6 @@ fn is_valid_catalog_id(id: &str) -> bool {
         && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
-}
-
-/// Visit every flow record across all `YYYY-MM-DD.jsonl` day files in
-/// `flows_dir`, OLDEST day first (so visitors see chronological order). Streams
-/// each file line-by-line (never whole-file), skipping blank + schema-header
-/// lines. Best-effort: unreadable/malformed files + lines are skipped. The
-/// visitor returns `ControlFlow::Break` to stop early (e.g. once a fetch hits its
-/// record cap). Shared cross-day scan primitive the catalog endpoints filter over
-/// (#691) — factored from the same read_dir + line-parse loop as scan_flow_days.
-///
-/// `pub(crate)` (was private until #1508 step 3): the `/runs` aggregator's
-/// `runs` module scans the flow stream ONCE with this same primitive (to
-/// resolve route/role/model + synthesize untracked ghost runs) rather than
-/// re-implementing the day-file walk — see that module's `build_flow_session_index`.
-pub(crate) fn for_each_flow_record_across_days(
-    flows_dir: &std::path::Path,
-    mut visit: impl FnMut(&str, &serde_json::Value) -> std::ops::ControlFlow<()>,
-) {
-    for (date, path) in flow_day_files(flows_dir) {
-        let mut stop = false;
-        for_each_record_in_day_file(&path, |v| {
-            if !stop && visit(&date, v).is_break() {
-                stop = true;
-            }
-        });
-        if stop {
-            return;
-        }
-    }
 }
 
 /// The `YYYY-MM-DD.jsonl` day files in `flows_dir`, oldest first, so a
@@ -3998,15 +3880,9 @@ fn for_each_record_in_day_file(path: &std::path::Path, mut visit: impl FnMut(&se
     true
 }
 
-/// Like [`for_each_flow_record_across_days`] but bounded to the day files
-/// whose name falls within `[from_day, to_day]` inclusive (UTC
-/// `YYYY-MM-DD`, string-comparable — filenames sort the same as their
-/// dates). A SEPARATE, smaller primitive rather than adding an optional
-/// range param to the unbounded walker — matching this crate's existing
-/// precedent (`runs::for_each_flow_record_from`) of keeping a bounded
-/// scan physically distinct from the full-history one its OTHER callers
-/// still need (`/flow-mission/:id`, the catalog endpoints' own
-/// `collect_records_by_field` walk).
+/// Every flow record in the day files whose name falls within
+/// `[from_day, to_day]` inclusive (UTC `YYYY-MM-DD`, string-comparable —
+/// filenames sort the same as their dates), oldest day first.
 ///
 /// Written for [`join_host_samples_into_session_records`] (found live
 /// 2026-09-06): that join's window is a run's own `[start_ms, end_ms]`,
@@ -4442,19 +4318,7 @@ fn collect_records_by_field(
         records.push(r.full());
     }
     if !truncated {
-        for_each_flow_record_across_days(flows_dir, |_date, v| {
-            records_scanned += 1;
-            if v.get(field).and_then(|f| f.as_str()) == Some(id) {
-                if records.len() >= MAX_CATALOG_RECORDS {
-                    truncated = true;
-                    return std::ops::ControlFlow::Break(());
-                }
-                if fleet_seen.is_empty() || !fleet_seen.contains(&RecordIdentity::of(v)) {
-                    records.push(v.clone());
-                }
-            }
-            std::ops::ControlFlow::Continue(())
-        });
+        (truncated, records_scanned) = collect_local_records_by_field(flows_dir, field, id, &fleet_seen, &mut records);
     }
     // Two sources, one timeline: the local walk is chronological on its own
     // and so is the fleet slice, but concatenated they interleave. The
@@ -4466,6 +4330,40 @@ fn collect_records_by_field(
         ts(a).cmp(&ts(b))
     });
     (records, truncated, records_scanned)
+}
+
+/// The local half of [`collect_records_by_field`]: each record in the day
+/// files whose `field` is `id` and that the fleet half did not already hold
+/// (`fleet_seen`), appended to `records` up to [`MAX_CATALOG_RECORDS`]. Only
+/// the day files that hold the id are parsed: the daemon's day index says
+/// which (a field it does not index walks every file). Returns whether the
+/// cap cut it, and how many records were parsed.
+fn collect_local_records_by_field(
+    flows_dir: &std::path::Path,
+    field: &str,
+    id: &str,
+    fleet_seen: &std::collections::HashSet<RecordIdentity>,
+    records: &mut Vec<serde_json::Value>,
+) -> (bool, usize) {
+    let (mut truncated, mut scanned) = (false, 0usize);
+    let days = day_index::DAY_INDEX.days(flows_dir).into_iter().filter(|d| d.summary.holds(field, id) != Some(false));
+    for day in days {
+        for_each_record_in_day_file(&day.path, |v| {
+            scanned += 1;
+            if truncated || v.get(field).and_then(|f| f.as_str()) != Some(id) {
+                return;
+            }
+            if records.len() >= MAX_CATALOG_RECORDS {
+                truncated = true;
+            } else if fleet_seen.is_empty() || !fleet_seen.contains(&RecordIdentity::of(v)) {
+                records.push(v.clone());
+            }
+        });
+        if truncated {
+            break;
+        }
+    }
+    (truncated, scanned)
 }
 
 /// Scan-cost figures [`join_host_samples_into_session_records`] returns so
@@ -4585,7 +4483,7 @@ fn join_host_samples_into_session_records(
         }
     }
     // (found live 2026-09-06) Bounded to the day files this run's own
-    // window actually falls in — `for_each_flow_record_across_days` opened
+    // window actually falls in — the walk it replaced opened
     // EVERY day file on the machine (108 files / 181 MB measured live)
     // regardless of how narrow `[start_ms, end_ms]` was, on a route the
     // live run pane polls every 5s.
@@ -5428,7 +5326,7 @@ fn push_flow_line(
         return;
     };
     // (found live 2026-09-06) The day file's own `{"_type":"schema",…}`
-    // header line is not a flow record — `for_each_flow_record_across_days`
+    // header line is not a flow record — `for_each_record_in_day_file`
     // already skips it; this reader didn't, so `GET /flow/<date>` served it
     // as record 0 (no `ts`, no `action`) on every day file that has one.
     if v.get("_type").and_then(|t| t.as_str()) == Some("schema") {
@@ -5488,64 +5386,79 @@ fn merge_ring_and_bookends(
 ///
 /// Polls at 250ms. Each `.next()` yields exactly one line. The unfold
 /// inner loop continues until a real line is available (no empty ticks).
-///
-/// State: (path, byte offset, incomplete-trailing-line buffer, pending lines).
 fn tail_lines(
     path: PathBuf,
     start_offset: u64,
 ) -> impl Stream<Item = String> {
-    let state: TailState = (path, start_offset, String::new(), VecDeque::new());
+    let state = TailState { path, offset: start_offset, partial: Vec::new(), pending: VecDeque::new() };
     stream::unfold(state, move |mut s| async move {
         loop {
             // 1. If we have queued lines, emit the next one immediately.
-            if let Some(line) = s.3.pop_front() {
+            if let Some(line) = s.pending.pop_front() {
                 return Some((line, s));
             }
 
             // 2. Otherwise, wait and poll the file for new bytes.
             tokio::time::sleep(Duration::from_millis(250)).await;
-            let size = tokio::fs::metadata(&s.0)
+            let size = tokio::fs::metadata(&s.path)
                 .await
                 .map(|m| m.len())
                 .unwrap_or(0);
-
-            // File rotated / truncated — reset offset.
-            if size < s.1 {
-                s.1 = 0;
-                s.2.clear();
-            }
-            if size <= s.1 {
-                continue;
-            }
-
-            // 3. Read the new bytes, parse out complete lines, queue them.
-            let Ok(mut file) = tokio::fs::File::open(&s.0).await else { continue };
-            use tokio::io::{AsyncReadExt, AsyncSeekExt};
-            if file.seek(std::io::SeekFrom::Start(s.1)).await.is_err() {
-                continue;
-            }
-            let mut buf = Vec::new();
-            if file.read_to_end(&mut buf).await.is_err() {
-                continue;
-            }
-            s.1 = size;
-            s.2.push_str(&String::from_utf8_lossy(&buf));
-
-            // Drain complete lines (ending in \n) into pending.
-            while let Some(nl) = s.2.find('\n') {
-                let line: String = s.2.drain(..nl).collect();
-                s.2.drain(..1);
-                if !line.is_empty() {
-                    s.3.push_back(line);
-                }
-            }
-            // s.2 now holds the incomplete trailing chunk (if any).
-            // Loop back to top — if pending now non-empty, we'll emit it.
+            s.read_new(size).await;
         }
     })
 }
 
-type TailState = (PathBuf, u64, String, VecDeque<String>);
+/// A file tail's position: the file, how far it has been read, the bytes of
+/// a line not yet ended, and the whole lines not yet yielded.
+struct TailState {
+    path: PathBuf,
+    offset: u64,
+    partial: Vec<u8>,
+    pending: VecDeque<String>,
+}
+
+impl TailState {
+    /// Queue the lines appended since the last read. `size` is the file's
+    /// length as stat'd just before: it says whether there is anything new
+    /// and whether the file was truncated, but what is read is everything
+    /// up to the end at read time. The offset advances by the bytes read,
+    /// never to `size`: a writer appending between the stat and the read
+    /// would otherwise leave the offset behind bytes already delivered,
+    /// and the next read would deliver them again.
+    async fn read_new(&mut self, size: u64) {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        // File rotated / truncated — reset offset.
+        if size < self.offset {
+            self.offset = 0;
+            self.partial.clear();
+        }
+        if size <= self.offset {
+            return;
+        }
+        let Ok(mut file) = tokio::fs::File::open(&self.path).await else { return };
+        if file.seek(std::io::SeekFrom::Start(self.offset)).await.is_err() {
+            return;
+        }
+        let mut buf = Vec::new();
+        if file.read_to_end(&mut buf).await.is_err() {
+            return;
+        }
+        self.offset += buf.len() as u64;
+        self.partial.extend_from_slice(&buf);
+        // Whole lines (ending in \n) are queued; the bytes after the last
+        // newline wait for the rest of their line. Lines are split as bytes
+        // and decoded whole, so a character split across two reads is kept.
+        let Some(end) = self.partial.iter().rposition(|b| *b == b'\n') else { return };
+        let rest = self.partial.split_off(end + 1);
+        let whole = std::mem::replace(&mut self.partial, rest);
+        for line in whole[..end].split(|b| *b == b'\n') {
+            if !line.is_empty() {
+                self.pending.push_back(String::from_utf8_lossy(line).into_owned());
+            }
+        }
+    }
+}
 
 /// The new lines of this machine's `<date>.jsonl` that the hub never carries
 /// (`darkmux_flow::stays_off_hub`), tailed from now like the file-tail path.

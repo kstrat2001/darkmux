@@ -928,8 +928,10 @@ pub struct ClientServerState {
     pub clone_repo: Arc<CloneRepo>,
     /// Updates a workspace's remote-tracking refs; never its branch or files.
     pub fetch_repo: PathAction,
-    /// One workspace creation at a time, so two requests never race for a name.
-    pub workspace_lock: Arc<Mutex<()>>,
+    /// One request at a time per thing a workspace is asked for (a bot's
+    /// clone of one repo, its worktree of one checkout). Names are held one
+    /// by one (`client_workspace::try_hold`), never all at once.
+    pub workspace_asks: Arc<crate::client_workspace::Asks>,
     /// Workspaces' live previews (dev servers from `.darkmux/preview.json`).
     pub previews: Arc<crate::client_preview::Previews>,
     /// The address the listener bound, so a `Host` naming another port is
@@ -982,7 +984,7 @@ impl ClientServerState {
             worktrees_base: Arc::new(|| canonical_base(&darkmux_types::workdir::worktrees_base_dir())),
             clone_repo: Arc::new(crate::client_workspace::clone_with_git),
             fetch_repo: Arc::new(crate::client_workspace::fetch_with_git),
-            workspace_lock: Arc::new(Mutex::new(())),
+            workspace_asks: Arc::new(crate::client_workspace::Asks::default()),
             previews: Arc::new(crate::client_preview::Previews::production()),
             bound: None,
             preview_enabled: Arc::new(read_preview_enabled),
@@ -1167,6 +1169,7 @@ pub fn run(port: u16) -> Result<()> {
         );
         let mut state = state;
         state.bound = Some(listener.local_addr()?);
+        log_lines(swept_partials(&state));
         // (#3456) Preview containers a `client serve` that died left behind.
         let reaper = state.previews.clone();
         std::thread::spawn(move || {
@@ -1205,8 +1208,21 @@ pub fn run(port: u16) -> Result<()> {
     served
 }
 
+/// Sweeps the clones a `client serve` stopped mid-clone left half done
+/// ([`crate::client_workspace::sweep_partials`]); a serve-log line each.
+pub(crate) fn swept_partials(state: &ClientServerState) -> Vec<String> {
+    let Ok(base) = (state.worktrees_base)() else {
+        return Vec::new();
+    };
+    crate::client_workspace::sweep_partials(&base)
+        .into_iter()
+        .map(|name| format!("darkmux client serve: removed workspace {name}'s unfinished clone (a stop interrupted it)"))
+        .collect()
+}
+
 /// How long a stopping `client serve` waits, from its stop signal, for the
-/// work it canceled to end: the executor's own [`CANCEL_GRACE`] (after
+/// work it canceled to end, and for docker to remove its previews'
+/// containers: the executor's own [`CANCEL_GRACE`] (after
 /// which it kills a child that would not stop), then room for what follows
 /// a kill (its containers stopped, its terminal record written) and for
 /// the run's commit. With [`RUNTIME_EXIT_WAIT`] the whole stop fits
@@ -1231,7 +1247,9 @@ fn begin_stop(previews: &crate::client_preview::Previews, works: &Mutex<HashMap<
 
 /// The rest of the stop, once the listener is done: every preview's
 /// container is removed (#3456) while the canceled work is waited for,
-/// until `work_until` at the latest ([`end_running_work`]). Returns the
+/// each until `work_until` at the latest ([`end_running_work`]); a docker
+/// that answers no `stop` or `rm` by then is no longer waited for, and its
+/// containers stop themselves once the heartbeat goes stale. Returns the
 /// work still running then.
 async fn finish_stop(
     previews: Arc<crate::client_preview::Previews>,
@@ -1239,13 +1257,20 @@ async fn finish_stop(
     work_until: std::time::Instant,
 ) -> Vec<String> {
     let ending = tokio::task::spawn_blocking(move || end_running_work(&works, work_until));
-    let removed = tokio::task::spawn_blocking(move || previews.stop_all())
-        .await
-        .unwrap_or_default();
-    for name in &removed {
-        eprintln!("{}", preview_log_line(name, "shutdown", "stopped"));
+    let stopping = tokio::task::spawn_blocking(move || previews.stop_all());
+    match tokio::time::timeout_at(work_until.into(), stopping).await {
+        Ok(removed) => {
+            let removed = removed.unwrap_or_default();
+            for name in &removed {
+                eprintln!("{}", preview_log_line(name, "shutdown", "stopped"));
+            }
+            eprintln!("darkmux client serve: previews stopped ({})", removed.len());
+        }
+        Err(_) => eprintln!(
+            "darkmux client serve: docker had not removed every preview container by the stop's bound; \
+             no longer waiting (each stops itself once this process's heartbeat goes stale)"
+        ),
     }
-    eprintln!("darkmux client serve: previews stopped ({})", removed.len());
     let left = ending.await.unwrap_or_default();
     if !left.is_empty() {
         eprintln!(
@@ -2115,7 +2140,7 @@ fn admit_and_run(
     req: WorkBody,
     answer: tokio::sync::oneshot::Sender<Result<WorkAccepted, Refused>>,
 ) {
-    let (spec, cancel) = match admit(state, client, req) {
+    let (spec, cancel, _in_use) = match admit(state, client, req) {
         Ok(admitted) => admitted,
         Err(r) => {
             let _ = answer.send(Err(r));
@@ -2264,18 +2289,21 @@ fn changed_paths(status: &WorkStatus) -> Vec<String> {
 
 /// Every refusal a work request can meet, in order; on success the work is
 /// registered as running and its spec (with the RESOLVED profile) returned,
-/// with the flag that cancels it.
+/// with the flag that cancels it and the hold on its workspace's name.
 fn admit(
     state: &ClientServerState,
     client: &ApprovedClient,
     req: WorkBody,
-) -> Result<(WorkSpec, Arc<CancelFlag>), Refused> {
+) -> Result<(WorkSpec, Arc<CancelFlag>, Option<crate::client_workspace::NameHold>), Refused> {
     check_role(state, &req.role)?;
     let workdir = admitted_workdir(state, client, &req)?;
     let profile = admitted_profile(state, &req)?;
     let work_id = format!("w-{}", random_hex(8).map_err(internal)?);
     let now = (state.now)();
     let git = workdir.as_deref().and_then(|w| work_copy_for(state, w));
+    // Held until the run has ended and committed, so the workspace cannot
+    // be removed under it, by this process or `client workspace rm`.
+    let in_use = held_work_copy(state, git.as_ref())?;
     let cancel = Arc::new(CancelFlag::default());
     let mut works = state.works.lock().unwrap();
     // Read under the lock the stop takes to look at the running work
@@ -2323,7 +2351,7 @@ fn admit(
         workdir,
         message: req.message,
     };
-    Ok((spec, cancel))
+    Ok((spec, cancel, in_use))
 }
 
 /// A work copy with an origin that is not on a `mux/` branch of its own (a
@@ -2866,37 +2894,121 @@ fn clone_workspace(state: &ClientServerState, url: &str, normalized: &str, made:
         Ok(b) => b,
         Err(e) => return internal(anyhow!(e)),
     };
-    let _one_at_a_time = state.workspace_lock.lock().unwrap();
-    match reusable(state, &base, || ws::find_by_origin(&base, normalized, made.bot, made.client)) {
-        Ok(Some(name)) => claimed(&base, &name, made, || existing_clone(state, &name)),
-        Ok(None) => new_clone(state, &base, (url, normalized), made),
+    let _asked = state.workspace_asks.hold(ask_key("clone", made, normalized));
+    let found = reusable(state, &base, || ws::find_by_origin(&base, normalized, made.bot, made.client));
+    reuse_or_make(
+        &base,
+        found,
+        |name| claimed(&base, name, made, || existing_clone(state, name)),
+        || new_clone(state, &base, (url, normalized), made),
+    )
+}
+
+/// The workspace `found` names, held for reuse and handed to `reuse`, or a
+/// new one from `make` when there is none (or it was removed meanwhile).
+fn reuse_or_make(
+    base: &Path,
+    found: Result<Option<String>, Refused>,
+    reuse: impl FnOnce(&str) -> Response,
+    make: impl FnOnce() -> Response,
+) -> Response {
+    let name = match found {
+        Ok(Some(name)) => name,
+        Ok(None) => return make(),
+        Err(r) => return *r,
+    };
+    match held_to_reuse(base, &name) {
+        Ok(Some(_held)) => reuse(&name),
+        Ok(None) => make(),
         Err(r) => *r,
+    }
+}
+
+/// What one bot of one client asks for (`what` of `of`), as an
+/// [`crate::client_workspace::Asks`] key. By the bot's slug, the name its
+/// branches carry, so bots whose names make one slug take turns.
+fn ask_key(what: &str, made: &Made, of: &str) -> String {
+    format!("{what}\0{}\0{}\0{of}", made.client, made.bot.slug)
+}
+
+/// Holds workspace `name` to reuse it ([`Hold::Shared`]), and only while it
+/// is still there: `None` when it was removed after it was found; a 409
+/// while it is being removed.
+///
+/// [`Hold::Shared`]: crate::client_workspace::Hold::Shared
+fn held_to_reuse(base: &Path, name: &str) -> Result<Option<crate::client_workspace::NameHold>, Refused> {
+    use crate::client_workspace as ws;
+    match ws::try_hold(base, name, ws::Hold::Shared) {
+        Ok(Some(held)) => Ok(crate::client_git::work_copy_of(base, name, &base.join(name)).map(|_| held)),
+        Ok(None) => Err(being_removed(name)),
+        Err(e) => Err(Box::new(internal(anyhow!(e)))),
+    }
+}
+
+/// Workspace `name` held for use ([`crate::client_workspace::Hold::Shared`]):
+/// a 409 while it is being removed.
+fn held_in_use(state: &ClientServerState, name: &str) -> Result<crate::client_workspace::NameHold, Refused> {
+    use crate::client_workspace as ws;
+    let base = (state.worktrees_base)().map_err(|e| Box::new(internal(anyhow!(e))))?;
+    match ws::try_hold(&base, name, ws::Hold::Shared) {
+        Ok(Some(held)) => Ok(held),
+        Ok(None) => Err(being_removed(name)),
+        Err(e) => Err(Box::new(internal(anyhow!(e)))),
+    }
+}
+
+/// The workspace work copy `wc` is (its folder's name, directly under the
+/// worktrees base), held for use as [`held_in_use`] holds it; `None` for a
+/// work copy that is no workspace.
+fn held_work_copy(state: &ClientServerState, wc: Option<&WorkCopy>) -> Result<Option<crate::client_workspace::NameHold>, Refused> {
+    let Some(wc) = wc else { return Ok(None) };
+    let base = (state.worktrees_base)().map_err(|e| Box::new(internal(anyhow!(e))))?;
+    match (wc.work_tree.parent(), wc.work_tree.file_name().and_then(|n| n.to_str())) {
+        (Some(parent), Some(name)) if parent == base && crate::client_workspace::valid_name(name) => {
+            held_in_use(state, name).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+/// A workspace whose name another request holds alone: it is being made
+/// or removed.
+fn being_removed(name: &str) -> Refused {
+    refuse(
+        StatusCode::CONFLICT, ClientCode::Conflict,
+        format!("workspace {name} is being made or removed; ask again in a moment"),
+    )
+}
+
+/// A free name from `names`, held alone ([`crate::client_workspace::hold_free_name`]),
+/// or the 409 that says there is none for `what`.
+fn hold_new_name(base: &Path, names: Vec<String>, what: &str) -> Result<(String, crate::client_workspace::NameHold), Refused> {
+    match crate::client_workspace::hold_free_name(base, names, |n| name_taken(base, n)) {
+        Ok(Some(held)) => Ok(held),
+        Ok(None) => Err(refuse(StatusCode::CONFLICT, ClientCode::Conflict, format!("no free workspace name for this {what}"))),
+        Err(e) => Err(Box::new(internal(anyhow!(e)))),
     }
 }
 
 /// A new clone of the repo for `made`'s client, on a new branch of the bot's.
 fn new_clone(state: &ClientServerState, base: &Path, (url, normalized): (&str, &str), made: &Made) -> Response {
-    let Some(name) = crate::client_workspace::name_for(normalized, |n| name_taken(base, n)) else {
-        return err(StatusCode::CONFLICT, ClientCode::Conflict, "no free workspace name for this repo");
+    let (name, held) = match hold_new_name(base, crate::client_workspace::name_candidates(normalized), "repo") {
+        Ok(found) => found,
+        Err(r) => return *r,
     };
     if let Err(r) = place_clone(state, url, normalized, made, base, &name) {
+        held.forget();
         return *r;
     }
     let from = match start_bot_branch(state, base, &name, made.git_ref, made.bot.slug) {
         Ok(from) => from,
         Err(r) => {
             forget_clone(base, &name);
+            held.forget();
             return *r;
         }
     };
-    match workspace_dir(state, &name) {
-        Ok(dir) => {
-            let mut v = workspace_json(state, &name, &dir, true);
-            v.from = Some(from);
-            (StatusCode::CREATED, Json(v)).into_response()
-        }
-        Err(r) => *r,
-    }
+    created_from(state, &name, from)
 }
 
 /// Puts new clone `name` on a new branch of the bot's, at the commit the
@@ -2961,11 +3073,12 @@ fn template_workspace(state: &ClientServerState, url: &str, normalized: &str, ma
         Ok(b) => b,
         Err(e) => return internal(anyhow!(e)),
     };
-    let _one_at_a_time = state.workspace_lock.lock().unwrap();
-    let Some(name) = free_project_name(&base, made.bot.slug) else {
-        return err(StatusCode::CONFLICT, ClientCode::Conflict, "no free workspace name for this project");
+    let (name, held) = match hold_new_name(&base, project_names(made.bot.slug), "project") {
+        Ok(found) => found,
+        Err(r) => return *r,
     };
     if let Err(r) = place_clone(state, url, normalized, made, &base, &name) {
+        held.forget();
         return *r;
     }
     let from = match git_ref {
@@ -2978,11 +3091,17 @@ fn template_workspace(state: &ClientServerState, url: &str, normalized: &str, ma
         .and_then(|commit| crate::client_workspace::record_template_commit(&base, &name, &commit));
     if let Err(e) = started {
         forget_clone(&base, &name);
+        held.forget();
         return internal(anyhow!("starting {name} from the template: {e}"));
     }
-    match workspace_dir(state, &name) {
+    created_from(state, &name, from)
+}
+
+/// The 201 for new workspace `name`, started from `from`.
+fn created_from(state: &ClientServerState, name: &str, from: String) -> Response {
+    match workspace_dir(state, name) {
         Ok(dir) => {
-            let mut v = workspace_json(state, &name, &dir, true);
+            let mut v = workspace_json(state, name, &dir, true);
             v.from = Some(from);
             (StatusCode::CREATED, Json(v)).into_response()
         }
@@ -2990,13 +3109,12 @@ fn template_workspace(state: &ClientServerState, url: &str, normalized: &str, ma
     }
 }
 
-/// `<bot>`, or with a number after it, free under the base (a partial
-/// clone's name counts as taken).
-fn free_project_name(base: &Path, bot: &str) -> Option<String> {
-    use crate::client_workspace as ws;
+/// The names a template project of bot `bot` may get: `<bot>`, or with a
+/// number after it.
+fn project_names(bot: &str) -> Vec<String> {
     std::iter::once(bot.to_string())
         .chain((2..100).map(|n| format!("{bot}-{n}")))
-        .find(|n| ws::valid_name(n) && !name_taken(base, n))
+        .collect()
 }
 
 /// Whether workspace name `n` is taken under `base`: by a folder, or by a
@@ -3127,32 +3245,36 @@ fn worktree_workspace(state: &ClientServerState, source: &Path, made: &Made) -> 
         Ok(found) => found,
         Err(r) => return *r,
     };
-    let _one_at_a_time = state.workspace_lock.lock().unwrap();
-    match reusable(state, &base, || ws::find_worktree_of(&base, &common, made.bot, made.client)) {
-        Ok(Some(name)) => claimed(&base, &name, made, || reused_worktree(state, &base, &name, &source)),
-        Ok(None) => new_worktree(state, &base, (&source, &common), made),
-        Err(r) => *r,
-    }
+    let _asked = state.workspace_asks.hold(ask_key("worktree", made, &common.to_string_lossy()));
+    let found = reusable(state, &base, || ws::find_worktree_of(&base, &common, made.bot, made.client));
+    reuse_or_make(
+        &base,
+        found,
+        |name| claimed(&base, name, made, || reused_worktree(state, &base, name, &source)),
+        || new_worktree(state, &base, (&source, &common), made),
+    )
 }
 
 /// A new worktree workspace of `source` (its git common dir beside it) for
 /// `made`'s client, recorded; taken back again if it cannot be recorded.
 fn new_worktree(state: &ClientServerState, base: &Path, (source, common): (&Path, &Path), made: &Made) -> Response {
-    let Some(name) = free_worktree_name(base, source, made.bot.slug) else {
-        return err(
-            StatusCode::CONFLICT, ClientCode::Conflict,
-            "no free workspace name for this checkout",
-        );
+    let (name, held) = match hold_new_name(base, worktree_names(source, made.bot.slug), "checkout") {
+        Ok(found) => found,
+        Err(r) => return *r,
     };
     match add_bot_worktree(state, source, made.git_ref, made.bot.slug, &base.join(&name)) {
         Ok(added) => match record_worktree(base, &name, source, common, made) {
             Ok(()) => created_worktree(state, &name, added.0, added.1),
             Err(e) => {
                 remove_worktree(source, &base.join(&name), &added.2);
+                held.forget();
                 internal(anyhow!(e))
             }
         },
-        Err(r) => *r,
+        Err(r) => {
+            held.forget();
+            *r
+        }
     }
 }
 
@@ -3210,7 +3332,11 @@ fn add_bot_worktree(
 ) -> Result<(String, Option<crate::client_workspace::Coded>, String), Refused> {
     use crate::client_workspace as ws;
     let branch = new_bot_branch(bot)?;
+    // One fetch of a checkout at a time: two bots' worktrees of it are
+    // made side by side, and git refuses a second fetch's ref updates.
+    let fetching = state.workspace_asks.hold(format!("fetch\0{}", source.display()));
     let fetch_error = (state.fetch_repo)(source).err();
+    drop(fetching);
     let start = git_ref
         .map(str::to_string)
         .or_else(|| ws::remote_default(source))
@@ -3259,11 +3385,11 @@ fn worktree_source(source: &Path, base: &Path) -> Result<(PathBuf, PathBuf), Ref
     Ok((source, common))
 }
 
-/// `<repo>-<bot>`, or with a number after it, free under the base. The
-/// checkout's folder name is cut short enough that every one of them, the
-/// numbered ones included, is a valid name; the bot's (at most 32
-/// characters) is kept whole.
-fn free_worktree_name(base: &Path, source: &Path, bot: &str) -> Option<String> {
+/// The names a worktree of `source` for bot `bot` may get: `<repo>-<bot>`,
+/// or with a number after it. The checkout's folder name is cut short
+/// enough that every one of them, the numbered ones included, is a valid
+/// name; the bot's (at most 32 characters) is kept whole.
+fn worktree_names(source: &Path, bot: &str) -> Vec<String> {
     use crate::client_workspace as ws;
     let repo = ws::slug(
         &source
@@ -3277,7 +3403,7 @@ fn free_worktree_name(base: &Path, source: &Path, bot: &str) -> Option<String> {
     let stem = format!("{}-{bot}", if repo.is_empty() { "repo" } else { repo });
     std::iter::once(stem.clone())
         .chain((2..100).map(|n| format!("{stem}-{n}")))
-        .find(|n| ws::valid_name(n) && std::fs::symlink_metadata(base.join(n)).is_err())
+        .collect()
 }
 
 /// The status and code a recipe refusal answers with. A recipe the trusted
@@ -3416,17 +3542,7 @@ struct PreviewStartBody {
 /// The start body: none (or empty) is a plain start; anything else is
 /// parsed strictly, an unknown key refused with `bad_request`.
 async fn preview_start_body(body: Body) -> Result<PreviewStartBody, Response> {
-    let bytes = axum::body::to_bytes(body, MAX_BODY_BYTES).await.map_err(|_| {
-        err(
-            StatusCode::PAYLOAD_TOO_LARGE, ClientCode::PayloadTooLarge,
-            format!("body larger than {MAX_BODY_BYTES} bytes"),
-        )
-    })?;
-    if bytes.iter().all(u8::is_ascii_whitespace) {
-        return Ok(PreviewStartBody::default());
-    }
-    serde_json::from_slice(&bytes)
-        .map_err(|e| err(StatusCode::BAD_REQUEST, ClientCode::BadRequest, format!("bad JSON body: {e}")))
+    optional_json_body(body).await
 }
 
 /// Starts workspace `name`'s preview from its trusted recipe; with `clean`,
@@ -3439,12 +3555,13 @@ fn start_preview(state: &ClientServerState, client: &ApprovedClient, name: &str,
         Ok(found) => found,
         Err(r) => return *r,
     };
-    if clean {
-        if let Err(e) = state.previews.clean(name, &dir, &source) {
-            return recipe_refusal(&source, &no_recipe_in(&source, e));
-        }
-    }
-    match state.previews.start(name, &dir, &source) {
+    let held = match held_in_use(state, name) {
+        Ok(held) => held,
+        Err(r) => return *r,
+    };
+    let started = if clean { state.previews.clean(name, &dir, &source) } else { Ok(()) }
+        .and_then(|()| state.previews.start_holding(name, &dir, &source, held));
+    match started {
         Ok((v, true)) => Json(v).into_response(),
         Ok((v, false)) => (StatusCode::ACCEPTED, Json(v)).into_response(),
         Err(e) => recipe_refusal(&source, &no_recipe_in(&source, e)),
@@ -3630,7 +3747,6 @@ pub(crate) async fn workspace_changes_handler(
 
 /// `/changes`, blocking, for `client`'s workspace `name`.
 fn branch_changes(st: &ClientServerState, client: &ApprovedClient, name: &str) -> Response {
-    use crate::client_workspace as ws;
     let dir = match owned_workspace(st, client, name) {
         Ok(d) => d,
         Err(r) => return *r,
@@ -3649,44 +3765,10 @@ fn branch_changes(st: &ClientServerState, client: &ApprovedClient, name: &str) -
     let (Some(base), Some(head)) = (git_line(&dir, &["merge-base", "HEAD", &default]), git_line(&dir, &["rev-parse", "HEAD"])) else {
         return err(StatusCode::CONFLICT, ClientCode::Conflict, "couldn't find where this branch left the default branch");
     };
-    let Some(listing) = git(&dir, None, &["diff", "--no-renames", "--name-status", "-z", &base, &head]) else {
-        return internal(anyhow!("listing the branch's changes failed"));
+    let files = match crate::client_changes::branch_files(&dir, &base, &head, MAX_CHANGES_BYTES) {
+        Ok(f) => f,
+        Err(e) => return changes_refusal(e),
     };
-    let fields: Vec<String> = String::from_utf8_lossy(&listing.stdout)
-        .split('\0')
-        .filter(|f| !f.is_empty())
-        .map(str::to_string)
-        .collect();
-    let mut files = Vec::new();
-    let mut total = 0usize;
-    for pair in fields.chunks(2) {
-        let [status, path] = pair else { continue };
-        if status.starts_with('D') {
-            files.push(BranchFile {
-                path: path.clone(),
-                deleted: Some(true),
-                mode: None,
-                content: None,
-            });
-            continue;
-        }
-        let Some(blob) = git(&dir, None, &["show", &format!("{head}:{path}")]) else {
-            return internal(anyhow!("reading {path} failed"));
-        };
-        total += blob.stdout.len();
-        if total > MAX_CHANGES_BYTES {
-            return err(StatusCode::PAYLOAD_TOO_LARGE, ClientCode::PayloadTooLarge, "the branch's changes are too large to send");
-        }
-        let mode = git_line(&dir, &["--literal-pathspecs", "ls-tree", &head, "--", path])
-            .and_then(|l| l.split_whitespace().next().map(str::to_string))
-            .unwrap_or_else(|| "100644".to_string());
-        files.push(BranchFile {
-            path: path.clone(),
-            deleted: None,
-            mode: Some(mode),
-            content: Some(ws::base64_encode(&blob.stdout)),
-        });
-    }
     Json(BranchChanges {
         base,
         base_branch,
@@ -3695,6 +3777,18 @@ fn branch_changes(st: &ClientServerState, client: &ApprovedClient, name: &str) -
         files,
     })
     .into_response()
+}
+
+/// The reply for a branch whose files could not be read.
+fn changes_refusal(e: crate::client_changes::ChangesError) -> Response {
+    use crate::client_changes::ChangesError;
+    match e {
+        ChangesError::Listing => internal(anyhow!("listing the branch's changes failed")),
+        ChangesError::Unreadable(path) => internal(anyhow!("reading {path} failed")),
+        ChangesError::TooLarge => {
+            err(StatusCode::PAYLOAD_TOO_LARGE, ClientCode::PayloadTooLarge, "the branch's changes are too large to send")
+        }
+    }
 }
 
 /// The work copy must be on a branch, and (with an origin) on a `mux/`
@@ -3751,6 +3845,110 @@ pub(crate) async fn workspace_status_handler(
     })
     .await
     .unwrap_or_else(|e| internal(anyhow!("workspace status panicked: {e}")))
+}
+
+/// `DELETE /client/workspaces/{name}`: removes one of this client's
+/// workspaces and what darkmux made for it
+/// ([`crate::client_workspace::remove_workspace`]), its live preview
+/// stopped first. Refused while a run or an Undo is in it. An optional body
+/// `{"force": true}` also removes a `mux/` branch nothing else holds, and
+/// a clone holding commits nothing else does.
+pub(crate) async fn workspace_remove_handler(
+    State(state): State<ClientServerState>,
+    ClientPath(name): ClientPath<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let client = match authenticate(&state, &headers) {
+        Ok(c) => c,
+        Err(r) => return *r,
+    };
+    let ask: RemoveBody = match optional_json_body(body).await {
+        Ok(ask) => ask,
+        Err(r) => return r,
+    };
+    let st = state.clone();
+    tokio::task::spawn_blocking(move || {
+        let reply = remove_owned(&st, &client, &name, ask.force);
+        eprintln!("darkmux client serve: workspace {name}: remove: {}", reply.status().as_u16());
+        reply
+    })
+    .await
+    .unwrap_or_else(|e| internal(anyhow!("workspace removal panicked: {e}")))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RemoveBody {
+    /// Also remove what holds commits nothing else does.
+    #[serde(default)]
+    force: bool,
+}
+
+/// How long a removal waits, after stopping a preview, for that preview to
+/// let go of the workspace (its `docker start -a` returning).
+const PREVIEW_LETGO_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Removes workspace `name` for `client`, which must own it: refused while
+/// one of its runs or an Undo is in it; its live preview stopped first.
+fn remove_owned(state: &ClientServerState, client: &ApprovedClient, name: &str, force: bool) -> Response {
+    use crate::client_workspace as ws;
+    let dir = match owned_workspace(state, client, name) {
+        Ok(dir) => dir,
+        Err(r) => return *r,
+    };
+    if let Some(r) = busy_copy(&state.works.lock().unwrap(), &dir) {
+        return *r;
+    }
+    let base = match (state.worktrees_base)() {
+        Ok(b) => b,
+        Err(e) => return internal(anyhow!(e)),
+    };
+    // Refused for what the workspace is before anything is stopped: a
+    // refused removal leaves its preview running.
+    if let Err(e) = ws::check_removable(&base, name, force) {
+        return err(status_of_code(e.code()), e.code(), e.message);
+    }
+    let preview_stopped = state.previews.stop(name);
+    let wait = if preview_stopped { PREVIEW_LETGO_WAIT } else { std::time::Duration::ZERO };
+    match ws::remove_workspace_within(&base, name, force, wait) {
+        Ok(r) => Json(WorkspaceRemoved {
+            workspace: name.to_string(),
+            kind: r.kind.word().to_string(),
+            branch: r.branch,
+            branch_removed: r.branch_removed,
+            preview_stopped,
+        })
+        .into_response(),
+        Err(e) => err(status_of_code(e.code()), e.code(), e.message),
+    }
+}
+
+/// The status a workspace refusal's code answers with.
+fn status_of_code(code: ClientCode) -> StatusCode {
+    match code {
+        ClientCode::BadRequest => StatusCode::BAD_REQUEST,
+        ClientCode::NotFound => StatusCode::NOT_FOUND,
+        ClientCode::Forbidden => StatusCode::FORBIDDEN,
+        ClientCode::Conflict | ClientCode::UnsavedCommits => StatusCode::CONFLICT,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// A body that may be absent (or empty): its default then; anything else
+/// is parsed strictly, an unknown key refused with `bad_request`.
+async fn optional_json_body<T: serde::de::DeserializeOwned + Default>(body: Body) -> Result<T, Response> {
+    let bytes = axum::body::to_bytes(body, MAX_BODY_BYTES).await.map_err(|_| {
+        err(
+            StatusCode::PAYLOAD_TOO_LARGE, ClientCode::PayloadTooLarge,
+            format!("body larger than {MAX_BODY_BYTES} bytes"),
+        )
+    })?;
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Ok(T::default());
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, ClientCode::BadRequest, format!("bad JSON body: {e}")))
 }
 
 pub(crate) async fn work_status_handler(
@@ -4392,7 +4590,7 @@ fn undo_run(st: &ClientServerState, headers: &HeaderMap, work_id: &str) -> Respo
     let (Some(wd), Some(commit)) = (w.git.clone(), w.commit.clone()) else {
         return err(StatusCode::CONFLICT, ClientCode::Conflict, "the run has no git work copy");
     };
-    let _held = match UndoHold::take(&st.works, work_id) {
+    let _held = match UndoHold::take(&st.works, work_id).and_then(|undo| Ok((undo, held_work_copy(st, Some(&wd))?))) {
         Ok(h) => h,
         Err(r) => return *r,
     };

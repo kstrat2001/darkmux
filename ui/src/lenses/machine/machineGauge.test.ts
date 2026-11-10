@@ -506,6 +506,54 @@ describe("modelKvLine for a server darkmux started (#3450)", () => {
   });
 });
 
+describe("server rows: not measured, and one row per server (#3450)", () => {
+  const server = (endpoint: string) => ({
+    endpoint,
+    engine: "flint",
+    model: "flint-int4",
+    served_name: "flint",
+    n_ctx: 32768,
+    port: 8092,
+    pid: 4243,
+    started_at_ms: 0,
+    answering: true,
+  });
+  const flintRow = (endpoint: string, current: number | null) =>
+    model({
+      identifier: "flint",
+      model_key: "flint-int4",
+      owner: "darkmux",
+      loaded_ctx: 32768,
+      weights_bytes: null as unknown as number,
+      kv_per_token_bytes: null as unknown as number,
+      kv_bytes_at_ctx: null as unknown as number,
+      potential_bytes: current as unknown as number,
+      current_bytes: current as unknown as number,
+      server: server(endpoint),
+    });
+
+  it("an unmeasured server reads 'not measured', never 'measured —'", () => {
+    const line = modelKvLine(flintRow("flint-a", null));
+    expect(line).toContain("· not measured");
+    expect(line).not.toContain("measured —");
+  });
+
+  // Every Flint server answers to the name `flint`, so two of them shared one
+  // row key: a duplicate React key, and NEW/DEPARTED merged across them.
+  it("two Flint servers on different endpoints are two rows, each tracked on its own", () => {
+    const a = flintRow("flint-a", 1_000);
+    const b = flintRow("flint-b", 2_000);
+    const first = advanceResidency(null, [a, b], 1000);
+    expect(new Set(first.rows.map((r) => r.identifier)).size).toBe(2);
+    // One of them stops: it departs, and the other stays live.
+    const second = advanceResidency(first.state, [a], 2000);
+    expect(second.rows.map((r) => [r.model.server?.endpoint, r.status])).toEqual([
+      ["flint-a", "live"],
+      ["flint-b", "ghost"],
+    ]);
+  });
+});
+
 describe("isEstimatedRow — the #1819 provenance predicate", () => {
   it("true only when potential_source is exactly 'estimated'", () => {
     expect(isEstimatedRow(model({ potential_source: "estimated" }))).toBe(true);

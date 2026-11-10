@@ -1098,6 +1098,19 @@ impl Previews {
         workdir: &Path,
         source: &RecipeSource,
     ) -> Result<(PreviewState, bool), RecipeRefusal> {
+        self.start_holding(name, workdir, source, ())
+    }
+
+    /// [`Previews::start`], keeping `hold` (the workspace's name, held so
+    /// it cannot be removed under the preview) until the preview it starts
+    /// has ended. A preview already running keeps its own.
+    pub fn start_holding(
+        &self,
+        name: &str,
+        workdir: &Path,
+        source: &RecipeSource,
+        hold: impl Send + 'static,
+    ) -> Result<(PreviewState, bool), RecipeRefusal> {
         let mut entries = self.entries.lock().unwrap();
         if self.stopping() {
             return Err(RecipeRefusal::Unreadable(
@@ -1145,7 +1158,10 @@ impl Previews {
             ready_within: self.ready_within,
         };
         let containers = self.containers.clone();
-        std::thread::spawn(move || run(entry, recipe, at, &*containers));
+        std::thread::spawn(move || {
+            let _held = hold;
+            run(entry, recipe, at, &*containers)
+        });
         Ok((snap, false))
     }
 

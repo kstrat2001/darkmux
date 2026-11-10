@@ -3149,6 +3149,15 @@ fn feeds_runs_index(v: &serde_json::Value) -> bool {
     named("session_id") || named("mission_id") || crate::usage_sum::is_usage_record(v)
 }
 
+/// Feed `h` the local records the daemon's `/runs` build folds: the lines its
+/// store keeps over the default window ([`WindowRecords::hash_into`]). A
+/// record no index folds (the daemon's own host telemetry) changes nothing,
+/// so it does not make the next poll rebuild. Reads the store as the next
+/// build would, so that build then finds nothing new on disk. Blocking.
+pub(crate) fn hash_daemon_runs_records(flows_dir: &StdPath, h: &mut impl std::hash::Hasher) {
+    RUNS_FLOW_RECORDS.read(flows_dir, &ScanWindow::default_window().cutoff_date).hash_into(h);
+}
+
 /// (#2891) The day files the daemon's `GET /runs` reads: kept as line text
 /// and read again only past what was already read (see `flow_window.rs`).
 /// Not a TTL cache: each read stats every file in the window, so a record
@@ -3183,16 +3192,13 @@ impl<'a> LocalRecords<'a> {
     }
 }
 
-/// Like `crate::for_each_flow_record_across_days`, but bounded to day files
-/// dated at or after `cutoff` (`YYYY-MM-DD`) — a [`ScanWindow`]'s, which is
+/// Every flow record in the day files dated at or after `cutoff`
+/// (`YYYY-MM-DD`) — a [`ScanWindow`]'s, which is
 /// [`RUNS_FLOW_SCAN_WINDOW_DAYS`] before now unless `--since` pushed it
-/// earlier (#2902 step 2b). A SEPARATE,
-/// smaller day-file walk rather than extending the shared primitive —
-/// that primitive's OTHER callers (`/flow-mission/:id`, `/flow-dispatch/:id`,
-/// the full-history catalog endpoints) must keep seeing a run's COMPLETE
-/// history; bounding is specific to THIS module's route-resolution/
-/// ghost-synthesis use, not a general flow-reading behavior change that
-/// would ripple into those unrelated endpoints.
+/// earlier (#2902 step 2b). Bounding is specific to THIS module's
+/// route-resolution/ghost-synthesis use: the replay routes
+/// (`/flow-mission/:id`, `/flow-dispatch/:id`) must keep seeing a run's
+/// COMPLETE history, which they read through the daemon's day index.
 fn for_each_flow_record_from(
     flows_dir: &StdPath,
     cutoff: &str,
