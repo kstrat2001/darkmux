@@ -22,7 +22,7 @@ use darkmux_flow::payload::{
     DispatchToolPayload, DispatchTurnPayload, DispatchWorkdirGitUnavailablePayload, EjectFailure, WorkdirGitMount, EjectedModel, GitCheckout,
     GitdirKind, HostWindow, Knob, KnobSource, KnobValue, LmsRole, MetricWindow, ResultClass, RuntimeBounds, StreamPhase,
     TelemetryCompactionPayload, TelemetryContextPayload, TelemetryDetectorPayload, TelemetryLmsPayload, TelemetryRuntimePayload,
-    ThermalStopUnresolvedPayload, ThermalTier5EjectFailedPayload, ThermalTier5EjectPayload, ToolOutcome, TurnUsage, UsagePayload,
+    StoppedServer, ThermalStopUnresolvedPayload, ThermalTier5EjectFailedPayload, ThermalTier5EjectPayload, ToolOutcome, TurnUsage, UsagePayload,
 };
 use crate::dispatch::DispatchOpts;
 use darkmux_types::execution_id::ExecutionId;
@@ -10121,8 +10121,10 @@ fn stamping_emitter<'a>(
 /// container," so the resident model that produced the heat keeps holding
 /// the GPU. This unloads every `darkmux:`-namespaced resident on this host
 /// (via [`darkmux_profiles::ownership::eject_all_managed`] — the SAME mechanism
-/// `darkmux machine eject` uses, not a second unloader) so the machine can
-/// actually cool.
+/// `darkmux machine eject` uses, not a second unloader), then (#3450,
+/// operator "Stop all") stops every engine server darkmux started, held by a
+/// running dispatch or not (`ownership::stop_all_servers`; only a server
+/// whose record matches the live process), so the machine can actually cool.
 ///
 /// **Ordering, per the operator's own spec:** checkpoint first, eject
 /// second, where there is time for both — waits up to `bound` for the
@@ -10159,59 +10161,81 @@ fn tier5_eject_on_critical(host_out: &Path, trip_wall: SystemTime, emit: &dyn Fn
         }
         thread::sleep(POLL_INTERVAL);
     };
-    match darkmux_profiles::ownership::eject_all_managed(false) {
-        Ok(summary) => {
-            let ejected: Vec<EjectedModel> = summary
-                .ejected
-                .iter()
-                .map(|m| EjectedModel { identifier: m.identifier.clone(), context: m.context })
-                .collect();
-            emit(darkmux_flow::Payload::ThermalTier5Eject(ThermalTier5EjectPayload {
-                reached_checkpoint_boundary,
-                ejected,
-                user_loaded_count: summary.user_loaded_count as u64,
-                simulated_host_source: None,
-                step_id: None,
-                context: None,
-            }));
-            // (#2774 review C1) A model that refused to unload no longer
-            // aborts the sweep, so BOTH outcomes can be real on one trip:
-            // some residents released, some still holding the GPU. The
-            // failure record is emitted alongside the success one and
-            // names every model still resident — on the safety path the
-            // operator needs to know exactly which ones darkmux could not
-            // release, not just that something went wrong.
-            if !summary.failed.is_empty() {
-                let failed: Vec<EjectFailure> = summary
-                    .failed
-                    .iter()
-                    .map(|f| EjectFailure { identifier: f.identifier.clone(), error: f.error.clone() })
-                    .collect();
-                emit(darkmux_flow::Payload::ThermalTier5EjectFailed(ThermalTier5EjectFailedPayload {
-                    reached_checkpoint_boundary,
-                    failed: Some(failed),
-                    ejected_count: Some(summary.ejected.len() as u64),
-                    error: None,
-                    simulated_host_source: None,
-                    step_id: None,
-                    context: None,
-                }));
-            }
-        }
-        Err(e) => {
-            // Could not even LIST the residents — there is no per-model
-            // detail to report, only the enumeration failure.
-            emit(darkmux_flow::Payload::ThermalTier5EjectFailed(ThermalTier5EjectFailedPayload {
-                reached_checkpoint_boundary,
-                failed: None,
-                ejected_count: None,
-                error: Some(e.to_string()),
-                simulated_host_source: None,
-                step_id: None,
-                context: None,
-            }));
-        }
+    // (#3450, operator "Stop all") LM Studio first, then every engine server
+    // darkmux started, held ones included: at `critical` the heat source is
+    // whatever darkmux holds, and the turn boundary was already given its
+    // chance above.
+    let lms = darkmux_profiles::ownership::eject_all_managed(false);
+    let servers = darkmux_profiles::ownership::stop_all_servers();
+    for record in tier5_records(lms, &servers, reached_checkpoint_boundary) {
+        emit(record);
     }
+}
+
+/// The tier-5 records for one trip: `thermal.tier5_eject` naming what came
+/// out (LM Studio residents and, #3450, the engine servers stopped), and
+/// `thermal.tier5_eject_failed` naming what did not, or the failure to list
+/// LM Studio's residents at all.
+fn tier5_records(
+    lms: anyhow::Result<darkmux_profiles::ownership::EjectSummary>,
+    servers: &darkmux_profiles::ownership::ServerEjectSummary,
+    reached_checkpoint_boundary: bool,
+) -> Vec<darkmux_flow::Payload> {
+    let stopped: Vec<StoppedServer> = servers
+        .stopped
+        .iter()
+        .map(|s| StoppedServer { endpoint: s.endpoint.clone(), model: s.model.clone(), pid: s.pid })
+        .collect();
+    let failed_servers: Option<Vec<EjectFailure>> = (!servers.failed.is_empty())
+        .then(|| servers.failed.iter().map(|f| EjectFailure { identifier: f.identifier.clone(), error: f.error.clone() }).collect());
+    let failed_record = |failed, ejected_count, error, stopped_servers| {
+        darkmux_flow::Payload::ThermalTier5EjectFailed(ThermalTier5EjectFailedPayload {
+            reached_checkpoint_boundary,
+            failed,
+            ejected_count,
+            error,
+            failed_servers: failed_servers.clone(),
+            stopped_servers,
+            simulated_host_source: None,
+            step_id: None,
+            context: None,
+        })
+    };
+    let summary = match lms {
+        Ok(summary) => summary,
+        // Could not even LIST the residents: there is no per-model detail to
+        // report, only the enumeration failure, and the servers it stopped.
+        Err(e) => return vec![failed_record(None, None, Some(e.to_string()), (!stopped.is_empty()).then_some(stopped))],
+    };
+    let ejected: Vec<EjectedModel> = summary
+        .ejected
+        .iter()
+        .map(|m| EjectedModel { identifier: m.identifier.clone(), context: m.context })
+        .collect();
+    let mut out = vec![darkmux_flow::Payload::ThermalTier5Eject(ThermalTier5EjectPayload {
+        reached_checkpoint_boundary,
+        ejected,
+        user_loaded_count: summary.user_loaded_count as u64,
+        stopped_servers: (!stopped.is_empty()).then_some(stopped),
+        simulated_host_source: None,
+        step_id: None,
+        context: None,
+    })];
+    // (#2774 review C1) A model that refused to unload no longer aborts the
+    // sweep, so BOTH outcomes can be real on one trip: some residents
+    // released, some still holding the GPU. The failure record is emitted
+    // alongside the success one and names every model (and, #3450, every
+    // engine server) still resident: on the safety path the operator needs
+    // to know exactly which ones darkmux could not release.
+    if !summary.failed.is_empty() || failed_servers.is_some() {
+        let failed: Vec<EjectFailure> = summary
+            .failed
+            .iter()
+            .map(|f| EjectFailure { identifier: f.identifier.clone(), error: f.error.clone() })
+            .collect();
+        out.push(failed_record((!failed.is_empty()).then_some(failed), Some(summary.ejected.len() as u64), None, None));
+    }
+    out
 }
 
 /// (#557 slice 4 · #1064) Run the always-on lms + host-load telemetry

@@ -209,6 +209,18 @@ pub fn eject_servers(dry_run: bool) -> ServerEjectSummary {
     eject_servers_in(&dirs, dry_run, crate::engine::server::Bounds::default(), &held)
 }
 
+/// (#3450, operator "Stop all") Stop every server darkmux started, held by a
+/// running dispatch or not: the thermal tier-5 hard stop, after its LM
+/// Studio sweep. Ownership still binds: only a server whose record matches
+/// the live process is signaled ([`crate::engine::server::stop_for_thermal`]).
+pub fn stop_all_servers() -> ServerEjectSummary {
+    stop_all_servers_in(&crate::engine::server::Dirs::under_home(), crate::engine::server::Bounds::default())
+}
+
+pub(crate) fn stop_all_servers_in(dirs: &crate::engine::server::Dirs, bounds: crate::engine::server::Bounds) -> ServerEjectSummary {
+    eject_servers_with(dirs, false, &|_| false, &|rec| crate::engine::server::stop_for_thermal(dirs, rec, bounds))
+}
+
 /// Whether a running dispatch holds darkmux's server: its served name is in
 /// another live holder's residency lease. `probe` is a guard of this
 /// process's own that leases nothing, so every dispatch's lease counts,
@@ -592,6 +604,30 @@ mod tests {
         assert!(alive(&busy), "a server a running dispatch holds is kept");
         assert!(alive(&stranger), "a process its record no longer matches is never signaled");
         assert!(darkmux_types::engine_record::read_in(&dirs.records, "idle").unwrap().is_none(), "its record is gone");
+    }
+
+    /// (#3450, operator "Stop all") The thermal tier-5 stop takes every
+    /// server darkmux started, a held one included, and still never a
+    /// process its record no longer matches.
+    #[test]
+    fn stopping_every_server_takes_held_ones_and_nothing_else() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = dirs_in(&tmp);
+        let (idle, busy, stranger) = (stand_in(), stand_in(), stand_in());
+        record(&dirs, "idle", idle.0.id(), None);
+        record(&dirs, "busy", busy.0.id(), None);
+        record(&dirs, "reused", stranger.0.id(), Some(7));
+        let dispatch = darkmux_types::residency_lease::LeaseGuard::acquire();
+        dispatch.write(&["darkmux:m/busy".to_string()]).unwrap();
+        let summary = stop_all_servers_in(&dirs, quick());
+        let mut stopped: Vec<&str> = summary.stopped.iter().map(|s| s.endpoint.as_str()).collect();
+        stopped.sort();
+        assert_eq!(stopped, vec!["busy", "idle"], "{summary:?}");
+        assert!(summary.held.is_empty() && summary.failed.is_empty(), "{summary:?}");
+        let alive = |s: &Stand| darkmux_platform::current().process_start_stamp(s.0.id()).is_some()
+            && !std::process::Command::new("ps").args(["-o", "stat=", "-p", &s.0.id().to_string()]).output().unwrap().stdout.starts_with(b"Z");
+        assert!(!alive(&busy), "the held server is stopped too");
+        assert!(alive(&stranger), "a reused pid is never signaled");
     }
 
     /// (#3450 review) A server whose process was gone by the time the eject

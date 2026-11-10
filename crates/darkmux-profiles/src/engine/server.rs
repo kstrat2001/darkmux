@@ -604,6 +604,15 @@ pub enum StopOutcome {
     NotRunning,
 }
 
+/// (#3450, operator "Stop all") The thermal tier-5 stop: like
+/// [`stop_if_idle`] under the endpoint's lock, but asking no lease, so a
+/// server a running dispatch holds is stopped too. Still only a process its
+/// record matches is signaled (`NotRunning` otherwise). Never for `machine
+/// eject`, which keeps held servers.
+pub fn stop_for_thermal(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds) -> Result<StopOutcome, ServerError> {
+    stop_if_idle(dirs, rec, bounds, &|_| false)
+}
+
 /// [`stop_unless_held`], saying which of the three it was.
 pub fn stop_if_idle(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds, held: Held<'_>) -> Result<StopOutcome, ServerError> {
     let _lock = lock_for_stop(dirs, rec)?;
@@ -1636,5 +1645,29 @@ S(("127.0.0.1", port), H).serve_forever()
         assert_eq!(stop_if_idle(&f.dirs, &rec, quick(), &|_| true), Ok(StopOutcome::Held));
         assert_eq!(stop_if_idle(&f.dirs, &rec, quick(), &not_held), Ok(StopOutcome::Stopped));
         assert_eq!(stop_if_idle(&f.dirs, &rec, quick(), &not_held), Ok(StopOutcome::NotRunning), "nothing left to signal");
+    }
+
+    /// (#3450, operator 2026-11-10 "Stop all") The thermal stop asks no
+    /// lease, so it stops a server a running dispatch holds; it still takes
+    /// the endpoint lock and signals only a process its record matches.
+    #[test]
+    fn a_thermal_stop_ignores_leases_never_a_process_its_record_does_not_match() {
+        let f = fixture();
+        let spawn = || {
+            let mut c = Command::new("sleep");
+            c.arg("30");
+            std::os::unix::process::CommandExt::process_group(&mut c, 0);
+            Reaped(c.spawn().unwrap())
+        };
+        let held = spawn();
+        let rec = record_of(&f, "tf", "tensorfold", held.0.id(), free_port(), &[]);
+        engine_record::write_in(&f.dirs.records, &rec).unwrap();
+        assert_eq!(stop_for_thermal(&f.dirs, &rec, quick()), Ok(StopOutcome::Stopped));
+        assert!(!alive(&rec), "stopped whatever leases it");
+        let stranger = spawn();
+        let reused = EngineRecord { start_stamp: 7, ..record_of(&f, "zz", "tensorfold", stranger.0.id(), free_port(), &[]) };
+        engine_record::write_in(&f.dirs.records, &reused).unwrap();
+        assert_eq!(stop_for_thermal(&f.dirs, &reused, quick()), Ok(StopOutcome::NotRunning));
+        assert!(darkmux_platform::current().process_start_stamp(stranger.0.id()).is_some(), "a reused pid is never signaled");
     }
 }

@@ -64,7 +64,7 @@ pub use telemetry::{
     TelemetryDetectorPayload, TelemetryLmsPayload, TelemetryRuntimePayload,
 };
 pub use thermal::{
-    BatteryPauseUnsupportedPayload, EjectFailure, EjectedModel, ThermalStopUnresolvedPayload, ThermalTier5EjectFailedPayload,
+    BatteryPauseUnsupportedPayload, EjectFailure, EjectedModel, StoppedServer, ThermalStopUnresolvedPayload, ThermalTier5EjectFailedPayload,
     ThermalTier5EjectPayload,
 };
 pub use usage::{CallKind, TokenSource, UsagePayload, UsagePurpose, UtilityErrorPayload, UtilityJobKind, UtilityStartPayload};
