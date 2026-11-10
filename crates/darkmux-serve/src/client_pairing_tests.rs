@@ -2938,7 +2938,7 @@ async fn a_repo_url_is_cloned_into_a_named_workspace() {
     .await;
     assert_eq!(code, 201, "{v}");
     assert_eq!(v["workspace"], "hcr");
-    assert_eq!(v["branch"], "main");
+    assert!(crate::client_workspace::is_bot_branch(v["branch"].as_str().unwrap(), "app"), "{v}");
     assert_eq!(v["repo"], "github.com/kstrat2001/hcr");
     assert!(!v["head"].as_str().unwrap().is_empty());
     assert!(h.base.join("hcr/README.md").exists());
@@ -2974,7 +2974,10 @@ async fn a_ref_is_cloned_on_that_branch() {
     )
     .await;
     assert_eq!(code, 201, "{v}");
-    assert_eq!(v["branch"], "dev");
+    assert_eq!(v["from"], "dev", "{v}");
+    let branch = v["branch"].as_str().unwrap();
+    assert!(crate::client_workspace::is_bot_branch(branch, "app"), "{v}");
+    assert_eq!(held_git(&h, "hcr", &["rev-parse", branch]), held_git(&h, "hcr", &["rev-parse", "dev"]), "cut from dev");
 }
 
 #[tokio::test]
@@ -3000,6 +3003,7 @@ async fn an_existing_checkout_of_the_repo_is_reused_whatever_its_name() {
             "git@github.com:kstrat2001/hcr.git",
         ],
     );
+    run_git(Some(&wt), &["checkout", "--quiet", "-b", "mux/app-abc123"]);
     hold(&h, "hcr-preview");
     let (code, v) = call(
         &h,
@@ -3013,6 +3017,22 @@ async fn an_existing_checkout_of_the_repo_is_reused_whatever_its_name() {
     assert_eq!(code, 200, "{v}");
     assert_eq!(v["workspace"], "hcr-preview");
     assert!(h.cloned.lock().unwrap().is_empty());
+}
+
+/// A held clone on no bot's branch (its default branch, as clones were
+/// before they got one) is never handed to a bot: its runs would commit to
+/// the default branch.
+#[tokio::test]
+async fn a_clone_on_no_bots_branch_is_never_handed_out() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = h.base.join("hcr");
+    run_git(None, &["clone", "--quiet", h.fixture.to_str().unwrap(), wt.to_str().unwrap()]);
+    run_git(Some(&wt), &["remote", "set-url", "origin", HCR]);
+    hold(&h, "hcr");
+    let (code, v) = call(&h, post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR}))).await;
+    assert_eq!((code, v["workspace"].as_str()), (201, Some("kstrat2001-hcr")), "{v}");
+    assert_eq!(run_git(Some(&wt), &["branch", "--show-current"]), "main", "the old clone is left as it was");
 }
 
 #[tokio::test]
@@ -3187,7 +3207,7 @@ async fn workspace_status_reports_branch_head_and_repo() {
     )
     .await;
     assert_eq!(code, 200, "{v}");
-    assert_eq!(v["branch"], "main");
+    assert!(crate::client_workspace::is_bot_branch(v["branch"].as_str().unwrap(), "app"), "{v}");
     assert_eq!(v["repo"], "github.com/kstrat2001/hcr");
     let (code, _) = call(
         &h,
@@ -3330,6 +3350,99 @@ async fn each_app_gets_its_own_workspace_of_a_repo() {
     .await;
     assert_eq!((code, v["code"].as_str()), (403, Some("forbidden")), "{v}");
     assert!(h.ran.lock().unwrap().is_empty());
+}
+
+/// `git <args>` against workspace `name`'s held repository (a clone's
+/// `--separate-git-dir`).
+fn held_git(h: &Harness, name: &str, args: &[&str]) -> String {
+    let gd = crate::client_git::clone_git_dir(&h.base, name);
+    let mut all = vec!["--git-dir", gd.to_str().unwrap()];
+    all.extend_from_slice(args);
+    run_git(None, &all)
+}
+
+/// A workspace cloned from a repo link starts on a `mux/<bot>-` branch of
+/// its own, cut where the clone checked out, so its runs commit there and
+/// the default branch never moves; `/changes` compares that branch with it.
+#[tokio::test]
+async fn a_cloned_workspaces_runs_commit_to_its_own_mux_branch_never_the_default() {
+    let h = harness();
+    let token = paired(&h).await;
+    let body = serde_json::json!({"repo_url": HCR, "bot": "Bot A"});
+    let (code, v) = call(&h, post("/client/workspaces", Some(&token), body)).await;
+    assert_eq!(code, 201, "{v}");
+    let branch = v["branch"].as_str().unwrap().to_string();
+    assert!(crate::client_workspace::is_bot_branch(&branch, "bot-a"), "{v}");
+    assert_eq!(v["from"], "origin/main", "{v}");
+    let main_before = held_git(&h, "hcr", &["rev-parse", "main"]);
+    let id = run_in(&h, &token, "hcr", "edit-readme").await;
+    let done = status(&h, &token, &id).await;
+    assert_eq!(done["branch"], branch.as_str(), "{done}");
+    assert_eq!(held_git(&h, "hcr", &["rev-parse", "main"]), main_before, "the default branch never moves");
+    let tip = held_git(&h, "hcr", &["rev-parse", &branch]);
+    assert!(tip.starts_with(done["commit"].as_str().unwrap()), "{tip} {done}");
+    let (code, c) = call(&h, get("/client/workspaces/hcr/changes", &[("authorization", &bearer(&token))])).await;
+    assert_eq!(code, 200, "{c}");
+    assert_eq!((c["branch"].as_str(), c["base_branch"].as_str()), (Some(branch.as_str()), Some("main")), "{c}");
+    let files: Vec<&str> = c["files"].as_array().unwrap().iter().map(|f| f["path"].as_str().unwrap()).collect();
+    assert_eq!(files, ["README.md"], "{c}");
+}
+
+/// Two bots of one app on one repo each get a workspace and a branch of
+/// their own. A repo-link request never gets a worktree (the other bot's
+/// local folder) nor a bot's whose name only starts with this one's; the
+/// same bot asking again gets its own back.
+#[tokio::test]
+async fn two_bots_of_one_app_get_their_own_workspace_and_branch_of_a_repo() {
+    let h = harness();
+    let token = paired(&h).await;
+    let mine = h.dir.path().join("my-site");
+    fixture_repo(&mine);
+    run_git(Some(&mine), &["remote", "add", "origin", HCR]);
+    let ask = |body: Value| post("/client/workspaces", Some(&token), body);
+    let (code, a) = call(&h, ask(serde_json::json!({"source_path": mine.to_str(), "bot": "Bot A"}))).await;
+    assert_eq!((code, a["workspace"].as_str()), (201, Some("my-site-bot-a")), "{a}");
+    let (code, b) = call(&h, ask(serde_json::json!({"repo_url": HCR, "bot": "Bot B"}))).await;
+    assert_eq!(code, 201, "B gets its own, never A's worktree: {b}");
+    assert!(crate::client_workspace::is_bot_branch(b["branch"].as_str().unwrap(), "bot-b"), "{b}");
+    let (code, a_clone) = call(&h, ask(serde_json::json!({"repo_url": HCR, "bot": "Bot A"}))).await;
+    assert_eq!(code, 201, "a repo link never gets a worktree, even its own bot's: {a_clone}");
+    assert!(crate::client_workspace::is_bot_branch(a_clone["branch"].as_str().unwrap(), "bot-a"), "{a_clone}");
+    let (code, again) = call(&h, ask(serde_json::json!({"repo_url": HCR, "bot": "Bot B"}))).await;
+    assert_eq!((code, &again["workspace"], &again["branch"]), (200, &b["workspace"], &b["branch"]), "B reuses its own: {again}");
+    // Bot "Bot" is not bot "Bot B", whose branch starts `mux/bot-`.
+    let (code, plain) = call(&h, ask(serde_json::json!({"repo_url": HCR, "bot": "Bot"}))).await;
+    assert_eq!(code, 201, "{plain}");
+    assert!(crate::client_workspace::is_bot_branch(plain["branch"].as_str().unwrap(), "bot"), "{plain}");
+    let (code, wt) = call(&h, ask(serde_json::json!({"source_path": mine.to_str(), "bot": "Bot"}))).await;
+    assert_eq!(code, 201, "never bot A's worktree: {wt}");
+    let names = [&a, &b, &a_clone, &plain, &wt].map(|v| v["workspace"].as_str().unwrap().to_string());
+    let distinct: std::collections::HashSet<_> = names.iter().collect();
+    assert_eq!(distinct.len(), names.len(), "{names:?}");
+}
+
+/// A checkout folder of 40 characters and a 32-character bot still make a
+/// valid workspace name, its numbered fallbacks included.
+#[tokio::test]
+async fn a_long_checkout_and_bot_name_still_fit_a_workspace_name() {
+    let h = harness();
+    let token = paired(&h).await;
+    let mine = h.dir.path().join("a".repeat(40));
+    fixture_repo(&mine);
+    let bot = "b".repeat(32);
+    let (code, v) = call(&h, post("/client/workspaces", Some(&token), serde_json::json!({"source_path": mine.to_str(), "bot": bot}))).await;
+    assert_eq!(code, 201, "{v}");
+    let first = v["workspace"].as_str().unwrap().to_string();
+    assert!(crate::client_workspace::valid_name(&first), "{first}");
+    let source = mine.canonicalize().unwrap();
+    let base = h.base.canonicalize().unwrap();
+    let mut last = first.clone();
+    while let Some(n) = free_worktree_name(&base, &source, &bot) {
+        assert!(crate::client_workspace::valid_name(&n), "{n}");
+        std::fs::create_dir(base.join(&n)).unwrap();
+        last = n;
+    }
+    assert!(last.ends_with("-99"), "every numbered name fits, the last too: {last}");
 }
 
 /// A store written before clients had ids, holding one client that
@@ -5141,16 +5254,80 @@ async fn a_new_run_goes_ahead_after_a_committed_run() {
     );
 }
 
+/// A Tweak may not name a run darkmux still knows that is another app's or
+/// ran in another work copy. A run that failed or was cancelled can be
+/// continued like a finished one: its edits are committed the same way.
 #[tokio::test]
-async fn continues_must_name_a_finished_run_of_yours_in_the_same_work_copy() {
+async fn continues_may_not_name_another_apps_run_or_one_in_another_work_copy() {
+    let h = harness();
+    let token = paired(&h).await;
+    let other = paired(&h).await;
+    git_workspace(&h, "site");
+    git_workspace(&h, "elsewhere");
+    // The other app's run in this very work copy, before the operator
+    // gave the copy to this app (`client claim`).
+    let ids: Vec<String> = h.store.read().unwrap().clients.iter().map(|c| c.id.clone()).collect();
+    own(&h, "site", &ids[1]);
+    let foreign = run_in(&h, &other, "site", "edit-readme").await;
+    own(&h, "site", &ids[0]);
+    let first = run_in(&h, &token, "site", "edit-other").await;
+    let tweak = |ws: &str, cont: &str| post("/client/work", Some(&token), serde_json::json!({"role": "coder", "message": "edit", "workspace": ws, "continues": cont}));
+    for (ws, cont) in [("elsewhere", first.as_str()), ("site", foreign.as_str())] {
+        let (code, v) = call(&h, tweak(ws, cont)).await;
+        assert_eq!((code, v["code"].as_str()), (409, Some("conflict")), "{ws} {cont}: {v}");
+    }
+    let failed = run_in(&h, &token, "site", "edit-fail").await;
+    assert_eq!(status(&h, &token, &failed).await["status"], "error");
+    let (code, v) = call(&h, tweak("site", &failed)).await;
+    assert_eq!(code, 202, "a failed run's committed edits can be tweaked: {v}");
+}
+
+/// "Tweak it" the next morning, or after `client serve` restarts: a
+/// `continues` naming a run darkmux has forgotten is a plain new run in the
+/// same work copy, never a refusal.
+#[tokio::test]
+async fn continues_naming_a_forgotten_run_is_a_plain_new_run() {
     let h = harness();
     let token = paired(&h).await;
     git_workspace(&h, "site");
     let first = run_in(&h, &token, "site", "edit-readme").await;
-    for (ws, cont) in [("site", "w-nope"), ("wt1", first.as_str())] {
-        let (code, v) = call(&h, post("/client/work", Some(&token), serde_json::json!({"role": "coder", "message": "edit", "workspace": ws, "continues": cont}))).await;
-        assert_eq!(code, 409, "{ws} {cont}: {v}");
-    }
+    h.clock.fetch_add(KEEP_WORK_SECS + 1, Ordering::SeqCst);
+    let next_morning = run_after(&h, &token, "site", "edit-other", Some(&first)).await;
+    assert_eq!(status(&h, &token, &next_morning).await["status"], "done");
+    assert_eq!(h.state.works.lock().unwrap()[&next_morning].continues, None, "an unknown id labels nothing");
+    // A restart forgets every run.
+    h.state.works.lock().unwrap().clear();
+    let after_restart = run_after(&h, &token, "site", "edit-readme-again", Some(&next_morning)).await;
+    assert_eq!(status(&h, &token, &after_restart).await["status"], "done");
+    let known = run_after(&h, &token, "site", "edit", Some(&after_restart)).await;
+    assert_eq!(h.state.works.lock().unwrap()[&known].continues.as_deref(), Some(after_restart.as_str()));
+}
+
+/// Finished work is kept for its keep time from when it ended, not from
+/// when it started: a long run is still there to poll right after it ends.
+#[tokio::test]
+async fn ended_work_is_kept_for_the_keep_time_from_when_it_ended() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (code, v) = call(&h, post("/client/work", Some(&token), serde_json::json!({"role": "coder", "message": "wait"}))).await;
+    assert_eq!(code, 202, "{v}");
+    let long = v["work_id"].as_str().unwrap().to_string();
+    h.clock.fetch_add(KEEP_WORK_SECS - 10, Ordering::SeqCst);
+    call(&h, post(&format!("/client/work/{long}/cancel"), Some(&token), serde_json::json!({}))).await;
+    assert_eq!(wait_done(&h, &token, &long).await["status"], "cancelled");
+    h.clock.fetch_add(20, Ordering::SeqCst);
+    assert_eq!(poll_after_pruning(&h, &token, &long).await, 200, "ended 20 s ago, so it is kept");
+    h.clock.fetch_add(KEEP_WORK_SECS, Ordering::SeqCst);
+    assert_eq!(poll_after_pruning(&h, &token, &long).await, 404, "past its keep time from when it ended");
+}
+
+/// Polls run `id` after a new work request, which forgets old work first.
+async fn poll_after_pruning(h: &Harness, token: &str, id: &str) -> u16 {
+    let (code, v) = call(h, post("/client/work", Some(token), serde_json::json!({"role": "coder", "message": "hello"}))).await;
+    assert_eq!(code, 202, "{v}");
+    let polled = call(h, get(&format!("/client/work/{id}"), &[("authorization", &bearer(token))])).await.0;
+    wait_done(h, token, v["work_id"].as_str().unwrap()).await;
+    polled
 }
 
 #[tokio::test]
