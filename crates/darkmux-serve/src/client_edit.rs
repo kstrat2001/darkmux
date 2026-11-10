@@ -61,68 +61,75 @@ pub fn normalize(text: &str) -> String {
 }
 
 /// `source` read the way a page shows it, each char with the byte span of
-/// the source it came from.
+/// the source it came from. One pass over the source's chars, so it always
+/// ends: an entity's own chars are skipped, never read again.
 fn rendered(source: &str) -> Vec<(char, usize, usize)> {
     let mut out = Vec::new();
-    let mut i = 0;
-    while i < source.len() {
-        let rest = &source[i..];
-        let c = rest.chars().next().expect("i is on a char boundary");
-        if c.is_whitespace() || c == '\u{a0}' {
-            let run = rest
-                .char_indices()
-                .find(|(_, c)| !(c.is_whitespace() || *c == '\u{a0}'))
-                .map_or(rest.len(), |(n, _)| n);
-            out.push((' ', i, i + run));
-            i += run;
-        } else if let Some((ent, ch)) = ENTITIES.iter().find(|(e, _)| rest.starts_with(e)) {
-            // A no-break space entity is whitespace too, and joins a run.
-            if *ch == ' ' && matches!(out.last(), Some((' ', _, end)) if *end == i) {
-                out.last_mut().expect("just matched").2 = i + ent.len();
-            } else {
-                out.push((*ch, i, i + ent.len()));
-            }
-            i += ent.len();
-        } else {
-            out.push((c, i, i + c.len_utf8()));
-            i += c.len_utf8();
+    let mut skip_to = 0;
+    for (i, c) in source.char_indices() {
+        if i < skip_to {
+            continue;
         }
+        let rest = &source[i..];
+        let (shown, len) = match ENTITIES.iter().find(|(e, _)| rest.starts_with(e)) {
+            Some((ent, ch)) => (*ch, ent.len()),
+            None => (c, c.len_utf8()),
+        };
+        skip_to = i + len;
+        push_shown(&mut out, shown, i, skip_to);
     }
     out
 }
 
+/// Adds one char the page shows, from source bytes `start..end`.
+/// Whitespace (a no-break space too, as a char or an entity) joins the run
+/// directly before it, so the run reads as one space.
+fn push_shown(out: &mut Vec<(char, usize, usize)>, c: char, start: usize, end: usize) {
+    if !(c.is_whitespace() || c == '\u{a0}') {
+        out.push((c, start, end));
+        return;
+    }
+    match out.last_mut() {
+        Some((' ', _, run_end)) if *run_end == start => *run_end = end,
+        _ => out.push((' ', start, end)),
+    }
+}
+
 /// The byte spans in `source` whose rendered text is `wanted` (already
-/// [`normalize`]d), without overlap, at most `limit` of them.
+/// [`normalize`]d), without overlap, at most `limit` of them. Each place
+/// is looked at once, so it always ends.
 pub fn find(source: &str, wanted: &str, limit: usize) -> Vec<(usize, usize)> {
     let want: Vec<char> = wanted.chars().collect();
-    if want.is_empty() {
-        return Vec::new();
-    }
     let page = rendered(source);
     let mut found = Vec::new();
-    let mut at = 0;
-    while at + want.len() <= page.len() && found.len() < limit {
-        let end = at + want.len();
-        // Whole words only: "more" is not found inside "furthermore".
-        let alnum = |i: Option<usize>| {
-            i.and_then(|i| page.get(i))
-                .is_some_and(|(c, _, _)| c.is_alphanumeric())
-        };
-        let cut_word = (want[0].is_alphanumeric() && alnum(at.checked_sub(1)))
-            || (want[want.len() - 1].is_alphanumeric() && alnum(Some(end)));
-        if !cut_word
-            && page[at..end]
-                .iter()
-                .map(|(c, _, _)| *c)
-                .eq(want.iter().copied())
-        {
+    if want.is_empty() || want.len() > page.len() {
+        return found;
+    }
+    // Where the next match may start: matches never overlap.
+    let mut free = 0;
+    for at in 0..=page.len() - want.len() {
+        if found.len() >= limit {
+            break;
+        }
+        if at >= free && matches_at(&page, &want, at) {
             found.push((page[at].1, page[at + want.len() - 1].2));
-            at += want.len();
-        } else {
-            at += 1;
+            free = at + want.len();
         }
     }
     found
+}
+
+/// Whether `want` is the rendered text at `at` in `page`, as whole words:
+/// "more" is not found inside "furthermore".
+fn matches_at(page: &[(char, usize, usize)], want: &[char], at: usize) -> bool {
+    let end = at + want.len();
+    let alnum = |i: Option<usize>| {
+        i.and_then(|i| page.get(i))
+            .is_some_and(|(c, _, _)| c.is_alphanumeric())
+    };
+    let cut_word = (want[0].is_alphanumeric() && alnum(at.checked_sub(1)))
+        || (want[want.len() - 1].is_alphanumeric() && alnum(Some(end)));
+    !cut_word && page[at..end].iter().map(|(c, _, _)| *c).eq(want.iter().copied())
 }
 
 #[cfg(test)]
@@ -205,6 +212,17 @@ mod tests {
     fn escaped_text_is_found_by_what_the_page_shows() {
         let src = format!("<p>{}</p>", as_source("a.html", "{a} & <b>"));
         assert_eq!(one(&src, "{a} & <b>").as_deref(), Some("&#123;a&#125; &amp; &lt;b&gt;"));
+    }
+
+    #[test]
+    fn edge_inputs_end_with_what_they_hold() {
+        assert!(find("", "a", 2).is_empty());
+        assert!(find("ab", "abc", 2).is_empty());
+        assert!(find("a a a", "a", 0).is_empty());
+        assert_eq!(find("a a a", "a", 9).len(), 3);
+        assert_eq!(find("x &amp;", "&", 2), vec![(2, 7)]);
+        // A no-break space entity and the spaces after it are one run.
+        assert_eq!(one("Hi&nbsp;\n there", "Hi there").as_deref(), Some("Hi&nbsp;\n there"));
     }
 
     #[test]

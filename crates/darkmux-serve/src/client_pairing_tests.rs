@@ -7663,16 +7663,25 @@ fn page_workspace(h: &Harness) -> PathBuf {
     wt
 }
 
+/// The longest one hand edit may take here before the test fails.
+const EDIT_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A hand edit, failed within [`EDIT_BOUND`]. An edit that does not end
+/// aborts the test process: a panic would not end it, since the runtime
+/// waits on the blocking task when it shuts down.
 async fn edit(h: &Harness, token: &str, old: &str, new: &str) -> (u16, Value) {
-    call(
-        h,
-        post(
-            "/client/workspaces/site/edit",
-            Some(token),
-            serde_json::json!({"old": old, "new": new}),
-        ),
-    )
-    .await
+    let req = post(
+        "/client/workspaces/site/edit",
+        Some(token),
+        serde_json::json!({"old": old, "new": new}),
+    );
+    match tokio::time::timeout(EDIT_BOUND, call(h, req)).await {
+        Ok(reply) => reply,
+        Err(_) => {
+            eprintln!("a hand edit ({old:?} to {new:?}) did not end within {EDIT_BOUND:?}");
+            std::process::abort();
+        }
+    }
 }
 
 #[tokio::test]
@@ -7836,7 +7845,8 @@ async fn a_hand_edit_refuses_a_file_with_uncommitted_changes_and_bad_input() {
 }
 
 /// Swaps `file` between a regular file holding `text` and a link to `host`,
-/// each swap one rename, until `stop` is set; leaves the regular file.
+/// each swap one rename, until `stop` is set or [`EDIT_BOUND`] has passed;
+/// leaves the regular file.
 fn swap_with_link(
     file: PathBuf,
     text: &'static str,
@@ -7844,12 +7854,13 @@ fn swap_with_link(
     scratch: PathBuf,
     stop: Arc<std::sync::atomic::AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
+    let deadline = std::time::Instant::now() + EDIT_BOUND;
     std::thread::spawn(move || {
         let (reg, lnk) = (scratch.join("reg"), scratch.join("lnk"));
         loop {
             std::fs::write(&reg, text).unwrap();
             std::fs::rename(&reg, &file).unwrap();
-            if stop.load(Ordering::SeqCst) {
+            if stop.load(Ordering::SeqCst) || std::time::Instant::now() >= deadline {
                 return;
             }
             let _ = std::fs::remove_file(&lnk);
