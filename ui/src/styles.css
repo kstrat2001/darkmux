@@ -4250,11 +4250,19 @@ body {
   font-weight: 400;
 }
 /* The page lost the daemon: every card is shown as it was at its last
-   contact, dimmed, with that time. Its words are unchanged on purpose. */
+   contact, dimmed, with that time. Its words are unchanged on purpose. The
+   time sits in the card's bottom padding, out of the flow, so the card keeps
+   the one size it has in every state (`next-parity-layout-run.spec.ts`). */
+.mach.not-current {
+  position: relative;
+}
 .mach.not-current > :not(.mach-asof) {
   opacity: 0.55;
 }
 .mach .mach-asof {
+  position: absolute;
+  right: 16px;
+  bottom: 1px;
   font: calc(11px * var(--fs-scale)) / 14px var(--font-mono);
   color: var(--error);
 }

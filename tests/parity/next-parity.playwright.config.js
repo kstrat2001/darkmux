@@ -42,7 +42,10 @@ module.exports = defineConfig({
     locale: 'en-US',
   },
   webServer: {
-    command: `python3 -m http.server ${PORT} --directory ${SERVED}`,
+    // The layout suites' server: the staged bundle, plus a live stream that
+    // stays open, so this suite's pages read as connected for as long as a
+    // capture takes (see `installCorpusRoutes`'s `liveStream`).
+    command: `node ${path.join(__dirname, 'lib', 'layout-server.js')} ${SERVED} ${PORT}`,
     url: `http://127.0.0.1:${PORT}/index.html`,
     reuseExistingServer: !process.env.CI,
     timeout: 30_000,

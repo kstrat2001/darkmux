@@ -1,7 +1,6 @@
 === topbar ===
 darkmux
-⟳
-◌LIVE
+●LIVE
 LIVE
 home
 guide
