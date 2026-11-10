@@ -473,6 +473,36 @@ mod tests {
         assert_eq!(dispatched.load(Ordering::SeqCst), 0);
     }
 
+    /// (#3514) A double host's reconcile is never planned against this
+    /// machine: a model priced past any machine's memory still loads on a
+    /// host whose loads take none of it.
+    #[serial_test::serial]
+    #[test]
+    fn dispatch_reconciled_never_plans_a_doubles_load_against_this_machine() {
+        let _env = LeaseTestEnv::new();
+        let factory = || -> Box<dyn ModelHost> {
+            let inner = MockHost::new().cataloged("m", 1u64 << 50);
+            Box::new(crate::lms_room::tests::ArchHost::new(inner, crate::lms_room::tests::Format::Gguf))
+        };
+        let result = dispatch_reconciled_with(
+            test_opts("coder"),
+            SeatClaim::LocalModel(placement("m", 8_000)),
+            |opts| {
+                Ok(DispatchResult {
+                    exit_code: 0,
+                    stdout: format!("dispatched {}", opts.role_id),
+                    stderr: String::new(),
+                    session_id: crate::test_session("n"),
+                    execution: None,
+                    out_dir: None,
+                    trajectory: None,
+                })
+            },
+            &factory,
+        );
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
     #[serial_test::serial]
     #[test]
     fn dispatch_reconciled_evicts_a_darkmux_owned_orphan_before_dispatching() {
