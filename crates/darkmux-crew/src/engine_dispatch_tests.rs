@@ -1717,18 +1717,39 @@ fn a_server_failure_is_the_refusal_its_code_names() {
 
 /// A slow start (1.5 s) of `model` in flight on `port`, begun on a thread:
 /// returns once its server is spawned and recorded.
-fn start_in_flight(r: &Rig, tf: &Tensorfold, model: &'static str, port: u16) -> std::thread::JoinHandle<Result<bool, String>> {
+fn start_in_flight(r: &Rig, tf: &Tensorfold, model: &'static str, port: u16) -> InFlight {
     let (tf, dirs) = (tf.clone(), r.dirs.clone());
-    let starting = std::thread::spawn(move || {
-        let ready = prepare_in(&slow(model, port), &dirs, &tf, quick(), &RealLeases, &mut |_, _| {}).map_err(|e| e.code.to_string())?;
+    let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let marked = ready.clone();
+    let handle = std::thread::spawn(move || {
+        let done = prepare_in(&slow(model, port), &dirs, &tf, quick(), &RealLeases, &mut |_, _| {}).map_err(|e| e.code.to_string())?;
+        marked.store(true, std::sync::atomic::Ordering::SeqCst);
         // Its dispatch runs on a while, holding its server.
         std::thread::sleep(Duration::from_millis(300));
-        Ok(ready.started)
+        Ok(done.started)
     });
     while server::running_now(&r.dirs, "tf").is_none() {
         std::thread::sleep(Duration::from_millis(20));
     }
-    starting
+    InFlight { handle, ready }
+}
+
+/// A start running on another thread, and whether its server has answered
+/// yet: a wait that ends while it has not ended without waiting the start
+/// out, whatever the runner's speed.
+struct InFlight {
+    handle: std::thread::JoinHandle<Result<bool, String>>,
+    ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl InFlight {
+    fn is_ready(&self) -> bool {
+        self.ready.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn join(self) -> std::thread::Result<Result<bool, String>> {
+        self.handle.join()
+    }
 }
 
 /// While a start is in flight on an endpoint, a dispatch for another model
@@ -1745,10 +1766,11 @@ fn busy_for_another_model_is_answered_at_once_while_a_start_is_in_flight() {
     let asked = std::time::Instant::now();
     let err = prepare_in(&target("TensorFold/b", port), &r.dirs, &tf, quick(), &RealLeases, &mut |_, _| {}).err().expect("refused");
     let waited = asked.elapsed();
+    let still_starting = !a.is_ready();
     assert_eq!(a.join().unwrap(), Ok(true));
     assert_eq!(err.code, "busy", "{err}");
     assert_eq!(err.waiting_on.as_deref(), Some("endpoint `tf` is serving `TensorFold/a` for a running dispatch"));
-    assert!(waited < Duration::from_millis(700), "busy was answered after {waited:?}, behind the other model's start");
+    assert!(still_starting, "busy was answered only after the other model's start ended ({waited:?})");
 }
 
 /// `busy` for another model is read before any lock is asked for: while
@@ -1832,9 +1854,10 @@ fn a_stop_ends_the_wait_for_a_start_in_flight() {
     let patience = Patience::new(&real_sleep, &stop, None);
     let err = prepare_with(&slow("TensorFold/m", port), &r.dirs, &tf, quick(), &RealLeases, &patience, &mut |_, _| {}).err().expect("stopped");
     let waited = asked.elapsed();
+    let still_starting = !a.is_ready();
     assert_eq!(err.code(), None, "a stop is not a refusal: {err:?}");
     assert_eq!(err.message(), "darkmux dispatch: stopped waiting for `TensorFold/m` (interrupted); nothing was started or evicted");
-    assert!(waited < Duration::from_millis(700), "the stop was seen after {waited:?}");
+    assert!(still_starting, "the stop was seen only after the start in flight ended ({waited:?})");
     assert_eq!(a.join().unwrap(), Ok(true), "the start in flight went on");
 }
 
@@ -1850,11 +1873,12 @@ fn the_wait_for_a_start_in_flight_ends_busy_at_the_dispatchs_timeout() {
     let patience = Patience::new(&real_sleep, &never_stopped, Some(Duration::from_millis(200)));
     let err = prepare_with(&slow("TensorFold/m", port), &r.dirs, &tf, quick(), &RealLeases, &patience, &mut |_, _| {}).err().expect("refused");
     let waited = asked.elapsed();
+    let still_starting = !a.is_ready();
     let NotResident::Refused(refusal) = err else { panic!("{err:?}") };
     assert_eq!(refusal.code, "busy", "{refusal}");
     assert_eq!(refusal.waiting_on.as_deref(), Some("endpoint `tf` is starting `TensorFold/m` for another dispatch"));
     assert!(refusal.message.contains("still busy after waiting"), "{refusal}");
-    assert!(waited < Duration::from_millis(700), "the timeout was seen after {waited:?}");
+    assert!(still_starting, "the timeout was seen only after the start in flight ended ({waited:?})");
     assert_eq!(a.join().unwrap(), Ok(true), "the start in flight went on");
 }
 
