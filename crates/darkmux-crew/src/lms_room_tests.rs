@@ -143,7 +143,7 @@ impl Rig {
         let bounds = server::Bounds { start: Duration::from_secs(5), stop_grace: Duration::from_secs(2), poll: Duration::from_millis(20) };
         // A load's reservation is kept, as it is while memory pages in, until
         // its lease drops.
-        ServerRoom { dirs: self.dirs(), bounds, machine, settle: |res, need, _| drop(res.set(need)) }
+        ServerRoom { dirs: self.dirs(), bounds, machine, settle: |res, need, _| { res.set(need); } }
     }
 }
 

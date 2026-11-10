@@ -467,24 +467,35 @@ pub(crate) fn load_reserved(
     n_ctx: u32,
     load: &dyn Fn(&str, &str, u32) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    let lock = gate.lock().map_err(|e| {
-        refuse("model_start_failed", format!("could not take darkmux's residency lock ({e:#}); check that darkmux's home is writable"))
-    })?;
-    let lease = LeaseGuard::acquire();
     let models = [identifier.to_string()];
-    let need = gate.commitment(model_key, n_ctx);
-    let free_before = gate.reclaimable().unwrap_or(0);
-    match need {
-        Some(bytes) => lease.write_starting(&models, bytes)?,
-        None => lease.write(&models)?,
-    }
-    drop(lock);
+    let (lease, need, free_before) = reserve_preflight(gate, model_key, &models, n_ctx)?;
     load(model_key, identifier, n_ctx)?;
     if let Some(bytes) = need {
         let res = lease.mark_loaded_reserving(&models, bytes)?;
         gate.settle(lease, res, bytes, free_before);
     }
     Ok(())
+}
+
+/// [`load_reserved`]'s part under the lock: the lease and its reservation,
+/// and the free figure read before the load. The lock is let go on return.
+fn reserve_preflight(
+    gate: &dyn Preflight,
+    model_key: &str,
+    models: &[String],
+    n_ctx: u32,
+) -> anyhow::Result<(LeaseGuard, Option<u64>, u64)> {
+    let _lock = gate.lock().map_err(|e| {
+        refuse("model_start_failed", format!("could not take darkmux's residency lock ({e:#}); check that darkmux's home is writable"))
+    })?;
+    let lease = LeaseGuard::acquire();
+    let need = gate.commitment(model_key, n_ctx);
+    let free_before = gate.reclaimable().unwrap_or(0);
+    match need {
+        Some(bytes) => lease.write_starting(models, bytes)?,
+        None => lease.write(models)?,
+    }
+    Ok((lease, need, free_before))
 }
 
 /// A machine whose memory is unknown, for tests that plan without one.
