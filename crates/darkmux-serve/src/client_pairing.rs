@@ -91,9 +91,20 @@
 //! `--separate-git-dir`; a worktree's is its admin directory in the user's
 //! checkout. A folder under the base that darkmux did not make gets no git.
 //!
+//! **What a client started ends with it.** A run is admitted and run by one
+//! task the request cannot cancel, so an app that hangs up mid-request never
+//! leaves a run registered with nothing running it. `client revoke` edits
+//! the store; this listener sees the store change (and looks again every
+//! minute) and cancels that client's running work and stops its previews
+//! ([`unpaired_tick`]). As `client serve` stops it cancels every running
+//! item and waits, within a bound, for each to end as a canceled run does;
+//! it never waits on a run without one ([`end_running_work`]).
+//!
 //! **State.** `~/.darkmux/clients.json` (0600), every read-modify-write under
 //! an exclusive `flock` on the file itself, so `client approve` in one process
-//! and this listener in another never lose a write. It is darkmux-written
+//! and this listener in another never lose a write. A change replaces the
+//! file in one rename, so it is never empty or half written, whatever
+//! happens mid-write ([`replace_store`]). It is darkmux-written
 //! state, but a hand edit is still checked with the user-file gate's key walk
 //! (`darkmux_types::user_files::key_issues`): an unknown key refuses every
 //! consumer, naming the file, the key path and the closest valid key. Work
@@ -113,7 +124,7 @@ use crate::client_git::WorkCopy;
 use crate::client_wire::*;
 use darkmux_types::client_code::ClientCode;
 use std::collections::HashMap;
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -279,7 +290,7 @@ impl ClientStore {
     /// Load, change, save, all under the file's exclusive lock. `f`'s error
     /// saves nothing.
     pub fn update<T>(&self, f: impl FnOnce(&mut ClientsFile) -> Result<T>) -> Result<T> {
-        let mut guard = darkmux_types::flock::lock_exclusive(&self.path)?;
+        let mut guard = self.lock_current()?;
         let file = guard.file();
         let mut text = String::new();
         file.take(darkmux_types::user_files::MAX_USER_FILE_BYTES + 1)
@@ -291,24 +302,64 @@ impl ClientStore {
         // A migration mints ids, so it is written at once: they must be the
         // same at the next read.
         if migrated || doc != before {
-            rewrite(guard.file(), &doc)?;
+            replace_store(&self.path, &doc)?;
         }
         owner_only(&self.path)?;
         Ok(out)
     }
+
+    /// The exclusive lock on the file now at the store's path. A change
+    /// replaces that file ([`replace_store`]), so a lock that was waited
+    /// for can be on the file the change before it replaced; that one is
+    /// let go and the new file locked, so a change always builds on the
+    /// one before it.
+    fn lock_current(&self) -> Result<darkmux_types::flock::FlockGuard> {
+        loop {
+            let mut guard = darkmux_types::flock::lock_exclusive(&self.path)?;
+            if is_file_at(guard.file(), &self.path)? {
+                return Ok(guard);
+            }
+        }
+    }
 }
 
-/// Replaces the locked file's contents with `doc`, synced.
-fn rewrite(file: &mut std::fs::File, doc: &ClientsFile) -> Result<()> {
+/// Whether `file` is the file now at `path` (not one since replaced there;
+/// a path with no file now is not it either).
+fn is_file_at(file: &std::fs::File, path: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let held = file.metadata().with_context(|| format!("reading {}", path.display()))?;
+    match std::fs::metadata(path) {
+        Ok(there) => Ok((held.dev(), held.ino()) == (there.dev(), there.ino())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(anyhow!("reading {}: {e}", path.display())),
+    }
+}
+
+/// Puts `doc` at `path` in one rename, as a workspace's owner record is
+/// written: a new owner-only file beside it, synced, takes its place, so
+/// the path holds the old store or the new one at every moment, never an
+/// emptied or half-written one (an empty file reads as an empty store,
+/// which would drop every pairing). Called under the store's lock, so one
+/// temp name serves.
+fn replace_store(path: &Path, doc: &ClientsFile) -> Result<()> {
     let mut bytes = serde_json::to_vec_pretty(doc)?;
     bytes.push(b'\n');
-    Ok(replace_contents(file, &bytes)?)
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let _ = std::fs::remove_file(&tmp);
+    let written = write_new_owner_only(&tmp, &bytes).and_then(|()| std::fs::rename(&tmp, path));
+    written.map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow!("writing {}: {e}", path.display())
+    })
 }
 
-/// `file` holds exactly `bytes`, synced to disk.
-fn replace_contents(file: &mut std::fs::File, bytes: &[u8]) -> std::io::Result<()> {
-    file.set_len(0)?;
-    file.rewind()?;
+/// A new file at `path` (which must not exist) holding `bytes`, readable
+/// and writable by its owner only, synced to disk.
+fn write_new_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
     file.write_all(bytes)?;
     file.sync_all()
 }
@@ -1076,7 +1127,10 @@ pub async fn bind_listener(port: u16) -> std::io::Result<tokio::net::TcpListener
 }
 
 /// Serve until Ctrl-C, SIGTERM or SIGHUP (blocking; builds its own
-/// runtime). Each runs the same cleanup on the way out.
+/// runtime). Each runs the same cleanup on the way out: running work is
+/// canceled and waited for within a bound ([`end_running_work`]), every
+/// preview is stopped, and the runtime is ended without waiting on a run
+/// that outlived its cancel ([`end_runtime`]).
 pub fn run(port: u16) -> Result<()> {
     preflight()?;
     let state = ClientServerState::production()?;
@@ -1085,7 +1139,7 @@ pub fn run(port: u16) -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(async move {
+    let served = rt.block_on(async move {
         let listener = bind_listener(port)
             .await
             .with_context(|| format!("binding {}", bind_addr(port)))?;
@@ -1099,7 +1153,6 @@ pub fn run(port: u16) -> Result<()> {
         );
         let mut state = state;
         state.bound = Some(listener.local_addr()?);
-        let shutdown_previews = state.previews.clone();
         // (#3456) Preview containers a `client serve` that died left behind.
         let reaper = state.previews.clone();
         std::thread::spawn(move || {
@@ -1122,20 +1175,159 @@ pub fn run(port: u16) -> Result<()> {
             PREVIEW_IDLE_CHECK_INTERVAL,
             idle_stop.clone(),
         );
-        let stopping = state.previews.clone();
-        let served = serve_until_stopped(listener, router(state), move || stopping.begin_shutdown()).await;
+        let (previews, works) = (state.previews.clone(), state.works.clone());
+        let stopped_at = Arc::new(std::sync::OnceLock::new());
+        let (stopping, cancel_from, stop_began) = (previews.clone(), works.clone(), stopped_at.clone());
+        let served = serve_until_stopped(listener, router(state), move || {
+            let _ = stop_began.set(begin_stop(&stopping, &cancel_from));
+        })
+        .await;
         idle_stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        // (#3456) Shutting down removes every preview container.
-        let previews = shutdown_previews.clone();
-        let removed = tokio::task::spawn_blocking(move || previews.stop_all())
-            .await
-            .unwrap_or_default();
-        for name in &removed {
-            eprintln!("{}", preview_log_line(name, "shutdown", "stopped"));
-        }
-        eprintln!("darkmux client serve: previews stopped ({})", removed.len());
+        let began = stopped_at.get().copied().unwrap_or_else(std::time::Instant::now);
+        finish_stop(previews, works, began + SHUTDOWN_WORK_WAIT).await;
         served
-    })
+    });
+    end_runtime(rt, RUNTIME_EXIT_WAIT);
+    served
+}
+
+/// How long a stopping `client serve` waits, from its stop signal, for the
+/// work it canceled to end: the executor's own [`CANCEL_GRACE`] (after
+/// which it kills a child that would not stop), then room for what follows
+/// a kill (its containers stopped, its terminal record written) and for
+/// the run's commit. With [`RUNTIME_EXIT_WAIT`] the whole stop fits
+/// launchd's 20 s before SIGKILL.
+const SHUTDOWN_WORK_WAIT: std::time::Duration = std::time::Duration::from_secs(CANCEL_GRACE.as_secs() + 5);
+
+/// How long the runtime's own tasks get once everything was stopped or
+/// given up on.
+const RUNTIME_EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The stop begins, at its signal: from here nothing new starts
+/// ([`refused_while_stopping`], [`admit`]) and every running work item is
+/// canceled, so the runs end while open connections drain. Returns when.
+fn begin_stop(previews: &crate::client_preview::Previews, works: &Mutex<HashMap<String, WorkEntry>>) -> std::time::Instant {
+    previews.begin_shutdown();
+    let canceled = cancel_running_work(works);
+    if !canceled.is_empty() {
+        eprintln!("darkmux client serve: canceling running work ({})", canceled.join(", "));
+    }
+    std::time::Instant::now()
+}
+
+/// The rest of the stop, once the listener is done: every preview's
+/// container is removed (#3456) while the canceled work is waited for,
+/// until `work_until` at the latest ([`end_running_work`]). Returns the
+/// work still running then.
+async fn finish_stop(
+    previews: Arc<crate::client_preview::Previews>,
+    works: Arc<Mutex<HashMap<String, WorkEntry>>>,
+    work_until: std::time::Instant,
+) -> Vec<String> {
+    let ending = tokio::task::spawn_blocking(move || end_running_work(&works, work_until));
+    let removed = tokio::task::spawn_blocking(move || previews.stop_all())
+        .await
+        .unwrap_or_default();
+    for name in &removed {
+        eprintln!("{}", preview_log_line(name, "shutdown", "stopped"));
+    }
+    eprintln!("darkmux client serve: previews stopped ({})", removed.len());
+    let left = ending.await.unwrap_or_default();
+    if !left.is_empty() {
+        eprintln!(
+            "darkmux client serve: work still running after its cancel; no longer waiting for it ({})",
+            left.join(", ")
+        );
+    }
+    left
+}
+
+/// Raises the cancel of every running work item, as its client's cancel
+/// would, and returns their ids, sorted. Raising one twice changes nothing.
+fn cancel_running_work(works: &Mutex<HashMap<String, WorkEntry>>) -> Vec<String> {
+    let works = works.lock().unwrap();
+    let mut running: Vec<String> = works
+        .iter()
+        .filter(|(_, w)| matches!(w.status, WorkStatus::Running))
+        .map(|(id, w)| {
+            w.cancel.request();
+            id.clone()
+        })
+        .collect();
+    running.sort();
+    running
+}
+
+/// What `client serve` does about running work as it stops (blocking):
+/// cancels every running item and waits for each to end as a canceled run
+/// does (its terminal state, its edits committed), but never past `until`.
+/// Returns the ids still running then, which the exit no longer waits for.
+pub(crate) fn end_running_work(works: &Mutex<HashMap<String, WorkEntry>>, until: std::time::Instant) -> Vec<String> {
+    loop {
+        let running = cancel_running_work(works);
+        if running.is_empty() || std::time::Instant::now() >= until {
+            return running;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+/// Ends the runtime without waiting on its blocking tasks past `within`: a
+/// run that outlived its cancel is on one of them, and dropping the runtime
+/// would wait for it without bound.
+pub(crate) fn end_runtime(rt: tokio::runtime::Runtime, within: std::time::Duration) {
+    rt.shutdown_timeout(within);
+}
+
+/// Ends what a client that is no longer paired left going: its running
+/// work is canceled and its live previews stopped. `client revoke` only
+/// edits the store, and once it has, no caller owns them, so nothing could
+/// stop them over the API. Returns the serve-log lines (each thing is
+/// ended, and said, once). A store that cannot be read ends nothing.
+pub fn unpaired_tick(state: &ClientServerState) -> Vec<String> {
+    let Ok(store) = state.store.peek() else {
+        return Vec::new();
+    };
+    let paired: std::collections::HashSet<String> = store.clients.into_iter().map(|c| c.id).collect();
+    let mut lines = cancel_unpaired_work(&state.works, &paired);
+    let Ok(base) = (state.worktrees_base)() else {
+        return lines;
+    };
+    let unpaired = |workspace: &str| {
+        crate::client_workspace::owner_of(&base, workspace).is_some_and(|owner| !paired.contains(&owner))
+    };
+    for name in state.previews.stop_live(unpaired) {
+        lines.push(preview_log_line(&name, "revoked", "stopped: its app is no longer paired"));
+    }
+    lines
+}
+
+/// Raises the cancel of every running work item whose client is not in
+/// `paired`, once each. Returns a serve-log line for each, sorted.
+fn cancel_unpaired_work(
+    works: &Mutex<HashMap<String, WorkEntry>>,
+    paired: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let works = works.lock().unwrap();
+    let mut lines: Vec<String> = works
+        .iter()
+        .filter(|(_, w)| matches!(w.status, WorkStatus::Running) && !w.cancel.requested())
+        .filter(|(_, w)| !paired.contains(&w.client_id))
+        .map(|(id, w)| {
+            w.cancel.request();
+            format!("darkmux client serve: work {id}: canceled: its app is no longer paired")
+        })
+        .collect();
+    lines.sort();
+    lines
+}
+
+/// What tells one version of the store's file from the next, from one
+/// `stat`: every change replaces the file ([`replace_store`]).
+fn store_stamp(store: &ClientStore) -> Option<(Option<std::time::SystemTime>, u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(store.path()).ok()?;
+    Some((meta.modified().ok(), meta.len(), meta.ino()))
 }
 
 /// How long a stopping `client serve` waits for open connections before it
@@ -1287,12 +1479,18 @@ async fn refused_while_stopping(
         )
     })?;
     if state.previews.stopping() {
-        return Err(err(
-            StatusCode::SERVICE_UNAVAILABLE, ClientCode::Unavailable,
-            "darkmux client serve is stopping; send the request again once it is back",
-        ));
+        return Err(stopping_refusal());
     }
     Ok(axum::extract::Request::from_parts(parts, Body::from(bytes)))
+}
+
+/// The refusal of a request that could start something once `client serve`
+/// has begun to stop.
+fn stopping_refusal() -> Response {
+    err(
+        StatusCode::SERVICE_UNAVAILABLE, ClientCode::Unavailable,
+        "darkmux client serve is stopping; send the request again once it is back",
+    )
 }
 
 /// Why [`only_this_machines_apps`] refuses `req`, or `None` to let it in.
@@ -1864,49 +2062,55 @@ pub(crate) async fn work_handler(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let spec = match admitted_work(&state, &headers, body).await {
-        Ok(spec) => spec,
+    let (client, req) = match work_request(&state, &headers, body).await {
+        Ok(asked) => asked,
         Err(r) => return *r,
     };
-    let work_id = spec.work_id.clone();
-    let profile = spec.profile.clone();
-    let execute = state.execute.clone();
-    let works = state.works.clone();
-    let now = state.now.clone();
-    let Some(cancel) = works
-        .lock()
-        .unwrap()
-        .get(&work_id)
-        .map(|w| w.cancel.clone())
-    else {
-        return internal(anyhow!("work {work_id} was admitted but is not registered"));
-    };
-    tokio::task::spawn_blocking(move || run_work(&execute, &works, spec, &cancel, &*now));
-    (
-        StatusCode::ACCEPTED,
-        Json(WorkAccepted { work_id, profile }),
-    )
-        .into_response()
+    let (answer, answered) = tokio::sync::oneshot::channel();
+    tokio::task::spawn_blocking(move || admit_and_run(&state, &client, req, answer));
+    match answered.await {
+        Ok(Ok(accepted)) => (StatusCode::ACCEPTED, Json(accepted)).into_response(),
+        Ok(Err(r)) => *r,
+        Err(_) => internal(anyhow!("work admission panicked")),
+    }
 }
 
-/// The request, authenticated and admitted ([`admit`]), off the async
-/// workers: the checks read the role library, the registry, config.json and
-/// the disk.
-async fn admitted_work(
+/// The request's client and body, before anything is registered.
+async fn work_request(
     state: &ClientServerState,
     headers: &HeaderMap,
     body: Body,
-) -> Result<WorkSpec, Refused> {
+) -> Result<(ApprovedClient, WorkBody), Refused> {
     let client = authenticate(state, headers)?;
     let req: WorkBody = json_body(body).await.map_err(Box::new)?;
     if req.message.trim().is_empty() {
         return Err(refuse(StatusCode::BAD_REQUEST, ClientCode::BadRequest, "`message` is empty"));
     }
-    let st = state.clone();
-    match tokio::task::spawn_blocking(move || admit(&st, &client, req)).await {
+    Ok((client, req))
+}
+
+/// Admits the request ([`admit`]) and runs what it admitted, in one task
+/// off the async workers (the checks read the role library, the registry,
+/// config.json and the disk), answering through `answer` in between. The
+/// request's own future only waits for that answer: a client that hangs up
+/// while its request is being admitted drops the future, never the task,
+/// so work registered as running always has its runner.
+fn admit_and_run(
+    state: &ClientServerState,
+    client: &ApprovedClient,
+    req: WorkBody,
+    answer: tokio::sync::oneshot::Sender<Result<WorkAccepted, Refused>>,
+) {
+    let (spec, cancel) = match admit(state, client, req) {
         Ok(admitted) => admitted,
-        Err(e) => Err(Box::new(internal(anyhow!("work admission panicked: {e}")))),
-    }
+        Err(r) => {
+            let _ = answer.send(Err(r));
+            return;
+        }
+    };
+    // Nobody waiting for the answer changes nothing: the work is registered.
+    let _ = answer.send(Ok(WorkAccepted { work_id: spec.work_id.clone(), profile: spec.profile.clone() }));
+    run_work(&state.execute, &state.works, spec, &cancel, &*state.now);
 }
 
 /// Runs one admitted work item to its end, blocking, and records how it went.
@@ -2045,19 +2249,27 @@ fn changed_paths(status: &WorkStatus) -> Vec<String> {
 }
 
 /// Every refusal a work request can meet, in order; on success the work is
-/// registered as running and its spec (with the RESOLVED profile) returned.
+/// registered as running and its spec (with the RESOLVED profile) returned,
+/// with the flag that cancels it.
 fn admit(
     state: &ClientServerState,
     client: &ApprovedClient,
     req: WorkBody,
-) -> Result<WorkSpec, Refused> {
+) -> Result<(WorkSpec, Arc<CancelFlag>), Refused> {
     check_role(state, &req.role)?;
     let workdir = admitted_workdir(state, client, &req)?;
     let profile = admitted_profile(state, &req)?;
     let work_id = format!("w-{}", random_hex(8).map_err(internal)?);
     let now = (state.now)();
     let git = workdir.as_deref().and_then(|w| work_copy_for(state, w));
+    let cancel = Arc::new(CancelFlag::default());
     let mut works = state.works.lock().unwrap();
+    // Read under the lock the stop takes to look at the running work
+    // ([`end_running_work`]): a request admitted before the stop began is
+    // registered by the time it looks, and none is registered after.
+    if state.previews.stopping() {
+        return Err(Box::new(stopping_refusal()));
+    }
     check_capacity(&mut works, client, now)?;
     check_work_copy(&works, client, workdir.as_ref(), req.continues.as_deref())?;
     let continues = req.continues.clone().filter(|c| works.contains_key(c));
@@ -2068,7 +2280,7 @@ fn admit(
             created: now,
             finished: None,
             status: WorkStatus::Running,
-            cancel: Arc::new(CancelFlag::default()),
+            cancel: cancel.clone(),
             git: git.clone(),
             workdir: workdir.clone(),
             baseline: None,
@@ -2090,13 +2302,14 @@ fn admit(
         state.works.lock().unwrap().remove(&work_id);
         return Err(r);
     }
-    Ok(WorkSpec {
+    let spec = WorkSpec {
         work_id,
         role: req.role,
         profile,
         workdir,
         message: req.message,
-    })
+    };
+    Ok((spec, cancel))
 }
 
 /// A work copy with an origin that is not on a `mux/` branch of its own (a
@@ -3314,7 +3527,11 @@ pub fn preview_idle_tick(state: &ClientServerState, skipped: &mut Option<String>
         .collect()
 }
 
-/// Starts the idle check's thread: every `interval` until `stop` is set.
+/// Starts the idle check's thread: every `interval` until `stop` is set,
+/// one [`preview_idle_tick`] and one [`unpaired_tick`]. Between checks it
+/// looks at the store's file (one `stat` each 200 ms) and runs
+/// [`unpaired_tick`] as soon as that changed, so a `client revoke` ends the
+/// client's work and previews within a moment, not at the next minute.
 pub(crate) fn spawn_preview_idle_check(
     state: ClientServerState,
     interval: std::time::Duration,
@@ -3323,6 +3540,7 @@ pub(crate) fn spawn_preview_idle_check(
     use std::sync::atomic::Ordering;
     std::thread::spawn(move || {
         let mut skipped = None;
+        let mut stamp = store_stamp(&state.store);
         let poll = interval.min(std::time::Duration::from_millis(200));
         loop {
             let mut slept = std::time::Duration::ZERO;
@@ -3332,12 +3550,23 @@ pub(crate) fn spawn_preview_idle_check(
                 }
                 std::thread::sleep(poll);
                 slept += poll;
+                let now = store_stamp(&state.store);
+                if now != stamp {
+                    stamp = now;
+                    log_lines(unpaired_tick(&state));
+                }
             }
-            for line in preview_idle_tick(&state, &mut skipped) {
-                eprintln!("{line}");
-            }
+            log_lines(preview_idle_tick(&state, &mut skipped));
+            log_lines(unpaired_tick(&state));
         }
     })
+}
+
+/// Writes serve-log lines to stderr.
+fn log_lines(lines: Vec<String>) {
+    for line in lines {
+        eprintln!("{line}");
+    }
 }
 
 pub(crate) async fn preview_stop_handler(
