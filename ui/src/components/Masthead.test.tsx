@@ -4,12 +4,19 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Masthead, RECONNECTING_ANNOUNCE_DELAY_MS } from "./Masthead";
 import type { Route } from "../lib/route";
 import { closeOpenModal, getOpenId } from "../lib/dialogManager";
+import { clkhm } from "../lib/format";
 
-function renderMasthead(route: Route, liveStatus: "live" | "reconnecting" = "live", replayDate: string | null = null, subject: "pending" | "failed" | "resolved" = "resolved") {
+function renderMasthead(
+  route: Route,
+  liveStatus: "live" | "reconnecting" = "live",
+  replayDate: string | null = null,
+  subject: "pending" | "failed" | "resolved" = "resolved",
+  dataAsOfMs: number | null = null,
+) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
-      <Masthead route={route} liveStatus={liveStatus} replayDate={replayDate} subject={subject} />
+      <Masthead route={route} liveStatus={liveStatus} replayDate={replayDate} subject={subject} dataAsOfMs={dataAsOfMs} />
     </QueryClientProvider>,
   );
 }
@@ -322,7 +329,6 @@ describe("Masthead — the pill is the ONE transport control (#2412)", () => {
     vi.useFakeTimers();
     const { container } = renderMasthead({ kind: "fleet" } as Route, "reconnecting");
     const toggle = container.querySelector(".catalog-toggle")!;
-    expect(toggle.textContent).toContain("LIVE");
     const dot = toggle.querySelector(".masthead__pilldot")!;
     expect(dot.className).toContain("stale");
     expect(dot.className).not.toContain(" live");
@@ -330,9 +336,38 @@ describe("Masthead — the pill is the ONE transport control (#2412)", () => {
     act(() => {
       vi.advanceTimersByTime(RECONNECTING_ANNOUNCE_DELAY_MS);
     });
+    expect(toggle.querySelector(".masthead__pilltext")!.textContent).toBe("reconnecting");
     const live = toggle.querySelector('[aria-live="polite"]')!;
     expect(live.textContent).toBe("reconnecting");
     vi.useRealTimers();
+  });
+
+  // A frozen daemon left the pill reading LIVE, with "reconnecting" only in a
+  // tooltip and a screen-reader span. Shown means rendered: the words are on
+  // the pill, with how old the page's data is.
+  it("(b1) live + reconnecting: the pill SAYS reconnecting and how old the data is, instead of LIVE", () => {
+    vi.useFakeTimers();
+    try {
+      const asOf = Date.UTC(2026, 10, 10, 14, 2, 30);
+      const { container } = renderMasthead({ kind: "fleet" } as Route, "reconnecting", null, "resolved", asOf);
+      const text = () => container.querySelector(".catalog-toggle .masthead__pilltext")!;
+      // Inside the hold (a page whose stream has not opened yet, or a hiccup)
+      // the words do not flash; the dot already says it.
+      expect(text().textContent).toBe("LIVE");
+      act(() => {
+        vi.advanceTimersByTime(RECONNECTING_ANNOUNCE_DELAY_MS);
+      });
+      expect(text().textContent).toBe(`reconnecting · data as of ${clkhm(asOf)}`);
+      expect(clkhm(asOf)).toMatch(/^\d\d:\d\d$/);
+      expect(container.querySelector(".catalog-toggle")!.textContent).not.toContain("LIVE");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("(b1) live + connected never shows an as-of time", () => {
+    const { container } = renderMasthead({ kind: "fleet" } as Route, "live", null, "resolved", Date.UTC(2026, 10, 10, 14, 2));
+    expect(container.querySelector(".catalog-toggle .masthead__pilltext")!.textContent).toBe("LIVE");
   });
 
   it("(#2284) a pending subject still announces a dropped stream as reconnecting once the hold elapses", () => {

@@ -135,6 +135,33 @@ describe("MachineHealthRegion: absence vs zero (the machine-lens provenance key 
     }
   });
 
+  // A resident server too busy to answer read "STARTING THE MODEL" for as
+  // long as it ran. Past the start bound it says it does not answer.
+  it("a server not answering long after its start says NOT ANSWERING, not STARTING", () => {
+    const now = 4 * 3600_000;
+    const busy: MachineResourcesResponse["models"][number] = {
+      identifier: "darkmux:TensorFold/q38",
+      model_key: "TensorFold/q38",
+      owner: "darkmux",
+      loaded_ctx: 262144,
+      weights_bytes: null as unknown as number,
+      kv_per_token_bytes: null as unknown as number,
+      kv_bytes_at_ctx: null as unknown as number,
+      potential_bytes: 21474836480,
+      potential_source: "measured",
+      current_bytes: 21474836480,
+      state: "green",
+      server: { endpoint: "tensorfold", engine: "tensorfold", model: "TensorFold/q38", served_name: "darkmux:TensorFold/q38", n_ctx: 262144, port: 8091, pid: 4242, started_at_ms: now - 3 * 3600_000, answering: false },
+    };
+    const { container } = renderRegion({ ...BASE, machine: { ...BASE.machine, state: "green" }, models: [busy] }, { nowMs: now });
+    const row = [...container.querySelectorAll(".mm-row")].find((c) => c.textContent?.includes("TensorFold/q38"))!;
+    expect(row.textContent).toContain("NOT ANSWERING");
+    expect(row.textContent).not.toContain("STARTING");
+    // A measured server on a green machine earns green: no state chip.
+    expect(row.querySelector(".mm-row-chip.is-state")).toBeNull();
+    expect(row.textContent).not.toContain("UNKNOWN");
+  });
+
   it("draws a .mm-row-pot layer for a priced model in the SAME payload", () => {
     const { container } = renderRegion(BASE);
     const pricedRow = [...container.querySelectorAll(".mm-row")].find((c) => c.textContent?.includes("priced-model") && !c.textContent?.includes("unpriced"))!;

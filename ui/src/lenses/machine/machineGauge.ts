@@ -612,7 +612,11 @@ export interface ResidencyState {
   shownGhosts: Set<string>;
 }
 
+/** A row's identity across polls. A server darkmux started is keyed on its
+ * endpoint: its `identifier` is the name it answers to, and every Flint
+ * server answers to `flint`, so two of them would share one row. */
 function rowIdentifier(m: ModelRow): string {
+  if (m.server) return `server:${m.server.endpoint}`;
   return m.identifier || m.model_key;
 }
 
@@ -761,7 +765,8 @@ export function modelKvLine(m: ModelRow): string {
   // has no weights or kv figure, and its potential IS its current.
   if (m.server) {
     const s = m.server;
-    return `ctx ${m.loaded_ctx} · ${s.engine} server for ${s.model} on endpoint ${s.endpoint}, port ${s.port} · measured ${memBytes(m.current_bytes)}`;
+    const memory = m.current_bytes != null ? `measured ${memBytes(m.current_bytes)}` : "not measured";
+    return `ctx ${m.loaded_ctx} · ${s.engine} server for ${s.model} on endpoint ${s.endpoint}, port ${s.port} · ${memory}`;
   }
   const kv = m.kv_bytes_at_ctx != null ? `kv@ctx ${memBytes(m.kv_bytes_at_ctx)}` : "kv unknown (no arch facts)";
   // #1819: an ESTIMATED row's potential is a labeled guess, not a

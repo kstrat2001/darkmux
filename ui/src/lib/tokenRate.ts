@@ -1481,10 +1481,14 @@ export function lastHeartbeatMs(perExecutionRecords: NormRecord[][]): number | n
  *  second liveness mechanism of its own; it only knows a boolean (and,
  *  below, a timestamp read from that same source).
  *
- *  Only `"stalled"` is downgraded. Every other state
- *  (`generating`/`rest`/`tools`/`prompt`) is read from records already in
- *  hand, which a lost connection does not retroactively invalidate — those
- *  may be a little stale, not actively WRONG the way a false STALL claim is.
+ *  While disconnected, EVERY state is downgraded, not only `"stalled"`. The
+ *  others (`generating`/`rest`/`tools`/`prompt`) are read from records in
+ *  hand, but each is a claim about now, and a frozen daemon proved how long
+ *  "a little stale" can last: a card read "processing prompt" with a moving
+ *  scope for as long as the freeze held, because a prompt's bound is minutes
+ *  and the reading never reached STALL. The half-open check below still
+ *  applies to `"stalled"` alone: it guards a connection the page does not
+ *  yet know it lost, where the other states are still honest.
  *
  *  Returns `null` on a downgrade — the exact "no live execution" reading
  *  both callers already render as every lamp off and no rate
@@ -1513,8 +1517,8 @@ export function liveStateWhileConnected(
   connected: boolean,
   halfOpen?: { lastContactMs: number | null; lastHeartbeatMs: number | null },
 ): LiveStateReading | null {
-  if (reading?.state !== "stalled") return reading;
-  if (!connected) return null;
+  if (reading === null || !connected) return null;
+  if (reading.state !== "stalled") return reading;
   if (halfOpen && halfOpen.lastHeartbeatMs != null) {
     const deadline = halfOpen.lastHeartbeatMs + STALL_AFTER_MS;
     if (halfOpen.lastContactMs == null || halfOpen.lastContactMs < deadline) return null;

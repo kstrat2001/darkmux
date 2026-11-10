@@ -916,6 +916,11 @@ body {
      two — plus the pill's own right edge never crossing the viewport).
      Desktop has no matching rule: this is `.masthead__pilltext`'s ONLY
      `max-width`, scoped to this breakpoint. */
+  /* A dropped stream's "data as of" words: the time beside "reconnecting"
+     is what a phone keeps (`Masthead.tsx`'s `livePillText`). */
+  .masthead__asof {
+    display: none;
+  }
   .masthead__pilltext {
     display: inline-block;
     max-width: calc(100vw - 190px);
@@ -4238,6 +4243,29 @@ body {
 /* (rec 2) What the machine serves, in words, under the count. A FIXED line:
    its height is reserved whether or not it has words, so a machine that
    serves nothing is the size of one that serves both. */
+/* The run page's header while the page has lost the daemon. */
+.session-run__asof {
+  font: calc(11px * var(--fs-scale)) / 1 var(--font-mono);
+  color: var(--error);
+  font-weight: 400;
+}
+/* The page lost the daemon: every card is shown as it was at its last
+   contact, dimmed, with that time. Its words are unchanged on purpose. The
+   time sits in the card's bottom padding, out of the flow, so the card keeps
+   the one size it has in every state (`next-parity-layout-run.spec.ts`). */
+.mach.not-current {
+  position: relative;
+}
+.mach.not-current > :not(.mach-asof) {
+  opacity: 0.55;
+}
+.mach .mach-asof {
+  position: absolute;
+  right: 16px;
+  bottom: 1px;
+  font: calc(11px * var(--fs-scale)) / 14px var(--font-mono);
+  color: var(--error);
+}
 .mach .serves {
   margin-top: 5px;
   height: 14px;
@@ -4254,6 +4282,13 @@ body {
 @media (max-width: 560px) {
   .mach .serves {
     font-size: 11px;
+  }
+  /* (#3450) The engine servers' names live in the line's title on desktop;
+     a phone has no hover, so the line wraps instead of cutting them off. */
+  .mach .serves.serves--engines {
+    height: auto;
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
 }
 /* The status lamp (`components/LampDot.tsx`), as the run page's state lamps. */

@@ -533,6 +533,36 @@ function plausiblyRunningOf(l: Lifecycle | null, row: Run | null, live: boolean,
   return shownRunState(l, row, live).status === "running" && !(rowDecides ? silentMachine : stopped);
 }
 
+/** The last contact, while the page has lost the daemon at the live edge;
+ *  `null` while it is connected, scrubbed, or has no contact to name. */
+function notCurrentAsOfOf(playhead: number | null, connected: boolean, lastContactMs: number | null): number | null {
+  if (playhead !== null || connected) return null;
+  return lastContactMs;
+}
+
+/** The page's "now": its last contact while it is not current. */
+function pageNow(notCurrentAsOf: number | null): number {
+  return notCurrentAsOf ?? Date.now();
+}
+
+/** Whether the shared 1 s clock subscribes: a plausibly running run, at the
+ *  live edge of a daemon-backed page that can see the daemon. */
+function ticksLive(plausiblyRunning: boolean, sourceKind: string, playhead: number | null, notCurrentAsOf: number | null): boolean {
+  if (!plausiblyRunning || sourceKind === "static" || injectedPlaybackDate() != null) return false;
+  return playhead === null && notCurrentAsOf === null;
+}
+
+/** The header's "as of HH:MM" while the page cannot see a running run. */
+function RunAsOf({ asOf }: { asOf: number | null }) {
+  if (asOf === null) return null;
+  return (
+    <>
+      {" "}
+      <span className="session-run__asof">as of {clkhm(asOf)}</span>
+    </>
+  );
+}
+
 /** At the live edge, a run's row (`/runs`, polled every `PRESENCE_POLL_MS`)
  *  can lag its flow terminal: the run closed, its row still reads in flight.
  *  The row decides how the run ended, so the page never shows an ending of
@@ -777,7 +807,12 @@ export function SessionReplay({
   // `wallNow` is a plain per-render `Date.now()` read (not a hook) — it
   // does not itself drive a re-render; see `ticking`/`useNowMs` below for
   // what does, at the live edge only.
-  const wallNow = Date.now();
+  // While the page has lost the daemon (a live route, at the live edge), the
+  // page's "now" is its last contact: the counters stop there instead of
+  // counting time the page cannot see, and the header says "as of". The
+  // status shown is whatever it was then; this page never decides a new one.
+  const notCurrentAsOf = notCurrentAsOfOf(playhead, connected, lastContactMs);
+  const wallNow = pageNow(notCurrentAsOf);
   const { asOf: clockNow, presence } = judgementAt(playhead, wallNow, livePresence);
   const pageRun = hasRecords ? sessionRun(data, sessionId, clockNow) : null;
   // The row whose run IS this session: the pill and the tiles show its
@@ -805,7 +840,7 @@ export function SessionReplay({
   // below fell back to `base` — `runRegions` with NO override, i.e. the
   // newest CUT record's own timestamp — instead of the playhead, so the
   // reading only advanced when a new record happened to arrive.
-  const ticking = plausiblyRunning && source.kind !== "static" && injectedPlaybackDate() == null && playhead === null;
+  const ticking = ticksLive(plausiblyRunning, source.kind, playhead, notCurrentAsOf);
   const nowMs = useNowMs(ticking);
   // (#2961) The playhead's clock, for REST's seconds hand.
   const playbackClock = usePlaybackClock();
@@ -928,6 +963,7 @@ export function SessionReplay({
           ({view.header.sid} on {view.header.machineName}
           {relayedSuffix(relay)})
         </span>
+        <RunAsOf asOf={view.ended ? null : notCurrentAsOf} />
       </h2>
 
       {view.briefLines.length > 0 && (

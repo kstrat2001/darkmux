@@ -714,6 +714,7 @@ export function App() {
         liveStatus={liveStatus}
         replayDate={route.kind === "playback" ? null : replayDate}
         subject={subject}
+        dataAsOfMs={lastContactRef.current}
       />
       {/* (#2107) Global machine-stats pill/drawer — a SIBLING of `<Masthead>`,
           not a child of it, so it can never touch that component's own

@@ -310,6 +310,22 @@ pub struct EngineServer {
     pub answering: bool,
 }
 
+impl EngineServer {
+    /// What a server that does not answer is doing, in the words every
+    /// surface uses: "starting the model" while its start is inside
+    /// [`START_BOUND`] (darkmux stops a start that runs longer), "not
+    /// answering" after (a resident too busy to answer the listing, or one
+    /// that stopped answering). The viewer words it the same
+    /// (`ui/src/lib/engineServers.ts`).
+    pub fn silent_word(&self, now_ms: u64) -> &'static str {
+        if u128::from(now_ms.saturating_sub(self.started_at_ms)) < START_BOUND.as_millis() {
+            "starting the model"
+        } else {
+            "not answering"
+        }
+    }
+}
+
 /// How long a listing waits for a server to answer `GET /v1/models`. Every
 /// server is asked at the same time, so a listing waits about this long
 /// however many servers run: well inside the 2 s a peer gives a machine card,
