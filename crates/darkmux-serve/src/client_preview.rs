@@ -120,10 +120,11 @@
 
 use crate::client_wire::PreviewState;
 
-/// Delete and create inside a run-written folder without crossing a link.
+/// Delete, create, read and replace inside a run-written folder without
+/// crossing a link (a hand edit's reads and write go through it too).
 #[cfg(unix)]
 #[path = "client_preview_at.rs"]
-mod at;
+pub(crate) mod at;
 use darkmux_types::data_version::PREVIEW_RECIPE_SCHEMA_VERSION;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
