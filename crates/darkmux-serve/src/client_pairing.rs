@@ -1169,12 +1169,7 @@ pub fn run(port: u16) -> Result<()> {
         );
         let mut state = state;
         state.bound = Some(listener.local_addr()?);
-        // Clones a `client serve` killed mid-clone left half done.
-        if let Ok(base) = (state.worktrees_base)() {
-            for name in crate::client_workspace::sweep_partials(&base) {
-                eprintln!("darkmux client serve: removed workspace {name}'s unfinished clone (a stop interrupted it)");
-            }
-        }
+        log_lines(swept_partials(&state));
         // (#3456) Preview containers a `client serve` that died left behind.
         let reaper = state.previews.clone();
         std::thread::spawn(move || {
@@ -1211,6 +1206,18 @@ pub fn run(port: u16) -> Result<()> {
     });
     end_runtime(rt, RUNTIME_EXIT_WAIT);
     served
+}
+
+/// Sweeps the clones a `client serve` stopped mid-clone left half done
+/// ([`crate::client_workspace::sweep_partials`]); a serve-log line each.
+pub(crate) fn swept_partials(state: &ClientServerState) -> Vec<String> {
+    let Ok(base) = (state.worktrees_base)() else {
+        return Vec::new();
+    };
+    crate::client_workspace::sweep_partials(&base)
+        .into_iter()
+        .map(|name| format!("darkmux client serve: removed workspace {name}'s unfinished clone (a stop interrupted it)"))
+        .collect()
 }
 
 /// How long a stopping `client serve` waits, from its stop signal, for the
@@ -4278,12 +4285,8 @@ fn undo_run(st: &ClientServerState, headers: &HeaderMap, work_id: &str) -> Respo
     let (Some(wd), Some(commit)) = (w.git.clone(), w.commit.clone()) else {
         return err(StatusCode::CONFLICT, ClientCode::Conflict, "the run has no git work copy");
     };
-    let _held = match UndoHold::take(&st.works, work_id) {
+    let _held = match UndoHold::take(&st.works, work_id).and_then(|undo| Ok((undo, held_work_copy(st, Some(&wd))?))) {
         Ok(h) => h,
-        Err(r) => return *r,
-    };
-    let _in_use = match held_work_copy(st, Some(&wd)) {
-        Ok(held) => held,
         Err(r) => return *r,
     };
     if let Some(by) = changed_later(st, &wd, &commit, &w.files) {

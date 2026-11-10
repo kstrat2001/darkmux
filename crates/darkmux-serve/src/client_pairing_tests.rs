@@ -3905,6 +3905,8 @@ fn a_half_done_clone_is_swept_and_its_name_freed() {
     std::fs::create_dir(base.join("kept")).unwrap();
     let busy = try_hold(base, "busy", Hold::Sole).unwrap().unwrap();
     assert_eq!(sweep_partials(base), ["gone", "kept"]);
+    std::fs::create_dir_all(base.join(".again.partial")).unwrap();
+    assert_eq!(swept_partials(&h.state), ["darkmux client serve: removed workspace again's unfinished clone (a stop interrupted it)"]);
     assert!(!name_taken(base, "gone"), "its name is free again");
     assert_eq!(kept_for(&h, "gone"), Vec::<String>::new());
     let kept = kept_for(&h, "kept");
