@@ -64,17 +64,22 @@ pub fn normalize(text: &str) -> String {
 /// the source it came from.
 fn rendered(source: &str) -> Vec<(char, usize, usize)> {
     let mut out = Vec::new();
-    let mut i = 0;
-    while i < source.len() {
+    // A `for` over the chars, skipping what a run or an entity already
+    // took: no index arithmetic can keep it from ending (#3533's mutation
+    // shard timed out on mutants that turned a `while` into a spin).
+    let mut taken = 0;
+    for (i, c) in source.char_indices() {
+        if i < taken {
+            continue;
+        }
         let rest = &source[i..];
-        let c = rest.chars().next().expect("i is on a char boundary");
         if c.is_whitespace() || c == '\u{a0}' {
             let run = rest
                 .char_indices()
                 .find(|(_, c)| !(c.is_whitespace() || *c == '\u{a0}'))
                 .map_or(rest.len(), |(n, _)| n);
             out.push((' ', i, i + run));
-            i += run;
+            taken = i + run;
         } else if let Some((ent, ch)) = ENTITIES.iter().find(|(e, _)| rest.starts_with(e)) {
             // A no-break space entity is whitespace too, and joins a run.
             if *ch == ' ' && matches!(out.last(), Some((' ', _, end)) if *end == i) {
@@ -82,10 +87,9 @@ fn rendered(source: &str) -> Vec<(char, usize, usize)> {
             } else {
                 out.push((*ch, i, i + ent.len()));
             }
-            i += ent.len();
+            taken = i + ent.len();
         } else {
             out.push((c, i, i + c.len_utf8()));
-            i += c.len_utf8();
         }
     }
     out
@@ -100,9 +104,16 @@ pub fn find(source: &str, wanted: &str, limit: usize) -> Vec<(usize, usize)> {
     }
     let page = rendered(source);
     let mut found = Vec::new();
-    let mut at = 0;
-    while at + want.len() <= page.len() && found.len() < limit {
+    // Bounded like `rendered`: a match skips its own chars through `next`.
+    let mut next = 0;
+    for at in 0..page.len() {
+        if found.len() >= limit {
+            break;
+        }
         let end = at + want.len();
+        if at < next || end > page.len() {
+            continue;
+        }
         // Whole words only: "more" is not found inside "furthermore".
         let alnum = |i: Option<usize>| {
             i.and_then(|i| page.get(i))
@@ -116,10 +127,8 @@ pub fn find(source: &str, wanted: &str, limit: usize) -> Vec<(usize, usize)> {
                 .map(|(c, _, _)| *c)
                 .eq(want.iter().copied())
         {
-            found.push((page[at].1, page[at + want.len() - 1].2));
-            at += want.len();
-        } else {
-            at += 1;
+            found.push((page[at].1, page[end - 1].2));
+            next = end;
         }
     }
     found
