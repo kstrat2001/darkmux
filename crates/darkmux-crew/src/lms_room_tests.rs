@@ -470,7 +470,7 @@ fn a_refused_wave_runs_none_of_its_jobs_and_each_ends_in_an_error() {
         let free = || Some(GIB);
         let machine = FakeMachine { capacity: Some(capacity), ..FakeMachine::new(&free) };
         let est = FixedEstimator(std::collections::BTreeMap::from([("map-model".to_string(), 5_000_000_000)]));
-        let results = run_bounded(jobs, &Facts::default(), &est, 4, &factory, &rig.room(&machine)).expect("planned");
+        let results = run_bounded(jobs, &Facts::default(), &est, 4, &factory, Some(&rig.room(&machine))).expect("planned");
         assert_eq!(ran.load(Ordering::SeqCst), 0, "no job of the refused wave ran");
         assert_eq!(results.len(), 2, "every job has its terminal result");
         for (_, r) in &results {
@@ -537,7 +537,7 @@ fn a_missions_waves_are_packed_against_the_machines_memory() {
         Box::new(MockHost::new().cataloged("a", 20 * GIB).cataloged("b", 20 * GIB).cataloged("c", 20 * GIB))
     };
     let three: Vec<Placement> = ["a", "b", "c"].iter().flat_map(|m| wave(m)).collect();
-    let schedule = schedule_waves(&three, &Facts::default(), &FixedEstimator::default(), &factory, &room).unwrap();
+    let schedule = schedule_waves(&three, &Facts::default(), &FixedEstimator::default(), &factory, Some(&room)).unwrap();
     assert_eq!(schedule.waves.len(), 2, "{schedule:?}");
     // The same three with an idle 30 GiB darkmux load to free: one wave.
     let with_idle = || -> Box<dyn ModelHost> {
@@ -549,15 +549,15 @@ fn a_missions_waves_are_packed_against_the_machines_memory() {
                 .cataloged("c", 20 * GIB),
         )
     };
-    let schedule = schedule_waves(&three, &Facts::default(), &FixedEstimator::default(), &with_idle, &room).unwrap();
+    let schedule = schedule_waves(&three, &Facts::default(), &FixedEstimator::default(), &with_idle, Some(&room)).unwrap();
     assert_eq!(schedule.waves.len(), 1, "{schedule:?}");
     // Sibling seats on `a` ride together.
     let siblings: Vec<Placement> = ["x", "y", "z"].iter().map(|s| Placement { seat: s.to_string(), ..wave("a")[0].clone() }).collect();
-    let schedule = schedule_waves(&siblings, &Facts::default(), &FixedEstimator::default(), &factory, &room).unwrap();
+    let schedule = schedule_waves(&siblings, &Facts::default(), &FixedEstimator::default(), &factory, Some(&room)).unwrap();
     assert_eq!(schedule.waves.len(), 1, "{schedule:?}");
     // A caller's own pool is planned on as given.
     let unknown = ServerRoom::without_machine();
-    let schedule = schedule_waves(&three, &Facts::default(), &FixedEstimator::default(), &factory, &unknown).unwrap();
+    let schedule = schedule_waves(&three, &Facts::default(), &FixedEstimator::default(), &factory, Some(&unknown)).unwrap();
     assert_eq!(schedule.waves.len(), 1, "no machine figures, no constraint: {schedule:?}");
 }
 
@@ -714,7 +714,7 @@ fn a_resident_the_wave_reuses_is_not_credited_to_its_pool() {
     let est = FixedEstimator(["a", "b", "c"].iter().map(|k| (k.to_string(), 40 * GIB)).collect());
     let factory = || -> Box<dyn ModelHost> { Box::new(MockHost::new().resident("darkmux:a", "a", 8_000, Some(40 * GIB))) };
     let abc: Vec<Placement> = ["a", "b", "c"].iter().flat_map(|m| wave(m)).collect();
-    let schedule = schedule_waves(&abc, &Facts::default(), &est, &factory, &room).unwrap();
+    let schedule = schedule_waves(&abc, &Facts::default(), &est, &factory, Some(&room)).unwrap();
     assert_eq!(schedule.waves, vec![abc[..2].to_vec(), vec![abc[2].clone()]], "{schedule:?}");
 }
 
@@ -747,7 +747,7 @@ fn a_wave_is_refused_only_on_the_commitment() {
         Box::new(ArchHost::new(MockHost::new().resident("m", "m", 8_000, Some(15 * GIB)).cataloged("m", 15 * GIB), Format::Mlx))
     };
     let long = vec![Placement { min_ctx: 200_000, ..wave("m")[0].clone() }];
-    let schedule = schedule_waves(&long, &Facts::default(), &FixedEstimator::default(), &factory, &room).unwrap();
+    let schedule = schedule_waves(&long, &Facts::default(), &FixedEstimator::default(), &factory, Some(&room)).unwrap();
     assert!(schedule.refusals.is_empty(), "{schedule:?}");
     assert_eq!(schedule.waves, vec![long]);
 }

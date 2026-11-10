@@ -1169,8 +1169,9 @@ pub fn run_step_graph(
                     darkmux_types::config_access::dispatch_free_concurrency() as usize,
                     host_factory,
                     // (#3514) Planned against this machine only when its
-                    // loads take this machine's memory.
-                    &crate::lms_room::ServerRoom::for_host(host_factory().as_ref()),
+                    // host's loads take this machine's memory, the host
+                    // made only when a local step needs one.
+                    None,
                 )
             });
             for sig in rx.iter() {

@@ -361,7 +361,11 @@ pub(crate) fn run_bounded<T: Send + 'static>(
     // (`config_access::jobs_at_once`), the darkmux bound convention.
     dispatch_free_cap: usize,
     host_factory: &(dyn Fn() -> Box<dyn ModelHost> + Sync),
-    room: &crate::lms_room::ServerRoom<'_>,
+    // (#3514) The machine the local track is planned against; `None` for
+    // the room of the host `host_factory` makes (this machine for LM
+    // Studio, none for a double), asked only when a local placement needs a
+    // host at all.
+    room: Option<&crate::lms_room::ServerRoom<'_>>,
 ) -> Result<Vec<(usize, JobOutcome<T>)>> {
     // ── partition + stamp local placements with a job-unique seat label ──
     // `plan_waves` returns `Vec<Placement>` BY VALUE; two jobs wanting
@@ -501,13 +505,19 @@ pub(crate) fn schedule_waves(
     facts: &Facts,
     est: &(dyn FootprintEstimator + Sync),
     host_factory: &(dyn Fn() -> Box<dyn ModelHost> + Sync),
-    room: &crate::lms_room::ServerRoom<'_>,
+    room: Option<&crate::lms_room::ServerRoom<'_>>,
 ) -> Result<WaveSchedule> {
     let refused = |e| anyhow!("darkmux: unexpected wave refusal under Auto mode: {e}");
-    if placements.is_empty() || !facts.pools.is_empty() || room.pools().is_empty() {
+    let as_given = placements.is_empty() || !facts.pools.is_empty() || room.is_some_and(|r| r.pools().is_empty());
+    if as_given {
         return darkmux_gestalt::plan_waves(placements, facts, est, WaveMode::Auto).map_err(refused);
     }
     let mut host = host_factory();
+    let own = crate::lms_room::ServerRoom::for_host(host.as_ref());
+    let room = room.unwrap_or(&own);
+    if room.pools().is_empty() {
+        return darkmux_gestalt::plan_waves(placements, facts, est, WaveMode::Auto).map_err(refused);
+    }
     let residents = host.list_resident().unwrap_or_default();
     let pools = room.wave_pools(&residents, placements, facts.utility_binding.as_deref());
     let pricing = crate::lms_room::LoadPricing::for_placements(placements, &residents, est, host.as_mut());
@@ -540,7 +550,7 @@ fn run_local_waves<T: Send + 'static>(
     est: &(dyn FootprintEstimator + Sync),
     host_factory: &(dyn Fn() -> Box<dyn ModelHost> + Sync),
     utility_binding: Option<&str>,
-    room: &crate::lms_room::ServerRoom<'_>,
+    room: Option<&crate::lms_room::ServerRoom<'_>>,
 ) {
     // One host instance for this whole local track — waves within it run
     // strictly sequentially (the `for wave in &schedule.waves` loop below),
@@ -562,6 +572,8 @@ fn run_local_waves<T: Send + 'static>(
     // at the same time; the on-disk file is the union of every live guard's
     // contribution, never a single wholesale overwrite.
     let lease_guard = residency_lease::LeaseGuard::acquire();
+    let own = crate::lms_room::ServerRoom::for_host(host.as_ref());
+    let room = room.unwrap_or(&own);
     for refusal in &schedule.refusals {
         if let Some((index, _job)) = by_seat.remove(&refusal.placement.seat) {
             results.lock().expect("results mutex poisoned").push((
@@ -1578,7 +1590,7 @@ mod tests {
         dispatch_free_cap: usize,
         host_factory: &(dyn Fn() -> Box<dyn ModelHost> + Sync),
     ) -> Result<Vec<(usize, JobOutcome<T>)>> {
-        super::run_bounded(jobs, facts, est, dispatch_free_cap, host_factory, &crate::lms_room::ServerRoom::without_machine())
+        super::run_bounded(jobs, facts, est, dispatch_free_cap, host_factory, Some(&crate::lms_room::ServerRoom::without_machine()))
     }
 
     /// [`super::ensure_wave_loaded`] in its host's room: a double's loads
