@@ -275,18 +275,9 @@ impl ClientStore {
     /// only; an absent one reads as empty and is not created): for a reader
     /// that must change nothing, `darkmux doctor`.
     pub fn peek(&self) -> Result<ClientsFile> {
-        let Some(mut guard) = darkmux_types::flock::lock_shared_existing(&self.path)? else {
+        let Some(mut guard) = self.lock_shared_current()? else {
             return Ok(ClientsFile::default());
         };
-        // A lock that was waited for can be on the file a change replaced
-        // meanwhile ([`ClientStore::lock_current`]): look once more, at the
-        // file that change left.
-        if !is_file_at(guard.file(), &self.path)? {
-            match darkmux_types::flock::lock_shared_existing(&self.path)? {
-                Some(current) => guard = current,
-                None => return Ok(ClientsFile::default()),
-            }
-        }
         let mut text = String::new();
         guard
             .file()
@@ -315,6 +306,20 @@ impl ClientStore {
         }
         owner_only(&self.path)?;
         Ok(out)
+    }
+
+    /// The shared lock on the store's file, `None` when there is none. A
+    /// lock that was waited for can be on the file a change replaced
+    /// meanwhile ([`ClientStore::lock_current`]); then the file that change
+    /// left is locked instead, once.
+    fn lock_shared_current(&self) -> Result<Option<darkmux_types::flock::FlockGuard>> {
+        let Some(mut guard) = darkmux_types::flock::lock_shared_existing(&self.path)? else {
+            return Ok(None);
+        };
+        if is_file_at(guard.file(), &self.path)? {
+            return Ok(Some(guard));
+        }
+        darkmux_types::flock::lock_shared_existing(&self.path)
     }
 
     /// The exclusive lock on the file now at the store's path. A change
