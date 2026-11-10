@@ -1562,3 +1562,19 @@ fn an_evictor_never_waits_on_a_taken_endpoint_under_the_machine_lock() {
     assert_eq!(answered, Err("busy"), "the taken server is counted as held");
     assert!(server::alive(&o_rec), "left running");
 }
+
+/// A server lifecycle failure keeps its code; `busy` names what holds the
+/// endpoint, without the advice, as the thing a queued dispatch waits on.
+#[test]
+fn a_server_failure_is_the_refusal_its_code_names() {
+    let held = server_refusal(server::ServerError::Busy { endpoint: "tf".into(), model: "TensorFold/a".into() });
+    assert_eq!(held.code, "busy");
+    assert_eq!(held.waiting_on.as_deref(), Some("endpoint `tf` is serving `TensorFold/a` for a running dispatch"));
+    assert!(held.message.ends_with("retry when it finishes"), "{held}");
+    let taken = server_refusal(server::ServerError::PortInUse {
+        endpoint: "tf".into(),
+        port: 8091,
+        holder: server::PortHolder::BeforeStart,
+    });
+    assert_eq!((taken.code, taken.waiting_on), ("port_in_use", None));
+}

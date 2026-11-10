@@ -653,6 +653,41 @@ pub(crate) fn dispatch_opts_for(
     Ok(opts)
 }
 
+/// The `step.result` record naming the verifiers that failed in a
+/// dispatch's envelope `stdout`; none when every one passed.
+fn failed_verifier_records(stdout: &str, step: &Step, ctx: &StepRunCtx) -> Vec<darkmux_flow::FlowRecord> {
+    let failed = parse_failed_verifiers(stdout);
+    if failed.is_empty() {
+        return Vec::new();
+    }
+    vec![darkmux_flow::FlowRecord {
+        source: Some(darkmux_flow::FlowSource::Scheduler),
+        ..darkmux_flow::FlowRecord::for_session_with(
+            &SessionId::task(ctx.run_id().clone(), &step.task_id),
+            darkmux_flow::Level::Warn,
+            darkmux_flow::Category::Work,
+            darkmux_flow::Stage::Dispatch,
+            darkmux_flow::Payload::StepResult(StepResultPayload {
+                count: Some(failed.len() as u64),
+                failed_verifiers: Some(failed),
+                ..StepResultPayload::new(&step.id, "dispatch.internal")
+            }),
+            step.id.clone(),
+        )
+    }]
+}
+
+/// A `dispatch.internal` step's error for its dispatch's `e`, in the step's
+/// context. (#3505) For a `preserve_dispatch_result` caller (the
+/// crew-of-one), a refusal's code is kept for `session`'s run to read back:
+/// the step graph carries only the error's text.
+fn dispatch_step_error(e: anyhow::Error, step: &Step, session: &SessionId, preserve_dispatch_result: bool) -> anyhow::Error {
+    if preserve_dispatch_result {
+        crate::engine_dispatch::stash_refusal(session, &e);
+    }
+    crate::dispatch_internal::with_step_context(e, || format!("step `{}` dispatch.internal", step.id))
+}
+
 impl StepKind for DispatchInternalStepKind {
     /// (#2312) An untyped producer: its output is text, not a wrapped body,
     /// so it satisfies only a consumer that asks for [`labels::TEXT`].
@@ -682,14 +717,7 @@ impl StepKind for DispatchInternalStepKind {
         // stays green. Everything below is post-dispatch handling.
         let opts = dispatch_opts_for(step, task, input, ctx)?;
         let session = opts.session.clone();
-        let result = dispatch(opts).map_err(|e| {
-            // (#3505) The crew-of-one reads a refusal's code back by session:
-            // the step graph carries only the error's text.
-            if preserve_dispatch_result {
-                crate::engine_dispatch::stash_refusal(&session, &e);
-            }
-            crate::dispatch_internal::with_step_context(e, || format!("step `{}` dispatch.internal", step.id))
-        })?;
+        let result = dispatch(opts).map_err(|e| dispatch_step_error(e, step, &session, preserve_dispatch_result))?;
 
         // (#1509) `preserve_dispatch_result` callers (the CLI dispatch verb's
         // crew-of-one graph) want the exact `DispatchResult` back, including a
@@ -720,28 +748,7 @@ impl StepKind for DispatchInternalStepKind {
             );
         }
 
-        let mut flow_records = Vec::new();
-        if parse_verifiers {
-            let failed = parse_failed_verifiers(&result.stdout);
-            if !failed.is_empty() {
-                flow_records.push(darkmux_flow::FlowRecord {
-                    source: Some(darkmux_flow::FlowSource::Scheduler),
-                    ..darkmux_flow::FlowRecord::for_session_with(
-                        &SessionId::task(ctx.run_id().clone(), &step.task_id),
-                        darkmux_flow::Level::Warn,
-                        darkmux_flow::Category::Work,
-                        darkmux_flow::Stage::Dispatch,
-                        darkmux_flow::Payload::StepResult(StepResultPayload {
-                            count: Some(failed.len() as u64),
-                            failed_verifiers: Some(failed),
-                            ..StepResultPayload::new(&step.id, "dispatch.internal")
-                        }),
-                        step.id.clone(),
-                    )
-                });
-            }
-        }
-
+        let flow_records = if parse_verifiers { failed_verifier_records(&result.stdout, step, ctx) } else { Vec::new() };
         Ok(StepOutcome {
             output: result.stdout,
             flow_records,

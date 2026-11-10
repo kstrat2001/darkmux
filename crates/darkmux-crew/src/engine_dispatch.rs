@@ -698,12 +698,7 @@ impl Start<'_> {
         if current.as_ref().is_some_and(|r| r.argv == spec.argv) {
             // Started by another dispatch since this one looked: reuse it.
             drop(machine_lock);
-            write_lease(lease, &spec.served_name, None)?;
-            let reused = server::reuse_locked(spec, dirs, bounds, &held, &mut |_| {}, endpoint_lock).map_err(server_refusal)?;
-            if reused.is_none() {
-                let _ = lease.write(&[]);
-            }
-            return Ok(reused.map(|record| (record, false)));
+            return self.reuse(endpoint_lock).map(|reused| reused.map(|record| (record, false)));
         }
         let leased = held_now(machine, lease);
         refuse_a_held_server(current.as_ref(), &leased, endpoint)?;
@@ -729,6 +724,22 @@ impl Start<'_> {
         let ensured = server::ensure_locked(spec, dirs, bounds, &held, &mut progress, endpoint_lock).map_err(server_refusal)?;
         let started = matches!(ensured, server::Ensured::Started(_));
         Ok(Some((ensured.record().clone(), started)))
+    }
+}
+
+impl Start<'_> {
+    /// The same command's server, reused under the endpoint's lock with this
+    /// dispatch's lease on it; `None`, the lease withdrawn, when it was found
+    /// unhealthy and stopped.
+    fn reuse(&self, endpoint_lock: &darkmux_types::flock::FlockGuard) -> Result<Option<EngineRecord>, EngineRefusal> {
+        let (spec, machine, lease) = (self.spec, self.machine, self.lease);
+        write_lease(lease, &spec.served_name, None)?;
+        let held = |r: &EngineRecord| held_now(machine, lease).contains(&served_name_of(r));
+        let reused = server::reuse_locked(spec, self.dirs, self.bounds, &held, &mut |_| {}, endpoint_lock).map_err(server_refusal)?;
+        if reused.is_none() {
+            let _ = lease.write(&[]);
+        }
+        Ok(reused)
     }
 }
 
