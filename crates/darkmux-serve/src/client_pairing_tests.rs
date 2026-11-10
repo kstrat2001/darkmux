@@ -3807,6 +3807,15 @@ async fn removing_a_worktree_never_touches_the_users_branches() {
         assert_eq!(worktrees(), 1);
     }
     assert_eq!(users(), before, "the user's branches and files are as they were");
+    // A worktree on a branch of the user's (moved there by hand): even with
+    // `force`, that branch stays.
+    let (code, v) = call(&h, post("/client/workspaces", Some(&token), serde_json::json!({"source_path": mine.to_str(), "bot": "b"}))).await;
+    assert_eq!(code, 201, "{v}");
+    run_git(Some(&mine), &["branch", "feature"]);
+    run_git(Some(&h.base.join(&name)), &["checkout", "--quiet", "feature"]);
+    let (code, gone) = remove_ws(&h, &token, &name, Some(serde_json::json!({"force": true}))).await;
+    assert_eq!((code, gone["branch"].as_str(), gone["branch_removed"].as_bool()), (200, Some("feature"), Some(false)), "{gone}");
+    assert!(!run_git(Some(&mine), &["branch", "--list", "feature"]).is_empty(), "the user's branch stays");
 }
 
 /// A workspace is not removed while something uses it: a run in it, or a

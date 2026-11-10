@@ -2058,4 +2058,43 @@ mod tests {
         assert!(!is_commit_sha("E044900CD94D086C841616B05ED63638AA402BE4"));
         assert!(!is_commit_sha(&"g".repeat(40)));
     }
+
+    /// A name held alone excludes every other hold; shared holds go
+    /// together; a hold let go frees the name; a forgotten name's lock file
+    /// is gone. A link at the lock's path is refused, never followed.
+    #[test]
+    fn a_name_is_held_alone_or_shared_never_through_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let sole = try_hold(base, "site", Hold::Sole).unwrap().unwrap();
+        assert!(try_hold(base, "site", Hold::Sole).unwrap().is_none());
+        assert!(try_hold(base, "site", Hold::Shared).unwrap().is_none());
+        assert!(try_hold(base, "other", Hold::Sole).unwrap().is_some(), "another name is free");
+        drop(sole);
+        let (a, b) = (try_hold(base, "site", Hold::Shared).unwrap(), try_hold(base, "site", Hold::Shared).unwrap());
+        assert!(a.is_some() && b.is_some());
+        assert!(try_hold(base, "site", Hold::Sole).unwrap().is_none());
+        drop((a, b));
+        try_hold(base, "site", Hold::Sole).unwrap().unwrap().forget();
+        assert!(!base.join(".site.lock").exists());
+        assert!(try_hold(base, "../x", Hold::Sole).is_err());
+        let target = base.join("elsewhere");
+        std::os::unix::fs::symlink(&target, base.join(".linked.lock")).unwrap();
+        assert!(try_hold(base, "linked", Hold::Sole).is_err());
+        assert!(!target.exists(), "nothing made through the link");
+    }
+
+    /// A lock file removed (or replaced) since it was opened is not the one
+    /// at the path, so a hold taken on it is no hold on the name.
+    #[test]
+    fn a_lock_file_removed_or_replaced_since_it_was_opened_is_not_the_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".site.lock");
+        let opened = lock_file(&path, Hold::Sole).unwrap().unwrap();
+        assert!(is_file_at(&opened, &path).unwrap());
+        std::fs::remove_file(&path).unwrap();
+        assert!(!is_file_at(&opened, &path).unwrap(), "removed");
+        std::fs::write(&path, "").unwrap();
+        assert!(!is_file_at(&opened, &path).unwrap(), "replaced");
+    }
 }
