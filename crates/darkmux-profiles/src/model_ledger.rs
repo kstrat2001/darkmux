@@ -3634,6 +3634,37 @@ esac
         assert_eq!(long - short, 32 * 8 * 128 * 2 * 2 * (65_536 - 4_096), "the KV term grows with the context, per the architecture");
     }
 
+    /// (#3514) The reader that answered names the format, and the format
+    /// what a load commits: a GGUF model pays its KV cache at load, an MLX
+    /// model (a `config.json`) only its weights, and a model neither reader
+    /// can answer has no commitment at all (its size-based guess is never a
+    /// refusal).
+    #[test]
+    fn a_load_commits_its_cache_only_when_its_weights_are_gguf() {
+        let root = TempTestRoot::new("commitment");
+        write_fixture_config_json(&root.0.join("mlx-model"), 32, 8, 128);
+        let gguf = root.0.join("gguf-model");
+        std::fs::create_dir_all(&gguf).unwrap();
+        std::fs::write(gguf.join("weights.gguf"), tiny_gguf_bytes(32, 32, 8, 4096)).unwrap();
+        let arch = resolve_arch_facts_of(
+            ["mlx-model", "gguf-model", "neither"].into_iter(),
+            &ArchFactsReader::with_root(&root.0),
+            &GgufFactsReader::with_root(&root.0),
+        );
+        assert_eq!(arch.kv_at_load.iter().collect::<Vec<_>>(), ["gguf-model"]);
+        let catalog: Vec<CatalogFact> = ["mlx-model", "gguf-model", "neither"]
+            .iter()
+            .map(|k| CatalogFact { model_key: k.to_string(), size_bytes: Some(4_000_000_000) })
+            .collect();
+        let pricer = LoadPricer::new(arch);
+        let at = |k: &str| pricer.figures(k, 100_000, Some(&catalog)).unwrap();
+        let margin = darkmux_gestalt::DEFAULT_TRANSIENT_MARGIN_BYTES;
+        assert_eq!(at("mlx-model").commitment, Some(4_000_000_000 + margin), "MLX: weights and the margin");
+        assert!(at("mlx-model").potential > 4_000_000_000 + margin, "its potential carries the cache");
+        assert_eq!(at("gguf-model").commitment, Some(at("gguf-model").potential), "GGUF: the cache at load");
+        assert_eq!(at("neither").commitment, None, "a guess commits nothing");
+    }
+
     #[test]
     fn resolve_arch_facts_prefers_config_json_over_gguf_when_both_present() {
         let root = TempTestRoot::new("precedence");

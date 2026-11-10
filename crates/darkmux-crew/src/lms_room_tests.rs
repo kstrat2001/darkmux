@@ -713,3 +713,37 @@ fn a_resident_the_wave_reuses_is_not_credited_to_its_pool() {
     let schedule = schedule_waves(&abc, &Facts::default(), &est, &factory, &room).unwrap();
     assert_eq!(schedule.waves, vec![abc[..2].to_vec(), vec![abc[2].clone()]], "{schedule:?}");
 }
+
+/// (#3514 B1) The planner refuses on the commitment too: an MLX model
+/// loaded beside a user's copy of it, whose commitment fits but whose
+/// potential would not, loads.
+#[test]
+#[serial_test::serial]
+fn the_planner_refuses_a_load_beside_a_user_copy_only_on_its_commitment() {
+    let rig = Rig::new();
+    let free = || Some(40 * GIB);
+    let machine = FakeMachine::new(&free);
+    let long = vec![Placement { min_ctx: 200_000, ..wave("m")[0].clone() }];
+    let mut host = MockHost::new().resident("m", "m", 8_000, Some(15 * GIB)).cataloged("m", 15 * GIB);
+    load_as(&mut host, Format::Mlx, &long, &rig.room(&machine)).expect("15.7 GiB at load fits 40 GiB");
+    assert!(loaded(&host));
+}
+
+/// (#3514 B1) Waves pack on the potential but refuse only on the
+/// commitment: the same load beside a user's copy is scheduled, not refused.
+#[test]
+#[serial_test::serial]
+fn a_wave_is_refused_only_on_the_commitment() {
+    use crate::concurrent_dispatch::schedule_waves;
+    let rig = Rig::new();
+    let free = || Some(40 * GIB);
+    let machine = FakeMachine::new(&free);
+    let room = rig.room(&machine);
+    let factory = || -> Box<dyn ModelHost> {
+        Box::new(ArchHost::new(MockHost::new().resident("m", "m", 8_000, Some(15 * GIB)).cataloged("m", 15 * GIB), Format::Mlx))
+    };
+    let long = vec![Placement { min_ctx: 200_000, ..wave("m")[0].clone() }];
+    let schedule = schedule_waves(&long, &Facts::default(), &FixedEstimator::default(), &factory, &room).unwrap();
+    assert!(schedule.refusals.is_empty(), "{schedule:?}");
+    assert_eq!(schedule.waves, vec![long]);
+}
