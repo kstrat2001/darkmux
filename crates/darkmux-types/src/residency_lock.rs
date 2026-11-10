@@ -14,18 +14,28 @@
 //! ([`crate::residency_lease::LeaseGuard::write_starting`]): every decision
 //! subtracts the reservations of starts still in flight
 //! ([`crate::residency_lease::LeaseGuard::reserved_by_others`]) from the free
-//! figure it reads. A reservation ends when its holder marks the model
-//! loaded or drops its lease.
+//! figure it reads. A model that answers may not have paged its memory in
+//! yet, so its holder keeps the reservation past the answer
+//! ([`crate::residency_lease::LeaseGuard::mark_loaded_reserving`]) and
+//! shrinks it as the memory pages in; it ends then, or when the holder drops
+//! its lease.
 //!
 //! **The protocol, for every path that makes a model resident** (an engine
 //! server's start, an LM Studio load):
 //!
-//! 1. [`acquire`] the lock, before any per-endpoint lock (always this
-//!    order, so two callers can never wait on each other).
-//! 2. Read free memory and the leases, decide, evict.
+//! 1. [`acquire`] the lock first, before any per-endpoint lock (always this
+//!    order, so two callers can never wait on each other). Take a
+//!    per-endpoint lock under it only WITHOUT waiting: when it is taken (a
+//!    start in flight there holds it until it answers), drop this lock,
+//!    wait for the endpoint's, let it go, and start again from 1. Never hold
+//!    this lock while waiting on anything another start holds.
+//! 2. Under both, read the endpoint, free memory and the leases again, and
+//!    decide: reuse what another start made in between, or evict.
 //! 3. Write the lease with its reservation (`write_starting`), then spawn
 //!    or begin the load.
-//! 4. Drop the lock. Mark the model loaded when it answers.
+//! 4. Drop this lock once the start is spawned, never later (a start takes
+//!    minutes). When the model answers, keep its reservation until its
+//!    memory pages in.
 //!
 //! A caller that reuses what is already resident decides nothing about
 //! memory and need not take it. A dispatch waiting for a busy model

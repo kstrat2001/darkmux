@@ -1536,3 +1536,29 @@ fn a_reservation_settles_as_the_footprint_grows_or_at_its_bound() {
     assert!(seen.iter().all(|b| *b == 30 * GIB) && seen.len() == 4, "unread: the whole need, polled to the bound: {seen:?}");
     assert_eq!(after, 0, "ends at the bound");
 }
+
+/// An evictor holding the machine lock never waits on another endpoint's
+/// lock: an idle server whose endpoint is taken (a reuse being decided
+/// there) is left running, and the start is answered at once instead.
+#[test]
+#[serial_test::serial]
+fn an_evictor_never_waits_on_a_taken_endpoint_under_the_machine_lock() {
+    let r = rig();
+    let tf = Tensorfold::at(fake_tensorfold(r.dir.path(), "1.2.4", 20.0).to_string_lossy().into_owned());
+    let roomy = FakeMachine { reclaimable: RefCell::new(Some(64 * GIB)), ..Default::default() };
+    let mut other = target("TensorFold/o", free_port());
+    other.endpoint.source = darkmux_types::endpoint::EndpointSource::Named("other".into());
+    let o_rec = prepare_in(&other, &r.dirs, &tf, quick(), &roomy, &mut |_, _| {}).unwrap().record.clone();
+    let taken = server::endpoint_lock(&r.dirs, "other").unwrap();
+    let (dirs, (tx, rx)) = (r.dirs.clone(), std::sync::mpsc::channel());
+    let o_alive = o_rec.clone();
+    std::thread::spawn(move || {
+        let frees = || Some(if server::alive(&o_alive) { GIB } else { 64 * GIB });
+        let machine = LeasedLater { inner: FakeMachine { capacity: Some(128 * GIB), ..Default::default() }, reclaim: Some(&frees), first: Vec::new(), then: Vec::new(), reads: RefCell::new(0) };
+        let _ = tx.send(prepare_in(&target("TensorFold/m", free_port()), &dirs, &tf, quick(), &machine, &mut |_, _| {}).map(|_| ()).map_err(|e| e.code));
+    });
+    let answered = rx.recv_timeout(Duration::from_secs(5)).expect("answered without waiting on the taken endpoint");
+    drop(taken);
+    assert_eq!(answered, Err("busy"), "the taken server is counted as held");
+    assert!(server::alive(&o_rec), "left running");
+}
