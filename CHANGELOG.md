@@ -169,6 +169,31 @@ schema 1.2, which an older `client serve` refuses, so every request it handles w
   made from, never from the workspace a run edits. A workspace cloned from a URL gets no preview;
   add `.darkmux/preview.json` to your own checkout of the repo and make the workspace from it.
 
+- **A busy dispatch can wait for its memory (#3504).** When a running dispatch holds the engine
+  endpoint or the memory a dispatch needs, `fleet.busy_policy` now decides for local dispatches too:
+  `refuse` (the default) answers `busy` at once as before; `queue` waits up to the dispatch's timeout,
+  printing a `queued` line every 20 s, writing `dispatch.queue.wait` / `dispatch.queue.resume`, and
+  showing run activity `queued` (also in the client API's work status). A stop ends the wait without
+  starting anything. A waiter holds no lease, so waiters never pin each other's servers. The queue is
+  not first-come-first-served: a later arrival can take freed memory first.
+
+- **Refusal codes reach every surface (#3505).** A refused `dispatch --json` prints
+  `{"result":"refused","code","error"}` (still a nonzero exit), and a fleet job's `error` reply
+  carries `code` (work wire 8.2, additive; 8.1 peers interoperate). An app retries `busy` and
+  `memory_in_use`, gives up on `wont_fit`, and treats every other failure as a failure.
+
+- **Machine surfaces show the engine servers darkmux starts (#3450).** `darkmux machine resources`
+  and `GET /machine/resources` (ledger 2.2) list each Tensorfold or Flint server as a darkmux row at
+  its measured memory (the physical footprint of its process group, never RSS: an MLX server's
+  weights live in GPU memory RSS does not see), no longer as "other tenants". `machine status`,
+  `/machine/status` and `/machine/specs` list them (`engine_servers`), and the profile-match line
+  counts a served profile and now matches darkmux's own `darkmux:` loads. The machine card (1.4)
+  states each model's `availability` (refreshed behind the card, dropped once older than 75 s) and
+  lists the servers; the viewer's machine lens and fleet cards show them, with "starting the model"
+  while one starts. `darkmux machine eject` also stops the idle servers darkmux started, never one a
+  running dispatch holds or one it did not start. `mission config show` and the lab profile check
+  read a server model's residency from darkmux's record.
+
 ### Changed
 
 - **A `--workdir` checkout's `.git` is mounted read-only by default (#3461).** When the workdir's
@@ -221,6 +246,24 @@ schema 1.2, which an older `client serve` refuses, so every request it handles w
 - **The minimum supported Rust is 1.89** for the `darkmux` binary and the crates that reach
   SQLite (`darkmux-crew`, `-doctor`, `-fleet`, `-lab`, `-serve`), up from 1.88 and 1.86:
   `rusqlite` 0.41 (below) needs it.
+
+- **`wont_fit` now means only "larger than this machine" (#3510).** Memory held by programs darkmux
+  did not start gets the new retryable `memory_in_use`; memory held by running darkmux dispatches or
+  starts in flight stays `busy`. A missing memory figure refuses instead of starting blind.
+
+- **The thermal hard stop also stops darkmux's engine servers.** At a `critical` reading, after its
+  checkpoint wait and the LM Studio sweep, tier 5 now stops every Tensorfold and Flint server darkmux
+  started, held ones included, so the machine can actually cool; never a server darkmux did not start.
+  `thermal.tier5_eject` gains `stopped_servers` and its failure record `failed_servers`.
+
+- **Client workspaces cloned from a repo get their own branch (#3489, #3490).** A clone gets a
+  `mux/<bot>-<id>` branch, so its runs, `/changes` and an app's Open PR never use the default branch.
+  A clone made on a 5.10 release candidate, still on its default branch (or the ref it was cloned at),
+  is moved onto its own branch at its next run, its commits included; until then `/changes` refuses
+  it with `no_own_branch`, so nothing can push onto your branch. A repo-link request reuses only that
+  bot's own clone, by the bot's exact name (recorded beside the workspace), never another bot's
+  worktree or a bot whose name makes the same slug. A branch darkmux cannot create is `branch_failed`
+  (422) with git's reason.
 
 ### Security
 
@@ -364,6 +407,31 @@ schema 1.2, which an older `client serve` refuses, so every request it handles w
   that run a command. A plain `dispatch --workdir <checkout>` whose `.git` is a real directory now
   prints a note: the run can change that repository's config and hooks, which the git you run
   there yourself still reads.
+
+- **Memory: darkmux no longer overcommits the machine (#3508, #3509, #3506, #3507, #3511).**
+  - An LM Studio load is now checked against the machine's memory: priced at what it commits at load
+    (GGUF: weights plus its cache at the context; MLX: weights, since its cache grows lazily), with
+    the full-context figure used only to choose what to evict and how to group waves. A size-only
+    estimate never refuses. A mission's models that do not fit together run in successive waves.
+  - One machine-wide residency lock serializes every decision to load, start or evict, on both
+    engines, and a load or start in flight reserves its memory until it has paged in (at most
+    120 s), so two concurrent starts can no longer both claim the same free memory. A model already
+    resident takes no lock.
+  - An LM Studio load stops darkmux's idle Tensorfold and Flint servers when it needs their memory.
+  - A running dispatch holds its LM Studio model and its compactor, lab runs included, so no other
+    dispatch unloads them mid-run, and an engine start never evicts the compactor.
+  - Before each unload darkmux re-checks that the model is still idle and as planned.
+  - LM Studio refusals carry `busy`, `memory_in_use` or `wont_fit` like the engine path.
+
+- `continues` naming a run `client serve` has forgotten (an hour later, or after a restart) starts a
+  plain new run instead of a 409; failed and canceled runs can be continued; finished work is kept for
+  an hour from when it ended (#3492). Workspace names always fit 64 characters (#3493). Cloning an
+  empty repository works.
+
+- Concurrent first runs no longer race extracting the runtime binary: one extracts under a lock and
+  the rest reuse its stamped copy (#3410). XML-format tool calls drop the newlines that wrap a value
+  on its own line, so a path no longer fails `read`; `write`/`edit` content keeps its whitespace
+  (#3417).
 
 ## [5.9.3] - 2026-10-29
 
