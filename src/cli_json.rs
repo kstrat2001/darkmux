@@ -195,6 +195,7 @@ macro_rules! cli_outputs {
 cli_outputs! {
     darkmux_crew::dispatch_envelope::DispatchEnvelope => ["dispatch <role> (a container execution)"],
     darkmux_crew::dispatch_envelope::DirectDispatchEnvelope => ["dispatch <role> (a hosted-endpoint execution)"],
+    darkmux_crew::dispatch_envelope::DispatchRefusedEnvelope => ["dispatch <role> (refused before its role ran)"],
     darkmux_heuristics::ProfileDraft => ["profile draft"],
     LessonTiers => ["memory lesson list", "memory lesson recall"],
     darkmux_crew::lessons::LessonsExport => ["memory lesson export"],

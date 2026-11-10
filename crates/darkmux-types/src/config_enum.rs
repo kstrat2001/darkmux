@@ -962,12 +962,14 @@ pub static ENUM_SETTINGS: &[EnumSetting] = &[
     // submission preflight when it builds its identity provider. The serve
     // daemon starts that listener, so `serve` refuses a bad value too
     // (`fleet.identity.provider` above shares the reason). `fleet.mode` stays
-    // unscoped: nothing in the daemon or its listener reads it.
+    // unscoped: nothing in the daemon or its listener reads it. (#3504) Every
+    // dispatch whose model is busy reads it too (`engine_dispatch::BusyWait`),
+    // so every entry point that dispatches refuses a bad value.
     EnumSetting::of::<crate::config::BusyPolicy>(
         "fleet.busy_policy",
         Some("DARKMUX_FLEET_BUSY_POLICY"),
         "refuse",
-        &[Scope::FleetSubmission, Scope::Serve],
+        &[Scope::Dispatch, Scope::MissionLaunch, Scope::LabRun, Scope::FleetSubmission, Scope::Serve],
         read_fleet_busy_policy,
     ),
     // (#2947 review C2) A typo here used to match nothing, silently.
@@ -1003,6 +1005,17 @@ pub fn config_path_of(setting: &EnumSetting) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// (#3504) A busy dispatch reads `fleet.busy_policy`, so every entry
+    /// point that dispatches refuses a value it does not know, as the fleet
+    /// listener and the daemon do.
+    #[test]
+    fn every_dispatching_entry_point_refuses_a_bad_busy_policy() {
+        let busy = setting("fleet.busy_policy").unwrap();
+        for scope in [Scope::Dispatch, Scope::MissionLaunch, Scope::LabRun, Scope::FleetSubmission, Scope::Serve] {
+            assert!(busy.scopes.contains(&scope), "{scope:?}");
+        }
+    }
     /// The port a URL is dialed on: the one it names, else its scheme's.
     #[test]
     fn a_urls_port_is_the_one_it_names_else_its_schemes() {

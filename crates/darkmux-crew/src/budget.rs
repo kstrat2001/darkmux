@@ -929,8 +929,9 @@ fn stop_record(endpoint_id: &str, reason: &str, waited_ms: u64, message: &str, c
 }
 
 /// Sleep `span` in [`WAIT_SLICE`]s, stopping early once the caller's run
-/// was stopped. Returns the milliseconds slept.
-fn sleep_sliced(env: &dyn BudgetEnv, span: Duration, caller: &BudgetCaller<'_>) -> u64 {
+/// was stopped. Returns the milliseconds slept. Also the queued dispatch's
+/// sleep (`engine_dispatch`, #3504).
+pub(crate) fn sleep_sliced(env: &dyn BudgetEnv, span: Duration, caller: &BudgetCaller<'_>) -> u64 {
     let mut left = span;
     let mut slept = 0u64;
     while !left.is_zero() {

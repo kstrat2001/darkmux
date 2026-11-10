@@ -76,6 +76,8 @@ export type FlowPayloads = {
   "dispatch.model.start": DispatchModelPayload,
   "dispatch.model.loading": DispatchModelPayload,
   "dispatch.model.ready": DispatchModelPayload,
+  "dispatch.queue.wait": DispatchModelPayload,
+  "dispatch.queue.resume": DispatchModelPayload,
   "gh.verb.executed": GhVerbExecutedPayload,
   "hook.fired": HookDeliveryPayload,
   "hook.failed": HookFailedPayload,

@@ -186,8 +186,11 @@ pub struct SingleShotJob {
 /// "8.0" is the base shape. "8.1" (#3028) added the job's optional
 /// `target_machine_uid`; a submission is written at the lowest version that
 /// can say its job ([`WorkJob::wire_version`]), and this constant is the
-/// highest a receiver takes.
-pub const WORK_JOB_SCHEMA_VERSION: &str = "8.1";
+/// highest a receiver takes. "8.2" (#3505) added the reply's optional `code`
+/// (a refused dispatch's refusal code, on an `error` reply); the job is
+/// unchanged, so a submission is still written at 8.0 or 8.1, and a sender
+/// on an older minor ignores the field.
+pub const WORK_JOB_SCHEMA_VERSION: &str = "8.2";
 
 /// A work wire version, `major.minor` (see [`WORK_JOB_SCHEMA_VERSION`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -686,7 +689,7 @@ mod tests {
     /// it parses.
     #[test]
     fn a_job_carrying_a_phase_id_is_refused_at_v8() {
-        assert_eq!(WORK_JOB_SCHEMA_VERSION, "8.1");
+        assert_eq!(WORK_JOB_SCHEMA_VERSION, "8.2");
         let mut v = serde_json::to_value(make_valid_job()).unwrap();
         assert!(v.get("phase_id").is_none(), "v8 never writes phase_id");
         assert!(serde_json::from_value::<WorkJob>(v.clone()).is_ok());

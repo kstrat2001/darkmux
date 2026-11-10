@@ -344,6 +344,8 @@ const ACTION_FACET: { readonly [K in keyof typeof ACTION]: ActivityFacet } = {
   DispatchModelStart: { section: "DISPATCH", failure: false },
   DispatchModelLoading: { section: "DISPATCH", failure: false },
   DispatchModelReady: { section: "DISPATCH", failure: false },
+  DispatchQueueWait: { section: "DISPATCH", failure: false },
+  DispatchQueueResume: { section: "DISPATCH", failure: false },
   GhVerbExecuted: { section: "OTHER", failure: false },
   HookFired: { section: "MISSION", failure: false },
   HookFailed: { section: "MISSION", failure: true },

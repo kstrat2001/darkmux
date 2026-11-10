@@ -5,7 +5,9 @@ import type { RecordContext } from "./RecordContext";
  * (#3448) The payload of `dispatch.model.start`, `.loading` and `.ready`: a
  * dispatch making its model resident on an engine darkmux starts servers
  * for. Written between `dispatch.start` and the first turn, only when the
- * model was not already resident.
+ * model was not already resident. (#3504) Also the payload of
+ * `dispatch.queue.wait` and `.resume`, a dispatch waiting for its model's
+ * endpoint or memory to free.
  */
 export type DispatchModelPayload = { 
 /**
@@ -30,9 +32,21 @@ replacing?: string,
  */
 evicted?: Array<string>, 
 /**
- * On `loading` and `ready`: how long the start has taken.
+ * On `loading` and `ready`: how long the start has taken. (#3504) On
+ * `dispatch.queue.wait` and `.resume`: how long the dispatch has waited.
  */
 elapsed_ms?: number, 
+/**
+ * (#3504) On `dispatch.queue.wait`: what the dispatch waits on (the
+ * endpoint serving another model, or the memory running dispatches
+ * hold), in the words its `busy` refusal would use.
+ */
+waiting_on?: string, 
+/**
+ * (#3504) On `dispatch.queue.wait`: the longest the dispatch waits (its
+ * timeout), ms; absent when its timeout is unbounded.
+ */
+wait_bound_ms?: number, 
 /**
  * The graph step the record belongs to, when its session is a step's.
  */

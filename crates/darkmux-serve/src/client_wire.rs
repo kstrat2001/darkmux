@@ -128,12 +128,13 @@ pub struct RunChanges {
 pub enum WorkState {
     Running {
         /// (#3467) `starting_model` while the run's dispatch is starting its
-        /// model (an engine server, a load), as the run lifecycle decides it
-        /// (the same `activity` `GET /runs` and `run list --json` carry).
+        /// model (an engine server, a load), and (#3504) `queued` while it
+        /// waits for a busy endpoint or memory, as the run lifecycle decides
+        /// it (the same `activity` `GET /runs` and `run list --json` carry).
         /// Absent otherwise.
         #[serde(skip_serializing_if = "Option::is_none")]
         activity: Option<crate::runs::RunActivity>,
-        /// With `activity`: how long the start has taken so far, ms.
+        /// With `activity`: how long the start (or the wait) has taken so far, ms.
         #[serde(skip_serializing_if = "Option::is_none")]
         activity_elapsed_ms: Option<u64>,
     },
@@ -243,7 +244,8 @@ pub struct WorkspaceInfo {
     pub repo: Option<String>,
     pub created: bool,
     /// Where a new workspace started (a ref, or `<repo>@<ref>` for a
-    /// template).
+    /// template). A clone or a worktree is on a new `mux/<bot>-<id>` branch
+    /// cut from there.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
     /// Why the fetch of a reused (or source) checkout failed.
