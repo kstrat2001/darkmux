@@ -44,6 +44,9 @@
       "episode_threshold": 2,
       "tier4_enabled": true
     },
+    "memory": {
+      "pressure_gate": "warning"
+    },
     "detection": {
       "degeneracy": {
         "policy": "conclude"

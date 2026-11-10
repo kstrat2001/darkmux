@@ -96,6 +96,32 @@ impl Platform for MacPlatform {
     fn reclaimable_memory_bytes(&self) -> Option<u64> {
         reclaimable_from_vm_stat(&vm_stat()?, page_size().unwrap_or(16_384))
     }
+
+    /// The kernel's own figures, read by `sysctlbyname` (no process is
+    /// spawned, so it is cheap and still answers on a machine short of
+    /// memory): `kern.memorystatus_vm_pressure_level`, `vm.swapusage`, and
+    /// the compressor's segments and compressed pages against their limits
+    /// (`vm.compressor.segment.total` / `.limit`, `vm.compressor.pages_compressed`
+    /// / `.pages_compressed_limit`), the two figures a kernel panic report
+    /// prints as percentages of their limits.
+    fn memory_pressure(&self) -> Option<crate::MemoryPressure> {
+        let int = |name: &str| sysctl_bytes(name).and_then(|b| uint_from_sysctl(&b));
+        let level = int("kern.memorystatus_vm_pressure_level").and_then(pressure_level_from);
+        let swap = sysctl_bytes("vm.swapusage").and_then(|b| swap_from_xsw_usage(&b));
+        let compressor_pct = fuller_pct(&[
+            (int("vm.compressor.segment.total"), int("vm.compressor.segment.limit")),
+            (int("vm.compressor.pages_compressed"), int("vm.compressor.pages_compressed_limit")),
+        ]);
+        if level.is_none() && swap.is_none() && compressor_pct.is_none() {
+            return None;
+        }
+        Some(crate::MemoryPressure {
+            level,
+            swap_used_bytes: swap.map(|(used, _)| used),
+            swap_free_bytes: swap.map(|(_, free)| free),
+            compressor_pct,
+        })
+    }
     /// `sysctl(CTL_KERN, KERN_PROC, KERN_PROC_PID, pid)`'s
     /// `kinfo_proc.kp_proc.p_starttime`, in microseconds since the epoch.
     /// Works for a process owned by ANY user, which is the point: a reused
@@ -527,6 +553,68 @@ fn run_trimmed(program: &str, args: &[&str]) -> Option<String> {
 #[cfg(not(target_os = "macos"))]
 fn run_trimmed(_program: &str, _args: &[&str]) -> Option<String> {
     None
+}
+
+/// The raw value of the sysctl `name`; `None` when the kernel has no such
+/// name or the read fails.
+#[cfg(target_os = "macos")]
+fn sysctl_bytes(name: &str) -> Option<Vec<u8>> {
+    let name = std::ffi::CString::new(name).ok()?;
+    // Every value read here is an integer or `struct xsw_usage` (32 bytes).
+    let mut buf = [0u8; 64];
+    let mut len: libc::size_t = buf.len();
+    // SAFETY: `buf` is `len` bytes, `len` says so, and the kernel writes at
+    // most that many and sets `len` to what it wrote; the return value is
+    // checked before anything is read.
+    let rc = unsafe { libc::sysctlbyname(name.as_ptr(), buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0) };
+    (rc == 0 && len <= buf.len()).then(|| buf[..len].to_vec())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sysctl_bytes(_name: &str) -> Option<Vec<u8>> {
+    None
+}
+
+/// An unsigned integer sysctl value: 4 or 8 native-endian bytes.
+pub(crate) fn uint_from_sysctl(bytes: &[u8]) -> Option<u64> {
+    match bytes.len() {
+        4 => Some(u64::from(u32::from_ne_bytes(bytes.try_into().ok()?))),
+        8 => Some(u64::from_ne_bytes(bytes.try_into().ok()?)),
+        _ => None,
+    }
+}
+
+/// `kern.memorystatus_vm_pressure_level` to the level it names: 1 normal,
+/// 2 warning, 4 critical (the kernel's `kVMPressure*` values, the ones
+/// `memory_pressure(1)` reports). Any other value is no reading.
+pub(crate) fn pressure_level_from(raw: u64) -> Option<crate::PressureLevel> {
+    match raw {
+        1 => Some(crate::PressureLevel::Normal),
+        2 => Some(crate::PressureLevel::Warning),
+        4 => Some(crate::PressureLevel::Critical),
+        _ => None,
+    }
+}
+
+/// `vm.swapusage`'s `struct xsw_usage` to `(used, free)` bytes: its first
+/// three members are `xsu_total`, `xsu_avail` and `xsu_used`, each a u64.
+pub(crate) fn swap_from_xsw_usage(bytes: &[u8]) -> Option<(u64, u64)> {
+    let word = |i: usize| bytes.get(i * 8..i * 8 + 8).and_then(|b| b.try_into().ok()).map(u64::from_ne_bytes);
+    let (_total, avail, used) = (word(0)?, word(1)?, word(2)?);
+    Some((used, avail))
+}
+
+/// The fullest of `(used, limit)` pairs, in percent of its limit, capped at
+/// 100. A pair with a figure missing or a zero limit is skipped; `None`
+/// when none is left.
+pub(crate) fn fuller_pct(pairs: &[(Option<u64>, Option<u64>)]) -> Option<u8> {
+    pairs
+        .iter()
+        .filter_map(|(used, limit)| match (used, limit) {
+            (Some(used), Some(limit)) if *limit > 0 => Some((used.saturating_mul(100) / limit).min(100) as u8),
+            _ => None,
+        })
+        .max()
 }
 
 #[cfg(target_os = "macos")]

@@ -16,6 +16,10 @@
 //!   server answers `flint`, #3453 review): a server is reused, and a start
 //!   is ready, only when darkmux's own server is what listens on the port
 //!   ([`listens`]); a start answered by anything else fails `port_in_use`.
+//!   While a server it spawned is starting, the machine's memory pressure
+//!   is read at every poll ([`ensure_watched`]): a start commits its memory
+//!   in seconds, so one that turns the pressure critical is stopped at once
+//!   and fails `memory_in_use`.
 //! - **Stop** ([`stop`]): only a server whose record still matches the live
 //!   process (pid and start stamp), `SIGTERM`, then `SIGKILL` after a grace,
 //!   then wait for its port to close.
@@ -154,6 +158,10 @@ pub enum ServerError {
     StartFailed { endpoint: String, log: PathBuf, detail: String },
     /// darkmux's server would not stop.
     StopFailed { endpoint: String, pid: u32, detail: String },
+    /// Memory pressure turned critical while the server was starting, and
+    /// darkmux stopped it ([`ensure_watched`]). `reading` is the pressure
+    /// read; `left_running` says why when the server could not be stopped.
+    MemoryPressure { endpoint: String, model: String, reading: String, left_running: Option<String> },
 }
 
 impl ServerError {
@@ -163,6 +171,7 @@ impl ServerError {
             ServerError::Busy { .. } => "busy",
             ServerError::StartFailed { .. } => "model_start_failed",
             ServerError::StopFailed { .. } => "model_stop_failed",
+            ServerError::MemoryPressure { .. } => "memory_in_use",
         }
     }
 }
@@ -184,6 +193,17 @@ impl std::fmt::Display for ServerError {
             }
             ServerError::StopFailed { endpoint, pid, detail } => {
                 write!(f, "endpoint `{endpoint}`: darkmux's server (pid {pid}) did not stop: {detail}")
+            }
+            ServerError::MemoryPressure { endpoint, model, reading, left_running } => {
+                write!(
+                    f,
+                    "endpoint `{endpoint}`: this machine's memory pressure turned critical while `{model}` was starting \
+                     ({reading})"
+                )?;
+                match left_running {
+                    None => write!(f, ", so darkmux stopped the server it was starting; retry once memory is free"),
+                    Some(why) => write!(f, ", and darkmux could not stop the server it was starting ({why}); stop it with `darkmux machine eject`"),
+                }
             }
         }
     }
@@ -488,7 +508,39 @@ pub fn ensure_locked(
     bounds: Bounds,
     held: Held<'_>,
     progress: &mut dyn FnMut(Progress),
+    lock: &darkmux_types::flock::FlockGuard,
+) -> Result<Ensured, ServerError> {
+    ensure_watched(spec, dirs, bounds, held, progress, lock, &|| None)
+}
+
+/// Asked every [`Bounds::poll`] while a server darkmux spawned is starting:
+/// the memory pressure reading, when it has turned critical.
+pub type Watch<'a> = &'a dyn Fn() -> Option<String>;
+
+/// How long a server stopped for memory pressure gets after `SIGTERM`
+/// before `SIGKILL`. It has served nothing, so nothing is lost by killing
+/// it, and every second it lives it holds (and may still be committing)
+/// the memory the machine is short of: two seconds lets an engine that
+/// exits on `SIGTERM` release its memory in order, against the 15 s
+/// ([`STOP_GRACE`]) a server that may be mid-request gets.
+pub const PRESSURE_STOP_GRACE: Duration = Duration::from_secs(2);
+
+/// [`ensure_locked`], watching the machine while the server it spawns
+/// starts: a start commits its memory in seconds, and a price that was too
+/// low can take a machine from fine to out of memory inside one start.
+/// `watch` is asked at every poll from the spawn until the server answers;
+/// when it names a reading, the server is stopped at once (it is darkmux's
+/// own start, under the endpoint's lock, and nothing holds it yet: only a
+/// process its record still matches is signaled) and the start fails
+/// [`ServerError::MemoryPressure`]. A server that is reused is not watched.
+pub fn ensure_watched(
+    spec: &ServerSpec,
+    dirs: &Dirs,
+    bounds: Bounds,
+    held: Held<'_>,
+    progress: &mut dyn FnMut(Progress),
     _lock: &darkmux_types::flock::FlockGuard,
+    watch: Watch<'_>,
 ) -> Result<Ensured, ServerError> {
     let start_failed = |detail: String| ServerError::StartFailed {
         endpoint: spec.endpoint.clone(),
@@ -504,14 +556,25 @@ pub fn ensure_locked(
     progress(Progress::Starting);
     let rec = spawn_and_record(spec, dirs).map_err(start_failed)?;
     progress(Progress::Spawned);
-    wait_ready(spec, dirs, &rec, bounds, progress).map_err(|fail| {
-        let _ = stop_locked(dirs, &rec, bounds);
-        match fail {
-            NotReady::Foreign(holder) => ServerError::PortInUse { endpoint: spec.endpoint.clone(), port: spec.port, holder },
-            NotReady::Failed(detail) => start_failed(detail),
+    wait_ready(spec, dirs, &rec, bounds, progress, watch).map_err(|fail| match fail {
+        NotReady::Pressure(reading) => stopped_for_pressure(spec, dirs, &rec, bounds, reading),
+        NotReady::Foreign(holder) => {
+            let _ = stop_locked(dirs, &rec, bounds);
+            ServerError::PortInUse { endpoint: spec.endpoint.clone(), port: spec.port, holder }
+        }
+        NotReady::Failed(detail) => {
+            let _ = stop_locked(dirs, &rec, bounds);
+            start_failed(detail)
         }
     })?;
     Ok(Ensured::Started(rec))
+}
+
+/// Stop the server `rec` darkmux was starting, within
+/// [`PRESSURE_STOP_GRACE`], and say so; a stop that fails is named too.
+fn stopped_for_pressure(spec: &ServerSpec, dirs: &Dirs, rec: &EngineRecord, bounds: Bounds, reading: String) -> ServerError {
+    let left_running = stop_locked(dirs, rec, Bounds { stop_grace: PRESSURE_STOP_GRACE, ..bounds }).err().map(|e| e.to_string());
+    ServerError::MemoryPressure { endpoint: spec.endpoint.clone(), model: spec.model.clone(), reading, left_running }
 }
 
 /// (#3511) [`ensure`]'s reuse, never a start, with the endpoint's lock
@@ -658,14 +721,28 @@ enum NotReady {
     /// Something darkmux did not start answers on the port (#3453 review).
     Foreign(PortHolder),
     Failed(String),
+    /// Memory pressure turned critical; the reading.
+    Pressure(String),
 }
 
-fn wait_ready(spec: &ServerSpec, dirs: &Dirs, rec: &EngineRecord, bounds: Bounds, progress: &mut dyn FnMut(Progress)) -> Result<(), NotReady> {
+fn wait_ready(
+    spec: &ServerSpec,
+    dirs: &Dirs,
+    rec: &EngineRecord,
+    bounds: Bounds,
+    progress: &mut dyn FnMut(Progress),
+    watch: Watch<'_>,
+) -> Result<(), NotReady> {
     let began = Instant::now();
     let mut last_beat = began;
     loop {
         if !alive(rec) {
             return Err(NotReady::Failed(format!("it exited during its start{}", log_tail(&dirs.log_for(&spec.endpoint)))));
+        }
+        // Before the answer is read: a server that answers on a machine
+        // out of memory is stopped like one still loading.
+        if let Some(reading) = watch() {
+            return Err(NotReady::Pressure(reading));
         }
         if answers(spec.port, &spec.served_name) {
             // The answer is darkmux's only when its own server is the listener.

@@ -248,7 +248,8 @@ pub struct ModelInfo {
     /// The weights on disk.
     pub weights_bytes: u64,
     /// The engine's own floor for serving it: the weights plus its runtime
-    /// margin, before any KV cache.
+    /// margin, before any KV cache. Not what a start commits
+    /// ([`conservative_commitment`]).
     pub memory_floor_bytes: u64,
 }
 
@@ -272,6 +273,81 @@ pub fn parse_info(text: &str) -> Result<ModelInfo> {
         .with_context(|| format!("`info`'s memory floor line {floor:?} names no GiB figure"))?;
     let memory_floor_bytes = (gib * 1024.0 * 1024.0 * 1024.0).round() as u64;
     Ok(ModelInfo { weights_bytes, memory_floor_bytes })
+}
+
+/// The weights of the one model Tensorfold's start was measured on,
+/// `TensorFold/Qwen3.8-27B-MLX-4bit` (its `info` line), which the figures
+/// below are scaled from.
+///
+/// These figures stand in for an estimate the engine does not report:
+/// `info`'s floor is the weights plus a margin "before any KV cache", and
+/// `plan` (its pre-start estimate) is CUDA-only, so on Metal nothing says
+/// what a start will commit (https://github.com/ashhart/TensorFold/issues/2761).
+/// They hold until that issue is resolved. Measured on a 128 GB M5 Max with
+/// Tensorfold 1.2, `tensorfold:process_footprint_bytes` at ready after a
+/// 4-token request (darkmux #3538):
+///
+/// | `--context` | drafter | footprint |
+/// |---|---|---|
+/// | 8,192 | yes | 27.6 GB |
+/// | 8,192 | no | 25.8 GB |
+/// | 65,536 | yes | 34.6 GB |
+/// | 65,536 | no | 32.9 GB |
+/// | 262,144 | yes | 67.3 GB |
+///
+/// So Tensorfold reserves its KV cache when it starts, not as the context
+/// fills. The figures are not derived from the model's `config.json`: its
+/// attention geometry (64 layers, 4 key-value heads of 256, full attention
+/// every fourth layer) gives 65 KB a token at bf16 if only the full
+/// attention layers cache and 262 KB if all do, and the engine measured
+/// neither.
+pub const MEASURED_WEIGHTS_BYTES: u64 = 16_081_519_429;
+
+/// What the measured model takes at no context: 26 GB, the smallest
+/// measurement (25.8 GB at 8k, no drafter) rounded up. Stands in for an
+/// engine-reported estimate (https://github.com/ashhart/TensorFold/issues/2761).
+pub const MEASURED_BASE_BYTES: u64 = 26_000_000_000;
+
+/// The KV cache a context token reserves at start: 166 KB, the steepest
+/// slope between two measurements (64k to 262k with a drafter: 32.7 GB over
+/// 196,608 tokens; 8k to 64k gives 122 KB). Stands in for an
+/// engine-reported estimate (https://github.com/ashhart/TensorFold/issues/2761).
+pub const KV_BYTES_PER_CONTEXT_TOKEN: u64 = 166_000;
+
+/// What `--drafter` adds: 1.8 GB, the difference with and without one at
+/// 8k and at 64k. Stands in for an engine-reported estimate
+/// (https://github.com/ashhart/TensorFold/issues/2761).
+pub const DRAFTER_BYTES: u64 = 1_800_000_000;
+
+/// What a start is priced at before it has ever been measured: never less
+/// than it will commit. The model's weights plus the overhead measured
+/// beyond them ([`MEASURED_BASE_BYTES`] less [`MEASURED_WEIGHTS_BYTES`], the
+/// KV cache at `n_ctx`, the drafter), and never under the engine's own
+/// floor. With base, slope and drafter each taken at their largest, every
+/// measured setup is priced 1.5 to 4.1 GB over what it took.
+///
+/// Only one model was measured, so another model's overhead is a guess
+/// made in the safe direction: a larger model's is scaled up with its
+/// weights, a smaller one's is kept whole (its cache per token is not
+/// smaller in proportion to its weights).
+pub fn conservative_commitment(info: ModelInfo, n_ctx: u32, drafter: bool) -> u64 {
+    let overhead = (MEASURED_BASE_BYTES - MEASURED_WEIGHTS_BYTES)
+        .saturating_add(KV_BYTES_PER_CONTEXT_TOKEN.saturating_mul(u64::from(n_ctx)))
+        .saturating_add(if drafter { DRAFTER_BYTES } else { 0 });
+    let scaled = if info.weights_bytes > MEASURED_WEIGHTS_BYTES {
+        (u128::from(overhead) * u128::from(info.weights_bytes) / u128::from(MEASURED_WEIGHTS_BYTES)).min(u128::from(u64::MAX)) as u64
+    } else {
+        overhead
+    };
+    info.weights_bytes.saturating_add(scaled).max(info.memory_floor_bytes)
+}
+
+/// Whether `engine_args` start the server with a drafter: `--drafter` with
+/// a value, as `--drafter VALUE` or `--drafter=VALUE`.
+pub fn has_drafter(engine_args: &[String]) -> bool {
+    engine_args.iter().enumerate().any(|(i, arg)| {
+        arg.starts_with("--drafter=") || (arg == "--drafter" && engine_args.get(i + 1).is_some_and(|v| !v.starts_with("--")))
+    })
 }
 
 fn expect_schema(doc: &serde_json::Value, what: &str) -> Result<()> {
@@ -496,6 +572,44 @@ mod tests {
     /// `info TensorFold/Qwen3.8-27B-MLX-4bit` from 1.2.4 on this machine.
     const INFO: &str = "family: Qwen3.5-2B or Qwen3.8-27B (qwen3_5)\nformat: 4-bit, group 64\n\
         weights: 14.98 GiB (16081519429 bytes)\nmemory floor: 16.98 GiB (weights plus a 2.00 GiB runtime margin)\n";
+
+    /// The setups measured on a clean machine (footprint at ready, after a
+    /// 4-token request): every one is priced at or above what it took, and
+    /// the 262k start that was priced at its 18.2 GB floor is priced near
+    /// the 67.3 GB it committed.
+    #[test]
+    fn a_start_is_priced_at_or_above_every_measured_footprint() {
+        let info = parse_info(INFO).unwrap();
+        let gb = |b: u64| b as f64 / 1e9;
+        for (n_ctx, drafter, measured_gb) in
+            [(8_192, true, 27.6), (8_192, false, 25.8), (65_536, true, 34.6), (65_536, false, 32.9), (262_144, true, 67.3)]
+        {
+            let priced = gb(conservative_commitment(info, n_ctx, drafter));
+            assert!(priced >= measured_gb, "context {n_ctx}, drafter {drafter}: priced {priced:.1} GB under the measured {measured_gb} GB");
+            assert!(priced <= measured_gb + 6.0, "context {n_ctx}, drafter {drafter}: priced {priced:.1} GB, far over the measured {measured_gb} GB");
+        }
+        let long = gb(conservative_commitment(info, 262_144, true));
+        assert!((67.3..72.0).contains(&long), "a 262k start with a drafter is priced around 67 GB, not its 18.2 GB floor: {long:.1}");
+    }
+
+    /// A model that was never measured is never priced below the measured
+    /// one's overhead: a larger model's scales up with its weights, a
+    /// smaller one's is kept whole, and the engine's own floor is a floor.
+    #[test]
+    fn an_unmeasured_model_is_priced_no_lower_than_the_measured_overhead() {
+        let measured = parse_info(INFO).unwrap();
+        let overhead = |info: ModelInfo, n_ctx| conservative_commitment(info, n_ctx, false) - info.weights_bytes;
+        let small = ModelInfo { weights_bytes: 2_000_000_000, memory_floor_bytes: 4_147_483_648 };
+        assert_eq!(overhead(small, 65_536), overhead(measured, 65_536), "a smaller model keeps the whole overhead");
+        let double = ModelInfo { weights_bytes: measured.weights_bytes * 2, memory_floor_bytes: measured.memory_floor_bytes * 2 };
+        assert_eq!(overhead(double, 65_536), overhead(measured, 65_536) * 2, "a model twice the size, twice the overhead");
+        let floor_above = ModelInfo { weights_bytes: 1_000_000_000, memory_floor_bytes: 500_000_000_000 };
+        assert_eq!(conservative_commitment(floor_above, 8_192, false), 500_000_000_000, "the engine's floor is never undercut");
+        assert!(conservative_commitment(measured, 8_192, true) > conservative_commitment(measured, 8_192, false), "a drafter adds");
+        let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(has_drafter(&args(&["--slide", "--drafter", "z-lab/d"])) && has_drafter(&args(&["--drafter=z-lab/d"])));
+        assert!(!has_drafter(&args(&["--drafter-bits", "4"])) && !has_drafter(&args(&["--drafter", "--slide"])) && !has_drafter(&[]));
+    }
 
     #[test]
     fn the_version_line_parses_and_only_1_2_is_verified() {

@@ -128,6 +128,12 @@ impl Platform for LinuxPlatform {
         reclaimable_from_meminfo(&read_to_string("/proc/meminfo")?)
     }
 
+    /// `/proc/meminfo`'s swap figures. Linux gives no pressure level
+    /// darkmux reads yet and has no compressor limit, so those are `None`.
+    fn memory_pressure(&self) -> Option<crate::MemoryPressure> {
+        pressure_from_meminfo(&read_to_string("/proc/meminfo")?)
+    }
+
     /// `/etc/os-release`'s `PRETTY_NAME`, named Omarchy where Omarchy is
     /// installed (`~/.local/share/omarchy`). A rolling release says no
     /// install time, so none is claimed.
@@ -696,6 +702,21 @@ fn read_policies_with_freq() -> Vec<(Vec<usize>, Option<u64>, Option<u64>)> {
     Vec::new()
 }
 
+
+/// `SwapTotal` and `SwapFree` from `/proc/meminfo` as a pressure reading:
+/// the swap in use and left. `None` when either line is missing.
+pub(crate) fn pressure_from_meminfo(meminfo: &str) -> Option<crate::MemoryPressure> {
+    let kb = |key: &str| {
+        meminfo.lines().find_map(|l| l.strip_prefix(key)).and_then(|v| v.split_whitespace().next()).and_then(|n| n.parse::<u64>().ok())
+    };
+    let (total, free) = (kb("SwapTotal:")?, kb("SwapFree:")?);
+    Some(crate::MemoryPressure {
+        level: None,
+        swap_used_bytes: Some(total.saturating_sub(free) * 1024),
+        swap_free_bytes: Some(free * 1024),
+        compressor_pct: None,
+    })
+}
 
 /// `MemAvailable` from `/proc/meminfo`: the kernel's estimate of what can be
 /// handed out without swapping, reclaimable cache included. `None` when the

@@ -90,6 +90,13 @@ pub trait Platform: Send + Sync {
     /// headroom` figure (#3281). `None` when the platform can't read it:
     /// callers report no figure, never a 0 that reads as "full".
     fn reclaimable_memory_bytes(&self) -> Option<u64>;
+    /// How hard the machine's memory is pressed right now: the kernel's own
+    /// pressure level, the swap in use and left, and how full the compressor
+    /// is against the kernel's limit for it. Each figure is `None` where the
+    /// platform does not report it; the whole answer is `None` where it
+    /// reads none of them. Cheap enough to ask several times a second: a
+    /// start is watched with it while its memory is committed.
+    fn memory_pressure(&self) -> Option<MemoryPressure>;
     /// (#2917, #3200) An opaque stamp of when process `pid` started, or
     /// `None` when it cannot be read (no such process, or the platform has
     /// no reader). Compare it only for EQUALITY against a stamp this same
@@ -266,6 +273,28 @@ pub struct MemorySnapshot {
     /// What can be handed out without swapping, reclaimable cache included.
     pub available_bytes: Option<u64>,
     pub swap_used_bytes: Option<u64>,
+}
+
+/// The kernel's own verdict on memory pressure, mildest first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PressureLevel {
+    Normal,
+    Warning,
+    Critical,
+}
+
+/// A memory pressure reading ([`Platform::memory_pressure`]). Every figure
+/// is optional: a platform reports what it can read, never a stand-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MemoryPressure {
+    pub level: Option<PressureLevel>,
+    pub swap_used_bytes: Option<u64>,
+    /// Swap left in what is allocated. Where swap grows on demand (macOS
+    /// adds swap files as it needs them) this is not headroom.
+    pub swap_free_bytes: Option<u64>,
+    /// How full the compressor is against the kernel's own limits for it,
+    /// in percent: the fuller of its segments and its compressed pages.
+    pub compressor_pct: Option<u8>,
 }
 
 impl MemorySnapshot {

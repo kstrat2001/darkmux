@@ -35,6 +35,12 @@
 //!    server, or an LM Studio load the plan keeps because it is pinned),
 //!    `memory_in_use` when only memory darkmux did not take is short.
 //!
+//! 4. A load that fits is still refused `memory_in_use` while the
+//!    machine's memory is already under pressure
+//!    ([`darkmux_types::memory_pressure`]), and one whose `lms load` returns
+//!    onto a machine whose pressure turned critical meanwhile is unloaded
+//!    again and refused the same way ([`watching_pressure`]).
+//!
 //! darkmux's idle LM Studio loads are the planner's own business: the wave's
 //! Exclusive scope already unloads every one the wave does not want, so only
 //! servers are evicted for a wave.
@@ -299,6 +305,11 @@ pub(crate) struct Evict<'a> {
 /// potential would refuse loads LM Studio makes fine. A potential not
 /// reached is a warning; a load with no commitment (its architecture
 /// unreadable) is never refused.
+///
+/// A plan whose loads fit is still refused `memory_in_use` while the
+/// machine's memory is already under pressure
+/// ([`crate::engine_dispatch::refuse_under_pressure`]), as an engine
+/// server's start is: the arithmetic is only as good as its prices.
 pub(crate) fn make_room(
     plan: &Plan,
     facts: &Facts,
@@ -310,6 +321,19 @@ pub(crate) fn make_room(
     if !plan.actions.iter().any(|a| matches!(a.action, Action::Load { .. })) {
         return Ok(());
     }
+    room_for_loads(plan, facts, pricing, evict, room, stopped)?;
+    crate::engine_dispatch::refuse_under_pressure(room.machine)
+}
+
+/// [`make_room`]'s memory arithmetic, for a plan that loads.
+fn room_for_loads(
+    plan: &Plan,
+    facts: &Facts,
+    pricing: &LoadPricing<'_>,
+    evict: &Evict<'_>,
+    room: &ServerRoom<'_>,
+    stopped: &mut Vec<String>,
+) -> Result<(), EngineRefusal> {
     let commitment = plan_room(plan, facts, &pricing.commitment());
     let Some(target) = plan_room(plan, facts, &pricing.potential()) else {
         eprintln!("darkmux: warning: no memory figure for this LM Studio load; loading it unchecked and LM Studio decides");
@@ -596,12 +620,64 @@ pub(crate) fn load_reserved(
     let room = gate.room();
     let (lease, reserved, before) = reserve_preflight(gate, &room, model_key, identifier, n_ctx)?;
     // A load that fails ends its reservation with `reserved`.
-    load(model_key, identifier, n_ctx)?;
+    let (loaded, critical) = watching_pressure(room.machine, room.bounds.poll, || load(model_key, identifier, n_ctx));
+    loaded?;
+    if let Some(reading) = critical {
+        // Cut with its reservation and its lease, which end here.
+        return Err(cut_for_pressure(&[identifier.to_string()], &reading, &mut |id| gate.unload(id)).into());
+    }
     let _ = lease.mark_loaded(&[identifier.to_string()]);
     if let Some(res) = reserved {
         (room.settle)(res, before);
     }
     Ok(lease)
+}
+
+/// Run `load` (an `lms load`, or a wave's), reading the machine's memory
+/// pressure every `poll` meanwhile and once more when it returns: the
+/// reading, when it turned critical
+/// ([`darkmux_types::memory_pressure::stops_start`]). A load cannot be
+/// interrupted the way a server darkmux spawned can be stopped, so the
+/// caller unloads what it loaded once the load returns
+/// ([`cut_for_pressure`]). With the gate off nothing is read.
+pub(crate) fn watching_pressure<T>(machine: &(dyn Machine + Sync), poll: std::time::Duration, load: impl FnOnce() -> T) -> (T, Option<String>) {
+    let gate = machine.pressure_gate();
+    if gate == darkmux_types::config::PressureGate::Off {
+        return (load(), None);
+    }
+    let critical = || darkmux_types::memory_pressure::stops_start(gate, machine.pressure().as_ref());
+    let (done, loading) = std::sync::mpsc::channel::<()>();
+    let critical = &critical;
+    std::thread::scope(|scope| {
+        let watcher = scope.spawn(move || loop {
+            match loading.recv_timeout(poll) {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if let Some(reading) = critical() {
+                        return Some(reading);
+                    }
+                }
+                _ => return None,
+            }
+        });
+        let out = load();
+        drop(done);
+        let seen = watcher.join().ok().flatten().or_else(critical);
+        (out, seen)
+    })
+}
+
+/// Unload the instances a load just made onto a machine whose memory
+/// pressure turned critical (`reading`), and refuse `memory_in_use`, naming
+/// any that could not be unloaded.
+pub(crate) fn cut_for_pressure(identifiers: &[String], reading: &str, unload: &mut dyn FnMut(&str) -> anyhow::Result<()>) -> EngineRefusal {
+    let left: Vec<String> = identifiers.iter().filter_map(|id| unload(id).err().map(|e| format!("`{id}` ({e:#})"))).collect();
+    let names = identifiers.iter().map(|id| format!("`{id}`")).collect::<Vec<_>>().join(", ");
+    let did = if left.is_empty() {
+        "so darkmux unloaded what it had just loaded; retry once memory is free".to_string()
+    } else {
+        format!("and darkmux could not unload {}; unload it with `darkmux machine eject`", left.join(", "))
+    };
+    refuse("memory_in_use", format!("this machine's memory pressure turned critical while {names} was loading ({reading}), {did}"))
 }
 
 /// [`load_reserved`]'s part under the lock: the lease and its reservation,
