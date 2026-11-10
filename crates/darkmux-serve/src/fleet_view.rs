@@ -811,7 +811,7 @@ impl FleetSources for ProcessSources {
     fn local_card(&self) -> MachineCard {
         match &self.card_cache {
             Some(cache) => cache.get(gather_local_card),
-            None => gather_local_card(),
+            None => crate::machine_card::gather_local_card_now(),
         }
     }
 

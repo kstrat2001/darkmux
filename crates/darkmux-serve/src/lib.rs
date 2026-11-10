@@ -3165,12 +3165,18 @@ async fn machine_status_handler() -> axum::Json<wire::MachineStatusResponse> {
         Ok(read) => (read.residents, read.read_at_ms),
         Err(_) => (EngineResidents::panicked(), current_millis()),
     };
-    axum::Json(wire::MachineStatusResponse {
+    axum::Json(machine_status_body(r, read_at_ms))
+}
+
+/// `/machine/status`'s body for one residents read.
+pub(crate) fn machine_status_body(r: EngineResidents, read_at_ms: u64) -> wire::MachineStatusResponse {
+    wire::MachineStatusResponse {
         lms_unreachable: r.unknown.is_some(),
         models: r.models,
         engine: r.engine,
+        engine_servers: r.servers,
         generated_at_ms: read_at_ms,
-    })
+    }
 }
 
 /// (#3428) One read of this machine's residents and what they leave for AI:
@@ -3237,6 +3243,9 @@ pub struct EngineResidents {
     /// reason): the engine does not report it, cannot be used, or could not
     /// be asked. `None` when `models` is the engine's answer.
     pub unknown: Option<String>,
+    /// (#3450) The servers darkmux started that are running now, from its
+    /// records: known whatever the engine answered.
+    pub servers: Vec<wire::EngineServer>,
 }
 
 impl EngineResidents {
@@ -3252,6 +3261,7 @@ impl EngineResidents {
             },
             models: Vec::new(),
             unknown: Some("the engine read failed".to_string()),
+            servers: Vec::new(),
         }
     }
 }
@@ -3267,9 +3277,10 @@ pub fn local_engine_residents() -> EngineResidents {
         reports_residency: matches!(engine.capabilities().residency, engine::Residency::Reported),
         usable: engine.usable(),
     };
+    let servers = darkmux_profiles::engine::server::listed(&darkmux_profiles::engine::server::Dirs::under_home());
     match engine.loaded() {
-        Ok(models) => EngineResidents { engine: view, models, unknown: None },
-        Err(e) => EngineResidents { engine: view, models: Vec::new(), unknown: Some(format!("{e:#}")) },
+        Ok(models) => EngineResidents { engine: view, models, unknown: None, servers },
+        Err(e) => EngineResidents { engine: view, models: Vec::new(), unknown: Some(format!("{e:#}")), servers },
     }
 }
 
@@ -3422,6 +3433,7 @@ fn degraded_specs() -> wire::MachineSpecsResponse {
         ram_free_for_ai_bytes: None,
         cpu_brand: None,
         loaded_models: Vec::new(),
+        engine_servers: Vec::new(),
         lms_unreachable: true,
         engine: Some(EngineResidents::panicked().engine),
         utility_model: None,
@@ -3449,7 +3461,8 @@ pub(crate) fn gather_served_specs() -> wire::MachineSpecsResponse {
 /// independent, so one failure never cascades.
 pub(crate) fn gather_specs_from(read: ResidentsRead) -> wire::MachineSpecsResponse {
     let ResidentsRead { residents, ram_free_for_ai_bytes: ram_free, read_at_ms } = read;
-    let (engine, loaded_models, lms_unreachable) = (residents.engine, residents.models, residents.unknown.is_some());
+    let lms_unreachable = residents.unknown.is_some();
+    let (engine, loaded_models, engine_servers) = (residents.engine, residents.models, residents.servers);
     let ram_total = darkmux_hardware::ram_installed_bytes();
     let cpu_brand = darkmux_hardware::cpu_brand().map(str::to_string);
     let machine_id = darkmux_flow::resolve_machine_id();
@@ -3497,6 +3510,7 @@ pub(crate) fn gather_specs_from(read: ResidentsRead) -> wire::MachineSpecsRespon
         ram_free_for_ai_bytes: ram_free,
         cpu_brand,
         loaded_models,
+        engine_servers,
         lms_unreachable,
         engine: Some(engine),
         utility_model,

@@ -143,9 +143,16 @@ pub struct MachineStatusResponse {
     pub lms_unreachable: bool,
     /// (#316) This machine's engine.
     pub engine: MachineEngine,
+    /// (#3450) The servers darkmux started that are running now (Tensorfold,
+    /// rec's Flint): darkmux's own residents beside its LM Studio loads in
+    /// `models`, known from darkmux's records whatever `lms_unreachable` says.
+    #[serde(default)]
+    pub engine_servers: Vec<EngineServer>,
     #[cfg_attr(test, ts(type = "number"))]
     pub generated_at_ms: u64,
 }
+
+pub use darkmux_profiles::engine::server::EngineServer;
 
 /// The configured machine utility model and whether it is resident.
 #[derive(Debug, Clone, Serialize, serde::Deserialize, schemars::JsonSchema)]
@@ -180,6 +187,10 @@ pub struct MachineSpecsResponse {
     pub ram_free_for_ai_bytes: Option<u64>,
     pub cpu_brand: Option<String>,
     pub loaded_models: Vec<LoadedModel>,
+    /// (#3450) As on `/machine/status`: the servers darkmux started that are
+    /// running now. Empty from a darkmux before 5.10, which listed none.
+    #[serde(default)]
+    pub engine_servers: Vec<EngineServer>,
     /// As on `/machine/status`: the resident list is not known (`engine`
     /// says why).
     pub lms_unreachable: bool,
