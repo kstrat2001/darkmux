@@ -321,7 +321,11 @@ mod tests {
     }
 
     /// A tree as deep as darkmux deletes is removed.
+    ///
+    /// Serial with the refusal test below: this walk holds a descriptor per
+    /// level, which that test's process-wide count would read as its own.
     #[test]
+    #[serial_test::serial(deep_tree_descriptors)]
     fn a_tree_as_deep_as_the_walk_takes_is_removed() {
         let (dir, removed) = remove_nested(MAX_DELETE_DEPTH);
         removed.unwrap();
@@ -332,13 +336,21 @@ mod tests {
     /// recursive walk's stack ran out near 2,000 levels on 2 MiB; a
     /// descriptor per level runs past a 256-file limit sooner). One deeper
     /// is refused with a reason, without holding a descriptor per level.
+    ///
+    /// `/dev/fd` counts the whole process, and under `cargo test` other
+    /// tests run on other threads of it, opening files of their own (the
+    /// release-mode gate failed here on a +2 bound). A walk that kept its
+    /// frames would leave [`MAX_DELETE_DEPTH`] open, so half that is the
+    /// bound: far above what a neighbor holds, far below a leak.
     #[test]
+    #[serial_test::serial(deep_tree_descriptors)]
     fn a_tree_deeper_than_the_walk_takes_is_refused() {
         let before = open_fds();
         let (_dir, removed) = remove_nested(MAX_DELETE_DEPTH + 72);
         let err = removed.unwrap_err();
         assert!(err.to_string().contains("deeper than"), "{err}");
-        assert!(open_fds() <= before + 2, "descriptors left open");
+        let after = open_fds();
+        assert!(after < before + MAX_DELETE_DEPTH / 2, "descriptors left open: {before} before, {after} after");
     }
 
     /// A path that is not plain names, a root that is not there, a NUL in a
