@@ -578,11 +578,13 @@ pub(crate) fn unload_unless_held(gate: &dyn Preflight, identifier: &str, unload:
 /// load begins; the reservation kept past the load until its memory pages
 /// in. A load that cannot be priced is leased with no reservation.
 ///
-/// The lease ends with the load: it says a dispatch is acquiring the model,
-/// and whichever dispatch then runs on it holds its own
-/// ([`hold_dispatch_models`]). The reservation is not a lease and outlives
-/// it, so a model just loaded for nobody (the compactor, the utility model)
-/// counts against free memory while it pages in, and is neither held nor
+/// The lease is returned, marked loaded, for the caller to keep until the
+/// dispatch that runs on the model holds it with its own
+/// ([`hold_dispatch_models`]): dropped any sooner, a model just loaded reads
+/// as idle and another darkmux process may unload it to make room. The
+/// reservation is not a lease and ends apart from it, so a model loaded for
+/// nobody (the compactor, the utility model) counts against free memory
+/// while it pages in, and once its lease is let go is neither held nor
 /// `busy`.
 pub(crate) fn load_reserved(
     gate: &dyn Preflight,
@@ -590,16 +592,16 @@ pub(crate) fn load_reserved(
     identifier: &str,
     n_ctx: u32,
     load: &dyn Fn(&str, &str, u32) -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<LeaseGuard> {
     let room = gate.room();
     let (lease, reserved, before) = reserve_preflight(gate, &room, model_key, identifier, n_ctx)?;
     // A load that fails ends its reservation with `reserved`.
     load(model_key, identifier, n_ctx)?;
-    drop(lease);
+    let _ = lease.mark_loaded(&[identifier.to_string()]);
     if let Some(res) = reserved {
         (room.settle)(res, before);
     }
-    Ok(())
+    Ok(lease)
 }
 
 /// [`load_reserved`]'s part under the lock: the lease and its reservation,

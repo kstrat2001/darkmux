@@ -668,6 +668,13 @@ fn the_container_path_takes_the_dispatch_lease() {
     assert!(body("lease_lmstudio_job").contains("hold_dispatch_models("));
     let launch = body("launch_container");
     assert!(launch.find("prepare_compactor(").unwrap() < launch.find("hold_dispatch_models(").unwrap());
+    // A model a preflight just loaded keeps that load's lease until the
+    // run's own holds it.
+    assert!(prepare.find("lease_lmstudio_job(").unwrap() < prepare.find("drop(preflight_hold)").unwrap());
+    assert!(launch.find("hold_dispatch_models(").unwrap() < launch.find("drop(compactor_hold)").unwrap());
+    // A compactor refused for memory fails the dispatch before the spawn.
+    let compactor = body("prepare_compactor");
+    assert!(compactor.contains("apply_compactor_setup(") && compactor.contains("})?;"), "{compactor}");
 }
 
 /// (#3508) The planner plans against the machine's memory too: a copy of a
@@ -918,7 +925,7 @@ fn a_load_whose_reservation_cannot_be_written_is_refused_before_it_loads() {
         loads.set(loads.get() + 1);
         Ok(())
     };
-    load_reserved(&gate, "util", "darkmux:util", 16_384, &counting).expect_err("refused");
+    assert!(load_reserved(&gate, "util", "darkmux:util", 16_384, &counting).is_err(), "refused");
     assert_eq!(loads.get(), 0, "the preflight loaded nothing");
     assert!(LeaseGuard::acquire().all_live_leased_models().is_empty(), "and holds no lease after");
 }
@@ -973,6 +980,8 @@ struct FakePreflight<'a> {
     locks: std::cell::Cell<u32>,
     /// Every load and unload asked of LM Studio, in order.
     calls: Mutex<Vec<String>>,
+    /// What other dispatches hold is read from the leases on disk.
+    real_leases: bool,
 }
 
 impl FakePreflight<'static> {
@@ -995,11 +1004,16 @@ impl<'a> FakePreflight<'a> {
             machine,
             locks: Default::default(),
             calls: Default::default(),
+            real_leases: false,
         }
     }
     /// The caller prices `model_key` at `bytes`, both ways.
     fn priced(mut self, model_key: &str, bytes: u64) -> Self {
         self.est.0.insert(model_key.into(), bytes);
+        self
+    }
+    fn reading_leases(mut self) -> Self {
+        self.real_leases = true;
         self
     }
     fn holding(mut self, held: &[&str]) -> Self {
@@ -1034,6 +1048,9 @@ impl<'a> FakePreflight<'a> {
 
 impl Preflight for FakePreflight<'_> {
     fn held_by_others(&self) -> Vec<String> {
+        if self.real_leases {
+            return LeaseGuard::acquire().all_live_leased_models();
+        }
         self.held.clone()
     }
     fn lock(&self) -> anyhow::Result<darkmux_types::residency_lock::ResidencyLock> {
@@ -1088,7 +1105,7 @@ fn a_preflight_load_reserves_under_the_lock_and_loads_outside_it() {
     let handed_on: Vec<u64> = SETTLING.lock().unwrap().iter().map(Reserved::need_bytes).collect();
     assert_eq!(handed_on, [5 * GIB], "the reservation is kept until it settles");
     let failing = |_: &str, _: &str, _: u32| -> anyhow::Result<()> { anyhow::bail!("no") };
-    load_reserved(&gate, "util", "darkmux:util", 16_384, &failing).unwrap_err();
+    assert!(load_reserved(&gate, "util", "darkmux:util", 16_384, &failing).is_err());
     assert_eq!(reserved_now(), 5 * GIB, "a failed load reserves nothing after: only the first load's is left");
 }
 
@@ -1147,7 +1164,7 @@ fn profile_model(id: &str) -> darkmux_types::ProfileModel {
 /// A preflight load as a dispatch makes it (a lab run's model, the
 /// compactor, the utility model), against `gate`.
 fn preflight(gate: &FakePreflight<'_>, id: &str) -> anyhow::Result<()> {
-    crate::dispatch_internal::preflight_load(&profile_model(id), crate::dispatch_internal::WindowSource::Profile, gate)
+    crate::dispatch_internal::preflight_load(&profile_model(id), crate::dispatch_internal::WindowSource::Profile, gate).map(drop)
 }
 
 /// A preflight load decides memory as a wave does: an idle engine server
@@ -1277,6 +1294,29 @@ fn a_preflight_never_unloads_its_own_instance_a_held_one_or_the_utility_binding(
     let text = format!("{err:#}");
     assert!(text.contains("running dispatches hold darkmux:held, darkmux:util;"), "{text}");
     assert!(unloads.lock().unwrap().is_empty(), "{:?}", unloads.lock().unwrap());
+}
+
+/// A model a preflight just loaded stays leased until its caller holds it
+/// with its own lease: a peer dispatch's compactor, loaded and not yet held
+/// by that dispatch, is never unloaded to make room, and the load that
+/// wanted its memory is `busy`.
+#[test]
+#[serial_test::serial]
+fn a_model_a_preflight_just_loaded_is_never_unloaded_before_its_caller_holds_it() {
+    let rig = Rig::new();
+    let peer = FakePreflight::without_machine();
+    let peers_load = load_reserved(&peer, "peer-compactor", "darkmux:peer-compactor", 8_000, &|_, _, _| Ok(())).expect("loads");
+    let unloads = Mutex::new(Vec::new());
+    let free = || Some(if unloads.lock().unwrap().is_empty() { 8 * GIB } else { 24 * GIB });
+    let machine = FakeMachine { leased: Mutex::new(Vec::new()), lms_unloads: Some(&unloads), ..FakeMachine::new(&free) };
+    let gate = FakePreflight::on(rig.dirs(), &machine)
+        .reading_leases()
+        .resident("darkmux:peer-compactor", "peer-compactor", 8_000, 16 * GIB)
+        .cataloged("m", 20 * GIB);
+    let err = preflight(&gate, "m").expect_err("refused while the peer's compactor is held");
+    assert_eq!(refusal_code(&err), Some("busy"), "{err:#}");
+    assert!(unloads.lock().unwrap().is_empty(), "{:?}", unloads.lock().unwrap());
+    drop(peers_load);
 }
 
 /// The stale-context reload through the same wiring: an instance a running
