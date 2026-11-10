@@ -635,7 +635,7 @@ fn reserve_preflight(
 fn preflight_room(gate: &dyn Preflight, room: &ServerRoom<'_>, lease: &LeaseGuard, want: &Placement) -> anyhow::Result<Option<PlanRoom>> {
     let mut host = gate.host();
     let residents = host.as_mut().and_then(|h| h.list_resident().ok()).unwrap_or_default();
-    let facts = Facts { residents, utility_binding: room.machine.utility(), ..Default::default() };
+    let facts = crate::concurrent_dispatch::reconcile_facts(residents, room.machine.utility());
     let host = host.as_deref_mut().map(|h| h as &mut dyn ModelHost);
     let pricing = LoadPricing::for_load(&want.model_key, want.min_ctx, gate.estimator(), host);
     let plan = loading(want);
