@@ -12,6 +12,7 @@ import { TokenScope } from "../../components/TokenScope";
 import { UtilityGlyph } from "../../components/UtilityGlyph";
 import { ServesLine } from "../../components/ServesLine";
 import { serversLine, serversTitle } from "../../lib/engineServers";
+import { clkhm } from "../../lib/format";
 import type { EngineServer } from "../../types/generated/EngineServer";
 import { LampDot } from "../../components/LampDot";
 import { LampForm } from "../../lib/lamp";
@@ -396,6 +397,26 @@ export interface CardClock {
   playheadT: number;
 }
 
+/** The card's classes: its activity, an offline machine, no signal, and a
+ *  card that is not current because the page lost the daemon. */
+function machClass(face: CardFace, status: CardStatus, disconnected: boolean, notCurrent: boolean): string {
+  return [
+    "mach",
+    face.active ? "active" : "",
+    status === CardStatus.Offline ? "absent" : "",
+    face.noSignal || disconnected ? "nosignal" : "",
+    notCurrent ? "not-current" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+/** "as of HH:MM" on a card that is not current; nothing on a current one. */
+function CardAsOf({ asOf }: { asOf: number | null | undefined }) {
+  if (asOf === undefined) return null;
+  return <div className="mach-asof">{asOf != null ? `as of ${clkhm(asOf)}` : "not current"}</div>;
+}
+
 /** One card. `selectedIdx` is the execution the tube shows (-1 when none);
  * the fleet lens owns the pager's pick, this only draws it. */
 export function MachineCard({
@@ -405,7 +426,12 @@ export function MachineCard({
   machineKey,
   clock,
   onShowExecution,
+  notCurrentAsOf,
 }: {
+  /** Set while the page has lost the daemon: the card is not current, and
+   *  this is the last moment it was (`null` when that is unknown). The
+   *  card's words stay what they were; the machine may really be idle. */
+  notCurrentAsOf?: number | null;
   card: FleetCard;
   face: CardFace;
   selectedIdx: number;
@@ -432,9 +458,8 @@ export function MachineCard({
   const drill = () => {
     location.hash = machineDrillHash(machineKey);
   };
-  const cls = ["mach", face.active ? "active" : "", status === CardStatus.Offline ? "absent" : "", face.noSignal || disconnected ? "nosignal" : ""]
-    .filter(Boolean)
-    .join(" ");
+  const notCurrent = notCurrentAsOf !== undefined;
+  const cls = machClass(face, status, disconnected, notCurrent);
   return (
     // Every card drills to the runs lens pinned to that machine (see
     // `machineDrillHash`). `data-act`/`data-arg` are DOM inspection hooks for
@@ -447,6 +472,7 @@ export function MachineCard({
       className={cls}
       data-act="machine"
       data-arg={machineKey}
+      data-current={notCurrent ? "false" : undefined}
       role="button"
       tabIndex={0}
       aria-label={card.name}
@@ -460,6 +486,7 @@ export function MachineCard({
     >
       <CardNameRow card={card} utilityQuietKnown={face.utilityQuietKnown} />
       <CardSpec card={card} />
+      <CardAsOf asOf={notCurrentAsOf} />
       <div className="mach-body mach-body--scope">
         <StatusLine status={status} note={card.note} reading={reading} />
         <CountLine card={card} face={face} status={status} machineKey={machineKey} executions={execs.length} position={selectedIdx + 1} />

@@ -1,3 +1,4 @@
+import { clkhm } from "../../lib/format";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -2766,6 +2767,29 @@ describe("savings hero: nothing leaks while loading (#2830)", () => {
       expect(card.className, "the dim dot").toContain("nosignal");
       expect(card.className, "the machine is still running").toContain("active");
       expect(latestTokenScopeProps()).toMatchObject({ state: "nosignal" });
+    });
+
+    // Every card, idle ones included, is a claim about now. While the page
+    // has lost the daemon each says how old it is, without changing what it
+    // says the machine is doing (an idle machine may really be idle).
+    it("every card reads as not current while disconnected: marked with its as-of time, its words unchanged", async () => {
+      const asOf = Date.parse(t1c);
+      mockFleetFetch({
+        flowToday: [{ ts: t1a, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.complete", handle: "coder" }],
+      });
+      const { unmount } = renderFleetLens({ connected: false, lastContactMs: asOf });
+      await waitFor(() => expect(document.querySelectorAll(".mach").length).toBeGreaterThan(0));
+      for (const card of document.querySelectorAll(".mach")) {
+        expect(card.getAttribute("data-current"), "every card").toBe("false");
+        expect(card.querySelector(".mach-asof")?.textContent).toBe(`as of ${clkhm(asOf)}`);
+        expect(card.querySelector(".stat")?.textContent).not.toBe("disconnected");
+      }
+      unmount();
+      // The inverted case: connected, no card carries the mark.
+      renderFleetLens({ connected: true, lastContactMs: asOf });
+      await waitFor(() => expect(document.querySelectorAll(".mach").length).toBeGreaterThan(0));
+      expect(document.querySelector('.mach[data-current="false"]')).toBeNull();
+      expect(document.querySelector(".mach-asof")).toBeNull();
     });
 
     // A frozen daemon: the last heartbeat says the model is reading a big

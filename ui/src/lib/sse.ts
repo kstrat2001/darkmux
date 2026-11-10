@@ -25,6 +25,10 @@ import { ingestRecord, type NormRecord } from "./ingest";
  * sees no behavior difference from the new, optional 5th parameter.
  */
 
+/** How often a hidden tab writes its streamed records: it runs no animation
+ *  frames, and nothing paints there, so a coarse timer is enough. */
+const HIDDEN_FLUSH_MS = 1_000;
+
 export interface FlowTailHandle {
   close: () => void;
 }
@@ -76,12 +80,27 @@ export function startFlowTail(
   // Records parsed since the last cache write. Every write re-merges the
   // whole 24h window downstream (`useFlowWindow`), so a burst of records is
   // one write per animation frame, not one per record. A hidden tab runs no
-  // frames: its records wait here and land in one write when it returns.
+  // frames, so there the write waits on a timer instead, and a tab going
+  // hidden writes whatever was waiting for its frame.
   let pending: NormRecord[] = [];
   let frame: number | null = null;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  const cancelScheduled = () => {
+    if (frame !== null) cancelAnimationFrame(frame);
+    if (timer !== null) clearTimeout(timer);
+    frame = null;
+    timer = null;
+  };
+
+  const schedule = () => {
+    if (frame !== null || timer !== null) return;
+    if (document.visibilityState === "hidden") timer = setTimeout(flush, HIDDEN_FLUSH_MS);
+    else frame = requestAnimationFrame(flush);
+  };
 
   const flush = () => {
-    frame = null;
+    cancelScheduled();
     if (!pending.length) return;
     const batch = pending;
     pending = [];
@@ -100,7 +119,7 @@ export function startFlowTail(
     const rec = ingestRecord(parsed);
     if (!rec) return;
     pending.push(rec);
-    frame ??= requestAnimationFrame(flush);
+    schedule();
   };
 
   const open = () => {
@@ -121,6 +140,8 @@ export function startFlowTail(
   const onVisibilityChange = () => {
     if (document.visibilityState === "visible") {
       open();
+    } else {
+      flush();
     }
   };
 
@@ -131,7 +152,6 @@ export function startFlowTail(
     close: () => {
       // What is still waiting for its frame belongs to this tail's day: write
       // it now, so a rollover or an unmount loses nothing.
-      if (frame !== null) cancelAnimationFrame(frame);
       flush();
       source?.close();
       source = null;

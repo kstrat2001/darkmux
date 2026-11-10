@@ -126,6 +126,44 @@ describe("startFlowTail", () => {
     }
   });
 
+  // A hidden tab runs no animation frames, so a frame-only flush would hold
+  // every record until the tab is shown again.
+  it("a hidden tab still writes its records, on a timer instead of a frame", () => {
+    vi.useFakeTimers();
+    Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
+    try {
+      const queryClient = new QueryClient();
+      const queryKey = ["flow", "2026-08-09", "tail"];
+      const handle = startFlowTail(queryClient, queryKey, "2026-08-09", (url) => new MockEventSource(url) as unknown as EventSource);
+      vi.spyOn(window, "requestAnimationFrame").mockImplementation(() => 0); // frames never come
+      MockEventSource.instances[0].emit(JSON.stringify({ action: "dispatch.start", ts: "2026-08-09T00:00:00Z", session_id: "s1" }));
+      vi.advanceTimersByTime(1_000);
+      expect((queryClient.getQueryData(queryKey) as unknown[] | undefined)?.length).toBe(1);
+      handle.close();
+    } finally {
+      Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+      vi.useRealTimers();
+    }
+  });
+
+  it("a tab going hidden writes what was waiting for a frame at once", () => {
+    vi.useFakeTimers();
+    try {
+      const queryClient = new QueryClient();
+      const queryKey = ["flow", "2026-08-09", "tail"];
+      const handle = startFlowTail(queryClient, queryKey, "2026-08-09", (url) => new MockEventSource(url) as unknown as EventSource);
+      vi.spyOn(window, "requestAnimationFrame").mockImplementation(() => 0); // the frame never comes
+      MockEventSource.instances[0].emit(JSON.stringify({ action: "dispatch.start", ts: "2026-08-09T00:00:00Z", session_id: "s1" }));
+      Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
+      document.dispatchEvent(new Event("visibilitychange"));
+      expect((queryClient.getQueryData(queryKey) as unknown[] | undefined)?.length).toBe(1);
+      handle.close();
+    } finally {
+      Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+      vi.useRealTimers();
+    }
+  });
+
   it("drops a malformed record instead of throwing", () => {
     const queryClient = new QueryClient();
     const queryKey = ["flow", "2026-08-09", "tail"];
