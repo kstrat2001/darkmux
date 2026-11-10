@@ -174,6 +174,9 @@ pub struct EjectedServer {
     pub endpoint: String,
     pub model: String,
     pub pid: u32,
+    /// (#3450) Stopped without the endpoint's lock, which a start in flight
+    /// held: the thermal stop only.
+    pub without_lock: bool,
 }
 
 /// (#3450) Outcome of an [`eject_servers`] sweep.
@@ -259,7 +262,7 @@ fn eject_servers_with(
         .into_iter()
         .filter(|r| server::alive(r) || server::left_behind(dirs, &r.endpoint).is_some());
     for rec in ours {
-        let entry = EjectedServer { endpoint: rec.endpoint.clone(), model: rec.model.clone(), pid: rec.pid };
+        let entry = EjectedServer { endpoint: rec.endpoint.clone(), model: rec.model.clone(), pid: rec.pid, without_lock: false };
         let outcome = match dry_run {
             true if held(&rec) => Ok(StopOutcome::Held),
             true => Ok(StopOutcome::Stopped),
@@ -280,6 +283,7 @@ impl ServerEjectSummary {
         use crate::engine::server::StopOutcome;
         match outcome {
             Ok(StopOutcome::Stopped) => self.stopped.push(entry),
+            Ok(StopOutcome::StoppedWithoutLock) => self.stopped.push(EjectedServer { without_lock: true, ..entry }),
             Ok(StopOutcome::Held) => self.held.push(entry),
             Ok(StopOutcome::NotRunning) => self.skipped.push(entry),
             Err(e) => self.failed.push(EjectFailure { identifier: entry.endpoint, error: e.to_string() }),
@@ -628,6 +632,19 @@ mod tests {
             && !std::process::Command::new("ps").args(["-o", "stat=", "-p", &s.0.id().to_string()]).output().unwrap().stdout.starts_with(b"Z");
         assert!(!alive(&busy), "the held server is stopped too");
         assert!(alive(&stranger), "a reused pid is never signaled");
+    }
+
+    /// (#3450 review) A server the thermal stop took down without its
+    /// endpoint's lock is reported as stopped, and as stopped that way.
+    #[test]
+    fn a_server_stopped_without_its_lock_says_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = dirs_in(&tmp);
+        let s = stand_in();
+        record(&dirs, "tf", s.0.id(), None);
+        let unlocked = |_: &darkmux_types::engine_record::EngineRecord| Ok(crate::engine::server::StopOutcome::StoppedWithoutLock);
+        let summary = eject_servers_with(&dirs, false, &|_| false, &unlocked);
+        assert_eq!(summary.stopped.iter().map(|e| (e.endpoint.as_str(), e.without_lock)).collect::<Vec<_>>(), vec![("tf", true)]);
     }
 
     /// (#3450 review) A server whose process was gone by the time the eject

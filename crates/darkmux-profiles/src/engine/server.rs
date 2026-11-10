@@ -708,6 +708,9 @@ pub enum StopOutcome {
     Stopped,
     /// A running dispatch holds it: left running.
     Held,
+    /// (#3450) The thermal stop signaled it without the endpoint's lock,
+    /// which a start in flight held past [`THERMAL_LOCK_WAIT`].
+    StoppedWithoutLock,
     /// Nothing was signaled: the record no longer matched a live process of
     /// darkmux's (it exited, or another process holds its pid or port). The
     /// stale record is removed.
@@ -719,9 +722,35 @@ pub enum StopOutcome {
 /// server a running dispatch holds is stopped too. Still only a process its
 /// record matches is signaled (`NotRunning` otherwise). Never for `machine
 /// eject`, which keeps held servers.
+///
+/// A start holds the endpoint's lock until its model answers (up to
+/// [`START_BOUND`]), and a server still loading is the likeliest heat
+/// source, so the stop does not wait that out: it tries the lock for
+/// [`THERMAL_LOCK_WAIT`], then stops the server without it
+/// ([`StopOutcome::StoppedWithoutLock`]). The record and identity check
+/// (pid and start stamp) still decide what is signaled; the start in flight
+/// then fails with its own `dispatch.error`, the operator's chosen tradeoff
+/// at `critical`.
 pub fn stop_for_thermal(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds) -> Result<StopOutcome, ServerError> {
-    stop_if_idle(dirs, rec, bounds, &|_| false)
+    let lock_path = engine_record::path_in(&dirs.records, &rec.endpoint).with_extension("server.lock");
+    let until = Instant::now() + THERMAL_LOCK_WAIT;
+    let failed = |e: anyhow::Error| ServerError::StopFailed { endpoint: rec.endpoint.clone(), pid: rec.pid, detail: format!("{e:#}") };
+    loop {
+        if let Some(_lock) = darkmux_types::flock::try_lock_exclusive(&lock_path).map_err(failed)? {
+            return Ok(if stop_locked(dirs, rec, bounds)? { StopOutcome::Stopped } else { StopOutcome::NotRunning });
+        }
+        if Instant::now() >= until {
+            break;
+        }
+        std::thread::sleep(THERMAL_LOCK_POLL);
+    }
+    Ok(if stop_locked(dirs, rec, bounds)? { StopOutcome::StoppedWithoutLock } else { StopOutcome::NotRunning })
 }
+
+/// How long the thermal stop tries for an endpoint's lock before it stops
+/// the server without it.
+pub const THERMAL_LOCK_WAIT: Duration = Duration::from_secs(2);
+const THERMAL_LOCK_POLL: Duration = Duration::from_millis(100);
 
 /// [`stop_unless_held`], saying which of the three it was.
 pub fn stop_if_idle(dirs: &Dirs, rec: &EngineRecord, bounds: Bounds, held: Held<'_>) -> Result<StopOutcome, ServerError> {
@@ -1829,5 +1858,41 @@ S(("127.0.0.1", port), H).serve_forever()
             let total = memory(group.0.id()).expect("measured");
             assert!(total > leader, "the forked child counts too: {total} vs the leader's {leader}");
         }
+    }
+
+    /// (#3450 review) The thermal stop does not wait out a start holding
+    /// the endpoint's lock (a start holds it through `wait_ready`, up to
+    /// START_BOUND): it tries for [`THERMAL_LOCK_WAIT`], then stops the
+    /// server without the lock, the record and identity check still
+    /// deciding what is signaled, and says it did.
+    #[test]
+    fn a_thermal_stop_does_not_wait_out_a_held_endpoint_lock() {
+        let f = fixture();
+        let server = Reaped({
+            let mut c = Command::new("sleep");
+            c.arg("30");
+            std::os::unix::process::CommandExt::process_group(&mut c, 0);
+            c.spawn().unwrap()
+        });
+        let rec = record_of(&f, "tf", "tensorfold", server.0.id(), free_port(), &[]);
+        engine_record::write_in(&f.dirs.records, &rec).unwrap();
+        let lock_path = engine_record::path_in(&f.dirs.records, "tf").with_extension("server.lock");
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _held = darkmux_types::flock::lock_exclusive(&lock_path).unwrap();
+            held_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_secs(10));
+        });
+        held_rx.recv().unwrap();
+        let started = Instant::now();
+        let outcome = stop_for_thermal(&f.dirs, &rec, quick());
+        let took = started.elapsed();
+        assert_eq!(outcome, Ok(StopOutcome::StoppedWithoutLock));
+        assert!(took < Duration::from_millis(3500), "the stop waited {took:?} on a held lock");
+        assert!(!alive(&rec), "the server is stopped");
+        let stranger = EngineRecord { start_stamp: 7, ..rec.clone() };
+        engine_record::write_in(&f.dirs.records, &stranger).unwrap();
+        assert_eq!(stop_for_thermal(&f.dirs, &stranger, quick()), Ok(StopOutcome::NotRunning), "identity still decides");
+        drop(holder);
     }
 }

@@ -8,4 +8,9 @@ export type StoppedServer = {
 /**
  * The `endpoints` id it served.
  */
-endpoint: string, model: string, pid: number, };
+endpoint: string, model: string, pid: number, 
+/**
+ * Stopped without the endpoint's lock, which a start still loading the
+ * model held past the stop's short wait. Absent when the lock was taken.
+ */
+without_lock?: boolean, };

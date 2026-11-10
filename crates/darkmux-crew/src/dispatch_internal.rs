@@ -10303,14 +10303,17 @@ fn tier5_records(
     servers: &darkmux_profiles::ownership::ServerEjectSummary,
     reached_checkpoint_boundary: bool,
 ) -> Vec<darkmux_flow::Payload> {
-    let stopped: Vec<StoppedServer> = servers
-        .stopped
-        .iter()
-        .map(|s| StoppedServer { endpoint: s.endpoint.clone(), model: s.model.clone(), pid: s.pid })
-        .collect();
+    let named = |list: &[darkmux_profiles::ownership::EjectedServer]| -> Option<Vec<StoppedServer>> {
+        let out: Vec<StoppedServer> = list
+            .iter()
+            .map(|s| StoppedServer { endpoint: s.endpoint.clone(), model: s.model.clone(), pid: s.pid, without_lock: s.without_lock.then_some(true) })
+            .collect();
+        (!out.is_empty()).then_some(out)
+    };
+    let (stopped, skipped) = (named(&servers.stopped), named(&servers.skipped));
     let failed_servers: Option<Vec<EjectFailure>> = (!servers.failed.is_empty())
         .then(|| servers.failed.iter().map(|f| EjectFailure { identifier: f.identifier.clone(), error: f.error.clone() }).collect());
-    let failed_record = |failed, ejected_count, error, stopped_servers| {
+    let failed_record = |failed, ejected_count, error, stopped_servers, skipped_servers| {
         darkmux_flow::Payload::ThermalTier5EjectFailed(ThermalTier5EjectFailedPayload {
             reached_checkpoint_boundary,
             failed,
@@ -10318,6 +10321,7 @@ fn tier5_records(
             error,
             failed_servers: failed_servers.clone(),
             stopped_servers,
+            skipped_servers,
             simulated_host_source: None,
             step_id: None,
             context: None,
@@ -10327,7 +10331,7 @@ fn tier5_records(
         Ok(summary) => summary,
         // Could not even LIST the residents: there is no per-model detail to
         // report, only the enumeration failure, and the servers it stopped.
-        Err(e) => return vec![failed_record(None, None, Some(e.to_string()), (!stopped.is_empty()).then_some(stopped))],
+        Err(e) => return vec![failed_record(None, None, Some(e.to_string()), stopped, skipped)],
     };
     let ejected: Vec<EjectedModel> = summary
         .ejected
@@ -10338,7 +10342,8 @@ fn tier5_records(
         reached_checkpoint_boundary,
         ejected,
         user_loaded_count: summary.user_loaded_count as u64,
-        stopped_servers: (!stopped.is_empty()).then_some(stopped),
+        stopped_servers: stopped,
+        skipped_servers: skipped,
         simulated_host_source: None,
         step_id: None,
         context: None,
@@ -10355,7 +10360,7 @@ fn tier5_records(
             .iter()
             .map(|f| EjectFailure { identifier: f.identifier.clone(), error: f.error.clone() })
             .collect();
-        out.push(failed_record((!failed.is_empty()).then_some(failed), Some(summary.ejected.len() as u64), None, None));
+        out.push(failed_record((!failed.is_empty()).then_some(failed), Some(summary.ejected.len() as u64), None, None, None));
     }
     out
 }

@@ -24,6 +24,11 @@ user_loaded_count: number,
  */
 stopped_servers?: Array<StoppedServer>, 
 /**
+ * (#3450) Servers whose record no longer matched a live process of
+ * darkmux's when the stop reached them: nothing signaled.
+ */
+skipped_servers?: Array<StoppedServer>, 
+/**
  * The scenario file behind a record made on scripted readings; absent on a real run.
  */
 simulated_host_source?: string, 

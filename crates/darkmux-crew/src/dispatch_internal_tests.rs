@@ -19545,9 +19545,10 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
     #[test]
     fn the_tier5_records_name_the_engine_servers_it_stopped() {
         use darkmux_profiles::ownership::{EjectFailure as Fail, EjectSummary, EjectedServer, ServerEjectSummary};
-        let server = |e: &str| EjectedServer { endpoint: e.into(), model: format!("m/{e}"), pid: 42 };
+        let server = |e: &str| EjectedServer { endpoint: e.into(), model: format!("m/{e}"), pid: 42, without_lock: false };
         let servers = ServerEjectSummary {
-            stopped: vec![server("tf")],
+            stopped: vec![server("tf"), EjectedServer { without_lock: true, ..server("loading") }],
+            skipped: vec![server("gone")],
             failed: vec![Fail { identifier: "fl".into(), error: "did not stop".into() }],
             ..Default::default()
         };
@@ -19556,13 +19557,23 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         let json: Vec<serde_json::Value> = records.iter().map(|p| serde_json::to_value(p).unwrap()).collect();
         let actions: Vec<String> = records.iter().map(|p| p.action().as_str().to_string()).collect();
         assert_eq!(actions, vec!["thermal.tier5_eject", "thermal.tier5_eject_failed"]);
-        assert_eq!(json[0]["stopped_servers"], serde_json::json!([{"endpoint": "tf", "model": "m/tf", "pid": 42}]), "{}", json[0]);
+        assert_eq!(
+            json[0]["stopped_servers"],
+            serde_json::json!([
+                {"endpoint": "tf", "model": "m/tf", "pid": 42},
+                {"endpoint": "loading", "model": "m/loading", "pid": 42, "without_lock": true}
+            ]),
+            "{}",
+            json[0]
+        );
+        assert_eq!(json[0]["skipped_servers"], serde_json::json!([{"endpoint": "gone", "model": "m/gone", "pid": 42}]), "{}", json[0]);
         assert_eq!(json[1]["failed_servers"], serde_json::json!([{"identifier": "fl", "error": "did not stop"}]), "{}", json[1]);
         let unlisted = super::tier5_records(Err(anyhow::anyhow!("lms unreachable")), &servers, false);
         let only: Vec<serde_json::Value> = unlisted.iter().map(|p| serde_json::to_value(p).unwrap()).collect();
         assert_eq!(only.len(), 1);
         assert_eq!(only[0]["error"], "lms unreachable");
         assert_eq!(only[0]["stopped_servers"][0]["endpoint"], "tf", "{}", only[0]);
+        assert_eq!(only[0]["skipped_servers"][0]["endpoint"], "gone", "{}", only[0]);
     }
 
     /// (C3) The tier-5 eject records, pinned by behavior through the seam
@@ -19598,6 +19609,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
                 ejected: Vec::new(),
                 user_loaded_count: 0,
                 stopped_servers: None,
+                skipped_servers: None,
                 simulated_host_source: None,
                 step_id: None,
                 context: None,
@@ -19612,6 +19624,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             error: Some("lms unreachable".to_string()),
             failed_servers: None,
             stopped_servers: None,
+            skipped_servers: None,
             simulated_host_source: None,
             step_id: None,
             context: None,

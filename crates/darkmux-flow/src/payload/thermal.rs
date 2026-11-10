@@ -34,6 +34,11 @@ pub struct StoppedServer {
     pub endpoint: String,
     pub model: String,
     pub pid: u32,
+    /// Stopped without the endpoint's lock, which a start still loading the
+    /// model held past the stop's short wait. Absent when the lock was taken.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub without_lock: Option<bool>,
 }
 
 /// The thermal breaker tripped and could not write or resolve the crawl STOP file: the payload of
@@ -95,6 +100,11 @@ pub struct ThermalTier5EjectPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub stopped_servers: Option<Vec<StoppedServer>>,
+    /// (#3450) Servers whose record no longer matched a live process of
+    /// darkmux's when the stop reached them: nothing signaled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub skipped_servers: Option<Vec<StoppedServer>>,
     /// The scenario file behind a record made on scripted readings; absent on a real run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
@@ -154,6 +164,11 @@ pub struct ThermalTier5EjectFailedPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub stopped_servers: Option<Vec<StoppedServer>>,
+    /// (#3450) Servers whose record no longer matched a live process of
+    /// darkmux's when the stop reached them: nothing signaled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub skipped_servers: Option<Vec<StoppedServer>>,
     /// The scenario file behind a record made on scripted readings; absent on a real run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]

@@ -167,7 +167,7 @@ mod tests {
     /// (#3450) What the eject did with each server, and a summary line.
     #[test]
     fn the_eject_lines_say_what_stopped_what_was_kept_and_what_failed() {
-        let one = |e: &str| EjectedServer { endpoint: e.into(), model: format!("m/{e}"), pid: 7 };
+        let one = |e: &str| EjectedServer { endpoint: e.into(), model: format!("m/{e}"), pid: 7, without_lock: false };
         let summary = ServerEjectSummary {
             stopped: vec![one("tf")],
             held: vec![one("busy")],
