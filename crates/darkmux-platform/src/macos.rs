@@ -259,8 +259,17 @@ pub(crate) fn signed_app_from(
 /// found by [`icon_in_bundle`]. `None` for an executable outside a bundle,
 /// or a bundle that names no icon darkmux can show.
 pub(crate) fn app_icon(executable: &std::path::Path) -> Option<std::path::PathBuf> {
+    app_icon_by(executable, plist_icon_name)
+}
+
+/// [`app_icon`] with the `Info.plist` reader passed in, so every branch is
+/// tested on every OS (the real reader needs macOS's `plutil`).
+pub(crate) fn app_icon_by(
+    executable: &std::path::Path,
+    icon_name: impl Fn(&std::path::Path) -> Option<String>,
+) -> Option<std::path::PathBuf> {
     let contents = bundle_contents(executable)?;
-    icon_in_bundle(&contents, &plist_icon_name(&contents.join("Info.plist"))?)
+    icon_in_bundle(&contents, &icon_name(&contents.join("Info.plist"))?)
 }
 
 /// `<X>.app/Contents` for an executable at `<X>.app/Contents/MacOS/<exe>`.

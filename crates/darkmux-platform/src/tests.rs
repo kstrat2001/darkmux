@@ -1496,6 +1496,30 @@ fn codesign_reads_this_ad_hoc_test_process_and_never_verifies_it() {
     assert!(macos::codesign_display(u32::MAX).is_err(), "no such process");
 }
 
+/// Every OS: the icon is looked up only for an executable inside an
+/// `.app` bundle, only when `Info.plist` names one, and only when that file
+/// is inside the bundle's `Resources`.
+#[test]
+fn an_icon_comes_only_from_a_bundle_that_names_one_inside_its_resources() {
+    let dir = tempfile::tempdir().unwrap();
+    let contents = dir.path().join("Mux Bot.app/Contents");
+    std::fs::create_dir_all(contents.join("MacOS")).unwrap();
+    std::fs::create_dir_all(contents.join("Resources")).unwrap();
+    std::fs::write(contents.join("Resources/AppIcon.icns"), b"icns").unwrap();
+    let exe = contents.join("MacOS/Mux Bot");
+    let named = |name: &'static str| move |plist: &std::path::Path| {
+        assert!(plist.ends_with("Contents/Info.plist"), "{plist:?}");
+        Some(name.to_string())
+    };
+    let icon = macos::app_icon_by(&exe, named("AppIcon")).unwrap();
+    assert!(icon.ends_with("Contents/Resources/AppIcon.icns"), "{icon:?}");
+    assert_eq!(macos::app_icon_by(&exe, |_| None), None, "Info.plist names no icon");
+    assert_eq!(macos::app_icon_by(&exe, named("Missing")), None, "the named file is absent");
+    assert_eq!(macos::app_icon_by(&exe, named("../../x")), None, "a path, not a file name");
+    let loose = dir.path().join("bin/tool");
+    assert_eq!(macos::app_icon_by(&loose, named("AppIcon")), None, "not inside an .app bundle");
+}
+
 /// (macOS) A bundle's icon is found from its executable through
 /// `Info.plist`, by `plutil`.
 #[cfg(target_os = "macos")]
