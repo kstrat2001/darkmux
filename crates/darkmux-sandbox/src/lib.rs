@@ -161,9 +161,10 @@ pub trait SandboxBackend: Send + Sync {
     fn run(&self, policy: &SandboxPolicy) -> (Command, SandboxHandle);
 
     /// The command that makes `policy`'s sandbox without starting it, and
-    /// its handle. Once that command succeeds, a [`stop`] or [`remove`]
-    /// finds it, so nothing started later can escape a stop that came
-    /// first.
+    /// its handle. Once that command succeeds, a [`remove`] finds it, and a
+    /// sandbox removed before it starts never runs. A [`stop`] is not
+    /// enough: it ends a running sandbox and leaves a created one to start
+    /// later, so a caller ending a created sandbox removes it.
     ///
     /// [`stop`]: SandboxBackend::stop
     /// [`remove`]: SandboxBackend::remove

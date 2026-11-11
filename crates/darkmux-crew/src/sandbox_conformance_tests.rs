@@ -250,9 +250,10 @@ fn a_stop_lets_the_sandbox_end_itself(backend: &dyn SandboxBackend, image: &str)
     assert!(until_listed(backend, &p.name, false), "{} outlived its stop", p.name);
 }
 
-/// A published port answers on the host's loopback, at its own number. The
-/// sandbox serves one line on it; the host reads that line back, so an
-/// accepting proxy with nothing behind it does not pass.
+/// A published port answers on the host's loopback, at its own number, and
+/// not on the host's outward address. The sandbox serves one line on it;
+/// the host reads that line back, so an accepting proxy with nothing behind
+/// it does not pass.
 fn a_published_port_answers_on_loopback(backend: &dyn SandboxBackend, image: &str) {
     use std::io::Read;
     let tree = tempfile::TempDir::new().unwrap();
@@ -272,9 +273,26 @@ fn a_published_port_answers_on_loopback(backend: &dyn SandboxBackend, image: &st
         }
         std::thread::sleep(Duration::from_millis(200));
     }
+    assert_eq!(got.trim(), "served", "nothing answered on 127.0.0.1:{port}");
+    if let Some(lan) = this_hosts_lan_address() {
+        let mut other = String::new();
+        if let Ok(mut conn) = std::net::TcpStream::connect_timeout(&(lan, port).into(), Duration::from_secs(2)) {
+            let _ = conn.set_read_timeout(Some(Duration::from_secs(2)));
+            let _ = conn.read_to_string(&mut other);
+        }
+        assert_ne!(other.trim(), "served", "the port answered on {lan}, not only on loopback");
+    }
     let _ = client.kill();
     let _ = client.wait();
-    assert_eq!(got.trim(), "served", "nothing answered on 127.0.0.1:{port}");
+}
+
+/// This host's address on its outward interface, when it has one: the
+/// address a connected UDP socket would send from (nothing is sent).
+fn this_hosts_lan_address() -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("192.0.2.1:9").ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
 }
 
 /// A kill's success is proof the sandbox was running: it fails for one that
@@ -293,6 +311,41 @@ fn a_kill_succeeds_only_against_a_running_sandbox(backend: &dyn SandboxBackend, 
     assert!(matches!(killed, Bounded::Finished { success: true, .. }), "{}", describe(&killed));
     let _ = client.wait();
     assert!(until_listed(backend, &p.name, false), "{} outlived its kill", p.name);
+}
+
+/// A stop ends a sandbox that ignores SIGTERM once the grace is up: it is
+/// gone well before the sleep it was running would have ended.
+fn a_stop_ends_a_sandbox_that_ignores_it_after_the_grace(backend: &dyn SandboxBackend, image: &str) {
+    let tree = tempfile::TempDir::new().unwrap();
+    let p = policy(image, tree.path(), "trap '' TERM; echo up > /workspace/up; while :; do sleep 0.1; done");
+    let (mut cmd, handle) = backend.run(&p);
+    let _removed = Removed(backend, handle.clone());
+    let mut client = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !tree.path().join("up").exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(tree.path().join("up").exists(), "{} never came up", p.name);
+    let asked = Instant::now();
+    let _ = run_bounded(backend.stop(&handle, Duration::from_secs(2)), Duration::from_secs(30));
+    assert!(until_listed(backend, &p.name, false), "{} outlived its stop", p.name);
+    assert!(asked.elapsed() < Duration::from_secs(20), "the stop took {:?}", asked.elapsed());
+    let _ = client.wait();
+}
+
+/// A created sandbox that is removed before it starts never runs: a later
+/// start fails, and nothing it would have written appears.
+fn a_sandbox_removed_before_it_starts_never_runs(backend: &dyn SandboxBackend, image: &str) {
+    let tree = tempfile::TempDir::new().unwrap();
+    let p = policy(image, tree.path(), "echo ran > /workspace/ran");
+    let (create, handle) = backend.create(&p);
+    let _removed = Removed(backend, handle.clone());
+    assert!(matches!(run_bounded(create, Duration::from_secs(60)), Bounded::Finished { success: true, .. }));
+    assert!(until_listed(backend, &p.name, true), "{} not listed once created", p.name);
+    let _ = run_bounded(backend.remove(&handle), Duration::from_secs(30));
+    let started = run_bounded(backend.start(&handle), Duration::from_secs(30));
+    assert!(!matches!(started, Bounded::Finished { success: true, .. }), "a removed sandbox started: {}", describe(&started));
+    assert!(!tree.path().join("ran").exists(), "a removed sandbox ran");
 }
 
 macro_rules! conformance {
@@ -327,6 +380,16 @@ macro_rules! conformance {
             #[ignore = $needs]
             fn a_kill_succeeds_only_against_a_running_sandbox() {
                 super::a_kill_succeeds_only_against_a_running_sandbox(&$make, $image)
+            }
+            #[test]
+            #[ignore = $needs]
+            fn a_stop_ends_a_sandbox_that_ignores_it_after_the_grace() {
+                super::a_stop_ends_a_sandbox_that_ignores_it_after_the_grace(&$make, $image)
+            }
+            #[test]
+            #[ignore = $needs]
+            fn a_sandbox_removed_before_it_starts_never_runs() {
+                super::a_sandbox_removed_before_it_starts_never_runs(&$make, $image)
             }
             #[test]
             #[ignore = $needs]
