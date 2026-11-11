@@ -778,7 +778,7 @@ mod tests {
         // The scratch copy, and the mount check beside it, read-only.
         assert_eq!(args.iter().filter(|a| *a == "-v").count(), 2, "the copy and the mount check only: {joined}");
         assert!(joined.contains(&format!("-v /tmp/s/{GATE_SENTINEL}-darkmux-gate-1:/darkmux-gate:ro")), "{joined}");
-        assert!(joined.contains("--entrypoint sh rust:1-slim -c"), "{joined}");
+        assert!(joined.contains("--entrypoint sh -- rust:1-slim -c"), "{joined}");
         // (#2973 review) The coder container's own limits, tini as PID 1, and
         // the owner pid as a label so an orphan can be reaped.
         for want in ["--pids-limit=512", "--memory=4g", "--init", &format!("--label darkmux.gate.pid={}", std::process::id())] {
@@ -803,7 +803,7 @@ mod tests {
         let want = ["run", "--rm", "--init", "--name", "darkmux-gate-1", "--network", "none", "--cap-drop=ALL",
             "--security-opt=no-new-privileges", "--pids-limit=512", "--memory=4g", "--label", &label,
             "-v", "/tmp/s/checkout:/workspace", "-v", "/tmp/s/.darkmux-gate-darkmux-gate-1:/darkmux-gate:ro",
-            "-w", "/workspace", "--entrypoint", "sh", "rust:1-slim", "-c", script];
+            "-w", "/workspace", "--entrypoint", "sh", "--", "rust:1-slim", "-c", script];
         assert_eq!(args, want.iter().map(|s| s.to_string()).collect::<Vec<_>>());
     }
 
