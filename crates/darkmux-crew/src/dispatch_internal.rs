@@ -5720,15 +5720,13 @@ enum Liveness {
 }
 
 fn probe_container_liveness(container_name: &str) -> Liveness {
-    // The `name` filter is a Go regexp and the container-name sanitizer
-    // upstream lets `.` through, so `darkmux-dispatch-a.b` also matches
-    // `darkmux-dispatch-aXb`. That is SAFE HERE and must stay this shape: a
-    // spurious extra match makes stdout non-empty, which reads as `Running`,
-    // which keeps the watchdog retrying. It can never manufacture a false
-    // `NotPresent`. Do NOT "fix" this toward a `docker ps -a` form or an
-    // unanchored filter — `-a` lists exited containers, so it would report a
-    // dead container as alive, and dropping the anchors would match every
-    // container whose name merely CONTAINS this one's. (#2232)
+    // A listing by exact name, running containers only. The backend
+    // anchors the name and escapes it (Docker's `name` filter is a Go
+    // regexp, and the sanitizer upstream lets `.` through), so only this
+    // container matches. Do NOT move this toward `stopped_too` or a prefix
+    // listing: a stopped container would read as alive, and a prefix would
+    // match every container whose name merely STARTS with this one's.
+    // (#2232, #3552)
     let backend = darkmux_sandbox::backend();
     let running = darkmux_sandbox::Query {
         having: darkmux_sandbox::Having::Name(container_name.to_string()),

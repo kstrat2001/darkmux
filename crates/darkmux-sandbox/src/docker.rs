@@ -156,7 +156,9 @@ impl DockerBackend {
     }
 
     /// `docker create -- <image>`: a stopped container to copy files out
-    /// of; it prints the container's id.
+    /// of ([`DockerBackend::copy_out`]); it prints the container's id. It
+    /// is not a sandbox and carries none of a policy's invariants, so it
+    /// must never be started: remove it once the copy is done.
     pub fn create_stopped(image: &str) -> Command {
         let mut cmd = Command::new(PROGRAM);
         cmd.args(["create", "--", image]);
@@ -474,6 +476,10 @@ mod tests {
         assert!(DockerBackend::on_path_in(Some(&joined(&[empty.path(), dir.path()]))));
         assert!(!DockerBackend::on_path_in(Some(&joined(&[empty.path()]))));
         assert!(!DockerBackend::on_path_in(None));
+        // A directory named like the program, even an executable one, is
+        // not the program.
+        std::fs::create_dir(empty.path().join("docker")).unwrap();
+        assert!(!DockerBackend::on_path_in(Some(&joined(&[empty.path()]))));
     }
 
     /// Each line is one container, with one value per label read, trimmed;
