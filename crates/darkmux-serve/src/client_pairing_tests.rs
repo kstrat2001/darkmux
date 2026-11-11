@@ -8603,3 +8603,53 @@ fn peer_holders_live() {
         println!("peer {peer}: held by {holders:?} -> {}", if holders.len() == 1 { "may verify" } else { "never verifies" });
     }
 }
+
+/// A container engine's identity is never remembered, even when Allow is
+/// clicked on its request: every container behind it would then pair on
+/// its own.
+#[tokio::test]
+async fn allow_never_remembers_a_container_engine() {
+    let h = harness();
+    h.app_signs_as(vec![Ok(signed("HUAQ24HBR6", "dev.kdrag0n.MacVirt"))]);
+    h.dialog_answers(darkmux_platform::AllowAnswer::Allow);
+    let id = request_pairing(&h).await;
+    let _ = dialog_shown(&h, 1).await;
+    assert_eq!(h.status(&id), Some(PendingStatus::Approved), "this one request is approved");
+    assert!(remembered_apps(&h.store).unwrap().is_empty(), "the engine is not remembered");
+    let said = crate::client_trust::act_on_answer(&h.store, "r-none", 1, darkmux_platform::AllowAnswer::Allow, None);
+    assert!(said.contains("no pairing request"), "{said}");
+}
+
+/// Bidirectional and invisible characters in the code the app sends never
+/// reach the dialog.
+#[tokio::test]
+async fn the_dialog_shows_no_bidi_or_invisible_characters() {
+    let h = harness();
+    let mut body = pair_body();
+    body["code"] = "4F7\u{202E}-K2Q\u{200B}\u{2066}".into();
+    let (code, _) = call(&h, post("/client/pair", None, body)).await;
+    assert_eq!(code, 202);
+    let message = dialog_shown(&h, 1).await;
+    assert!(message.contains("Code 4F7-K2Q."), "{message}");
+    let app = darkmux_platform::SignedApp { signer: "Apple Development: \u{202E}evil".into(), ..fork() };
+    let shown = crate::client_trust::dialog_message("X", Some(&app));
+    assert!(shown.contains("Signed by Apple Development: evil,") && !shown.contains('\u{202E}'), "{shown}");
+}
+
+/// An auto-approval is the approval `client approve` makes (`approve_as`):
+/// before the app collects its token, the request holds the client name and
+/// id it will have, and `client revoke <name>` can take it back.
+#[tokio::test]
+async fn an_auto_approval_is_the_approval_client_approve_makes() {
+    let h = harness();
+    h.app_signs_as(vec![Ok(mux_bot())]);
+    let id = request_pairing(&h).await;
+    let uncollected = list_uncollected(&h.store, (h.state.now)()).unwrap();
+    assert_eq!(uncollected.len(), 1);
+    let p = &uncollected[0];
+    assert_eq!(p.request_id, id);
+    assert!(p.client_name.is_some() && p.client_id.is_some(), "{p:?}");
+    assert!(p.auto_approved.is_some());
+    assert!(revoke(&h.store, p.client_name.as_deref().unwrap()).unwrap(), "revocable like any approval");
+    assert_eq!(poll(&h, &id, SECRET).await.1["status"], "denied");
+}

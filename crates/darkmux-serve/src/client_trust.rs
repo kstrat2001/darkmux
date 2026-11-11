@@ -17,9 +17,10 @@
 //! - **Anything else** (an app signed by another team, an unsigned or ad hoc
 //!   build, a container's traffic, a process darkmux cannot tell): a native
 //!   dialog showing the code and who signed the app, or that no known
-//!   developer did. Allow approves (and remembers a signed app's identity),
-//!   Don't Allow denies, and no answer leaves the request pending to
-//!   expire as before. The dialog runs on a thread of its own, never on the
+//!   developer did, with Don't Allow as the default. Allow approves (and
+//!   remembers a signed app's identity, never a container engine's); Don't
+//!   Allow, Return or Esc (or, on Linux, closing it) denies; a dialog left
+//!   until it gives up leaves the request pending to expire as before. The dialog runs on a thread of its own, never on the
 //!   listener; a request raises at most one, a process at most
 //!   [`PAIR_REQUESTS_PER_PROCESS`] at once and the machine at most
 //!   [`MAX_OPEN_DIALOGS`].
@@ -133,15 +134,20 @@ pub fn judge(signed: Result<SignedApp, String>, policy: &PairingPolicy, remember
 /// The dialog's text: the code the app shows, and who signed the app as the
 /// OS verified it (never the app's own name for itself), or that no known
 /// developer did. Shown as plain text by the platform, never as script.
+/// Every part is [`darkmux_platform::display_safe`]: no control,
+/// bidirectional or invisible character reaches the person deciding.
 pub fn dialog_message(code: &str, signed: Option<&SignedApp>) -> String {
+    let safe = darkmux_platform::display_safe;
     let who = match signed {
         Some(app) => format!(
             "Signed by {}, team {}, {}.\nAllow pairs it now and next time.",
-            app.signer, app.team, app.bundle
+            safe(&app.signer),
+            safe(&app.team),
+            safe(&app.bundle)
         ),
         None => "Not signed by a known developer.".to_string(),
     };
-    format!("An app wants to use darkmux on this Mac. Code {code}.\n\n{who}")
+    format!("An app wants to use darkmux on this Mac. Code {}.\n\n{who}", safe(code))
 }
 
 /// The notice once a trusted app is paired.
@@ -286,16 +292,25 @@ fn offer_dialog(state: &ClientServerState, request_id: &str, code: &str, from: O
     None
 }
 
+/// What an Allow says about the app it remembers: a container engine is
+/// never remembered ([`crate::client_pairing::approve_as`]).
+fn remembered_said(app: Option<&SigningIdentity>) -> String {
+    match app {
+        Some(app) if darkmux_platform::container_engine_of_team(&app.team).is_some() => {
+            format!("; {app} is a container engine, so it is not remembered")
+        }
+        Some(app) => format!("; {app} is remembered"),
+        None => String::new(),
+    }
+}
+
 /// Carries out the dialog's answer for request `request_id`: Allow
 /// approves (remembering `remember`), Don't Allow denies through the deny
 /// path, and no answer leaves it pending. The serve-log line.
 pub fn act_on_answer(store: &ClientStore, request_id: &str, now: u64, answer: AllowAnswer, remember: Option<SigningIdentity>) -> String {
     let said = match answer {
         AllowAnswer::Allow => approve_as(store, request_id, now, &Approval::Dialog { remember: remember.clone() })
-            .map(|name| match remember {
-                Some(app) => format!("approved as {name} in the dialog; {app} is remembered"),
-                None => format!("approved as {name} in the dialog"),
-            }),
+            .map(|name| format!("approved as {name} in the dialog{}", remembered_said(remember.as_ref()))),
         AllowAnswer::DontAllow => deny(store, request_id, now).map(|()| "denied in the dialog".to_string()),
         AllowAnswer::NoAnswer => Ok("no answer in the dialog; left pending".to_string()),
         AllowAnswer::NoDialog(why) => Ok(format!("no dialog ({why}); left pending for `darkmux client approve`")),

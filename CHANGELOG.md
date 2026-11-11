@@ -24,15 +24,18 @@ darkmux release.
   turns this off) with the hardened runtime is approved at once, after the connection and the
   signature are checked again just before approval, with a notice ("Mux Bot is now paired with
   darkmux on this Mac."); `client list` marks it auto-approved. Any other app (another team, an
-  unsigned or ad hoc build, a container's traffic through Docker's forwarder, a process darkmux
-  cannot tell) gets a centered dialog showing the code and who signed it as macOS verified it, or
-  "Not signed by a known developer.": Allow approves, Don't Allow denies, and a closed or ignored
-  dialog leaves the request pending to expire as before. Allow on a validly signed app remembers it
-  (team and bundle id, in `clients.json`), so a build of Mux Bot under your own team pairs with no
-  dialog next time; `darkmux client forget <team>/<bundle>` forgets it, and `client list` and
+  unsigned or ad hoc build, a container's traffic through Docker Desktop's, OrbStack's, Rancher
+  Desktop's or Podman's forwarder, a connection more than one process holds, a process darkmux
+  cannot tell) gets a centered dialog showing the code, who signed it as macOS verified it (with the
+  app's own icon) or "Not signed by a known developer.", with Don't Allow as the default: Allow
+  approves; Don't Allow, Return or Esc denies; a dialog left until it gives up leaves the request
+  pending to expire as before. Allow on a validly signed app remembers it (team and bundle id, in
+  `clients.json`; never a container engine's), so a build of Mux Bot under your own team pairs with
+  no dialog next time; `darkmux client forget <team>/<bundle>` forgets it, and `client list` and
   `darkmux doctor` show what is remembered. The dialog never blocks the listener, one process can
   raise at most two at once, and `clients.pairing.dialog: false` turns it off. On Linux nothing
-  auto-approves (no code signing); the dialog is `zenity` in a graphical session. `darkmux client
+  auto-approves (no code signing); the dialog is `zenity` in a graphical session, where closing it
+  also denies. `darkmux client
   approve` is unchanged.
 
 - **A preview's install is redone when its inputs change, and an app can ask for a clean restart

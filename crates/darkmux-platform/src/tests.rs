@@ -1158,7 +1158,7 @@ Identifier=com.darklyenergized.darkmuxapp
 Format=app bundle with Mach-O thin (arm64)
 CodeDirectory v=20500 size=464 flags=0x10000(runtime) hashes=3+7 location=embedded
 Signature size=4790
-Authority=Apple Development: Kain Osterholt (Q8XXXXXXXX)
+Authority=Apple Development: Test Developer (ABCDE12345)
 Authority=Apple Worldwide Developer Relations Certification Authority
 Authority=Apple Root CA
 Signed Time=Nov 10, 2026 at 2:53:57 PM
@@ -1195,7 +1195,7 @@ fn a_signed_hardened_app_is_named_by_its_team_bundle_and_signer() {
         SignedApp {
             team: "5LDXYW8B6T".into(),
             bundle: "com.darklyenergized.darkmuxapp".into(),
-            signer: "Apple Development: Kain Osterholt (Q8XXXXXXXX)".into(),
+            signer: "Apple Development: Test Developer (ABCDE12345)".into(),
             icon: None,
         }
     );
@@ -1273,9 +1273,10 @@ fn a_process_codesign_cannot_read_is_not_named() {
 
 #[test]
 fn a_signers_name_shows_as_one_line() {
-    let shown = MUX_BOT_SHOWN.replace("Kain Osterholt", "Kain\u{1b}[2J Osterholt");
+    let shown = MUX_BOT_SHOWN.replace("Test Developer", "Test\u{1b}[2J \u{202E}repoleveD\u{2066} Developer\u{200B}");
     let app = macos::signed_app_from(Ok(shown), |_| Ok(()), no_icon).unwrap();
     assert!(!app.signer.chars().any(char::is_control), "{}", app.signer);
+    assert_eq!(app.signer, "Apple Development: Test [2J repoleveD Developer (ABCDE12345)", "bidi and zero-width characters are dropped");
 }
 
 #[test]
@@ -1311,7 +1312,9 @@ fn zenity_shows_the_message_as_plain_text_in_one_argument() {
     let args = linux::zenity_allow_args(hostile, 15);
     assert!(args.contains(&"--no-markup".to_string()));
     assert_eq!(args.last().unwrap(), &format!("--text={hostile}"));
-    assert_eq!(args.iter().filter(|a| a.starts_with("--extra-button=")).count(), 2);
+    for want in ["--ok-label=Allow", "--cancel-label=Don't Allow", "--default-cancel"] {
+        assert!(args.contains(&want.to_string()), "{want}: Don't Allow is the default, and Esc and close are it too");
+    }
 }
 
 /// Each answer maps to what the person chose: a button, or none at all.
@@ -1321,11 +1324,10 @@ fn each_dialog_outcome_is_the_answer_given() {
     assert_eq!(macos::dialog_answer(true, "Don't Allow\n", ""), AllowAnswer::DontAllow);
     assert_eq!(macos::dialog_answer(true, "\n", ""), AllowAnswer::NoAnswer, "gave up");
     assert!(matches!(macos::dialog_answer(false, "", "execution error: User canceled. (-128)"), AllowAnswer::NoDialog(_)));
-    assert_eq!(linux::zenity_answer(Some(1), "Allow\n"), AllowAnswer::Allow);
-    assert_eq!(linux::zenity_answer(Some(1), "Don't Allow\n"), AllowAnswer::DontAllow);
-    assert_eq!(linux::zenity_answer(Some(1), ""), AllowAnswer::NoAnswer, "closed");
-    assert_eq!(linux::zenity_answer(Some(5), ""), AllowAnswer::NoAnswer, "timed out");
-    assert!(matches!(linux::zenity_answer(Some(255), ""), AllowAnswer::NoDialog(_)));
+    assert_eq!(linux::zenity_answer(Some(0)), AllowAnswer::Allow);
+    assert_eq!(linux::zenity_answer(Some(1)), AllowAnswer::DontAllow, "Don't Allow, Esc or closed");
+    assert_eq!(linux::zenity_answer(Some(5)), AllowAnswer::NoAnswer, "timed out: left pending");
+    assert!(matches!(linux::zenity_answer(Some(255)), AllowAnswer::NoDialog(_)));
 }
 
 #[test]
@@ -1458,7 +1460,7 @@ fn a_dialog_run_that_never_ended_is_no_dialog() {
     let mut sh = std::process::Command::new("/bin/sh");
     sh.args(["-c", "echo Allow; exit 1"]);
     let out = crate::output_within(sh, std::time::Duration::from_secs(10));
-    assert_eq!(linux::zenity_run_answer(out.clone()), AllowAnswer::Allow);
+    assert_eq!(linux::zenity_run_answer(out.clone()), AllowAnswer::DontAllow, "zenity's exit decides, never its output");
     assert!(matches!(macos::dialog_run_answer(out), AllowAnswer::NoDialog(_)), "osascript failing is no dialog");
 }
 
@@ -1513,4 +1515,27 @@ fn an_app_bundles_icon_is_found_from_its_executable() {
     assert!(icon.ends_with("Contents/Resources/AppIcon.icns"), "{icon:?}");
     std::fs::write(contents.join("Info.plist"), r#"<?xml version="1.0"?><plist version="1.0"><dict/></plist>"#).unwrap();
     assert_eq!(macos::app_icon(&contents.join("MacOS/Mux Bot")), None, "no icon named");
+}
+
+/// Text shown to someone deciding whether to trust an app keeps its order
+/// and shows all it holds: bidirectional controls, zero-width and other
+/// invisible format characters are dropped, control characters become spaces.
+#[test]
+fn display_safe_drops_reordering_and_invisible_characters() {
+    for c in ['\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', '\u{200E}', '\u{200F}', '\u{061C}', '\u{200B}', '\u{200D}', '\u{2060}', '\u{FEFF}', '\u{00AD}', '\u{E0041}'] {
+        assert_eq!(crate::display_safe(&format!("a{c}b")), "ab", "U+{:04X}", c as u32);
+    }
+    assert_eq!(crate::display_safe("a\nb\u{1b}c"), "a b c");
+    assert_eq!(crate::display_safe("Mux Bot 4F7-K2Q é 日本"), "Mux Bot 4F7-K2Q é 日本", "ordinary text is kept");
+}
+
+/// Every container engine whose team signs its forwarder is never named as
+/// an app, whatever its signature (the team ids read from each vendor's app).
+#[test]
+fn every_listed_container_engine_is_never_named() {
+    for (team, engine) in [("HUAQ24HBR6", "OrbStack"), ("2Q6FHJR3H3", "Rancher Desktop"), ("HYSCB8KRL2", "Podman")] {
+        let shown = format!("Identifier=x.y\nCodeDirectory v=20500 size=1 flags=0x10000(runtime) hashes=1+7 location=embedded\nAuthority=Developer ID Application: X ({team})\nTeamIdentifier={team}\n");
+        let e = macos::signed_app_from(Ok(shown), |_| Ok(()), no_icon).unwrap_err();
+        assert!(e.contains(engine) && e.contains("container traffic"), "{e}");
+    }
 }

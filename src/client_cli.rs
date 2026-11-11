@@ -144,8 +144,8 @@ fn age(now: u64, then: u64) -> String {
 fn describe(p: &PendingRequest, now: u64) -> String {
     format!(
         "  device: {}\n  code:   {}\n  age:    {}",
-        p.device_name,
-        p.code,
+        darkmux_platform::display_safe(&p.device_name),
+        darkmux_platform::display_safe(&p.code),
         age(now, p.created)
     )
 }
@@ -304,8 +304,31 @@ pub(crate) fn doctor_checks() -> Vec<crate::doctor::Check> {
     } else {
         Ok(Vec::new())
     };
-    let remembered = ClientStore::production().peek().map(|f| f.remembered_apps);
-    vec![unowned_row(unowned), remembered_row(remembered)]
+    let store = ClientStore::production().peek();
+    let remembered = store.as_ref().map(|f| f.remembered_apps.clone()).map_err(|e| anyhow::anyhow!("{e:#}"));
+    let auto = store.map(|f| f.clients);
+    vec![unowned_row(unowned), remembered_row(remembered), auto_approved_row(auto)]
+}
+
+/// (#3544) The row naming each paired client that paired with no operator
+/// step, by the signature that verified it.
+fn auto_approved_row(clients: Result<Vec<cp::ApprovedClient>>) -> crate::doctor::Check {
+    use crate::doctor::{Check, Status};
+    let name = "client auto-approvals".to_string();
+    let (status, message) = match clients {
+        Ok(list) => {
+            let auto: Vec<String> = list
+                .iter()
+                .filter_map(|c| c.auto_approved.as_ref().map(|app| format!("{} (signed by {app})", c.name)))
+                .collect();
+            match auto.is_empty() {
+                true => (Status::Pass, "none: every paired client was approved by you".to_string()),
+                false => (Status::Pass, format!("paired with no dialog, by a verified signature: {}", auto.join(", "))),
+            }
+        }
+        Err(e) => (Status::Warn, format!("could not read the client store: {e:#}")),
+    };
+    Check { name, status, message, hint: Some("`darkmux client revoke <name>` removes a client".to_string()) }
 }
 
 /// (#3544) The row naming the apps the operator allowed in the pairing
@@ -610,6 +633,21 @@ mod tests {
         let (code, _, err) = verb(&here, ClientCmd::Forget { app: "nonsense".into() }, "");
         assert_eq!(code, 1);
         assert!(err.contains("<team>/<bundle>"), "{err}");
+    }
+
+    #[test]
+    fn doctor_names_each_auto_approved_client() {
+        let client = |name: &str, auto: bool| cp::ApprovedClient {
+            name: name.into(),
+            id: "c-0".into(),
+            created: 1,
+            token_hash: "00".into(),
+            auto_approved: auto.then(|| cp::SigningIdentity { team: "5LDXYW8B6T".into(), bundle: "com.darklyenergized.darkmuxapp".into() }),
+        };
+        let row = auto_approved_row(Ok(vec![client("mux-bot", true), client("phone", false)]));
+        assert!(row.message.contains("mux-bot (signed by 5LDXYW8B6T/com.darklyenergized.darkmuxapp)"), "{}", row.message);
+        assert!(!row.message.contains("phone"), "{}", row.message);
+        assert!(auto_approved_row(Ok(vec![client("phone", false)])).message.starts_with("none"));
     }
 
     #[test]

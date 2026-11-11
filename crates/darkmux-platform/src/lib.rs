@@ -241,6 +241,55 @@ pub enum AllowAnswer {
     NoDialog(String),
 }
 
+/// (#3544) Developer teams whose signed processes carry container traffic
+/// to this machine (a container engine's port forwarding runs in its own
+/// signed processes): a connection from one is a container's, never an
+/// app's, so it is never named as an app, never trusted and never
+/// remembered. Each team id here was read with `codesign -dv` from the
+/// vendor's own published app.
+///
+/// Read on 2026-11-11: Docker Desktop (`com.docker.docker`, Docker Inc),
+/// OrbStack 2.2.5 (`dev.kdrag0n.MacVirt`, Orbital Labs), Rancher Desktop
+/// 1.25.0 (`io.rancherdesktop.app` and its `limactl`, SUSE), Podman 6.2.0's
+/// installer (`gvproxy`, `vfkit`, `podman`) and Podman Desktop 1.30.5 (Red
+/// Hat). Not verified, so not listed: Finch (AWS) and any other engine with
+/// a signed forwarder; an Allow on one would remember it. Engines built from
+/// source or by Homebrew (Colima, Lima, Podman) are ad hoc or unsigned
+/// there, so they never verify anyway.
+pub const CONTAINER_ENGINE_TEAMS: &[(&str, &str)] = &[
+    ("9BNSXJN65R", "Docker Desktop"),
+    ("HUAQ24HBR6", "OrbStack"),
+    ("2Q6FHJR3H3", "Rancher Desktop"),
+    ("HYSCB8KRL2", "Podman"),
+];
+
+/// The container engine `team` signs for, if it is one
+/// ([`CONTAINER_ENGINE_TEAMS`]).
+pub fn container_engine_of_team(team: &str) -> Option<&'static str> {
+    CONTAINER_ENGINE_TEAMS.iter().find(|(t, _)| *t == team).map(|(_, engine)| *engine)
+}
+
+/// (#3544) `s` as a person deciding whether to trust an app may be shown
+/// it: every control character becomes a space, and every invisible format
+/// character that can reorder or hide text is dropped (the bidirectional
+/// embeddings, overrides, isolates and marks, zero-width characters, word
+/// joiners and invisible operators, the byte-order mark, interlinear
+/// annotation marks, and tag characters), so text reads in the order it is
+/// written and shows all it holds.
+pub fn display_safe(s: &str) -> String {
+    s.chars().filter(|c| !is_hiding_format_char(*c)).map(|c| if c.is_control() { ' ' } else { c }).collect()
+}
+
+/// The format characters [`display_safe`] drops.
+pub(crate) fn is_hiding_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{E0000}'..='\u{E007F}'
+    )
+}
+
 /// The words the dialog's buttons show, the same on every platform.
 pub const ALLOW_BUTTON: &str = "Allow";
 pub const DONT_ALLOW_BUTTON: &str = "Don't Allow";

@@ -630,8 +630,12 @@ pub fn approve_as(store: &ClientStore, request_id: &str, now: u64, how: &Approva
     })
 }
 
-/// Adds `app` to the remembered apps, once.
+/// Adds `app` to the remembered apps, once. A container engine's team is
+/// never remembered: every container behind it would then pair on its own.
 fn remember_in(f: &mut ClientsFile, app: &SigningIdentity, now: u64) {
+    if darkmux_platform::container_engine_of_team(&app.team).is_some() {
+        return;
+    }
     if !f.remembered_apps.iter().any(|r| &r.identity() == app) {
         f.remembered_apps.push(RememberedApp { team: app.team.clone(), bundle: app.bundle.clone(), allowed: now });
     }

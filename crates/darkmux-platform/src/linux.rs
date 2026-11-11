@@ -279,17 +279,18 @@ pub(crate) fn on_path(tool: &str, path: &std::ffi::OsStr) -> Option<std::path::P
         .find(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
 }
 
-/// `zenity`'s arguments for the Allow dialog: the two buttons as extra
-/// buttons (whose label it prints when one is pressed), no OK or Cancel,
-/// and the message as plain text (`--no-markup`), in one argument of its own.
+/// `zenity`'s arguments for the Allow dialog: OK is Allow and Cancel is
+/// Don't Allow, which is the default (`--default-cancel`), so Return, Esc and
+/// closing the window all mean Don't Allow, as on macOS; the message is
+/// plain text (`--no-markup`), in one argument of its own.
 pub(crate) fn zenity_allow_args(message: &str, timeout_secs: u64) -> Vec<String> {
     vec![
         "--question".to_string(),
         "--title=darkmux".to_string(),
         "--no-markup".to_string(),
-        "--switch".to_string(),
-        format!("--extra-button={}", crate::DONT_ALLOW_BUTTON),
-        format!("--extra-button={}", crate::ALLOW_BUTTON),
+        format!("--ok-label={}", crate::ALLOW_BUTTON),
+        format!("--cancel-label={}", crate::DONT_ALLOW_BUTTON),
+        "--default-cancel".to_string(),
         format!("--timeout={timeout_secs}"),
         format!("--text={message}"),
     ]
@@ -298,16 +299,19 @@ pub(crate) fn zenity_allow_args(message: &str, timeout_secs: u64) -> Vec<String>
 /// What the `zenity` run (`None`: it did not start or end) means.
 pub(crate) fn zenity_run_answer(out: Option<std::process::Output>) -> crate::AllowAnswer {
     match out {
-        Some(out) => zenity_answer(out.status.code(), &String::from_utf8_lossy(&out.stdout)),
+        Some(out) => zenity_answer(out.status.code()),
         None => crate::AllowAnswer::NoDialog("zenity did not start or did not end".to_string()),
     }
 }
 
-/// What `zenity`'s exit means: a pressed button prints its label (exit 1);
-/// closing prints nothing; `5` is its timeout. Any other exit showed nothing.
-pub(crate) fn zenity_answer(code: Option<i32>, stdout: &str) -> crate::AllowAnswer {
+/// What `zenity --question`'s exit means: `0` is Allow; `1` is Don't Allow,
+/// Esc or the window closed (all Don't Allow); `5` is its timeout (no
+/// answer). Any other exit showed nothing.
+pub(crate) fn zenity_answer(code: Option<i32>) -> crate::AllowAnswer {
     match code {
-        Some(0 | 1 | 5) => crate::answer_from_button(stdout),
+        Some(0) => crate::AllowAnswer::Allow,
+        Some(1) => crate::AllowAnswer::DontAllow,
+        Some(5) => crate::AllowAnswer::NoAnswer,
         other => crate::AllowAnswer::NoDialog(format!("zenity exited with {other:?}")),
     }
 }

@@ -230,12 +230,6 @@ impl Platform for MacPlatform {
     }
 }
 
-/// Teams whose signed processes carry container traffic to this machine
-/// (Docker Desktop's port forwarding runs in its own signed processes): a
-/// connection from one is a container's, never an app's, so it is never
-/// named as one, and so never trusted or remembered.
-pub(crate) const CONTAINER_ENGINE_TEAMS: &[(&str, &str)] = &[("9BNSXJN65R", "Docker Desktop")];
-
 /// The hardened-runtime bit of a code directory's flags.
 const CS_RUNTIME: u32 = 0x10000;
 /// The ad hoc bit: signed by no certificate at all (`codesign -s -`).
@@ -253,7 +247,7 @@ pub(crate) fn signed_app_from(
     let team = team_of(field("TeamIdentifier="))?;
     signed_by_a_developer_with_runtime(&shown)?;
     let bundle = field("Identifier=").filter(|b| is_bundle_id(b)).ok_or("its signature names no bundle id darkmux can check")?;
-    let signer = field("Authority=").map(printable).ok_or("its signature names no signing certificate")?;
+    let signer = field("Authority=").map(crate::display_safe).ok_or("its signature names no signing certificate")?;
     verify(&signing_requirement(team, bundle)).map_err(|e| format!("its signature does not hold: {e}"))?;
     // Only now, with the signature verified, is the bundle's icon its own.
     let icon = field("Executable=").and_then(|exe| icon_of(std::path::Path::new(exe)));
@@ -326,8 +320,8 @@ fn team_of(field: Option<&str>) -> Result<&str, String> {
         Some(t) if !is_team_id(t) => return Err(format!("its team id `{t}` is not one darkmux can check")),
         Some(t) => t,
     };
-    match CONTAINER_ENGINE_TEAMS.iter().find(|(t, _)| *t == team) {
-        Some((_, engine)) => Err(format!("{engine}'s process: container traffic is never an app on this Mac")),
+    match crate::container_engine_of_team(team) {
+        Some(engine) => Err(format!("{engine}'s process: container traffic is never an app on this Mac")),
         None => Ok(team),
     }
 }
@@ -345,11 +339,6 @@ fn signed_by_a_developer_with_runtime(shown: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `s` with every control character (a line break in a certificate's name)
-/// replaced by a space, so it shows as the one line it claims to be.
-pub(crate) fn printable(s: &str) -> String {
-    s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
-}
 
 /// The code requirement a process must satisfy to be `team`'s `bundle`:
 /// Apple's anchor, `team`'s certificate, that identifier. Both are checked
