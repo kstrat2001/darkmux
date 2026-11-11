@@ -2228,6 +2228,13 @@ mod tests {
             let expected = docker_create_args(&a_spec(&recipe, None)).join(" ");
             assert!(said.starts_with(&expected), "create gets the spec's arguments: {said}");
             assert!(said.contains("start -a darkmux-preview-site"), "{said}");
+            assert!(said.contains("exec darkmux-preview-site cat /proc/net/tcp /proc/net/tcp6"), "{said}");
+            docker.remove("darkmux-preview-site");
+            let said = std::fs::read_to_string(calls).unwrap();
+            assert!(
+                said.ends_with("stop -t 5 darkmux-preview-site\nrm -f darkmux-preview-site\n"),
+                "remove stops with five seconds' grace, then removes: {said}"
+            );
         });
     }
 
