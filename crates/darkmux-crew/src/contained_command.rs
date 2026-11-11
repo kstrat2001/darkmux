@@ -104,6 +104,8 @@ pub fn policy(image: &str, name: &str, run: &Run) -> SandboxPolicy {
         labels: vec![(PID_LABEL.to_string(), std::process::id().to_string())],
         mounts,
         ports: Vec::new(),
+        stdin: false,
+        host_alias: None,
         user: run.user.clone(),
         // The image's home belongs to the image's own user.
         env: run.user.iter().map(|_| ("HOME".to_string(), "/tmp".to_string())).collect(),
@@ -272,7 +274,7 @@ mod tests {
         let args = container_args("node:22", "darkmux-test-1", &a_run(&mounts, Some("501:20".into())));
         let joined = args.join(" ");
         for want in ["--network none", "--cap-drop=ALL", "--security-opt=no-new-privileges", "-v /tmp/s/tree:/workspace",
-            "-v /tmp/s/report:/report", "-w /workspace/pkg", "--user=501:20 -e HOME=/tmp", "--entrypoint sh node:22 -c"] {
+            "-v /tmp/s/report:/report", "-w /workspace/pkg", "--user=501:20 -e HOME=/tmp", "--entrypoint sh -- node:22 -c"] {
             assert!(joined.contains(want), "missing `{want}` in: {joined}");
         }
         // The tree, the named mount, and the mount check beside the tree, read-only.
@@ -290,6 +292,8 @@ mod tests {
 
     /// (#3112) The whole `docker run` argv, pinned before isolation became a
     /// seam: moving it behind the sandbox backend must not change one byte.
+    /// One deliberate change since: `--` fences the image from the options,
+    /// as dispatch's line always has (#907).
     #[test]
     fn the_container_argv_is_byte_for_byte_pinned() {
         let label = format!("darkmux.gate.pid={}", std::process::id());
@@ -302,7 +306,7 @@ mod tests {
                 "--security-opt=no-new-privileges", "--pids-limit=512", "--memory=4g", "--label", &label,
                 "-v", "/tmp/s/tree:/workspace", "-v", "/tmp/s/.darkmux-gate-darkmux-test-1:/darkmux-gate:ro",
                 "-v", "/tmp/s/report:/report", "--user=501:20", "-e", "HOME=/tmp", "-w", "/workspace/pkg",
-                "--entrypoint", "sh", "node:22", "-c", script]),
+                "--entrypoint", "sh", "--", "node:22", "-c", script]),
         );
         let bare = Run { workdir: "/", ..a_run(&[], None) };
         assert_eq!(
@@ -310,7 +314,7 @@ mod tests {
             strings(&["run", "--rm", "--init", "--name", "n", "--network", "none", "--cap-drop=ALL",
                 "--security-opt=no-new-privileges", "--pids-limit=512", "--memory=4g", "--label", &label,
                 "-v", "/tmp/s/tree:/workspace", "-v", "/tmp/s/.darkmux-gate-n:/darkmux-gate:ro", "-w", "/workspace",
-                "--entrypoint", "sh", "node:22", "-c", script]),
+                "--entrypoint", "sh", "--", "node:22", "-c", script]),
         );
         // A tree with no parent has no mount check to mount.
         let rootless = Run { tree: Path::new("/"), ..bare.clone() };
@@ -318,7 +322,7 @@ mod tests {
             container_args("node:22", "n", &rootless),
             strings(&["run", "--rm", "--init", "--name", "n", "--network", "none", "--cap-drop=ALL",
                 "--security-opt=no-new-privileges", "--pids-limit=512", "--memory=4g", "--label", &label,
-                "-v", "/:/workspace", "-w", "/workspace", "--entrypoint", "sh", "node:22", "-c", script]),
+                "-v", "/:/workspace", "-w", "/workspace", "--entrypoint", "sh", "--", "node:22", "-c", script]),
         );
     }
 

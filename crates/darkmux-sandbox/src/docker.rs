@@ -22,7 +22,8 @@ impl DockerBackend {
     /// `docker run`'s arguments for `policy` (the program itself excluded),
     /// in a fixed order: the sandbox's identity and invariants, its network
     /// and limits, its labels, its mounts in the policy's order, its user
-    /// and environment, its working directory, then the image and command.
+    /// and environment, its working directory, then `--` and the image and
+    /// command.
     pub fn run_args(policy: &SandboxPolicy) -> Vec<String> {
         Self::args("run", policy)
     }
@@ -33,11 +34,15 @@ impl DockerBackend {
         if policy.network == Network::None {
             args.extend(strings(&["--network", "none"]));
         }
+        args.extend(policy.host_alias.as_ref().map(|name| format!("--add-host={name}:host-gateway")));
         args.extend([format!("--cap-drop={CAP_DROP}"), format!("--security-opt={SECURITY_OPT}")]);
         args.extend(policy.limits.pids.map(|n| format!("--pids-limit={n}")));
         args.extend(policy.limits.memory.as_ref().map(|m| format!("--memory={m}")));
         for (key, value) in &policy.labels {
             args.extend(["--label".to_string(), format!("{key}={value}")]);
+        }
+        if policy.stdin {
+            args.push("-i".to_string());
         }
         args.extend(policy.mounts.iter().flat_map(volume));
         for port in &policy.ports {
@@ -54,7 +59,9 @@ impl DockerBackend {
         if let Some(entrypoint) = &policy.entrypoint {
             args.extend(["--entrypoint".to_string(), entrypoint.clone()]);
         }
-        args.push(policy.image.clone());
+        // (#907) `--` fences the image from the options, so an image ref
+        // starting with `-` is never read as one.
+        args.extend(["--".to_string(), policy.image.clone()]);
         args.extend(policy.command.iter().cloned());
         args
     }
@@ -70,6 +77,7 @@ impl DockerBackend {
         let filter = match &query.having {
             Having::Label(key) => format!("label={key}"),
             Having::NamePrefix(prefix) => format!("name=^{prefix}"),
+            Having::Name(name) => format!("name=^{name}$"),
         };
         let labels: String = query.read.iter().map(|key| format!("\t{{{{.Label \"{key}\"}}}}")).collect();
         args.extend(["--filter".to_string(), filter, "--format".to_string(), format!("{{{{.Names}}}}{labels}")]);
@@ -193,6 +201,8 @@ mod tests {
             labels: Vec::new(),
             mounts: Vec::new(),
             ports: Vec::new(),
+            stdin: false,
+            host_alias: None,
             user: None,
             env: Vec::new(),
             workdir: None,
@@ -207,7 +217,7 @@ mod tests {
     fn a_bare_policy_carries_only_the_invariants() {
         assert_eq!(
             DockerBackend::run_args(&bare()),
-            strings(&["run", "--rm", "--init", "--name", "s-1", "--cap-drop=ALL", "--security-opt=no-new-privileges", "img:1"])
+            strings(&["run", "--rm", "--init", "--name", "s-1", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--", "img:1"])
         );
     }
 
@@ -224,6 +234,8 @@ mod tests {
                 mount("/h/tree/.git", "/workspace/.git", Access::ReadOnly),
             ],
             ports: vec![4100, 4200],
+            stdin: true,
+            host_alias: Some("host.docker.internal".into()),
             user: Some("501:20".into()),
             env: vec![("HOME".into(), "/tmp".into()), ("K".into(), "v w".into())],
             workdir: Some("/workspace".into()),
@@ -233,11 +245,12 @@ mod tests {
         };
         assert_eq!(
             DockerBackend::run_args(&policy),
-            strings(&["run", "--rm", "--init", "--name", "s-1", "--network", "none", "--cap-drop=ALL",
-                "--security-opt=no-new-privileges", "--pids-limit=512", "--memory=4g", "--label", "a.b=1", "--label", "c=2",
+            strings(&["run", "--rm", "--init", "--name", "s-1", "--network", "none",
+                "--add-host=host.docker.internal:host-gateway", "--cap-drop=ALL",
+                "--security-opt=no-new-privileges", "--pids-limit=512", "--memory=4g", "--label", "a.b=1", "--label", "c=2", "-i",
                 "-v", "/h/tree:/workspace", "-v", "/h/tree/.git:/workspace/.git:ro", "-p", "127.0.0.1:4100:4100",
                 "-p", "127.0.0.1:4200:4200", "--user=501:20", "-e", "HOME=/tmp",
-                "-e", "K=v w", "-w", "/workspace", "--entrypoint", "sh", "img:1", "-c", "echo hi"])
+                "-e", "K=v w", "-w", "/workspace", "--entrypoint", "sh", "--", "img:1", "-c", "echo hi"])
         );
     }
 
@@ -287,6 +300,11 @@ mod tests {
                 Some("docker"),
                 strings(&["ps", "-a", "--filter", "label=darkmux.gate.pid", "--format", "{{.Names}}\t{{.Label \"darkmux.gate.pid\"}}"])
             )
+        );
+        let exact = Query { having: Having::Name("darkmux-dispatch-a.b".into()), stopped_too: false, read: Vec::new() };
+        assert_eq!(
+            DockerBackend::list_args(&exact),
+            strings(&["ps", "--filter", "name=^darkmux-dispatch-a.b$", "--format", "{{.Names}}"])
         );
         let by_name = Query { having: Having::NamePrefix("p-".into()), stopped_too: false, read: strings(&["a", "b"]) };
         assert_eq!(

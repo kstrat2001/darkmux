@@ -39,6 +39,8 @@ fn policy(image: &str, tree: &Path, script: &str) -> SandboxPolicy {
         limits: Limits { memory: Some("256m".to_string()), pids: Some(64) },
         mounts: vec![Mount { host: tree.to_path_buf(), at: "/workspace".to_string(), access: Access::ReadWrite }],
         ports: Vec::new(),
+        stdin: false,
+        host_alias: None,
         user: None,
         env: Vec::new(),
         workdir: Some("/workspace".to_string()),
