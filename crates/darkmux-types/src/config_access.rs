@@ -794,6 +794,56 @@ fn clients_preview_idle_minutes_with_source_in(cfg: &DarkmuxConfig) -> (u64, Sou
     );
     (v.unwrap_or(CLIENTS_PREVIEW_IDLE_MINUTES_DEFAULT), s)
 }
+/// (#3544) The developer team that signs Mux Bot: the built-in
+/// `clients.pairing.verified_teams`.
+pub const CLIENTS_PAIRING_VERIFIED_TEAMS_DEFAULT: &[&str] = &["5LDXYW8B6T"];
+/// (#3544) The teams whose signed Mux Bot pairs on this machine with no
+/// dialog, against `cfg`: `env(DARKMUX_CLIENTS_PAIRING_VERIFIED_TEAMS)`
+/// (comma-separated, trimmed, empty entries dropped) >
+/// `cfg.clients.pairing.verified_teams` > Mux Bot's team. Empty: none.
+pub fn clients_pairing_verified_teams_in(cfg: &DarkmuxConfig) -> Vec<String> {
+    clients_pairing_verified_teams_with_source_in(cfg).0
+}
+/// [`clients_pairing_verified_teams_in`] and the tier that set it.
+fn clients_pairing_verified_teams_with_source_in(cfg: &DarkmuxConfig) -> (Vec<String>, Source) {
+    if let Some(s) = env_str("DARKMUX_CLIENTS_PAIRING_VERIFIED_TEAMS") {
+        return (s.split(',').map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).collect(), Source::Env);
+    }
+    match cfg.clients.as_ref().and_then(|c| c.pairing.as_ref()).and_then(|p| p.verified_teams.clone()) {
+        Some(list) => (list, Source::Config),
+        None => (CLIENTS_PAIRING_VERIFIED_TEAMS_DEFAULT.iter().map(|t| t.to_string()).collect(), Source::BuiltIn),
+    }
+}
+/// (#3544) Whether an app that does not verify gets a native Allow dialog,
+/// against `cfg`: `env(DARKMUX_CLIENTS_PAIRING_DIALOG)` >
+/// `cfg.clients.pairing.dialog` > `true`. An unrecognized env token leaves it on.
+pub fn clients_pairing_dialog_in(cfg: &DarkmuxConfig) -> bool {
+    clients_pairing_dialog_with_source_in(cfg).0
+}
+/// [`clients_pairing_dialog_in`] and the tier that set it.
+fn clients_pairing_dialog_with_source_in(cfg: &DarkmuxConfig) -> (bool, Source) {
+    if let Some(s) = env_str("DARKMUX_CLIENTS_PAIRING_DIALOG") {
+        return (parse_bool_token(&s).unwrap_or(true), Source::Env);
+    }
+    match cfg.clients.as_ref().and_then(|c| c.pairing.as_ref()).and_then(|p| p.dialog) {
+        Some(on) => (on, Source::Config),
+        None => (true, Source::BuiltIn),
+    }
+}
+/// [`clients_pairing_verified_teams_in`] against this process's config tier.
+pub fn clients_pairing_verified_teams() -> Vec<String> {
+    clients_pairing_verified_teams_in(config())
+}
+/// [`clients_pairing_verified_teams_in`] against this process's config tier,
+/// and the tier that set it.
+pub fn clients_pairing_verified_teams_with_source() -> (Vec<String>, Source) {
+    clients_pairing_verified_teams_with_source_in(config())
+}
+/// [`clients_pairing_dialog_in`] against this process's config tier, and
+/// the tier that set it.
+pub fn clients_pairing_dialog_with_source() -> (bool, Source) {
+    clients_pairing_dialog_with_source_in(config())
+}
 /// [`clients_profiles_in`] against this process's config tier.
 pub fn clients_profiles() -> Option<Vec<String>> {
     clients_profiles_in(config())
@@ -2747,6 +2797,9 @@ mod location_guard {
         ("cmd_allowed_verbs", "CLI verb names"),
         ("clients_profiles", "profile names a paired client app may run on"),
         ("clients_profiles_in", "profile names a paired client app may run on, against a given config"),
+        ("CLIENTS_PAIRING_VERIFIED_TEAMS_DEFAULT", "developer team ids, public in the source"),
+        ("clients_pairing_verified_teams_in", "developer team ids, against a given config"),
+        ("clients_pairing_verified_teams", "developer team ids"),
         ("hooks_enabled_provenance", "which tier set a switch"),
         ("check_retired_env", "the same leftovers as `retired_env_leftovers`, split by policy"),
         ("role_profiles", "role and profile names"),
@@ -4414,6 +4467,48 @@ mod tests {
             match prev {
                 Some(v) => std::env::set_var(key, v),
                 None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    /// (#3544) `clients.pairing.*`: env > config > Mux Bot's team and the
+    /// dialog on; an empty team list is none, not the default.
+    #[serial_test::serial]
+    #[test]
+    fn clients_pairing_settings_are_env_then_config_then_default() {
+        let keys = ["DARKMUX_CLIENTS_PAIRING_VERIFIED_TEAMS", "DARKMUX_CLIENTS_PAIRING_DIALOG"];
+        let prev: Vec<Option<String>> = keys.iter().map(|k| std::env::var(k).ok()).collect();
+        for k in keys {
+            unsafe { std::env::remove_var(k); }
+        }
+        let with = |teams: Option<Vec<String>>, dialog: Option<bool>| crate::config::DarkmuxConfig {
+            clients: Some(crate::config::ClientsConfig {
+                pairing: Some(crate::config::ClientsPairingConfig { verified_teams: teams, dialog, ..Default::default() }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let unset = crate::config::DarkmuxConfig::default();
+        assert_eq!(clients_pairing_verified_teams_with_source_in(&unset), (vec!["5LDXYW8B6T".to_string()], Source::BuiltIn));
+        assert_eq!(clients_pairing_dialog_with_source_in(&unset), (true, Source::BuiltIn));
+        let empty = with(Some(vec![]), Some(false));
+        assert_eq!(clients_pairing_verified_teams_with_source_in(&empty), (vec![], Source::Config), "empty is none");
+        assert_eq!(clients_pairing_dialog_with_source_in(&empty), (false, Source::Config));
+        unsafe {
+            std::env::set_var(keys[0], " AAAAAAAAAA, ,BBBBBBBBBB ");
+            std::env::set_var(keys[1], "off");
+        }
+        assert_eq!(
+            clients_pairing_verified_teams_with_source_in(&empty),
+            (vec!["AAAAAAAAAA".to_string(), "BBBBBBBBBB".to_string()], Source::Env)
+        );
+        assert_eq!(clients_pairing_dialog_with_source_in(&with(None, Some(true))), (false, Source::Env));
+        for (k, v) in keys.iter().zip(prev) {
+            unsafe {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
             }
         }
     }

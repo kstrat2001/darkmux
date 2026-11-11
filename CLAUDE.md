@@ -56,7 +56,7 @@ A new feature conforms to these or extends them through their own versioning; it
 
 Full text: `docs/agents/DOCTRINE.md`.
 
-- **Operator sovereignty:** the operator never has to wonder where a decision came from. Surface, suggest, record; never substitute judgment silently. Never mutate user state (`~/.darkmux/profiles.json`, `config.json`) without confirmation.
+- **Operator sovereignty:** the operator never has to wonder where a decision came from. Surface, suggest, record; never substitute judgment silently. Never mutate user state (`~/.darkmux/profiles.json`, `config.json`) without confirmation. One grant comes by installation: a Mux Bot signed by a verified team pairs on the same Mac with no dialog; every other pairing needs an explicit Allow.
 - **Harness before model:** for slow or wrong output, check compaction, context windows and loaded state (`darkmux doctor`) before blaming the model.
 - **The lab loop:** baseline, one variable, re-measure, compare, record. Never skip the baseline or change two things at once.
 - **No blind runs:** no measurement-grade run launches until its records stream per event, host telemetry samples alongside, the knob config is snapshotted, and a live view exists. The observer must not join the observed: no model calls on an observability path.

@@ -225,6 +225,95 @@ impl Platform for LinuxPlatform {
         let gib = self.ram_installed_bytes()?.div_ceil(1 << 30);
         Some(if self.gpu_api().is_some() { sold_size_on_apple(gib) } else { gib })
     }
+
+    /// (#3544) Linux has no code signing, so no process is ever named by one.
+    fn signed_app(&self, _pid: u32) -> Result<crate::SignedApp, String> {
+        Err("this machine has no code signing to check".to_string())
+    }
+
+    /// (#3544) `zenity --question` in the graphical session this process
+    /// was started in (`WAYLAND_DISPLAY` or `DISPLAY`); none without one, or
+    /// without `zenity` on `PATH`.
+    fn ask_allow(&self, message: &str, _icon: Option<&std::path::Path>, timeout_secs: u64) -> crate::AllowAnswer {
+        let Some(zenity) = graphical_tool("zenity") else {
+            return crate::AllowAnswer::NoDialog("no graphical session with zenity".to_string());
+        };
+        let mut cmd = std::process::Command::new(zenity);
+        cmd.args(zenity_allow_args(message, timeout_secs)).current_dir("/");
+        let deadline = std::time::Duration::from_secs(timeout_secs.saturating_add(10));
+        zenity_run_answer(crate::output_within(cmd, deadline))
+    }
+
+    /// (#3544) `notify-send` in the graphical session, when there is one.
+    fn notify(&self, message: &str) {
+        if let Some(tool) = graphical_tool("notify-send") {
+            let mut cmd = std::process::Command::new(tool);
+            cmd.args(["--app-name=darkmux", "--", "darkmux", message]).current_dir("/");
+            crate::spawn_detached(cmd);
+        }
+    }
+}
+
+/// `tool`'s path on `PATH`, when this process runs in a graphical session.
+fn graphical_tool(tool: &str) -> Option<std::path::PathBuf> {
+    let var = std::env::var_os;
+    graphical_tool_in(tool, [var("WAYLAND_DISPLAY"), var("DISPLAY")], var("PATH"))
+}
+
+/// [`graphical_tool`] from `WAYLAND_DISPLAY`, `DISPLAY` and `PATH`: a
+/// session is either display variable set and not empty.
+pub(crate) fn graphical_tool_in(
+    tool: &str,
+    displays: [Option<std::ffi::OsString>; 2],
+    path: Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    displays.iter().flatten().any(|v| !v.is_empty()).then_some(())?;
+    on_path(tool, &path?)
+}
+
+/// The first executable file named `tool` in the directories of `path`.
+pub(crate) fn on_path(tool: &str, path: &std::ffi::OsStr) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(path)
+        .map(|dir| dir.join(tool))
+        .find(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+}
+
+/// `zenity`'s arguments for the Allow dialog: OK is Allow and Cancel is
+/// Don't Allow, which is the default (`--default-cancel`), so Return, Esc and
+/// closing the window all mean Don't Allow, as on macOS; the message is
+/// plain text (`--no-markup`), in one argument of its own.
+pub(crate) fn zenity_allow_args(message: &str, timeout_secs: u64) -> Vec<String> {
+    vec![
+        "--question".to_string(),
+        "--title=darkmux".to_string(),
+        "--no-markup".to_string(),
+        format!("--ok-label={}", crate::ALLOW_BUTTON),
+        format!("--cancel-label={}", crate::DONT_ALLOW_BUTTON),
+        "--default-cancel".to_string(),
+        format!("--timeout={timeout_secs}"),
+        format!("--text={message}"),
+    ]
+}
+
+/// What the `zenity` run (`None`: it did not start or end) means.
+pub(crate) fn zenity_run_answer(out: Option<std::process::Output>) -> crate::AllowAnswer {
+    match out {
+        Some(out) => zenity_answer(out.status.code()),
+        None => crate::AllowAnswer::NoDialog("zenity did not start or did not end".to_string()),
+    }
+}
+
+/// What `zenity --question`'s exit means: `0` is Allow; `1` is Don't Allow,
+/// Esc or the window closed (all Don't Allow); `5` is its timeout (no
+/// answer). Any other exit showed nothing.
+pub(crate) fn zenity_answer(code: Option<i32>) -> crate::AllowAnswer {
+    match code {
+        Some(0) => crate::AllowAnswer::Allow,
+        Some(1) => crate::AllowAnswer::DontAllow,
+        Some(5) => crate::AllowAnswer::NoAnswer,
+        other => crate::AllowAnswer::NoDialog(format!("zenity exited with {other:?}")),
+    }
 }
 
 /// An M1 or M2 sold with 8, 16, 24, 32, 64, 96 or 128 GB: the next multiple of 8.
