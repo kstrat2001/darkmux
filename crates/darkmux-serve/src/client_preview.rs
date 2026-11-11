@@ -2329,6 +2329,54 @@ mod tests {
         assert_eq!(args.len(), image_at + 3, "the script is the last argument");
     }
 
+    /// (#3112) The whole `docker create` line, as a set of options (their
+    /// order is Docker's business) plus the environment in order (a later
+    /// key wins) and the image and script last. Pinned before previews
+    /// moved onto the sandbox seam, so the move adds, drops or changes no
+    /// option.
+    #[test]
+    fn a_preview_container_is_created_with_exactly_these_options() {
+        let recipe = a_recipe(serde_json::json!({"schema_version": "1.0", "command": "npm run dev"}));
+        let spec = a_spec(&recipe, Some("501:20".into()));
+        let args = docker_create_args(&spec);
+        let (head, tail) = args.split_at(args.len() - 5);
+        assert_eq!(tail, ["--entrypoint", "sh", "sha256:runtime", "-c", spec.script.as_str()]);
+        assert_eq!(head[0], "create");
+        let mut options = Vec::new();
+        let mut it = head[1..].iter();
+        while let Some(a) = it.next() {
+            let takes_value = ["--name", "--label", "-v", "-w", "-p", "-e"].contains(&a.as_str());
+            options.push(if takes_value { format!("{a} {}", it.next().unwrap()) } else { a.clone() });
+        }
+        let env: Vec<String> = options.iter().filter(|o| o.starts_with("-e ")).cloned().collect();
+        let mut options: Vec<String> = options.into_iter().filter(|o| !o.starts_with("-e ")).collect();
+        options.sort();
+        let mut want: Vec<String> = [
+            "--rm",
+            "--init",
+            "--name darkmux-preview-site-4100-r1",
+            "--cap-drop=ALL",
+            "--security-opt=no-new-privileges",
+            "--pids-limit=512",
+            "--memory=4g",
+            "--label darkmux.dispatch.host-pid=7",
+            "--label darkmux.preview.workspace=site",
+            "-v /tmp/ws/site:/workspace",
+            "-v /tmp/p/heartbeats/darkmux-preview-site-4100-r1:/darkmux-heartbeat:ro",
+            "-w /workspace",
+            "-p 127.0.0.1:4100:4100",
+            "-p 127.0.0.1:4200:4200",
+            "--user=501:20",
+        ]
+        .map(String::from)
+        .to_vec();
+        want.sort();
+        assert_eq!(options, want);
+        let mut want_env = vec!["-e HOME=/tmp".to_string()];
+        want_env.extend(spec.env.iter().map(|(k, v)| format!("-e {k}={v}")));
+        assert_eq!(env, want_env, "HOME first, then the spec's environment in order");
+    }
+
     /// (#3456) No host environment reaches the container: its environment
     /// is polling for file watchers, the recipe's `env` with its ports
     /// filled in, and the port variables, each as `KEY=value` (a bare `-e
