@@ -791,6 +791,22 @@ mod tests {
         assert!(script.ends_with("\ncargo test"), "{script}");
     }
 
+    /// (#3112) The gate's whole `docker run` argv, pinned before isolation
+    /// became a seam: moving it behind the sandbox backend must not change
+    /// one byte.
+    #[test]
+    fn the_gate_container_argv_is_byte_for_byte_pinned() {
+        let args = gate_container_args("rust:1-slim", "darkmux-gate-1", Path::new("/tmp/s/checkout"), "cargo test");
+        let label = format!("darkmux.gate.pid={}", std::process::id());
+        let script = "test -f /darkmux-gate/.darkmux-gate || { echo 'the tree was not mounted: the Docker daemon cannot see the \
+                      host path' >&2; exit 125; }\necho 'darkmux-contained: started'\ncargo test";
+        let want = ["run", "--rm", "--init", "--name", "darkmux-gate-1", "--network", "none", "--cap-drop=ALL",
+            "--security-opt=no-new-privileges", "--pids-limit=512", "--memory=4g", "--label", &label,
+            "-v", "/tmp/s/checkout:/workspace", "-v", "/tmp/s/.darkmux-gate-darkmux-gate-1:/darkmux-gate:ro",
+            "-w", "/workspace", "--entrypoint", "sh", "rust:1-slim", "-c", script];
+        assert_eq!(args, want.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    }
+
     /// (#3177 review) The step itself, with a `test_command` and no place
     /// to run it: the summary carries the refusal and every mod records it.
     #[test]

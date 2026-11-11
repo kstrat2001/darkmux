@@ -286,6 +286,158 @@ mod tests {
         assert!(!container_args("node:22", "n", &a_run(&[], None)).join(" ").contains("--user"));
     }
 
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// (#3112) The whole `docker run` argv, pinned before isolation became a
+    /// seam: moving it behind the sandbox backend must not change one byte.
+    #[test]
+    fn the_container_argv_is_byte_for_byte_pinned() {
+        let label = format!("darkmux.gate.pid={}", std::process::id());
+        let script = "test -f /darkmux-gate/.darkmux-gate || { echo 'the tree was not mounted: the Docker daemon cannot see the \
+                      host path' >&2; exit 125; }\necho 'darkmux-contained: started'\nnpm test";
+        let mounts = [(PathBuf::from("/tmp/s/report"), "/report".to_string())];
+        assert_eq!(
+            container_args("node:22", "darkmux-test-1", &a_run(&mounts, Some("501:20".into()))),
+            strings(&["run", "--rm", "--init", "--name", "darkmux-test-1", "--network", "none", "--cap-drop=ALL",
+                "--security-opt=no-new-privileges", "--pids-limit=512", "--memory=4g", "--label", &label,
+                "-v", "/tmp/s/tree:/workspace", "-v", "/tmp/s/.darkmux-gate-darkmux-test-1:/darkmux-gate:ro",
+                "-v", "/tmp/s/report:/report", "--user=501:20", "-e", "HOME=/tmp", "-w", "/workspace/pkg",
+                "--entrypoint", "sh", "node:22", "-c", script]),
+        );
+        let bare = Run { workdir: "/", ..a_run(&[], None) };
+        assert_eq!(
+            container_args("node:22", "n", &bare),
+            strings(&["run", "--rm", "--init", "--name", "n", "--network", "none", "--cap-drop=ALL",
+                "--security-opt=no-new-privileges", "--pids-limit=512", "--memory=4g", "--label", &label,
+                "-v", "/tmp/s/tree:/workspace", "-v", "/tmp/s/.darkmux-gate-n:/darkmux-gate:ro", "-w", "/workspace",
+                "--entrypoint", "sh", "node:22", "-c", script]),
+        );
+        // A tree with no parent has no mount check to mount.
+        let rootless = Run { tree: Path::new("/"), ..bare.clone() };
+        assert_eq!(
+            container_args("node:22", "n", &rootless),
+            strings(&["run", "--rm", "--init", "--name", "n", "--network", "none", "--cap-drop=ALL",
+                "--security-opt=no-new-privileges", "--pids-limit=512", "--memory=4g", "--label", &label,
+                "-v", "/:/workspace", "-w", "/workspace", "--entrypoint", "sh", "node:22", "-c", script]),
+        );
+    }
+
+    /// (#3112) The spawned program is `docker`, its arguments the pinned
+    /// argv, and the container is named `<prefix>-<pid>-<seq>`.
+    #[test]
+    fn a_contained_command_spawns_docker_with_the_pinned_argv() {
+        let (cmd, name) = command(&Placement::Container("node:22".into()), &a_run(&[], None));
+        let name = name.expect("a container run is named");
+        let prefix = format!("darkmux-test-{}-", std::process::id());
+        assert!(name.strip_prefix(&prefix).is_some_and(|n| n.parse::<u64>().is_ok()), "{name}");
+        assert_eq!(cmd.get_program(), "docker");
+        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args, container_args("node:22", &name, &a_run(&[], None)));
+    }
+
+    /// A fake `docker` first on `PATH` that records each invocation's
+    /// arguments NUL-separated (each invocation ended by `\x01`, since an
+    /// argument may hold a newline), lists `ps_output`
+    /// for `ps`, and for `run` prints the start line, or sleeps when `hang`.
+    fn fake_docker(dir: &Path, ps_output: &str, hang: bool) -> (PathBuf, Option<String>) {
+        let record = dir.join("invocations");
+        let listing = dir.join("ps.txt");
+        std::fs::write(&listing, ps_output).unwrap();
+        let run = if hang { "exec sleep 30" } else { "echo 'darkmux-contained: started'; echo ran" };
+        let docker = dir.join("docker");
+        std::fs::write(
+            &docker,
+            format!(
+                "#!/bin/sh\nprintf '%s\\0' \"$@\" >> {rec}\nprintf '\\001' >> {rec}\ncase \"$1\" in ps) cat {ls};; run) {run};; esac\n",
+                rec = record.display(),
+                ls = listing.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let prev = std::env::var("PATH").ok();
+        // SAFETY: every caller is `#[serial]`.
+        unsafe { std::env::set_var("PATH", format!("{}:{}", dir.display(), prev.clone().unwrap_or_default())) };
+        (record, prev)
+    }
+
+    fn restore_path(prev: Option<String>) {
+        // SAFETY: every caller is `#[serial]`.
+        unsafe {
+            match prev {
+                Some(p) => std::env::set_var("PATH", p),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+
+    fn invocations(record: &Path) -> Vec<Vec<String>> {
+        std::fs::read_to_string(record)
+            .unwrap_or_default()
+            .split_terminator('\u{1}')
+            .map(|l| l.trim_end_matches('\0').split('\0').map(str::to_string).collect())
+            .collect()
+    }
+
+    /// A pid no process holds: a child that has exited and been reaped.
+    fn a_dead_pid() -> u32 {
+        let mut child = Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    /// (#3112) A contained run's whole conversation with Docker, pinned: the
+    /// orphan listing, the orphan's removal (a live owner's is left), then
+    /// the run itself.
+    #[test]
+    #[serial_test::serial] // puts a fake docker first on PATH
+    fn a_contained_run_speaks_the_pinned_docker_invocations_in_order() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ps = format!("orphan-c\t{}\nlive-c\t{}\nunlabeled-c\t\n", a_dead_pid(), std::process::id());
+        let (record, prev) = fake_docker(dir.path(), &ps, false);
+        let tree = dir.path().join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        let run_ = Run { command: "true", tree: &tree, workdir: "", mounts: &[], user: None, name_prefix: "darkmux-test" };
+        let ran = run(&Placement::Container("img:1".into()), &run_, Duration::from_secs(20));
+        restore_path(prev);
+        let Ok(Bounded::Finished { stdout, .. }) = ran else { panic!("{ran:?}") };
+        assert_eq!(String::from_utf8_lossy(&stdout), "ran\n");
+        let calls = invocations(&record);
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        assert_eq!(
+            calls[0],
+            strings(&["ps", "-a", "--filter", "label=darkmux.gate.pid", "--format", "{{.Names}}\t{{.Label \"darkmux.gate.pid\"}}"])
+        );
+        assert_eq!(calls[1], strings(&["rm", "-f", "orphan-c"]));
+        let name = &calls[2][4];
+        assert!(name.starts_with(&format!("darkmux-test-{}-", std::process::id())), "{name}");
+        assert_eq!(calls[2], container_args("img:1", name, &run_));
+    }
+
+    /// (#3112) A run past its deadline removes its container by name.
+    #[test]
+    #[serial_test::serial] // puts a fake docker first on PATH
+    fn a_contained_run_past_its_deadline_removes_its_container_by_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (record, prev) = fake_docker(dir.path(), "", true);
+        let tree = dir.path().join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        let run_ = Run { command: "sleep 300", tree: &tree, workdir: "", mounts: &[], user: None, name_prefix: "darkmux-test" };
+        let ran = run(&Placement::Container("img:1".into()), &run_, Duration::from_secs(2));
+        restore_path(prev);
+        assert!(matches!(ran, Ok(Bounded::TimedOut { .. })), "{ran:?}");
+        let calls = invocations(&record);
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        assert_eq!(calls[0][0], "ps");
+        let name = calls[1][4].clone();
+        assert_eq!(calls[1], container_args("img:1", &name, &run_));
+        assert_eq!(calls[2], strings(&["rm", "-f", &name]));
+    }
+
     /// On the host the command runs in the tree's working directory.
     #[test]
     fn a_host_run_is_sh_in_the_workdir() {
