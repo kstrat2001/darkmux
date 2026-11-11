@@ -6836,6 +6836,127 @@ S(("127.0.0.1", port), H).serve_forever()
 
     /// A minimal valid config: no optional flags set. Each test below flips
     /// exactly one field so the assertion isolates that branch.
+    /// (#3112) A `docker run` line as Docker reads it: its options as a
+    /// sorted set (their order is Docker's business, except mounts and
+    /// environment, kept in order below), its `-v` mounts in order (a later
+    /// one is layered over an earlier), its `-e` environment in order (a
+    /// later key wins), and everything from the image on, in order.
+    fn as_docker_reads_it(argv: &[String]) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+        assert_eq!(argv[..2], ["docker", "run"]);
+        let image_at = argv.iter().position(|a| a == &base_argv_config().image).expect("the image");
+        let (mut options, mut mounts, mut env) = (Vec::new(), Vec::new(), Vec::new());
+        let mut it = argv[2..image_at].iter().filter(|a| *a != "--");
+        while let Some(a) = it.next() {
+            match a.as_str() {
+                "-v" => mounts.push(it.next().unwrap().clone()),
+                "-e" => env.push(it.next().unwrap().clone()),
+                "--name" | "--label" | "--entrypoint" | "-w" => options.push(format!("{a} {}", it.next().unwrap())),
+                _ => options.push(a.clone()),
+            }
+        }
+        options.sort();
+        (options, mounts, env, argv[image_at..].to_vec())
+    }
+
+    /// Every option a dispatch can set, on.
+    fn every_option_argv_config() -> DockerRunConfig {
+        DockerRunConfig {
+            host_identity: Some(crate::orphan_reaper::HostIdentity {
+                pid: 42,
+                start: 4200,
+                machine: "MACHINE-A".into(),
+                pid_ns: "pid:9".into(),
+            }),
+            mod_attachment_mounts: vec![(PathBuf::from("/tmp/mods/m1"), "/darkmux-mods/m1".to_string())],
+            inject: true,
+            runtime_binary: Some(PathBuf::from("/tmp/rt/darkmux-runtime")),
+            cache_dir: Some(PathBuf::from("/tmp/cache")),
+            max_pause_ms_env: Some(250),
+            remote_needs_auth: true,
+            workspace_read_only: true,
+            workdir_git_read_only: Some(PathBuf::from("/tmp/ws/.git")),
+            container_host_access: darkmux_platform::ContainerHostAccess::HostGateway,
+            container_user: darkmux_platform::ContainerUser::Host { uid: 501, gid: Some(20) },
+            ..base_argv_config()
+        }
+    }
+
+    /// (#3112) The whole `docker run` line of a bare dispatch and of one with
+    /// every option on, as Docker reads it, and the `--` fence right before
+    /// the image (#907). Pinned before dispatch moved onto the sandbox seam,
+    /// so the move adds, drops or changes no option, mount, variable or
+    /// runtime argument.
+    #[test]
+    fn a_dispatch_container_is_run_with_exactly_these_options() {
+        let strings = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let env = |extra: &[&str]| {
+            let mut e = strings(&[
+                "CARGO_HOME=/darkmux-cache/cargo",
+                "npm_config_cache=/darkmux-cache/npm",
+                "PIP_CACHE_DIR=/darkmux-cache/pip",
+                "DARKMUX_FEEDBACK_INJECTION=true",
+                "DARKMUX_TURN_DELAY_MS=0",
+                "DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY=conclude",
+                "DARKMUX_INACTIVITY_TIMEOUT_SECONDS=600",
+                "DARKMUX_INACTIVITY_TIMEOUT_SECONDS_SOURCE=built-in",
+            ]);
+            e.extend(strings(extra));
+            e
+        };
+        let tail = strings(&[
+            "darkmux-runtime:latest", "run", "--model", "m", "--role-id", "test-role", "--execution-id", "exec-test",
+            "--system", "role", "--prompt-file", "/darkmux-out/.prompt.txt",
+        ]);
+        let hardening = ["--cap-drop=ALL", "--init", "--memory=4g", "--name darkmux-edge", "--pids-limit=512", "--rm",
+            "--security-opt=no-new-privileges"];
+
+        let bare = build_docker_run_argv(&base_argv_config());
+        assert_eq!(
+            as_docker_reads_it(&bare),
+            (
+                strings(&hardening),
+                strings(&["/tmp/ws:/workspace", "/tmp/out:/darkmux-out", "/tmp/cache:/darkmux-cache"]),
+                env(&[]),
+                tail.clone()
+            )
+        );
+
+        let every = build_docker_run_argv(&every_option_argv_config());
+        let mut options = strings(&hardening);
+        options.extend(strings(&[
+            "--add-host=host.docker.internal:host-gateway",
+            "--entrypoint /darkmux-runtime",
+            "--label darkmux.dispatch.host-machine=MACHINE-A",
+            "--label darkmux.dispatch.host-pid-ns=pid:9",
+            "--label darkmux.dispatch.host-pid=42",
+            "--label darkmux.dispatch.host-start=4200",
+            "--user=501:20",
+            "-i",
+        ]));
+        options.sort();
+        assert_eq!(
+            as_docker_reads_it(&every),
+            (
+                options,
+                strings(&[
+                    "/tmp/ws:/workspace:ro",
+                    "/tmp/out:/darkmux-out",
+                    "/tmp/ws/.git:/workspace/.git:ro",
+                    "/tmp/mods/m1:/darkmux-mods/m1:ro",
+                    "/tmp/cache:/darkmux-cache",
+                    "/tmp/rt/darkmux-runtime:/darkmux-runtime:ro",
+                ]),
+                env(&["DARKMUX_MAX_PAUSE_MS=250", "HOME=/tmp"]),
+                tail
+            )
+        );
+        for argv in [&bare, &every] {
+            let image_at = argv.iter().position(|a| a == "darkmux-runtime:latest").unwrap();
+            assert_eq!(argv[image_at - 1], "--", "the image is fenced from the options (#907)");
+            assert_eq!(argv.iter().filter(|a| *a == "--").count(), 1);
+        }
+    }
+
     fn base_argv_config() -> DockerRunConfig {
         DockerRunConfig {
             host_identity: None,
