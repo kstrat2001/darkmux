@@ -204,6 +204,359 @@ impl Platform for MacPlatform {
     fn forget_secret(&self, item: &str, account: &str) {
         let _ = command_stdout("security", &["delete-generic-password", "-a", account, "-s", item]);
     }
+
+    /// (#3544) `codesign -d` names the signature's team, identifier and
+    /// flags; `codesign --verify --strict` against a requirement built from
+    /// them then proves it: valid now, anchored at Apple, that team's
+    /// certificate, that identifier. Both read the running process by pid.
+    /// The kernel's path for the process (`proc_pidpath`) must be the one
+    /// `codesign` names, with no control character in it, so a file name
+    /// cannot add lines to what `codesign -d` prints.
+    fn signed_app(&self, pid: u32) -> Result<crate::SignedApp, String> {
+        signed_app_from(process_path(pid), codesign_display(pid), |requirement| codesign_verify(pid, requirement), app_icon)
+    }
+
+    /// (#3544) `osascript`'s `display dialog`, centered, with the message and
+    /// the timeout passed as the script's arguments, never as script text.
+    fn ask_allow(&self, message: &str, icon: Option<&std::path::Path>, timeout_secs: u64) -> crate::AllowAnswer {
+        let mut cmd = std::process::Command::new("/usr/bin/osascript");
+        cmd.args(allow_dialog_args(message, icon, timeout_secs)).current_dir("/");
+        let deadline = std::time::Duration::from_secs(timeout_secs.saturating_add(10));
+        dialog_run_answer(crate::output_within(cmd, deadline))
+    }
+
+    /// (#3544) `osascript`'s `display notification`, not waited on.
+    fn notify(&self, message: &str) {
+        let mut cmd = std::process::Command::new("/usr/bin/osascript");
+        cmd.args(notice_args(message)).current_dir("/");
+        crate::spawn_detached(cmd);
+    }
+}
+
+/// The hardened-runtime bit of a code directory's flags.
+const CS_RUNTIME: u32 = 0x10000;
+/// The ad hoc bit: signed by no certificate at all (`codesign -s -`).
+const CS_ADHOC: u32 = 0x2;
+
+/// [`Platform::signed_app`] from `codesign -d`'s answer and a verifier for
+/// a requirement, so every refusal is tested without a real process.
+pub(crate) fn signed_app_from(
+    path: Result<std::path::PathBuf, String>,
+    display: Result<String, String>,
+    verify: impl FnOnce(&str) -> Result<(), String>,
+    icon_of: impl FnOnce(&std::path::Path, &str) -> Option<std::path::PathBuf>,
+) -> Result<crate::SignedApp, String> {
+    let exe = path?;
+    let shown = display?;
+    let body = codesign_fields(&exe, &shown)?;
+    let field = |key: &str| body.lines().find_map(|l| l.strip_prefix(key)).map(str::trim);
+    let team = team_of(field("TeamIdentifier="))?;
+    signed_by_a_developer_with_runtime(body)?;
+    let bundle = field("Identifier=").filter(|b| is_bundle_id(b)).ok_or("its signature names no bundle id darkmux can check")?;
+    let signer = field("Authority=").map(crate::display_safe).ok_or("its signature names no signing certificate")?;
+    let requirement = signing_requirement(team, bundle);
+    verify(&requirement).map_err(|e| format!("its signature does not hold: {e}"))?;
+    // Only now, with the signature verified, may the bundle's icon be shown,
+    // and only when the bundle itself verifies against the same requirement.
+    let icon = icon_of(&exe, &requirement);
+    Ok(crate::SignedApp { team: team.to_string(), bundle: bundle.to_string(), signer, icon })
+}
+
+/// What `codesign -d` says after its `Executable=` line, when that line
+/// names exactly `exe` (the kernel's path for the process), `exe` holds no
+/// control character, and the next line is the signature's `Identifier=`
+/// (codesign's own order), and `Identifier=`, `TeamIdentifier=` and
+/// `CodeDirectory` each appear once. `codesign` prints the path raw, so a
+/// line break in a file name would otherwise put lines of the file's
+/// choosing ahead of the signature's own (#3547 review); a line added there
+/// now breaks that order or repeats a field, and names no app. The signing
+/// identifier is printed raw too, and its signer chooses it: a line break
+/// in it can add an `Authority=` line after `Identifier=`. That case is
+/// refused by the requirement, whose `identifier` is the text before the
+/// break and so never the signature's real identifier.
+pub(crate) fn codesign_fields<'a>(exe: &std::path::Path, shown: &'a str) -> Result<&'a str, String> {
+    let exe = exe.to_str().ok_or("its executable's path is not text darkmux can check")?;
+    if exe.chars().any(char::is_control) {
+        return Err("its executable's path holds a control character".to_string());
+    }
+    let body = shown
+        .strip_prefix("Executable=")
+        .and_then(|rest| rest.strip_prefix(exe))
+        .and_then(|rest| rest.strip_prefix('\n'))
+        .filter(|body| body.starts_with("Identifier="))
+        .ok_or_else(|| "codesign described another executable than the one the process runs".to_string())?;
+    for key in ["Identifier=", "TeamIdentifier=", "CodeDirectory "] {
+        if body.lines().filter(|l| l.starts_with(key)).count() != 1 {
+            return Err(format!("codesign's description has no single `{}` line", key.trim_end_matches(['=', ' '])));
+        }
+    }
+    Ok(body)
+}
+
+/// The icon of the app bundle `executable` runs from
+/// (`<X>.app/Contents/MacOS/<exe>`): its `Info.plist`'s `CFBundleIconFile`,
+/// found by [`icon_in_bundle`]. `None` for an executable outside a bundle,
+/// or a bundle that names no icon darkmux can show.
+pub(crate) fn app_icon(executable: &std::path::Path, requirement: &str) -> Option<std::path::PathBuf> {
+    app_icon_by(executable, requirement, codesign_verify_path, plist_icon_name)
+}
+
+/// [`app_icon`] with the bundle verifier and the `Info.plist` reader passed
+/// in, so every branch is tested on every OS. The bundle (`<X>.app`) must
+/// itself satisfy `requirement`: its signature seals its `Info.plist` and
+/// `Resources`, so the icon is the signed app's own, not one a signed
+/// executable was copied in beside.
+pub(crate) fn app_icon_by(
+    executable: &std::path::Path,
+    requirement: &str,
+    verify_bundle: impl FnOnce(&std::path::Path, &str) -> Result<(), String>,
+    icon_name: impl Fn(&std::path::Path) -> Option<String>,
+) -> Option<std::path::PathBuf> {
+    let contents = bundle_contents(executable)?;
+    verify_bundle(contents.parent()?, requirement).ok()?;
+    icon_in_bundle(&contents, &icon_name(&contents.join("Info.plist"))?)
+}
+
+/// `<X>.app/Contents` for an executable at `<X>.app/Contents/MacOS/<exe>`.
+pub(crate) fn bundle_contents(executable: &std::path::Path) -> Option<std::path::PathBuf> {
+    let macos = executable.parent().filter(|d| d.file_name() == Some("MacOS".as_ref()))?;
+    let contents = macos.parent().filter(|d| d.file_name() == Some("Contents".as_ref()))?;
+    let app = contents.parent()?;
+    app.extension().is_some_and(|e| e == "app").then(|| contents.to_path_buf())
+}
+
+/// The icon `name` (a `CFBundleIconFile`; `.icns` added when it has no
+/// extension) as a file inside `contents/Resources`: a plain file name only
+/// (no `/`, no `..`), and the file it resolves to, links followed, must
+/// still be inside `Resources`. `None` otherwise, so the dialog falls back
+/// to the caution icon.
+pub(crate) fn icon_in_bundle(contents: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    if !is_plain_file_name(name) {
+        return None;
+    }
+    let file = match std::path::Path::new(name).extension() {
+        Some(_) => name.to_string(),
+        None => format!("{name}.icns"),
+    };
+    let resources = contents.join("Resources").canonicalize().ok()?;
+    let icon = resources.join(file).canonicalize().ok()?;
+    (icon.starts_with(&resources) && icon.is_file()).then_some(icon)
+}
+
+/// A name that is one file name: not empty, no separator or NUL, not `.`
+/// or `..`.
+fn is_plain_file_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains(['/', '\\', '\0']) && name != "." && name != ".."
+}
+
+/// `CFBundleIconFile` from an `Info.plist` (XML or binary), by `plutil`.
+#[cfg(target_os = "macos")]
+pub(crate) fn plist_icon_name(plist: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new("/usr/bin/plutil")
+        .args(["-extract", "CFBundleIconFile", "raw", "-o", "-"])
+        .arg(plist)
+        .current_dir("/")
+        .output()
+        .ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn plist_icon_name(_plist: &std::path::Path) -> Option<String> {
+    None
+}
+
+/// The developer team `codesign -d` names, when it is one darkmux names an
+/// app by: present, plain, and not a container engine's.
+fn team_of(field: Option<&str>) -> Result<&str, String> {
+    let team = match field {
+        None | Some("not set") => return Err("signed by no developer team (unsigned, ad hoc, or an Apple system binary)".to_string()),
+        Some(t) if !is_team_id(t) => return Err(format!("its team id `{t}` is not one darkmux can check")),
+        Some(t) => t,
+    };
+    match crate::container_engine_of_team(team) {
+        Some(engine) => Err(format!("{engine}'s process: container traffic is never an app on this Mac")),
+        None => Ok(team),
+    }
+}
+
+/// The code directory's flags say a certificate signed it (not ad hoc)
+/// with the hardened runtime; flags that cannot be read count as ad hoc.
+fn signed_by_a_developer_with_runtime(shown: &str) -> Result<(), String> {
+    let flags = code_directory_flags(shown).unwrap_or(CS_ADHOC);
+    if flags & CS_ADHOC != 0 {
+        return Err("signed ad hoc, by no developer".to_string());
+    }
+    if flags & CS_RUNTIME == 0 {
+        return Err("not built with the hardened runtime".to_string());
+    }
+    Ok(())
+}
+
+
+/// The code requirement a process must satisfy to be `team`'s `bundle`:
+/// Apple's anchor, `team`'s certificate, that identifier. Both are checked
+/// to be plain ([`is_team_id`], [`is_bundle_id`]) before they are put in it.
+pub(crate) fn signing_requirement(team: &str, bundle: &str) -> String {
+    format!("anchor apple generic and certificate leaf[subject.OU] = \"{team}\" and identifier \"{bundle}\"")
+}
+
+/// A developer team id: ten upper-case letters and digits.
+pub(crate) fn is_team_id(s: &str) -> bool {
+    s.len() == 10 && s.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+}
+
+/// A bundle id darkmux puts in a requirement: letters, digits, `.`, `-` and
+/// `_`, starting with a letter or digit, at most 255 bytes.
+pub(crate) fn is_bundle_id(s: &str) -> bool {
+    let first_ok = s.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric());
+    first_ok && s.len() <= 255 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+}
+
+/// The `flags=0x...` of `codesign -d`'s `CodeDirectory` line.
+pub(crate) fn code_directory_flags(shown: &str) -> Option<u32> {
+    let line = shown.lines().find(|l| l.starts_with("CodeDirectory "))?;
+    let hex = line.split_whitespace().find_map(|w| w.strip_prefix("flags=0x"))?;
+    u32::from_str_radix(hex.split('(').next()?, 16).ok()
+}
+
+/// The `osascript` arguments for the Allow dialog. The script is fixed
+/// text; the timeout, the message and the icon's path reach it as `argv`
+/// items 1, 2 and 3 (the timeout first, so a message starting with `-` is
+/// never read as an option). Don't Allow is both the default and the cancel
+/// button, so Return and Esc mean Don't Allow (the dialog can take focus
+/// while someone types elsewhere); Allow takes a click. With no icon, or one
+/// the dialog cannot show, it shows the caution icon: the icon never costs
+/// the dialog.
+pub(crate) fn allow_dialog_args(message: &str, icon: Option<&std::path::Path>, timeout_secs: u64) -> Vec<String> {
+    const ASK: &str = "display dialog (item 2 of argv) with title \"darkmux\" buttons {\"Don't Allow\", \"Allow\"} default button \"Don't Allow\" cancel button \"Don't Allow\" giving up after ((item 1 of argv) as integer)";
+    let script = [
+        "on run argv".to_string(),
+        "activate".to_string(),
+        "try".to_string(),
+        format!(
+            "if (count of argv) > 2 then\ntry\nset answer to {ASK} with icon (POSIX file (item 3 of argv))\non error number n\nif n is -128 then error number -128\nset answer to {ASK} with icon caution\nend try\nelse\nset answer to {ASK} with icon caution\nend if"
+        ),
+        "on error number n".to_string(),
+        "if n is -128 then return \"Don't Allow\"".to_string(),
+        "error number n".to_string(),
+        "end try".to_string(),
+        "if gave up of answer then return \"\"".to_string(),
+        "return button returned of answer".to_string(),
+        "end run".to_string(),
+    ];
+    let mut args: Vec<String> = script.iter().flat_map(|line| ["-e".to_string(), line.clone()]).collect();
+    args.extend([timeout_secs.to_string(), message.to_string()]);
+    args.extend(icon.map(|p| p.to_string_lossy().into_owned()));
+    args
+}
+
+/// The `osascript` arguments for a notice: fixed script, the message as
+/// `argv` item 2 (item 1 is the title, so the message is never an option).
+pub(crate) fn notice_args(message: &str) -> Vec<String> {
+    let script = ["on run argv", "display notification (item 2 of argv) with title (item 1 of argv)", "end run"];
+    let mut args: Vec<String> = script.iter().flat_map(|line| ["-e".to_string(), line.to_string()]).collect();
+    args.extend(["darkmux".to_string(), message.to_string()]);
+    args
+}
+
+/// What the dialog's `osascript` run (`None`: it did not start or end) means.
+pub(crate) fn dialog_run_answer(out: Option<std::process::Output>) -> crate::AllowAnswer {
+    match out {
+        Some(out) => dialog_answer(out.status.success(), &String::from_utf8_lossy(&out.stdout), &String::from_utf8_lossy(&out.stderr)),
+        None => crate::AllowAnswer::NoDialog("osascript did not start or did not end".to_string()),
+    }
+}
+
+/// What the dialog's `osascript` run means: the button it printed, nothing
+/// when it gave up, and no dialog when it failed (no window server, or the
+/// person dismissed it some other way: either way, no answer was given).
+pub(crate) fn dialog_answer(succeeded: bool, stdout: &str, stderr: &str) -> crate::AllowAnswer {
+    if succeeded {
+        return crate::answer_from_button(stdout);
+    }
+    crate::AllowAnswer::NoDialog(format!("osascript: {}", stderr.trim()))
+}
+
+/// `codesign -d --verbose=2 <pid>`'s answer (it writes to stderr), or why
+/// it has none.
+#[cfg(target_os = "macos")]
+pub(crate) fn codesign_display(pid: u32) -> Result<String, String> {
+    let out = std::process::Command::new("/usr/bin/codesign")
+        .args(["-d", "--verbose=2", &pid.to_string()])
+        .current_dir("/")
+        .output()
+        .map_err(|e| format!("running codesign: {e}"))?;
+    let said = String::from_utf8_lossy(&out.stderr).into_owned();
+    match out.status.success() {
+        true => Ok(said),
+        false => Err(format!("codesign: {}", said.trim())),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn codesign_display(_pid: u32) -> Result<String, String> {
+    Err("no codesign on this machine".to_string())
+}
+
+/// `codesign --verify --strict -R=<requirement> <pid>`.
+#[cfg(target_os = "macos")]
+pub(crate) fn codesign_verify(pid: u32, requirement: &str) -> Result<(), String> {
+    let out = std::process::Command::new("/usr/bin/codesign")
+        .args(["--verify", "--strict", &format!("-R={requirement}"), &pid.to_string()])
+        .current_dir("/")
+        .output()
+        .map_err(|e| format!("running codesign: {e}"))?;
+    match out.status.success() {
+        true => Ok(()),
+        false => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn codesign_verify(_pid: u32, _requirement: &str) -> Result<(), String> {
+    Err("no codesign on this machine".to_string())
+}
+
+/// `codesign --verify --strict -R=<requirement> <path>`: the code on disk
+/// (an app bundle, with its sealed resources) satisfies `requirement`.
+#[cfg(target_os = "macos")]
+pub(crate) fn codesign_verify_path(path: &std::path::Path, requirement: &str) -> Result<(), String> {
+    let out = std::process::Command::new("/usr/bin/codesign")
+        .args(["--verify", "--strict", &format!("-R={requirement}"), "--"])
+        .arg(path)
+        .current_dir("/")
+        .output()
+        .map_err(|e| format!("running codesign: {e}"))?;
+    match out.status.success() {
+        true => Ok(()),
+        false => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn codesign_verify_path(_path: &std::path::Path, _requirement: &str) -> Result<(), String> {
+    Err("no codesign on this machine".to_string())
+}
+
+/// The kernel's path for the executable `pid` runs (`proc_pidpath`).
+#[cfg(target_os = "macos")]
+pub(crate) fn process_path(pid: u32) -> Result<std::path::PathBuf, String> {
+    use std::os::unix::ffi::OsStrExt;
+    let pid = libc::c_int::try_from(pid).map_err(|_| "no such process".to_string())?;
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: `buf` is writable for the length passed, and the kernel writes
+    // at most that many bytes, returning how many it wrote (0 or less: none).
+    let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    match usize::try_from(n) {
+        Ok(n) if n > 0 && n <= buf.len() => Ok(std::ffi::OsStr::from_bytes(&buf[..n]).into()),
+        _ => Err("the kernel names no executable for that process".to_string()),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn process_path(_pid: u32) -> Result<std::path::PathBuf, String> {
+    Err("no process paths on this machine".to_string())
 }
 
 /// The longest command line handed to `security -i`, well inside the ~4095

@@ -12720,8 +12720,11 @@ mod tests {
         //
         // 76: `checks_clients::check_clients_settings` adds one row per
         // `clients.*` setting (three), after the thermal rows.
+        //
+        // (#3544) 78: two more `clients.*` rows, `clients.pairing.verified_teams`
+        // and `clients.pairing.dialog`.
         let expected =
-            76 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            78 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

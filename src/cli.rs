@@ -1736,15 +1736,26 @@ pub enum ClientCmd {
         #[arg(value_name = "CODE", conflicts_with = "code")]
         code_arg: Option<String>,
     },
-    /// List paired clients, approvals an app has not collected yet, and what
-    /// apps may run here (`clients.profiles`).
+    /// List paired clients (and which paired on their own, by a verified
+    /// signature), approvals an app has not collected yet, apps you allowed
+    /// in the pairing dialog, and what apps may run here (`clients.profiles`).
     List,
     /// Remove a paired client; its token stops working at once. An approval
     /// its app has not collected yet is taken back too. Its workspaces stay,
-    /// owned by no one until `client claim` gives them to a client.
+    /// owned by no one until `client claim` gives them to a client. An app
+    /// you allowed in the pairing dialog stays remembered, and pairs again
+    /// with no dialog: `client forget <team>/<bundle>` as well stops that.
     Revoke {
         /// The client's name (from `client list`).
         name: String,
+    },
+    /// Forget an app you allowed in the pairing dialog (`client list` names
+    /// each as `<team>/<bundle>`): its next pairing asks again. Clients it
+    /// already paired stay paired until `client revoke`.
+    Forget {
+        /// The app's signing identity, `<team>/<bundle>` (from `client list`).
+        #[arg(value_name = "TEAM/BUNDLE")]
+        app: String,
     },
     /// Give a workspace darkmux made for a paired app to a paired client:
     /// one made before workspaces had owners while several apps were paired,

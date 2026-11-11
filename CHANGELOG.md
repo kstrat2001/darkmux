@@ -25,6 +25,29 @@ this release writes (see Changed), and refuses the new `config.json` and `profil
 
 ### Added
 
+- **Mux Bot pairs on the same Mac with no code to type, and any other app gets a native Allow
+  dialog (#3544).** When an app asks to pair, `darkmux client serve` finds the process on the other
+  end of the connection and checks its code signature against Apple's anchor: a Mux Bot
+  (`com.darklyenergized.darkmuxapp` or `.check`) signed by a team in
+  `clients.pairing.verified_teams` (CONFIG 2.8; default `["5LDXYW8B6T"]`, Mux Bot's team; empty
+  turns this off) with the hardened runtime is approved at once, after the connection and the
+  signature are checked again just before approval, with a notice ("Mux Bot is now paired with
+  darkmux on this Mac."); `client list` marks it auto-approved. Any other app (another team, an
+  unsigned or ad hoc build, a container's traffic through Docker Desktop's, OrbStack's, Rancher
+  Desktop's or Podman's forwarder, a connection more than one process holds, a process darkmux
+  cannot tell) gets a centered dialog showing the code, who signed it as macOS verified it (with the
+  app's own icon when its whole bundle verifies; a process whose file path holds a control character
+  names no signer) or "Not signed by a known developer.", with Don't Allow as the default: Allow
+  approves; Don't Allow, Return or Esc denies; a dialog left until it gives up leaves the request
+  pending to expire as before. Allow on a validly signed app remembers it (team and bundle id, in
+  `clients.json`; never a container engine's), so a build of Mux Bot under your own team pairs with
+  no dialog next time; `darkmux client forget <team>/<bundle>` forgets it, and `client list` and
+  `darkmux doctor` show what is remembered. The dialog never blocks the listener, one process can
+  raise at most two at once, and `clients.pairing.dialog: false` turns it off. On Linux nothing
+  auto-approves (no code signing); the dialog is `zenity` in a graphical session, where closing it
+  also denies. `darkmux client
+  approve` is unchanged.
+
 - **A preview's install is redone when its inputs change, and an app can ask for a clean restart
   (#3484).** After a successful install darkmux records a fingerprint beside the workspace (the
   runtime image id, the install command, and `package.json` and the lockfiles present,

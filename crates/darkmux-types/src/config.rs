@@ -450,6 +450,14 @@ use std::path::Path;
 //           `warning`, `critical` or `off`, default `warning`), the memory
 //           pressure at which darkmux refuses to start or load a model. An
 //           older binary refuses a config carrying it.
+//           Also ADDED (#3544, unreleased with 2.8, so folded into it):
+//           `clients.pairing.verified_teams` (string list;
+//           `DARKMUX_CLIENTS_PAIRING_VERIFIED_TEAMS`, comma-separated; default
+//           `["5LDXYW8B6T"]`, empty = none), the teams whose signed Mux Bot
+//           pairs on this machine with no dialog, and `clients.pairing.dialog`
+//           (bool, default true; `DARKMUX_CLIENTS_PAIRING_DIALOG`), whether an
+//           app that does not verify gets a native Allow dialog. An older
+//           binary refuses a config carrying either.
 pub const CONFIG_SCHEMA_VERSION: &str = "2.8";
 
 /// A `config.json` key an older darkmux read (and `init` may have written)
@@ -1875,6 +1883,27 @@ pub struct ClientsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub profiles: Option<Vec<String>>,
     /// Live previews of a workspace's dev server — see [`ClientsPreviewConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")] pub preview: Option<ClientsPreviewConfig>,
+    /// (#3544) How a pairing request is approved — see [`ClientsPairingConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub pairing: Option<ClientsPairingConfig>,
+    #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+/// (CONFIG 2.8, #3544) How `client serve` approves a pairing request from an
+/// app on this machine. A Mux Bot signed by one of `verified_teams` (and
+/// verified against its running process) is approved at once; any other app
+/// gets a native Allow dialog, unless `dialog` is off. `darkmux client
+/// approve` works either way.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ClientsPairingConfig {
+    /// The developer team ids whose signed Mux Bot pairs with no dialog.
+    /// Absent: `["5LDXYW8B6T"]`, the team that signs Mux Bot. Empty: none,
+    /// so every pairing asks (an app the operator allowed and darkmux
+    /// remembered still pairs at once until `darkmux client forget`).
+    /// `darkmux config set clients.pairing.verified_teams <comma-separated-list>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub verified_teams: Option<Vec<String>>,
+    /// Whether an app that does not verify gets the Allow dialog. Absent:
+    /// `true`. `false`: no dialog; `darkmux client approve` is the way.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub dialog: Option<bool>,
     #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 

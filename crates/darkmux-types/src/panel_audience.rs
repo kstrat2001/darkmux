@@ -199,6 +199,8 @@ pub const CONFIG_SHOWN: &[&str] = &[
     "clients.profiles",
     "clients.preview.enabled",
     "clients.preview.idle_minutes",
+    "clients.pairing.verified_teams",
+    "clients.pairing.dialog",
     "hooks.enabled",
     "hooks.max_outbox_mb",
     "hooks.jq_timeout_ms",
