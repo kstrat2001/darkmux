@@ -307,9 +307,14 @@ fn a_tick_lists_once_and_kills_only_the_orphan() {
     let calls = std::fs::read_to_string(&record).unwrap();
     let calls: Vec<&str> = calls.lines().collect();
     assert_eq!(calls.len(), 2, "one ps, one kill: {calls:?}");
-    assert!(
-        calls[0].starts_with("ps --filter name=^darkmux-dispatch- --format"),
-        "{calls:?}"
+    assert_eq!(
+        calls[0],
+        "ps --filter name=^darkmux-dispatch- --format {{.Names}}\t\
+         {{.Label \"darkmux.dispatch.host-pid\"}}\t\
+         {{.Label \"darkmux.dispatch.host-start\"}}\t\
+         {{.Label \"darkmux.dispatch.host-machine\"}}\t\
+         {{.Label \"darkmux.dispatch.host-pid-ns\"}}",
+        "the listing: running containers named for dispatch, name then the four host labels"
     );
     assert_eq!(calls[1], "kill darkmux-dispatch-dead");
 }
