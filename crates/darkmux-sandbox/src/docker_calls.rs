@@ -47,8 +47,8 @@ fn production_files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// `text`'s lines outside `#[cfg(test)]` items. An item is the next line
 /// ending in `;`, `}` or `{` after the attribute (other attributes and a
-/// multi-line signature between); a block item runs to the `}` at its own
-/// indent.
+/// multi-line signature between); a block item runs to the line at its own
+/// indent that starts with `}` (`}`, `};`, `});`).
 fn production_lines(text: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut lines = text.lines();
@@ -76,7 +76,7 @@ fn skip_test_item<'a>(lines: &mut impl Iterator<Item = &'a str>) {
         }
         if trimmed.ends_with('{') {
             let close = format!("{}}}", indent.unwrap_or_default());
-            lines.by_ref().find(|l| l.trim_end() == close);
+            lines.by_ref().find(|l| l.starts_with(&close));
             return;
         }
     }
@@ -205,10 +205,26 @@ fn test_items_are_skipped_and_production_around_them_counts() {
         "#[cfg(test)]",
         "fn one_line_with_body() -> u8 { 1 }",
         "e \"docker\"",
+        // A struct-literal item closes with `};`, not a bare `}` (#3552
+        // review): the item ends there, not at the end of the file.
+        "#[cfg(test)]",
+        "const R: std::ops::Range<u8> = std::ops::Range {",
+        "    start: 0,",
+        "    end: \"docker\".len() as u8,",
+        "};",
+        "f \"docker\"",
+        "    #[cfg(test)]",
+        "    static S: Wrap = Wrap(Inner {",
+        "        x: \"docker\",",
+        "    });",
+        "g \"docker\"",
     ]
     .join("\n");
     let counted: Vec<&str> = production_lines(&text).into_iter().filter(|l| l.contains(LITERAL)).collect();
-    assert_eq!(counted, vec!["a \"docker\"", "b \"docker\"", "c \"docker\"", "d \"docker\"", "e \"docker\""]);
+    assert_eq!(
+        counted,
+        vec!["a \"docker\"", "b \"docker\"", "c \"docker\"", "d \"docker\"", "e \"docker\"", "f \"docker\"", "g \"docker\""]
+    );
 }
 
 /// The walk sees production files only, in every Rust tree the repo builds

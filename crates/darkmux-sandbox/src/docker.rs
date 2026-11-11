@@ -5,9 +5,11 @@
 use crate::{Access, BackendKind, Having, Listed, Mount, Network, Query, SandboxBackend, SandboxHandle, SandboxPolicy};
 use std::process::Command;
 
-/// The program every Docker command runs, for a caller asking whether it is
-/// on `PATH`.
-pub const PROGRAM: &str = "docker";
+/// The program every Docker command runs. Private: a caller outside this
+/// crate that could name it could build its own `docker run` past every
+/// policy invariant without the ratchet seeing a literal (#3552 review).
+/// Asking whether it is installed is [`DockerBackend::on_path`].
+const PROGRAM: &str = "docker";
 
 /// `--cap-drop`: every Linux capability. A sandbox's code needs none.
 pub const CAP_DROP: &str = "ALL";
@@ -78,12 +80,22 @@ impl DockerBackend {
         }
         let filter = match &query.having {
             Having::Label(key) => format!("label={key}"),
-            Having::NamePrefix(prefix) => format!("name=^{prefix}"),
-            Having::Name(name) => format!("name=^{name}$"),
+            Having::NamePrefix(prefix) => format!("name=^{}", regex_literal(prefix)),
+            Having::Name(name) => format!("name=^{}$", regex_literal(name)),
         };
         let labels: String = query.read.iter().map(|key| format!("\t{{{{.Label \"{key}\"}}}}")).collect();
         args.extend(["--filter".to_string(), filter, "--format".to_string(), format!("{{{{.Names}}}}{labels}")]);
         args
+    }
+
+    /// Whether `PATH` finds the `docker` program: an executable file of
+    /// that name in one of its directories.
+    pub fn on_path() -> bool {
+        Self::on_path_in(std::env::var_os("PATH").as_deref())
+    }
+
+    fn on_path_in(path: Option<&std::ffi::OsStr>) -> bool {
+        path.is_some_and(|p| std::env::split_paths(p).any(|dir| is_executable_file(&dir.join(PROGRAM))))
     }
 
     /// `docker exec`: `argv` in the running container. Docker's alone (a
@@ -166,6 +178,36 @@ impl DockerBackend {
 /// A listed label's value, `None` when it is empty or Docker's `<no value>`.
 fn present(field: Option<&str>) -> Option<String> {
     field.map(str::trim).filter(|v| !v.is_empty() && *v != "<no value>").map(str::to_string)
+}
+
+/// `name` as a regular expression matching only itself (Docker's `name`
+/// filter is one): every character but a letter, digit, `_` or `-` is
+/// escaped.
+fn regex_literal(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        if !(c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// A regular file exec would run: on unix, one with an exec bit set.
+fn is_executable_file(path: &std::path::Path) -> bool {
+    let Ok(md) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        md.is_file() && md.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        md.is_file()
+    }
 }
 
 fn strings(args: &[&str]) -> Vec<String> {
@@ -394,13 +436,44 @@ mod tests {
         let exact = Query { having: Having::Name("darkmux-dispatch-a.b".into()), stopped_too: false, read: Vec::new() };
         assert_eq!(
             DockerBackend::list_args(&exact),
-            strings(&["ps", "--filter", "name=^darkmux-dispatch-a.b$", "--format", "{{.Names}}"])
+            strings(&["ps", "--filter", r"name=^darkmux-dispatch-a\.b$", "--format", "{{.Names}}"])
         );
         let by_name = Query { having: Having::NamePrefix("p-".into()), stopped_too: false, read: strings(&["a", "b"]) };
         assert_eq!(
             DockerBackend::list_args(&by_name),
             strings(&["ps", "--filter", "name=^p-", "--format", "{{.Names}}\t{{.Label \"a\"}}\t{{.Label \"b\"}}"])
         );
+        let dotted_prefix = Query { having: Having::NamePrefix("p.".into()), stopped_too: false, read: Vec::new() };
+        assert_eq!(DockerBackend::list_args(&dotted_prefix)[2], r"name=^p\.");
+    }
+
+    /// Docker's name filter is a regular expression, so a name is matched
+    /// literally only when every character but a letter, digit, `_` or `-`
+    /// is escaped: `a.b` must not match a neighbor `aXb`.
+    #[test]
+    fn a_name_is_escaped_into_its_regular_expression() {
+        assert_eq!(regex_literal("darkmux-dispatch_a1"), "darkmux-dispatch_a1");
+        assert_eq!(regex_literal("a.b"), r"a\.b");
+        assert_eq!(regex_literal("a+b*c?(d)[e]{f}|g^h$i\\j/k"), r"a\+b\*c\?\(d\)\[e\]\{f\}\|g\^h\$i\\j\/k");
+    }
+
+    /// `on_path` finds an executable `docker` in a `PATH` directory, and
+    /// nothing in an empty, absent or non-executable one.
+    #[cfg(unix)]
+    #[test]
+    fn on_path_finds_an_executable_docker_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let empty = tempfile::TempDir::new().unwrap();
+        let bin = dir.path().join("docker");
+        std::fs::write(&bin, "").unwrap();
+        let joined = |dirs: &[&std::path::Path]| std::env::join_paths(dirs).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!DockerBackend::on_path_in(Some(&joined(&[dir.path()]))));
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(DockerBackend::on_path_in(Some(&joined(&[empty.path(), dir.path()]))));
+        assert!(!DockerBackend::on_path_in(Some(&joined(&[empty.path()]))));
+        assert!(!DockerBackend::on_path_in(None));
     }
 
     /// Each line is one container, with one value per label read, trimmed;

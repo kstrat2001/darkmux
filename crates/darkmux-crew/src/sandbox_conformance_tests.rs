@@ -10,7 +10,7 @@
 //! way a contained run removes one.
 
 use crate::bounded_command::{run_bounded, Bounded};
-use darkmux_sandbox::{Access, Limits, Mount, Network, Query, SandboxBackend, SandboxHandle, SandboxPolicy};
+use darkmux_sandbox::{Access, Having, Limits, Mount, Network, Query, SandboxBackend, SandboxHandle, SandboxPolicy};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -350,6 +350,33 @@ fn a_sandbox_removed_before_it_starts_never_runs(backend: &dyn SandboxBackend, i
     assert!(!tree.path().join("ran").exists(), "a removed sandbox ran");
 }
 
+/// A listing by name is literal: `<base>.a` finds that sandbox and not a
+/// neighbor `<base>Xa`, by exact name and by prefix alike (Docker's name
+/// filter is a regular expression, where `.` is any character; #3552
+/// review). The watchdog's probe and the reapers list this way.
+fn a_listing_by_name_matches_the_name_literally(backend: &dyn SandboxBackend, image: &str) {
+    let tree = tempfile::TempDir::new().unwrap();
+    let base = a_name();
+    let mut created = Vec::new();
+    for name in [format!("{base}.a"), format!("{base}Xa")] {
+        let mut p = policy(image, tree.path(), "true");
+        p.name = name;
+        let (create, handle) = backend.create(&p);
+        created.push(Removed(backend, handle));
+        let made = run_bounded(create, Duration::from_secs(60));
+        assert!(matches!(made, Bounded::Finished { success: true, .. }), "{}", describe(&made));
+    }
+    let names = |having: Having| -> Vec<String> {
+        let query = Query { having, stopped_too: true, read: Vec::new() };
+        let Bounded::Finished { success: true, stdout, .. } = run_bounded(backend.list(&query), Duration::from_secs(30)) else {
+            panic!("the backend could not list its sandboxes");
+        };
+        backend.parse_list(&query, &String::from_utf8_lossy(&stdout)).into_iter().map(|l| l.handle.id).collect()
+    };
+    assert_eq!(names(Having::Name(format!("{base}.a"))), vec![format!("{base}.a")], "by exact name");
+    assert_eq!(names(Having::NamePrefix(format!("{base}."))), vec![format!("{base}.a")], "by prefix");
+}
+
 macro_rules! conformance {
     ($backend:ident, $make:expr, $image:literal, $needs:literal) => {
         mod $backend {
@@ -407,6 +434,11 @@ macro_rules! conformance {
             #[ignore = $needs]
             fn a_published_port_answers_on_loopback() {
                 super::a_published_port_answers_on_loopback(&$make, $image)
+            }
+            #[test]
+            #[ignore = $needs]
+            fn a_listing_by_name_matches_the_name_literally() {
+                super::a_listing_by_name_matches_the_name_literally(&$make, $image)
             }
         }
     };

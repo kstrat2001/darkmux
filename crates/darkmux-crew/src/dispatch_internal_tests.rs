@@ -6963,7 +6963,7 @@ S(("127.0.0.1", port), H).serve_forever()
     /// (#1959 packet 2) The full-argv wiring: `workspace_read_only: true`
     /// on `DockerRunConfig` must reach the actual `docker run` argv as
     /// `-v /tmp/ws:/workspace:ro`, not just be asserted at the
-    /// `apply_volume_mounts` unit level above.
+    /// `volume_mounts` unit level above.
     #[test]
     fn build_docker_run_argv_appends_ro_to_workspace_mount_when_read_only() {
         let mut config = base_argv_config();

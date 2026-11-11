@@ -1646,7 +1646,7 @@ pub fn run_resumable(
     // (#2114 finding 3) Container out-dir root — where `pace.json` and
     // `checkpoint.json` live. Production is always `/darkmux-out`
     // (`trajectory::RUNTIME_OUT_BASE`, always mounted read-write — see
-    // `dispatch_internal::apply_volume_mounts`); tests pass a tempdir.
+    // `dispatch_internal::volume_mounts`); tests pass a tempdir.
     // Deliberately NOT `/workspace`: that mount is `:ro` for crawl-kind
     // dispatches (#1959) and, when writable, is the operator's own repo —
     // either produces a checkpoint write failure or an untracked file in

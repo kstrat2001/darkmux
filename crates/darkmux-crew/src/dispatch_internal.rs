@@ -216,7 +216,7 @@ fn git_checkout(workdir: &Path, found: &darkmux_types::workdir::SplitGitdir) -> 
 
 /// (#2294) The container path a split-gitdir checkout is mounted at, so
 /// both the operator warning and the model-facing note name a path the
-/// reader can actually see. `apply_volume_mounts` above mounts the
+/// reader can actually see. `volume_mounts` above mounts the
 /// workdir at `/workspace`, so a checkout AT the workdir is `/workspace`
 /// and one one level under it is `/workspace/<child>`.
 pub(crate) fn container_path_for(workdir: &Path, checkout: &Path) -> String {
@@ -546,7 +546,7 @@ pub(crate) fn capture_system_prompts(f: impl FnOnce()) -> Vec<String> {
 /// proposed a change — the container reads it and never writes it back.
 ///
 /// Extracted from the docker-spawn site for the same reason as
-/// `apply_volume_mounts`: the mount rule is unit-testable without a container.
+/// `volume_mounts`: the mount rule is unit-testable without a container.
 pub(crate) fn mod_attachment_mounts(mounts: &[(PathBuf, String)]) -> Vec<Mount> {
     mounts
         .iter()
@@ -558,7 +558,7 @@ pub(crate) fn mod_attachment_mounts(mounts: &[(PathBuf, String)]) -> Vec<Mount> 
 /// the matching container path the runtime reads it from via `--prompt-file`.
 /// Keeps a substantial brief off the `docker run` argv (ARG_MAX + `ps`).
 /// NOTE: `PROMPT_FILE_CONTAINER_PATH` embeds the `/darkmux-out` mount literal
-/// from `apply_volume_mounts` above — if that mount point ever changes, this
+/// from `volume_mounts` above — if that mount point ever changes, this
 /// (and the `RUNTIME_OUT_BASE` sync the mount comment names) must change too.
 pub(crate) const PROMPT_FILE_NAME: &str = ".prompt.txt";
 const PROMPT_FILE_CONTAINER_PATH: &str = "/darkmux-out/.prompt.txt";
@@ -577,7 +577,7 @@ const PROMPT_FILE_CONTAINER_PATH: &str = "/darkmux-out/.prompt.txt";
 /// `--resume` CLI flag (#2110/#2109 are the natural callers; see
 /// `resume_checkpoint`'s own doc below). NOTE: like
 /// `PROMPT_FILE_CONTAINER_PATH`, this embeds the `/darkmux-out` mount
-/// literal from `apply_volume_mounts` — if that mount point ever changes,
+/// literal from `volume_mounts` — if that mount point ever changes,
 /// this must change too.
 const RESUME_CHECKPOINT_CONTAINER_PATH: &str = "/darkmux-out/checkpoint.json";
 
@@ -849,7 +849,7 @@ pub(crate) fn validate_resume_checkpoint_content(
 ///
 /// Deliberately does NOT deserialize into `runtime::checkpoint::RunCheckpoint`
 /// — `runtime/` is a separate crate, built into the Docker image and NOT
-/// linked against this one (same boundary `apply_volume_mounts`'s doc
+/// linked against this one (same boundary `volume_mounts`'s doc
 /// describes for the duplicated `/darkmux-out` literal), so this crate has
 /// no access to that type. Instead this does a light schema sanity check
 /// (object shape, numeric `schema_version`, array `messages`) — enough to
@@ -1576,7 +1576,7 @@ use crate::exclusive_fs::{create_dir_exclusive_0700, create_dir_exclusive_unique
 ///
 /// Plain-argument signature (not `&DispatchOpts`) so tests can exercise it
 /// without constructing a whole `DispatchOpts` — same pattern as
-/// `apply_volume_mounts`/`validate_resume_checkpoint`/`write_resume_origin_meta`
+/// `volume_mounts`/`validate_resume_checkpoint`/`write_resume_origin_meta`
 /// above.
 fn resolve_host_out(host_out_override: Option<&Path>, role_id: &str, unix_micros: u128) -> Result<PathBuf> {
     match host_out_override {
@@ -1596,14 +1596,15 @@ fn resolve_host_out(host_out_override: Option<&Path>, role_id: &str, unix_micros
     }
 }
 
-/// (#703) Inject the host-cached static runtime binary into an operator
-/// image: bind-mount it read-only at `/darkmux-runtime` and override the
-/// container entrypoint to it. Used when dispatching into an image OTHER
-/// than the default (which has the binary baked in). MUST be applied after
-/// the volume mounts and before the image arg — `-v` / `--entrypoint` are
-/// docker-run OPTIONS that precede the IMAGE. Unit-testable without docker.
+/// (#703) Where an injected runtime binary is mounted, and the entrypoint
+/// the policy then runs.
 pub(crate) const RUNTIME_INJECTION_PATH: &str = "/darkmux-runtime";
 
+/// (#703) Inject the host-cached static runtime binary into an operator
+/// image: a read-only mount at [`RUNTIME_INJECTION_PATH`], which
+/// `dispatch_policy` also makes the entrypoint. Used when dispatching into
+/// an image OTHER than the default (which has the binary baked in). It is
+/// the policy's last mount, after the volumes, mods and cache.
 pub(crate) fn runtime_injection_mount(binary: &Path) -> Mount {
     Mount { host: binary.to_path_buf(), at: RUNTIME_INJECTION_PATH.to_string(), access: Access::ReadOnly }
 }
@@ -1625,8 +1626,9 @@ pub(crate) fn shared_cache_dir_for(remote_origin: Option<&str>) -> Option<std::p
 /// point the language package managers at it, so the inner verify loop doesn't
 /// re-download deps on every dispatch. The registry/download caches are
 /// concurrency-safe; per-dispatch `target/` stays in the workspace, so
-/// concurrent dispatches don't contend on build artifacts. Docker-run OPTIONS
-/// (must precede the image arg). Unit-testable without docker.
+/// concurrent dispatches don't contend on build artifacts. Returns the mount
+/// and the environment pointing the package managers at it. Unit-testable
+/// without docker.
 fn cache_mount(cache: &Path) -> (Mount, Vec<(String, String)>) {
     let mount = Mount { host: cache.to_path_buf(), at: "/darkmux-cache".to_string(), access: Access::ReadWrite };
     let env = ["CARGO_HOME=/darkmux-cache/cargo", "npm_config_cache=/darkmux-cache/npm", "PIP_CACHE_DIR=/darkmux-cache/pip"];
@@ -2324,7 +2326,7 @@ pub struct DockerRunConfig {
     /// Unique container name for `docker ps` debugging.
     pub container_name: String,
     /// (#3200) The darkmux process starting this container, written as
-    /// labels (`orphan_reaper::host_label_args`) so `darkmux serve`'s reaper
+    /// labels (`orphan_reaper::host_labels`) so `darkmux serve`'s reaper
     /// can tell a container whose host died unhandled. `None` (the host
     /// cannot read its own start time or machine uid) labels nothing, and
     /// the reaper leaves an unlabeled container alone.
@@ -2335,7 +2337,7 @@ pub struct DockerRunConfig {
     pub host_out: PathBuf,
     /// (#2295) `(host attachments dir, container path)` for each briefed mod
     /// that HAS attachments — bound read-only by
-    /// `apply_mod_attachment_mounts`. Empty on every dispatch that names no
+    /// `mod_attachment_mounts`. Empty on every dispatch that names no
     /// mod, and on a mod that carries no files.
     pub mod_attachment_mounts: Vec<(PathBuf, String)>,
     /// Whether to inject the darkmux-runtime binary into a non-default image.
@@ -2734,7 +2736,7 @@ fn runtime_args(config: &DockerRunConfig) -> Vec<String> {
 
     // (#2114) Resume: the checkpoint lives inside `config.workspace` itself
     // (see `RESUME_CHECKPOINT_CONTAINER_PATH`'s doc), already visible at
-    // this fixed container path once `apply_volume_mounts` above binds it —
+    // this fixed container path once `volume_mounts` above binds it —
     // no extra mount needed.
     if config.resume_checkpoint {
         args.push("--resume".to_string());
@@ -6797,7 +6799,7 @@ fn lease_lmstudio_job(
 /// what gets bind-mounted? A `.git` that is a POINTER FILE (`gitdir:
 /// <path>`) rather than the ordinary directory means yes — the real git
 /// directory sits somewhere only the host can see, while
-/// `apply_volume_mounts` mounts `workspace` and `host_out` and nothing
+/// `volume_mounts` mounts `workspace` and `host_out` and nothing
 /// else. Every git command the dispatch runs then fails with a
 /// confusing `fatal: not a git repository: <host path>` deep inside the
 /// sandbox, naming a path the operator never typed.

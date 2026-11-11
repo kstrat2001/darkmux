@@ -119,12 +119,17 @@ impl Default for DockerImageInspector {
     }
 }
 
+/// `docker image inspect` printing `<id>|<version label>`, the line
+/// `parse_inspect_line` reads.
+fn inspect_command(image: &str) -> std::process::Command {
+    let format = format!("{{{{.Id}}}}|{{{{index .Config.Labels \"{RUNTIME_IMAGE_VERSION_LABEL}\"}}}}");
+    darkmux_sandbox::DockerBackend::image_inspect(&format, &[image])
+}
+
 impl ImageInspector for DockerImageInspector {
     fn inspect(&self, image: &str) -> ImageInspection {
         use crate::bounded_command::{run_bounded, Bounded};
-        let format =
-            format!("{{{{.Id}}}}|{{{{index .Config.Labels \"{RUNTIME_IMAGE_VERSION_LABEL}\"}}}}");
-        match run_bounded(darkmux_sandbox::DockerBackend::image_inspect(&format, &[image]), self.timeout) {
+        match run_bounded(inspect_command(image), self.timeout) {
             Bounded::Finished { success: true, stdout, .. } => {
                 parse_inspect_line(&String::from_utf8_lossy(&stdout))
             }
@@ -1065,6 +1070,25 @@ mod tests {
         assert_eq!(
             parse_inspect_line("sha256:abc|<no value>\n"),
             ImageInspection::Present { id: "sha256:abc".into(), version_label: None }
+        );
+    }
+
+    /// (#3552 review) The inspect prints exactly what `parse_inspect_line`
+    /// reads: the id, `|`, the version label.
+    #[test]
+    fn the_inspect_prints_the_id_and_version_label_the_parser_reads() {
+        let cmd = inspect_command("darkmux-runtime:latest");
+        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(
+            args,
+            vec![
+                "image",
+                "inspect",
+                "--format",
+                "{{.Id}}|{{index .Config.Labels \"org.opencontainers.image.version\"}}",
+                "--",
+                "darkmux-runtime:latest",
+            ]
         );
     }
 
