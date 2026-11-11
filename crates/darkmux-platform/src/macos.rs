@@ -250,11 +250,6 @@ pub(crate) fn signed_app_from(
     let shown = display?;
     let body = codesign_fields(&exe, &shown)?;
     let field = |key: &str| body.lines().find_map(|l| l.strip_prefix(key)).map(str::trim);
-    for key in ["Identifier=", "TeamIdentifier=", "CodeDirectory "] {
-        if body.lines().filter(|l| l.starts_with(key)).count() != 1 {
-            return Err(format!("codesign's description has no single `{}` line", key.trim_end_matches(['=', ' '])));
-        }
-    }
     let team = team_of(field("TeamIdentifier="))?;
     signed_by_a_developer_with_runtime(body)?;
     let bundle = field("Identifier=").filter(|b| is_bundle_id(b)).ok_or("its signature names no bundle id darkmux can check")?;
@@ -270,21 +265,32 @@ pub(crate) fn signed_app_from(
 /// What `codesign -d` says after its `Executable=` line, when that line
 /// names exactly `exe` (the kernel's path for the process), `exe` holds no
 /// control character, and the next line is the signature's `Identifier=`
-/// (codesign's own order). `codesign` prints the path raw, so a line break
-/// in a file name would otherwise put lines of the file's choosing ahead of
-/// the signature's own (#3547 review); any line added there now either
-/// breaks that order or repeats `Identifier=`, which names no app.
+/// (codesign's own order), and `Identifier=`, `TeamIdentifier=` and
+/// `CodeDirectory` each appear once. `codesign` prints the path raw, so a
+/// line break in a file name would otherwise put lines of the file's
+/// choosing ahead of the signature's own (#3547 review); a line added there
+/// now breaks that order or repeats a field, and names no app. The signing
+/// identifier is printed raw too, and its signer chooses it: a line break
+/// in it can add an `Authority=` line after `Identifier=`. That case is
+/// refused by the requirement, whose `identifier` is the text before the
+/// break and so never the signature's real identifier.
 pub(crate) fn codesign_fields<'a>(exe: &std::path::Path, shown: &'a str) -> Result<&'a str, String> {
     let exe = exe.to_str().ok_or("its executable's path is not text darkmux can check")?;
     if exe.chars().any(char::is_control) {
         return Err("its executable's path holds a control character".to_string());
     }
-    shown
+    let body = shown
         .strip_prefix("Executable=")
         .and_then(|rest| rest.strip_prefix(exe))
         .and_then(|rest| rest.strip_prefix('\n'))
         .filter(|body| body.starts_with("Identifier="))
-        .ok_or_else(|| "codesign described another executable than the one the process runs".to_string())
+        .ok_or_else(|| "codesign described another executable than the one the process runs".to_string())?;
+    for key in ["Identifier=", "TeamIdentifier=", "CodeDirectory "] {
+        if body.lines().filter(|l| l.starts_with(key)).count() != 1 {
+            return Err(format!("codesign's description has no single `{}` line", key.trim_end_matches(['=', ' '])));
+        }
+    }
+    Ok(body)
 }
 
 /// The icon of the app bundle `executable` runs from
