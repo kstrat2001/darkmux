@@ -19,54 +19,57 @@ darkmux release.
 The Mux Bot release: darkmux starts the Tensorfold and Flint servers it dispatches to, and a paired
 app (`darkmux client serve`) gets its own workspaces, git history and container previews.
 
-**Upgrading:** restart `darkmux client serve` (and a `brew services` daemon) right after you
-install 5.10, before any `darkmux client` command. The first such command moves `clients.json` to
-schema 1.2, which an older `client serve` refuses, so every request it handles would fail.
+**Upgrading:** upgrade every darkmux that reads the same `~/.darkmux`, a `brew services` daemon
+included (`brew services restart darkmux`). darkmux 5.0 through 5.9 cannot read the task records
+this release writes (see Changed), and refuses the new `config.json` and `profiles.json` keys.
 
 ### Added
 
 - **A preview's install is redone when its inputs change, and an app can ask for a clean restart
-  (#3484).** `install.unless_exists: node_modules` skipped the install whenever `node_modules`
-  existed, so an install broken on an older image, or a dependency a run added, stayed broken.
-  After a successful install darkmux records a fingerprint beside the workspace (the runtime image
-  id, the install command, and `package.json` and the lockfiles present, `bun.lock`/`bun.lockb` included; a symlinked lockfile
-  counts as its link text and is never followed), and skips the install only while it matches. A
-  failed install records nothing, so the next start retries. `POST
+  (#3484).** After a successful install darkmux records a fingerprint beside the workspace (the
+  runtime image id, the install command, and `package.json` and the lockfiles present,
+  `bun.lock`/`bun.lockb` included; a symlinked lockfile counts as its link text and is never
+  followed), and `install.unless_exists` skips the install only while its path exists and the
+  fingerprint matches, so an install broken on an older image, or a dependency a run added, is
+  redone. A failed install records nothing, so the next start retries. `POST
   /client/workspaces/{name}/preview` takes an optional body, `{"clean": true}`: it stops the preview,
   forgets the record and deletes the `unless_exists` path inside the workspace (a symlink there is
-  unlinked, never followed), then starts with a fresh install. No body, or `clean: false`, is a
-  plain start as before; an unknown key is refused (`bad_request`).
+  unlinked, never followed), then starts with a fresh install. A clean restart refuses a folder tree
+  deeper than 128 levels, with a reason. No body, or `clean: false`, is a plain start; an unknown key
+  is refused (`bad_request`).
 
 - **Every client API refusal and failed run carries a code (#3468).** `darkmux client serve`'s refusal
-  bodies gain `code` beside `error` (`preview_disabled`, `no_source_checkout`, `template_no_recipe` (a template project whose
-  first commit has no recipe), `no_recipe`, `recipe_invalid`, `filter_in_repo_config`, `clone_failed`, and a class code for every
-  other refusal), a failed work item's status gains `code` (read from its run's `dispatch.error`:
-  `busy`, `wont_fit`, `model_start_failed`, `model_stop_failed`, `port_in_use`, `engine_unavailable`,
-  `engine_in_use`, else `dispatch_failed`), and a workspace's `fetch_error` gains `fetch_error_code`
-  (`network_key_in_repo_config`, `fetch_failed`). One enum, one wire spelling each; all additive. An
-  app branches on the code, never on darkmux's wording.
+  bodies carry `code` beside `error` (`preview_disabled`, `no_source_checkout`, `template_no_recipe` (a
+  template project whose first commit has no recipe), `no_recipe`, `recipe_invalid`,
+  `filter_in_repo_config`, `clone_failed`, and a class code for every other refusal), a failed work
+  item's status carries `code` (read from its run's `dispatch.error`: `busy`, `wont_fit`,
+  `memory_in_use`, `model_start_failed`, `model_stop_failed`, `port_in_use`, `engine_unavailable`,
+  `engine_in_use`, else `dispatch_failed`), and a workspace's `fetch_error` comes with
+  `fetch_error_code` (`network_key_in_repo_config`, `fetch_failed`). One enum, one wire spelling
+  each. An app branches on the code, never on darkmux's wording.
 
 - **A run starting its model says so (#3467).** While a dispatch is between `dispatch.model.start` and
-  `dispatch.model.ready` (a Tensorfold server starting, say), its run reads `activity: "starting_model"`
+  `dispatch.model.ready` (a Tensorfold or Flint server starting), its run reads `activity: "starting_model"`
   with `activity_elapsed_ms` (from the latest `dispatch.model.loading`) in `GET /runs`, `darkmux run list
   --json` and the client's `GET /client/work/{id}` while it is `running`. The run lifecycle decides it
   once (`Attempt::starting_model`); every surface reads it. Both fields are additive and absent otherwise.
 
 - **Listings say whether darkmux can make each model resident (#3466).** `darkmux profile list --json`
   gains an `availability` list (one row per profile model: `profile`, `model`, `endpoint`, `engine`,
-  `state`, `reason`), and each profile in `GET /client/profiles` an `availability` object
+  `state`, `reason`), and each profile in `GET /client/profiles` carries an `availability` object
   (`state`, `reason`). The state is `resident`, `startable` (a stopped Tensorfold or Flint server whose engine
   is verified, has the model and has its port free reads this, so an app keeps it among its choices),
   `unavailable` (with why), `external` (an endpoint darkmux only sends to) or `unknown` (a probe failed
-  or timed out; never read as `unavailable`). Anything the dispatch preflight refuses (config, registry,
-  a role or skill file) makes every model `unavailable` with the refusal as its reason. Each engine is
-  asked once per listing, all at once, within 10 s for LM Studio and 3 s for an engine binary (a probe
-  still running then is killed with its process group), and the listing loads and starts nothing.
-  Both shapes are additive; the client's `reachable` and `loaded` stay. A managed profile (LM Studio,
-  Tensorfold or Flint) is now `reachable` only when it is `resident` or `startable`, so an app picking the
-  first that answers never picks one whose dispatch would fail (LM Studio answering for a model it has
-  not downloaded used to read reachable); an engine server's `loaded` follows its availability. rec's own server running reads
-  `unavailable`, naming `rec stop`.
+  or timed out; never read as `unavailable`). A model reads `resident` only when a dispatch would use
+  it: an unverified or missing engine binary or bad `engine_args` reads `unavailable`. Anything the
+  dispatch preflight refuses (config, registry, a role or skill file) makes every model `unavailable`
+  with the refusal as its reason. Each engine is asked once per listing, all at once, within 10 s for
+  LM Studio and 3 s for an engine binary (a probe still running then is killed with its process group,
+  and the answers it already had are kept), and the listing loads and starts nothing. The `profile
+  list --json` field is additive. In `GET /client/profiles` a managed profile (LM Studio, Tensorfold or
+  Flint) is `reachable` only when it is `resident` or `startable`, so an app picking the first that
+  answers never picks one whose dispatch would fail, and an engine server's `loaded` follows its
+  availability. rec's own server running reads `unavailable`, naming `rec stop`.
 
 - **rec's Flint is a second engine whose servers darkmux starts (#3453).** An endpoint declares
   `"managed": "flint"` with a `port`; a profile model on it names the revision rec has installed
@@ -83,9 +86,8 @@ schema 1.2, which an older `client serve` refuses, so every request it handles w
   over a server it did not start. `darkmux doctor` gains a `flint engine` row (rec's version, its
   runtime and each Flint model's directory, and whether rec's own server is up).
   `darkmux config set engines.flint.bin <path>` (or `DARKMUX_FLINT_BIN`) names `rec` when it is not
-  on `PATH`. No schema version moves: `flint` joins `PROFILES_SCHEMA_VERSION` 2.3,
-  `engines.flint.bin` joins `CONFIG_SCHEMA_VERSION` 2.8 and `engine_in_use` joins
-  `FLOW_SCHEMA_VERSION` 2.7.0, all unreleased.
+  on `PATH`. The `flint` value, `engines.flint.bin` and `engine_in_use` belong to
+  `PROFILES_SCHEMA_VERSION` 2.3, `CONFIG_SCHEMA_VERSION` 2.8 and `FLOW_SCHEMA_VERSION` 2.7.0.
 
 - **A dispatch to a Tensorfold profile starts its server (#3448).** darkmux makes the model resident
   between `dispatch.start` and the first request on every dispatch path that runs a role (single-shot, the
@@ -95,33 +97,91 @@ schema 1.2, which an older `client serve` refuses, so every request it handles w
   `.loading` (every 10 s) and `.ready` records say so, and a refusal is a `dispatch.error` with a
   stable `code`: `busy`, `wont_fit`, `model_start_failed`, `model_stop_failed` (darkmux's own
   server would not stop when it was replaced or evicted), `port_in_use` or `engine_unavailable`.
-  The model is sent under its `darkmux:` name. A utility binding on a Tensorfold endpoint is refused at
+  `port_in_use` says which check found the port held (before the start, a process darkmux did not
+  start, or nothing it could read), and an unreadable listener lookup is retried once (#3488).
+  The model is sent under its `darkmux:` name, and a single-shot dispatch to a Tensorfold or Flint
+  server is labeled `openai:127.0.0.1:<port>/<model>`. A utility binding on a Tensorfold endpoint is refused at
   preflight, and a `dispatch.single_shot` / `dispatch.map` step naming one in `config.endpoint` is
   refused by name: those steps call an endpoint directly and start no server. `FLOW_SCHEMA_VERSION` 2.6.0 -> 2.7.0, additive.
 
-- **Tensorfold endpoints are read and checked (#3448, part 1).** An endpoint
+- **A dispatch never stops, replaces or evicts an engine server another running dispatch holds.**
+  Whether the server is held is decided under the endpoint's lock, together with the decision to
+  stop it: a held server running the same model is reused even when it is too busy to answer in
+  time, a dispatch for another model on that endpoint is refused `busy`, and an eviction reads the
+  leases again before each server or LM Studio load it unloads. A server whose leader exited while
+  its workers still serve is kept the same way, and otherwise cleared with its workers. A dispatch
+  whose residency lease cannot be written is refused (`model_start_failed`).
+
+- **Waiting on a model start, and memory reservations (#3522, #3523).** A dispatch for another model
+  while a start is in flight on its endpoint is refused `busy` at once; a dispatch waiting for the
+  same model's start honors its timeout, Ctrl-C, a client's cancel and `mission abort`, and writes
+  `dispatch.model.loading`. Memory reservations are one record per start (`<home>/run/reservations/`),
+  apart from leases, so a fresh compactor never reads as held and an earlier wave never erases a later
+  wave's reservation.
+
+- **Tensorfold endpoints are read and checked (#3448).** An endpoint
   can declare `"managed": "tensorfold"` with the `port` darkmux will serve it on, and a profile
   model on it can carry `engine_args` (extra `tensorfold-native serve` flags). `darkmux doctor`
   gains a `tensorfold engine` row that asks the installed binary its version (darkmux supports
   Tensorfold 1.2.x), its models and its serve flags, and checks each Tensorfold profile model
-  against them. `darkmux config set engines.tensorfold.bin <path>` (or `DARKMUX_TENSORFOLD_BIN`)
-  names the binary when it is not on `PATH`. `PROFILES_SCHEMA_VERSION` 2.2 -> 2.3 and `CONFIG_SCHEMA_VERSION` 2.6 -> 2.7, both
-  additive; an older binary refuses the new keys and value.
+  against them. `engine_args` are checked against the installed engine on every dispatch too,
+  including whether a flag takes a value; `--alias`, `--api-key-file` and abbreviations of the flags
+  darkmux sets are refused. An engine endpoint whose `port` another engine endpoint, LM Studio or
+  darkmux's daemon uses is refused at preflight and failed by `darkmux doctor`, naming both.
+  `darkmux config set engines.tensorfold.bin <path>` (or `DARKMUX_TENSORFOLD_BIN`)
+  names the binary when it is not on `PATH`. `PROFILES_SCHEMA_VERSION` 2.2 -> 2.3 and
+  `CONFIG_SCHEMA_VERSION` 2.6 -> 2.8, both additive; an older binary refuses the new keys and values.
 - `darkmux client serve` (local prototype, #3447): a loopback-only endpoint an app on this machine
   pairs with (`darkmux client approve`), then runs work through. It answers only this machine's
   apps: a loopback connection naming the listener, through no proxy, with no `Origin` header (a web
   page cannot drive it), and JSON request bodies. With `clients.profiles` unset an app may run on
   any profile whose work stays on this machine, judged as dispatch judges it (a managed engine:
   LM Studio, or a Tensorfold or Flint server darkmux starts; or the `default_engine` on
-  loopback); the role's own profile is checked the same way. Its 17 routes
+  loopback); the role's own profile is checked the same way. A paired app works only in workspaces
+  darkmux made for it: a mission's worktrees, other apps' workspaces and folders no app asked for are
+  refused `forbidden`, and two apps asking for one repository get separate workspaces. Its 19 routes
   and their response types are in `route-table.golden` (a new contract surface; nothing changes
   for the viewer daemon's routes).
+- **Each paired app has a stable id (`clients.json` schema 1.2).** An app's workspaces and runs belong
+  to an id minted when you approve it, never its display name, so a later pairing given a revoked
+  app's name inherits neither. `darkmux client revoke` leaves the app's workspaces owned by no one
+  until `darkmux client claim <workspace> <client>` gives one to a paired app, and `darkmux doctor`
+  lists unowned workspaces.
+- **Pairing.** `darkmux client revoke <name>` (or a deny) takes back an approval the app has not
+  collected yet, and `client list` shows such approvals. No one process on this machine may have more
+  than two pairing requests waiting, so a container cannot fill the queue. `darkmux client approve
+  <CODE>` works beside `--code <CODE>`, and every message names the command that works. `darkmux
+  doctor` shows the `clients.*` settings and where each came from, and `client list` credits
+  `clients.profiles` to the environment or `config.json`.
+- **A work copy's history stays honest.** Undo is refused (`conflict`) while another run works in the
+  same copy, and no run starts while an Undo reverts. A failed or canceled run's edits are committed
+  as that run's own commit, which Undo can revert, never in the next run's commit, and a cancel that
+  lands after a run finished leaves it finished. `continues` naming a run `client serve` has
+  forgotten (an hour later, or after a restart) starts a plain new run; failed and canceled runs can
+  be continued; finished work is kept for an hour from when it ended (#3492).
+- **Client workspaces cloned from a repo get their own branch (#3489, #3490).** A clone gets a
+  `mux/<bot>-<id>` branch, so its runs, `/changes` and an app's Open PR never use the default branch.
+  A repo-link request reuses only that bot's own clone, by the bot's exact name (recorded beside the
+  workspace), never another bot's worktree or a bot whose name makes the same slug. A branch darkmux
+  cannot create is `branch_failed` (422) with git's reason. Private HTTPS clones and fetches use your
+  own credential helpers (the system `osxkeychain` helper from Xcode's git config, and gh's per-host
+  helper); a checkout's own helpers are never run. Cloning an empty repository works, workspace names
+  always fit 64 characters (#3493), and each workspace name has its own lock, so a slow clone holds up
+  only its own name and a clone interrupted by a stop releases it. `/changes` reads a branch's files in
+  two git calls (#3531), and a submodule whose commit the repository holds is refused like any other.
+- **`client serve` stops cleanly (#3521, #3524, #3525, #3536).** SIGTERM (launchd) and SIGHUP stop its
+  previews as Ctrl-C does. It waits at most 5 s for open connections and refuses anything they ask to
+  start (`unavailable`), cancels running work and waits up to 15 s for each run's record and commit
+  (never longer on a wedged docker), and stops the previews in parallel; a second signal stops it at
+  once. A stale preview whose shell ignores TERM is killed after 5 s. An app that disconnects while its
+  run is admitted never leaves the run stuck `running`. A revoked client's runs are canceled and its
+  previews stopped. `clients.json` is replaced by an atomic rename.
 - Host git never reads git config a run can write: a client workspace's repository is held by
   darkmux outside the work tree the run is given (a clone's `--separate-git-dir`, a worktree's own
   admin directory in your checkout), and every host git call in a workspace names it, with
   `core.fsmonitor`, hooks, signing, `core.sshCommand`, `credential.helper` and external diffs off
   and no system config. A run that rewrites its workspace's `.git` changes nothing on the host. A
-  run inside a client workspace's container no longer has a usable `.git` there.
+  run inside a client workspace's container has no `.git` there.
 - Previews run in a container, not on the host (#3456). Each running preview gets one
   long-lived container of its own from the darkmux runtime image (resolved as a dispatch resolves
   it), with the dispatch container's hardening. The workspace is its only mount, so a recipe
@@ -137,18 +197,20 @@ schema 1.2, which an older `client serve` refuses, so every request it handles w
   answers. If `client serve` is killed without stopping its previews, each container stops itself
   once a heartbeat `client serve` touches every 30 s has not changed for 12 looks 10 s apart (it
   never compares the heartbeat with the clock, so a Mac waking from sleep does not stop a live
-  preview). A preview container has
+  preview). Each preview run carries its own id in its container's name and its heartbeat folder,
+  and a run's end removes only its own (#3485). A start while the workspace's preview is live joins
+  it (200), checked and registered under one lock. A preview container has
   the network, and through `host.docker.internal` it reaches this Mac's loopback services (LM
   Studio, the darkmux daemons, local databases), as a dispatch container does. A recipe's `env`
-  keys must be variable names. Previews need Docker now.
+  keys must be variable names. Previews need Docker.
 - Previews are off by default (`clients.preview.enabled`, CONFIG 2.8, default `false`). Even
   with its recipe read only from your own checkout, a preview runs the workspace's code (its
   `package.json` scripts and whatever they load, which a model may have written), in a container
   with network access. `darkmux config set clients.preview.enabled true` turns it on.
   `env_from_source` never copies through a symlink. Known gap: a file a running preview writes in
   the workspace during a run can be committed as the run's.
-- A preview no app asks about stops on its own (#3459). An app that quit or crashed never stopped
-  its preview, so its dev server ran until `client serve` did. Once a minute `client serve` stops
+- A preview no app asks about stops on its own (#3459), so one whose app quit or crashed does not
+  run until `client serve` stops. Once a minute `client serve` stops
   every preview no app has asked about (a start or a status) for `clients.preview.idle_minutes`
   (CONFIG 2.8, `DARKMUX_CLIENTS_PREVIEW_IDLE_MINUTES`; default `15`, `0` = never), the way a stop
   does, and says so in its log. The setting is read at each check, so `darkmux config set` applies
@@ -169,18 +231,23 @@ schema 1.2, which an older `client serve` refuses, so every request it handles w
   made from, never from the workspace a run edits. A workspace cloned from a URL gets no preview;
   add `.darkmux/preview.json` to your own checkout of the repo and make the workspace from it.
 
-- **A busy dispatch can wait for its memory (#3504).** When a running dispatch holds the engine
-  endpoint or the memory a dispatch needs, `fleet.busy_policy` now decides for local dispatches too:
-  `refuse` (the default) answers `busy` at once as before; `queue` waits up to the dispatch's timeout,
-  printing a `queued` line every 20 s, writing `dispatch.queue.wait` / `dispatch.queue.resume`, and
-  showing run activity `queued` (also in the client API's work status). A stop ends the wait without
-  starting anything. A waiter holds no lease, so waiters never pin each other's servers. The queue is
-  not first-come-first-served: a later arrival can take freed memory first.
+- **A busy dispatch to a Tensorfold or Flint server can wait for its memory (#3504).** When a running
+  dispatch holds the engine endpoint or the memory a dispatch to a Tensorfold or Flint server needs,
+  `fleet.busy_policy` decides for local dispatches too: `refuse` (the default) answers `busy` at once;
+  `queue` waits up to the dispatch's timeout, printing a `queued` line every 20 s, writing
+  `dispatch.queue.wait` / `dispatch.queue.resume`, and showing run activity `queued` (also in the
+  client API's work status). A stop ends the wait without starting anything. A waiter holds no lease,
+  so waiters never pin each other's servers. The queue is not first-come-first-served: a later arrival
+  can take freed memory first. An LM Studio load refused `busy` is refused at once, whatever the
+  policy.
 
-- **Refusal codes reach every surface (#3505).** A refused `dispatch --json` prints
+- **Refusal codes reach every surface (#3505, #3510).** A refused `dispatch --json` prints
   `{"result":"refused","code","error"}` (still a nonzero exit), and a fleet job's `error` reply
-  carries `code` (work wire 8.2, additive; 8.1 peers interoperate). An app retries `busy` and
-  `memory_in_use`, gives up on `wont_fit`, and treats every other failure as a failure.
+  carries `code` (work wire 8.2, additive; 8.1 peers interoperate). `wont_fit` means only "larger
+  than this machine"; memory held by programs darkmux did not start is the retryable `memory_in_use`;
+  memory held by running darkmux dispatches or starts in flight is `busy`. A missing memory figure
+  refuses instead of starting blind. An app retries `busy` and `memory_in_use`, gives up on
+  `wont_fit`, and treats every other failure as a failure.
 
 - **Machine surfaces show the engine servers darkmux starts (#3450).** `darkmux machine resources`
   and `GET /machine/resources` (ledger 2.2) list each Tensorfold or Flint server as a darkmux row at
@@ -190,7 +257,9 @@ schema 1.2, which an older `client serve` refuses, so every request it handles w
   counts a served profile and now matches darkmux's own `darkmux:` loads. The machine card (1.4)
   states each model's `availability` (refreshed behind the card, dropped once older than 75 s) and
   lists the servers; the viewer's machine lens and fleet cards show them, with "starting the model"
-  while one starts. `darkmux machine eject` also stops the idle servers darkmux started, never one a
+  while one starts (only within the start bound; past it, a server that does not answer reads "not
+  answering"), two Flint servers as two rows, and an unmeasured server as "not measured".
+  `darkmux machine eject` also stops the idle servers darkmux started, never one a
   running dispatch holds or one it did not start. `mission config show` and the lab profile check
   read a server model's residency from darkmux's record.
 
@@ -198,8 +267,9 @@ schema 1.2, which an older `client serve` refuses, so every request it handles w
   optional `{"force": true}`) and `darkmux client workspace rm <name> [--force]` remove a workspace and
   what darkmux made for it: its folder and records, a clone's repository, a worktree's admin dir in your
   checkout, and its `mux/` branch once another branch holds it (or with `force`). Your own branches are
-  never touched. Work held nowhere else is refused with the new code `unsaved_commits` until `force`,
-  and a refused removal leaves a live preview running.
+  never touched. Work held nowhere else is refused with the new code `unsaved_commits` until `force`.
+  The route stops the workspace's live preview first (a refused removal leaves it running), and the
+  CLI `client workspace rm` refuses while a preview runs.
 
 - **An app can hand-edit text in a workspace (#3533).** `POST /client/workspaces/{name}/edit` with
   `{old, new}` finds the one place in the workspace's tracked files that holds the text a person
@@ -222,7 +292,7 @@ schema 1.2, which an older `client serve` refuses, so every request it handles w
   built-in role or mission config does that: `coder` commits only when asked, the reviewers and
   the crawler only read, and the coder phase works in its own worktrees, whose `.git` is a pointer
   file and is unaffected. The preflight note says how `.git` was mounted, `dispatch.start` records
-  it (`workdir_git`: `read_only` | `read_write`, which joins `FLOW_SCHEMA_VERSION` 2.7.0, unreleased),
+  it (`workdir_git`: `read_only` | `read_write`, part of `FLOW_SCHEMA_VERSION` 2.7.0),
   and a resume may not mount a writable `.git` its checkpoint's run did not have (a record that
   is missing reads as read-only). Inside the run, `git checkout -- <file>` and `git restore` fail
   too, so a coder cannot undo its own edit that way. **Not covered:** a repository the run creates
@@ -248,50 +318,21 @@ schema 1.2, which an older `client serve` refuses, so every request it handles w
   `~/.darkmux`, a `brew services` daemon included (`brew services restart darkmux`), or the older
   one shows this one's missions without their tasks.
 
-- **`clients.json` moves to schema 1.2: each paired app has a stable id.** An app's workspaces and
-  runs belong to an id minted when you approve it, never its display name, so a later pairing given
-  a revoked app's name inherits neither. A 1.1 store gets ids the first time it is read. The one app
-  paired at that moment keeps the workspaces it had from before owners existed, while it stays
-  paired; any other workspace no paired app owns waits for `darkmux client claim <workspace>
-  <client>`, and `darkmux doctor` lists them. An older darkmux refuses a 1.2 store (see Upgrading
-  above).
-
-- **`port_in_use` says which check found the port held** (before the start, a process darkmux did
-  not start, or nothing it could read), and an unreadable listener lookup is retried once (#3488).
-
 - **The minimum supported Rust is 1.89** for the `darkmux` binary and the crates that reach
   SQLite (`darkmux-crew`, `-doctor`, `-fleet`, `-lab`, `-serve`), up from 1.88 and 1.86:
   `rusqlite` 0.41 (below) needs it.
 
-- **`wont_fit` now means only "larger than this machine" (#3510).** Memory held by programs darkmux
-  did not start gets the new retryable `memory_in_use`; memory held by running darkmux dispatches or
-  starts in flight stays `busy`. A missing memory figure refuses instead of starting blind.
-
 - **The thermal hard stop also stops darkmux's engine servers.** At a `critical` reading, after its
   checkpoint wait and the LM Studio sweep, tier 5 now stops every Tensorfold and Flint server darkmux
   started, held ones included, so the machine can actually cool; never a server darkmux did not start.
-  `thermal.tier5_eject` gains `stopped_servers` and its failure record `failed_servers`.
+  `thermal.tier5_eject` gains `stopped_servers` and `skipped_servers`, and its failure record
+  `failed_servers`.
 
-- **Client workspaces cloned from a repo get their own branch (#3489, #3490).** A clone gets a
-  `mux/<bot>-<id>` branch, so its runs, `/changes` and an app's Open PR never use the default branch.
-  A clone made on a 5.10 release candidate, still on its default branch (or the ref it was cloned at),
-  is moved onto its own branch at its next run, its commits included; until then `/changes` refuses
-  it with `no_own_branch`, so nothing can push onto your branch. A repo-link request reuses only that
-  bot's own clone, by the bot's exact name (recorded beside the workspace), never another bot's
-  worktree or a bot whose name makes the same slug. A branch darkmux cannot create is `branch_failed`
-  (422) with git's reason.
-
-- **The daemon refuses a request whose `Host` is not this machine (#3534).** A request naming no
-  address of this machine (an IP literal, `localhost`, its host and tailnet names, a roster machine) gets
-  421, which closes DNS-rebinding reads of flow records and panels when read auth is off. `tailscale
-  serve` and peers keep working; a reverse proxy under a custom name is refused.
-
-- **`dispatch.model` waits and memory reservations (#3522, #3523).** A dispatch for another model while
-  a start is in flight on its endpoint is refused `busy` at once instead of after that start (up to 15
-  min); a dispatch waiting for the same model's start honors its timeout, Ctrl-C, a client's cancel and
-  `mission abort`, and writes `dispatch.model.loading`. Memory reservations are one record per start
-  (`<home>/run/reservations/`), apart from leases, so a fresh compactor never reads as held and an
-  earlier wave never erases a later wave's reservation.
+- **The daemon refuses a request whose `Host` is a name this machine does not answer to (#3534).**
+  Such a request gets 421 (IP literals, `localhost`, its own host and tailnet names and roster
+  machines pass, as does a request with no `Host` header), which closes DNS-rebinding reads of flow
+  records and panels when read auth is off. `tailscale serve` and peers keep working; a reverse proxy
+  under a custom name is refused.
 
 ### Security
 
@@ -308,81 +349,6 @@ schema 1.2, which an older `client serve` refuses, so every request it handles w
   and a FIFO there is refused instead of hanging the preview.
 
 ### Fixed
-
-- **A dispatch never stops, replaces or evicts an engine server another running dispatch holds.**
-  Whether the server is held is decided under the endpoint's lock, together with the decision to
-  stop it: a held server running the same model is reused even when it is too busy to answer in
-  time, a dispatch for another model on that endpoint is refused `busy`, and an eviction reads the
-  leases again before each server or LM Studio load it unloads. Before, two dispatches on one
-  endpoint could replace each other's server (on Flint, a dispatch was then answered by the other
-  model). A server whose leader exited while its workers still serve is kept the same way, and
-  otherwise cleared with its workers instead of later reading as `port_in_use`. A dispatch whose
-  residency lease cannot be written is refused (`model_start_failed`) instead of running without
-  that protection.
-
-- **Tensorfold `engine_args` are checked against the installed engine on every dispatch**, including
-  whether a flag takes a value; `--alias`, `--api-key-file` and abbreviations of the flags darkmux
-  sets are refused. An engine endpoint whose `port` another engine endpoint, LM Studio or darkmux's
-  daemon uses is refused at preflight and failed by `darkmux doctor`, naming both.
-
-- **Availability reads what a dispatch would do.** A model reads `resident` only when a dispatch would
-  use it: an unverified or missing engine binary, bad `engine_args`, or rec's own server beside
-  darkmux's now read `unavailable`. A probe cut at the listing bound keeps the answers it already had
-  (a slow `lms ls` no longer turns a loaded model `unknown`).
-
-- **Single-shot dispatches to Tensorfold or Flint are labeled `openai:127.0.0.1:<port>/<model>`**, not
-  `openai:remote/…` or "hosted".
-
-- **A paired app works only in workspaces darkmux made for it.** A mission's worktrees, other apps'
-  workspaces and folders no app asked for are refused `forbidden`, and two apps asking for one
-  repository get separate workspaces.
-
-- **A work copy's history stays honest.** Undo is refused (`conflict`) while another run works in the
-  same copy, and no run starts while an Undo reverts. A failed or cancelled run's edits are committed
-  as that run's own commit, which Undo can revert, instead of riding along in the next run's commit,
-  and a cancel that lands after a run finished no longer marks it cancelled.
-
-- **Pairing.** `darkmux client revoke <name>` (or a deny) takes back an approval the app has not
-  collected yet, and `client list` shows such approvals. No one process on this machine may have more
-  than two pairing requests waiting, so a container cannot fill the queue, and finding which process
-  sent a request costs one lookup per round however many are waiting. `darkmux client approve
-  <CODE>` works beside `--code <CODE>`, and every message names the command that works.
-
-- **`darkmux doctor` shows the `clients.*` settings and where each came from**, and `client list`
-  credits `clients.profiles` to the environment or `config.json` correctly.
-
-- **Private HTTPS clones and fetches use your own credential helpers again**: the system `osxkeychain`
-  helper (Xcode's git config) and gh's per-host helper. A checkout's own helpers are still never run.
-
-- **A preview's install fingerprint covers `package.json` beside the lockfiles** and counts
-  `bun.lock`/`bun.lockb`, so each workspace reinstalls once after the upgrade.
-
-- **`client serve` stops cleanly.** SIGTERM (launchd) and SIGHUP stop its previews as Ctrl-C does; it
-  waits at most 5 s for open connections, refuses anything they ask to start (`unavailable`), stops
-  the previews in parallel, and a second signal stops it at once. A stale preview whose shell ignores
-  TERM is killed after 5 s.
-
-- **A preview's clean restart refuses a folder tree deeper than 128 levels**, with a reason, instead
-  of running out of file descriptors.
-
-- **A coder phase whose task names no branch is torn down by the branch its worktree has checked
-  out, never one the conventions derive (#3457 follow-up).** A worktree task written before this
-  release (a mission in flight across the upgrade) records no branch. `mission finalize` and
-  `abort` then force-deleted the name the conventions `branch_template` derives whenever the
-  worktree still existed: with `feat/{ticket}` and ticket `ABC-1`, an unrelated branch of yours
-  named `feat/ABC-1` was deleted and the phase's real branch was left behind (with no template,
-  the real branch was left behind). The branch is now the one the main repository's record of the
-  worktree has checked out (its `worktrees/<name>/HEAD`, never the worktree's own `.git`), and only
-  when that branch exists. When it cannot tell (a detached HEAD, no record), it deletes no branch
-  and prints the `git worktree list` / `git branch -D` commands to finish by hand.
-
-- **A preview's heartbeat belongs to its run, not its workspace's name (#3485).** A preview's
-  container and heartbeat folder were named by workspace and port, so two runs of one workspace on
-  the same port (a stop or clean restart, then a start that drew the freed port) shared one folder,
-  and the first run's cleanup deleted the folder the second run's container watched; that container
-  then stopped itself as if `client serve` had died. Each run now carries its own id in its
-  container's name and its heartbeat folder, and a run's end removes only its own. A start while the
-  workspace's preview is live already joins it (200), checked and registered under one lock.
 
 - **The runtime image carries Node 22 (#3482).** It moves from Alpine 3.20 (Node 20.15) to Alpine 3.22 (Node 22.23 LTS, npm 11). Client previews run a project's dev server in this image, and current Vite, rolldown and @vitejs/plugin-react need `^20.19 || >=22.12`: on 20.15, `npm ci` skipped their native bindings and the dev server could not start. Dispatches run in the same image, so their tools move with it (git 2.49, Python 3.12).
 
@@ -412,14 +378,12 @@ schema 1.2, which an older `client serve` refuses, so every request it handles w
   on elapsed time can therefore lag by up to 20 s, up from 10 s. The `/machine/resources` cache is
   now keyed by the engine setting and `lms` binary, like the residents read beside it.
 
-- **A paired app's `workdir` is exactly one workspace (#3451 review).** `POST /client/work` checked a
-  raw `workdir` only for lying under the worktrees base, so it admitted the base itself and the dot
-  entries beside the workspaces: the repositories darkmux holds for them (`.<name>.git`) and its
-  `.source`, `.gitdir` and `.template` records. A run handed one of those could rewrite what host git
-  and the preview recipe trust. A client `workdir` must now be a workspace directly under the base,
-  admitted by its name. The shared check every queued or fleet workdir goes through also refuses the
-  base itself and anything under a dot entry; nested coder-phase worktrees (`<repo>/<phase>`) are
-  still admitted there.
+- **A `workdir` is exactly one workspace (#3451 review).** The check every queued or fleet workdir
+  goes through refuses the worktrees base itself and anything under a dot entry beside the
+  workspaces (the repositories darkmux holds for them, `.<name>.git`, and its `.source`, `.gitdir`
+  and `.template` records), which a run handed one could use to rewrite what host git and the
+  preview recipe trust; nested coder-phase worktrees (`<repo>/<phase>`) are still admitted. A paired
+  app's `workdir` must be a workspace directly under the base, admitted by its name.
 
 - **Host git never runs what a dispatch wrote into a git directory (#3457).** A dispatch mounts its
   workdir read-write, so a run could replace a coder-phase worktree's `.git` pointer with a
@@ -429,7 +393,10 @@ schema 1.2, which an older `client serve` refuses, so every request it handles w
   `mission finalize`/`abort` delete the branch darkmux recorded at launch (a new `Task.branch`),
   never the one the worktree's HEAD names, through the main repository recorded at launch (a new
   `Task.repo_root`, both under task schema 1.1, which an older darkmux cannot read; see Changed),
-  never one resolved from a cwd inside the worktree. A repo-defined filter
+  never one resolved from a cwd inside the worktree. A task with no recorded branch (one saved
+  before this release) takes its branch from the main repository's record of the worktree; when
+  that is unclear, nothing is deleted and the `git worktree list` / `git branch -D` commands to
+  finish by hand are printed. A repo-defined filter
   driver never runs under darkmux's host git, wherever attributes assign it (a driver only your
   global config defines, such as Git LFS's default install, still does). Every host git call carries overrides for the settings
   that run a command. A plain `dispatch --workdir <checkout>` whose `.git` is a real directory now
@@ -451,11 +418,6 @@ schema 1.2, which an older `client serve` refuses, so every request it handles w
   - Before each unload darkmux re-checks that the model is still idle and as planned.
   - LM Studio refusals carry `busy`, `memory_in_use` or `wont_fit` like the engine path.
 
-- `continues` naming a run `client serve` has forgotten (an hour later, or after a restart) starts a
-  plain new run instead of a 409; failed and canceled runs can be continued; finished work is kept for
-  an hour from when it ended (#3492). Workspace names always fit 64 characters (#3493). Cloning an
-  empty repository works.
-
 - Concurrent first runs no longer race extracting the runtime binary: one extracts under a lock and
   the rest reuse its stamped copy (#3410). XML-format tool calls drop the newlines that wrap a value
   on its own line, so a path no longer fails `read`; `write`/`edit` content keeps its whitespace
@@ -467,16 +429,6 @@ schema 1.2, which an older `client serve` refuses, so every request it handles w
   refused for memory fails the dispatch before its container starts, with the code; a model a preflight
   just loaded stays leased until its dispatch holds it.
 
-- **`client serve` lifecycle (#3521, #3524, #3525, #3536).** An app that disconnects while its run is
-  admitted no longer leaves the run stuck `running`. Stopping `client serve` cancels running work and
-  waits up to 15 s for each run's record and commit, and no longer waits on a wedged docker past that. A
-  revoked client's runs are canceled and its previews stopped. `clients.json` is replaced by an atomic
-  rename. Each workspace name has its own lock, so a slow clone holds up only its own name (reuse at 21
-  workspaces: 1.76 s to 0.15 s), and a clone interrupted by a stop no longer holds its name.
-
-- **`/changes` reads a branch's files in two git calls (#3531)**, not four per file (330 files: about
-  15 s to under 0.1 s). A submodule whose commit the repository holds is refused like any other.
-
 - **The daemon (#3534).** The live tail no longer delivers a record twice; panels are cached per width
   (one of a few fixed widths, and a remote reader is served the last answer, never refused); the replay
   routes, `/flow-days` and the roster's uid backfill read a kept per-day index instead of all history on
@@ -486,20 +438,19 @@ schema 1.2, which an older `client serve` refuses, so every request it handles w
 - **The viewer (#3532).** A lost stream reads "reconnecting · data as of HH:MM", every fleet card and
   the run page header show "as of" and the run page's counters stop; the reconcile poll reaches back a
   minute while live, not thirty (about 660 KB less per poll); streamed records are batched per frame and
-  inserted into the window (about 50 ms to under 0.1 ms per record at 30k); an engine server that does
-  not answer reads "starting the model" only within the start bound, else "not answering"; two Flint
-  servers are two rows; an unmeasured server reads "not measured".
+  inserted into the window (about 50 ms to under 0.1 ms per record at 30k).
 
 - **A server start is priced at what it commits, and memory pressure refuses or stops it (#3538).** A
   Tensorfold start reserves its KV cache for the whole `n_ctx` before its first answer (measured: 27.6 GB
-  at 8k, 34.6 GB at 64k, 67.3 GB at 262k with a drafter, for Qwen3.8-27B 4-bit), so darkmux now prices it
-  from those measurements instead of its weights floor; a Flint start adds a measured allowance for its
-  lazily grown cache. The figures stand in for an engine-reported estimate (ashhart/TensorFold#2761). A
-  start or LM Studio load is refused `memory_in_use`, before anything is evicted, while memory pressure is
-  at or above `runtime.memory.pressure_gate` (`warning` by default, `critical`, `off`), including when the
-  memory compressor's segments are 70% full while the kernel still reads normal; a server darkmux is
-  starting is stopped, and an LM Studio load unloaded unless a dispatch took it up, if pressure turns
-  critical meanwhile. A stress test on 5.10 builds without this panicked the machine.
+  at 8k, 34.6 GB at 64k, 67.3 GB at 262k with a drafter, for Qwen3.8-27B 4-bit), so darkmux prices it
+  from those measurements; a Flint start adds a measured allowance for its lazily grown cache. The
+  figures stand in for an engine-reported estimate (ashhart/TensorFold#2761). A start or LM Studio load
+  is refused `memory_in_use`, before anything is evicted, while memory pressure is at or above
+  `runtime.memory.pressure_gate` (`warning` by default, `critical`, `off`); under `warning` the gate
+  also trips when the memory compressor's segments are 70% full while the kernel still reads normal.
+  A server darkmux is starting is stopped, and an LM Studio load unloaded unless a dispatch took it
+  up, if pressure turns critical meanwhile. A platform that reports no memory pressure (Linux today)
+  has no gate.
 
 ## [5.9.3] - 2026-10-29
 
