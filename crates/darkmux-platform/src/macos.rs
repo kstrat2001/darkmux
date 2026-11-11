@@ -380,18 +380,24 @@ pub(crate) fn code_directory_flags(shown: &str) -> Option<u32> {
 /// The `osascript` arguments for the Allow dialog. The script is fixed
 /// text; the timeout, the message and the icon's path reach it as `argv`
 /// items 1, 2 and 3 (the timeout first, so a message starting with `-` is
-/// never read as an option). With no icon, or one the dialog cannot show,
-/// it shows the caution icon: the icon never costs the dialog.
+/// never read as an option). Don't Allow is both the default and the cancel
+/// button, so Return and Esc mean Don't Allow (the dialog can take focus
+/// while someone types elsewhere); Allow takes a click. With no icon, or one
+/// the dialog cannot show, it shows the caution icon: the icon never costs
+/// the dialog.
 pub(crate) fn allow_dialog_args(message: &str, icon: Option<&std::path::Path>, timeout_secs: u64) -> Vec<String> {
-    const ASK: &str = "display dialog (item 2 of argv) with title \"darkmux\" buttons {\"Don't Allow\", \"Allow\"} default button \"Allow\" giving up after ((item 1 of argv) as integer)";
-    let with_icon = format!("try\nset answer to {ASK} with icon (POSIX file (item 3 of argv))\nend try");
-    let with_caution = format!("if answer is missing value then set answer to {ASK} with icon caution");
+    const ASK: &str = "display dialog (item 2 of argv) with title \"darkmux\" buttons {\"Don't Allow\", \"Allow\"} default button \"Don't Allow\" cancel button \"Don't Allow\" giving up after ((item 1 of argv) as integer)";
     let script = [
         "on run argv".to_string(),
         "activate".to_string(),
-        "set answer to missing value".to_string(),
-        format!("if (count of argv) > 2 then\n{with_icon}\nend if"),
-        with_caution,
+        "try".to_string(),
+        format!(
+            "if (count of argv) > 2 then\ntry\nset answer to {ASK} with icon (POSIX file (item 3 of argv))\non error number n\nif n is -128 then error number -128\nset answer to {ASK} with icon caution\nend try\nelse\nset answer to {ASK} with icon caution\nend if"
+        ),
+        "on error number n".to_string(),
+        "if n is -128 then return \"Don't Allow\"".to_string(),
+        "error number n".to_string(),
+        "end try".to_string(),
         "if gave up of answer then return \"\"".to_string(),
         "return button returned of answer".to_string(),
         "end run".to_string(),

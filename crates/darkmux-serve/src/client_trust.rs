@@ -2,7 +2,9 @@
 //! Allow dialog for everyone else.
 //!
 //! When a pairing request arrives, `client serve` asks which process on
-//! this machine sent it (`peer_process_of`) and who signed that process
+//! this machine holds its connection (`peer_holders_of`): a connection held
+//! by more than one process (one handed it, or let a child inherit it) is
+//! never trusted. Then it asks who signed the one holder
 //! (`darkmux_platform::Platform::signed_app`: valid now, under Apple's
 //! anchor, a team certificate, the hardened runtime). Then:
 //!
@@ -31,18 +33,21 @@
 //! never verify).
 //!
 //! **The residual pid window.** The listener is TCP on loopback, so the OS
-//! hands it no credentials for the other end: the pid is whichever process
-//! holds that connection when darkmux looks (`lsof`), and the signature is
-//! read by pid. The re-check narrows the window to the time between the
-//! last look and the store write (milliseconds), and the request's own
-//! pairing secret ties the token to whoever sent the request. A process
-//! that hands its open connection to a freshly launched Mux Bot (an
-//! inherited descriptor) would still be approved as it; only a channel
-//! whose peer the kernel names (a Unix socket's peer token, or XPC) closes
-//! that, and that process could run `client approve` anyway.
+//! hands it no credentials for the other end: the holders are whichever
+//! processes have that connection open when darkmux looks (`lsof`), and the
+//! signature is read by pid. A connection more than one process holds (one
+//! that let a launched Mux Bot inherit it while keeping its own copy) is
+//! never trusted, at the first look or the re-check. The re-check narrows
+//! the rest to the time between the last look and the store write
+//! (milliseconds). What stays open: a process that writes the request, hands
+//! the connection to a Mux Bot it launched and closes its own copy before
+//! darkmux looks is approved as that Mux Bot, and it knows the pairing
+//! secret. Only a channel whose peer the kernel names at connect time (a
+//! Unix socket's peer token, or XPC) closes that, and such a process,
+//! running as this user, could run `client approve` anyway.
 
 use crate::client_pairing::{
-    approve_as, deny, peer_process_of, Approval, ClientServerState, ClientStore, RememberedApp, SigningIdentity,
+    approve_as, deny, peer_holders_of, Approval, ClientServerState, ClientStore, RememberedApp, SigningIdentity,
     PAIR_REQUESTS_PER_PROCESS,
 };
 use darkmux_platform::{AllowAnswer, SignedApp};
@@ -182,13 +187,17 @@ impl Drop for DialogSlot {
     }
 }
 
-/// Who sent a request from process `from` (`None`: darkmux could not tell),
-/// under the pairing policy as it reads now. Off the async workers: it runs
-/// `codesign`.
-pub async fn sender_of(state: &ClientServerState, from: Option<u32>) -> (Sender, PairingPolicy) {
+/// Who sent a request on a connection `holders` hold (empty: darkmux could
+/// not tell), under the pairing policy as it reads now. Only a connection
+/// exactly one process holds is ever named by a signature: with two, the one
+/// that verifies need not be the one that wrote the request. Off the async
+/// workers: it runs `codesign`.
+pub async fn sender_of(state: &ClientServerState, holders: &[u32]) -> (Sender, PairingPolicy) {
     let policy = (state.pairing_policy)().unwrap_or_else(|_| PairingPolicy::fail_closed());
-    let Some(pid) = from else {
-        return (Sender::Unverified("darkmux could not tell which process sent it".to_string()), policy);
+    let pid = match holders {
+        [pid] => *pid,
+        [] => return (Sender::Unverified("darkmux could not tell which process sent it".to_string()), policy),
+        many => return (Sender::Unverified(format!("its connection is held by {} processes ({many:?})", many.len())), policy),
     };
     let remembered = state.store.read().map(|f| f.remembered_apps).unwrap_or_default();
     let check = state.signed_app.clone();
@@ -221,13 +230,13 @@ pub async fn decide(
 }
 
 /// The re-check immediately before an approval with no operator step: the
-/// connection is still held by process `from`, and that process still
-/// verifies as `app`.
+/// connection is still held by process `from` and no other, and that
+/// process still verifies as `app`.
 async fn still_the_same_app(state: &ClientServerState, peer: Option<SocketAddr>, from: Option<u32>, app: &SignedApp) -> Result<(), String> {
     let pid = from.ok_or("no process")?;
-    let now_from = peer_process_of(state, peer.map(axum::extract::ConnectInfo)).await;
-    if now_from != Some(pid) {
-        return Err(format!("its connection is now held by {now_from:?}, not pid {pid}"));
+    let now_held = peer_holders_of(state, peer.map(axum::extract::ConnectInfo)).await;
+    if now_held != [pid] {
+        return Err(format!("its connection is now held by {now_held:?}, not pid {pid} alone"));
     }
     let check = state.signed_app.clone();
     let again = tokio::task::spawn_blocking(move || check(pid)).await.map_err(|e| e.to_string())??;

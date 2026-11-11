@@ -948,11 +948,13 @@ pub type PreviewMinutes = Arc<dyn Fn() -> Result<u64, String> + Send + Sync>;
 pub type WorkActivity = Arc<dyn Fn(&str, &str) -> (Option<crate::runs::RunActivity>, Option<u64>) + Send + Sync>;
 /// (peer, the listener's address) -> the process on this machine that sent
 /// a request from `peer`; `None` when that cannot be told.
-/// (the listener's address, the peers asked about) -> the process on this
-/// machine at each of those peers' ends that can be told, from one look at
-/// every connection to the listener; `None` when none can be told.
+/// (the listener's address, the peers asked about) -> every process on this
+/// machine holding each of those peers' ends that can be told (sorted, each
+/// once: a socket can be held by more than one process, one that inherited
+/// it), from one look at every connection to the listener; `None` when none
+/// can be told.
 pub type PeerProcesses =
-    Arc<dyn Fn(Option<SocketAddr>, &[SocketAddr]) -> Option<HashMap<SocketAddr, u32>> + Send + Sync>;
+    Arc<dyn Fn(Option<SocketAddr>, &[SocketAddr]) -> Option<HashMap<SocketAddr, Vec<u32>>> + Send + Sync>;
 
 /// Who sent each waiting pairing request, found in rounds: one look at every
 /// connection to the listener ([`ClientServerState::peer_processes`]) at a
@@ -966,7 +968,7 @@ pub struct PeerRounds {
     /// Rounds begun so far.
     begun: std::sync::atomic::AtomicU64,
     /// The latest finished round's number and answers.
-    last: Mutex<(u64, HashMap<SocketAddr, u32>)>,
+    last: Mutex<(u64, HashMap<SocketAddr, Vec<u32>>)>,
     /// The peers of the requests waiting for an answer, each once per
     /// request.
     waiting: Mutex<Vec<SocketAddr>>,
@@ -975,9 +977,9 @@ pub struct PeerRounds {
 impl PeerRounds {
     /// The answer for `peer` from a round that began after `after`, if one
     /// has finished.
-    fn answer_since(&self, after: u64, peer: SocketAddr) -> Option<Option<u32>> {
+    fn answer_since(&self, after: u64, peer: SocketAddr) -> Option<Vec<u32>> {
         let last = self.last.lock().unwrap();
-        (last.0 > after).then(|| last.1.get(&peer).copied())
+        (last.0 > after).then(|| last.1.get(&peer).cloned().unwrap_or_default())
     }
 }
 
@@ -1176,11 +1178,25 @@ fn canonical_base(base: &Path) -> Result<PathBuf, String> {
     base.canonicalize().map_err(named)
 }
 
-/// The process at each of `wanted`'s ends, from one look at every connection
-/// to the listener at `bound` ([`darkmux_platform::Platform::tcp_peers_of`]).
-fn peer_processes_here(bound: Option<SocketAddr>, wanted: &[SocketAddr]) -> Option<HashMap<SocketAddr, u32>> {
+/// Every process holding each of `wanted`'s ends, from one look at every
+/// connection to the listener at `bound`
+/// ([`darkmux_platform::Platform::tcp_peers_of`]).
+fn peer_processes_here(bound: Option<SocketAddr>, wanted: &[SocketAddr]) -> Option<HashMap<SocketAddr, Vec<u32>>> {
     let all = darkmux_platform::current().tcp_peers_of(bound?)?;
-    Some(all.into_iter().filter(|(peer, _)| wanted.contains(peer)).collect())
+    Some(holders_by_peer(all.into_iter().filter(|(peer, _)| wanted.contains(peer))))
+}
+
+/// `(peer, pid)` pairs grouped by peer: each peer's holders sorted, each once.
+pub(crate) fn holders_by_peer(pairs: impl Iterator<Item = (SocketAddr, u32)>) -> HashMap<SocketAddr, Vec<u32>> {
+    let mut by_peer: HashMap<SocketAddr, Vec<u32>> = HashMap::new();
+    for (peer, pid) in pairs {
+        by_peer.entry(peer).or_default().push(pid);
+    }
+    for pids in by_peer.values_mut() {
+        pids.sort_unstable();
+        pids.dedup();
+    }
+    by_peer
 }
 
 /// `clients.profiles` from `config.json` as it is NOW (the process-wide
@@ -1847,12 +1863,15 @@ pub(crate) async fn pair_handler(
         return *r;
     }
     let now = (state.now)();
-    let (record, from) = match new_request(&state, req, peer, now).await {
+    let (record, holders) = match new_request(&state, req, peer, now).await {
         Ok(made) => made,
         Err(e) => return internal(e),
     };
     let (request_id, code) = (record.request_id.clone(), record.code.clone());
-    let sender = crate::client_trust::sender_of(&state, from).await;
+    // The per-process bound counts a shared connection against its lowest
+    // holder; trust needs exactly one ([`crate::client_trust::sender_of`]).
+    let from = holders.first().copied();
+    let sender = crate::client_trust::sender_of(&state, &holders).await;
     match add_pending(&state, record, from, now) {
         Ok(true) => {
             let peer = peer.map(|axum::extract::ConnectInfo(p)| p);
@@ -1867,16 +1886,16 @@ pub(crate) async fn pair_handler(
     }
 }
 
-/// A new pending request for `req`, and the process it came from when that
-/// can be told ([`peer_process_of`]).
+/// A new pending request for `req`, and the processes holding the
+/// connection it came on, as far as that can be told ([`peer_holders_of`]).
 async fn new_request(
     state: &ClientServerState,
     req: PairBody,
     peer: Option<axum::extract::ConnectInfo<SocketAddr>>,
     now: u64,
-) -> Result<(PendingRequest, Option<u32>)> {
+) -> Result<(PendingRequest, Vec<u32>)> {
     let request_id = format!("r-{}", random_hex(16)?);
-    let from = peer_process_of(state, peer).await;
+    let from = peer_holders_of(state, peer).await;
     let record = PendingRequest {
         request_id,
         device_name: req.device_name,
@@ -1891,14 +1910,17 @@ async fn new_request(
     Ok((record, from))
 }
 
-/// The process on this machine a pairing request came from, when that can
-/// be told, from a round ([`PeerRounds`]) that began after it arrived: the
-/// one that finished while it queued, else one it runs itself, off the
-/// async workers, for every request waiting. A request whose sender went
-/// away while it queued is dropped before it starts a round.
-pub(crate) async fn peer_process_of(state: &ClientServerState, peer: Option<axum::extract::ConnectInfo<SocketAddr>>) -> Option<u32> {
+/// Every process on this machine holding the connection a pairing request
+/// came on (empty when that cannot be told), from a round ([`PeerRounds`])
+/// that began after it arrived: the one that finished while it queued, else
+/// one it runs itself, off the async workers, for every request waiting. A
+/// request whose sender went away while it queued is dropped before it
+/// starts a round.
+pub(crate) async fn peer_holders_of(state: &ClientServerState, peer: Option<axum::extract::ConnectInfo<SocketAddr>>) -> Vec<u32> {
     use std::sync::atomic::Ordering::SeqCst;
-    let axum::extract::ConnectInfo(p) = peer?;
+    let Some(axum::extract::ConnectInfo(p)) = peer else {
+        return Vec::new();
+    };
     let rounds = state.pair_lookups.clone();
     let _waiting = Waiting::new(&rounds, p);
     let arrived = rounds.begun.load(SeqCst);
@@ -1914,12 +1936,12 @@ pub(crate) async fn peer_process_of(state: &ClientServerState, peer: Option<axum
     tokio::task::spawn_blocking(move || {
         let _one_round_at_a_time = turn;
         let found = (st.peer_processes)(st.bound, &wanted).unwrap_or_default();
-        let pid = found.get(&p).copied();
+        let holders = found.get(&p).cloned().unwrap_or_default();
         *r.last.lock().unwrap() = (round, found);
-        pid
+        holders
     })
     .await
-    .unwrap_or(None)
+    .unwrap_or_default()
 }
 
 /// Stores a new pairing request from process `from` under the bounds

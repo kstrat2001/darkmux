@@ -407,13 +407,14 @@ fn harness() -> Harness {
 /// The process at each of `wanted`'s ends, as the harness tells it: the app
 /// is pid 100 (any port); `CONTAINER_PEER_PORTS..` are Docker's process
 /// (pid 900); `UNKNOWN_PEER_PORTS..` cannot be told.
-fn test_peer_processes(wanted: &[SocketAddr]) -> HashMap<SocketAddr, u32> {
+fn test_peer_processes(wanted: &[SocketAddr]) -> HashMap<SocketAddr, Vec<u32>> {
     wanted
         .iter()
         .filter_map(|peer| match peer.port() {
+            p if p >= SHARED_PEER_PORTS => Some((*peer, vec![100, 555])),
             p if p >= UNKNOWN_PEER_PORTS => None,
-            p if p >= CONTAINER_PEER_PORTS => Some((*peer, 900)),
-            _ => Some((*peer, 100)),
+            p if p >= CONTAINER_PEER_PORTS => Some((*peer, vec![900])),
+            _ => Some((*peer, vec![100])),
         })
         .collect()
 }
@@ -426,6 +427,9 @@ const BOUND: &str = "127.0.0.1:8767";
 const CONTAINER_PEER_PORTS: u16 = 20_000;
 /// Peer ports whose process the harness cannot tell.
 const UNKNOWN_PEER_PORTS: u16 = 30_000;
+/// (#3544) Peer ports whose connection two processes hold: the app (pid
+/// 100) and another (pid 555) it was handed to, or that inherited it.
+const SHARED_PEER_PORTS: u16 = 40_000;
 
 /// A request as this machine's app sends it: from a loopback peer, with a
 /// `Host` naming the listener (each added only when the test set none).
@@ -7355,7 +7359,7 @@ fn the_production_peer_lookup_answers_the_peers_asked_about() {
     let _accepted = [listener.accept().unwrap(), listener.accept().unwrap()];
     let asked = clients[0].local_addr().unwrap();
     let found = peer_processes_here(Some(local), &[asked]).unwrap();
-    assert_eq!(found, HashMap::from([(asked, std::process::id())]));
+    assert_eq!(found, HashMap::from([(asked, vec![std::process::id()])]));
     assert_eq!(peer_processes_here(None, &[asked]), None);
 }
 
@@ -8225,8 +8229,62 @@ async fn a_recheck_that_finds_another_signed_app_does_not_approve() {
 async fn a_sender_with_no_process_is_unverified() {
     let h = harness();
     h.app_signs_as(vec![Ok(mux_bot())]);
-    let (sender, _) = crate::client_trust::sender_of(&h.state, None).await;
+    let (sender, _) = crate::client_trust::sender_of(&h.state, &[]).await;
     assert!(matches!(sender, crate::client_trust::Sender::Unverified(_)), "{sender:?}");
+}
+
+/// (#3544) A connection two processes hold never verifies, even when the
+/// app holding it is a verified Mux Bot: the other may be the one that
+/// wrote the request. It gets the dialog, which names no signer.
+#[tokio::test]
+async fn a_connection_held_by_two_processes_never_verifies() {
+    let h = harness();
+    h.app_signs_as(vec![Ok(mux_bot())]);
+    let (code, v) = call(&h, pair_from(SHARED_PEER_PORTS, "4F7-K2Q")).await;
+    assert_eq!(code, 202);
+    let id = v["request_id"].as_str().unwrap().to_string();
+    let message = dialog_shown(&h, 1).await;
+    assert_eq!(h.status(&id), Some(PendingStatus::Pending));
+    assert!(message.contains("Not signed by a known developer."), "{message}");
+    assert!(h.trust.notices.lock().unwrap().is_empty());
+}
+
+/// Two holders, one of them a verified Mux Bot, is judged unverified at the
+/// first look, before any re-check.
+#[tokio::test]
+async fn two_holders_one_verified_is_not_trusted() {
+    let h = harness();
+    h.app_signs_as(vec![Ok(mux_bot())]);
+    let (sender, _) = crate::client_trust::sender_of(&h.state, &[100, 555]).await;
+    assert!(matches!(sender, crate::client_trust::Sender::Unverified(ref why) if why.contains("held by 2 processes")), "{sender:?}");
+    let (sender, _) = crate::client_trust::sender_of(&h.state, &[100]).await;
+    assert!(matches!(sender, crate::client_trust::Sender::Trusted(..)), "one holder verifies: {sender:?}");
+}
+
+/// The re-check finds a second holder (the connection was shared after
+/// the first look): not approved.
+#[tokio::test]
+async fn a_connection_shared_by_the_recheck_does_not_approve() {
+    let mut h = harness();
+    h.app_signs_as(vec![Ok(mux_bot())]);
+    let looks = Arc::new(AtomicU64::new(0));
+    let l = looks.clone();
+    h.state.peer_processes = Arc::new(move |_bound, wanted| {
+        let holders = if l.fetch_add(1, Ordering::SeqCst) == 0 { vec![100] } else { vec![100, 555] };
+        Some(wanted.iter().map(|p| (*p, holders.clone())).collect())
+    });
+    let id = request_pairing(&h).await;
+    let _ = dialog_shown(&h, 1).await;
+    assert_eq!(h.status(&id), Some(PendingStatus::Pending));
+}
+
+#[test]
+fn a_peers_holders_are_grouped_sorted_and_counted_once() {
+    let a: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+    let b: SocketAddr = "127.0.0.1:5001".parse().unwrap();
+    let by_peer = holders_by_peer([(a, 7), (b, 3), (a, 2), (a, 7)].into_iter());
+    assert_eq!(by_peer[&a], [2, 7]);
+    assert_eq!(by_peer[&b], [3]);
 }
 
 /// The re-check also looks at the connection again: held by another
@@ -8239,7 +8297,7 @@ async fn a_connection_held_by_another_process_at_the_recheck_does_not_approve() 
     let l = looks.clone();
     h.state.peer_processes = Arc::new(move |_bound, wanted| {
         let pid = if l.fetch_add(1, Ordering::SeqCst) == 0 { 100 } else { 101 };
-        Some(wanted.iter().map(|p| (*p, pid)).collect())
+        Some(wanted.iter().map(|p| (*p, vec![pid])).collect())
     });
     let id = request_pairing(&h).await;
     let _ = dialog_shown(&h, 1).await;
@@ -8528,5 +8586,20 @@ fn a_signing_identity_is_written_and_read_as_team_slash_bundle() {
     assert_eq!(id.to_string(), "AAAAAAAAAA/com.example.muxfork");
     for bad in ["", "AAAAAAAAAA", "/com.example", "AAAAAAAAAA/"] {
         assert_eq!(SigningIdentity::parse(bad), None, "{bad}");
+    }
+}
+
+/// (#3544) The real lookup against a listener you run, printing every
+/// process holding each connection to it:
+/// `DARKMUX_PEER_LISTENER=127.0.0.1:<port> cargo nextest run -p darkmux-serve
+/// peer_holders_live --run-ignored only --no-capture`.
+#[test]
+#[ignore = "reads this machine's real connections; pass DARKMUX_PEER_LISTENER"]
+fn peer_holders_live() {
+    let local: SocketAddr = std::env::var("DARKMUX_PEER_LISTENER").expect("DARKMUX_PEER_LISTENER").parse().unwrap();
+    let all = darkmux_platform::current().tcp_peers_of(local).expect("lsof answers");
+    let peers: Vec<SocketAddr> = all.iter().map(|(p, _)| *p).collect();
+    for (peer, holders) in peer_processes_here(Some(local), &peers).unwrap() {
+        println!("peer {peer}: held by {holders:?} -> {}", if holders.len() == 1 { "may verify" } else { "never verifies" });
     }
 }

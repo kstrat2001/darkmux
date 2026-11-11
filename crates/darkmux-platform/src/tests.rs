@@ -1299,7 +1299,7 @@ fn the_dialog_message_is_an_argument_never_script() {
         assert_eq!(flag, "-e");
         assert!(!line.contains("pwned"), "{line}");
     }
-    assert!(args.iter().filter(|a| *a == "-e").count() == 8);
+    assert!(args.iter().filter(|a| *a == "-e").count() == 11);
     let notice = macos::notice_args(hostile);
     assert_eq!(notice.last().unwrap(), hostile);
     assert!(notice[..notice.len() - 2].iter().all(|a| !a.contains("pwned")));
@@ -1361,7 +1361,8 @@ fn allow_dialog_live() {
     assert!(std::env::var_os("DARKMUX_SHOW_ALLOW_DIALOG").is_some(), "set DARKMUX_SHOW_ALLOW_DIALOG=1");
     let message = std::env::var("DARKMUX_ALLOW_DIALOG_TEXT").unwrap_or_else(|_| "An app wants to use darkmux on this Mac. Code 4F7-K2Q.".into());
     let icon = std::env::var_os("DARKMUX_ALLOW_DIALOG_ICON").map(std::path::PathBuf::from);
-    println!("answer: {:?}", current().ask_allow(&message, icon.as_deref(), 15));
+    let secs = std::env::var("DARKMUX_ALLOW_DIALOG_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(15);
+    println!("answer: {:?}", current().ask_allow(&message, icon.as_deref(), secs));
 }
 
 /// A verified app is shown with its bundle's own icon, looked up from the
@@ -1426,6 +1427,11 @@ fn the_icon_path_is_an_argument_and_caution_is_the_fallback() {
     let script: Vec<&String> = args.iter().zip(args.iter().skip(1)).filter(|(f, _)| *f == "-e").map(|(_, l)| l).collect();
     assert!(script.iter().all(|l| !l.contains("do shell script")));
     assert!(script.iter().any(|l| l.contains("with icon caution")));
+    // Return and Esc both mean Don't Allow: it is the default and the cancel
+    // button, and a cancel (-128) is answered as Don't Allow.
+    assert!(script.iter().all(|l| !l.contains("default button \"Allow\"")));
+    assert!(script.iter().any(|l| l.contains("default button \"Don't Allow\" cancel button \"Don't Allow\"")));
+    assert!(script.iter().any(|l| l.as_str() == "if n is -128 then return \"Don't Allow\""));
     assert_eq!(macos::allow_dialog_args("m", None, 15).len(), args.len() - 1, "no icon, no argument");
 }
 
