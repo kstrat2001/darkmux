@@ -149,8 +149,9 @@ fn each_prefix_reaps_only_its_own_containers() {
         1,
         "the dispatch reaper's rule is unchanged"
     );
-    let args = docker_ps_args_named(PREVIEW_CONTAINER_PREFIX);
-    assert_eq!(args[..3], ["ps", "--filter", "name=^darkmux-preview-"]);
+    let query = host_query(PREVIEW_CONTAINER_PREFIX);
+    assert_eq!(query.having, darkmux_sandbox::Having::NamePrefix("darkmux-preview-".into()));
+    assert!(!query.stopped_too, "a reaper lists running sandboxes only");
 }
 
 /// (#3456) The host labels as `key=value`, the form a container spec
@@ -182,7 +183,7 @@ fn an_unknown_machine_identity_reaps_nothing() {
 fn parse_reads_labels_and_treats_empty_as_absent() {
     let out =
         "darkmux-dispatch-a\t200\t1000\tMACHINE-A\tpid:4026531836\ndarkmux-dispatch-b\t\t\t\t\n\n";
-    let got = parse_docker_ps(out);
+    let got = listed_containers(darkmux_sandbox::backend().parse_list(&host_query(DISPATCH_CONTAINER_PREFIX), out));
     assert_eq!(
         got,
         vec![
@@ -279,8 +280,11 @@ fn restore_path(prev: Option<String>) {
     }
 }
 
-/// One tick against a fake docker: it lists dispatch containers only, kills
-/// exactly the orphan, and leaves the live host's and the unlabeled one.
+/// One tick against a fake docker: it lists dispatch containers only,
+/// removes exactly the orphan, and leaves the live host's and the unlabeled
+/// one. (#3112) Through the sandbox backend's `kill`, whose success, like
+/// `docker kill`'s, means the container was running: the reaper's "killed"
+/// line names only a container it actually ended.
 #[test]
 #[serial]
 fn a_tick_lists_once_and_kills_only_the_orphan() {
@@ -307,9 +311,14 @@ fn a_tick_lists_once_and_kills_only_the_orphan() {
     let calls = std::fs::read_to_string(&record).unwrap();
     let calls: Vec<&str> = calls.lines().collect();
     assert_eq!(calls.len(), 2, "one ps, one kill: {calls:?}");
-    assert!(
-        calls[0].starts_with("ps --filter name=^darkmux-dispatch- --format"),
-        "{calls:?}"
+    assert_eq!(
+        calls[0],
+        "ps --filter name=^darkmux-dispatch- --format {{.Names}}\t\
+         {{.Label \"darkmux.dispatch.host-pid\"}}\t\
+         {{.Label \"darkmux.dispatch.host-start\"}}\t\
+         {{.Label \"darkmux.dispatch.host-machine\"}}\t\
+         {{.Label \"darkmux.dispatch.host-pid-ns\"}}",
+        "the listing: running containers named for dispatch, name then the four host labels"
     );
     assert_eq!(calls[1], "kill darkmux-dispatch-dead");
 }

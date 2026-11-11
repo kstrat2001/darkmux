@@ -4,7 +4,7 @@
 //! the cadence and the log.
 //!
 //! Same dedicated-`std::thread` shape and stop flag as `host_sampler`. One
-//! bounded `docker ps` per tick; a `docker kill` only for an orphan. It
+//! bounded listing per tick; a `docker kill` only for an orphan. It
 //! writes no flow record: each reaped container gets one log line naming it
 //! and its dead host pid, so an operator who sees a container vanish can
 //! find why. The dispatch it belonged to keeps the terminal state the read

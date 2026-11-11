@@ -76,6 +76,9 @@ pub struct SandboxPolicy {
     pub labels: Vec<(String, String)>,
     /// In order: a later mount at a nested path is layered over an earlier.
     pub mounts: Vec<Mount>,
+    /// Ports the host reaches on its loopback, at the same number, and on
+    /// no other address.
+    pub ports: Vec<u16>,
     /// `uid:gid` to run as; `None` keeps the image's user.
     pub user: Option<String>,
     /// The whole environment the policy adds, each `KEY=value`; nothing of
@@ -104,11 +107,45 @@ pub struct SandboxHandle {
     pub id: String,
 }
 
-/// One sandbox a listing found carrying a label, and that label's value.
+/// Which sandboxes a listing returns.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Labeled {
+pub enum Having {
+    /// Those carrying this label key, whatever its value.
+    Label(String),
+    /// Those whose name starts with this.
+    NamePrefix(String),
+}
+
+/// A listing: which sandboxes, whether stopped ones too, and which labels
+/// to read from each.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Query {
+    pub having: Having,
+    /// Sandboxes that have exited but not been removed, as well as running
+    /// ones.
+    pub stopped_too: bool,
+    /// The label keys whose values each [`Listed`] carries, in this order.
+    pub read: Vec<String>,
+}
+
+impl Query {
+    /// Every sandbox carrying `key`, running or not, with its value.
+    pub fn labeled(key: &str) -> Query {
+        Query { having: Having::Label(key.to_string()), stopped_too: true, read: vec![key.to_string()] }
+    }
+}
+
+/// One sandbox a listing found, with the value of each label its query
+/// read, in the query's order: `None` where the sandbox has none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
     pub handle: SandboxHandle,
-    pub value: String,
+    pub labels: Vec<Option<String>>,
+}
+
+/// The backend darkmux runs sandboxes through. Docker is the only one.
+pub fn backend() -> &'static dyn SandboxBackend {
+    &DockerBackend
 }
 
 /// A way to run a policy. Each method plans a process for the caller to
@@ -123,22 +160,45 @@ pub trait SandboxBackend: Send + Sync {
     /// [`remove`]: SandboxBackend::remove
     fn run(&self, policy: &SandboxPolicy) -> (Command, SandboxHandle);
 
+    /// The command that makes `policy`'s sandbox without starting it, and
+    /// its handle. Once that command succeeds, a [`remove`] finds it, and a
+    /// sandbox removed before it starts never runs. A [`stop`] is not
+    /// enough: it ends a running sandbox and leaves a created one to start
+    /// later, so a caller ending a created sandbox removes it.
+    ///
+    /// [`stop`]: SandboxBackend::stop
+    /// [`remove`]: SandboxBackend::remove
+    fn create(&self, policy: &SandboxPolicy) -> (Command, SandboxHandle);
+
+    /// The command that starts a created sandbox, attached until it exits.
+    fn start(&self, handle: &SandboxHandle) -> Command;
+
+    /// The command that asks the sandbox to end (SIGTERM to its tree) and
+    /// ends it after `grace` (whole seconds) if it has not.
+    fn stop(&self, handle: &SandboxHandle, grace: std::time::Duration) -> Command;
+
+    /// The command that ends `handle`'s sandbox at once (SIGKILL to its
+    /// tree). It succeeds only when the sandbox was running, so its success
+    /// is proof the sandbox was there; a sandbox that ends this way is
+    /// removed as any other is when it exits.
+    fn kill(&self, handle: &SandboxHandle) -> Command;
+
     /// The command that stops and removes `handle`'s sandbox, its whole
     /// process tree with it. Removing one already gone succeeds or fails
     /// harmlessly; either way it is gone.
     fn remove(&self, handle: &SandboxHandle) -> Command;
 
-    /// The command that lists every sandbox carrying a `key` label, running
-    /// or not; [`parse_labeled`] reads its output.
+    /// The command that lists the sandboxes `query` asks for;
+    /// [`parse_list`] reads its output.
     ///
-    /// [`parse_labeled`]: SandboxBackend::parse_labeled
-    fn list_labeled(&self, key: &str) -> Command;
+    /// [`parse_list`]: SandboxBackend::parse_list
+    fn list(&self, query: &Query) -> Command;
 
-    /// The sandboxes in [`list_labeled`]'s output, each with the label's
-    /// value as listed.
+    /// The sandboxes in [`list`]'s output for `query`, each with one value
+    /// per label `query` reads.
     ///
-    /// [`list_labeled`]: SandboxBackend::list_labeled
-    fn parse_labeled(&self, listing: &str) -> Vec<Labeled>;
+    /// [`list`]: SandboxBackend::list
+    fn parse_list(&self, query: &Query, listing: &str) -> Vec<Listed>;
 }
 
 #[cfg(test)]
