@@ -10,6 +10,7 @@
 //! should ever select.
 
 use crate::bounded_command::{run_bounded, Bounded};
+use darkmux_sandbox::{Access, DockerBackend, Limits, Mount, Network, SandboxBackend, SandboxHandle, SandboxPolicy};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -77,55 +78,57 @@ pub struct Run<'a> {
     pub name_prefix: &'a str,
 }
 
-/// `docker run` arguments for a run in a container.
-pub fn container_args(image: &str, name: &str, run: &Run) -> Vec<String> {
-    use crate::dispatch_internal::{DOCKER_CAP_DROP, DOCKER_MEMORY, DOCKER_PIDS_LIMIT, DOCKER_SECURITY_OPT};
-    let mut args: Vec<String> = ["run", "--rm", "--init", "--name", name, "--network", "none"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    args.extend([
-        // (#2973 review) The coder container's own limits: model-written
-        // code here is no more trusted than the coder's.
-        format!("--cap-drop={DOCKER_CAP_DROP}"),
-        format!("--security-opt={DOCKER_SECURITY_OPT}"),
-        format!("--pids-limit={DOCKER_PIDS_LIMIT}"),
-        format!("--memory={DOCKER_MEMORY}"),
-        "--label".to_string(),
-        format!("{PID_LABEL}={}", std::process::id()),
-        "-v".to_string(),
-        format!("{}:/workspace", run.tree.display()),
-    ]);
+/// (#3112) The backend a contained run goes through. Docker is the only one.
+fn backend() -> &'static dyn SandboxBackend {
+    &DockerBackend
+}
+
+/// (#3112) What a run's container may see and do: the tree at `/workspace`,
+/// the mount check beside it read-only, the named mounts read-write, no
+/// network, the coder container's limits, the owner's pid as a label, and
+/// `sh` running the command behind the mount check.
+pub fn policy(image: &str, name: &str, run: &Run) -> SandboxPolicy {
+    use crate::dispatch_internal::{DOCKER_MEMORY, DOCKER_PIDS_LIMIT};
+    let read_write = |host: &Path, at: &str| Mount { host: host.to_path_buf(), at: at.to_string(), access: Access::ReadWrite };
+    let mut mounts = vec![read_write(run.tree, "/workspace")];
     if let Some(sentinel_dir) = sentinel_dir_for(name, run.tree) {
-        args.extend(["-v".to_string(), format!("{}:{SENTINEL_AT}:ro", sentinel_dir.display())]);
+        mounts.push(Mount { host: sentinel_dir, at: SENTINEL_AT.to_string(), access: Access::ReadOnly });
     }
-    for (host, at) in run.mounts {
-        args.extend(["-v".to_string(), format!("{}:{at}", host.display())]);
-    }
-    if let Some(user) = &run.user {
-        // The image's home belongs to the image's own user.
-        args.extend([format!("--user={user}"), "-e".to_string(), "HOME=/tmp".to_string()]);
-    }
+    mounts.extend(run.mounts.iter().map(|(host, at)| read_write(host, at)));
     let workdir = match run.workdir.trim_matches('/') {
         "" => "/workspace".to_string(),
         rel => format!("/workspace/{rel}"),
     };
-    args.extend([
-        "-w".to_string(),
-        workdir,
+    SandboxPolicy {
+        name: name.to_string(),
+        image: image.to_string(),
+        network: Network::None,
+        // (#2973 review) The coder container's own limits: model-written
+        // code here is no more trusted than the coder's.
+        limits: Limits { memory: Some(DOCKER_MEMORY.to_string()), pids: Some(DOCKER_PIDS_LIMIT) },
+        labels: vec![(PID_LABEL.to_string(), std::process::id().to_string())],
+        mounts,
+        user: run.user.clone(),
+        // The image's home belongs to the image's own user.
+        env: run.user.iter().map(|_| ("HOME".to_string(), "/tmp".to_string())).collect(),
+        workdir: Some(workdir),
         // The image's own entrypoint never wraps the command (the darkmux
         // runtime image's would take `sh -c` as its arguments).
-        "--entrypoint".to_string(),
-        "sh".to_string(),
-        image.to_string(),
-        "-c".to_string(),
-        format!(
-            "test -f {SENTINEL_AT}/{SENTINEL} || {{ echo 'the tree was not mounted: the Docker daemon cannot see the host path' >&2; exit {DOCKER_RUN_FAILED}; }}\n\
-             echo '{STARTED_LINE}'\n{}",
-            run.command
-        ),
-    ]);
-    args
+        entrypoint: Some("sh".to_string()),
+        command: vec![
+            "-c".to_string(),
+            format!(
+                "test -f {SENTINEL_AT}/{SENTINEL} || {{ echo 'the tree was not mounted: the Docker daemon cannot see the host path' >&2; exit {DOCKER_RUN_FAILED}; }}\n\
+                 echo '{STARTED_LINE}'\n{}",
+                run.command
+            ),
+        ],
+    }
+}
+
+/// `docker run` arguments for a run in a container.
+pub fn container_args(image: &str, name: &str, run: &Run) -> Vec<String> {
+    DockerBackend::run_args(&policy(image, name, run))
 }
 
 /// The command to spawn, and the container's name when it runs in one.
@@ -140,9 +143,8 @@ pub fn command(placement: &Placement, run: &Run) -> (Command, Option<String>) {
             static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let name = format!("{}-{}-{n}", run.name_prefix, std::process::id());
-            let mut cmd = Command::new("docker");
-            cmd.args(container_args(image, &name, run));
-            (cmd, Some(name))
+            let (cmd, handle) = backend().run(&policy(image, &name, run));
+            (cmd, Some(handle.id))
         }
     }
 }
@@ -211,14 +213,13 @@ pub fn orphaned_containers(listed: &[(String, Option<u32>)], alive: impl Fn(u32)
 /// Remove containers whose owner is gone. Best effort and bounded: a Docker
 /// that cannot list them is the next `docker run`'s failure to name.
 pub fn reap_orphaned_containers() {
-    let mut ps = Command::new("docker");
-    ps.args(["ps", "-a", "--filter", &format!("label={PID_LABEL}"), "--format", &format!("{{{{.Names}}}}\t{{{{.Label \"{PID_LABEL}\"}}}}")]);
-    let Bounded::Finished { success: true, stdout, .. } = run_bounded(ps, Duration::from_secs(30)) else {
+    let Bounded::Finished { success: true, stdout, .. } = run_bounded(backend().list_labeled(PID_LABEL), Duration::from_secs(30)) else {
         return;
     };
-    let listed: Vec<(String, Option<u32>)> = String::from_utf8_lossy(&stdout)
-        .lines()
-        .filter_map(|l| l.split_once('\t').map(|(n, p)| (n.to_string(), p.trim().parse().ok())))
+    let listed: Vec<(String, Option<u32>)> = backend()
+        .parse_labeled(&String::from_utf8_lossy(&stdout))
+        .into_iter()
+        .map(|l| (l.handle.id, l.value.trim().parse().ok()))
         .collect();
     for name in orphaned_containers(&listed, crate::host_sampler_lock::pid_alive) {
         remove_container(&name);
@@ -228,8 +229,8 @@ pub fn reap_orphaned_containers() {
 /// Stop and remove a container whose `docker run` client was killed. Best
 /// effort: a container already gone is the goal, not an error.
 pub fn remove_container(name: &str) {
-    let mut rm = Command::new("docker");
-    rm.args(["rm", "-f", name]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    let mut rm = backend().remove(&SandboxHandle { backend: backend().kind(), id: name.to_string() });
+    rm.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     let _ = run_bounded(rm, Duration::from_secs(30));
 }
 

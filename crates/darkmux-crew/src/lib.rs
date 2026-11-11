@@ -38,6 +38,10 @@ pub mod absence_backstop;
 // catch.
 #[cfg(test)]
 mod test_guard_conformance;
+// (#3112) What every sandbox backend must do, run against each one (opt-in:
+// it starts real sandboxes).
+#[cfg(test)]
+mod sandbox_conformance_tests;
 // (#1230 Packet 1) Bounded concurrent-dispatch executor over gestalt's
 // `plan_waves` — see the module doc. No production caller in this packet;
 // Packet 2's `run_step_graph` scheduler is the intended first consumer.
