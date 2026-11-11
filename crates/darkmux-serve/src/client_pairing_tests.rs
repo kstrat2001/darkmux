@@ -8004,3 +8004,188 @@ fn a_file_whose_status_git_cannot_read_is_not_edited() {
     let refused = refuse_unless_clean(&not_a_repo, "page.html").expect_err("an unreadable status is not clean");
     assert_eq!(refused.status(), StatusCode::CONFLICT);
 }
+
+// ─── Added images (#3545) ────────────────────────────────────────────────
+
+/// A tiny PNG's bytes (the signature is what darkmux checks), and as base64.
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+
+fn b64(bytes: &[u8]) -> String {
+    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for c in bytes.chunks(3) {
+        let n = (c[0] as u32) << 16
+            | (*c.get(1).unwrap_or(&0) as u32) << 8
+            | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            if i <= c.len() {
+                out.push(A[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// A workspace with a page that shows one image, committed.
+fn image_workspace(h: &Harness) -> PathBuf {
+    let wt = git_workspace(h, "site");
+    std::fs::write(
+        wt.join("page.html"),
+        "<img src=\"/hero.jpg\" alt=\"\">\n<p>/two.jpg /two.jpg</p>\n",
+    )
+    .unwrap();
+    run_git(Some(&wt), &["add", "page.html"]);
+    run_git(Some(&wt), &["commit", "--quiet", "-m", "page"]);
+    wt
+}
+
+async fn add_image(h: &Harness, token: &str, body: Value) -> (u16, Value) {
+    let req = post("/client/workspaces/site/image", Some(token), body);
+    match tokio::time::timeout(EDIT_BOUND, call(h, req)).await {
+        Ok(reply) => reply,
+        Err(_) => {
+            eprintln!("adding an image did not end within {EDIT_BOUND:?}");
+            std::process::abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_image_sent_as_bytes_is_added_pointed_at_and_undone_like_a_run() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = image_workspace(&h);
+    let (code, v) = add_image(
+        &h,
+        &token,
+        serde_json::json!({"name": "../My Logo.png", "data": b64(PNG), "replace": "/hero.jpg"}),
+    )
+    .await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["matches"], 1);
+    let path = v["path"].as_str().unwrap().to_string();
+    let url = v["url"].as_str().unwrap().to_string();
+    assert!(
+        path.starts_with("public/images/my-logo-") && path.ends_with(".png"),
+        "{path}"
+    );
+    assert_eq!(url, path.trim_start_matches("public"));
+    assert_eq!(std::fs::read(wt.join(&path)).unwrap(), PNG);
+    assert_eq!(
+        std::fs::read_to_string(wt.join("page.html")).unwrap(),
+        format!("<img src=\"{url}\" alt=\"\">\n<p>/two.jpg /two.jpg</p>\n")
+    );
+    assert_eq!(
+        run_git(Some(&wt), &["status", "--porcelain"]),
+        "?? notes.txt",
+        "both committed, the owner's file stays out"
+    );
+    let id = v["work_id"].as_str().unwrap().to_string();
+    let done = status(&h, &token, &id).await;
+    assert_eq!(done["status"], "done", "{done}");
+    let (code, v) = call(
+        &h,
+        post(
+            &format!("/client/work/{id}/undo"),
+            Some(&token),
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 200, "{v}");
+    assert!(!wt.join(&path).exists(), "Undo takes the image out");
+    assert!(std::fs::read_to_string(wt.join("page.html"))
+        .unwrap()
+        .contains("/hero.jpg"));
+}
+
+#[tokio::test]
+async fn an_image_without_replace_is_only_added_and_the_same_image_twice_is_kept() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = image_workspace(&h);
+    let body = serde_json::json!({"name": "photo.png", "data": b64(PNG)});
+    let (code, v) = add_image(&h, &token, body.clone()).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["matches"], Value::Null);
+    assert!(v["work_id"].is_string(), "{v}");
+    let head = run_git(Some(&wt), &["rev-parse", "HEAD"]);
+    let (code, again) = add_image(&h, &token, body).await;
+    assert_eq!(code, 200, "{again}");
+    assert_eq!(again["path"], v["path"]);
+    assert_eq!(again["work_id"], Value::Null, "nothing new to commit");
+    assert_eq!(run_git(Some(&wt), &["rev-parse", "HEAD"]), head);
+}
+
+#[tokio::test]
+async fn an_image_whose_reference_is_found_zero_or_several_times_changes_nothing() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = image_workspace(&h);
+    let head = run_git(Some(&wt), &["rev-parse", "HEAD"]);
+    for (replace, n) in [("/two.jpg", 2), ("/nowhere.jpg", 0)] {
+        let (code, v) = add_image(
+            &h,
+            &token,
+            serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": replace}),
+        )
+        .await;
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(v["matches"], n, "{replace}: {v}");
+        assert_eq!(v["work_id"], Value::Null);
+    }
+    assert_eq!(run_git(Some(&wt), &["rev-parse", "HEAD"]), head);
+    assert!(!wt.join("public").exists(), "no image left behind");
+}
+
+#[tokio::test]
+async fn an_image_refuses_what_is_not_one_and_never_writes_through_a_link() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = image_workspace(&h);
+    let svg = b64(b"<svg xmlns='http://www.w3.org/2000/svg'><script>x()</script></svg>");
+    let (code, v) = add_image(
+        &h,
+        &token,
+        serde_json::json!({"name": "a.svg", "data": svg}),
+    )
+    .await;
+    assert_eq!(code, 415, "{v}");
+    let (code, _) = add_image(
+        &h,
+        &token,
+        serde_json::json!({"name": "a.png", "data": "not base64!"}),
+    )
+    .await;
+    assert_eq!(code, 400);
+    let (code, _) = add_image(
+        &h,
+        &token,
+        serde_json::json!({"name": "a.png", "data": b64(PNG), "path": "x"}),
+    )
+    .await;
+    assert_eq!(code, 400, "unknown keys are refused");
+    let big = b64(&[PNG, &vec![0u8; crate::client_image::MAX_IMAGE_BYTES]].concat());
+    let (code, _) = add_image(
+        &h,
+        &token,
+        serde_json::json!({"name": "a.png", "data": big}),
+    )
+    .await;
+    assert_eq!(code, 413);
+    // A link where the folder should be: refused, nothing written outside.
+    let outside = h.base.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::create_dir_all(wt.join("public")).unwrap();
+    std::os::unix::fs::symlink(&outside, wt.join("public/images")).unwrap();
+    let (code, v) = add_image(
+        &h,
+        &token,
+        serde_json::json!({"name": "a.png", "data": b64(PNG)}),
+    )
+    .await;
+    assert_eq!(code, 409, "{v}");
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+}

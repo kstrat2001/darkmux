@@ -4213,7 +4213,23 @@ fn edit_checked(
     let work_id = format!("w-{}", random_hex(8).map_err(|e| Box::new(internal(e)))?);
     let held = hold_for_edit(st, client, &dir, &wc, &work_id, edit_title(&old, &req.new))?;
     let outcome = edit_in(st, &wc, &old, &req.new, &work_id);
-    held.finish(outcome)
+    let landed = held.finish(outcome)?;
+    Ok(EditReply {
+        matches: 1,
+        work_id: Some(landed.work_id),
+        file: landed.files.into_iter().next(),
+        commit: Some(landed.commit),
+        branch: Some(landed.branch),
+    })
+}
+
+/// What a hand edit or an added image committed: its work record, the files
+/// (the first is the one it was for), the short commit, the branch.
+struct Landed {
+    work_id: String,
+    files: Vec<String>,
+    commit: String,
+    branch: String,
 }
 
 /// A hand edit registered as running in its work copy ([`busy_copy`]), so
@@ -4231,7 +4247,7 @@ struct EditHold {
 impl EditHold {
     /// The edit's work record once [`edit_in`] ended: done with its commit,
     /// or gone when nothing was edited.
-    fn finish(mut self, outcome: Result<EditDone, Refused>) -> Result<EditReply, Refused> {
+    fn finish(mut self, outcome: Result<EditDone, Refused>) -> Result<Landed, Refused> {
         let now = (self.now)();
         let mut works = self.works.lock().unwrap();
         self.ended = true;
@@ -4242,12 +4258,11 @@ impl EditHold {
                 return Err(r);
             }
         };
-        let reply = EditReply {
-            matches: 1,
-            work_id: Some(self.id.clone()),
-            file: Some(done.file.clone()),
-            commit: Some(short(&done.commit)),
-            branch: Some(done.branch.clone()),
+        let reply = Landed {
+            work_id: self.id.clone(),
+            files: done.files.clone(),
+            commit: short(&done.commit),
+            branch: done.branch.clone(),
         };
         if let Some(e) = works.get_mut(&self.id) {
             record_edit(e, done, now);
@@ -4338,20 +4353,22 @@ fn hold_for_edit(
 /// The edit's work record once it landed: done, with its commit.
 fn record_edit(e: &mut WorkEntry, done: EditDone, now: u64) {
     e.status = WorkStatus::Done {
-        result: serde_json::json!({"hand_edit": {"file": done.file}}),
+        result: done.result,
         changes: done.changes,
         changes_error: done.changes_error,
     };
     e.finished = Some(now);
     e.baseline = Some(done.baseline);
-    e.files = vec![done.file];
+    e.files = done.files;
     e.commit = Some(done.commit);
     e.branch = Some(done.branch);
 }
 
 /// What a hand edit that landed did.
 struct EditDone {
-    file: String,
+    /// The work record's `result`.
+    result: serde_json::Value,
+    files: Vec<String>,
     commit: String,
     branch: String,
     baseline: String,
@@ -4476,7 +4493,8 @@ fn write_and_commit(
         )
     })?;
     Ok(EditDone {
-        file,
+        result: serde_json::json!({"hand_edit": {"file": file}}),
+        files: vec![file],
         commit,
         branch,
         baseline: before.tree,
@@ -4513,6 +4531,293 @@ fn edit_title(old: &str, new: &str) -> String {
         }
     };
     format!("\"{}\" to \"{}\"", cut(old), cut(new))
+}
+
+// ─── Added images (#3545) ────────────────────────────────────────────────
+
+/// The largest body the image route reads: the largest image as base64,
+/// plus room for the other fields. Only this route reads this much.
+const MAX_IMAGE_BODY_BYTES: usize =
+    crate::client_image::MAX_IMAGE_BYTES.div_ceil(3) * 4 + 64 * 1024;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImageBody {
+    /// The picked file's name: only a hint for the name darkmux gives it.
+    name: String,
+    /// The image's bytes, base64.
+    data: String,
+    /// The image reference as the page reads it (an `<img>`'s `src`
+    /// attribute): its one place in the tracked files is pointed at the new
+    /// image, in the same commit.
+    #[serde(default)]
+    replace: Option<String>,
+}
+
+/// `POST /client/workspaces/{name}/image` (#3545): an image a person picked
+/// on the device the app runs on, sent as bytes (never a path: darkmux
+/// never reads a file a client names). darkmux checks what it is (PNG,
+/// JPEG, GIF, WebP; [`crate::client_image::sniff`]), names it itself under
+/// [`crate::client_image::IMAGE_FOLDER`], and commits it as a work record
+/// with no model, like a hand edit, so `/client/work/{id}/undo` reverts it.
+/// With `replace`, the one place that holds that reference now points at
+/// the image; found zero times or more than once, nothing changes and the
+/// reply says how many.
+pub(crate) async fn workspace_image_handler(
+    State(state): State<ClientServerState>,
+    ClientPath(name): ClientPath<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let client = match authenticate(&state, &headers) {
+        Ok(c) => c,
+        Err(r) => return *r,
+    };
+    let bytes = match axum::body::to_bytes(body, MAX_IMAGE_BODY_BYTES).await {
+        Ok(b) => b,
+        Err(_) => {
+            return err(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                ClientCode::PayloadTooLarge,
+                format!(
+                    "an image is at most {} MB",
+                    crate::client_image::MAX_IMAGE_BYTES / (1024 * 1024)
+                ),
+            )
+        }
+    };
+    let req: ImageBody = match serde_json::from_slice(&bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                ClientCode::BadRequest,
+                format!("bad JSON body: {e}"),
+            )
+        }
+    };
+    let st = state.clone();
+    tokio::task::spawn_blocking(move || match image_checked(&st, &client, &name, &req) {
+        Ok(reply) => Json(reply).into_response(),
+        Err(r) => *r,
+    })
+    .await
+    .unwrap_or_else(|e| internal(anyhow!("adding an image panicked: {e}")))
+}
+
+/// The image's bytes and kind, and the reference to point at it, once the
+/// body is checked.
+fn image_input(req: &ImageBody) -> Result<(Vec<u8>, &'static str, Option<String>), Refused> {
+    use crate::client_image::{decode_base64, sniff, MAX_IMAGE_BYTES};
+    clean_text(&req.name, "name", 0, 255)?;
+    let bytes = decode_base64(&req.data).ok_or_else(|| {
+        refuse(
+            StatusCode::BAD_REQUEST,
+            ClientCode::BadRequest,
+            "`data` must be base64",
+        )
+    })?;
+    if bytes.len() > MAX_IMAGE_BYTES {
+        return Err(refuse(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            ClientCode::PayloadTooLarge,
+            format!("an image is at most {} MB", MAX_IMAGE_BYTES / (1024 * 1024)),
+        ));
+    }
+    let kind = sniff(&bytes).ok_or_else(|| {
+        refuse(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ClientCode::UnsupportedMediaType,
+            "`data` must be a PNG, JPEG, GIF or WebP image",
+        )
+    })?;
+    let replace = match &req.replace {
+        None => None,
+        Some(r) => {
+            let r = crate::client_edit::normalize(r);
+            if r.is_empty() || r.chars().count() > MAX_EDIT_OLD_CHARS {
+                return Err(refuse(
+                    StatusCode::BAD_REQUEST,
+                    ClientCode::BadRequest,
+                    format!("`replace` must hold text, at most {MAX_EDIT_OLD_CHARS} characters"),
+                ));
+            }
+            Some(r)
+        }
+    };
+    Ok((bytes, kind, replace))
+}
+
+/// [`workspace_image_handler`], blocking, with every refusal an `Err`.
+fn image_checked(
+    st: &ClientServerState,
+    client: &ApprovedClient,
+    name: &str,
+    req: &ImageBody,
+) -> Result<ImageReply, Refused> {
+    let (bytes, kind, replace) = image_input(req)?;
+    let dir = owned_workspace(st, client, name)?;
+    let wc = work_copy_for(st, &dir).ok_or_else(|| {
+        refuse(
+            StatusCode::CONFLICT,
+            ClientCode::Conflict,
+            "darkmux holds no repository for this workspace",
+        )
+    })?;
+    let _in_use = held_work_copy(st, Some(&wc))?;
+    let file_name = crate::client_image::file_name(&req.name, &bytes, kind);
+    let image = Image {
+        path: format!("{}/{file_name}", crate::client_image::IMAGE_FOLDER),
+        url: format!("/images/{file_name}"),
+        bytes,
+    };
+    let work_id = format!("w-{}", random_hex(8).map_err(|e| Box::new(internal(e)))?);
+    let held = hold_for_edit(
+        st,
+        client,
+        &dir,
+        &wc,
+        &work_id,
+        format!("image {file_name}"),
+    )?;
+    let outcome = image_in(st, &wc, &image, replace.as_deref(), &work_id);
+    let landed = held.finish(outcome)?;
+    Ok(ImageReply {
+        matches: replace.map(|_| 1),
+        path: Some(image.path),
+        url: Some(image.url),
+        work_id: Some(landed.work_id),
+        commit: Some(landed.commit),
+        branch: Some(landed.branch),
+    })
+}
+
+/// An image to add: where it goes, how the page reaches it, its bytes.
+struct Image {
+    path: String,
+    url: String,
+    bytes: Vec<u8>,
+}
+
+/// A reply sent with nothing committed: a `replace` found `matches` times
+/// (not once), or the same image already there and nothing to point at it.
+fn image_not_committed(matches: Option<u32>, image: Option<&Image>) -> Refused {
+    Box::new(
+        Json(ImageReply {
+            matches,
+            path: image.map(|i| i.path.clone()),
+            url: image.map(|i| i.url.clone()),
+            work_id: None,
+            commit: None,
+            branch: None,
+        })
+        .into_response(),
+    )
+}
+
+/// Writes the image (kept when the same bytes are already there), points
+/// the one place holding `replace` at it, and commits both; a failed step
+/// puts back what it changed.
+fn image_in(
+    st: &ClientServerState,
+    wc: &WorkCopy,
+    image: &Image,
+    replace: Option<&str>,
+    work_id: &str,
+) -> Result<EditDone, Refused> {
+    use crate::client_preview::at;
+    let conflict = |why: String| refuse(StatusCode::CONFLICT, ClientCode::Conflict, why);
+    let hit = match replace {
+        None => None,
+        Some(old) => {
+            let mut hits = find_in_tracked(wc, old)?;
+            if hits.len() != 1 {
+                return Err(image_not_committed(Some(hits.len() as u32), None));
+            }
+            Some(hits.remove(0))
+        }
+    };
+    if let Some((file, _, _)) = &hit {
+        refuse_unless_clean(wc, file)?;
+    }
+    onto_own_branch(st, Some(wc))?;
+    let already = match at::open_regular(&wc.work_tree, &image.path) {
+        Ok((file, _)) => {
+            use std::io::Read;
+            let mut held = Vec::new();
+            file.take(image.bytes.len() as u64 + 1)
+                .read_to_end(&mut held)
+                .map_err(|e| conflict(format!("darkmux didn't add {}: {e}", image.path)))?;
+            if held != image.bytes {
+                return Err(conflict(format!(
+                    "{} already holds a different file",
+                    image.path
+                )));
+            }
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(conflict(format!("darkmux didn't add {}: {e}", image.path))),
+    };
+    if already && hit.is_none() {
+        return Err(image_not_committed(None, Some(image)));
+    }
+    let before = snapshot_tree(wc)
+        .map_err(|e| Box::new(internal(anyhow!("reading the work copy failed: {e}"))))?;
+    if !already {
+        at::write_new_making_folders(&wc.work_tree, &image.path, &image.bytes, 0o644)
+            .map_err(|e| conflict(format!("darkmux didn't add {}: {e}", image.path)))?;
+    }
+    let put_back = |also: Option<&str>| {
+        if !already {
+            let _ = at::remove(&wc.work_tree, &image.path);
+        }
+        if let Some(f) = also {
+            let _ = git_quiet(wc, &["--literal-pathspecs", "checkout", "HEAD", "--", f]);
+        }
+    };
+    let mut files = vec![image.path.clone()];
+    if let Some((file, (start, end), text)) = &hit {
+        let edited = format!("{}{}{}", &text[..*start], image.url, &text[*end..]);
+        if let Err(e) = at::replace_regular(&wc.work_tree, file, text.as_bytes(), edited.as_bytes())
+        {
+            put_back(None);
+            return Err(conflict(format!("darkmux didn't edit {file}: {e}")));
+        }
+        files.push(file.clone());
+    }
+    let (changes, changes_error) = match changes_since(wc, &before.tree) {
+        Ok(c) => (Some(c), None),
+        Err(e) => (
+            None,
+            Some(format!("reading the image's changes failed: {e}")),
+        ),
+    };
+    let message = format!("image: {} (work {work_id})", image.path);
+    let (commit, branch) = commit_run(wc, &files, &message).map_err(|e| {
+        let _ = git_quiet(
+            wc,
+            &[
+                "--literal-pathspecs",
+                "reset",
+                "--quiet",
+                "HEAD",
+                "--",
+                &image.path,
+            ],
+        );
+        put_back(hit.as_ref().map(|(f, _, _)| f.as_str()));
+        conflict(format!("couldn't commit the image: {e}"))
+    })?;
+    Ok(EditDone {
+        result: serde_json::json!({"image": {"path": image.path, "url": image.url}}),
+        files,
+        commit,
+        branch,
+        baseline: before.tree,
+        changes,
+        changes_error,
+    })
 }
 
 // ─── Commits and Undo ────────────────────────────────────────────────────

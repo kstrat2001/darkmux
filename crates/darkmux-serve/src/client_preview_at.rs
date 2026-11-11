@@ -219,6 +219,64 @@ pub(crate) fn create_new(root: &Path, rel: &str, mode: u32) -> io::Result<File> 
     Ok(File::from(fd))
 }
 
+/// Writes `bytes` as the new file `rel` inside `root` with permission bits
+/// `mode`, making each missing folder on the way (`0o755`). No link is
+/// followed at any name; refused when anything is already at `rel`.
+pub(crate) fn write_new_making_folders(
+    root: &Path,
+    rel: &str,
+    bytes: &[u8],
+    mode: u32,
+) -> io::Result<()> {
+    use io::Write;
+    let parts = Path::new(rel)
+        .components()
+        .map(|c| match c {
+            Component::Normal(n) => Ok(n),
+            _ => Err(invalid("not a plain relative path")),
+        })
+        .collect::<io::Result<Vec<&OsStr>>>()?;
+    let (last, folders) = parts.split_last().ok_or_else(|| invalid("an empty path"))?;
+    let root = cstr(root.as_os_str())?;
+    // SAFETY: a valid NUL-terminated path; the fd is checked before use.
+    let fd = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `open` just returned this fd.
+    let mut at = unsafe { OwnedFd::from_raw_fd(fd) };
+    for folder in folders {
+        let c = cstr(folder)?;
+        // SAFETY: a valid NUL-terminated name and an fd we own.
+        if unsafe { libc::mkdirat(at.as_raw_fd(), c.as_ptr(), 0o755) } != 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() != io::ErrorKind::AlreadyExists {
+                return Err(e);
+            }
+        }
+        at = open_at(
+            at.as_raw_fd(),
+            folder,
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            0,
+        )?;
+    }
+    let mut out = File::from(open_at(
+        at.as_raw_fd(),
+        last,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+        mode,
+    )?);
+    out.write_all(bytes)?;
+    out.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    out.sync_all()
+}
+
 /// Opens the regular file `rel` inside `root` for reading, with its
 /// permission bits. Opened `O_NONBLOCK`, so a FIFO (or a device) there
 /// never waits for a writer before it is refused; blocking reads again once

@@ -16,6 +16,17 @@ darkmux release.
 
 ### Added
 
+- **An app can add a picture to a workspace (#3545).** `POST /client/workspaces/{name}/image`
+  takes `{"name", "data", "replace"?}`: the image's bytes as base64, never a path, so darkmux never
+  reads a file a client names. darkmux takes only PNG, JPEG, GIF and WebP, recognized by their first
+  bytes (never SVG, which can carry script), at most 10 MB. It picks the file's name itself, a slug
+  of `name` plus a short content hash, under `public/images/`, and never writes through a symlink.
+  It commits the image as a work record with no model, like a hand edit, so `/client/work/{id}/undo`
+  takes it out again. With `replace` (an `<img>`'s `src` as the source has it), the one place in the
+  tracked files that holds it points at the new image in the same commit. Found zero times or more
+  than once, nothing changes and the reply gives `matches`. Sending the same image again with no
+  `replace` commits nothing and replies with its `path` and `url`. New reply type `ImageReply`.
+
 - **A preview's install is redone when its inputs change, and an app can ask for a clean restart
   (#3484).** `install.unless_exists: node_modules` skipped the install whenever `node_modules`
   existed, so an install broken on an older image, or a dependency a run added, stayed broken.

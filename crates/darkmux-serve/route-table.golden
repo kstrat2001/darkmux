@@ -47,6 +47,7 @@ GET /client/workspaces/:name  json WorkspaceInfo (client listener: 127.0.0.1, th
 DELETE /client/workspaces/:name  json WorkspaceRemoved (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
 GET /client/workspaces/:name/changes  json BranchChanges (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
 POST /client/workspaces/:name/edit  json EditReply (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
+POST /client/workspaces/:name/image  json ImageReply (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
 POST /client/workspaces/:name/preview  json PreviewState (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
 GET /client/workspaces/:name/preview  json PreviewState (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
 DELETE /client/workspaces/:name/preview  json StatusWord (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
@@ -92,6 +93,12 @@ EditReply.work_id?: string | null
 FileChange.added?: integer | null
 FileChange.path: string
 FileChange.removed?: integer | null
+ImageReply.branch?: string | null
+ImageReply.commit?: string | null
+ImageReply.matches?: integer | null
+ImageReply.path?: string | null
+ImageReply.url?: string | null
+ImageReply.work_id?: string | null
 Install.command: string
 Install.unless_exists?: string | null
 KeepReply.branch?: string | null
