@@ -79,6 +79,12 @@ pub struct SandboxPolicy {
     /// Ports the host reaches on its loopback, at the same number, and on
     /// no other address.
     pub ports: Vec<u16>,
+    /// Whether the sandbox reads the caller's stdin (a secret piped in);
+    /// otherwise it gets none.
+    pub stdin: bool,
+    /// A name inside the sandbox that reaches this host's own services (a
+    /// model server on the host), where the backend does not provide one.
+    pub host_alias: Option<String>,
     /// `uid:gid` to run as; `None` keeps the image's user.
     pub user: Option<String>,
     /// The whole environment the policy adds, each `KEY=value`; nothing of
@@ -114,6 +120,8 @@ pub enum Having {
     Label(String),
     /// Those whose name starts with this.
     NamePrefix(String),
+    /// The one with exactly this name.
+    Name(String),
 }
 
 /// A listing: which sandboxes, whether stopped ones too, and which labels
