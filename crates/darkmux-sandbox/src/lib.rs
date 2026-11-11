@@ -76,6 +76,9 @@ pub struct SandboxPolicy {
     pub labels: Vec<(String, String)>,
     /// In order: a later mount at a nested path is layered over an earlier.
     pub mounts: Vec<Mount>,
+    /// Ports the host reaches on its loopback, at the same number, and on
+    /// no other address.
+    pub ports: Vec<u16>,
     /// `uid:gid` to run as; `None` keeps the image's user.
     pub user: Option<String>,
     /// The whole environment the policy adds, each `KEY=value`; nothing of
@@ -156,6 +159,22 @@ pub trait SandboxBackend: Send + Sync {
     ///
     /// [`remove`]: SandboxBackend::remove
     fn run(&self, policy: &SandboxPolicy) -> (Command, SandboxHandle);
+
+    /// The command that makes `policy`'s sandbox without starting it, and
+    /// its handle. Once that command succeeds, a [`stop`] or [`remove`]
+    /// finds it, so nothing started later can escape a stop that came
+    /// first.
+    ///
+    /// [`stop`]: SandboxBackend::stop
+    /// [`remove`]: SandboxBackend::remove
+    fn create(&self, policy: &SandboxPolicy) -> (Command, SandboxHandle);
+
+    /// The command that starts a created sandbox, attached until it exits.
+    fn start(&self, handle: &SandboxHandle) -> Command;
+
+    /// The command that asks the sandbox to end (SIGTERM to its tree) and
+    /// ends it after `grace` (whole seconds) if it has not.
+    fn stop(&self, handle: &SandboxHandle, grace: std::time::Duration) -> Command;
 
     /// The command that stops and removes `handle`'s sandbox, its whole
     /// process tree with it. Removing one already gone succeeds or fails

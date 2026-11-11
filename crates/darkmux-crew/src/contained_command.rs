@@ -103,6 +103,7 @@ pub fn policy(image: &str, name: &str, run: &Run) -> SandboxPolicy {
         limits: Limits { memory: Some(DOCKER_MEMORY.to_string()), pids: Some(DOCKER_PIDS_LIMIT) },
         labels: vec![(PID_LABEL.to_string(), std::process::id().to_string())],
         mounts,
+        ports: Vec::new(),
         user: run.user.clone(),
         // The image's home belongs to the image's own user.
         env: run.user.iter().map(|_| ("HOME".to_string(), "/tmp".to_string())).collect(),

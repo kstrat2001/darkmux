@@ -24,7 +24,12 @@ impl DockerBackend {
     /// and limits, its labels, its mounts in the policy's order, its user
     /// and environment, its working directory, then the image and command.
     pub fn run_args(policy: &SandboxPolicy) -> Vec<String> {
-        let mut args = strings(&["run", "--rm", "--init", "--name", &policy.name]);
+        Self::args("run", policy)
+    }
+
+    /// `run_args` under another verb (`create` takes the same line).
+    fn args(verb: &str, policy: &SandboxPolicy) -> Vec<String> {
+        let mut args = strings(&[verb, "--rm", "--init", "--name", &policy.name]);
         if policy.network == Network::None {
             args.extend(strings(&["--network", "none"]));
         }
@@ -35,6 +40,9 @@ impl DockerBackend {
             args.extend(["--label".to_string(), format!("{key}={value}")]);
         }
         args.extend(policy.mounts.iter().flat_map(volume));
+        for port in &policy.ports {
+            args.extend(["-p".to_string(), format!("127.0.0.1:{port}:{port}")]);
+        }
         args.extend(policy.user.as_ref().map(|u| format!("--user={u}")));
         for (key, value) in &policy.env {
             // Always `KEY=value`: a bare `-e KEY` would copy the host's value.
@@ -66,6 +74,15 @@ impl DockerBackend {
         let labels: String = query.read.iter().map(|key| format!("\t{{{{.Label \"{key}\"}}}}")).collect();
         args.extend(["--filter".to_string(), filter, "--format".to_string(), format!("{{{{.Names}}}}{labels}")]);
         args
+    }
+
+    /// `docker exec`: `argv` in the running container. Docker's alone (a
+    /// backend without containers has nothing to exec into), so not part of
+    /// [`SandboxBackend`].
+    pub fn exec(handle: &SandboxHandle, argv: &[&str]) -> Command {
+        let mut cmd = Command::new(PROGRAM);
+        cmd.args(["exec", &handle.id]).args(argv);
+        cmd
     }
 
     fn handle(id: &str) -> SandboxHandle {
@@ -100,6 +117,24 @@ impl SandboxBackend for DockerBackend {
         let mut cmd = Command::new(PROGRAM);
         cmd.args(Self::run_args(policy));
         (cmd, Self::handle(&policy.name))
+    }
+
+    fn create(&self, policy: &SandboxPolicy) -> (Command, SandboxHandle) {
+        let mut cmd = Command::new(PROGRAM);
+        cmd.args(Self::args("create", policy));
+        (cmd, Self::handle(&policy.name))
+    }
+
+    fn start(&self, handle: &SandboxHandle) -> Command {
+        let mut cmd = Command::new(PROGRAM);
+        cmd.args(["start", "-a", &handle.id]);
+        cmd
+    }
+
+    fn stop(&self, handle: &SandboxHandle, grace: std::time::Duration) -> Command {
+        let mut cmd = Command::new(PROGRAM);
+        cmd.args(["stop", "-t", &grace.as_secs().to_string(), &handle.id]);
+        cmd
     }
 
     fn remove(&self, handle: &SandboxHandle) -> Command {
@@ -151,6 +186,7 @@ mod tests {
             limits: Limits::default(),
             labels: Vec::new(),
             mounts: Vec::new(),
+            ports: Vec::new(),
             user: None,
             env: Vec::new(),
             workdir: None,
@@ -181,6 +217,7 @@ mod tests {
                 mount("/h/tree", "/workspace", Access::ReadWrite),
                 mount("/h/tree/.git", "/workspace/.git", Access::ReadOnly),
             ],
+            ports: vec![4100, 4200],
             user: Some("501:20".into()),
             env: vec![("HOME".into(), "/tmp".into()), ("K".into(), "v w".into())],
             workdir: Some("/workspace".into()),
@@ -192,7 +229,8 @@ mod tests {
             DockerBackend::run_args(&policy),
             strings(&["run", "--rm", "--init", "--name", "s-1", "--network", "none", "--cap-drop=ALL",
                 "--security-opt=no-new-privileges", "--pids-limit=512", "--memory=4g", "--label", "a.b=1", "--label", "c=2",
-                "-v", "/h/tree:/workspace", "-v", "/h/tree/.git:/workspace/.git:ro", "--user=501:20", "-e", "HOME=/tmp",
+                "-v", "/h/tree:/workspace", "-v", "/h/tree/.git:/workspace/.git:ro", "-p", "127.0.0.1:4100:4100",
+                "-p", "127.0.0.1:4200:4200", "--user=501:20", "-e", "HOME=/tmp",
                 "-e", "K=v w", "-w", "/workspace", "--entrypoint", "sh", "img:1", "-c", "echo hi"])
         );
     }
@@ -205,6 +243,25 @@ mod tests {
         assert_eq!(cmd.get_program(), "docker");
         assert_eq!(args_of(&cmd), DockerBackend::run_args(&bare()));
         assert_eq!(handle, SandboxHandle { backend: BackendKind::Docker, id: "s-1".into() });
+    }
+
+    /// `create` is `run`'s line under `docker create`, so a created sandbox
+    /// has every invariant; `start` attaches to it by name; `stop` gives it
+    /// the grace in whole seconds before the kill.
+    #[test]
+    fn create_start_and_stop_are_docker_create_start_and_stop() {
+        let policy = SandboxPolicy { ports: vec![4100], ..bare() };
+        let (cmd, handle) = DockerBackend.create(&policy);
+        let mut want = DockerBackend::run_args(&policy);
+        want[0] = "create".into();
+        assert_eq!((cmd.get_program().to_str(), args_of(&cmd)), (Some("docker"), want));
+        assert_eq!(handle, DockerBackend::handle("s-1"));
+        let cmd = DockerBackend.start(&handle);
+        assert_eq!((cmd.get_program().to_str(), args_of(&cmd)), (Some("docker"), strings(&["start", "-a", "s-1"])));
+        let cmd = DockerBackend.stop(&handle, std::time::Duration::from_millis(5900));
+        assert_eq!((cmd.get_program().to_str(), args_of(&cmd)), (Some("docker"), strings(&["stop", "-t", "5", "s-1"])));
+        let cmd = DockerBackend::exec(&handle, &["cat", "/proc/net/tcp"]);
+        assert_eq!((cmd.get_program().to_str(), args_of(&cmd)), (Some("docker"), strings(&["exec", "s-1", "cat", "/proc/net/tcp"])));
     }
 
     /// Removal is by name and forced. A listing by label shows stopped

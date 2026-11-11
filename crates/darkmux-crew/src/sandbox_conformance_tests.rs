@@ -38,6 +38,7 @@ fn policy(image: &str, tree: &Path, script: &str) -> SandboxPolicy {
         network: Network::None,
         limits: Limits { memory: Some("256m".to_string()), pids: Some(64) },
         mounts: vec![Mount { host: tree.to_path_buf(), at: "/workspace".to_string(), access: Access::ReadWrite }],
+        ports: Vec::new(),
         user: None,
         env: Vec::new(),
         workdir: Some("/workspace".to_string()),
@@ -207,6 +208,75 @@ fn a_reaper_finds_an_orphan_by_its_label(backend: &dyn SandboxBackend, image: &s
     neighbor_client.wait().unwrap();
 }
 
+/// A created sandbox is listed before it starts, so a stop from then on
+/// finds it; starting it runs the policy attached, its output the client's.
+fn a_created_sandbox_is_listed_then_runs_when_started(backend: &dyn SandboxBackend, image: &str) {
+    let tree = tempfile::TempDir::new().unwrap();
+    let p = policy(image, tree.path(), "echo started");
+    let (create, handle) = backend.create(&p);
+    let _removed = Removed(backend, handle.clone());
+    let made = run_bounded(create, Duration::from_secs(60));
+    assert!(matches!(made, Bounded::Finished { success: true, .. }), "{}", describe(&made));
+    assert!(until_listed(backend, &p.name, true), "{} not listed once created", p.name);
+    match run_bounded(backend.start(&handle), Duration::from_secs(60)) {
+        Bounded::Finished { success: true, stdout, .. } => assert_eq!(String::from_utf8_lossy(&stdout).trim(), "started"),
+        other => panic!("{} did not start: {}", p.name, describe(&other)),
+    }
+}
+
+/// A stop asks first: the sandbox's own SIGTERM handler runs within the
+/// grace, and the sandbox is gone after.
+fn a_stop_lets_the_sandbox_end_itself(backend: &dyn SandboxBackend, image: &str) {
+    let tree = tempfile::TempDir::new().unwrap();
+    let p = policy(
+        image,
+        tree.path(),
+        "trap 'echo bye > /workspace/bye; exit 0' TERM; echo up > /workspace/up; while :; do sleep 0.1; done",
+    );
+    let (create, handle) = backend.create(&p);
+    let _removed = Removed(backend, handle.clone());
+    assert!(matches!(run_bounded(create, Duration::from_secs(60)), Bounded::Finished { success: true, .. }));
+    let start = backend.start(&handle);
+    let attached = std::thread::spawn(move || run_bounded(start, Duration::from_secs(60)));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !tree.path().join("up").exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(tree.path().join("up").exists(), "{} never came up", p.name);
+    let stopped = run_bounded(backend.stop(&handle, Duration::from_secs(5)), Duration::from_secs(30));
+    assert!(matches!(stopped, Bounded::Finished { success: true, .. }), "{}", describe(&stopped));
+    let _ = attached.join();
+    assert_eq!(std::fs::read_to_string(tree.path().join("bye")).unwrap_or_default().trim(), "bye", "the TERM handler did not run");
+    assert!(until_listed(backend, &p.name, false), "{} outlived its stop", p.name);
+}
+
+/// A published port answers on the host's loopback, at its own number. The
+/// sandbox serves one line on it; the host reads that line back, so an
+/// accepting proxy with nothing behind it does not pass.
+fn a_published_port_answers_on_loopback(backend: &dyn SandboxBackend, image: &str) {
+    use std::io::Read;
+    let tree = tempfile::TempDir::new().unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let script = format!("while :; do echo served | nc -l -p {port}; done");
+    let p = SandboxPolicy { network: Network::Default, ports: vec![port], ..policy(image, tree.path(), &script) };
+    let (mut cmd, handle) = backend.run(&p);
+    let _removed = Removed(backend, handle);
+    let mut client = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut got = String::new();
+    while got.trim() != "served" && Instant::now() < deadline {
+        got.clear();
+        if let Ok(mut conn) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+            let _ = conn.set_read_timeout(Some(Duration::from_secs(2)));
+            let _ = conn.read_to_string(&mut got);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let _ = client.kill();
+    let _ = client.wait();
+    assert_eq!(got.trim(), "served", "nothing answered on 127.0.0.1:{port}");
+}
+
 macro_rules! conformance {
     ($backend:ident, $make:expr, $image:literal, $needs:literal) => {
         mod $backend {
@@ -234,6 +304,21 @@ macro_rules! conformance {
             #[ignore = $needs]
             fn a_reaper_finds_an_orphan_by_its_label() {
                 super::a_reaper_finds_an_orphan_by_its_label(&$make, $image)
+            }
+            #[test]
+            #[ignore = $needs]
+            fn a_created_sandbox_is_listed_then_runs_when_started() {
+                super::a_created_sandbox_is_listed_then_runs_when_started(&$make, $image)
+            }
+            #[test]
+            #[ignore = $needs]
+            fn a_stop_lets_the_sandbox_end_itself() {
+                super::a_stop_lets_the_sandbox_end_itself(&$make, $image)
+            }
+            #[test]
+            #[ignore = $needs]
+            fn a_published_port_answers_on_loopback() {
+                super::a_published_port_answers_on_loopback(&$make, $image)
             }
         }
     };
