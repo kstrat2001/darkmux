@@ -5,7 +5,6 @@
 # instead. It also fails if a count drops, so moving a call behind the seam
 # lowers its line here in the same commit. This list only shrinks.
 crates/darkmux-crew/src/dispatch_internal.rs 11
-crates/darkmux-crew/src/orphan_reaper.rs 2
 crates/darkmux-crew/src/runtime_image.rs 4
 crates/darkmux-doctor/src/lib.rs 3
 crates/darkmux-serve/src/client_preview.rs 4

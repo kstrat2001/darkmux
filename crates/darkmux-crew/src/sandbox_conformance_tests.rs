@@ -10,7 +10,7 @@
 //! way a contained run removes one.
 
 use crate::bounded_command::{run_bounded, Bounded};
-use darkmux_sandbox::{Access, Limits, Mount, Network, SandboxBackend, SandboxHandle, SandboxPolicy};
+use darkmux_sandbox::{Access, Limits, Mount, Network, Query, SandboxBackend, SandboxHandle, SandboxPolicy};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -80,10 +80,11 @@ fn describe(ran: &Bounded) -> String {
 
 /// The values of `key` on the sandboxes the backend lists by it.
 fn listed(backend: &dyn SandboxBackend, key: &str) -> Vec<String> {
-    let Bounded::Finished { success: true, stdout, .. } = run_bounded(backend.list_labeled(key), Duration::from_secs(30)) else {
+    let query = Query::labeled(key);
+    let Bounded::Finished { success: true, stdout, .. } = run_bounded(backend.list(&query), Duration::from_secs(30)) else {
         panic!("the backend could not list its sandboxes");
     };
-    backend.parse_labeled(&String::from_utf8_lossy(&stdout)).into_iter().map(|l| l.value.trim().to_string()).collect()
+    backend.parse_list(&query, &String::from_utf8_lossy(&stdout)).into_iter().filter_map(|l| l.labels[0].clone()).collect()
 }
 
 /// Wait up to 30 s for `name` to be listed by `key` or not, as `want` says.
