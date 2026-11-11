@@ -104,11 +104,45 @@ pub struct SandboxHandle {
     pub id: String,
 }
 
-/// One sandbox a listing found carrying a label, and that label's value.
+/// Which sandboxes a listing returns.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Labeled {
+pub enum Having {
+    /// Those carrying this label key, whatever its value.
+    Label(String),
+    /// Those whose name starts with this.
+    NamePrefix(String),
+}
+
+/// A listing: which sandboxes, whether stopped ones too, and which labels
+/// to read from each.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Query {
+    pub having: Having,
+    /// Sandboxes that have exited but not been removed, as well as running
+    /// ones.
+    pub stopped_too: bool,
+    /// The label keys whose values each [`Listed`] carries, in this order.
+    pub read: Vec<String>,
+}
+
+impl Query {
+    /// Every sandbox carrying `key`, running or not, with its value.
+    pub fn labeled(key: &str) -> Query {
+        Query { having: Having::Label(key.to_string()), stopped_too: true, read: vec![key.to_string()] }
+    }
+}
+
+/// One sandbox a listing found, with the value of each label its query
+/// read, in the query's order: `None` where the sandbox has none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
     pub handle: SandboxHandle,
-    pub value: String,
+    pub labels: Vec<Option<String>>,
+}
+
+/// The backend darkmux runs sandboxes through. Docker is the only one.
+pub fn backend() -> &'static dyn SandboxBackend {
+    &DockerBackend
 }
 
 /// A way to run a policy. Each method plans a process for the caller to
@@ -128,17 +162,17 @@ pub trait SandboxBackend: Send + Sync {
     /// harmlessly; either way it is gone.
     fn remove(&self, handle: &SandboxHandle) -> Command;
 
-    /// The command that lists every sandbox carrying a `key` label, running
-    /// or not; [`parse_labeled`] reads its output.
+    /// The command that lists the sandboxes `query` asks for;
+    /// [`parse_list`] reads its output.
     ///
-    /// [`parse_labeled`]: SandboxBackend::parse_labeled
-    fn list_labeled(&self, key: &str) -> Command;
+    /// [`parse_list`]: SandboxBackend::parse_list
+    fn list(&self, query: &Query) -> Command;
 
-    /// The sandboxes in [`list_labeled`]'s output, each with the label's
-    /// value as listed.
+    /// The sandboxes in [`list`]'s output for `query`, each with one value
+    /// per label `query` reads.
     ///
-    /// [`list_labeled`]: SandboxBackend::list_labeled
-    fn parse_labeled(&self, listing: &str) -> Vec<Labeled>;
+    /// [`list`]: SandboxBackend::list
+    fn parse_list(&self, query: &Query, listing: &str) -> Vec<Listed>;
 }
 
 #[cfg(test)]

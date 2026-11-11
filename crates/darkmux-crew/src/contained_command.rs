@@ -10,7 +10,7 @@
 //! should ever select.
 
 use crate::bounded_command::{run_bounded, Bounded};
-use darkmux_sandbox::{Access, DockerBackend, Limits, Mount, Network, SandboxBackend, SandboxHandle, SandboxPolicy};
+use darkmux_sandbox::{backend, Access, DockerBackend, Limits, Mount, Network, Query, SandboxHandle, SandboxPolicy};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -76,11 +76,6 @@ pub struct Run<'a> {
     pub user: Option<String>,
     /// The prefix of the container's name.
     pub name_prefix: &'a str,
-}
-
-/// (#3112) The backend a contained run goes through. Docker is the only one.
-fn backend() -> &'static dyn SandboxBackend {
-    &DockerBackend
 }
 
 /// (#3112) What a run's container may see and do: the tree at `/workspace`,
@@ -213,13 +208,14 @@ pub fn orphaned_containers(listed: &[(String, Option<u32>)], alive: impl Fn(u32)
 /// Remove containers whose owner is gone. Best effort and bounded: a Docker
 /// that cannot list them is the next `docker run`'s failure to name.
 pub fn reap_orphaned_containers() {
-    let Bounded::Finished { success: true, stdout, .. } = run_bounded(backend().list_labeled(PID_LABEL), Duration::from_secs(30)) else {
+    let query = Query::labeled(PID_LABEL);
+    let Bounded::Finished { success: true, stdout, .. } = run_bounded(backend().list(&query), Duration::from_secs(30)) else {
         return;
     };
     let listed: Vec<(String, Option<u32>)> = backend()
-        .parse_labeled(&String::from_utf8_lossy(&stdout))
+        .parse_list(&query, &String::from_utf8_lossy(&stdout))
         .into_iter()
-        .map(|l| (l.handle.id, l.value.trim().parse().ok()))
+        .map(|l| (l.handle.id, l.labels[0].as_deref().and_then(|v| v.parse().ok())))
         .collect();
     for name in orphaned_containers(&listed, crate::host_sampler_lock::pid_alive) {
         remove_container(&name);

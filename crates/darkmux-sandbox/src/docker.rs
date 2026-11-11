@@ -2,7 +2,7 @@
 //! is the one place outside the ratchet's list that may spell the `docker`
 //! program (`docker-calls.allow`).
 
-use crate::{Access, BackendKind, Labeled, Mount, Network, SandboxBackend, SandboxHandle, SandboxPolicy};
+use crate::{Access, BackendKind, Having, Listed, Mount, Network, Query, SandboxBackend, SandboxHandle, SandboxPolicy};
 use std::process::Command;
 
 const PROGRAM: &str = "docker";
@@ -51,9 +51,31 @@ impl DockerBackend {
         args
     }
 
+    /// `docker ps`'s arguments for `query`: `-a` for stopped ones too, one
+    /// filter, and a format printing the name and each label read,
+    /// tab-separated.
+    pub fn list_args(query: &Query) -> Vec<String> {
+        let mut args = strings(&["ps"]);
+        if query.stopped_too {
+            args.push("-a".to_string());
+        }
+        let filter = match &query.having {
+            Having::Label(key) => format!("label={key}"),
+            Having::NamePrefix(prefix) => format!("name=^{prefix}"),
+        };
+        let labels: String = query.read.iter().map(|key| format!("\t{{{{.Label \"{key}\"}}}}")).collect();
+        args.extend(["--filter".to_string(), filter, "--format".to_string(), format!("{{{{.Names}}}}{labels}")]);
+        args
+    }
+
     fn handle(id: &str) -> SandboxHandle {
         SandboxHandle { backend: BackendKind::Docker, id: id.to_string() }
     }
+}
+
+/// A listed label's value, `None` when it is empty or Docker's `<no value>`.
+fn present(field: Option<&str>) -> Option<String> {
+    field.map(str::trim).filter(|v| !v.is_empty() && *v != "<no value>").map(str::to_string)
 }
 
 fn strings(args: &[&str]) -> Vec<String> {
@@ -86,19 +108,23 @@ impl SandboxBackend for DockerBackend {
         cmd
     }
 
-    fn list_labeled(&self, key: &str) -> Command {
+    fn list(&self, query: &Query) -> Command {
         let mut cmd = Command::new(PROGRAM);
-        cmd.args(["ps", "-a", "--filter", &format!("label={key}"), "--format", &format!("{{{{.Names}}}}\t{{{{.Label \"{key}\"}}}}")]);
+        cmd.args(Self::list_args(query));
         cmd
     }
 
-    /// One `name<TAB>value` line per container; a line with no tab is not
-    /// one.
-    fn parse_labeled(&self, listing: &str) -> Vec<Labeled> {
+    /// One `name<TAB>value…` line per container. An empty value, or
+    /// Docker's `<no value>`, is a label the container does not carry.
+    fn parse_list(&self, query: &Query, listing: &str) -> Vec<Listed> {
         listing
             .lines()
-            .filter_map(|l| l.split_once('\t'))
-            .map(|(name, value)| Labeled { handle: Self::handle(name), value: value.to_string() })
+            .filter_map(|line| {
+                let mut fields = line.split('\t');
+                let name = fields.next()?.trim();
+                let labels = (0..query.read.len()).map(|_| present(fields.next())).collect();
+                (!name.is_empty()).then(|| Listed { handle: Self::handle(name), labels })
+            })
             .collect()
     }
 }
@@ -181,25 +207,41 @@ mod tests {
         assert_eq!(handle, SandboxHandle { backend: BackendKind::Docker, id: "s-1".into() });
     }
 
-    /// Removal is by name and forced; a listing filters on the label key and
-    /// prints each container's name and that label's value.
+    /// Removal is by name and forced. A listing by label shows stopped
+    /// containers too and filters on the key; one by name prefix shows
+    /// running ones, anchored at the name's start; each prints the name
+    /// and every label read, tab-separated.
     #[test]
     fn remove_and_list_are_docker_rm_and_ps() {
         let cmd = DockerBackend.remove(&DockerBackend::handle("s-1"));
         assert_eq!((cmd.get_program().to_str(), args_of(&cmd)), (Some("docker"), strings(&["rm", "-f", "s-1"])));
-        let cmd = DockerBackend.list_labeled("darkmux.gate.pid");
+        let cmd = DockerBackend.list(&Query::labeled("darkmux.gate.pid"));
         assert_eq!(
-            args_of(&cmd),
-            strings(&["ps", "-a", "--filter", "label=darkmux.gate.pid", "--format", "{{.Names}}\t{{.Label \"darkmux.gate.pid\"}}"])
+            (cmd.get_program().to_str(), args_of(&cmd)),
+            (
+                Some("docker"),
+                strings(&["ps", "-a", "--filter", "label=darkmux.gate.pid", "--format", "{{.Names}}\t{{.Label \"darkmux.gate.pid\"}}"])
+            )
+        );
+        let by_name = Query { having: Having::NamePrefix("p-".into()), stopped_too: false, read: strings(&["a", "b"]) };
+        assert_eq!(
+            DockerBackend::list_args(&by_name),
+            strings(&["ps", "--filter", "name=^p-", "--format", "{{.Names}}\t{{.Label \"a\"}}\t{{.Label \"b\"}}"])
         );
     }
 
-    /// Each tabbed line is one container and its value, kept as listed; a
-    /// line with no tab is skipped.
+    /// Each line is one container, with one value per label read, trimmed;
+    /// an empty field, `<no value>` or a missing one is `None`; a blank
+    /// line or an empty name is not a container.
     #[test]
     fn a_listing_parses_to_handles_and_values() {
-        let listed = DockerBackend.parse_labeled("a\t111\nno-tab\nb\t \nc\t222 \n");
-        let got: Vec<(String, String)> = listed.into_iter().map(|l| (l.handle.id, l.value)).collect();
-        assert_eq!(got, vec![("a".into(), "111".into()), ("b".into(), " ".into()), ("c".into(), "222 ".into())]);
+        let query = Query { having: Having::NamePrefix("x".into()), stopped_too: false, read: strings(&["a", "b"]) };
+        let listed = DockerBackend.parse_list(&query, "a\t111\t x \nno-tab\nb\t \t<no value>\n\n\t9\t9\n");
+        let got: Vec<(String, Vec<Option<String>>)> = listed.into_iter().map(|l| (l.handle.id, l.labels)).collect();
+        let some = |s: &str| Some(s.to_string());
+        assert_eq!(
+            got,
+            vec![("a".into(), vec![some("111"), some("x")]), ("no-tab".into(), vec![None, None]), ("b".into(), vec![None, None])]
+        );
     }
 }
