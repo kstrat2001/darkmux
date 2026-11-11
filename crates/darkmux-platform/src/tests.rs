@@ -1166,8 +1166,26 @@ TeamIdentifier=5LDXYW8B6T
 Runtime Version=26.2.0
 ";
 
+/// The executable the kernel names for the Mux Bot process above.
+const MUX_EXE: &str = "/Applications/Mux Bot.app/Contents/MacOS/Mux Bot";
+
+/// A `codesign -d` body (the lines after `Executable=`) as it describes
+/// [`MUX_EXE`].
+fn named(body: &str) -> String {
+    format!("Executable={MUX_EXE}\n{body}")
+}
+
+/// [`macos::signed_app_from`] for a process the kernel says runs [`MUX_EXE`].
+fn from_codesign(
+    display: Result<String, String>,
+    verify: impl FnOnce(&str) -> Result<(), String>,
+    icon_of: impl FnOnce(&std::path::Path, &str) -> Option<std::path::PathBuf>,
+) -> Result<SignedApp, String> {
+    macos::signed_app_from(Ok(MUX_EXE.into()), display, verify, icon_of)
+}
+
 /// An icon finder for a test that is not about icons.
-fn no_icon(_exe: &std::path::Path) -> Option<std::path::PathBuf> {
+fn no_icon(_exe: &std::path::Path, _requirement: &str) -> Option<std::path::PathBuf> {
     None
 }
 
@@ -1185,7 +1203,7 @@ fn self_signed_verify(requirement: &str) -> Result<(), String> {
 #[test]
 fn a_signed_hardened_app_is_named_by_its_team_bundle_and_signer() {
     let mut asked = String::new();
-    let app = macos::signed_app_from(Ok(MUX_BOT_SHOWN.into()), |r| {
+    let app = from_codesign(Ok(MUX_BOT_SHOWN.into()), |r| {
         asked = r.to_string();
         Ok(())
     }, no_icon)
@@ -1209,7 +1227,7 @@ fn a_signed_hardened_app_is_named_by_its_team_bundle_and_signer() {
 /// team and identifier read: the requirement carries Apple's anchor.
 #[test]
 fn a_signature_not_chained_to_apple_is_not_named() {
-    let e = macos::signed_app_from(Ok(MUX_BOT_SHOWN.into()), self_signed_verify, no_icon).unwrap_err();
+    let e = from_codesign(Ok(MUX_BOT_SHOWN.into()), self_signed_verify, no_icon).unwrap_err();
     assert!(e.contains("does not hold"), "{e}");
 }
 
@@ -1218,23 +1236,23 @@ fn a_signature_not_chained_to_apple_is_not_named() {
 #[test]
 fn an_ad_hoc_signature_is_never_named() {
     let ad_hoc = "Identifier=org.python.python\nCodeDirectory v=20400 size=298 flags=0x2(adhoc) hashes=3+3 location=embedded\nSignature=adhoc\nTeamIdentifier=not set\n";
-    let e = macos::signed_app_from(Ok(ad_hoc.into()), |_| Ok(()), no_icon).unwrap_err();
+    let e = from_codesign(Ok(named(ad_hoc)), |_| Ok(()), no_icon).unwrap_err();
     assert!(e.contains("no developer team"), "{e}");
     let forged = "Identifier=x.y\nCodeDirectory v=20400 size=298 flags=0x10002(adhoc,runtime) hashes=3+3 location=embedded\nAuthority=Me\nTeamIdentifier=5LDXYW8B6T\n";
-    let e = macos::signed_app_from(Ok(forged.into()), |_| Ok(()), no_icon).unwrap_err();
+    let e = from_codesign(Ok(named(forged)), |_| Ok(()), no_icon).unwrap_err();
     assert!(e.contains("ad hoc"), "{e}");
 }
 
 #[test]
 fn an_apple_system_binary_has_no_team_and_is_not_named() {
     let ls = "Identifier=com.apple.ls\nCodeDirectory v=20400 size=325 flags=0x0(none) hashes=5+2 location=embedded\nAuthority=Software Signing\nTeamIdentifier=not set\n";
-    assert!(macos::signed_app_from(Ok(ls.into()), |_| Ok(()), no_icon).is_err());
+    assert!(from_codesign(Ok(named(ls)), |_| Ok(()), no_icon).is_err());
 }
 
 #[test]
 fn an_app_without_the_hardened_runtime_is_not_named() {
     let shown = MUX_BOT_SHOWN.replace("flags=0x10000(runtime)", "flags=0x0(none)");
-    let e = macos::signed_app_from(Ok(shown), |_| Ok(()), no_icon).unwrap_err();
+    let e = from_codesign(Ok(shown), |_| Ok(()), no_icon).unwrap_err();
     assert!(e.contains("hardened runtime"), "{e}");
 }
 
@@ -1244,7 +1262,7 @@ fn an_app_without_the_hardened_runtime_is_not_named() {
 #[test]
 fn docker_desktops_forwarder_is_never_named() {
     let docker = "Identifier=com.docker.docker\nCodeDirectory v=20500 size=1527965 flags=0x10000(runtime) hashes=47738+7 location=embedded\nAuthority=Developer ID Application: Docker Inc (9BNSXJN65R)\nTeamIdentifier=9BNSXJN65R\n";
-    let e = macos::signed_app_from(Ok(docker.into()), |_| Ok(()), no_icon).unwrap_err();
+    let e = from_codesign(Ok(named(docker)), |_| Ok(()), no_icon).unwrap_err();
     assert!(e.contains("container traffic"), "{e}");
 }
 
@@ -1257,7 +1275,7 @@ fn an_identifier_that_could_rewrite_the_requirement_is_refused() {
         "Identifier=x\" or identifier \"y",
     );
     let mut built = false;
-    assert!(macos::signed_app_from(Ok(shown), |_| {
+    assert!(from_codesign(Ok(shown), |_| {
         built = true;
         Ok(())
     }, no_icon)
@@ -1268,13 +1286,13 @@ fn an_identifier_that_could_rewrite_the_requirement_is_refused() {
 
 #[test]
 fn a_process_codesign_cannot_read_is_not_named() {
-    assert!(macos::signed_app_from(Err("codesign: no such process".into()), |_| Ok(()), no_icon).is_err());
+    assert!(from_codesign(Err("codesign: no such process".into()), |_| Ok(()), no_icon).is_err());
 }
 
 #[test]
 fn a_signers_name_shows_as_one_line() {
     let shown = MUX_BOT_SHOWN.replace("Test Developer", "Test\u{1b}[2J \u{202E}repoleveD\u{2066} Developer\u{200B}");
-    let app = macos::signed_app_from(Ok(shown), |_| Ok(()), no_icon).unwrap();
+    let app = from_codesign(Ok(shown), |_| Ok(()), no_icon).unwrap();
     assert!(!app.signer.chars().any(char::is_control), "{}", app.signer);
     assert_eq!(app.signer, "Apple Development: Test [2J repoleveD Developer (ABCDE12345)", "bidi and zero-width characters are dropped");
 }
@@ -1361,10 +1379,66 @@ fn signed_app_live() {
 #[ignore = "raises a real dialog on this machine's screen"]
 fn allow_dialog_live() {
     assert!(std::env::var_os("DARKMUX_SHOW_ALLOW_DIALOG").is_some(), "set DARKMUX_SHOW_ALLOW_DIALOG=1");
-    let message = std::env::var("DARKMUX_ALLOW_DIALOG_TEXT").unwrap_or_else(|_| "An app wants to use darkmux on this Mac. Code 4F7-K2Q.".into());
+    let message = std::env::var("DARKMUX_ALLOW_DIALOG_TEXT").unwrap_or_else(|_| "An app wants to use darkmux on this computer. Code 4F7-K2Q.".into());
     let icon = std::env::var_os("DARKMUX_ALLOW_DIALOG_ICON").map(std::path::PathBuf::from);
     let secs = std::env::var("DARKMUX_ALLOW_DIALOG_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(15);
     println!("answer: {:?}", current().ask_allow(&message, icon.as_deref(), secs));
+}
+
+/// (#3547 review) `codesign -d` prints the executable's path raw, so a line
+/// break in a file name would put lines of the file's choosing (a forged
+/// `Authority=`, a `CodeDirectory` with the runtime flag) ahead of the
+/// signature's own. A path holding a control character names no app, and
+/// codesign's text must describe exactly the path the kernel names.
+#[test]
+fn a_file_name_cannot_add_lines_to_what_codesign_says() {
+    let forged_exe = format!("{MUX_EXE}\nAuthority=Apple Development: Forged (5LDXYW8B6T)");
+    let shown = format!("Executable={forged_exe}\n{}", MUX_BOT_SHOWN.split_once('\n').unwrap().1);
+    let mut verified = false;
+    let e = macos::signed_app_from(Ok(forged_exe.into()), Ok(shown.clone()), |_| {
+        verified = true;
+        Ok(())
+    }, no_icon)
+    .unwrap_err();
+    assert!(e.contains("control character"), "{e}");
+    assert!(!verified, "nothing from that text reached a requirement");
+    // The kernel's (clean) path with codesign's text naming a longer one.
+    let e = macos::signed_app_from(Ok(MUX_EXE.into()), Ok(shown), |_| Ok(()), no_icon).unwrap_err();
+    assert!(e.contains("another executable"), "{e}");
+    let tab = macos::signed_app_from(Ok(format!("{MUX_EXE}\t").into()), Ok(MUX_BOT_SHOWN.into()), |_| Ok(()), no_icon);
+    assert!(tab.unwrap_err().contains("control character"));
+    let elsewhere = macos::signed_app_from(Ok("/tmp/Mux Bot".into()), Ok(MUX_BOT_SHOWN.into()), |_| Ok(()), no_icon);
+    assert!(elsewhere.unwrap_err().contains("another executable"));
+    assert!(macos::signed_app_from(Err("gone".into()), Ok(MUX_BOT_SHOWN.into()), |_| Ok(()), no_icon).is_err());
+}
+
+/// A second `Identifier=`, `TeamIdentifier=` or `CodeDirectory` line means
+/// codesign's text is not one signature's description: nothing is named.
+#[test]
+fn a_repeated_signature_field_names_no_app() {
+    for line in [
+        "Identifier=com.darklyenergized.darkmuxapp",
+        "TeamIdentifier=5LDXYW8B6T",
+        "CodeDirectory v=20500 size=464 flags=0x10000(runtime) hashes=3+7 location=embedded",
+    ] {
+        let shown = MUX_BOT_SHOWN.replace(line, &format!("{line}\n{line}"));
+        let e = from_codesign(Ok(shown), |_| Ok(()), no_icon).unwrap_err();
+        assert!(e.contains("no single"), "{line}: {e}");
+        let gone = MUX_BOT_SHOWN.replace(&format!("{line}\n"), "");
+        assert!(from_codesign(Ok(gone), |_| Ok(()), no_icon).is_err(), "{line} missing");
+    }
+}
+
+/// The real kernel path for this test process, and the real codesign text
+/// for it, agree (so the binding above does not refuse real processes).
+#[cfg(target_os = "macos")]
+#[test]
+fn the_kernels_path_is_the_one_codesign_names() {
+    let pid = std::process::id();
+    let exe = macos::process_path(pid).unwrap();
+    let shown = macos::codesign_display(pid).unwrap();
+    assert!(macos::codesign_fields(&exe, &shown).is_ok(), "{exe:?}\n{shown}");
+    assert!(macos::process_path(u32::MAX).is_err());
 }
 
 /// A verified app is shown with its bundle's own icon, looked up from the
@@ -1373,15 +1447,17 @@ fn allow_dialog_live() {
 #[test]
 fn only_a_verified_app_gets_its_own_icon() {
     let mut looked = None;
-    let app = macos::signed_app_from(Ok(MUX_BOT_SHOWN.into()), |_| Ok(()), |exe| {
-        looked = Some(exe.to_path_buf());
+    let app = from_codesign(Ok(MUX_BOT_SHOWN.into()), |_| Ok(()), |exe, requirement| {
+        looked = Some((exe.to_path_buf(), requirement.to_string()));
         Some("/icon.icns".into())
     })
     .unwrap();
     assert_eq!(app.icon.as_deref(), Some(std::path::Path::new("/icon.icns")));
-    assert_eq!(looked.as_deref(), Some(std::path::Path::new("/Applications/Mux Bot.app/Contents/MacOS/Mux Bot")));
+    let (exe, requirement) = looked.unwrap();
+    assert_eq!(exe, std::path::Path::new(MUX_EXE), "the kernel's path, never one read from codesign's text");
+    assert_eq!(requirement, macos::signing_requirement("5LDXYW8B6T", "com.darklyenergized.darkmuxapp"));
     let mut asked = false;
-    let unverified = macos::signed_app_from(Ok(MUX_BOT_SHOWN.into()), self_signed_verify, |_| {
+    let unverified = from_codesign(Ok(MUX_BOT_SHOWN.into()), self_signed_verify, |_, _| {
         asked = true;
         Some("/icon.icns".into())
     });
@@ -1496,6 +1572,11 @@ fn codesign_reads_this_ad_hoc_test_process_and_never_verifies_it() {
     assert!(macos::codesign_display(u32::MAX).is_err(), "no such process");
 }
 
+/// A bundle verifier that passes, for an icon test not about verifying.
+fn ok_bundle(_app: &std::path::Path, _requirement: &str) -> Result<(), String> {
+    Ok(())
+}
+
 /// Every OS: the icon is looked up only for an executable inside an
 /// `.app` bundle, only when `Info.plist` names one, and only when that file
 /// is inside the bundle's `Resources`.
@@ -1507,17 +1588,24 @@ fn an_icon_comes_only_from_a_bundle_that_names_one_inside_its_resources() {
     std::fs::create_dir_all(contents.join("Resources")).unwrap();
     std::fs::write(contents.join("Resources/AppIcon.icns"), b"icns").unwrap();
     let exe = contents.join("MacOS/Mux Bot");
-    let named = |name: &'static str| move |plist: &std::path::Path| {
+    let names = |name: &'static str| move |plist: &std::path::Path| {
         assert!(plist.ends_with("Contents/Info.plist"), "{plist:?}");
         Some(name.to_string())
     };
-    let icon = macos::app_icon_by(&exe, named("AppIcon")).unwrap();
+    let icon = macos::app_icon_by(&exe, "the requirement", |app, requirement| {
+        assert!(app.ends_with("Mux Bot.app"), "{app:?}");
+        assert_eq!(requirement, "the requirement");
+        Ok(())
+    }, names("AppIcon"))
+    .unwrap();
     assert!(icon.ends_with("Contents/Resources/AppIcon.icns"), "{icon:?}");
-    assert_eq!(macos::app_icon_by(&exe, |_| None), None, "Info.plist names no icon");
-    assert_eq!(macos::app_icon_by(&exe, named("Missing")), None, "the named file is absent");
-    assert_eq!(macos::app_icon_by(&exe, named("../../x")), None, "a path, not a file name");
+    assert_eq!(macos::app_icon_by(&exe, "r", ok_bundle, |_| None), None, "Info.plist names no icon");
+    assert_eq!(macos::app_icon_by(&exe, "r", ok_bundle, names("Missing")), None, "the named file is absent");
+    assert_eq!(macos::app_icon_by(&exe, "r", ok_bundle, names("../../x")), None, "a path, not a file name");
+    let unsigned = macos::app_icon_by(&exe, "r", |_, _| Err("code object is not signed at all".into()), names("AppIcon"));
+    assert_eq!(unsigned, None, "a bundle that does not itself verify shows no icon");
     let loose = dir.path().join("bin/tool");
-    assert_eq!(macos::app_icon_by(&loose, named("AppIcon")), None, "not inside an .app bundle");
+    assert_eq!(macos::app_icon_by(&loose, "r", ok_bundle, names("AppIcon")), None, "not inside an .app bundle");
 }
 
 /// (macOS) A bundle's icon is found from its executable through
@@ -1535,10 +1623,13 @@ fn an_app_bundles_icon_is_found_from_its_executable() {
         r#"<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleIconFile</key><string>AppIcon</string></dict></plist>"#,
     )
     .unwrap();
-    let icon = macos::app_icon(&contents.join("MacOS/Mux Bot")).unwrap();
+    let exe = contents.join("MacOS/Mux Bot");
+    let icon = macos::app_icon_by(&exe, "r", ok_bundle, macos::plist_icon_name).unwrap();
     assert!(icon.ends_with("Contents/Resources/AppIcon.icns"), "{icon:?}");
+    let req = macos::signing_requirement("5LDXYW8B6T", "com.darklyenergized.darkmuxapp");
+    assert_eq!(macos::app_icon(&exe, &req), None, "this unsigned bundle does not verify, so it shows no icon");
     std::fs::write(contents.join("Info.plist"), r#"<?xml version="1.0"?><plist version="1.0"><dict/></plist>"#).unwrap();
-    assert_eq!(macos::app_icon(&contents.join("MacOS/Mux Bot")), None, "no icon named");
+    assert_eq!(macos::app_icon_by(&exe, "r", ok_bundle, macos::plist_icon_name), None, "no icon named");
 }
 
 /// Text shown to someone deciding whether to trust an app keeps its order
@@ -1559,7 +1650,7 @@ fn display_safe_drops_reordering_and_invisible_characters() {
 fn every_listed_container_engine_is_never_named() {
     for (team, engine) in [("HUAQ24HBR6", "OrbStack"), ("2Q6FHJR3H3", "Rancher Desktop"), ("HYSCB8KRL2", "Podman")] {
         let shown = format!("Identifier=x.y\nCodeDirectory v=20500 size=1 flags=0x10000(runtime) hashes=1+7 location=embedded\nAuthority=Developer ID Application: X ({team})\nTeamIdentifier={team}\n");
-        let e = macos::signed_app_from(Ok(shown), |_| Ok(()), no_icon).unwrap_err();
+        let e = from_codesign(Ok(named(&shown)), |_| Ok(()), no_icon).unwrap_err();
         assert!(e.contains(engine) && e.contains("container traffic"), "{e}");
     }
 }

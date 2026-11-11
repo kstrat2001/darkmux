@@ -147,7 +147,7 @@ pub fn dialog_message(code: &str, signed: Option<&SignedApp>) -> String {
         ),
         None => "Not signed by a known developer.".to_string(),
     };
-    format!("An app wants to use darkmux on this Mac. Code {}.\n\n{who}", safe(code))
+    format!("An app wants to use darkmux on this computer. Code {}.\n\n{who}", safe(code))
 }
 
 /// The notice once a trusted app is paired.

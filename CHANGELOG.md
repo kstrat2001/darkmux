@@ -27,7 +27,8 @@ darkmux release.
   unsigned or ad hoc build, a container's traffic through Docker Desktop's, OrbStack's, Rancher
   Desktop's or Podman's forwarder, a connection more than one process holds, a process darkmux
   cannot tell) gets a centered dialog showing the code, who signed it as macOS verified it (with the
-  app's own icon) or "Not signed by a known developer.", with Don't Allow as the default: Allow
+  app's own icon when its whole bundle verifies; a process whose file path holds a control character
+  names no signer) or "Not signed by a known developer.", with Don't Allow as the default: Allow
   approves; Don't Allow, Return or Esc denies; a dialog left until it gives up leaves the request
   pending to expire as before. Allow on a validly signed app remembers it (team and bundle id, in
   `clients.json`; never a container engine's), so a build of Mux Bot under your own team pairs with

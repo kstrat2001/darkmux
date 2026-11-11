@@ -8636,6 +8636,16 @@ async fn the_dialog_shows_no_bidi_or_invisible_characters() {
     assert!(shown.contains("Signed by Apple Development: evil,") && !shown.contains('\u{202E}'), "{shown}");
 }
 
+/// (#3547 review) The dialog is every platform's (Linux's zenity too), so
+/// it names no one OS.
+#[test]
+fn the_pairing_dialog_names_no_one_platform() {
+    for shown in [crate::client_trust::dialog_message("X", None), crate::client_trust::dialog_message("X", Some(&fork()))] {
+        assert!(shown.starts_with("An app wants to use darkmux on this computer. Code X."), "{shown}");
+        assert!(!shown.contains("Mac"), "{shown}");
+    }
+}
+
 /// An auto-approval is the approval `client approve` makes (`approve_as`):
 /// before the app collects its token, the request holds the client name and
 /// id it will have, and `client revoke <name>` can take it back.

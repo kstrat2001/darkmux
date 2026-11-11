@@ -337,7 +337,7 @@ fn remembered_row(remembered: Result<Vec<cp::RememberedApp>>) -> crate::doctor::
     use crate::doctor::{Check, Status};
     let name = "client remembered apps".to_string();
     let (status, message, hint) = match remembered {
-        Ok(list) if list.is_empty() => (Status::Pass, "none: only a Mux Bot signed by a verified team pairs with no dialog".to_string(), None),
+        Ok(list) if list.is_empty() => (Status::Pass, "none: no app has been allowed in the pairing dialog".to_string(), None),
         Ok(list) => (
             Status::Pass,
             format!(
@@ -655,7 +655,8 @@ mod tests {
         let row = remembered_row(Ok(vec![cp::RememberedApp { team: "AAAAAAAAAA".into(), bundle: "com.example.muxfork".into(), allowed: 1 }]));
         assert!(row.message.contains("AAAAAAAAAA/com.example.muxfork"), "{}", row.message);
         assert!(row.hint.unwrap().contains("darkmux client forget"));
-        assert!(remembered_row(Ok(Vec::new())).message.starts_with("none"));
+        let none = remembered_row(Ok(Vec::new())).message;
+        assert_eq!(none, "none: no app has been allowed in the pairing dialog", "true on every platform (#3547 review)");
     }
 
     /// `client revoke` says what it revoked, or refuses a name no client has.

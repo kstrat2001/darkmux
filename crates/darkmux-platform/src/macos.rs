@@ -209,8 +209,11 @@ impl Platform for MacPlatform {
     /// flags; `codesign --verify --strict` against a requirement built from
     /// them then proves it: valid now, anchored at Apple, that team's
     /// certificate, that identifier. Both read the running process by pid.
+    /// The kernel's path for the process (`proc_pidpath`) must be the one
+    /// `codesign` names, with no control character in it, so a file name
+    /// cannot add lines to what `codesign -d` prints.
     fn signed_app(&self, pid: u32) -> Result<crate::SignedApp, String> {
-        signed_app_from(codesign_display(pid), |requirement| codesign_verify(pid, requirement), app_icon)
+        signed_app_from(process_path(pid), codesign_display(pid), |requirement| codesign_verify(pid, requirement), app_icon)
     }
 
     /// (#3544) `osascript`'s `display dialog`, centered, with the message and
@@ -238,37 +241,73 @@ const CS_ADHOC: u32 = 0x2;
 /// [`Platform::signed_app`] from `codesign -d`'s answer and a verifier for
 /// a requirement, so every refusal is tested without a real process.
 pub(crate) fn signed_app_from(
+    path: Result<std::path::PathBuf, String>,
     display: Result<String, String>,
     verify: impl FnOnce(&str) -> Result<(), String>,
-    icon_of: impl FnOnce(&std::path::Path) -> Option<std::path::PathBuf>,
+    icon_of: impl FnOnce(&std::path::Path, &str) -> Option<std::path::PathBuf>,
 ) -> Result<crate::SignedApp, String> {
+    let exe = path?;
     let shown = display?;
-    let field = |key: &str| shown.lines().find_map(|l| l.strip_prefix(key)).map(str::trim);
+    let body = codesign_fields(&exe, &shown)?;
+    let field = |key: &str| body.lines().find_map(|l| l.strip_prefix(key)).map(str::trim);
+    for key in ["Identifier=", "TeamIdentifier=", "CodeDirectory "] {
+        if body.lines().filter(|l| l.starts_with(key)).count() != 1 {
+            return Err(format!("codesign's description has no single `{}` line", key.trim_end_matches(['=', ' '])));
+        }
+    }
     let team = team_of(field("TeamIdentifier="))?;
-    signed_by_a_developer_with_runtime(&shown)?;
+    signed_by_a_developer_with_runtime(body)?;
     let bundle = field("Identifier=").filter(|b| is_bundle_id(b)).ok_or("its signature names no bundle id darkmux can check")?;
     let signer = field("Authority=").map(crate::display_safe).ok_or("its signature names no signing certificate")?;
-    verify(&signing_requirement(team, bundle)).map_err(|e| format!("its signature does not hold: {e}"))?;
-    // Only now, with the signature verified, is the bundle's icon its own.
-    let icon = field("Executable=").and_then(|exe| icon_of(std::path::Path::new(exe)));
+    let requirement = signing_requirement(team, bundle);
+    verify(&requirement).map_err(|e| format!("its signature does not hold: {e}"))?;
+    // Only now, with the signature verified, may the bundle's icon be shown,
+    // and only when the bundle itself verifies against the same requirement.
+    let icon = icon_of(&exe, &requirement);
     Ok(crate::SignedApp { team: team.to_string(), bundle: bundle.to_string(), signer, icon })
+}
+
+/// What `codesign -d` says after its `Executable=` line, when that line
+/// names exactly `exe` (the kernel's path for the process), `exe` holds no
+/// control character, and the next line is the signature's `Identifier=`
+/// (codesign's own order). `codesign` prints the path raw, so a line break
+/// in a file name would otherwise put lines of the file's choosing ahead of
+/// the signature's own (#3547 review); any line added there now either
+/// breaks that order or repeats `Identifier=`, which names no app.
+pub(crate) fn codesign_fields<'a>(exe: &std::path::Path, shown: &'a str) -> Result<&'a str, String> {
+    let exe = exe.to_str().ok_or("its executable's path is not text darkmux can check")?;
+    if exe.chars().any(char::is_control) {
+        return Err("its executable's path holds a control character".to_string());
+    }
+    shown
+        .strip_prefix("Executable=")
+        .and_then(|rest| rest.strip_prefix(exe))
+        .and_then(|rest| rest.strip_prefix('\n'))
+        .filter(|body| body.starts_with("Identifier="))
+        .ok_or_else(|| "codesign described another executable than the one the process runs".to_string())
 }
 
 /// The icon of the app bundle `executable` runs from
 /// (`<X>.app/Contents/MacOS/<exe>`): its `Info.plist`'s `CFBundleIconFile`,
 /// found by [`icon_in_bundle`]. `None` for an executable outside a bundle,
 /// or a bundle that names no icon darkmux can show.
-pub(crate) fn app_icon(executable: &std::path::Path) -> Option<std::path::PathBuf> {
-    app_icon_by(executable, plist_icon_name)
+pub(crate) fn app_icon(executable: &std::path::Path, requirement: &str) -> Option<std::path::PathBuf> {
+    app_icon_by(executable, requirement, codesign_verify_path, plist_icon_name)
 }
 
-/// [`app_icon`] with the `Info.plist` reader passed in, so every branch is
-/// tested on every OS (the real reader needs macOS's `plutil`).
+/// [`app_icon`] with the bundle verifier and the `Info.plist` reader passed
+/// in, so every branch is tested on every OS. The bundle (`<X>.app`) must
+/// itself satisfy `requirement`: its signature seals its `Info.plist` and
+/// `Resources`, so the icon is the signed app's own, not one a signed
+/// executable was copied in beside.
 pub(crate) fn app_icon_by(
     executable: &std::path::Path,
+    requirement: &str,
+    verify_bundle: impl FnOnce(&std::path::Path, &str) -> Result<(), String>,
     icon_name: impl Fn(&std::path::Path) -> Option<String>,
 ) -> Option<std::path::PathBuf> {
     let contents = bundle_contents(executable)?;
+    verify_bundle(contents.parent()?, requirement).ok()?;
     icon_in_bundle(&contents, &icon_name(&contents.join("Info.plist"))?)
 }
 
@@ -306,7 +345,7 @@ fn is_plain_file_name(name: &str) -> bool {
 
 /// `CFBundleIconFile` from an `Info.plist` (XML or binary), by `plutil`.
 #[cfg(target_os = "macos")]
-fn plist_icon_name(plist: &std::path::Path) -> Option<String> {
+pub(crate) fn plist_icon_name(plist: &std::path::Path) -> Option<String> {
     let out = std::process::Command::new("/usr/bin/plutil")
         .args(["-extract", "CFBundleIconFile", "raw", "-o", "-"])
         .arg(plist)
@@ -317,7 +356,7 @@ fn plist_icon_name(plist: &std::path::Path) -> Option<String> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn plist_icon_name(_plist: &std::path::Path) -> Option<String> {
+pub(crate) fn plist_icon_name(_plist: &std::path::Path) -> Option<String> {
     None
 }
 
@@ -471,6 +510,47 @@ pub(crate) fn codesign_verify(pid: u32, requirement: &str) -> Result<(), String>
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn codesign_verify(_pid: u32, _requirement: &str) -> Result<(), String> {
     Err("no codesign on this machine".to_string())
+}
+
+/// `codesign --verify --strict -R=<requirement> <path>`: the code on disk
+/// (an app bundle, with its sealed resources) satisfies `requirement`.
+#[cfg(target_os = "macos")]
+pub(crate) fn codesign_verify_path(path: &std::path::Path, requirement: &str) -> Result<(), String> {
+    let out = std::process::Command::new("/usr/bin/codesign")
+        .args(["--verify", "--strict", &format!("-R={requirement}"), "--"])
+        .arg(path)
+        .current_dir("/")
+        .output()
+        .map_err(|e| format!("running codesign: {e}"))?;
+    match out.status.success() {
+        true => Ok(()),
+        false => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn codesign_verify_path(_path: &std::path::Path, _requirement: &str) -> Result<(), String> {
+    Err("no codesign on this machine".to_string())
+}
+
+/// The kernel's path for the executable `pid` runs (`proc_pidpath`).
+#[cfg(target_os = "macos")]
+pub(crate) fn process_path(pid: u32) -> Result<std::path::PathBuf, String> {
+    use std::os::unix::ffi::OsStrExt;
+    let pid = libc::c_int::try_from(pid).map_err(|_| "no such process".to_string())?;
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: `buf` is writable for the length passed, and the kernel writes
+    // at most that many bytes, returning how many it wrote (0 or less: none).
+    let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    match usize::try_from(n) {
+        Ok(n) if n > 0 && n <= buf.len() => Ok(std::ffi::OsStr::from_bytes(&buf[..n]).into()),
+        _ => Err("the kernel names no executable for that process".to_string()),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn process_path(_pid: u32) -> Result<std::path::PathBuf, String> {
+    Err("no process paths on this machine".to_string())
 }
 
 /// The longest command line handed to `security -i`, well inside the ~4095
