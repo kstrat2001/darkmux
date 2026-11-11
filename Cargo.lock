@@ -754,6 +754,7 @@ dependencies = [
  "darkmux-lab",
  "darkmux-platform",
  "darkmux-profiles",
+ "darkmux-sandbox",
  "darkmux-types",
  "dirs",
  "serde_json",

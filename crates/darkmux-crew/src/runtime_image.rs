@@ -124,9 +124,7 @@ impl ImageInspector for DockerImageInspector {
         use crate::bounded_command::{run_bounded, Bounded};
         let format =
             format!("{{{{.Id}}}}|{{{{index .Config.Labels \"{RUNTIME_IMAGE_VERSION_LABEL}\"}}}}");
-        let mut cmd = Command::new("docker");
-        cmd.args(["image", "inspect", "--format", &format, "--", image]);
-        match run_bounded(cmd, self.timeout) {
+        match run_bounded(darkmux_sandbox::DockerBackend::image_inspect(&format, &[image]), self.timeout) {
             Bounded::Finished { success: true, stdout, .. } => {
                 parse_inspect_line(&String::from_utf8_lossy(&stdout))
             }
@@ -176,9 +174,7 @@ pub fn pull_public_image(image: &str, timeout: Duration) -> Result<()> {
         Some(Err(why)) => Some(why),
         None => None,
     };
-    let mut cmd = Command::new("docker");
-    cmd.args(["pull", image]);
-    run_pull(cmd, image, deadline, timeout)?.map_err(|why| match anonymous_refusal {
+    run_pull(darkmux_sandbox::DockerBackend::pull(image), image, deadline, timeout)?.map_err(|why| match anonymous_refusal {
         Some(anon) => anyhow::anyhow!("`docker pull {image}` failed: {why} (anonymously: {anon})"),
         None => anyhow::anyhow!("`docker pull {image}` failed: {why}"),
     })
@@ -202,8 +198,8 @@ fn anonymous_attempt(
         },
     };
     let anon = anonymous_docker_config(image)?;
-    let mut cmd = Command::new("docker");
-    cmd.args(["pull", image]).env("DOCKER_CONFIG", anon.path());
+    let mut cmd = darkmux_sandbox::DockerBackend::pull(image);
+    cmd.env("DOCKER_CONFIG", anon.path());
     if let Some(h) = &host {
         cmd.env("DOCKER_HOST", h);
     }
@@ -234,9 +230,7 @@ fn registry_of(image: &str) -> String {
 /// context never touches the credential store. `None` when docker cannot say.
 fn context_endpoint() -> Option<String> {
     use crate::bounded_command::{run_bounded, Bounded};
-    let mut cmd = Command::new("docker");
-    cmd.args(["context", "inspect", "--format", "{{.Endpoints.docker.Host}}"]);
-    match run_bounded(cmd, INSPECT_TIMEOUT) {
+    match run_bounded(darkmux_sandbox::DockerBackend::context_host(), INSPECT_TIMEOUT) {
         Bounded::Finished { success: true, stdout, .. } => {
             let host = String::from_utf8_lossy(&stdout).trim().to_string();
             (!host.is_empty()).then_some(host)
