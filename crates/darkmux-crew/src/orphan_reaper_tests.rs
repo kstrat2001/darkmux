@@ -282,12 +282,12 @@ fn restore_path(prev: Option<String>) {
 
 /// One tick against a fake docker: it lists dispatch containers only,
 /// removes exactly the orphan, and leaves the live host's and the unlabeled
-/// one. (#3112) Removal is the sandbox backend's `rm -f`, where it was
-/// `docker kill`: a dispatch or preview container runs with `--rm`, so the
-/// two end in the same place.
+/// one. (#3112) Through the sandbox backend's `kill`, whose success, like
+/// `docker kill`'s, means the container was running: the reaper's "killed"
+/// line names only a container it actually ended.
 #[test]
 #[serial]
-fn a_tick_lists_once_and_removes_only_the_orphan() {
+fn a_tick_lists_once_and_kills_only_the_orphan() {
     let dir = TempDir::new().unwrap();
     let ps = "darkmux-dispatch-alive\t100\t1000\tMACHINE-A\tpid:4026531836\n\
               darkmux-dispatch-dead\t200\t1000\tMACHINE-A\tpid:4026531836\n\
@@ -310,7 +310,7 @@ fn a_tick_lists_once_and_removes_only_the_orphan() {
     );
     let calls = std::fs::read_to_string(&record).unwrap();
     let calls: Vec<&str> = calls.lines().collect();
-    assert_eq!(calls.len(), 2, "one ps, one removal: {calls:?}");
+    assert_eq!(calls.len(), 2, "one ps, one kill: {calls:?}");
     assert_eq!(
         calls[0],
         "ps --filter name=^darkmux-dispatch- --format {{.Names}}\t\
@@ -320,7 +320,7 @@ fn a_tick_lists_once_and_removes_only_the_orphan() {
          {{.Label \"darkmux.dispatch.host-pid-ns\"}}",
         "the listing: running containers named for dispatch, name then the four host labels"
     );
-    assert_eq!(calls[1], "rm -f darkmux-dispatch-dead");
+    assert_eq!(calls[1], "kill darkmux-dispatch-dead");
 }
 
 /// No docker on `PATH`: the tick says so and does nothing else.

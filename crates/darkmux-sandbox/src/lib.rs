@@ -176,6 +176,12 @@ pub trait SandboxBackend: Send + Sync {
     /// ends it after `grace` (whole seconds) if it has not.
     fn stop(&self, handle: &SandboxHandle, grace: std::time::Duration) -> Command;
 
+    /// The command that ends `handle`'s sandbox at once (SIGKILL to its
+    /// tree). It succeeds only when the sandbox was running, so its success
+    /// is proof the sandbox was there; a sandbox that ends this way is
+    /// removed as any other is when it exits.
+    fn kill(&self, handle: &SandboxHandle) -> Command;
+
     /// The command that stops and removes `handle`'s sandbox, its whole
     /// process tree with it. Removing one already gone succeeds or fails
     /// harmlessly; either way it is gone.

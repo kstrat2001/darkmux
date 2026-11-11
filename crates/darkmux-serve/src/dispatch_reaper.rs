@@ -4,7 +4,7 @@
 //! the cadence and the log.
 //!
 //! Same dedicated-`std::thread` shape and stop flag as `host_sampler`. One
-//! bounded listing per tick; a removal (`docker rm -f`) only for an orphan. It
+//! bounded listing per tick; a `docker kill` only for an orphan. It
 //! writes no flow record: each reaped container gets one log line naming it
 //! and its dead host pid, so an operator who sees a container vanish can
 //! find why. The dispatch it belonged to keeps the terminal state the read
@@ -143,10 +143,10 @@ mod tests {
         let mut warned = false;
         let lines = with_path(dir.path(), || this_host_tick_lines(&mut warned));
         let calls = std::fs::read_to_string(&record).unwrap();
-        let kills: Vec<&str> = calls.lines().filter(|l| l.starts_with("rm -f ")).collect();
+        let kills: Vec<&str> = calls.lines().filter(|l| l.starts_with("kill ")).collect();
         assert_eq!(
             kills,
-            vec!["rm -f darkmux-dispatch-dead"],
+            vec!["kill darkmux-dispatch-dead"],
             "{calls}\n{lines:?}"
         );
         assert_eq!(lines.len(), 1, "{lines:?}");
@@ -173,7 +173,7 @@ mod tests {
 
     /// The serve tick against a fake docker listing one orphan and one live
     /// host's container: one line, naming the orphan and its dead pid; the
-    /// fake saw exactly one `ps` and one `rm -f`.
+    /// fake saw exactly one `ps` and one `kill`.
     #[test]
     #[serial]
     fn a_serve_tick_kills_the_orphan_and_names_it_and_its_host() {
@@ -214,9 +214,9 @@ mod tests {
         assert_eq!(
             calls
                 .lines()
-                .filter(|l| l.starts_with("rm -f "))
+                .filter(|l| l.starts_with("kill "))
                 .collect::<Vec<_>>(),
-            vec!["rm -f darkmux-dispatch-dead"]
+            vec!["kill darkmux-dispatch-dead"]
         );
     }
 

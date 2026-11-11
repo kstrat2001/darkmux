@@ -26,9 +26,10 @@
 //! label's. A pid whose start time cannot be read is kept (fail safe). The
 //! same pid-plus-start-time test as the residency lease (#2917).
 //!
-//! **What it does to one.** Removes it through the sandbox backend
+//! **What it does to one.** Kills it through the sandbox backend
 //! (`darkmux_sandbox`, #3112), nothing else: the workspace and out-dir are
-//! bind mounts and survive the container.
+//! bind mounts and survive the container. A kill succeeds only against a
+//! running container, so "killed" names only one the reaper ended.
 //!
 //! **Client previews (#3456)** carry the same four labels and are judged by
 //! the same rule under their own name prefix ([`PREVIEW_CONTAINER_PREFIX`],
@@ -254,21 +255,21 @@ pub fn host_liveness(pid: u32) -> HostLiveness {
     }
 }
 
-/// How long one listing or removal may take before the tick gives up on
+/// How long one listing or kill may take before the tick gives up on
 /// it. A wedged Docker Desktop must not wedge the reaper thread.
 const DOCKER_CALL_BOUND: Duration = Duration::from_secs(10);
 
 /// One reaper pass.
 #[derive(Debug)]
 pub enum ReapTick {
-    /// The listing answered; each orphan found, with whether its removal
+    /// The listing answered; each orphan found, with whether its kill
     /// succeeded.
     Listed { reaped: Vec<(Orphan, bool)> },
     /// The listing did not answer (no docker, a stopped daemon, a timeout).
     DockerUnavailable,
 }
 
-/// List the dispatch containers, decide, and remove each orphan.
+/// List the dispatch containers, decide, and kill each orphan.
 pub fn reap_tick(local: Option<&LocalHost>, liveness: impl Fn(u32) -> HostLiveness) -> ReapTick {
     reap_tick_named(DISPATCH_CONTAINER_PREFIX, local, liveness)
 }
@@ -299,7 +300,7 @@ pub fn reap_tick_named(
                 id: orphan.name.clone(),
             };
             let ok = matches!(
-                run_bounded(backend.remove(&handle), DOCKER_CALL_BOUND),
+                run_bounded(backend.kill(&handle), DOCKER_CALL_BOUND),
                 Bounded::Finished { success: true, .. }
             );
             (orphan, ok)

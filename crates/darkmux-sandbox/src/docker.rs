@@ -137,6 +137,12 @@ impl SandboxBackend for DockerBackend {
         cmd
     }
 
+    fn kill(&self, handle: &SandboxHandle) -> Command {
+        let mut cmd = Command::new(PROGRAM);
+        cmd.args(["kill", &handle.id]);
+        cmd
+    }
+
     fn remove(&self, handle: &SandboxHandle) -> Command {
         let mut cmd = Command::new(PROGRAM);
         cmd.args(["rm", "-f", &handle.id]);
@@ -258,6 +264,8 @@ mod tests {
         assert_eq!(handle, DockerBackend::handle("s-1"));
         let cmd = DockerBackend.start(&handle);
         assert_eq!((cmd.get_program().to_str(), args_of(&cmd)), (Some("docker"), strings(&["start", "-a", "s-1"])));
+        let cmd = DockerBackend.kill(&handle);
+        assert_eq!((cmd.get_program().to_str(), args_of(&cmd)), (Some("docker"), strings(&["kill", "s-1"])));
         let cmd = DockerBackend.stop(&handle, std::time::Duration::from_millis(5900));
         assert_eq!((cmd.get_program().to_str(), args_of(&cmd)), (Some("docker"), strings(&["stop", "-t", "5", "s-1"])));
         let cmd = DockerBackend::exec(&handle, &["cat", "/proc/net/tcp"]);

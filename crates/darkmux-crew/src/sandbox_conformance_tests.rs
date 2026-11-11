@@ -277,6 +277,24 @@ fn a_published_port_answers_on_loopback(backend: &dyn SandboxBackend, image: &st
     assert_eq!(got.trim(), "served", "nothing answered on 127.0.0.1:{port}");
 }
 
+/// A kill's success is proof the sandbox was running: it fails for one that
+/// was never made, succeeds for a running one, and that one is gone after.
+fn a_kill_succeeds_only_against_a_running_sandbox(backend: &dyn SandboxBackend, image: &str) {
+    let tree = tempfile::TempDir::new().unwrap();
+    let never = SandboxHandle { backend: backend.kind(), id: a_name() };
+    let ghost = run_bounded(backend.kill(&never), Duration::from_secs(30));
+    assert!(!matches!(ghost, Bounded::Finished { success: true, .. }), "killing a sandbox never made succeeded");
+    let p = policy(image, tree.path(), "sleep 300");
+    let (mut cmd, handle) = backend.run(&p);
+    let _removed = Removed(backend, handle.clone());
+    let mut client = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    assert!(until_listed(backend, &p.name, true), "{} never listed", p.name);
+    let killed = run_bounded(backend.kill(&handle), Duration::from_secs(30));
+    assert!(matches!(killed, Bounded::Finished { success: true, .. }), "{}", describe(&killed));
+    let _ = client.wait();
+    assert!(until_listed(backend, &p.name, false), "{} outlived its kill", p.name);
+}
+
 macro_rules! conformance {
     ($backend:ident, $make:expr, $image:literal, $needs:literal) => {
         mod $backend {
@@ -304,6 +322,11 @@ macro_rules! conformance {
             #[ignore = $needs]
             fn a_reaper_finds_an_orphan_by_its_label() {
                 super::a_reaper_finds_an_orphan_by_its_label(&$make, $image)
+            }
+            #[test]
+            #[ignore = $needs]
+            fn a_kill_succeeds_only_against_a_running_sandbox() {
+                super::a_kill_succeeds_only_against_a_running_sandbox(&$make, $image)
             }
             #[test]
             #[ignore = $needs]
