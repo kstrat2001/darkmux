@@ -63,10 +63,10 @@ pub use crate::runtime_image::RUNTIME_IMAGE;
 // capabilities, forbid privilege escalation, limit PIDs and memory.
 /// Drop ALL Linux capabilities — the runtime needs none for its job
 /// (HTTP calls to LMStudio, file reads/writes via bind mounts).
-pub const DOCKER_CAP_DROP: &str = "ALL";
+pub const DOCKER_CAP_DROP: &str = darkmux_sandbox::docker::CAP_DROP;
 /// Prevent newpriv inside the container — even if a capability is
 /// granted, the kernel blocks setuid/setgid/binary-sUID tricks.
-pub const DOCKER_SECURITY_OPT: &str = "no-new-privileges";
+pub const DOCKER_SECURITY_OPT: &str = darkmux_sandbox::docker::SECURITY_OPT;
 /// Per-container PID limit — prevents fork-bomb style resource exhaustion
 /// inside the container. 512 is a sane default for an LLM agent loop.
 pub const DOCKER_PIDS_LIMIT: u64 = 512;

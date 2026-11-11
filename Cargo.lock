@@ -724,6 +724,7 @@ dependencies = [
  "darkmux-hardware",
  "darkmux-platform",
  "darkmux-profiles",
+ "darkmux-sandbox",
  "darkmux-trajectory",
  "darkmux-types",
  "dirs",
@@ -895,6 +896,15 @@ dependencies = [
  "tempfile",
  "ts-rs",
  "ureq",
+]
+
+[[package]]
+name = "darkmux-sandbox"
+version = "5.9.3"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
