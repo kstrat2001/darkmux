@@ -222,59 +222,55 @@ pub(crate) fn create_new(root: &Path, rel: &str, mode: u32) -> io::Result<File> 
 /// Writes `bytes` as the new file `rel` inside `root` with permission bits
 /// `mode`, making each missing folder on the way (`0o755`). No link is
 /// followed at any name; refused when anything is already at `rel`.
-pub(crate) fn write_new_making_folders(
-    root: &Path,
-    rel: &str,
-    bytes: &[u8],
-    mode: u32,
-) -> io::Result<()> {
+pub(crate) fn write_new_making_folders(root: &Path, rel: &str, bytes: &[u8], mode: u32) -> io::Result<()> {
     use io::Write;
-    let parts = Path::new(rel)
+    let parts = plain_parts(rel)?;
+    let (last, folders) = parts.split_last().ok_or_else(|| invalid("an empty path"))?;
+    let mut at = open_root(root)?;
+    for folder in folders {
+        at = make_and_open(&at, folder)?;
+    }
+    let mut out = File::from(open_at(at.as_raw_fd(), last, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, mode)?);
+    out.write_all(bytes)?;
+    out.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    out.sync_all()
+}
+
+/// `rel`'s names, refused unless every one is a plain name.
+fn plain_parts(rel: &str) -> io::Result<Vec<&OsStr>> {
+    Path::new(rel)
         .components()
         .map(|c| match c {
             Component::Normal(n) => Ok(n),
             _ => Err(invalid("not a plain relative path")),
         })
-        .collect::<io::Result<Vec<&OsStr>>>()?;
-    let (last, folders) = parts.split_last().ok_or_else(|| invalid("an empty path"))?;
+        .collect()
+}
+
+/// The folder `root`, opened.
+fn open_root(root: &Path) -> io::Result<OwnedFd> {
     let root = cstr(root.as_os_str())?;
     // SAFETY: a valid NUL-terminated path; the fd is checked before use.
-    let fd = unsafe {
-        libc::open(
-            root.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
-    };
+    let fd = unsafe { libc::open(root.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: `open` just returned this fd.
-    let mut at = unsafe { OwnedFd::from_raw_fd(fd) };
-    for folder in folders {
-        let c = cstr(folder)?;
-        // SAFETY: a valid NUL-terminated name and an fd we own.
-        if unsafe { libc::mkdirat(at.as_raw_fd(), c.as_ptr(), 0o755) } != 0 {
-            let e = io::Error::last_os_error();
-            if e.kind() != io::ErrorKind::AlreadyExists {
-                return Err(e);
-            }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// The folder `name` in `dir`, made when missing, opened without following
+/// a link.
+fn make_and_open(dir: &OwnedFd, name: &OsStr) -> io::Result<OwnedFd> {
+    let c = cstr(name)?;
+    // SAFETY: a valid NUL-terminated name and an fd we own.
+    if unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o755) } != 0 {
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::AlreadyExists {
+            return Err(e);
         }
-        at = open_at(
-            at.as_raw_fd(),
-            folder,
-            libc::O_RDONLY | libc::O_DIRECTORY,
-            0,
-        )?;
     }
-    let mut out = File::from(open_at(
-        at.as_raw_fd(),
-        last,
-        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-        mode,
-    )?);
-    out.write_all(bytes)?;
-    out.set_permissions(std::fs::Permissions::from_mode(mode))?;
-    out.sync_all()
+    open_at(dir.as_raw_fd(), name, libc::O_RDONLY | libc::O_DIRECTORY, 0)
 }
 
 /// Opens the regular file `rel` inside `root` for reading, with its

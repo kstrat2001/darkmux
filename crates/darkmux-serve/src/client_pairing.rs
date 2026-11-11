@@ -4715,6 +4715,10 @@ fn image_not_committed(matches: Option<u32>, image: Option<&Image>) -> Refused {
     )
 }
 
+fn conflict(why: String) -> Refused {
+    refuse(StatusCode::CONFLICT, ClientCode::Conflict, why)
+}
+
 /// Writes the image (kept when the same bytes are already there), points
 /// the one place holding `replace` at it, and commits both; a failed step
 /// puts back what it changed.
@@ -4725,88 +4729,39 @@ fn image_in(
     replace: Option<&str>,
     work_id: &str,
 ) -> Result<EditDone, Refused> {
-    use crate::client_preview::at;
-    let conflict = |why: String| refuse(StatusCode::CONFLICT, ClientCode::Conflict, why);
     let hit = match replace {
+        Some(old) => Some(one_reference(wc, old)?),
         None => None,
-        Some(old) => {
-            let mut hits = find_in_tracked(wc, old)?;
-            if hits.len() != 1 {
-                return Err(image_not_committed(Some(hits.len() as u32), None));
-            }
-            Some(hits.remove(0))
-        }
     };
-    if let Some((file, _, _)) = &hit {
-        refuse_unless_clean(wc, file)?;
-    }
     onto_own_branch(st, Some(wc))?;
-    let already = match at::open_regular(&wc.work_tree, &image.path) {
-        Ok((file, _)) => {
-            use std::io::Read;
-            let mut held = Vec::new();
-            file.take(image.bytes.len() as u64 + 1)
-                .read_to_end(&mut held)
-                .map_err(|e| conflict(format!("darkmux didn't add {}: {e}", image.path)))?;
-            if held != image.bytes {
-                return Err(conflict(format!(
-                    "{} already holds a different file",
-                    image.path
-                )));
-            }
-            true
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(e) => return Err(conflict(format!("darkmux didn't add {}: {e}", image.path))),
-    };
+    let already = image_already_there(wc, image)?;
     if already && hit.is_none() {
         return Err(image_not_committed(None, Some(image)));
     }
     let before = snapshot_tree(wc)
         .map_err(|e| Box::new(internal(anyhow!("reading the work copy failed: {e}"))))?;
-    if !already {
-        at::write_new_making_folders(&wc.work_tree, &image.path, &image.bytes, 0o644)
-            .map_err(|e| conflict(format!("darkmux didn't add {}: {e}", image.path)))?;
-    }
-    let put_back = |also: Option<&str>| {
-        if !already {
-            let _ = at::remove(&wc.work_tree, &image.path);
-        }
-        if let Some(f) = also {
-            let _ = git_quiet(wc, &["--literal-pathspecs", "checkout", "HEAD", "--", f]);
-        }
-    };
-    let mut files = vec![image.path.clone()];
-    if let Some((file, (start, end), text)) = &hit {
-        let edited = format!("{}{}{}", &text[..*start], image.url, &text[*end..]);
-        if let Err(e) = at::replace_regular(&wc.work_tree, file, text.as_bytes(), edited.as_bytes())
-        {
-            put_back(None);
-            return Err(conflict(format!("darkmux didn't edit {file}: {e}")));
-        }
-        files.push(file.clone());
-    }
-    let (changes, changes_error) = match changes_since(wc, &before.tree) {
+    let files = place_image(wc, image, already, hit.as_ref())?;
+    commit_image(wc, image, already, files, before.tree, work_id)
+}
+
+/// Commits the placed image (and the file pointed at it); a failed commit
+/// puts back what was placed.
+fn commit_image(
+    wc: &WorkCopy,
+    image: &Image,
+    already: bool,
+    files: Vec<String>,
+    baseline: String,
+    work_id: &str,
+) -> Result<EditDone, Refused> {
+    let (changes, changes_error) = match changes_since(wc, &baseline) {
         Ok(c) => (Some(c), None),
-        Err(e) => (
-            None,
-            Some(format!("reading the image's changes failed: {e}")),
-        ),
+        Err(e) => (None, Some(format!("reading the image's changes failed: {e}"))),
     };
     let message = format!("image: {} (work {work_id})", image.path);
     let (commit, branch) = commit_run(wc, &files, &message).map_err(|e| {
-        let _ = git_quiet(
-            wc,
-            &[
-                "--literal-pathspecs",
-                "reset",
-                "--quiet",
-                "HEAD",
-                "--",
-                &image.path,
-            ],
-        );
-        put_back(hit.as_ref().map(|(f, _, _)| f.as_str()));
+        let _ = git_quiet(wc, &["--literal-pathspecs", "reset", "--quiet", "HEAD", "--", &image.path]);
+        put_image_back(wc, image, already, files.get(1).map(String::as_str));
         conflict(format!("couldn't commit the image: {e}"))
     })?;
     Ok(EditDone {
@@ -4814,10 +4769,71 @@ fn image_in(
         files,
         commit,
         branch,
-        baseline: before.tree,
+        baseline,
         changes,
         changes_error,
     })
+}
+
+/// The one place `old` is in the tracked files, in a file with no
+/// uncommitted change; else the reply naming how many places hold it.
+fn one_reference(wc: &WorkCopy, old: &str) -> Result<EditHit, Refused> {
+    let mut hits = find_in_tracked(wc, old)?;
+    if hits.len() != 1 {
+        return Err(image_not_committed(Some(hits.len() as u32), None));
+    }
+    let hit = hits.remove(0);
+    refuse_unless_clean(wc, &hit.0)?;
+    Ok(hit)
+}
+
+/// Whether the image is already at its path (the same bytes); refused when
+/// a different file, or anything darkmux won't read, is there.
+fn image_already_there(wc: &WorkCopy, image: &Image) -> Result<bool, Refused> {
+    use std::io::Read;
+    let didnt = |e: std::io::Error| conflict(format!("darkmux didn't add {}: {e}", image.path));
+    let file = match crate::client_preview::at::open_regular(&wc.work_tree, &image.path) {
+        Ok((file, _)) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(didnt(e)),
+    };
+    let mut held = Vec::new();
+    file.take(image.bytes.len() as u64 + 1).read_to_end(&mut held).map_err(didnt)?;
+    if held != image.bytes {
+        return Err(conflict(format!("{} already holds a different file", image.path)));
+    }
+    Ok(true)
+}
+
+/// Writes the image (unless `already` there) and points `hit` at it: the
+/// files to commit, image first. A failed step puts back what it changed.
+fn place_image(wc: &WorkCopy, image: &Image, already: bool, hit: Option<&EditHit>) -> Result<Vec<String>, Refused> {
+    use crate::client_preview::at;
+    if !already {
+        at::write_new_making_folders(&wc.work_tree, &image.path, &image.bytes, 0o644)
+            .map_err(|e| conflict(format!("darkmux didn't add {}: {e}", image.path)))?;
+    }
+    let mut files = vec![image.path.clone()];
+    if let Some((file, (start, end), text)) = hit {
+        let edited = format!("{}{}{}", &text[..*start], image.url, &text[*end..]);
+        if let Err(e) = at::replace_regular(&wc.work_tree, file, text.as_bytes(), edited.as_bytes()) {
+            put_image_back(wc, image, already, None);
+            return Err(conflict(format!("darkmux didn't edit {file}: {e}")));
+        }
+        files.push(file.clone());
+    }
+    Ok(files)
+}
+
+/// Takes out an image darkmux wrote (never one that was already there) and
+/// puts `edited` back as committed.
+fn put_image_back(wc: &WorkCopy, image: &Image, already: bool, edited: Option<&str>) {
+    if !already {
+        let _ = crate::client_preview::at::remove(&wc.work_tree, &image.path);
+    }
+    if let Some(f) = edited {
+        let _ = git_quiet(wc, &["--literal-pathspecs", "checkout", "HEAD", "--", f]);
+    }
 }
 
 // ─── Commits and Undo ────────────────────────────────────────────────────
