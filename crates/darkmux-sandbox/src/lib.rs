@@ -33,6 +33,11 @@ pub enum Access {
 /// earlier mount is layered over it: a read-write tree at `/workspace` with
 /// its `.git` read-only at `/workspace/.git` sees the tree writable and its
 /// `.git` not.
+///
+/// `at` places a host path at another path, which Docker (and bubblewrap,
+/// and Apple's `container`) can do and Seatbelt and Landlock cannot: they
+/// only allow or deny a host path where it is. How such a backend honors
+/// `/workspace` is the first question of the Seatbelt step (#3112).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mount {
     pub host: PathBuf,

@@ -46,7 +46,7 @@ fn production_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// `text`'s lines outside `#[cfg(test)]` items. An item is the next line
-/// ending in `;` or `{` after the attribute (other attributes and a
+/// ending in `;`, `}` or `{` after the attribute (other attributes and a
 /// multi-line signature between); a block item runs to the `}` at its own
 /// indent.
 fn production_lines(text: &str) -> Vec<&str> {
@@ -69,7 +69,9 @@ fn skip_test_item<'a>(lines: &mut impl Iterator<Item = &'a str>) {
         if indent.is_none() && !trimmed.trim_start().starts_with("#[") {
             indent = Some(&line[..line.len() - line.trim_start().len()]);
         }
-        if trimmed.ends_with(';') {
+        // A declaration, or a one-line item (`fn f() {}`) closed on its own
+        // line.
+        if trimmed.ends_with(';') || trimmed.ends_with('}') {
             return;
         }
         if trimmed.ends_with('{') {
@@ -80,14 +82,29 @@ fn skip_test_item<'a>(lines: &mut impl Iterator<Item = &'a str>) {
     }
 }
 
+/// Every Rust package the repo builds: the root, each one under `crates/`,
+/// `plugins/` and `tools/`, and `runtime/` (outside the workspace).
+fn packages(root: &Path) -> Vec<PathBuf> {
+    let mut out = vec![root.to_path_buf(), root.join("runtime")];
+    for group in ["crates", "plugins", "tools"] {
+        let Ok(entries) = std::fs::read_dir(root.join(group)) else {
+            continue;
+        };
+        out.extend(entries.flatten().map(|e| e.path()));
+    }
+    out
+}
+
 /// Production lines spelling the program, per workspace-relative file,
 /// outside the backend.
 fn docker_calls(root: &Path) -> BTreeMap<String, usize> {
     let mut files = Vec::new();
-    production_files(&root.join("src"), &mut files);
-    let crates = std::fs::read_dir(root.join("crates")).expect("crates/ exists");
-    for krate in crates.flatten() {
-        production_files(&krate.path().join("src"), &mut files);
+    for package in packages(root) {
+        production_files(&package.join("src"), &mut files);
+        let build = package.join("build.rs");
+        if build.is_file() {
+            files.push(build);
+        }
     }
     let mut calls = BTreeMap::new();
     for file in files {
@@ -158,9 +175,9 @@ fn the_ratchet_refuses_a_new_call_and_a_stale_count() {
     assert!(ratchet_violations(&shrank, &allowed)[0].contains("Lower its line"));
 }
 
-/// Test items are not production: a `#[cfg(test)]` module, function or
-/// `mod x;` declaration is skipped through its end, and the lines after it
-/// count again.
+/// Test items are not production: a `#[cfg(test)]` module, function,
+/// one-line item or `mod x;` declaration is skipped through its end, and
+/// the lines after it count again.
 #[test]
 fn test_items_are_skipped_and_production_around_them_counts() {
     let text = [
@@ -182,14 +199,22 @@ fn test_items_are_skipped_and_production_around_them_counts() {
         "        \"docker\"",
         "    }",
         "c \"docker\"",
+        "#[cfg(test)]",
+        "fn one_line() {}",
+        "d \"docker\"",
+        "#[cfg(test)]",
+        "fn one_line_with_body() -> u8 { 1 }",
+        "e \"docker\"",
     ]
     .join("\n");
     let counted: Vec<&str> = production_lines(&text).into_iter().filter(|l| l.contains(LITERAL)).collect();
-    assert_eq!(counted, vec!["a \"docker\"", "b \"docker\"", "c \"docker\""]);
+    assert_eq!(counted, vec!["a \"docker\"", "b \"docker\"", "c \"docker\"", "d \"docker\"", "e \"docker\""]);
 }
 
-/// The walk sees production files only, and finds a literal the way the
-/// ratchet counts it, so a pass is not an empty scan.
+/// The walk sees production files only, in every Rust tree the repo builds
+/// (the workspace, `runtime/`, `plugins/`, `tools/`, and build scripts),
+/// and finds a literal the way the ratchet counts it, so a pass is not an
+/// empty scan.
 #[test]
 fn the_scan_counts_production_files_and_skips_test_files() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -206,6 +231,21 @@ fn the_scan_counts_production_files_and_skips_test_files() {
     write("crates/x/tests/proof.rs", "\"docker\"\n");
     write("crates/x/src/tests/helper.rs", "\"docker\"\n");
     write(BACKEND, "\"docker\"\n");
+    write("crates/x/build.rs", "\"docker\"\n");
+    write("runtime/src/main.rs", "\"docker\"\n");
+    write("plugins/p/src/lib.rs", "\"docker\"\n");
+    write("tools/t/src/main.rs", "\"docker\"\n");
     let found = docker_calls(&root);
-    assert_eq!(found, BTreeMap::from([("crates/x/src/lib.rs".to_string(), 1), ("src/main.rs".to_string(), 1)]));
+    let one = |p: &str| (p.to_string(), 1);
+    assert_eq!(
+        found,
+        BTreeMap::from([
+            one("crates/x/build.rs"),
+            one("crates/x/src/lib.rs"),
+            one("plugins/p/src/lib.rs"),
+            one("runtime/src/main.rs"),
+            one("src/main.rs"),
+            one("tools/t/src/main.rs"),
+        ])
+    );
 }
