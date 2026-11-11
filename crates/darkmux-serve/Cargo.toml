@@ -15,6 +15,7 @@ darkmux-types = { path = "../darkmux-types" }
 darkmux-flow = { path = "../darkmux-flow" }
 darkmux-profiles = { path = "../darkmux-profiles" }
 darkmux-crew = { path = "../darkmux-crew" }
+darkmux-sandbox = { path = "../darkmux-sandbox" }
 darkmux-fleet = { path = "../darkmux-fleet" }
 # (#2814) `machine_uid()` — the stable hardware identity `/machine/specs` now
 # reports, so a viewer can answer "is this card the machine serving the page?"

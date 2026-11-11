@@ -125,6 +125,7 @@ use crate::client_wire::PreviewState;
 #[cfg(unix)]
 #[path = "client_preview_at.rs"]
 pub(crate) mod at;
+use darkmux_sandbox::{backend, Access, DockerBackend, Limits, Mount, Network, SandboxHandle, SandboxPolicy};
 use darkmux_types::data_version::PREVIEW_RECIPE_SCHEMA_VERSION;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -759,63 +760,67 @@ pub struct ContainerSpec {
     pub script: String,
 }
 
-/// `docker create` arguments for a preview container: the dispatch
-/// container's hardening (no capabilities, no new privileges, its pid and
-/// memory limits, `--init`), removed when it exits, the workspace its only
-/// writable mount (and its heartbeat folder, read-only), only the
-/// preview's two ports published and only on loopback, and an environment
-/// of exactly `spec.env`. It keeps the default network: an install step
-/// fetches packages. Created first and started after (`docker start -a`),
-/// so a stop at any moment finds the container by name.
-pub fn docker_create_args(spec: &ContainerSpec) -> Vec<String> {
-    use darkmux_crew::dispatch_internal::{
-        DOCKER_CAP_DROP, DOCKER_MEMORY, DOCKER_PIDS_LIMIT, DOCKER_SECURITY_OPT,
+/// (#3112) What a preview container may see and do: the dispatch
+/// container's hardening (no capabilities, no new privileges and `--init`,
+/// which every sandbox has, plus its pid and memory limits), removed when
+/// it exits, the workspace its only writable mount (and its heartbeat
+/// folder, read-only), only the preview's two ports published and only on
+/// loopback, and an environment of exactly `spec.env` (after `HOME=/tmp`
+/// for a container user: the image's home belongs to the image's own
+/// user). It keeps the default network: an install step fetches packages.
+pub fn preview_policy(spec: &ContainerSpec) -> SandboxPolicy {
+    use darkmux_crew::dispatch_internal::{DOCKER_MEMORY, DOCKER_PIDS_LIMIT};
+    let mount = |host: &Path, at: &str, access| Mount {
+        host: host.to_path_buf(),
+        at: at.to_string(),
+        access,
     };
-    let mut args: Vec<String> = ["create", "--rm", "--init", "--name", &spec.name]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    args.extend([
-        format!("--cap-drop={DOCKER_CAP_DROP}"),
-        format!("--security-opt={DOCKER_SECURITY_OPT}"),
-        format!("--pids-limit={DOCKER_PIDS_LIMIT}"),
-        format!("--memory={DOCKER_MEMORY}"),
-    ]);
-    for label in &spec.labels {
-        args.extend(["--label".to_string(), label.clone()]);
-    }
-    args.extend([
-        "-v".to_string(),
-        format!("{}:{WORKSPACE_AT}", spec.workspace.display()),
-        "-v".to_string(),
-        format!("{}:{HEARTBEAT_AT}:ro", spec.heartbeat.display()),
-        "-w".to_string(),
-        WORKSPACE_AT.to_string(),
-    ]);
-    for port in spec.ports {
-        args.extend(["-p".to_string(), format!("127.0.0.1:{port}:{port}")]);
-    }
-    if let Some(user) = &spec.user {
-        // The image's home belongs to the image's own user.
-        args.extend([
-            format!("--user={user}"),
-            "-e".to_string(),
-            "HOME=/tmp".to_string(),
-        ]);
-    }
-    for (k, v) in &spec.env {
-        // Always `KEY=value`: a bare `-e KEY` would copy the host's value.
-        args.extend(["-e".to_string(), format!("{k}={v}")]);
-    }
-    args.extend([
+    let home = spec.user.iter().map(|_| ("HOME".to_string(), "/tmp".to_string()));
+    SandboxPolicy {
+        name: spec.name.clone(),
+        image: spec.image.clone(),
+        network: Network::Default,
+        limits: Limits {
+            memory: Some(DOCKER_MEMORY.to_string()),
+            pids: Some(DOCKER_PIDS_LIMIT),
+        },
+        labels: spec
+            .labels
+            .iter()
+            .map(|l| {
+                let (k, v) = l.split_once('=').unwrap_or((l, ""));
+                (k.to_string(), v.to_string())
+            })
+            .collect(),
+        mounts: vec![
+            mount(&spec.workspace, WORKSPACE_AT, Access::ReadWrite),
+            mount(&spec.heartbeat, HEARTBEAT_AT, Access::ReadOnly),
+        ],
+        ports: spec.ports.to_vec(),
+        user: spec.user.clone(),
+        env: home.chain(spec.env.iter().cloned()).collect(),
+        workdir: Some(WORKSPACE_AT.to_string()),
         // The runtime image's own entrypoint never wraps the script.
-        "--entrypoint".to_string(),
-        "sh".to_string(),
-        spec.image.clone(),
-        "-c".to_string(),
-        spec.script.clone(),
-    ]);
-    args
+        entrypoint: Some("sh".to_string()),
+        command: vec!["-c".to_string(), spec.script.clone()],
+    }
+}
+
+/// The `docker create` arguments a preview container is made with: the
+/// sandbox backend's command for [`preview_policy`]. Created first and
+/// started after (`docker start -a`), so a stop at any moment finds the
+/// container by name.
+pub fn docker_create_args(spec: &ContainerSpec) -> Vec<String> {
+    let (cmd, _) = backend().create(&preview_policy(spec));
+    cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect()
+}
+
+/// A preview container's handle, by its name.
+fn handle(name: &str) -> SandboxHandle {
+    SandboxHandle {
+        backend: backend().kind(),
+        id: name.to_string(),
+    }
 }
 
 /// The container's script: a start line, a watchdog in the background
@@ -940,8 +945,7 @@ impl PreviewContainers for Docker {
 
     fn create(&self, spec: &ContainerSpec) -> Result<(), String> {
         use darkmux_crew::bounded_command::{run_bounded, Bounded};
-        let mut cmd = std::process::Command::new("docker");
-        cmd.args(docker_create_args(spec));
+        let (cmd, _) = backend().create(&preview_policy(spec));
         match run_bounded(cmd, DOCKER_CREATE_BOUND) {
             Bounded::Finished { success: true, .. } => Ok(()),
             Bounded::Finished { stderr, .. } => Err(format!(
@@ -954,8 +958,7 @@ impl PreviewContainers for Docker {
 
     fn listeners(&self, name: &str) -> Option<String> {
         use darkmux_crew::bounded_command::{run_bounded, Bounded};
-        let mut cmd = std::process::Command::new("docker");
-        cmd.args(["exec", name, "cat", "/proc/net/tcp", "/proc/net/tcp6"]);
+        let cmd = DockerBackend::exec(&handle(name), &["cat", "/proc/net/tcp", "/proc/net/tcp6"]);
         match run_bounded(cmd, DOCKER_CALL_BOUND) {
             Bounded::Finished { stdout, .. } if !stdout.is_empty() => {
                 Some(String::from_utf8_lossy(&stdout).to_string())
@@ -973,9 +976,8 @@ impl PreviewContainers for Docker {
         let err = out
             .try_clone()
             .map_err(|e| format!("opening {}: {e}", log.display()))?;
-        let mut cmd = std::process::Command::new("docker");
-        cmd.args(["start", "-a", name])
-            .stdin(std::process::Stdio::null())
+        let mut cmd = backend().start(&handle(name));
+        cmd.stdin(std::process::Stdio::null())
             .stdout(out)
             .stderr(err);
         // Its own process group: a Ctrl-C at `client serve` reaches darkmux,
@@ -990,15 +992,14 @@ impl PreviewContainers for Docker {
 
     fn remove(&self, name: &str) {
         use darkmux_crew::bounded_command::run_bounded;
-        let quiet = |args: &[&str]| {
-            let mut c = std::process::Command::new("docker");
-            c.args(args)
-                .stdout(std::process::Stdio::null())
+        let quiet = |mut c: std::process::Command| {
+            c.stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null());
             c
         };
-        let _ = run_bounded(quiet(&["stop", "-t", "5", name]), DOCKER_CALL_BOUND);
-        let _ = run_bounded(quiet(&["rm", "-f", name]), DOCKER_CALL_BOUND);
+        let stop = backend().stop(&handle(name), Duration::from_secs(5));
+        let _ = run_bounded(quiet(stop), DOCKER_CALL_BOUND);
+        let _ = run_bounded(quiet(backend().remove(&handle(name))), DOCKER_CALL_BOUND);
     }
 
     fn reap_orphans(&self) -> Vec<String> {
