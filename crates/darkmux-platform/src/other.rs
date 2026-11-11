@@ -109,4 +109,14 @@ impl Platform for OtherPlatform {
     fn secret_store(&self) -> crate::SecretStore {
         crate::SecretStore::PrivateFile
     }
+
+    fn signed_app(&self, _pid: u32) -> Result<crate::SignedApp, String> {
+        Err("darkmux cannot check code signatures on this platform".to_string())
+    }
+
+    fn ask_allow(&self, _message: &str, _icon: Option<&std::path::Path>, _timeout_secs: u64) -> crate::AllowAnswer {
+        crate::AllowAnswer::NoDialog("darkmux shows no dialogs on this platform".to_string())
+    }
+
+    fn notify(&self, _message: &str) {}
 }

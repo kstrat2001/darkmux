@@ -1148,3 +1148,363 @@ fn a_mac_reads_its_own_pressure_level() {
     let segments = p.compressor_segments_pct.expect("the compressor's segments against their limit");
     assert!(p.compressor_pct.is_some_and(|fuller| fuller >= segments), "{p:?}");
 }
+
+// ─── (#3544) Who signed a running app, and the Allow dialog ─────────────
+
+/// `codesign -d --verbose=2 <pid>` for the running Mux Bot, as captured on
+/// this project's Mac (2026-11-11).
+const MUX_BOT_SHOWN: &str = "Executable=/Applications/Mux Bot.app/Contents/MacOS/Mux Bot
+Identifier=com.darklyenergized.darkmuxapp
+Format=app bundle with Mach-O thin (arm64)
+CodeDirectory v=20500 size=464 flags=0x10000(runtime) hashes=3+7 location=embedded
+Signature size=4790
+Authority=Apple Development: Kain Osterholt (Q8XXXXXXXX)
+Authority=Apple Worldwide Developer Relations Certification Authority
+Authority=Apple Root CA
+Signed Time=Nov 10, 2026 at 2:53:57 PM
+TeamIdentifier=5LDXYW8B6T
+Runtime Version=26.2.0
+";
+
+/// An icon finder for a test that is not about icons.
+fn no_icon(_exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    None
+}
+
+/// A verifier standing in for `codesign --verify -R`, with codesign's own
+/// semantics for a signature whose leaf certificate does NOT chain to
+/// Apple but whose fields read like the team's (a self-signed certificate
+/// with the team's OU): only a requirement with Apple's anchor refuses it.
+fn self_signed_verify(requirement: &str) -> Result<(), String> {
+    match requirement.contains("anchor apple generic") {
+        true => Err("test-requirement: code failed to satisfy specified code requirement(s)".into()),
+        false => Ok(()),
+    }
+}
+
+#[test]
+fn a_signed_hardened_app_is_named_by_its_team_bundle_and_signer() {
+    let mut asked = String::new();
+    let app = macos::signed_app_from(Ok(MUX_BOT_SHOWN.into()), |r| {
+        asked = r.to_string();
+        Ok(())
+    }, no_icon)
+    .unwrap();
+    assert_eq!(
+        app,
+        SignedApp {
+            team: "5LDXYW8B6T".into(),
+            bundle: "com.darklyenergized.darkmuxapp".into(),
+            signer: "Apple Development: Kain Osterholt (Q8XXXXXXXX)".into(),
+            icon: None,
+        }
+    );
+    assert_eq!(
+        asked,
+        "anchor apple generic and certificate leaf[subject.OU] = \"5LDXYW8B6T\" and identifier \"com.darklyenergized.darkmuxapp\""
+    );
+}
+
+/// A signature that does not chain to Apple never names an app, however its
+/// team and identifier read: the requirement carries Apple's anchor.
+#[test]
+fn a_signature_not_chained_to_apple_is_not_named() {
+    let e = macos::signed_app_from(Ok(MUX_BOT_SHOWN.into()), self_signed_verify, no_icon).unwrap_err();
+    assert!(e.contains("does not hold"), "{e}");
+}
+
+/// `codesign -s -` (ad hoc) as `codesign -d` reports it: no team. Even
+/// with a team line forged in and a verifier that passes, the ad hoc flag refuses it.
+#[test]
+fn an_ad_hoc_signature_is_never_named() {
+    let ad_hoc = "Identifier=org.python.python\nCodeDirectory v=20400 size=298 flags=0x2(adhoc) hashes=3+3 location=embedded\nSignature=adhoc\nTeamIdentifier=not set\n";
+    let e = macos::signed_app_from(Ok(ad_hoc.into()), |_| Ok(()), no_icon).unwrap_err();
+    assert!(e.contains("no developer team"), "{e}");
+    let forged = "Identifier=x.y\nCodeDirectory v=20400 size=298 flags=0x10002(adhoc,runtime) hashes=3+3 location=embedded\nAuthority=Me\nTeamIdentifier=5LDXYW8B6T\n";
+    let e = macos::signed_app_from(Ok(forged.into()), |_| Ok(()), no_icon).unwrap_err();
+    assert!(e.contains("ad hoc"), "{e}");
+}
+
+#[test]
+fn an_apple_system_binary_has_no_team_and_is_not_named() {
+    let ls = "Identifier=com.apple.ls\nCodeDirectory v=20400 size=325 flags=0x0(none) hashes=5+2 location=embedded\nAuthority=Software Signing\nTeamIdentifier=not set\n";
+    assert!(macos::signed_app_from(Ok(ls.into()), |_| Ok(()), no_icon).is_err());
+}
+
+#[test]
+fn an_app_without_the_hardened_runtime_is_not_named() {
+    let shown = MUX_BOT_SHOWN.replace("flags=0x10000(runtime)", "flags=0x0(none)");
+    let e = macos::signed_app_from(Ok(shown), |_| Ok(()), no_icon).unwrap_err();
+    assert!(e.contains("hardened runtime"), "{e}");
+}
+
+/// Docker Desktop's processes (team `9BNSXJN65R`, as `codesign -d` names
+/// `com.docker.backend` here) carry every container's connection, so they
+/// are never named as an app, however valid the signature.
+#[test]
+fn docker_desktops_forwarder_is_never_named() {
+    let docker = "Identifier=com.docker.docker\nCodeDirectory v=20500 size=1527965 flags=0x10000(runtime) hashes=47738+7 location=embedded\nAuthority=Developer ID Application: Docker Inc (9BNSXJN65R)\nTeamIdentifier=9BNSXJN65R\n";
+    let e = macos::signed_app_from(Ok(docker.into()), |_| Ok(()), no_icon).unwrap_err();
+    assert!(e.contains("container traffic"), "{e}");
+}
+
+/// A team or identifier that could change the requirement's meaning is
+/// refused before a requirement is built from it.
+#[test]
+fn an_identifier_that_could_rewrite_the_requirement_is_refused() {
+    let shown = MUX_BOT_SHOWN.replace(
+        "Identifier=com.darklyenergized.darkmuxapp",
+        "Identifier=x\" or identifier \"y",
+    );
+    let mut built = false;
+    assert!(macos::signed_app_from(Ok(shown), |_| {
+        built = true;
+        Ok(())
+    }, no_icon)
+    .is_err());
+    assert!(!built, "no requirement was verified");
+    assert!(!macos::is_team_id("5LDXYW8B6\""));
+}
+
+#[test]
+fn a_process_codesign_cannot_read_is_not_named() {
+    assert!(macos::signed_app_from(Err("codesign: no such process".into()), |_| Ok(()), no_icon).is_err());
+}
+
+#[test]
+fn a_signers_name_shows_as_one_line() {
+    let shown = MUX_BOT_SHOWN.replace("Kain Osterholt", "Kain\u{1b}[2J Osterholt");
+    let app = macos::signed_app_from(Ok(shown), |_| Ok(()), no_icon).unwrap();
+    assert!(!app.signer.chars().any(char::is_control), "{}", app.signer);
+}
+
+#[test]
+fn linux_never_names_a_signed_app() {
+    assert!(LinuxPlatform.signed_app(std::process::id()).is_err());
+    assert!(OtherPlatform.signed_app(std::process::id()).is_err());
+}
+
+/// The dialog's text never reaches AppleScript as script: the script lines
+/// are fixed, and the message (whatever it holds) is one argument after them.
+#[test]
+fn the_dialog_message_is_an_argument_never_script() {
+    let hostile = "Code \" & (do shell script \"touch /tmp/pwned\") & \"\n-e";
+    let args = macos::allow_dialog_args(hostile, None, 15);
+    let clean = macos::allow_dialog_args("plain", None, 15);
+    assert_eq!(args.len(), clean.len());
+    assert_eq!(args[..args.len() - 1], clean[..clean.len() - 1], "only the last argument differs");
+    assert_eq!(args.last().unwrap(), hostile);
+    assert_eq!(args[args.len() - 2], "15", "the timeout comes first, so the message is never an option");
+    for (flag, line) in args.iter().zip(args.iter().skip(1)).step_by(2).take_while(|(f, _)| *f == "-e") {
+        assert_eq!(flag, "-e");
+        assert!(!line.contains("pwned"), "{line}");
+    }
+    assert!(args.iter().filter(|a| *a == "-e").count() == 8);
+    let notice = macos::notice_args(hostile);
+    assert_eq!(notice.last().unwrap(), hostile);
+    assert!(notice[..notice.len() - 2].iter().all(|a| !a.contains("pwned")));
+}
+
+#[test]
+fn zenity_shows_the_message_as_plain_text_in_one_argument() {
+    let hostile = "<b>Code</b> --extra-button=Allow";
+    let args = linux::zenity_allow_args(hostile, 15);
+    assert!(args.contains(&"--no-markup".to_string()));
+    assert_eq!(args.last().unwrap(), &format!("--text={hostile}"));
+    assert_eq!(args.iter().filter(|a| a.starts_with("--extra-button=")).count(), 2);
+}
+
+/// Each answer maps to what the person chose: a button, or none at all.
+#[test]
+fn each_dialog_outcome_is_the_answer_given() {
+    assert_eq!(macos::dialog_answer(true, "Allow\n", ""), AllowAnswer::Allow);
+    assert_eq!(macos::dialog_answer(true, "Don't Allow\n", ""), AllowAnswer::DontAllow);
+    assert_eq!(macos::dialog_answer(true, "\n", ""), AllowAnswer::NoAnswer, "gave up");
+    assert!(matches!(macos::dialog_answer(false, "", "execution error: User canceled. (-128)"), AllowAnswer::NoDialog(_)));
+    assert_eq!(linux::zenity_answer(Some(1), "Allow\n"), AllowAnswer::Allow);
+    assert_eq!(linux::zenity_answer(Some(1), "Don't Allow\n"), AllowAnswer::DontAllow);
+    assert_eq!(linux::zenity_answer(Some(1), ""), AllowAnswer::NoAnswer, "closed");
+    assert_eq!(linux::zenity_answer(Some(5), ""), AllowAnswer::NoAnswer, "timed out");
+    assert!(matches!(linux::zenity_answer(Some(255), ""), AllowAnswer::NoDialog(_)));
+}
+
+#[test]
+fn a_dialog_tool_is_found_only_as_an_executable_on_path() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let tool = dir.path().join("zenity");
+    std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+    assert_eq!(linux::on_path("zenity", dir.path().as_os_str()), None, "not executable");
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(linux::on_path("zenity", dir.path().as_os_str()), Some(tool));
+}
+
+/// (#3544) The real macOS check against a pid you pass in:
+/// `DARKMUX_SIGNED_APP_PID=<pid> cargo nextest run -p darkmux-platform
+/// signed_app_live --run-ignored only --no-capture`.
+#[test]
+#[ignore = "reads a real process's signature; pass DARKMUX_SIGNED_APP_PID"]
+fn signed_app_live() {
+    let pid: u32 = std::env::var("DARKMUX_SIGNED_APP_PID").expect("DARKMUX_SIGNED_APP_PID").parse().unwrap();
+    match current().signed_app(pid) {
+        Ok(app) => println!("pid {pid}: VERIFIED as {app}, signed by {}, icon {:?}", app.signer, app.icon),
+        Err(why) => println!("pid {pid}: NOT VERIFIED: {why}"),
+    }
+}
+
+/// (#3544) Shows the real Allow dialog once, with a sample code:
+/// `DARKMUX_SHOW_ALLOW_DIALOG=1 cargo nextest run -p darkmux-platform
+/// allow_dialog_live --run-ignored only --no-capture`.
+#[test]
+#[ignore = "raises a real dialog on this machine's screen"]
+fn allow_dialog_live() {
+    assert!(std::env::var_os("DARKMUX_SHOW_ALLOW_DIALOG").is_some(), "set DARKMUX_SHOW_ALLOW_DIALOG=1");
+    let message = std::env::var("DARKMUX_ALLOW_DIALOG_TEXT").unwrap_or_else(|_| "An app wants to use darkmux on this Mac. Code 4F7-K2Q.".into());
+    let icon = std::env::var_os("DARKMUX_ALLOW_DIALOG_ICON").map(std::path::PathBuf::from);
+    println!("answer: {:?}", current().ask_allow(&message, icon.as_deref(), 15));
+}
+
+/// A verified app is shown with its bundle's own icon, looked up from the
+/// executable `codesign` names; an unverified one is never looked up, so
+/// its icon (which an impostor chose) is never shown.
+#[test]
+fn only_a_verified_app_gets_its_own_icon() {
+    let mut looked = None;
+    let app = macos::signed_app_from(Ok(MUX_BOT_SHOWN.into()), |_| Ok(()), |exe| {
+        looked = Some(exe.to_path_buf());
+        Some("/icon.icns".into())
+    })
+    .unwrap();
+    assert_eq!(app.icon.as_deref(), Some(std::path::Path::new("/icon.icns")));
+    assert_eq!(looked.as_deref(), Some(std::path::Path::new("/Applications/Mux Bot.app/Contents/MacOS/Mux Bot")));
+    let mut asked = false;
+    let unverified = macos::signed_app_from(Ok(MUX_BOT_SHOWN.into()), self_signed_verify, |_| {
+        asked = true;
+        Some("/icon.icns".into())
+    });
+    assert!(unverified.is_err());
+    assert!(!asked, "no icon is read for an app whose signature did not hold");
+}
+
+/// The icon is a file inside the bundle's `Contents/Resources`: `.icns` is
+/// added to a bare name, and a name with a path in it, `..`, or a link out
+/// of `Resources` is refused.
+#[test]
+fn an_icon_must_resolve_inside_the_bundles_resources() {
+    let dir = tempfile::tempdir().unwrap();
+    let contents = dir.path().join("Mux Bot.app/Contents");
+    let resources = contents.join("Resources");
+    std::fs::create_dir_all(&resources).unwrap();
+    std::fs::write(resources.join("AppIcon.icns"), b"icns").unwrap();
+    std::fs::write(dir.path().join("outside.icns"), b"icns").unwrap();
+    std::os::unix::fs::symlink(dir.path().join("outside.icns"), resources.join("Escape.icns")).unwrap();
+    std::fs::create_dir_all(resources.join("x")).unwrap();
+    let found = macos::icon_in_bundle(&contents, "AppIcon").unwrap();
+    assert_eq!(found, resources.canonicalize().unwrap().join("AppIcon.icns"));
+    assert!(macos::icon_in_bundle(&contents, "AppIcon.icns").is_some());
+    for refused in ["../../outside.icns", "..", "x/../AppIcon", "Escape", "", "Missing"] {
+        assert_eq!(macos::icon_in_bundle(&contents, refused), None, "{refused}");
+    }
+}
+
+#[test]
+fn an_executable_outside_an_app_bundle_has_no_bundle() {
+    let exe = std::path::Path::new("/Applications/Mux Bot.app/Contents/MacOS/Mux Bot");
+    assert_eq!(macos::bundle_contents(exe).as_deref(), Some(std::path::Path::new("/Applications/Mux Bot.app/Contents")));
+    assert_eq!(macos::bundle_contents(std::path::Path::new("/usr/bin/python3")), None);
+    assert_eq!(macos::bundle_contents(std::path::Path::new("/tmp/Contents/MacOS/x")), None, "not in a .app");
+}
+
+/// The icon's path is an argument too, after the message; with none, the
+/// script shows the caution icon.
+#[test]
+fn the_icon_path_is_an_argument_and_caution_is_the_fallback() {
+    let path = std::path::Path::new("/A \" & (do shell script \"id\") & \"/AppIcon.icns");
+    let args = macos::allow_dialog_args("m", Some(path), 15);
+    assert_eq!(args.last().unwrap(), &path.to_string_lossy());
+    assert_eq!(args[args.len() - 2], "m");
+    let script: Vec<&String> = args.iter().zip(args.iter().skip(1)).filter(|(f, _)| *f == "-e").map(|(_, l)| l).collect();
+    assert!(script.iter().all(|l| !l.contains("do shell script")));
+    assert!(script.iter().any(|l| l.contains("with icon caution")));
+    assert_eq!(macos::allow_dialog_args("m", None, 15).len(), args.len() - 1, "no icon, no argument");
+}
+
+/// A tool that ends is read to its end; one that runs past the deadline is
+/// killed and reads as none, so a wedged dialog never holds its caller.
+#[test]
+fn a_dialog_tool_is_read_or_killed_at_its_deadline() {
+    let mut echo = std::process::Command::new("/bin/sh");
+    echo.args(["-c", "echo Allow"]);
+    let out = crate::output_within(echo, std::time::Duration::from_secs(10)).unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "Allow");
+    let mut slow = std::process::Command::new("/bin/sleep");
+    slow.arg("30");
+    let started = std::time::Instant::now();
+    assert!(crate::output_within(slow, std::time::Duration::from_millis(200)).is_none());
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert!(crate::output_within(std::process::Command::new("/nonexistent/tool"), std::time::Duration::from_secs(1)).is_none());
+}
+
+#[test]
+fn a_dialog_run_that_never_ended_is_no_dialog() {
+    assert!(matches!(macos::dialog_run_answer(None), AllowAnswer::NoDialog(_)));
+    assert!(matches!(linux::zenity_run_answer(None), AllowAnswer::NoDialog(_)));
+    let mut sh = std::process::Command::new("/bin/sh");
+    sh.args(["-c", "echo Allow; exit 1"]);
+    let out = crate::output_within(sh, std::time::Duration::from_secs(10));
+    assert_eq!(linux::zenity_run_answer(out.clone()), AllowAnswer::Allow);
+    assert!(matches!(macos::dialog_run_answer(out), AllowAnswer::NoDialog(_)), "osascript failing is no dialog");
+}
+
+/// A graphical session is a display variable that is set and not empty;
+/// without one, no dialog tool is used.
+#[test]
+fn a_dialog_tool_is_used_only_in_a_graphical_session() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let tool = dir.path().join("zenity");
+    std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = Some(dir.path().as_os_str().to_owned());
+    let set = |v: &str| Some(std::ffi::OsString::from(v));
+    assert_eq!(linux::graphical_tool_in("zenity", [None, None], path.clone()), None);
+    assert_eq!(linux::graphical_tool_in("zenity", [set(""), None], path.clone()), None, "empty is unset");
+    assert_eq!(linux::graphical_tool_in("zenity", [set("wayland-1"), None], path.clone()), Some(tool.clone()));
+    assert_eq!(linux::graphical_tool_in("zenity", [None, set(":0")], path), Some(tool));
+    assert_eq!(linux::graphical_tool_in("zenity", [None, set(":0")], None), None);
+}
+
+/// (macOS) The real `codesign` leaves, against this test's own process:
+/// the test binary is signed ad hoc by the linker, so it is read, never
+/// verified against Apple's anchor, and never named.
+#[cfg(target_os = "macos")]
+#[test]
+fn codesign_reads_this_ad_hoc_test_process_and_never_verifies_it() {
+    let pid = std::process::id();
+    let shown = macos::codesign_display(pid).unwrap();
+    assert!(shown.contains("adhoc") || shown.contains("TeamIdentifier=not set"), "{shown}");
+    assert!(macos::codesign_verify(pid, "anchor apple generic").is_err());
+    assert!(MacPlatform.signed_app(pid).is_err());
+    assert!(macos::codesign_display(u32::MAX).is_err(), "no such process");
+}
+
+/// (macOS) A bundle's icon is found from its executable through
+/// `Info.plist`, by `plutil`.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_app_bundles_icon_is_found_from_its_executable() {
+    let dir = tempfile::tempdir().unwrap();
+    let contents = dir.path().join("Mux Bot.app/Contents");
+    std::fs::create_dir_all(contents.join("MacOS")).unwrap();
+    std::fs::create_dir_all(contents.join("Resources")).unwrap();
+    std::fs::write(contents.join("Resources/AppIcon.icns"), b"icns").unwrap();
+    std::fs::write(
+        contents.join("Info.plist"),
+        r#"<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleIconFile</key><string>AppIcon</string></dict></plist>"#,
+    )
+    .unwrap();
+    let icon = macos::app_icon(&contents.join("MacOS/Mux Bot")).unwrap();
+    assert!(icon.ends_with("Contents/Resources/AppIcon.icns"), "{icon:?}");
+    std::fs::write(contents.join("Info.plist"), r#"<?xml version="1.0"?><plist version="1.0"><dict/></plist>"#).unwrap();
+    assert_eq!(macos::app_icon(&contents.join("MacOS/Mux Bot")), None, "no icon named");
+}

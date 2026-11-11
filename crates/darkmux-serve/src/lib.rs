@@ -54,6 +54,7 @@ mod client_changes;
 pub mod client_pairing;
 pub mod client_preview;
 pub mod client_profiles;
+pub mod client_trust;
 pub mod client_wire;
 pub mod client_workspace;
 mod fleet_listener;

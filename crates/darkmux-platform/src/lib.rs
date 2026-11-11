@@ -158,6 +158,28 @@ pub trait Platform: Send + Sync {
     /// the platform has no reader.
     fn process_group(&self, pid: u32) -> Option<u32>;
 
+    /// (#3544) Who signed running process `pid`: its developer team and
+    /// bundle id, when it is an app darkmux can name by its signature (valid
+    /// now, from a team certificate under Apple's anchor, with the hardened
+    /// runtime). `Err` says why not: unsigned or ad hoc, an Apple system
+    /// binary (no team), no hardened runtime, a signature that does not
+    /// hold, a container engine's process (container traffic is never an app
+    /// on this machine), no such process, or a platform with no code
+    /// signing. It names the app; the caller decides whether to trust it.
+    fn signed_app(&self, pid: u32) -> Result<SignedApp, String>;
+
+    /// (#3544) Asks the person at this machine, in a native dialog with
+    /// Don't Allow and Allow, about `message`, waiting up to `timeout_secs`
+    /// (blocking). `message` is shown as plain text, never read as script or
+    /// markup. `icon` is the requesting app's own icon, given only for an app
+    /// whose signature verified ([`SignedApp::icon`]); without one (or when it
+    /// cannot be shown) the dialog shows the system's caution icon.
+    fn ask_allow(&self, message: &str, icon: Option<&std::path::Path>, timeout_secs: u64) -> AllowAnswer;
+
+    /// (#3544) A short notice for the person at this machine, shown without
+    /// waiting for it; nothing where there is no screen to show it on.
+    fn notify(&self, message: &str);
+
     /// What would identify this machine if it were shared: its hardware id,
     /// its serial number and its names on the network. darkmux never sends
     /// these; what it shares is checked against them. Empty where none is read.
@@ -181,6 +203,84 @@ pub trait Platform: Send + Sync {
     /// class: what [`Platform::ram_installed_bytes`] says, where that is exact.
     fn ram_as_sold_gb(&self) -> Option<u64> {
         self.ram_installed_bytes().map(|b| b.div_ceil(1 << 30))
+    }
+}
+
+/// See [`Platform::signed_app`]: the signing identity of a running app.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SignedApp {
+    /// The developer team id (ten characters, `5LDXYW8B6T`).
+    pub team: String,
+    /// The signature's identifier, the bundle id for an app
+    /// (`com.darklyenergized.darkmuxapp`).
+    pub bundle: String,
+    /// The signing certificate's name as the OS reports it (`Apple
+    /// Development: Name (ID)`), control characters replaced by spaces: what
+    /// a person deciding whether to trust the app is shown.
+    pub signer: String,
+    /// The app's own icon file, inside its bundle's `Contents/Resources`,
+    /// when it has one darkmux can show: read only after the signature
+    /// verified, so it is the signed app's, never one an impostor chose.
+    pub icon: Option<std::path::PathBuf>,
+}
+
+impl std::fmt::Display for SignedApp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.team, self.bundle)
+    }
+}
+
+/// See [`Platform::ask_allow`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AllowAnswer {
+    Allow,
+    DontAllow,
+    /// Closed, ignored until it gave up, or dismissed without a choice.
+    NoAnswer,
+    /// No dialog could be shown (no graphical session, no dialog tool), and why.
+    NoDialog(String),
+}
+
+/// The words the dialog's buttons show, the same on every platform.
+pub const ALLOW_BUTTON: &str = "Allow";
+pub const DONT_ALLOW_BUTTON: &str = "Don't Allow";
+
+/// What a dialog tool's chosen button label means: one of the two buttons,
+/// else no answer.
+pub(crate) fn answer_from_button(label: &str) -> AllowAnswer {
+    match label.trim() {
+        ALLOW_BUTTON => AllowAnswer::Allow,
+        DONT_ALLOW_BUTTON => AllowAnswer::DontAllow,
+        _ => AllowAnswer::NoAnswer,
+    }
+}
+
+/// Runs `cmd` to its end, or kills it at `deadline`: `None` when it could
+/// not start or was killed. For a tool that waits on a person (a dialog),
+/// so a wedged one never holds its caller forever.
+pub(crate) fn output_within(mut cmd: std::process::Command, deadline: std::time::Duration) -> Option<std::process::Output> {
+    use std::process::Stdio;
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().ok()?;
+    let until = std::time::Instant::now() + deadline;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if std::time::Instant::now() < until => std::thread::sleep(std::time::Duration::from_millis(100)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+/// Starts `cmd` and lets it finish on its own (reaped on a thread), for a
+/// notice nobody waits on.
+pub(crate) fn spawn_detached(mut cmd: std::process::Command) {
+    use std::process::Stdio;
+    if let Ok(mut child) = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+        std::thread::spawn(move || child.wait());
     }
 }
 

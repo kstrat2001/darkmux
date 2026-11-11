@@ -16,6 +16,25 @@ darkmux release.
 
 ### Added
 
+- **Mux Bot pairs on the same Mac with no code to type, and any other app gets a native Allow
+  dialog (#3544).** When an app asks to pair, `darkmux client serve` finds the process on the other
+  end of the connection and checks its code signature against Apple's anchor: a Mux Bot
+  (`com.darklyenergized.darkmuxapp` or `.check`) signed by a team in
+  `clients.pairing.verified_teams` (CONFIG 2.8; default `["5LDXYW8B6T"]`, Mux Bot's team; empty
+  turns this off) with the hardened runtime is approved at once, after the connection and the
+  signature are checked again just before approval, with a notice ("Mux Bot is now paired with
+  darkmux on this Mac."); `client list` marks it auto-approved. Any other app (another team, an
+  unsigned or ad hoc build, a container's traffic through Docker's forwarder, a process darkmux
+  cannot tell) gets a centered dialog showing the code and who signed it as macOS verified it, or
+  "Not signed by a known developer.": Allow approves, Don't Allow denies, and a closed or ignored
+  dialog leaves the request pending to expire as before. Allow on a validly signed app remembers it
+  (team and bundle id, in `clients.json`), so a build of Mux Bot under your own team pairs with no
+  dialog next time; `darkmux client forget <team>/<bundle>` forgets it, and `client list` and
+  `darkmux doctor` show what is remembered. The dialog never blocks the listener, one process can
+  raise at most two at once, and `clients.pairing.dialog: false` turns it off. On Linux nothing
+  auto-approves (no code signing); the dialog is `zenity` in a graphical session. `darkmux client
+  approve` is unchanged.
+
 - **A preview's install is redone when its inputs change, and an app can ask for a clean restart
   (#3484).** `install.unless_exists: node_modules` skipped the install whenever `node_modules`
   existed, so an install broken on an older image, or a dependency a run added, stayed broken.

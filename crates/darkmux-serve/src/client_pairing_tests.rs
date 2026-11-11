@@ -46,7 +46,78 @@ struct Harness {
     /// What the run lifecycle says each running work item is doing
     /// (default: nothing besides its turns).
     activity: Arc<Mutex<(Option<crate::runs::RunActivity>, Option<u64>)>>,
+    /// (#3544) The pairing seams: who signed each pid, what the dialog
+    /// answers, and what it and the notice were asked to show.
+    trust: TrustSeams,
     state: ClientServerState,
+}
+
+/// pid -> the answers `signed_app` gives in turn.
+type SignedAnswers = Arc<Mutex<HashMap<u32, Vec<Result<darkmux_platform::SignedApp, String>>>>>;
+
+/// (#3544) What the harness's platform says about pairing: no process is
+/// signed and the dialog gets no answer, until a test says otherwise.
+#[derive(Clone)]
+struct TrustSeams {
+    /// pid -> the answers `signed_app` gives in turn (the last one repeats);
+    /// a pid not here is unsigned.
+    signed: SignedAnswers,
+    answer: Arc<Mutex<darkmux_platform::AllowAnswer>>,
+    /// Every dialog's message, in order.
+    asked: Arc<Mutex<Vec<String>>>,
+    /// Every dialog's icon, in order (`None`: the caution icon).
+    icons: Arc<Mutex<Vec<Option<PathBuf>>>>,
+    notices: Arc<Mutex<Vec<String>>>,
+    policy: Arc<Mutex<Result<crate::client_trust::PairingPolicy, String>>>,
+    /// Holds every dialog open while set.
+    hold: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl TrustSeams {
+    fn new() -> Self {
+        TrustSeams {
+            signed: Arc::new(Mutex::new(HashMap::new())),
+            answer: Arc::new(Mutex::new(darkmux_platform::AllowAnswer::NoAnswer)),
+            asked: Arc::new(Mutex::new(Vec::new())),
+            icons: Arc::new(Mutex::new(Vec::new())),
+            notices: Arc::new(Mutex::new(Vec::new())),
+            policy: Arc::new(Mutex::new(Ok(crate::client_trust::PairingPolicy {
+                verified_teams: vec!["5LDXYW8B6T".to_string()],
+                dialog: true,
+            }))),
+            hold: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    fn wire(&self, state: &mut ClientServerState) {
+        let icons = self.icons.clone();
+        let (signed, answer, asked, notices, policy, hold) = (
+            self.signed.clone(),
+            self.answer.clone(),
+            self.asked.clone(),
+            self.notices.clone(),
+            self.policy.clone(),
+            self.hold.clone(),
+        );
+        state.signed_app = Arc::new(move |pid| {
+            let mut all = signed.lock().unwrap();
+            match all.get_mut(&pid) {
+                Some(seq) if seq.len() > 1 => seq.remove(0),
+                Some(seq) => seq[0].clone(),
+                None => Err("unsigned".to_string()),
+            }
+        });
+        state.ask_allow = Arc::new(move |message, icon, _timeout| {
+            icons.lock().unwrap().push(icon.map(Path::to_path_buf));
+            asked.lock().unwrap().push(message.to_string());
+            while hold.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            answer.lock().unwrap().clone()
+        });
+        state.notify = Arc::new(move |message| notices.lock().unwrap().push(message.to_string()));
+        state.pairing_policy = Arc::new(move || policy.lock().unwrap().clone());
+    }
 }
 
 impl Harness {
@@ -305,8 +376,17 @@ fn harness() -> Harness {
         peer_processes: Arc::new(|_bound, wanted| Some(test_peer_processes(wanted))),
         pair_peers: Arc::new(Mutex::new(HashMap::new())),
         pair_lookups: Arc::new(PeerRounds::default()),
+        pairing_policy: Arc::new(|| Err("wired below".to_string())),
+        signed_app: Arc::new(|_| Err("wired below".to_string())),
+        ask_allow: Arc::new(|_, _, _| darkmux_platform::AllowAnswer::NoAnswer),
+        notify: Arc::new(|_| {}),
+        dialogs: Arc::new(crate::client_trust::DialogSlots::default()),
     };
+    let trust = TrustSeams::new();
+    let mut state = state;
+    trust.wire(&mut state);
     Harness {
+        trust,
         activity,
         preview_on,
         preview_idle,
@@ -743,7 +823,7 @@ async fn an_unreadable_policy_does_not_consume_the_token_delivery() {
 /// is found in rounds (one look at every connection, about 0.2 s here), each
 /// answering every request waiting when it began, so the app waits for at
 /// most two rounds whatever the flood holds open, and the rounds stay few.
-/// A lone request asks nothing.
+/// A lone request asks once (#3544: who sent it decides whether it pairs at once).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_held_open_flood_delays_pairing_by_at_most_two_lookup_rounds() {
     let mut h = harness();
@@ -757,7 +837,7 @@ async fn a_held_open_flood_delays_pairing_by_at_most_two_lookup_rounds() {
         Some(test_peer_processes(wanted))
     });
     let _ = request_pairing(&h).await;
-    assert_eq!(rounds.load(Ordering::SeqCst), 0, "a lone request asks nothing");
+    assert_eq!(rounds.swap(0, Ordering::SeqCst), 1, "a lone request asks once");
     let flood = (0..40u16).map(|i| call(&h, pair_from(CONTAINER_PEER_PORTS + i, "X")));
     let app = async {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -787,12 +867,13 @@ async fn a_request_whose_sender_left_while_queued_starts_no_round() {
         Some(test_peer_processes(wanted))
     });
     let _ = request_pairing(&h).await;
+    let before = rounds.load(Ordering::SeqCst);
     let held = h.state.pair_lookups.turn.clone().lock_owned().await;
     let gone = tokio::time::timeout(std::time::Duration::from_millis(50), call(&h, pair_from(CONTAINER_PEER_PORTS, "X"))).await;
     assert!(gone.is_err(), "it queued behind the held turn");
     drop(held);
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    assert_eq!(rounds.load(Ordering::SeqCst), 0);
+    assert_eq!(rounds.load(Ordering::SeqCst), before);
 }
 
 /// An approval the app has not collected yet can be taken back: revoking
@@ -916,9 +997,8 @@ async fn a_container_flooding_pair_requests_never_crowds_out_the_app() {
     }
     let id = request_pairing(&h).await;
     let now = (h.state.now)();
-    // Docker's first request, made to an empty queue, asked the OS nothing
-    // and counts only toward the cap; its others hold at most the bound.
-    assert!(list_pending(&h.store, now).unwrap().len() <= PAIR_REQUESTS_PER_PROCESS + 2);
+    // Docker's requests hold at most the bound.
+    assert!(list_pending(&h.store, now).unwrap().len() <= PAIR_REQUESTS_PER_PROCESS + 1);
     let found = find_by_code(&h.store, "4f7-k2q", now).unwrap();
     assert_eq!(found.request_id, id);
     approve(&h.store, &id, now).unwrap();
@@ -931,9 +1011,9 @@ async fn a_container_flooding_pair_requests_never_crowds_out_the_app() {
 }
 
 /// The app's own newest request replaces its oldest past the same bound,
-/// so an app that asks again (a new code) is never refused. Its first, made
-/// to an empty queue, asked the OS nothing, so it counts only toward the
-/// cap and is never replaced.
+/// so an app that asks again (a new code) is never refused. Every request
+/// is attributed to its process (#3544: who sent it decides whether it
+/// pairs at once), so the bound holds from the first.
 #[tokio::test]
 async fn an_app_that_asks_again_replaces_its_oldest_request() {
     let h = harness();
@@ -942,9 +1022,11 @@ async fn an_app_that_asks_again_replaces_its_oldest_request() {
         ids.push(request_pairing(&h).await);
     }
     let live: Vec<String> = list_pending(&h.store, (h.state.now)()).unwrap().into_iter().map(|p| p.request_id).collect();
-    assert_eq!(live, [ids[0].clone(), ids[2].clone(), ids[3].clone()], "the oldest it was asked about went");
-    let (code, _) = poll(&h, &ids[1], SECRET).await;
-    assert_eq!(code, 404);
+    assert_eq!(live, [ids[2].clone(), ids[3].clone()], "its oldest went");
+    for gone in &ids[..2] {
+        let (code, _) = poll(&h, gone, SECRET).await;
+        assert_eq!(code, 404);
+    }
 }
 
 // ─── Tokens ──────────────────────────────────────────────────────────────
@@ -1226,7 +1308,7 @@ fn peeking_never_sees_a_half_written_store() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("clients.json");
     let store = ClientStore::at(path.clone());
-    store.update(|f| { f.clients.push(ApprovedClient { name: "a".into(), id: "c-0000000000000001".into(), created: 1, token_hash: "00".into() }); Ok(()) }).unwrap();
+    store.update(|f| { f.clients.push(ApprovedClient { name: "a".into(), id: "c-0000000000000001".into(), created: 1, token_hash: "00".into(), auto_approved: None }); Ok(()) }).unwrap();
     let full = std::fs::read_to_string(&path).unwrap();
     let (locked_tx, locked_rx) = std::sync::mpsc::channel();
     let p2 = path.clone();
@@ -7614,7 +7696,7 @@ fn a_change_that_waited_for_the_lock_builds_on_the_one_before_it() {
             .unwrap();
     });
     holding.wait();
-    let client = ApprovedClient { name: "second".into(), id: "c-2".into(), created: 1, token_hash: "h".into() };
+    let client = ApprovedClient { name: "second".into(), id: "c-2".into(), created: 1, token_hash: "h".into(), auto_approved: None };
     store.update(|f| { f.clients.push(client.clone()); Ok(()) }).unwrap();
     a.join().unwrap();
     let now = store.read().unwrap();
@@ -8003,4 +8085,448 @@ fn a_file_whose_status_git_cannot_read_is_not_edited() {
     let not_a_repo = WorkCopy { work_tree: dir.path().to_path_buf(), git_dir: dir.path().join("no-such-git-dir") };
     let refused = refuse_unless_clean(&not_a_repo, "page.html").expect_err("an unreadable status is not clean");
     assert_eq!(refused.status(), StatusCode::CONFLICT);
+}
+
+// ─── (#3544) Pairing with no code: verified apps, and the Allow dialog ───
+
+fn signed(team: &str, bundle: &str) -> darkmux_platform::SignedApp {
+    darkmux_platform::SignedApp {
+        team: team.into(),
+        bundle: bundle.into(),
+        signer: format!("Apple Development: Someone ({team})"),
+        icon: Some(PathBuf::from(format!("/Applications/{bundle}.app/Contents/Resources/AppIcon.icns"))),
+    }
+}
+
+/// Mux Bot as the default verified team signs it.
+fn mux_bot() -> darkmux_platform::SignedApp {
+    signed("5LDXYW8B6T", "com.darklyenergized.darkmuxapp")
+}
+
+/// A Mux Bot someone built from source with their own team (and so their
+/// own bundle id).
+fn fork() -> darkmux_platform::SignedApp {
+    signed("AAAAAAAAAA", "com.example.muxfork")
+}
+
+impl Harness {
+    /// The app (pid 100) signs as each of `answers` in turn.
+    fn app_signs_as(&self, answers: Vec<Result<darkmux_platform::SignedApp, String>>) {
+        self.trust.signed.lock().unwrap().insert(100, answers);
+    }
+    fn dialog_answers(&self, a: darkmux_platform::AllowAnswer) {
+        *self.trust.answer.lock().unwrap() = a;
+    }
+    fn asked(&self) -> Vec<String> {
+        self.trust.asked.lock().unwrap().clone()
+    }
+    fn status(&self, id: &str) -> Option<PendingStatus> {
+        self.store.read().unwrap().pending.iter().find(|p| p.request_id == id).map(|p| p.status)
+    }
+    fn set_pairing(&self, teams: &[&str], dialog: bool) {
+        *self.trust.policy.lock().unwrap() =
+            Ok(crate::client_trust::PairingPolicy { verified_teams: teams.iter().map(|t| t.to_string()).collect(), dialog });
+    }
+}
+
+/// Waits (up to 5 s) for `f` to say something.
+async fn settle<T>(f: impl Fn() -> Option<T>) -> T {
+    for _ in 0..1000 {
+        if let Some(v) = f() {
+            return v;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("never settled");
+}
+
+/// Waits for the dialog for the `n`th request to have been answered: it
+/// was asked, and the dialog thread then had time to act.
+async fn dialog_shown(h: &Harness, n: usize) -> String {
+    let message = settle(|| h.asked().get(n - 1).cloned()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    message
+}
+
+/// A Mux Bot signed by the verified team pairs at once: no dialog, no
+/// code, the token on its first poll, the client marked auto-approved, and
+/// one notice.
+#[tokio::test]
+async fn a_verified_mux_bot_pairs_with_no_dialog_and_no_code() {
+    let h = harness();
+    h.app_signs_as(vec![Ok(mux_bot())]);
+    let id = request_pairing(&h).await;
+    let (code, v) = poll(&h, &id, SECRET).await;
+    assert_eq!(code, 200, "{v}");
+    assert!(v["token"].is_string(), "{v}");
+    let clients = list_clients(&h.store).unwrap();
+    assert_eq!(
+        clients[0].auto_approved,
+        Some(SigningIdentity { team: "5LDXYW8B6T".into(), bundle: "com.darklyenergized.darkmuxapp".into() })
+    );
+    assert_eq!(*h.trust.notices.lock().unwrap(), ["Mux Bot is now paired with darkmux on this Mac."]);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(h.asked().is_empty(), "no dialog");
+}
+
+/// An app with no signature darkmux can name is never approved on its own:
+/// it gets the dialog, which says so.
+#[tokio::test]
+async fn an_unverified_app_is_never_auto_approved() {
+    let h = harness();
+    let id = request_pairing(&h).await;
+    let message = dialog_shown(&h, 1).await;
+    assert_eq!(h.status(&id), Some(PendingStatus::Pending));
+    assert!(message.contains("Code 4F7-K2Q.") && message.contains("Not signed by a known developer."), "{message}");
+    assert!(h.trust.notices.lock().unwrap().is_empty());
+}
+
+/// A request whose process darkmux cannot tell is never approved on its
+/// own, whatever is signed on this machine.
+#[tokio::test]
+async fn an_unidentifiable_peer_is_never_auto_approved() {
+    let h = harness();
+    h.app_signs_as(vec![Ok(mux_bot())]);
+    let (code, v) = call(&h, pair_from(UNKNOWN_PEER_PORTS, "4F7-K2Q")).await;
+    assert_eq!(code, 202);
+    let id = v["request_id"].as_str().unwrap().to_string();
+    let message = dialog_shown(&h, 1).await;
+    assert_eq!(h.status(&id), Some(PendingStatus::Pending));
+    assert!(message.contains("Not signed by a known developer."), "{message}");
+}
+
+/// A verification that passes, then fails at the re-check just before
+/// approval (the process changed), does not approve, and its dialog
+/// remembers nothing.
+#[tokio::test]
+async fn a_verification_that_fails_at_the_recheck_does_not_approve() {
+    let h = harness();
+    h.app_signs_as(vec![Ok(mux_bot()), Err("no such process".into())]);
+    let id = request_pairing(&h).await;
+    let message = dialog_shown(&h, 1).await;
+    assert_eq!(h.status(&id), Some(PendingStatus::Pending));
+    assert!(message.contains("Not signed by a known developer."), "{message}");
+}
+
+/// The re-check must find the same identity: a pid that verifies as
+/// another app by then (recycled to another signed process) is not approved.
+#[tokio::test]
+async fn a_recheck_that_finds_another_signed_app_does_not_approve() {
+    let h = harness();
+    h.app_signs_as(vec![Ok(mux_bot()), Ok(fork())]);
+    let id = request_pairing(&h).await;
+    let _ = dialog_shown(&h, 1).await;
+    assert_eq!(h.status(&id), Some(PendingStatus::Pending));
+}
+
+/// A request whose process darkmux cannot tell is judged unverified before
+/// any signature is asked about.
+#[tokio::test]
+async fn a_sender_with_no_process_is_unverified() {
+    let h = harness();
+    h.app_signs_as(vec![Ok(mux_bot())]);
+    let (sender, _) = crate::client_trust::sender_of(&h.state, None).await;
+    assert!(matches!(sender, crate::client_trust::Sender::Unverified(_)), "{sender:?}");
+}
+
+/// The re-check also looks at the connection again: held by another
+/// process by then, the request is not approved.
+#[tokio::test]
+async fn a_connection_held_by_another_process_at_the_recheck_does_not_approve() {
+    let mut h = harness();
+    h.app_signs_as(vec![Ok(mux_bot())]);
+    let looks = Arc::new(AtomicU64::new(0));
+    let l = looks.clone();
+    h.state.peer_processes = Arc::new(move |_bound, wanted| {
+        let pid = if l.fetch_add(1, Ordering::SeqCst) == 0 { 100 } else { 101 };
+        Some(wanted.iter().map(|p| (*p, pid)).collect())
+    });
+    let id = request_pairing(&h).await;
+    let _ = dialog_shown(&h, 1).await;
+    assert_eq!(h.status(&id), Some(PendingStatus::Pending));
+    assert!(looks.load(Ordering::SeqCst) >= 2, "the connection was looked up again");
+}
+
+/// An empty `clients.pairing.verified_teams` approves nothing on its own:
+/// Mux Bot gets the dialog, which names who signed it.
+#[tokio::test]
+async fn an_empty_team_list_means_no_auto_approval() {
+    let h = harness();
+    h.set_pairing(&[], true);
+    h.app_signs_as(vec![Ok(mux_bot())]);
+    let id = request_pairing(&h).await;
+    let message = dialog_shown(&h, 1).await;
+    assert_eq!(h.status(&id), Some(PendingStatus::Pending));
+    assert!(
+        message.contains("Signed by Apple Development: Someone (5LDXYW8B6T), team 5LDXYW8B6T, com.darklyenergized.darkmuxapp."),
+        "{message}"
+    );
+}
+
+/// The verified team trusts Mux Bot's bundle ids only: another app signed
+/// by the same team is asked about.
+#[tokio::test]
+async fn another_app_from_the_verified_team_gets_the_dialog() {
+    let h = harness();
+    h.app_signs_as(vec![Ok(signed("5LDXYW8B6T", "com.darklyenergized.other"))]);
+    let id = request_pairing(&h).await;
+    let _ = dialog_shown(&h, 1).await;
+    assert_eq!(h.status(&id), Some(PendingStatus::Pending));
+}
+
+/// A config that cannot be read approves nothing on its own.
+#[tokio::test]
+async fn an_unreadable_pairing_policy_approves_nothing_on_its_own() {
+    let h = harness();
+    *h.trust.policy.lock().unwrap() = Err("config.json does not parse".into());
+    h.app_signs_as(vec![Ok(mux_bot())]);
+    let id = request_pairing(&h).await;
+    let _ = dialog_shown(&h, 1).await;
+    assert_eq!(h.status(&id), Some(PendingStatus::Pending));
+}
+
+/// Each dialog answer: Allow approves (the app collects its token), Don't
+/// Allow denies (the app hears `denied`), and no answer or no dialog leave
+/// it pending.
+#[tokio::test]
+async fn each_dialog_answer_maps_to_its_outcome() {
+    use darkmux_platform::AllowAnswer as A;
+    for (answer, want) in [
+        (A::Allow, Some(PendingStatus::Approved)),
+        (A::DontAllow, Some(PendingStatus::Denied)),
+        (A::NoAnswer, Some(PendingStatus::Pending)),
+        (A::NoDialog("no screen".into()), Some(PendingStatus::Pending)),
+    ] {
+        let h = harness();
+        h.dialog_answers(answer.clone());
+        let id = request_pairing(&h).await;
+        let _ = dialog_shown(&h, 1).await;
+        assert_eq!(h.status(&id), want, "{answer:?}");
+        let (_, v) = poll(&h, &id, SECRET).await;
+        match want {
+            Some(PendingStatus::Approved) => assert!(v["token"].is_string(), "{v}"),
+            Some(PendingStatus::Denied) => assert_eq!(v["status"], "denied"),
+            _ => assert_eq!(v["status"], "pending"),
+        }
+    }
+}
+
+/// Allow on a signed app remembers its signing identity, and the next
+/// request from a process that verifies as it pairs at once, with no
+/// second dialog, marked auto-approved.
+#[tokio::test]
+async fn allow_on_a_signed_app_remembers_it_and_it_pairs_at_once_next_time() {
+    let h = harness();
+    h.app_signs_as(vec![Ok(fork())]);
+    h.dialog_answers(darkmux_platform::AllowAnswer::Allow);
+    let first = request_pairing(&h).await;
+    let message = dialog_shown(&h, 1).await;
+    assert!(message.contains("com.example.muxfork") && message.contains("Allow pairs it now and next time."), "{message}");
+    assert_eq!(h.status(&first), Some(PendingStatus::Approved));
+    let remembered = remembered_apps(&h.store).unwrap();
+    assert_eq!(remembered.iter().map(|r| r.identity().to_string()).collect::<Vec<_>>(), ["AAAAAAAAAA/com.example.muxfork"]);
+    assert!(poll(&h, &first, SECRET).await.1["token"].is_string());
+
+    h.dialog_answers(darkmux_platform::AllowAnswer::NoAnswer);
+    let second = request_pairing(&h).await;
+    let (_, v) = poll(&h, &second, SECRET).await;
+    assert!(v["token"].is_string(), "the second pairs at once: {v}");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(h.asked().len(), 1, "no second dialog");
+    assert_eq!(*h.trust.notices.lock().unwrap(), ["com.example.muxfork is now paired with darkmux on this Mac."]);
+    let marked: Vec<_> = list_clients(&h.store).unwrap().into_iter().map(|c| c.auto_approved.is_some()).collect();
+    assert_eq!(marked, [false, true], "the dialog's approval is the operator's; the second is automatic");
+}
+
+/// Allow on an app with no signature approves it once and remembers
+/// nothing: its next request asks again.
+#[tokio::test]
+async fn allow_on_an_unsigned_app_remembers_nothing() {
+    let h = harness();
+    h.dialog_answers(darkmux_platform::AllowAnswer::Allow);
+    let first = request_pairing(&h).await;
+    let message = dialog_shown(&h, 1).await;
+    assert!(!message.contains("next time"), "{message}");
+    assert_eq!(h.status(&first), Some(PendingStatus::Approved));
+    assert!(remembered_apps(&h.store).unwrap().is_empty());
+    let second = request_pairing(&h).await;
+    let _ = dialog_shown(&h, 2).await;
+    assert_eq!(h.status(&second), Some(PendingStatus::Approved), "approved again by the second Allow, not on its own");
+}
+
+/// Container traffic (Docker's forwarder, which the platform never names
+/// as an app) is never remembered: Allow pairs that one request only.
+#[tokio::test]
+async fn container_traffic_is_never_remembered() {
+    let h = harness();
+    h.trust.signed.lock().unwrap().insert(900, vec![Err("Docker Desktop's process: container traffic is never an app on this Mac".into())]);
+    h.dialog_answers(darkmux_platform::AllowAnswer::Allow);
+    let (code, _) = call(&h, pair_from(CONTAINER_PEER_PORTS, "C-1")).await;
+    assert_eq!(code, 202);
+    let _ = dialog_shown(&h, 1).await;
+    assert!(remembered_apps(&h.store).unwrap().is_empty());
+    h.dialog_answers(darkmux_platform::AllowAnswer::NoAnswer);
+    let (_, v) = call(&h, pair_from(CONTAINER_PEER_PORTS + 1, "C-2")).await;
+    let _ = dialog_shown(&h, 2).await;
+    assert_eq!(h.status(v["request_id"].as_str().unwrap()), Some(PendingStatus::Pending));
+}
+
+/// A remembered identity is the pair (team, bundle id): another bundle
+/// under the same team is asked about.
+#[tokio::test]
+async fn a_remembered_identity_does_not_match_another_bundle_of_its_team() {
+    let h = harness();
+    h.store.update(|f| {
+        f.remembered_apps.push(RememberedApp { team: "AAAAAAAAAA".into(), bundle: "com.example.muxfork".into(), allowed: 1 });
+        Ok(())
+    }).unwrap();
+    h.app_signs_as(vec![Ok(signed("AAAAAAAAAA", "com.example.other"))]);
+    let id = request_pairing(&h).await;
+    let _ = dialog_shown(&h, 1).await;
+    assert_eq!(h.status(&id), Some(PendingStatus::Pending));
+}
+
+/// `forget` removes a remembered app: its next pairing asks again.
+#[tokio::test]
+async fn forget_removes_a_remembered_app() {
+    let h = harness();
+    let app = SigningIdentity { team: "AAAAAAAAAA".into(), bundle: "com.example.muxfork".into() };
+    h.store.update(|f| {
+        f.remembered_apps.push(RememberedApp { team: app.team.clone(), bundle: app.bundle.clone(), allowed: 1 });
+        Ok(())
+    }).unwrap();
+    assert!(forget(&h.store, &app).unwrap());
+    assert!(!forget(&h.store, &app).unwrap(), "already forgotten");
+    h.app_signs_as(vec![Ok(fork())]);
+    let id = request_pairing(&h).await;
+    let _ = dialog_shown(&h, 1).await;
+    assert_eq!(h.status(&id), Some(PendingStatus::Pending));
+}
+
+/// The dialog never holds up the listener, a request raises at most one,
+/// and one process at most PAIR_REQUESTS_PER_PROCESS at once: a flood from
+/// Docker's forwarder raises two, and the requests are still answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dialogs_never_block_the_listener_and_a_process_raises_at_most_its_bound() {
+    let h = harness();
+    h.trust.hold.store(true, Ordering::SeqCst);
+    for i in 0..6u16 {
+        let answered = tokio::time::timeout(std::time::Duration::from_secs(2), call(&h, pair_from(CONTAINER_PEER_PORTS + i, "X"))).await;
+        assert_eq!(answered.expect("answered while the dialogs wait").0, 202);
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(h.asked().len(), PAIR_REQUESTS_PER_PROCESS);
+    let _ = call(&h, pair_from(5555, "4F7-K2Q")).await;
+    let _ = settle(|| (h.asked().len() == PAIR_REQUESTS_PER_PROCESS + 1).then_some(())).await;
+    h.trust.hold.store(false, Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let _ = call(&h, pair_from(CONTAINER_PEER_PORTS + 50, "Y")).await;
+    let _ = settle(|| (h.asked().len() == PAIR_REQUESTS_PER_PROCESS + 2).then_some(())).await;
+}
+
+/// No more than MAX_OPEN_DIALOGS are open at once, whoever asks.
+#[test]
+fn open_dialogs_are_bounded_per_process_and_in_all() {
+    use crate::client_trust::{DialogSlots, MAX_OPEN_DIALOGS};
+    let slots = Arc::new(DialogSlots::default());
+    let mine: Vec<_> = (0..PAIR_REQUESTS_PER_PROCESS).map(|_| slots.take(Some(1)).unwrap()).collect();
+    assert!(slots.take(Some(1)).is_none(), "one process's bound");
+    let others: Vec<_> = (2..).take(MAX_OPEN_DIALOGS - mine.len()).map(|p| slots.take(Some(p)).unwrap()).collect();
+    assert!(slots.take(Some(99)).is_none(), "the machine's bound");
+    drop(mine);
+    assert!(slots.take(Some(1)).is_some(), "a closed dialog gives its place back");
+    drop(others);
+}
+
+/// `clients.pairing.dialog` off: no dialog; `client approve` still works.
+#[tokio::test]
+async fn with_the_dialog_off_nothing_is_shown() {
+    let h = harness();
+    h.set_pairing(&["5LDXYW8B6T"], false);
+    let id = request_pairing(&h).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(h.asked().is_empty());
+    approve(&h.store, &id, (h.state.now)()).unwrap();
+    assert!(poll(&h, &id, SECRET).await.1["token"].is_string());
+}
+
+/// A signed app's dialog shows its own icon; an unsigned one's shows the
+/// caution icon, whatever its bundle holds (the platform never reads an
+/// unverified bundle's icon: `only_a_verified_app_gets_its_own_icon`).
+#[tokio::test]
+async fn only_a_signed_apps_dialog_shows_its_own_icon() {
+    let h = harness();
+    h.app_signs_as(vec![Ok(fork())]);
+    let _ = request_pairing(&h).await;
+    let _ = dialog_shown(&h, 1).await;
+    h.app_signs_as(vec![Err("unsigned".into())]);
+    let _ = request_pairing(&h).await;
+    let _ = dialog_shown(&h, 2).await;
+    let icons = h.trust.icons.lock().unwrap().clone();
+    assert_eq!(icons, [Some(PathBuf::from("/Applications/com.example.muxfork.app/Contents/Resources/AppIcon.icns")), None]);
+}
+
+/// The app's own name for itself never reaches the dialog; the code does,
+/// and the platform passes the whole message as an argument, never as
+/// script (darkmux-platform's `the_dialog_message_is_an_argument_never_script`).
+#[tokio::test]
+async fn the_apps_display_name_never_reaches_the_dialog() {
+    let h = harness();
+    let mut body = pair_body();
+    body["device_name"] = "Mux Bot\" & (do shell script \"id\") & \"".into();
+    let (code, _) = call(&h, post("/client/pair", None, body)).await;
+    assert_eq!(code, 202);
+    let message = dialog_shown(&h, 1).await;
+    assert!(!message.contains("do shell script") && !message.contains("Mux Bot"), "{message}");
+}
+
+/// `clients.pairing.*` is read from the config as it is now, with Mux
+/// Bot's team and the dialog on by default.
+#[serial_test::serial]
+#[test]
+fn the_pairing_policy_is_read_fresh_with_its_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    unsafe {
+        std::env::remove_var("DARKMUX_CLIENTS_PAIRING_VERIFIED_TEAMS");
+        std::env::remove_var("DARKMUX_CLIENTS_PAIRING_DIALOG");
+    }
+    let defaults = crate::client_trust::PairingPolicy { verified_teams: vec!["5LDXYW8B6T".into()], dialog: true };
+    assert_eq!(read_pairing_policy_at(&path), Ok(defaults));
+    std::fs::write(&path, r#"{"clients": {"pairing": {"verified_teams": [], "dialog": false}}}"#).unwrap();
+    assert_eq!(read_pairing_policy_at(&path), Ok(crate::client_trust::PairingPolicy { verified_teams: vec![], dialog: false }));
+}
+
+/// `act_on_answer` against a request that expired meanwhile approves
+/// nothing and says why.
+#[test]
+fn an_allow_after_the_request_expired_approves_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ClientStore::at(dir.path().join("clients.json"));
+    store.update(|f| {
+        f.pending.push(PendingRequest {
+            request_id: "r-1".into(),
+            device_name: "d".into(),
+            code: "C".into(),
+            pair_secret_hash: hash_hex(SECRET),
+            created: 1,
+            status: PendingStatus::Pending,
+            client_name: None,
+            client_id: None,
+            auto_approved: None,
+        });
+        Ok(())
+    }).unwrap();
+    let said = crate::client_trust::act_on_answer(&store, "r-1", 1 + PENDING_TTL_SECS + 1, darkmux_platform::AllowAnswer::Allow, Some(SigningIdentity { team: "A".into(), bundle: "b".into() }));
+    assert!(said.contains("no longer pending"), "{said}");
+    assert!(store.read().unwrap().remembered_apps.is_empty(), "nothing remembered for an approval that did not happen");
+}
+
+#[test]
+fn a_signing_identity_is_written_and_read_as_team_slash_bundle() {
+    let id = SigningIdentity::parse(" AAAAAAAAAA/com.example.muxfork ").unwrap();
+    assert_eq!(id.to_string(), "AAAAAAAAAA/com.example.muxfork");
+    for bad in ["", "AAAAAAAAAA", "/com.example", "AAAAAAAAAA/"] {
+        assert_eq!(SigningIdentity::parse(bad), None, "{bad}");
+    }
 }

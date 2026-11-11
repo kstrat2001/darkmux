@@ -1,8 +1,9 @@
 //! `darkmux client` (local prototype): the CLI half of client pairing. The
 //! store, the listener and the HTTP contract live in
 //! `darkmux_serve::client_pairing`; this module is the operator's side:
-//! `serve`, `approve` (the only way a pairing is ever granted), `list`,
-//! `revoke`.
+//! `serve`, `approve` (the operator's way to grant a pairing; `client serve`
+//! also grants one to a verified app, or on the dialog's Allow, #3544),
+//! `list`, `revoke`, `forget`.
 
 use anyhow::Result;
 use darkmux_serve::client_pairing::{self as cp, ClientStore, PendingRequest};
@@ -44,6 +45,7 @@ fn run_verb(sub: ClientCmd, here: &Here, input: &mut dyn BufRead, out: &mut dyn 
         ClientCmd::List => list_to(&here.store, here.now, &here.policy, out),
         ClientCmd::Claim { workspace, client } => claim(here, &workspace, &client, out, err),
         ClientCmd::Revoke { name } => revoke(here, &name, out, err),
+        ClientCmd::Forget { app } => forget(here, &app, out, err),
         ClientCmd::Workspace { sub: crate::cli::ClientWorkspaceCmd::Rm { name, force } } => {
             remove_workspace(here, &name, force, out, err)
         }
@@ -58,6 +60,20 @@ fn revoke(here: &Here, name: &str, out: &mut dyn Write, err: &mut dyn Write) -> 
         return Ok(0);
     }
     writeln!(err, "no paired client named {name} (see `darkmux client list`)")?;
+    Ok(1)
+}
+
+/// `client forget <team>/<bundle>`.
+fn forget(here: &Here, app: &str, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32> {
+    let Some(identity) = cp::SigningIdentity::parse(app) else {
+        writeln!(err, "`{app}` is not <team>/<bundle> (see `darkmux client list`)")?;
+        return Ok(1);
+    };
+    if cp::forget(&here.store, &identity)? {
+        writeln!(out, "forgot {identity}: its next pairing asks again (its paired clients stay; `darkmux client revoke <name>` removes one)")?;
+        return Ok(0);
+    }
+    writeln!(err, "no remembered app {identity} (see `darkmux client list`)")?;
     Ok(1)
 }
 
@@ -255,19 +271,29 @@ fn act_on(store: &ClientStore, now: u64, p: &PendingRequest, reply: &str) -> Res
 fn client_lines(store: &ClientStore, now: u64) -> Result<Vec<String>> {
     let mut lines: Vec<String> = cp::list_clients(store)?
         .into_iter()
-        .map(|c| format!("{}  (paired {})", c.name, age(now, c.created)))
+        .map(|c| format!("{}  (paired {}{})", c.name, age(now, c.created), on_its_own(c.auto_approved.as_ref())))
         .collect();
     lines.extend(cp::list_uncollected(store, now)?.into_iter().map(|p| {
         let name = p.client_name.unwrap_or_default();
         format!(
-            "{name}  (approved {}; its app has not collected its token yet: `darkmux client revoke {name}` takes it back)",
-            age(now, p.created)
+            "{name}  (approved {}{}; its app has not collected its token yet: `darkmux client revoke {name}` takes it back)",
+            age(now, p.created),
+            on_its_own(p.auto_approved.as_ref())
         )
     }));
     if lines.is_empty() {
         lines.push("no paired clients".to_string());
     }
+    lines.extend(cp::remembered_apps(store)?.into_iter().map(|r| {
+        let app = r.identity();
+        format!("remembered app {app}  (allowed {}; pairs with no dialog: `darkmux client forget {app}` forgets it)", age(now, r.allowed))
+    }));
     Ok(lines)
+}
+
+/// What `client list` adds for a pairing approved with no operator step.
+fn on_its_own(auto: Option<&cp::SigningIdentity>) -> String {
+    auto.map(|app| format!(", auto-approved: signed by {app}")).unwrap_or_default()
 }
 
 /// `darkmux doctor`'s row for client workspaces no paired client owns.
@@ -278,7 +304,28 @@ pub(crate) fn doctor_checks() -> Vec<crate::doctor::Check> {
     } else {
         Ok(Vec::new())
     };
-    vec![unowned_row(unowned)]
+    let remembered = ClientStore::production().peek().map(|f| f.remembered_apps);
+    vec![unowned_row(unowned), remembered_row(remembered)]
+}
+
+/// (#3544) The row naming the apps the operator allowed in the pairing
+/// dialog, each of which pairs again with no dialog.
+fn remembered_row(remembered: Result<Vec<cp::RememberedApp>>) -> crate::doctor::Check {
+    use crate::doctor::{Check, Status};
+    let name = "client remembered apps".to_string();
+    let (status, message, hint) = match remembered {
+        Ok(list) if list.is_empty() => (Status::Pass, "none: only a Mux Bot signed by a verified team pairs with no dialog".to_string(), None),
+        Ok(list) => (
+            Status::Pass,
+            format!(
+                "{} pair with no dialog (allowed in the pairing dialog)",
+                list.iter().map(|r| r.identity().to_string()).collect::<Vec<_>>().join(", ")
+            ),
+            Some("`darkmux client forget <team>/<bundle>` forgets one".to_string()),
+        ),
+        Err(e) => (Status::Warn, format!("could not read the client store: {e:#}"), None),
+    };
+    Check { name, status, message, hint }
 }
 
 /// The row for `unowned`: Pass when every client workspace has a paired
@@ -357,6 +404,7 @@ mod tests {
                         status: cp::PendingStatus::Pending,
                         client_name: None,
                         client_id: None,
+                        auto_approved: None,
                     });
                 }
                 Ok(())
@@ -512,6 +560,7 @@ mod tests {
                         id: format!("c-{i:016}"),
                         created: 1,
                         token_hash: "00".repeat(32),
+                        auto_approved: None,
                     });
                 }
                 Ok(())
@@ -533,6 +582,42 @@ mod tests {
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let code = run_verb(sub, here, &mut answers.as_bytes(), &mut out, &mut err).unwrap();
         (code, String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
+    }
+
+    /// (#3544) `client list` names a client that paired on its own by the
+    /// signature that verified it, and each remembered app with how to
+    /// forget it; `client forget` forgets it, and refuses one not remembered
+    /// or not written `<team>/<bundle>`.
+    #[test]
+    fn list_shows_auto_approvals_and_remembered_apps_and_forget_forgets() {
+        let (_d, here) = here(&["mux-bot"], &[]);
+        here.store
+            .update(|f| {
+                f.clients[0].auto_approved = Some(cp::SigningIdentity { team: "5LDXYW8B6T".into(), bundle: "com.darklyenergized.darkmuxapp".into() });
+                f.remembered_apps.push(cp::RememberedApp { team: "AAAAAAAAAA".into(), bundle: "com.example.muxfork".into(), allowed: 100 });
+                Ok(())
+            })
+            .unwrap();
+        let (_, out, _) = verb(&here, ClientCmd::List, "");
+        assert!(out.contains("mux-bot  (paired 3m ago, auto-approved: signed by 5LDXYW8B6T/com.darklyenergized.darkmuxapp)"), "{out}");
+        assert!(out.contains("remembered app AAAAAAAAAA/com.example.muxfork") && out.contains("`darkmux client forget AAAAAAAAAA/com.example.muxfork`"), "{out}");
+        let (code, out, _) = verb(&here, ClientCmd::Forget { app: "AAAAAAAAAA/com.example.muxfork".into() }, "");
+        assert_eq!(code, 0, "{out}");
+        assert!(here.store.read().unwrap().remembered_apps.is_empty());
+        let (code, _, err) = verb(&here, ClientCmd::Forget { app: "AAAAAAAAAA/com.example.muxfork".into() }, "");
+        assert_eq!(code, 1);
+        assert!(err.contains("no remembered app"), "{err}");
+        let (code, _, err) = verb(&here, ClientCmd::Forget { app: "nonsense".into() }, "");
+        assert_eq!(code, 1);
+        assert!(err.contains("<team>/<bundle>"), "{err}");
+    }
+
+    #[test]
+    fn doctor_names_each_remembered_app() {
+        let row = remembered_row(Ok(vec![cp::RememberedApp { team: "AAAAAAAAAA".into(), bundle: "com.example.muxfork".into(), allowed: 1 }]));
+        assert!(row.message.contains("AAAAAAAAAA/com.example.muxfork"), "{}", row.message);
+        assert!(row.hint.unwrap().contains("darkmux client forget"));
+        assert!(remembered_row(Ok(Vec::new())).message.starts_with("none"));
     }
 
     /// `client revoke` says what it revoked, or refuses a name no client has.

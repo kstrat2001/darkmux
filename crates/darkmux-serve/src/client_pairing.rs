@@ -13,9 +13,12 @@
 //!
 //! **Pairing.** The app `POST`s `/client/pair` with a device name, a code it
 //! shows its user and a random `pair_secret` (a `scopes` field is accepted
-//! and ignored: what an app may run is machine policy, not the app's ask). The
-//! operator runs `darkmux client approve --code <CODE>` here with the code the
-//! app shows, sees the device, code and age, and approves (or denies). A
+//! and ignored: what an app may run is machine policy, not the app's ask). A
+//! Mux Bot on this machine whose code signature verifies (a verified team, or
+//! an app the operator allowed before) is approved at once; any other app gets
+//! a native Allow dialog ([`crate::client_trust`], #3544). Either way, the
+//! operator can run `darkmux client approve --code <CODE>` here with the code
+//! the app shows, see the device, code and age, and approve (or deny). A
 //! pairing records identity only. The app polls `/client/pair/{id}` with
 //! `X-Pair-Secret`; on the first poll after approval this listener mints the
 //! token (32 random bytes, hex), stores ONLY its BLAKE3 hash as an approved
@@ -158,6 +161,10 @@ const KEEP_WORK_SECS: u64 = 3600;
 /// 1.2: every client has a stable random `id`, minted at approval, which its
 /// workspaces and runs are keyed by (never its display name, which a later
 /// pairing can reuse). A 1.1 store's clients get one when it is read.
+/// Additive in 1.2 (#3544, unreleased with it): `auto_approved` on a request
+/// and a client (the signing identity that approved it with no operator
+/// step) and `remembered_apps` (apps the operator allowed in the dialog,
+/// which then pair at once).
 pub const CLIENTS_SCHEMA_VERSION: &str = "1.2";
 
 // ─── Store ───────────────────────────────────────────────────────────────
@@ -189,6 +196,9 @@ pub struct PendingRequest {
     /// The id the client will have, minted at approval.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
+    /// (#3544) The signing identity that approved it with no operator step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_approved: Option<SigningIdentity>,
 }
 
 impl PendingRequest {
@@ -213,6 +223,54 @@ pub struct ApprovedClient {
     pub created: u64,
     /// BLAKE3 of the bearer token, hex. The token itself is never stored.
     pub token_hash: String,
+    /// (#3544) The signing identity that approved it with no operator step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_approved: Option<SigningIdentity>,
+}
+
+/// (#3544) An app as its code signature names it: the developer team and
+/// the bundle id. Written `<team>/<bundle>`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SigningIdentity {
+    pub team: String,
+    pub bundle: String,
+}
+
+impl SigningIdentity {
+    /// `<team>/<bundle>`, as `client list` writes it.
+    pub fn parse(s: &str) -> Option<Self> {
+        let (team, bundle) = s.trim().split_once('/')?;
+        (!team.is_empty() && !bundle.is_empty()).then(|| Self { team: team.to_string(), bundle: bundle.to_string() })
+    }
+}
+
+impl From<&darkmux_platform::SignedApp> for SigningIdentity {
+    fn from(app: &darkmux_platform::SignedApp) -> Self {
+        Self { team: app.team.clone(), bundle: app.bundle.clone() }
+    }
+}
+
+impl std::fmt::Display for SigningIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.team, self.bundle)
+    }
+}
+
+/// (#3544) An app the operator allowed in the pairing dialog, remembered by
+/// its signing identity: a later pairing from a process that verifies as it
+/// is approved at once, until `client forget`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RememberedApp {
+    pub team: String,
+    pub bundle: String,
+    /// Unix seconds.
+    pub allowed: u64,
+}
+
+impl RememberedApp {
+    pub fn identity(&self) -> SigningIdentity {
+        SigningIdentity { team: self.team.clone(), bundle: self.bundle.clone() }
+    }
 }
 
 /// `~/.darkmux/clients.json`.
@@ -229,6 +287,9 @@ pub struct ClientsFile {
     /// Decided once, at the migration; never set otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_owner: Option<String>,
+    /// (#3544) Apps the operator allowed in the pairing dialog.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remembered_apps: Vec<RememberedApp>,
 }
 
 impl Default for ClientsFile {
@@ -238,6 +299,7 @@ impl Default for ClientsFile {
             pending: Vec::new(),
             clients: Vec::new(),
             legacy_owner: None,
+            remembered_apps: Vec::new(),
         }
     }
 }
@@ -530,27 +592,85 @@ pub fn find_by_code(store: &ClientStore, code: &str, now: u64) -> Result<Pending
     }
 }
 
+/// How a pairing request is approved (#3544). Every way goes through
+/// [`approve_as`], the one approval path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Approval {
+    /// The operator: `darkmux client approve`.
+    Operator,
+    /// Allow in the dialog; `remember` is the requesting app's signing
+    /// identity when it had one, kept so it pairs at once next time.
+    Dialog { remember: Option<SigningIdentity> },
+    /// No operator step: the requesting process verified as this identity.
+    Verified(SigningIdentity),
+}
+
 /// Approve a live request; the token is minted when the app collects it.
 /// Returns the client name it will have.
 pub fn approve(store: &ClientStore, request_id: &str, now: u64) -> Result<String> {
+    approve_as(store, request_id, now, &Approval::Operator)
+}
+
+/// [`approve`], saying how it was approved: one write records the approval,
+/// the identity that approved it on its own, and the app the dialog's Allow
+/// remembers.
+pub fn approve_as(store: &ClientStore, request_id: &str, now: u64, how: &Approval) -> Result<String> {
     store.update(|f| {
-        prune(f, now);
-        let mut taken: Vec<String> = f.clients.iter().map(|c| c.name.clone()).collect();
-        taken.extend(f.pending.iter().filter_map(|p| p.client_name.clone()));
-        let p = f
-            .pending
-            .iter_mut()
-            .find(|p| p.request_id == request_id)
-            .ok_or_else(|| anyhow!("no pairing request {request_id}"))?;
-        if !p.live(now) {
-            bail!("pairing request {request_id} is no longer pending (expired or already decided)");
+        let name = approve_in(f, request_id, now)?;
+        match how {
+            Approval::Operator | Approval::Dialog { remember: None } => {}
+            Approval::Verified(app) => {
+                if let Some(p) = f.pending.iter_mut().find(|p| p.request_id == request_id) {
+                    p.auto_approved = Some(app.clone());
+                }
+            }
+            Approval::Dialog { remember: Some(app) } => remember_in(f, app, now),
         }
-        let name = client_name_for(&p.device_name, &taken);
-        p.status = PendingStatus::Approved;
-        p.client_name = Some(name.clone());
-        p.client_id = Some(new_client_id()?);
         Ok(name)
     })
+}
+
+/// Adds `app` to the remembered apps, once.
+fn remember_in(f: &mut ClientsFile, app: &SigningIdentity, now: u64) {
+    if !f.remembered_apps.iter().any(|r| &r.identity() == app) {
+        f.remembered_apps.push(RememberedApp { team: app.team.clone(), bundle: app.bundle.clone(), allowed: now });
+    }
+}
+
+/// The apps the operator allowed in the dialog (`client list`).
+pub fn remembered_apps(store: &ClientStore) -> Result<Vec<RememberedApp>> {
+    Ok(store.read()?.remembered_apps)
+}
+
+/// Forgets a remembered app: its next pairing asks again. `false` when it
+/// was not remembered. Its paired clients stay paired (`client revoke`).
+pub fn forget(store: &ClientStore, app: &SigningIdentity) -> Result<bool> {
+    store.update(|f| {
+        let before = f.remembered_apps.len();
+        f.remembered_apps.retain(|r| &r.identity() != app);
+        Ok(f.remembered_apps.len() != before)
+    })
+}
+
+/// [`approve`]'s change to the store: the request marked approved, with the
+/// client name and id it will have.
+fn approve_in(f: &mut ClientsFile, request_id: &str, now: u64) -> Result<String> {
+    prune(f, now);
+    let mut taken: Vec<String> = f.clients.iter().map(|c| c.name.clone()).collect();
+    taken.extend(f.pending.iter().filter_map(|p| p.client_name.clone()));
+    let p = f
+        .pending
+        .iter_mut()
+        .find(|p| p.request_id == request_id)
+        .ok_or_else(|| anyhow!("no pairing request {request_id}"))?;
+    if !p.live(now) {
+        bail!("pairing request {request_id} is no longer pending (expired or already decided)");
+    }
+    let name = client_name_for(&p.device_name, &taken);
+    p.status = PendingStatus::Approved;
+    p.client_name = Some(name.clone());
+    p.client_id = Some(new_client_id()?);
+    Ok(name)
 }
 
 /// Deny a live request, or take back an approval its app has not collected
@@ -568,6 +688,7 @@ pub fn deny(store: &ClientStore, request_id: &str, now: u64) -> Result<()> {
         p.status = PendingStatus::Denied;
         p.client_name = None;
         p.client_id = None;
+        p.auto_approved = None;
         Ok(())
     })
 }
@@ -603,6 +724,7 @@ pub fn revoke(store: &ClientStore, name: &str) -> Result<bool> {
                 p.status = PendingStatus::Denied;
                 p.client_name = None;
                 p.client_id = None;
+                p.auto_approved = None;
                 found = true;
             }
         }
@@ -954,6 +1076,16 @@ pub struct ClientServerState {
     /// [`PAIR_REQUESTS_PER_PROCESS`] of them. In memory only; a restart
     /// forgets it (those requests then count only toward [`MAX_PENDING`]).
     pub pair_peers: Arc<Mutex<HashMap<String, u32>>>,
+    /// (#3544) `clients.pairing.*`, read per pairing request.
+    pub pairing_policy: crate::client_trust::PairingPolicySource,
+    /// (#3544) Who signed a process on this machine.
+    pub signed_app: crate::client_trust::SignedAppCheck,
+    /// (#3544) The Allow dialog, blocking until answered or given up.
+    pub ask_allow: crate::client_trust::AskAllow,
+    /// (#3544) A notice nobody waits on.
+    pub notify: crate::client_trust::Notify,
+    /// (#3544) The Allow dialogs open now.
+    pub dialogs: Arc<crate::client_trust::DialogSlots>,
 }
 
 impl ClientServerState {
@@ -992,6 +1124,11 @@ impl ClientServerState {
             peer_processes: Arc::new(peer_processes_here),
             pair_peers: Arc::new(Mutex::new(HashMap::new())),
             pair_lookups: Arc::new(PeerRounds::default()),
+            pairing_policy: Arc::new(read_pairing_policy),
+            signed_app: Arc::new(|pid| darkmux_platform::current().signed_app(pid)),
+            ask_allow: Arc::new(|message, icon, timeout| darkmux_platform::current().ask_allow(message, icon, timeout)),
+            notify: Arc::new(|message| darkmux_platform::current().notify(message)),
+            dialogs: Arc::new(crate::client_trust::DialogSlots::default()),
         })
     }
 }
@@ -1054,6 +1191,21 @@ fn read_profiles_policy() -> Result<Option<Vec<String>>, String> {
     read_profiles_policy_at(
         &darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config,
     )
+}
+
+/// (#3544) `clients.pairing.*` from `config.json` as it is now, env first
+/// (read per request, so `config set` applies without a restart).
+fn read_pairing_policy() -> Result<crate::client_trust::PairingPolicy, String> {
+    read_pairing_policy_at(&darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config)
+}
+
+/// [`read_pairing_policy`] against the config at `path`.
+pub(crate) fn read_pairing_policy_at(path: &Path) -> Result<crate::client_trust::PairingPolicy, String> {
+    use darkmux_types::config_access as ca;
+    read_config_at(path).map(|cfg| crate::client_trust::PairingPolicy {
+        verified_teams: ca::clients_pairing_verified_teams_in(&cfg),
+        dialog: ca::clients_pairing_dialog_in(&cfg),
+    })
 }
 
 /// The config gate `client serve` runs before it listens, the same one
@@ -1699,13 +1851,14 @@ pub(crate) async fn pair_handler(
         Ok(made) => made,
         Err(e) => return internal(e),
     };
-    let request_id = record.request_id.clone();
+    let (request_id, code) = (record.request_id.clone(), record.code.clone());
+    let sender = crate::client_trust::sender_of(&state, from).await;
     match add_pending(&state, record, from, now) {
-        Ok(true) => (
-            StatusCode::ACCEPTED,
-            Json(PairAccepted { request_id }),
-        )
-            .into_response(),
+        Ok(true) => {
+            let peer = peer.map(|axum::extract::ConnectInfo(p)| p);
+            log_lines(crate::client_trust::decide(&state, (&request_id, &code), peer, from, sender).await);
+            (StatusCode::ACCEPTED, Json(PairAccepted { request_id })).into_response()
+        }
         Ok(false) => err(
             StatusCode::TOO_MANY_REQUESTS, ClientCode::TooManyRequests,
             "too many pairing requests are waiting; try again later",
@@ -1715,7 +1868,7 @@ pub(crate) async fn pair_handler(
 }
 
 /// A new pending request for `req`, and the process it came from when that
-/// is asked ([`request_process`]).
+/// can be told ([`peer_process_of`]).
 async fn new_request(
     state: &ClientServerState,
     req: PairBody,
@@ -1723,7 +1876,7 @@ async fn new_request(
     now: u64,
 ) -> Result<(PendingRequest, Option<u32>)> {
     let request_id = format!("r-{}", random_hex(16)?);
-    let from = request_process(state, peer, now).await?;
+    let from = peer_process_of(state, peer).await;
     let record = PendingRequest {
         request_id,
         device_name: req.device_name,
@@ -1733,24 +1886,9 @@ async fn new_request(
         status: PendingStatus::Pending,
         client_name: None,
         client_id: None,
+        auto_approved: None,
     };
     Ok((record, from))
-}
-
-/// The process on this machine a new pairing request came from, asked only
-/// when another request is waiting already: to one alone in the queue the
-/// per-process bound has nothing to say, so a lone app's pairing asks the
-/// OS nothing.
-async fn request_process(
-    state: &ClientServerState,
-    peer: Option<axum::extract::ConnectInfo<SocketAddr>>,
-    now: u64,
-) -> Result<Option<u32>> {
-    let others_waiting = state.store.read()?.pending.iter().any(|p| p.live(now));
-    Ok(match others_waiting {
-        true => peer_process_of(state, peer).await,
-        false => None,
-    })
 }
 
 /// The process on this machine a pairing request came from, when that can
@@ -1758,7 +1896,7 @@ async fn request_process(
 /// one that finished while it queued, else one it runs itself, off the
 /// async workers, for every request waiting. A request whose sender went
 /// away while it queued is dropped before it starts a round.
-async fn peer_process_of(state: &ClientServerState, peer: Option<axum::extract::ConnectInfo<SocketAddr>>) -> Option<u32> {
+pub(crate) async fn peer_process_of(state: &ClientServerState, peer: Option<axum::extract::ConnectInfo<SocketAddr>>) -> Option<u32> {
     use std::sync::atomic::Ordering::SeqCst;
     let axum::extract::ConnectInfo(p) = peer?;
     let rounds = state.pair_lookups.clone();
@@ -1861,6 +1999,7 @@ fn poll_pending(f: &mut ClientsFile, request_id: &str, secret: &str, now: u64) -
         id,
         created: now,
         token_hash: hash_hex(&token),
+        auto_approved: p.auto_approved.clone(),
     });
     f.pending.remove(i);
     Ok(PollOutcome::Approved { client_name, token })
