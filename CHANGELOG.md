@@ -14,7 +14,7 @@ darkmux release.
 
 ## [Unreleased]
 
-## [5.10.0] - 2026-11-10
+## [5.10.0] - 2026-11-11
 
 The Mux Bot release: darkmux starts the Tensorfold and Flint servers it dispatches to, and a paired
 app (`darkmux client serve`) gets its own workspaces, git history and container previews.
