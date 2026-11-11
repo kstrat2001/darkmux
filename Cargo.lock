@@ -922,6 +922,7 @@ dependencies = [
  "darkmux-lab",
  "darkmux-platform",
  "darkmux-profiles",
+ "darkmux-sandbox",
  "darkmux-types",
  "futures",
  "hyper 1.9.0",
