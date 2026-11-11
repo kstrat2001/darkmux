@@ -2542,6 +2542,9 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn health_reports_whether_the_daemon_finds_docker_to_this_machine_only() {
+        // Its own process: it empties `PATH`, which a test spawning git
+        // alongside in this binary would read.
+        darkmux_types::run_in_own_process!();
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join("docker"), "").unwrap();
         #[cfg(unix)]

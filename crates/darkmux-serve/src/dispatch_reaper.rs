@@ -224,6 +224,9 @@ mod tests {
     #[test]
     #[serial]
     fn without_docker_the_reaper_says_so_once() {
+        // Its own process: it empties `PATH`, which a test spawning git
+        // alongside in this binary would read.
+        darkmux_types::run_in_own_process!();
         let empty = TempDir::new().unwrap();
         let prev = std::env::var("PATH").ok();
         // SAFETY: `#[serial]`.

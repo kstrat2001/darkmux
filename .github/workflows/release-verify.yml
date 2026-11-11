@@ -82,9 +82,27 @@ jobs:
         if: steps.tree.outputs.hit != 'true'
         run: cargo build --workspace --release --all-targets
 
+      # nextest under the `ci` profile, as `ci.yml` runs the same suite
+      # (#2896): each test in its own process, no retries. Plain `cargo test`
+      # ran every test of a crate in one process, so tests that set
+      # process-wide state (`PATH`, `GIT_CONFIG_GLOBAL`, a workspace name's
+      # lock) failed each other at random: four of eight runs here on
+      # 2026-11-09/10 failed so, never on the code under test. This gate is
+      # for the release PROFILE; the runner now matches the one every PR
+      # passes. nextest skips doctests, so the step after runs them.
+      - name: Install cargo-nextest
+        if: steps.tree.outputs.hit != 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.140
+
       - name: Test release (whole workspace)
         if: steps.tree.outputs.hit != 'true'
-        run: cargo test -q --workspace --release
+        run: cargo nextest run --workspace --release --profile ci
+
+      - name: Doc tests release (nextest does not run them)
+        if: steps.tree.outputs.hit != 'true'
+        run: cargo test -q --workspace --release --doc
 
       - name: Clippy release (whole workspace, all targets, no warnings allowed)
         if: steps.tree.outputs.hit != 'true'
