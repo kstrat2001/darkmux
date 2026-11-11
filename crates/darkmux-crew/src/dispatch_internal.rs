@@ -1849,10 +1849,7 @@ fn cached_binary_is_current_at(dir: &Path, want_version: &str, want_image_id: Op
 /// present locally, non-UTF8 output) — the caller falls back to
 /// version-only comparison rather than treating "unknown" as "different".
 fn resolve_image_id(source_image: &str) -> Option<String> {
-    let out = Command::new("docker")
-        .args(["image", "inspect", "-f", "{{.Id}}", "--", source_image])
-        .output()
-        .ok()?;
+    let out = darkmux_sandbox::DockerBackend::image_id(source_image).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -1933,8 +1930,7 @@ fn extract_runtime_binary_to(source_image: &str, tmp: &Path) -> Result<()> {
     // run path), and we validate it first so a ref starting with `-` / control
     // chars can't be smuggled as a docker flag.
     validate_image_ref(source_image)?;
-    let created = Command::new("docker")
-        .args(["create", "--", source_image])
+    let created = darkmux_sandbox::DockerBackend::create_stopped(source_image)
         .output()
         .context("docker create (to extract the runtime binary for --image injection)")?;
     if !created.status.success() {
@@ -1962,15 +1958,9 @@ fn extract_runtime_binary_to(source_image: &str, tmp: &Path) -> Result<()> {
             tmp.display()
         )
     })?;
-    let cp = Command::new("docker")
-        .args([
-            "cp",
-            &format!("{cid}:/usr/local/bin/darkmux-runtime"),
-            tmp_str,
-        ])
-        .output();
+    let cp = darkmux_sandbox::DockerBackend::copy_out(&cid, "/usr/local/bin/darkmux-runtime", tmp_str).output();
     // Best-effort cleanup of the throwaway container regardless of cp result.
-    let _ = Command::new("docker").args(["rm", "-f", &cid]).output();
+    let _ = darkmux_sandbox::backend().remove(&sandbox_named(&cid)).output();
     let cp = cp.context("docker cp (extracting the runtime binary)")?;
     if !cp.status.success() {
         let _ = fs::remove_file(tmp);
@@ -13758,9 +13748,7 @@ fn docker_runtime_status_live() -> DockerRuntimeStatus {
 /// probe would hang doctor and every dispatch preflight with it.
 fn probe_docker_daemon(timeout: Duration) -> Option<DockerRuntimeStatus> {
     use crate::bounded_command::{run_bounded, Bounded};
-    let mut cmd = Command::new("docker");
-    cmd.args(["version", "--format", "{{.Server.Version}}"]);
-    match run_bounded(cmd, timeout) {
+    match run_bounded(darkmux_sandbox::DockerBackend::version(), timeout) {
         Bounded::Finished { success: true, .. } => None,
         Bounded::Finished { stderr, .. } => Some(DockerRuntimeStatus::DaemonUnreachable(
             String::from_utf8_lossy(&stderr).trim().to_string(),

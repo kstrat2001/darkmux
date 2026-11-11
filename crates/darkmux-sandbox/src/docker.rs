@@ -5,7 +5,9 @@
 use crate::{Access, BackendKind, Having, Listed, Mount, Network, Query, SandboxBackend, SandboxHandle, SandboxPolicy};
 use std::process::Command;
 
-const PROGRAM: &str = "docker";
+/// The program every Docker command runs, for a caller asking whether it is
+/// on `PATH`.
+pub const PROGRAM: &str = "docker";
 
 /// `--cap-drop`: every Linux capability. A sandbox's code needs none.
 pub const CAP_DROP: &str = "ALL";
@@ -90,6 +92,69 @@ impl DockerBackend {
     pub fn exec(handle: &SandboxHandle, argv: &[&str]) -> Command {
         let mut cmd = Command::new(PROGRAM);
         cmd.args(["exec", &handle.id]).args(argv);
+        cmd
+    }
+
+    /// (#3112) Docker's image and engine commands. Docker's alone: a
+    /// backend without images has nothing to inspect, pull or copy out of,
+    /// so none of these is part of [`SandboxBackend`]. Each is the exact
+    /// line its caller ran before it moved here.
+    ///
+    /// `docker image inspect --format <format> -- <images…>`.
+    pub fn image_inspect(format: &str, images: &[&str]) -> Command {
+        let mut cmd = Command::new(PROGRAM);
+        cmd.args(["image", "inspect", "--format", format, "--"]).args(images);
+        cmd
+    }
+
+    /// `docker image inspect -f {{.Id}} -- <image>`: the image's
+    /// content-addressed id.
+    pub fn image_id(image: &str) -> Command {
+        let mut cmd = Command::new(PROGRAM);
+        cmd.args(["image", "inspect", "-f", "{{.Id}}", "--", image]);
+        cmd
+    }
+
+    /// `docker pull <image>`.
+    pub fn pull(image: &str) -> Command {
+        let mut cmd = Command::new(PROGRAM);
+        cmd.args(["pull", image]);
+        cmd
+    }
+
+    /// `docker context inspect`: the current context's engine endpoint.
+    pub fn context_host() -> Command {
+        let mut cmd = Command::new(PROGRAM);
+        cmd.args(["context", "inspect", "--format", "{{.Endpoints.docker.Host}}"]);
+        cmd
+    }
+
+    /// `docker images <repo> --format <format>`.
+    pub fn images(repo: &str, format: &str) -> Command {
+        let mut cmd = Command::new(PROGRAM);
+        cmd.args(["images", repo, "--format", format]);
+        cmd
+    }
+
+    /// `docker version`: whether the engine answers, and its version.
+    pub fn version() -> Command {
+        let mut cmd = Command::new(PROGRAM);
+        cmd.args(["version", "--format", "{{.Server.Version}}"]);
+        cmd
+    }
+
+    /// `docker create -- <image>`: a stopped container to copy files out
+    /// of; it prints the container's id.
+    pub fn create_stopped(image: &str) -> Command {
+        let mut cmd = Command::new(PROGRAM);
+        cmd.args(["create", "--", image]);
+        cmd
+    }
+
+    /// `docker cp <container>:<path> <dest>`.
+    pub fn copy_out(container: &str, path: &str, dest: &str) -> Command {
+        let mut cmd = Command::new(PROGRAM);
+        cmd.args(["cp", &format!("{container}:{path}"), dest]);
         cmd
     }
 
@@ -283,6 +348,31 @@ mod tests {
         assert_eq!((cmd.get_program().to_str(), args_of(&cmd)), (Some("docker"), strings(&["stop", "-t", "5", "s-1"])));
         let cmd = DockerBackend::exec(&handle, &["cat", "/proc/net/tcp"]);
         assert_eq!((cmd.get_program().to_str(), args_of(&cmd)), (Some("docker"), strings(&["exec", "s-1", "cat", "/proc/net/tcp"])));
+    }
+
+    /// Docker's image and engine commands are the exact lines their callers
+    /// ran.
+    #[test]
+    fn image_and_engine_commands_are_the_lines_callers_ran() {
+        let line = |cmd: Command| {
+            assert_eq!(cmd.get_program().to_str(), Some("docker"));
+            args_of(&cmd)
+        };
+        assert_eq!(
+            line(DockerBackend::image_inspect("{{.Id}}", &["a:1", "b:2"])),
+            strings(&["image", "inspect", "--format", "{{.Id}}", "--", "a:1", "b:2"])
+        );
+        assert_eq!(line(DockerBackend::image_id("a:1")), strings(&["image", "inspect", "-f", "{{.Id}}", "--", "a:1"]));
+        assert_eq!(line(DockerBackend::pull("a:1")), strings(&["pull", "a:1"]));
+        assert_eq!(
+            line(DockerBackend::context_host()),
+            strings(&["context", "inspect", "--format", "{{.Endpoints.docker.Host}}"])
+        );
+        assert_eq!(line(DockerBackend::images("repo", "{{.Tag}}")), strings(&["images", "repo", "--format", "{{.Tag}}"]));
+        assert_eq!(line(DockerBackend::version()), strings(&["version", "--format", "{{.Server.Version}}"]));
+        assert_eq!(line(DockerBackend::create_stopped("a:1")), strings(&["create", "--", "a:1"]));
+        assert_eq!(line(DockerBackend::copy_out("c1", "/usr/local/bin/x", "/tmp/x")), strings(&["cp", "c1:/usr/local/bin/x", "/tmp/x"]));
+        assert_eq!(PROGRAM, "docker");
     }
 
     /// Removal is by name and forced. A listing by label shows stopped

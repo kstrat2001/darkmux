@@ -5548,7 +5548,7 @@ fn check_daemon_docker() -> Check {
     let health = loopback_http_body(&host, darkmux_types::config_access::serve_client_port(), "/health");
     let (daemon, listener_on) = health.as_deref().map(parse_daemon_docker).unwrap_or((None, false));
     let in_panel = env::var_os("DARKMUX_PANEL").is_some();
-    classify_daemon_docker(daemon, which("docker").is_some(), listener_on, in_panel)
+    classify_daemon_docker(daemon, which(darkmux_sandbox::docker::PROGRAM).is_some(), listener_on, in_panel)
 }
 
 /// `/health`'s `docker_on_path` (`None` when absent: no daemon, one older than
@@ -5855,7 +5855,7 @@ fn probe_runtime_image() -> RuntimeImageProbe {
     use darkmux_crew::runtime_image::{RUNTIME_IMAGE_REPO, RUNTIME_IMAGE_VERSION_LABEL};
     let timeout = std::time::Duration::from_secs(5);
     let Some(list) = bounded_output(
-        Command::new("docker").args(["images", RUNTIME_IMAGE_REPO, "--format", "{{.Repository}}:{{.Tag}}"]),
+        &mut darkmux_sandbox::DockerBackend::images(RUNTIME_IMAGE_REPO, "{{.Repository}}:{{.Tag}}"),
         timeout,
     ) else {
         return RuntimeImageProbe::NotApplicable("`docker` not available".into());
@@ -5871,9 +5871,7 @@ fn probe_runtime_image() -> RuntimeImageProbe {
     // One inspect for every tag: one output line per ref, in order.
     let format = format!("{{{{index .Config.Labels \"{RUNTIME_IMAGE_VERSION_LABEL}\"}}}}");
     let Some(out) = bounded_output(
-        Command::new("docker")
-            .args(["image", "inspect", "--format", &format, "--"])
-            .args(&tags),
+        &mut darkmux_sandbox::DockerBackend::image_inspect(&format, &tags.iter().map(String::as_str).collect::<Vec<_>>()),
         timeout,
     ) else {
         return RuntimeImageProbe::NotApplicable("`docker image inspect` did not answer".into());
