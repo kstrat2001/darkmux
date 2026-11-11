@@ -362,7 +362,7 @@ fn with_logged_git<T>(log: &Path, f: impl FnOnce() -> T) -> T {
     let old = std::env::var_os("PATH").unwrap();
     let mut paths = vec![shim.path().to_path_buf()];
     paths.extend(std::env::split_paths(&old));
-    // SAFETY: #[serial]; restored below.
+    // SAFETY: only the test that runs in its own process calls this.
     unsafe { std::env::set_var("PATH", std::env::join_paths(paths).unwrap()) };
     let out = f();
     unsafe { std::env::set_var("PATH", old) };
@@ -382,16 +382,20 @@ fn git_calls_for(files: usize) -> usize {
     let read = with_logged_git(&log, || branch_files(&wc, &base, &head, MAX));
     assert_eq!(read.expect("the branch reads").len(), files);
     let calls = std::fs::read_to_string(&log).unwrap_or_default();
-    // Only this repository's calls: a test running alongside may spawn git too.
     let tree = wc.work_tree.display().to_string();
     calls.lines().filter(|l| l.contains(&tree)).count()
 }
 
 /// Reading a branch's files costs the same few git calls for 1 file or 40,
 /// not a `show` and an `ls-tree` (each with its config read) per file.
+///
+/// Runs in its own process: the logging `git` goes on `PATH`, which every
+/// test in this binary reads, and `#[serial]` holds back only other serial
+/// tests. Under `cargo test` (one process) a test spawning git alongside
+/// found the shim, whose folder was then deleted under it.
 #[test]
-#[serial_test::serial]
 fn reading_a_branch_costs_a_fixed_number_of_git_calls() {
+    darkmux_types::run_in_own_process!();
     let (one, forty) = (git_calls_for(1), git_calls_for(40));
     assert_eq!(one, forty, "git calls grew with the file count: {one} for 1 file, {forty} for 40");
     assert!(one <= 4, "{one} git calls for one file");
