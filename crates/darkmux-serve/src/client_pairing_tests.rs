@@ -5720,6 +5720,10 @@ fn a_preview_needs_the_docker_sandbox_for_now() {
     for part in ["previews need `runtime.sandbox` `docker` for now", "this machine's sandbox is `seatbelt`", "darkmux config set runtime.sandbox docker"] {
         assert!(refused.contains(part), "missing `{part}` in: {refused}");
     }
+    let landlock = crate::client_pairing::preview_sandbox_refusal(&Ok(BackendKind::Landlock)).expect("refused");
+    for part in ["previews need `runtime.sandbox` `docker` for now", "this machine's sandbox is `landlock`", "darkmux config set runtime.sandbox docker"] {
+        assert!(landlock.contains(part), "missing `{part}` in: {landlock}");
+    }
     let bad = crate::client_pairing::preview_sandbox_refusal(&Err("`x` is not a valid sandbox".into())).expect("refused");
     assert!(bad.contains("`x` is not a valid sandbox"), "{bad}");
 }
