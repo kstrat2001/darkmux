@@ -828,6 +828,7 @@ mod tests {
             ("data.yml", format!("{}a: {}\nimage: e\n", " ".repeat(size / 2), "e ".repeat(size / 4)), 1),
             ("post.md", format!("{}[a]: {}\n[b]: e\n", " ".repeat(size / 2), "e ".repeat(size / 4)), 1),
             ("page.html", format!("<p>{}</p><img src=\"e?v=2\">", "e?".repeat(size / 2)), 1),
+            ("page.html", format!("<p>{}{}</p>", "a ".repeat(size / 4), "e?".repeat(size / 4)), 0),
         ];
         for (file, page, want) in &pages {
             let started = std::time::Instant::now();
