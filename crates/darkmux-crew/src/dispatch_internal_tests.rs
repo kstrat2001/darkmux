@@ -11095,6 +11095,46 @@ S(("127.0.0.1", port), H).serve_forever()
         assert_eq!((site.file.as_str(), site.start_line, site.end_line), ("src/a.ts", 3, 9));
     }
 
+    /// (#3112 review) A mod proposed in a sandbox on the host (the launcher
+    /// stamped `context.root`) names its files under that root; its kit is
+    /// stored exactly as one proposed under `/workspace` is.
+    #[test]
+    #[serial]
+    fn a_mod_proposed_under_a_host_seen_root_is_stored_like_a_container_one() {
+        let stored = |root: Option<&str>, header: &str| {
+            let tmp = TempDir::new().unwrap();
+            let mods_store = tmp.path().join("mods");
+            let findings_store = tmp.path().join("findings");
+            let prev = mod_test_env(tmp.path(), &mods_store, &findings_store);
+            let mut context = serde_json::json!({"source": "app"});
+            if let Some(r) = root {
+                context["root"] = serde_json::json!(r);
+            }
+            let mut state = TailerState::new_for_test(
+                tmp.path().join("trajectory.jsonl"),
+                crate::test_session("sess-root"),
+                "coder".into(),
+                "darkmux:qwen3.6".into(),
+            )
+            .with_record_context(Some(ctx(context)));
+            let kit = format!("--- {header}/app/src/a.ts\n+++ {header}/app/src/a.ts\n@@ -1 +1 @@\n-a\n+b\n");
+            state.handle_event(
+                &serde_json::json!({
+                    "type": "tool.completed", "seq": 1, "tool_seq": 0, "tool_name": "create_mod",
+                    "args": "{}", "result": "Recorded mod 1.", "ok": true,
+                    "emitted": {"kit": kit, "for": [], "attach": []}, "emit_seq": 1,
+                })
+                .to_string(),
+            );
+            let all = crate::mods::load_all_at(&mods_store).unwrap();
+            restore_env(prev);
+            all[0].kit.clone()
+        };
+        let docker = stored(None, "/workspace");
+        assert_eq!(docker.as_deref(), Some("--- src/a.ts\n+++ src/a.ts\n@@ -1 +1 @@\n-a\n+b\n"));
+        assert_eq!(stored(Some("/Users/op/tree"), "/Users/op/tree"), docker);
+    }
+
     /// (#2265, 5.0) Through the REAL spawned tailer (the wiring `dispatch()`
     /// uses): the resolved profile names the proposer, a finding gets the
     /// planned span holding it as `context.site` and the mod inherits it, and

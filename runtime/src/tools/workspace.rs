@@ -225,6 +225,20 @@ mod tests {
         );
     }
 
+    /// (#3112 review) A shipped role whose frozen prompt says the working
+    /// directory is mounted at `/workspace` (`tool-bench`) reaches the model
+    /// naming the host-seen root under a sandbox on the host: the runtime
+    /// renames its `--system` text (`naming_root`), so the frozen text itself
+    /// never changes. Byte-identical under the default root.
+    #[test]
+    fn a_shipped_role_prompt_naming_workspace_is_renamed_to_the_root() {
+        let role = include_str!("../../../templates/builtin/roles/tool-bench.md");
+        assert!(role.contains("`/workspace`"), "the role still names the container path");
+        assert_eq!(naming(role, Path::new(DEFAULT_WORKSPACE)), role);
+        let renamed = naming(role, Path::new("/Users/op/ws"));
+        assert!(!renamed.contains("/workspace") && renamed.contains("`/Users/op/ws`"), "{renamed}");
+    }
+
     /// (#3112 step 2) The root is the env override when set and non-empty,
     /// else `/workspace`; the tool definitions the model sees follow it.
     #[test]

@@ -13098,12 +13098,19 @@ impl TailerState {
         // the one free-actor field a mod has: role handle plus the model that
         // ran it.
         let by = format!("{} ({})", self.role_id, self.model);
+        // (#3112 review) A kit proposed in a sandbox on the host names its
+        // files under the root the launcher stamped; in container
+        // coordinates it is stored exactly as one proposed in a container.
+        let kit = crate::mods::kit_in_container_coords(
+            self.record_context.as_ref().and_then(|c| c.root.as_deref()),
+            kit,
+        );
         if let Err(e) = crate::mods::create_from_emission(
             &crate::mods::mods_dir(),
             &crate::findings::findings_dir(),
             &by,
             &for_keys,
-            kit,
+            &kit,
             &attachments,
             crate::findings::Scope {
                 mission_id: self.session.mission_id().map(str::to_string),

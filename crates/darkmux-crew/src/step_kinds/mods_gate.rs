@@ -213,6 +213,9 @@ impl StepKind for ModsGateStepKind {
         let resolved_source: Option<String> = workdir
             .and_then(|w| resolve_single_source_dir(Path::new(w)).ok())
             .and_then(|d| d.file_name().and_then(|n| n.to_str()).map(str::to_string));
+        // (#3112 review) Where the proposing sandbox saw the workdir, recorded
+        // beside the source so the deliverer maps a host-seen kit too.
+        let tree_seen = workdir.map(|w| darkmux_sandbox::seen_at_configured(Path::new(w), "/workspace"));
         let mut mods_gated = 0usize;
         for m in &targets {
             // A mutation self-check on this line is documented in this
@@ -228,7 +231,7 @@ impl StepKind for ModsGateStepKind {
                 None => (None, no_command_reason.clone()),
                 Some(cmd) => gate_one_mod(m, cmd, workdir, &placement),
             };
-            let res = mods::record_gate_with_source(&root, &m.key, outcome, skip_reason.as_deref(), resolved_source.as_deref())
+            let res = mods::record_gate_with_source_root(&root, &m.key, outcome, skip_reason.as_deref(), resolved_source.as_deref(), tree_seen.as_deref())
                 .with_context(|| format!("step `{}`: recording the gate for mod `{}`", step.id, m.key))?;
             if res == mods::Materialized::Created {
                 mods_gated += 1;
@@ -346,6 +349,16 @@ fn scratch_copy(source_dir: &Path) -> Result<(tempfile::TempDir, PathBuf), Strin
     Ok((scratch, scratch_checkout))
 }
 
+/// `kit` in the coordinates of the checkout `source_dir` (whose directory
+/// name is the source id), its headers mapped off `/workspace/<source>/` or
+/// the host-seen `<tree_seen>/<source>/` (#3112 review).
+fn gate_kit_mapped(kit: &str, source_dir: &Path, tree_seen: &str) -> String {
+    match source_dir.file_name().and_then(|n| n.to_str()) {
+        Some(source_id) if !source_id.trim().is_empty() => mods::strip_kit_source_prefix_under(Some(tree_seen), source_id, kit),
+        _ => kit.to_string(),
+    }
+}
+
 /// `kit` written as `<scratch>/mod.patch`, in the coordinates of the
 /// checkout copied from `source_dir`, and terminated.
 fn write_kit_patch(scratch: &Path, source_dir: &Path, kit: &str) -> Result<PathBuf, String> {
@@ -356,14 +369,11 @@ fn write_kit_patch(scratch: &Path, source_dir: &Path, kit: &str) -> Result<PathB
     // the one source checkout beneath the workdir, and that directory's name
     // IS the source id, so map here; a kit already in repo coordinates is a
     // no-op for the `a/`/`b/`-marked headers (see `strip_kit_source_prefix`).
-    let mapped_kit;
-    let kit = match source_dir.file_name().and_then(|n| n.to_str()) {
-        Some(source_id) if !source_id.trim().is_empty() => {
-            mapped_kit = mods::strip_kit_source_prefix(source_id, kit);
-            mapped_kit.as_str()
-        }
-        _ => kit,
-    };
+    // (#3112 review) Where the proposing sandbox saw the tree: the kit may
+    // name its files under that root instead of `/workspace`.
+    let tree_seen = darkmux_sandbox::seen_at_configured(source_dir.parent().unwrap_or(source_dir), "/workspace");
+    let mapped_kit = gate_kit_mapped(kit, source_dir, &tree_seen);
+    let kit = mapped_kit.as_str();
     let patch_path = scratch.join("mod.patch");
     // (#2387) Terminate the patch. A kit arrives as a JSON string, which
     // needs no trailing newline and rarely has one; `git apply` reads an
@@ -1025,6 +1035,18 @@ mod tests {
         assert!(missing.contains("could not write the mod's kit"), "{missing}");
     }
 
+    /// (#3112 review) A kit proposed in a sandbox on the host names its files
+    /// under the tree's host-seen root; the gate maps it to the checkout just
+    /// as it maps a `/workspace` one.
+    #[test]
+    fn a_host_seen_kit_is_mapped_to_the_checkout_like_a_container_one() {
+        let source = Path::new("/any/tree/src1");
+        let docker = gate_kit_mapped("--- /workspace/src1/x.txt\n+++ /workspace/src1/x.txt\n", source, "/workspace");
+        let host = gate_kit_mapped("--- /Users/op/tree/src1/x.txt\n+++ /Users/op/tree/src1/x.txt\n", source, "/Users/op/tree");
+        assert_eq!(docker, "--- x.txt\n+++ x.txt\n");
+        assert_eq!(host, docker);
+    }
+
     /// With a `test_command` but no placement chosen, every mod records the
     /// refusal as its skip reason and nothing is spawned.
     #[test]
@@ -1093,6 +1115,7 @@ mod tests {
             phase_id: None,
             step_id: None,
             source: None,
+            source_root: None,
             gate: None,
             gate_skipped_reason: None,
             change_key: None,

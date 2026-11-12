@@ -18,8 +18,14 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const FLOW_SCHEMA_VERSION: &str = "2.7.0";
+pub const FLOW_SCHEMA_VERSION: &str = "2.8.0";
 // Version history:
+//   2.8.0 (#3112): `payload.context.root`, where a dispatch's sandbox saw the
+//           workspace, stamped only when it is not the container's
+//           `/workspace` (a sandbox on the host sees it at its own path); a
+//           finding's `file` under it maps to its source like one under
+//           `/workspace`. ADDITIVE: absent on every record before 2.8.0 and on
+//           every Docker run's records.
 //   2.7.0 (#3448): three actions, `dispatch.model.start`, `.loading` and
 //           `.ready` (payload `DispatchModelPayload`: `engine`, `endpoint`,
 //           `model`, and `replacing`, `evicted` on start, `elapsed_ms` on

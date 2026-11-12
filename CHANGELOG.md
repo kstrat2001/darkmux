@@ -31,6 +31,14 @@ darkmux release.
   need Docker: under Seatbelt a preview start is refused (403 `forbidden`), naming
   `darkmux config set runtime.sandbox docker`.
 
+  Under a sandbox on the host every model-facing path names where that sandbox sees it: the lab
+  prompt, crawl unit briefs, split-gitdir notes, mod attachments, and the shipped `review` and
+  `crawl` mod-writer messages, which now say `${WORKSPACE_ROOT}` (a step message placeholder,
+  expanded to `/workspace` in a container; a config without it is unchanged). Findings and mod
+  kits that name the host-seen root are stored exactly as `/workspace` ones are: flow schema
+  2.8.0 adds `payload.context.root`, mod records 2.2 add `source_root`, both additive and absent
+  on Docker runs.
+
   **Upgrading:** on a Mac whose `config.json` names no sandbox, dispatches, lab runs and the mods
   gate move from Docker to Seatbelt. To keep Docker, `darkmux config set runtime.sandbox docker`
   (and upgrade every darkmux that reads the same `~/.darkmux` first: an older binary refuses the

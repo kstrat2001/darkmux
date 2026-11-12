@@ -9502,7 +9502,7 @@ fn mod_create_mints_per_call_copies_attachments_and_finding_show_lists_the_mods(
         &fs::read_to_string(home.path().join("mods").join(&key_a).join("mod.json")).unwrap(),
     )
     .expect("the record is on disk where the key says");
-    assert_eq!(rec["schema_version"], "2.1");
+    assert_eq!(rec["schema_version"], "2.2");
     assert!(rec["change_key"].as_str().is_some_and(|k| k.starts_with("chg-") && k.len() == 68), "{rec}");
     assert!(rec.get("proposer").is_none(), "a CLI mod names no darkmux role");
     assert_eq!(rec["by"], "sonnet");
@@ -11688,7 +11688,8 @@ fn the_create_mod_message_names_the_kit_shape_and_is_shared_by_both_configs() {
         "exactly as they appear",
         "not inside a code fence",
         "end with a newline",
-        "mounted at `/workspace/<source>`",
+        // (#3112) Expanded where the dispatch's sandbox sees the workdir.
+        "mounted at `${WORKSPACE_ROOT}/<source>`",
         "A diff written into your reply is not a mod",
     ] {
         assert!(crawl.contains(needle), "the message must name the kit shape ({needle:?}):\n{crawl}");

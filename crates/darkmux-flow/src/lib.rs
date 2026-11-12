@@ -4097,7 +4097,10 @@ mod tests {
         //            `FlowRecord.work_id` / `attempt`; `source` is closed
         //            (`FlowSource`), `tier` names who acted, and payload
         //            time keys use `*_ms` / `*_at_ms`. See schema.rs.
-        assert_eq!(FLOW_SCHEMA_VERSION, "2.7.0");
+        //   2.8.0 — (#3112) additive: `payload.context.root`, where a
+        //            dispatch's sandbox saw the workspace when it is not
+        //            the container's `/workspace` (a sandbox on the host).
+        assert_eq!(FLOW_SCHEMA_VERSION, "2.8.0");
     }
 
     #[test]

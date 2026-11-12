@@ -91,7 +91,10 @@ use std::path::{Path, PathBuf};
 /// **`"2"` → `"2.1"` (#2265, 5.0).** Three additive fields: `change_key`,
 /// `proposer`, `site`. A `"2"` record reads with all three absent, pinned by
 /// `a_schema_2_record_loads_with_the_new_fields_absent`.
-pub const MOD_SCHEMA_VERSION: &str = "2.1";
+///
+/// **`"2.1"` → `"2.2"` (#3112).** One additive field, `source_root`; a
+/// `"2.1"` record reads with it absent.
+pub const MOD_SCHEMA_VERSION: &str = "2.2";
 
 /// The runtime tool whose accepted calls become mods. Its finding sibling
 /// needs a LIST (the pre-2026-09-03 `report_finding` is in the append-only
@@ -383,7 +386,7 @@ pub struct ModSite {
 
 /// One mod, as stored at `<mods dir>/<key>/mod.json`.
 ///
-/// **The stored shape, at [`MOD_SCHEMA_VERSION`] `"2.1"`** (#2310 swarm F /
+/// **The stored shape, at [`MOD_SCHEMA_VERSION`] `"2.2"`** (#2310 swarm F /
 /// S2-2b — the doc used to stop at the `"1"` set, so three surfaces gained
 /// fields nothing here named):
 ///
@@ -401,6 +404,8 @@ pub struct ModSite {
 ///   gate's outcome, or why none ran. Mutually exclusive; `record_gate`
 ///   refuses to set both.
 ///
+/// - `source_root` (#3112, `"2.2"`) — where the proposing sandbox saw the
+///   tree, when that is not `/workspace`; the gate records it beside `source`.
 /// - `change_key` / `proposer` / `site` (#2265, `"2.1"`) — the proposal's
 ///   content handle, the darkmux role that proposed it, and the planned site
 ///   it came from. Each is absent when it does not apply.
@@ -495,6 +500,14 @@ pub struct ModRecord {
     /// schema version does not move.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// (#3112, `"2.2"`) Where the proposing sandbox saw the tree, recorded by
+    /// the gate beside `source` when that is not the container's
+    /// `/workspace` (a sandbox on the host sees it at its own path): a kit
+    /// written under `<source_root>/<source>/` reads in repo coordinates
+    /// through it ([`kit_in_repo_coords`]). Absent for a container, and on
+    /// every record before `"2.2"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_root: Option<String>,
     /// (#2310 P4c-2b) The confirmation gate — DESIGN.md "the changed files
     /// name the test targets, which is what makes confirmation cheap
     /// enough to do per finding": a `test_command` run against this mod's
@@ -906,7 +919,31 @@ pub fn record_gate_with_source(
     skipped_reason: Option<&str>,
     resolved_source: Option<&str>,
 ) -> Result<Materialized> {
-    record_gate_with(root, key, outcome, skipped_reason, resolved_source, || Ok(()))
+    record_gate_with(root, key, outcome, skipped_reason, (resolved_source, None), || Ok(()))
+}
+
+/// (#3112 review) [`record_gate_with_source`], also recording where the
+/// proposing sandbox saw the tree (`source_root`; `None` for a container).
+pub fn record_gate_with_source_root(
+    root: &Path,
+    key: &str,
+    outcome: Option<GateOutcome>,
+    skipped_reason: Option<&str>,
+    resolved_source: Option<&str>,
+    source_root: Option<&str>,
+) -> Result<Materialized> {
+    record_gate_with(root, key, outcome, skipped_reason, (resolved_source, source_root), || Ok(()))
+}
+
+/// (#3112 review) A record's kit in repo coordinates: its header paths under
+/// `/workspace/<source>/` (or `<source_root>/<source>/`) mapped off. `None`
+/// for a record with no kit; a record with no source is read as stored.
+pub fn kit_in_repo_coords(record: &ModRecord) -> Option<String> {
+    let kit = record.kit.as_deref()?;
+    Some(match record.source.as_deref().filter(|s| !s.trim().is_empty()) {
+        Some(source) => strip_kit_source_prefix_under(record.source_root.as_deref(), source, kit),
+        None => kit.to_string(),
+    })
 }
 
 /// [`record_gate_with_source`] with a crash-injection seam between the temp write and the rename.
@@ -915,7 +952,7 @@ fn record_gate_with(
     key: &str,
     outcome: Option<GateOutcome>,
     skipped_reason: Option<&str>,
-    resolved_source: Option<&str>,
+    (resolved_source, source_root): (Option<&str>, Option<&str>),
     before_commit: impl FnOnce() -> Result<()>,
 ) -> Result<Materialized> {
     anyhow::ensure!(is_safe_key(key), "refusing to gate a mod under an unsafe key {key:?}");
@@ -928,6 +965,9 @@ fn record_gate_with(
     }
     record.gate = outcome;
     record.gate_skipped_reason = skipped_reason.map(str::to_string);
+    if record.source_root.is_none() {
+        record.source_root = crate::findings::host_root(source_root).map(str::to_string);
+    }
     if record.source.is_none() {
         record.source = resolved_source.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
     }
@@ -1036,6 +1076,7 @@ pub fn create(
         // (#2361) An external actor's change is already written in the
         // repo's own coordinates — there is no container to map out of.
         source: None,
+        source_root: None,
         // (#2310 P4c-2b) `mod create` is a one-shot CLI write, not part of
         // any create-mods gate loop — never gated at create time.
         gate: None,
@@ -1266,18 +1307,43 @@ pub fn decode_b64(s: &str) -> Result<Vec<u8>> {
 const RENAME_COPY_HEADERS: [&str; 4] = ["rename from ", "rename to ", "copy from ", "copy to "];
 
 pub fn strip_kit_source_prefix(source_id: &str, kit: &str) -> String {
+    strip_kit_source_prefix_under(None, source_id, kit)
+}
+
+/// (#3112 review) [`strip_kit_source_prefix`] for a kit written where the
+/// sandbox saw the workspace at `root` (a sandbox on the host; `None` is the
+/// container's `/workspace`): a header path under `<root>/<source>/` maps as
+/// one under `/workspace/<source>/` does. Body lines are never touched.
+pub fn strip_kit_source_prefix_under(root: Option<&str>, source_id: &str, kit: &str) -> String {
     if source_id.is_empty() {
         return kit.to_string();
     }
-    let map_path = |p: &str| -> String {
+    map_kit_header_paths(kit, |p: &str| -> String {
         for marker in ["a/", "b/"] {
             if let Some(rest) = p.strip_prefix(marker) {
-                let mapped = crate::findings::strip_source_prefix(source_id, rest);
+                let mapped = crate::findings::strip_source_prefix_under(root, source_id, rest);
                 return format!("{marker}{mapped}");
             }
         }
-        crate::findings::strip_source_prefix(source_id, p)
-    };
+        crate::findings::strip_source_prefix_under(root, source_id, p)
+    })
+}
+
+/// (#3112 review) A kit's header paths under the host-seen `root` rewritten
+/// to the container's `/workspace` coordinates, so a kit proposed in a
+/// sandbox on the host reaches the store exactly as one proposed in a
+/// container. Body lines are never touched; `None` (or `/workspace`) leaves
+/// the kit byte-identical.
+pub fn kit_in_container_coords(root: Option<&str>, kit: &str) -> String {
+    match crate::findings::host_root(root) {
+        Some(_) => map_kit_header_paths(kit, |p: &str| crate::findings::in_container_coords(root, p)),
+        None => kit.to_string(),
+    }
+}
+
+/// `kit` with every header path (`diff --git`, rename/copy, `---`/`+++`)
+/// passed through `map_path`; every other line byte-identical.
+fn map_kit_header_paths(kit: &str, map_path: impl Fn(&str) -> String) -> String {
     let mut out = String::with_capacity(kit.len());
     for line in kit.split_inclusive('\n') {
         let (body, eol) = match line.strip_suffix('\n') {
@@ -1287,47 +1353,52 @@ pub fn strip_kit_source_prefix(source_id: &str, kit: &str) -> String {
             },
             None => (line, ""),
         };
-        let mapped = if let Some(rest) = body.strip_prefix("diff --git ") {
-            // Two paths, space-separated. A path with a space in it is not
-            // representable in this header form anyway (git quotes it), and
-            // a quoted one simply falls through unmapped rather than being
-            // corrupted.
-            let parts: Vec<&str> = rest.split(' ').collect();
-            if parts.len() == 2 {
-                format!("diff --git {} {}", map_path(parts[0]), map_path(parts[1]))
-            } else {
-                body.to_string()
-            }
-        } else if let Some((marker, path)) = RENAME_COPY_HEADERS.iter().find_map(|m| body.strip_prefix(*m).map(|r| (*m, r)))
-        {
-            // (#2310 fix-loop E2, from the loop-D review) A rename/copy
-            // carries its two paths on their OWN header lines, unmarked by
-            // `a/`/`b/`. Mapping the `diff --git` line while leaving these
-            // behind produced a kit whose halves disagreed about where the
-            // file lives, which `git apply` refuses outright — the mod then
-            // recorded "kit did not apply" and a real change posted as a
-            // double-check thread instead.
-            format!("{marker}{}", map_path(path))
-        } else if let Some(rest) = body.strip_prefix("--- ").or_else(|| body.strip_prefix("+++ ")) {
-            let marker = &body[..4];
-            // A `---`/`+++` header may carry a tab plus timestamp
-            // (`diff -u` output); only the path half is mapped.
-            let (path, tail) = match rest.find('\t') {
-                Some(i) => (&rest[..i], &rest[i..]),
-                None => (rest, ""),
-            };
-            if path == "/dev/null" {
-                body.to_string()
-            } else {
-                format!("{marker}{}{tail}", map_path(path))
-            }
-        } else {
-            body.to_string()
-        };
-        out.push_str(&mapped);
+        out.push_str(&map_header_line(body, &map_path));
         out.push_str(eol);
     }
     out
+}
+
+/// One kit line (no line ending) with its header paths passed through
+/// `map_path`; any other line returned as it is.
+fn map_header_line(body: &str, map_path: &impl Fn(&str) -> String) -> String {
+    if let Some(rest) = body.strip_prefix("diff --git ") {
+        // Two paths, space-separated. A path with a space in it is not
+        // representable in this header form anyway (git quotes it), and
+        // a quoted one simply falls through unmapped rather than being
+        // corrupted.
+        let parts: Vec<&str> = rest.split(' ').collect();
+        if parts.len() == 2 {
+            format!("diff --git {} {}", map_path(parts[0]), map_path(parts[1]))
+        } else {
+            body.to_string()
+        }
+    } else if let Some((marker, path)) = RENAME_COPY_HEADERS.iter().find_map(|m| body.strip_prefix(*m).map(|r| (*m, r)))
+    {
+        // (#2310 fix-loop E2, from the loop-D review) A rename/copy
+        // carries its two paths on their OWN header lines, unmarked by
+        // `a/`/`b/`. Mapping the `diff --git` line while leaving these
+        // behind produced a kit whose halves disagreed about where the
+        // file lives, which `git apply` refuses outright — the mod then
+        // recorded "kit did not apply" and a real change posted as a
+        // double-check thread instead.
+        format!("{marker}{}", map_path(path))
+    } else if let Some(rest) = body.strip_prefix("--- ").or_else(|| body.strip_prefix("+++ ")) {
+        let marker = &body[..4];
+        // A `---`/`+++` header may carry a tab plus timestamp
+        // (`diff -u` output); only the path half is mapped.
+        let (path, tail) = match rest.find('\t') {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, ""),
+        };
+        if path == "/dev/null" {
+            body.to_string()
+        } else {
+            format!("{marker}{}{tail}", map_path(path))
+        }
+    } else {
+        body.to_string()
+    }
 }
 
 /// The mod a DISPATCH proposed, from the runtime's emission.
@@ -1475,6 +1546,7 @@ pub fn create_from_emission(
         phase_id: scope.phase_id,
         step_id: scope.step_id,
         source: source.map(str::to_string),
+        source_root: None,
         // (#2310 P4c-2b) Gated after the fact, by `mods.gate` — never at
         // creation time (the coder proposing the mod hasn't run any test
         // yet).
@@ -1973,6 +2045,13 @@ mod tests {
     fn the_bare_path_branch_cannot_tell_container_coords_from_a_top_level_dir_of_the_same_name() {
         // Case 1 — container coordinates. Mapping is correct.
         assert_eq!(strip_kit_source_prefix("app", "rename from app/x.ts\n"), "rename from x.ts\n");
+        // (#3112 review) Under a host-seen root, its header paths map like
+        // `/workspace`'s; a body line naming the root is left alone.
+        let host = "--- /Users/op/tree/app/src/a.ts\n+++ /Users/op/tree/app/src/a.ts\n@@ -1 +1 @@\n-/Users/op/tree/app/x\n+y\n";
+        let docker = "--- /workspace/app/src/a.ts\n+++ /workspace/app/src/a.ts\n@@ -1 +1 @@\n-/Users/op/tree/app/x\n+y\n";
+        assert_eq!(strip_kit_source_prefix_under(Some("/Users/op/tree"), "app", host), strip_kit_source_prefix("app", docker));
+        assert_eq!(kit_in_container_coords(Some("/Users/op/tree"), host), docker);
+        assert_eq!(kit_in_container_coords(None, host), host);
         // Case 2 — the SAME string as a repo-relative path in a repo with a
         // top-level `app/`. Indistinguishable, so it is over-stripped.
         // KNOWN LIMITATION, not a desired behavior.
@@ -2511,6 +2590,7 @@ mod tests {
             phase_id: None,
             step_id: None,
             source: None,
+            source_root: None,
             gate: None,
             gate_skipped_reason: None,
             change_key: None,
@@ -2547,6 +2627,7 @@ mod tests {
             phase_id: None,
             step_id: None,
             source: None,
+            source_root: None,
             gate: None,
             gate_skipped_reason: None,
             change_key: None,
@@ -2654,7 +2735,7 @@ mod tests {
         materialize(tmp.path(), &a_gateable_mod("mod-crash")).unwrap();
         let path = record_path_at(tmp.path(), "mod-crash");
         let before = std::fs::read(&path).unwrap();
-        let err = record_gate_with(tmp.path(), "mod-crash", gate_pass(), None, Some("src"), || {
+        let err = record_gate_with(tmp.path(), "mod-crash", gate_pass(), None, (Some("src"), None), || {
             anyhow::bail!("injected crash")
         })
         .unwrap_err();
@@ -2669,6 +2750,28 @@ mod tests {
         record_gate_with_source(tmp.path(), "mod-crash", gate_pass(), None, Some("src")).unwrap();
         let rec = load_at(tmp.path(), "mod-crash").unwrap().unwrap();
         assert!(rec.gate.unwrap().passed);
+    }
+
+    /// (#3112 review) The gate records where the proposing sandbox saw the
+    /// tree (`source_root`) beside the source, and the stored kit is read in
+    /// repo coordinates from both, as a `/workspace` one is from the source.
+    #[test]
+    fn a_gated_record_keeps_its_source_root_and_reads_its_kit_through_it() {
+        let tmp = TempDir::new().unwrap();
+        let mut m = a_gateable_mod("mod-root");
+        m.kit = Some("--- /Users/op/tree/src/x.ts\n+++ /Users/op/tree/src/x.ts\n".into());
+        materialize(tmp.path(), &m).unwrap();
+        record_gate_with_source_root(tmp.path(), "mod-root", gate_pass(), None, Some("src"), Some("/Users/op/tree")).unwrap();
+        let rec = load_at(tmp.path(), "mod-root").unwrap().unwrap();
+        assert_eq!(rec.source_root.as_deref(), Some("/Users/op/tree"));
+        assert_eq!(kit_in_repo_coords(&rec).as_deref(), Some("--- x.ts\n+++ x.ts\n"));
+        let mut docker = a_gateable_mod("mod-ws");
+        docker.kit = Some("--- /workspace/src/x.ts\n+++ /workspace/src/x.ts\n".into());
+        materialize(tmp.path(), &docker).unwrap();
+        record_gate_with_source(tmp.path(), "mod-ws", gate_pass(), None, Some("src")).unwrap();
+        let rec = load_at(tmp.path(), "mod-ws").unwrap().unwrap();
+        assert_eq!(rec.source_root, None, "a container's gate records no root");
+        assert_eq!(kit_in_repo_coords(&rec).as_deref(), Some("--- x.ts\n+++ x.ts\n"));
     }
 
     /// (#3074) The rewrite replaces the file (new inode) instead of truncating in
@@ -2708,6 +2811,7 @@ mod tests {
             phase_id: None,
             step_id: None,
             source: None,
+            source_root: None,
             gate: None,
             gate_skipped_reason: None,
             change_key: None,
@@ -2962,7 +3066,7 @@ mod tests {
         assert_ne!(cli.key, rt.key, "still two proposals, two minted keys");
         assert!(cli.change_key.is_some());
         assert_eq!(cli.change_key, rt.change_key);
-        assert_eq!(cli.schema_version, "2.1");
+        assert_eq!(cli.schema_version, "2.2");
         let stored = load_at(&mods, &rt.key).unwrap().unwrap();
         assert_eq!(stored.change_key, rt.change_key, "persisted, not only returned");
     }
