@@ -3775,3 +3775,139 @@ describe("absentOrUnknown (#3213)", () => {
     expect(absentOrUnknown(true, "00000000-0000-4000-8000-ABCDEF000001")).toBe(false);
   });
 });
+
+// (#3554) The count line names the model behind "1 running" (and its engine
+// when it is not this machine's managed LM Studio), and says how many models
+// an idle machine holds. The line is one ellipsized line; its full text is the
+// tooltip, and the running count's own control carries it in its name.
+describe("FleetLens: the count line names the model and what is loaded (#3554)", () => {
+  const at = (hms: string) => `${todayUTC()}T${hms}.000Z`;
+  const SELF = { machine_id: "MacBook-Pro", machine_uid: "u-self", cpu_brand: "Apple M5 Max" };
+  const resident = (identifier: string) => ({ identifier, model: identifier.replace(/^darkmux:/, ""), status: "idle", size: "1 GB", context: 4096 });
+  const start = (sid: string, extra: Record<string, unknown>, payload: Record<string, unknown> = {}) => ({
+    ts: at("10:01:00"), machine_uid: "u-self", machine_id: "MacBook-Pro", session_id: sid, action: "dispatch.start", handle: "coder", payload, ...extra,
+  });
+  const countEl = () => document.querySelector(".mach .runs")!;
+
+  it("an idle machine reads how many of darkmux's models it holds, never another app's", async () => {
+    mockFleetFetch({ runs: [], specs: { ...SELF, loaded_models: [resident("darkmux:qwen"), resident("darkmux:util-4b"), resident("user-loaded")] } });
+    renderFleetLens();
+    await waitFor(() => expect(countEl()?.textContent).toBe("0 running · 2 loaded"));
+    expect(countEl().getAttribute("title")).toBe("0 running · 2 loaded");
+  });
+
+  // (#3554, operator) A machine whose only model is a server darkmux started
+  // holds one, never "0 loaded" above its own "1 server" line.
+  it("a Flint-only machine reads 1 loaded", async () => {
+    const flint = { endpoint: "local-flint", engine: "flint", model: "flint-int4", served_name: "flint", n_ctx: 4096, port: 8092, pid: 1, started_at_ms: 0, answering: true };
+    mockFleetFetch({ runs: [], specs: { ...SELF, loaded_models: [resident("user-loaded")], engine_servers: [flint] } });
+    renderFleetLens();
+    await waitFor(() => expect(countEl()?.textContent).toBe("0 running · 1 loaded"));
+  });
+
+  it("a server still starting its model adds nothing, and the title says it is starting", async () => {
+    const tf = { endpoint: "local-tf", engine: "tensorfold", model: "Qwen3.8-27B", served_name: "darkmux:Qwen3.8-27B", n_ctx: 4096, port: 8093, pid: 2, started_at_ms: Date.now() - 30_000, answering: false };
+    mockFleetFetch({ runs: [], specs: { ...SELF, loaded_models: [], engine_servers: [tf] } });
+    renderFleetLens();
+    await waitFor(() => expect(countEl()?.textContent).toBe("0 running · 0 loaded"));
+    expect(countEl().getAttribute("title")).toBe("0 running · 0 loaded · 1 server starting the model");
+  });
+
+  it("a machine whose engine could not say what it holds never reads 0 loaded: the title says why", async () => {
+    mockFleetFetch({ runs: [], specs: { ...SELF, lms_unreachable: true } });
+    renderFleetLens();
+    await waitFor(() => expect(countEl()?.textContent).toBe("0 running"));
+    expect(countEl().getAttribute("title")).toMatch(/^0 running · loaded models unknown: LM Studio could not be asked/);
+  });
+
+  it("one running execution on LM Studio names its model, in the line, its title and its control's name", async () => {
+    mockFleetFetch({ runs: [], flowToday: [start("s1", { model: "darkmux:qwen3.6-35b-a3b" })], specs: { ...SELF, loaded_models: [resident("darkmux:qwen3.6-35b-a3b")] } });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".runs--live")?.textContent).toBe("1 running · qwen3.6-35b-a3b"));
+    const live = document.querySelector(".runs--live")!;
+    expect(live.getAttribute("title")).toBe("1 running · qwen3.6-35b-a3b");
+    expect(live).toHaveAccessibleName("open the 1 running dispatch on MacBook-Pro: 1 running · qwen3.6-35b-a3b");
+  });
+
+  it("a hosted run names its model and engine", async () => {
+    mockFleetFetch({ runs: [], flowToday: [start("s1", { model: "gpt-4o" }, { endpoint: "azure:myorg.openai.azure.com/gpt-4o" })], specs: SELF });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".runs--live")?.textContent).toBe("1 running · gpt-4o · Azure OpenAI"));
+    expect(document.querySelector(".runs--live")!.getAttribute("title")).toBe("1 running · gpt-4o · Azure OpenAI on myorg.openai.azure.com");
+  });
+
+  it("several executions: the line follows the one the tube shows", async () => {
+    mockFleetFetch({
+      runs: [],
+      flowToday: [start("s1", { model: "darkmux:coder-model" }), start("s2", { model: "darkmux:reviewer-model" })],
+      specs: SELF,
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector('.mach-scope[role="button"]')).not.toBeNull());
+    expect(countEl().textContent).toBe("2 running · 1/2 · coder-model");
+    fireEvent.click(document.querySelector('.mach-scope[role="button"]')!);
+    await waitFor(() => expect(countEl().textContent).toBe("2 running · 2/2 · reviewer-model"));
+  });
+
+  // (#3554 re-review) A static build (the published demo) reads a committed
+  // snapshot of the view: what it says is loaded is not now on any machine.
+  it("a static build names no residents and no server engine", async () => {
+    const metas = [["darkmux-flow-src", "/demo-flow.jsonl"], ["darkmux-fleet-src", "/fleet/view"]].map(([name, content]) => {
+      const m = document.createElement("meta");
+      m.setAttribute("name", name);
+      m.setAttribute("content", content);
+      document.head.appendChild(m);
+      return m;
+    });
+    try {
+      const flint = { endpoint: "local-flint", engine: "flint", model: "flint-int4", served_name: "flint", n_ctx: 4096, port: 8092, pid: 1, started_at_ms: 0, answering: true };
+      mockFleetFetch({ runs: [], specs: { ...SELF, loaded_models: [resident("darkmux:qwen")], engine_servers: [flint] } });
+      renderFleetLens({ records: normAll([{ ...start("s1", { model: "flint" }, { endpoint: "openai:127.0.0.1:8092/flint-int4" }) }]) });
+      await waitFor(() => expect(document.querySelector(".mach .spec")?.textContent).toBe("Apple M5 Max"));
+      await waitFor(() => expect(countEl()?.textContent).toBe("1 running · flint · 127.0.0.1:8092"));
+    } finally {
+      metas.forEach((m) => m.remove());
+    }
+  });
+
+  it("two executions whose ids shorten alike keep what tells them apart (an A/B run)", async () => {
+    mockFleetFetch({
+      runs: [],
+      flowToday: [start("s1", { model: "darkmux:qwen3.6-35b-a3b-turboquant-mlx" }), start("s2", { model: "darkmux:qwen3.6-35b-a3b-mlx" })],
+      specs: SELF,
+    });
+    renderFleetLens();
+    await waitFor(() => expect(countEl()?.textContent).toBe("2 running · 1/2 · qwen3.6-35b-a3b-turboquant-mlx"));
+  });
+
+  it("a scrubbed playhead names no residents: what is loaded is a fact about now", async () => {
+    mockFleetFetch({ runs: [], specs: { ...SELF, loaded_models: [resident("darkmux:qwen")] } });
+    renderFleetLens({ playhead: Date.parse(at("09:00:00")) });
+    await waitFor(() => expect(countEl()?.textContent).toMatch(/^0 running/));
+    // The view has answered (the hardware line is the row's), so the count
+    // line had its chance to name the residents.
+    await waitFor(() => expect(document.querySelector(".mach .spec")!.textContent).toBe("Apple M5 Max"));
+    expect(countEl().textContent).toBe("0 running");
+  });
+
+  // (#3554 review) Which server holds a port is a fact about now: a past run
+  // on 8092 is named by its address off the live edge, never by whatever
+  // engine holds 8092 today.
+  describe("a run on a server darkmux started", () => {
+    const server = { endpoint: "local-flint", engine: "tensorfold", model: "other-model", served_name: "x", n_ctx: 4096, port: 8092, pid: 1, started_at_ms: 0, answering: true };
+    const flintRun = (hms: string) => ({ ...start("s1", { model: "flint" }, { endpoint: "openai:127.0.0.1:8092/flint-int4" }), ts: at(hms) });
+    it("is named by the engine that holds its port at the live edge", async () => {
+      mockFleetFetch({ runs: [], flowToday: [flintRun("10:01:00")], specs: { ...SELF, engine_servers: [server] } });
+      renderFleetLens();
+      await waitFor(() => expect(document.querySelector(".runs--live")?.textContent).toBe("1 running · flint · tensorfold"));
+      expect(document.querySelector(".runs--live")!.getAttribute("title")).toBe("1 running · flint-int4 · tensorfold on 127.0.0.1:8092");
+    });
+    it("is named by its address under a scrubbed playhead", async () => {
+      mockFleetFetch({ runs: [], flowToday: [flintRun("08:59:30")], specs: { ...SELF, engine_servers: [server] } });
+      renderFleetLens({ playhead: Date.parse(at("09:00:00")) });
+      await waitFor(() => expect(document.querySelector(".mach .spec")!.textContent).toBe("Apple M5 Max"));
+      await waitFor(() => expect(countEl()?.textContent).toBe("1 running · flint · 127.0.0.1:8092"));
+      expect(countEl().getAttribute("title")).toBe("1 running · flint-int4 · 127.0.0.1:8092");
+    });
+  });
+});

@@ -1555,6 +1555,27 @@ export function executionRole(records: NormRecord[]): string {
   return handle ? handle.replace(/^darkmux\//, "").toLowerCase() : "";
 }
 
+/** The latest `dispatch.start` among `records` (a tie goes to the later one
+ *  listed, as `executionRole` breaks it). */
+function latestStart(records: NormRecord[]): NormRecord | undefined {
+  let latest: NormRecord | undefined;
+  for (const r of records) {
+    if (r.action !== ACTION.DispatchStart) continue;
+    if (latest === undefined || (r.tMs ?? -Infinity) >= (latest.tMs ?? -Infinity)) latest = r;
+  }
+  return latest;
+}
+
+/** (#3554) What an execution runs on, as its LATEST `dispatch.start` names it
+ *  (the same start `executionRole` reads): the model, and the endpoint it
+ *  called (the start's `endpoint`, absent for managed LM Studio). Each field is present only when that start names it; an
+ *  execution whose start has not landed names neither. */
+function executionRoute(records: NormRecord[]): Pick<ExecutionTokenReading, "model" | "endpoint"> {
+  const latest = latestStart(records);
+  const endpoint = payloadOf(latest, ACTION.DispatchStart)?.endpoint;
+  return { ...(latest?.model ? { model: latest.model } : {}), ...(endpoint ? { endpoint } : {}) };
+}
+
 /** One execution's own reading, as of `nowMs` — the pager's per-page data
  *  (#2881, "the tube, color, and rate/state word all belong to that one
  *  run"). Callers pass records already narrowed to ONE execution (one entry
@@ -1564,6 +1585,11 @@ export function executionRole(records: NormRecord[]): string {
 export interface ExecutionTokenReading {
   sessionId: string;
   role: string;
+  /** (#3554) The model the execution's start record names (`executionRoute`). */
+  model?: string;
+  /** (#3554) The endpoint route its start record names (a hosted endpoint,
+   *  or a server darkmux started); absent: managed LM Studio. */
+  endpoint?: string;
   /** `null` exactly like `FleetCard.liveTokState` — the disconnection
    *  downgrade (`liveStateWhileConnected`) applied to THIS execution: "we
    *  cannot say" rather than a false STALL claim for this one run, same
@@ -1637,6 +1663,7 @@ export function executionTokenReading(
   return {
     sessionId: records.find((r) => r.session_id)?.session_id ?? "",
     role: executionRole(records),
+    ...executionRoute(records),
     state,
     restSecondsLeft: state === "rest" ? liveState?.restSecondsLeft : undefined,
     ...(state === "rest" && liveState?.restEndMs !== undefined ? { restEndMs: liveState.restEndMs } : {}),
