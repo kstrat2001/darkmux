@@ -105,12 +105,17 @@ mkdir -m 700 "$d/tmp" && printf '%s' "$2" > "$d/profile.sb" && printf '%s' "$3" 
 /// for none), then the program and its arguments. Records its own pid (the
 /// group's), survives the group's SIGTERM long enough to see the sandbox
 /// out, and removes the directory when it exits (with [`LAUNCHED`]:
-/// [`launcher`]). When its program ends, whatever the program left running
-/// in its process group is killed, until none is left (#3112).
+/// [`launcher`]). Its guard, a helper in a group of its own started first,
+/// waits for the launcher to be gone (its program ended, or the launcher
+/// itself killed outright, which no handler sees) and then kills the
+/// launcher's whole group again and again until it is empty (#3112): one
+/// kill of a group reaches every member at that instant, a fork-hopper's
+/// newest pid included, where a list of pids is always a step behind.
 /// A process that moved to a group of its own (`setsid`, `setpgid`) is not
 /// reached: unlike a container's, this sandbox does not end everything in it.
 const LAUNCH: &str = r#"wd=$1; shift
 echo $$ > "$d/pid" && ps -o lstart= -p $$ > "$d/started" || exit 125
+/usr/bin/perl -e 'setpgrp(0, 0); my $l = getppid(); select(undef, undef, undef, 0.05) while getppid() == $l; for (1 .. 1000) { last unless kill(0, -$l); kill("KILL", -$l); }' </dev/null >/dev/null 2>&1 &
 trap : TERM INT HUP
 [ -z "$wd" ] || cd "$wd" || { rm -rf "$d"; exit 125; }
 [ -n "$1" ] || { echo "seatbelt: no program to run (a policy needs an entrypoint)" >&2; rm -rf "$d"; exit 125; }
@@ -133,14 +138,10 @@ while [ "$n" -lt 1000 ] && kill -0 -- "-$g" 2>/dev/null; do
 done
 "#;
 
-/// The launcher's end. It leads the group it must empty, so it cannot kill
-/// the group itself: it starts a helper in a group of its own that waits
-/// for the launcher to exit and then empties the group as [`DRAIN`] does,
-/// removes the directory, and exits with the program's status. Whatever the
-/// program left running in its group ends a few milliseconds after the
-/// launcher does.
-const LAUNCHED: &str = r#"/usr/bin/perl -e 'setpgrp(0, 0); my ($l, $g) = @ARGV; select(undef, undef, undef, 0.005) while kill(0, $l); for (1 .. 1000) { last unless kill(0, -$g); kill("KILL", -$g); }' "$$" "$g" </dev/null >/dev/null 2>&1 &
-rm -rf "$d"
+/// The launcher's end: the directory removed, the program's status its
+/// own. What the program left running in the group is ended by the
+/// launcher's guard ([`LAUNCH`]), once the launcher is gone.
+const LAUNCHED: &str = r#"rm -rf "$d"
 exit $rc
 "#;
 

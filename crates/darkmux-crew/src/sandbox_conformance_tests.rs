@@ -466,6 +466,30 @@ fn a_sandbox_ends_with_its_program(backend: &dyn SandboxBackend, host: &Host) {
     assert_eq!(group, host.a_new_group_outlives_the_program, "a process in a group of its own, after the program ended");
 }
 
+/// A sandbox whose client was killed outright (SIGKILL: no handler runs)
+/// still ends, its background processes with it, once it is removed, as a
+/// contained run removes one cut short. Nothing outlives it looping.
+fn a_sandbox_whose_client_was_killed_ends_on_removal(backend: &dyn SandboxBackend, host: &Host) {
+    let tree = tempfile::TempDir::new().unwrap();
+    let beat = tree.path().join("beat");
+    let p = policy(backend, host.image, tree.path(), "(while :; do echo x >> beat; sleep 0.1; done) & sleep 300");
+    let (mut cmd, handle) = backend.run(&p);
+    let removed = Removed(backend, handle);
+    let mut client = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while len(&beat) == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(len(&beat) > 0, "the background loop never ran");
+    client.kill().unwrap();
+    client.wait().unwrap();
+    drop(removed);
+    std::thread::sleep(Duration::from_millis(500));
+    let after = len(&beat);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(len(&beat), after, "a background loop outlived its sandbox's removal after its client was killed");
+}
+
 /// Removing a running sandbox ends fork-hoppers in it (eight at once), not
 /// only the processes one look at it would list.
 fn a_removal_ends_fork_hoppers(backend: &dyn SandboxBackend, host: &Host) {
@@ -719,6 +743,11 @@ macro_rules! conformance {
             }
             #[test]
             #[ignore = $needs]
+            fn a_sandbox_whose_client_was_killed_ends_on_removal() {
+                super::a_sandbox_whose_client_was_killed_ends_on_removal(&$make, &$host)
+            }
+            #[test]
+            #[ignore = $needs]
             fn a_removal_ends_fork_hoppers() {
                 super::a_removal_ends_fork_hoppers(&$make, &$host)
             }
@@ -737,10 +766,12 @@ conformance!(
     super::Host {
         image: "alpine:3.22",
         route_probe: "tail -n +2 /proc/net/route",
-        serve: |port| format!("while :; do echo served | nc -l -p {port}; done"),
+        // A listen that fails (the port refused or taken) waits before it
+        // tries again, never spinning.
+        serve: |port| format!("while :; do echo served | nc -l -p {port} || sleep 1; done"),
         tcp_probe: |port| format!("nc -w 2 127.0.0.1 {port} </dev/null >/dev/null 2>&1 && echo connected; true"),
         unix_probe: |path| format!("nc -U '{path}' </dev/null >/dev/null 2>&1 && echo connected; true"),
-        serve_any: |port| format!("while :; do echo served | nc -l -p {port}; done"),
+        serve_any: |port| format!("while :; do echo served | nc -l -p {port} || sleep 1; done"),
         every_address_reaches_the_lan: false,
         new_group: |script| format!("setsid sh -c '{script}' &"),
         a_new_group_outlives_the_program: false,
@@ -756,10 +787,10 @@ conformance!(
     super::Host {
         image: "unused",
         route_probe: "nc -z -G 2 1.1.1.1 53 2>/dev/null && echo route; true",
-        serve: |port| format!("while :; do echo served | nc -l 127.0.0.1 {port}; done"),
+        serve: |port| format!("while :; do echo served | nc -l 127.0.0.1 {port} || sleep 1; done"),
         tcp_probe: |port| format!("nc -z -G 2 127.0.0.1 {port} >/dev/null 2>&1 && echo connected; true"),
         unix_probe: |path| format!("nc -U '{path}' </dev/null >/dev/null 2>&1 && echo connected; true"),
-        serve_any: |port| format!("while :; do echo served | nc -l {port}; done"),
+        serve_any: |port| format!("while :; do echo served | nc -l {port} || sleep 1; done"),
         // #3559: recorded, not wanted.
         every_address_reaches_the_lan: true,
         new_group: |script| format!("/usr/bin/perl -e 'setpgrp(0, 0); exec @ARGV' sh -c '{script}' &"),
