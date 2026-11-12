@@ -7,7 +7,9 @@
 //! processes:
 //! - **The caller** unshares the namespaces, maps its own user and group to
 //!   themselves, and waits for the init below, exiting as it exits. It
-//!   outlives the group's SIGTERM, so a stop's grace is the sandbox's.
+//!   outlives the group's SIGTERM, so a stop's grace is the sandbox's, but
+//!   not its own parent: when that ends, killed outright included, so does
+//!   it, and the init with it.
 //! - **An init** (pid 1 of the new pid namespace) builds the sandbox's root:
 //!   a read-only tmpfs holding only the granted paths, each bound at its own
 //!   path (read-only ones made read-only, recursively), the granted device
@@ -336,6 +338,7 @@ mod imp {
         if argv.is_empty() {
             return Err(Error::other("no program to run"));
         }
+        ends_with_its_parent()?;
         unshare(c.host_network)?;
         // SAFETY: this process is single-threaded (the caller's contract), so
         // the children may allocate; each exits through _exit or exec.
@@ -353,6 +356,20 @@ mod imp {
             }
             std::process::exit(wait_code(init))
         }
+    }
+
+    /// Ends this process when its parent (the launcher that records the
+    /// sandbox) ends, killed outright included, so a sandbox whose launcher
+    /// is gone, and which `remove` can no longer find by its pid, does not
+    /// run on. A parent already gone before the request ends it now.
+    fn ends_with_its_parent() -> Result<(), Error> {
+        // SAFETY: getppid and prctl take no pointers.
+        let parent = unsafe { libc::getppid() };
+        check(unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } as libc::c_long, "prctl")?;
+        if unsafe { libc::getppid() } != parent {
+            std::process::exit(137);
+        }
+        Ok(())
     }
 
     /// Pid 1 of the sandbox: build its root, start the program, reap until

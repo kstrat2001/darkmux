@@ -1684,3 +1684,127 @@ fn a_fake_answers_the_default_sandbox_the_test_set() {
     let fake = FakePlatform { default_sandbox: DefaultSandbox::Seatbelt, ..FakePlatform::default() };
     assert_eq!(fake.default_sandbox(), DefaultSandbox::Seatbelt);
 }
+
+/// (#3112) `netstat -anv -p tcp`'s LISTEN rows on a port, read from the
+/// kernel's own socket table (no walk over processes, which a fork-hopper
+/// races): every address (`*`, by its family), IPv4 and IPv6 loopback, a
+/// scoped address (`fe80::1%lo0`), and the owner's pid at the end of a
+/// `process:pid` field whose name holds spaces. Another port or state is
+/// not one. A header that is not netstat's, or an IPv4 LISTEN row on the
+/// port that does not read, is no answer at all (`None`), never "nothing
+/// listens". (#3112 review) netstat prints at most 16 characters of an IPv6
+/// address: one that long is never read as an address (it may be cut), so
+/// it is no address at all (`addr: None`), never loopback.
+#[test]
+fn netstat_listen_rows_on_a_port_parse_to_addresses_and_owners() {
+    let head = "Active Internet connections (including servers)\nProto Recv-Q Send-Q  Local Address          Foreign Address        (state)          rxbytes      txbytes  rhiwat  shiwat          process:pid    state  options           gencnt    flags   flags1 usecnt rtncnt fltrs\n";
+    let row = |proto: &str, local: &str, state: &str, who: &str| {
+        format!("{proto}       0      0  {local}                *.*                    {state}                 0            0  131072  131072           {who}   00000 00000002 0000000000ff626a 00000000 00000800      1      0 000000\n")
+    };
+    let table = [
+        head.to_string(),
+        row("tcp4", "*.47996", "LISTEN", "Python:2900"),
+        row("tcp6", "::1.47996", "LISTEN", "Python:2901"),
+        row("tcp4", "127.0.0.1.47996", "LISTEN", "Grok Bot:82871"),
+        row("tcp46", "*.47996", "LISTEN", "node:7"),
+        row("tcp6", "fe80::1%lo0.47996", "LISTEN", "node:8"),
+        row("tcp6", "fe80::1823:f45e:.47996", "LISTEN", "node:9"),
+        row("tcp6", "2001:f40:974:5c8.47996", "LISTEN", "node:10"),
+        row("tcp4", "127.0.0.1.47997", "LISTEN", "Python:2900"),
+        "tcp4       0      0  127.0.0.1.47996        127.0.0.1.50000        ESTABLISHED         1 2 3 4 x:9 00 0 0 0 0 0 0 0\n".to_string(),
+    ]
+    .concat();
+    let at = |addr: &str, text: &str, scope: Option<&str>, pid| PortListener { addr: Some(addr.parse().unwrap()), text: text.to_string(), scope: scope.map(str::to_string), pid: Some(pid) };
+    let cut = |text: &str, pid| PortListener { addr: None, text: text.to_string(), scope: None, pid: Some(pid) };
+    assert_eq!(
+        crate::port_listeners_from_netstat(&table, 47996),
+        Some(vec![
+            at("0.0.0.0", "*", None, 2900),
+            at("::1", "::1", None, 2901),
+            at("127.0.0.1", "127.0.0.1", None, 82871),
+            at("::", "*", None, 7),
+            at("fe80::1", "fe80::1%lo0", Some("lo0"), 8),
+            cut("fe80::1823:f45e:", 9),
+            cut("2001:f40:974:5c8", 10),
+        ])
+    );
+    assert_eq!(crate::port_listeners_from_netstat(&table, 1), Some(vec![]), "no listener on the port");
+    assert_eq!(crate::port_listeners_from_netstat("not netstat\n", 1), None, "a header that is not netstat's");
+    let broken = format!("{head}{}", row("tcp4", "garbage.47996x", "LISTEN", "x:1"));
+    assert_eq!(crate::port_listeners_from_netstat(&broken, 47996), None, "a LISTEN row that does not read");
+    let unparsed = format!("{head}{}", row("tcp4", "not-an-ip.47996", "LISTEN", "x:1"));
+    assert_eq!(crate::port_listeners_from_netstat(&unparsed, 47996), None);
+}
+
+/// (#3112 review) Only a netstat that exited 0 answers; any other exit,
+/// or none (killed at the bound), is no answer.
+#[test]
+fn only_a_netstat_that_succeeded_answers() {
+    assert_eq!(crate::macos::netstat_answer(Some(0), "x"), Some("x".to_string()));
+    for code in [Some(1), Some(2), None] {
+        assert_eq!(crate::macos::netstat_answer(code, "x"), None, "{code:?}");
+    }
+}
+
+/// (#3112) Who listens on a port and at which address, asked of this
+/// host's strategy: a child listening on every address and one on the
+/// loopback, on two ports, each read with its address and owner; a port
+/// with none reads empty. An OS with no strategy cannot say; the fake
+/// answers what was set.
+#[test]
+fn the_host_lists_a_ports_listeners_with_their_addresses() {
+    let host = current();
+    if host.tcp_port_listeners(1).is_none() {
+        return; // no strategy reads sockets here
+    }
+    let mut child = std::process::Command::new("/usr/bin/python3")
+        .args(["-c", "import socket,sys,time\na=socket.socket();a.bind(('0.0.0.0',0));a.listen()\nb=socket.socket();b.bind(('127.0.0.1',0));b.listen()\nprint(a.getsockname()[1],b.getsockname()[1],flush=True)\ntime.sleep(30)"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut std::io::BufReader::new(child.stdout.take().unwrap()), &mut line).unwrap();
+    let ports: Vec<u16> = line.split_whitespace().map(|p| p.parse().unwrap()).collect();
+    let (wide, near) = (host.tcp_port_listeners(ports[0]), host.tcp_port_listeners(ports[1]));
+    let _ = child.kill();
+    let _ = child.wait();
+    let pid = Some(child.id());
+    let read = |l: Option<Vec<PortListener>>| l.map(|l| l.into_iter().map(|l| (l.addr, l.pid)).collect::<Vec<_>>());
+    assert_eq!(read(wide), Some(vec![(Some("0.0.0.0".parse().unwrap()), pid)]));
+    assert_eq!(read(near), Some(vec![(Some("127.0.0.1".parse().unwrap()), pid)]));
+    let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    assert_eq!(host.tcp_port_listeners(free).map(|l| l.into_iter().filter(|l| l.pid != Some(std::process::id())).count()), Some(0));
+    assert_eq!(OtherPlatform.tcp_port_listeners(1), None);
+    let one = PortListener { addr: Some("0.0.0.0".parse().unwrap()), text: "0.0.0.0".into(), scope: None, pid: Some(7) };
+    let fake = FakePlatform { port_listeners: vec![(5, vec![one.clone()])], ..Default::default() };
+    assert_eq!((fake.tcp_port_listeners(5), fake.tcp_port_listeners(6)), (Some(vec![one]), Some(vec![])));
+}
+
+/// (#3112) `/proc/net/tcp{,6}`'s LISTEN rows as (address, inode), whatever
+/// the port; an ESTABLISHED row is not one.
+#[test]
+fn proc_net_listen_rows_read_with_their_address() {
+    let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 41231 1 0000000000000000 100 0 0 10 0\n\
+   1: 00000000:1F91 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 41232 1 0000000000000000 100 0 0 10 0\n\
+   3: 0100007F:1F90 0100007F:D431 01 00000000:00000000 00:00000000 00000000  1000        0 41234 1 0000000000000000 100 0 0 10 0\n";
+    assert_eq!(
+        crate::linux::listening_sockets(table),
+        vec![("127.0.0.1:8080".parse().unwrap(), 41231), ("0.0.0.0:8081".parse().unwrap(), 41232)]
+    );
+}
+
+/// (#3112 review) A bounded command's output is drained while it runs: one
+/// that prints more than a pipe holds (netstat's table on a busy machine)
+/// finishes, whole, instead of blocking on a full pipe until the bound
+/// kills it.
+#[test]
+fn a_bounded_command_with_more_output_than_a_pipe_holds_finishes() {
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.args(["-c", "head -c 300000 /dev/zero; echo done >&2"]);
+    let started = std::time::Instant::now();
+    let out = crate::output_within(cmd, std::time::Duration::from_secs(3)).expect("it finished within its bound");
+    assert_eq!(out.stdout.len(), 300_000);
+    assert_eq!(String::from_utf8_lossy(&out.stderr).trim(), "done");
+    assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+}

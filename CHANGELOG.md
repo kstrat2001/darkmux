@@ -30,9 +30,42 @@ darkmux release.
   keeps its own until it restarts, the processes it starts read the setting fresh), and answers
   `docker_on_path` only when either is Docker; doctor's `daemon sandbox` row warns when the two
   differ. `init`'s next steps, the guide
-  and the README ask for Docker only under Docker. Client previews (`darkmux client serve`) still
-  need Docker: under Seatbelt a preview start is refused (403 `forbidden`), naming
-  `darkmux config set runtime.sandbox docker`.
+  and the README ask for Docker only under Docker.
+
+- **Client previews run in the selected sandbox: Seatbelt previews, no Docker needed (#3112).**
+  A preview starts in the sandbox `runtime.sandbox` names at that request, and is stopped in the
+  one it started in. Under Seatbelt its dev server runs this Mac's own toolchain: each program the
+  recipe runs (and the interpreter a script asks `env` for, npm's node) is found on the PATH
+  `client serve` runs with, and only its install folder is readable (nvm's version folder, never
+  your home); a program not on PATH is refused, naming it and where darkmux looked. darkmux gives
+  the dev server the loopback: a recipe's new `{host}` is `127.0.0.1` there (`0.0.0.0` in a
+  container), and a `HOST` of `0.0.0.0` is given as `127.0.0.1`, so a recipe written for Docker
+  runs unchanged (`{host}` is preview recipe schema 1.1; a 1.0 recipe keeps `{host}` as text, and
+  an older darkmux refuses a 1.1 recipe as newer). The kernel holds the preview to its app and HMR
+  ports: it binds only on them and takes in traffic only on them (a bind to any other port, and a
+  `listen` with no bind, are refused; no socket on another port accepts connections or
+  unsolicited datagrams; replies on connections it opened, TCP or connected UDP, arrive, and an
+  unconnected UDP socket's `recvfrom` is refused, even for a reply). It cannot hold them to the loopback (#3559), so darkmux
+  reads those two TCP ports from the kernel's socket table before it reports the preview ready and
+  every 2 s after, and stops one listening beyond the loopback, naming the socket: on those two
+  ports, detection with a short window, not a kernel boundary (UDP on them is not watched). A
+  dev server that opens internal listeners on ephemeral ports (Next.js-style workers) is refused
+  under Seatbelt; run it with `runtime.sandbox docker`. A stop kills only the preview's own
+  process group; anything still listening on its ports afterwards is reported in the serve log,
+  never killed. A workspace installed in the other sandbox has its
+  `install.unless_exists` path (Linux-built `node_modules`) deleted in darkmux's workspace copy
+  and reinstalled, saying so in the logs. Previews stay off by default.
+- **Seatbelt: a sandbox's process group ends with its program (#3112).** Whatever the program
+  left running in its process group is killed when it exits, over and over until none is left.
+  Unlike a container's init, it does not reach a process that moved to a group of its own, or to
+  another existing group in its session (`setsid`, `setpgid`).
+- **Seatbelt can hold a sandbox to named ports (#3112).** A policy naming ports binds and takes in
+  traffic only on those: a bind to any other port and a `listen` with no bind are refused, and no
+  socket on another port accepts connections or unsolicited datagrams; replies on connections it
+  opened (TCP, connected UDP) arrive.
+- **Seatbelt does not hold a bind to the loopback (#3559).** The docs no longer claim it: a
+  dispatch under Seatbelt can listen on every address. Recorded by a conformance case; dispatches
+  are not watched yet.
 
   Under a sandbox on the host every model-facing path names where that sandbox sees it: the lab
   prompt, crawl unit briefs, split-gitdir notes, mod attachments, and the shipped `review` and

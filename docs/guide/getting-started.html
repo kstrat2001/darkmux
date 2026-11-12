@@ -45,7 +45,7 @@
       <tbody>
         <tr><td><a href="https://brew.sh">Homebrew</a></td><td>How darkmux installs.</td></tr>
         <tr><td><a href="https://lmstudio.ai">LM Studio</a>, with at least one model downloaded and its command-line tool enabled (<code>~/.lmstudio/bin/lms bootstrap</code>)</td><td>darkmux loads and unloads models through <code>lms</code>. <code>init</code> picks your first worker model from what you have downloaded.</td></tr>
-        <tr><td>Docker: optional on macOS</td><td>On a Mac, <code>dispatch</code>, <code>lab run</code>, and missions run in macOS’s own sandbox (Seatbelt), which needs nothing installed. Docker is the opt-in: <code>darkmux config set runtime.sandbox docker</code> runs each dispatch in a small <code>darkmux-runtime</code> container, pulled on first use, with Docker running. It is the default on Linux, and client previews need it for now. <code>radio</code>, <code>doctor</code>, and the viewer need no sandbox at all.</td></tr>
+        <tr><td>Docker: optional on macOS</td><td>On a Mac, <code>dispatch</code>, <code>lab run</code>, and missions run in macOS’s own sandbox (Seatbelt), which needs nothing installed. Docker is the opt-in: <code>darkmux config set runtime.sandbox docker</code> runs each dispatch in a small <code>darkmux-runtime</code> container, pulled on first use, with Docker running. It is the default on Linux. Client previews run in whichever sandbox is selected. <code>radio</code>, <code>doctor</code>, and the viewer need no sandbox at all.</td></tr>
       </tbody>
     </table>
     <p>darkmux is developed and tested on Apple Silicon. Everything below was run on one.</p>

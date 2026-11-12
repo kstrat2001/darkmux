@@ -112,6 +112,10 @@ impl Platform for OtherPlatform {
         None
     }
 
+    fn tcp_port_listeners(&self, _port: u16) -> Option<Vec<crate::PortListener>> {
+        None
+    }
+
     fn process_group(&self, _pid: u32) -> Option<u32> {
         None
     }

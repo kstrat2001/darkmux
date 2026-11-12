@@ -5694,7 +5694,7 @@ async fn previews_are_refused_while_clients_preview_enabled_is_off() {
     assert!(
         e.contains("darkmux config set clients.preview.enabled true")
             && e.contains("runs the workspace's own code")
-            && e.contains("in a container with network access"),
+            && e.contains("in a sandbox with network access"),
         "{v}"
     );
     let (code, v) = call(&h, get(&format!("/client/workspaces/{name}/preview"), &[("authorization", &bearer(&token))])).await;
@@ -5709,29 +5709,26 @@ async fn previews_are_refused_while_clients_preview_enabled_is_off() {
     assert_eq!(code, 503, "{v}");
 }
 
-/// (#3112) A preview runs in a Docker container, and only there for now:
-/// under any other sandbox a start is refused, naming the setting that
-/// would allow it, and nothing starts. Docker allows it.
+/// (#3112) Docker and Seatbelt start a preview; Landlock has no preview
+/// runner yet and refuses it, naming the setting that would allow it; a
+/// refused setting refuses it, saying why.
 #[test]
-fn a_preview_needs_the_docker_sandbox_for_now() {
+fn a_preview_runs_under_docker_and_seatbelt_and_landlock_refuses_it() {
     use darkmux_sandbox::BackendKind;
     assert!(crate::client_pairing::preview_sandbox_refusal(&Ok(BackendKind::Docker)).is_none());
-    let refused = crate::client_pairing::preview_sandbox_refusal(&Ok(BackendKind::Seatbelt)).expect("refused");
-    for part in ["previews need `runtime.sandbox` `docker` for now", "this machine's sandbox is `seatbelt`", "darkmux config set runtime.sandbox docker"] {
-        assert!(refused.contains(part), "missing `{part}` in: {refused}");
-    }
+    assert!(crate::client_pairing::preview_sandbox_refusal(&Ok(BackendKind::Seatbelt)).is_none());
     let landlock = crate::client_pairing::preview_sandbox_refusal(&Ok(BackendKind::Landlock)).expect("refused");
-    for part in ["previews need `runtime.sandbox` `docker` for now", "this machine's sandbox is `landlock`", "darkmux config set runtime.sandbox docker"] {
+    for part in ["previews need `runtime.sandbox` `docker` here for now", "this machine's sandbox is `landlock`", "darkmux config set runtime.sandbox docker"] {
         assert!(landlock.contains(part), "missing `{part}` in: {landlock}");
     }
     let bad = crate::client_pairing::preview_sandbox_refusal(&Err("`x` is not a valid sandbox".into())).expect("refused");
     assert!(bad.contains("`x` is not a valid sandbox"), "{bad}");
 }
 
-/// (#3112) The route: under another sandbox a start is a 403 naming the
-/// setting, and nothing runs. (#3112 review) The sandbox is read per
-/// request, so after the `config set` the refusal recommends, a start goes
-/// through.
+/// (#3112) The route starts a preview in the sandbox `runtime.sandbox`
+/// names when it is asked, read per request: under Seatbelt the sandbox it
+/// makes is Seatbelt's, and after a `config set` to Docker, the next start's
+/// is Docker's. A refused setting is a 403 naming why, and nothing runs.
 #[tokio::test]
 async fn a_preview_start_follows_the_sandbox_read_per_request() {
     use darkmux_sandbox::BackendKind;
@@ -5739,18 +5736,34 @@ async fn a_preview_start_follows_the_sandbox_read_per_request() {
     let token = paired(&h).await;
     let (mine, name, ws) = served_workspace(&h, &token).await;
     recipe(&mine, serde_json::json!({"command": format!("touch ran; {}", serve()), "env": {"PORT": "{port}"}}));
-    let sandbox = Arc::new(Mutex::new(BackendKind::Seatbelt));
+    let runs = tempfile::TempDir::new().unwrap();
+    let seatbelt = Arc::new(crate::client_preview::HostEmulator::default());
+    *seatbelt.on_host.lock().unwrap() = true;
+    h.state.previews = Arc::new(
+        crate::client_preview::Previews::new(runs.path().join("previews"), h.containers.clone())
+            .with_backend(BackendKind::Seatbelt, seatbelt.clone()),
+    );
+    let sandbox: Arc<Mutex<Result<BackendKind, String>>> = Arc::new(Mutex::new(Err("`podman` is not a sandbox darkmux runs".into())));
     let read = sandbox.clone();
-    h.state.preview_sandbox = Arc::new(move || Ok(*read.lock().unwrap()));
+    h.state.preview_sandbox = Arc::new(move || read.lock().unwrap().clone());
     let (code, v) = start_preview(&h, &token, &name).await;
     assert_eq!(code, 403, "{v}");
     assert_eq!(v["code"], "forbidden", "{v}");
-    assert!(v["error"].as_str().unwrap().contains("darkmux config set runtime.sandbox docker"), "{v}");
+    assert!(v["error"].as_str().unwrap().contains("`podman` is not a sandbox darkmux runs"), "{v}");
     std::thread::sleep(std::time::Duration::from_millis(300));
     assert!(!ws.join("ran").exists(), "nothing started");
-    *sandbox.lock().unwrap() = BackendKind::Docker;
-    let (code, v) = start_preview(&h, &token, &name).await;
-    assert!(code == 200 || code == 202, "the start goes through once the setting allows it: {code} {v}");
+    for kind in [BackendKind::Seatbelt, BackendKind::Docker] {
+        *sandbox.lock().unwrap() = Ok(kind);
+        let (code, v) = start_preview(&h, &token, &name).await;
+        assert!(code == 200 || code == 202, "{kind:?}: {code} {v}");
+        let ran_in = if kind == BackendKind::Seatbelt { &seatbelt } else { &h.containers };
+        let made = (0..200).find_map(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            ran_in.specs.lock().unwrap().first().map(|s| s.backend)
+        });
+        assert_eq!(made, Some(kind), "the preview's sandbox is the one selected when it started");
+        h.state.previews.stop(&name);
+    }
 }
 
 /// (#3112 review) The production reader takes `runtime.sandbox` from
