@@ -100,25 +100,29 @@ fn push_shown(out: &mut Vec<(char, usize, usize)>, c: char, start: usize, end: u
 /// words: "more" is not found inside "furthermore". Each place is looked at
 /// once, so it always ends.
 pub fn find(source: &str, wanted: &str, limit: usize) -> Vec<(usize, usize)> {
-    find_whole(source, wanted, limit, char::is_alphanumeric)
+    find_where(source, wanted, limit, whole_words)
 }
 
-/// [`find`] for an image reference (an `<img>`'s `src`, #3545): a path
-/// character ([`is_path_char`]) next to either end means the match is part
-/// of a longer path, so `hero.jpg` is not found inside `/assets/hero.jpg`,
-/// nor `/hero.jpg` inside `/thumbs/hero.jpg` or `/hero.jpg.bak`.
+/// [`find`] for an image reference (an `<img>`'s `src`, #3545): only where
+/// a page uses one ([`whole_reference`]), so never part of a longer URL
+/// (`hero.jpg` in `/assets/hero.jpg`, `2x.png` in `logo@2x.png`,
+/// `//cdn.x.com/a.jpg` in `https://cdn.x.com/a.jpg`) and never words in the
+/// page's text.
 pub fn find_reference(source: &str, wanted: &str, limit: usize) -> Vec<(usize, usize)> {
-    find_whole(source, wanted, limit, is_path_char)
+    find_where(source, wanted, limit, whole_reference)
 }
 
-/// A character that continues a path: a letter, a digit, `/`, `.`, `-`, `_`.
-fn is_path_char(c: char) -> bool {
-    c.is_alphanumeric() || matches!(c, '/' | '.' | '-' | '_')
-}
+/// One rendered char of a page, with the source bytes it came from.
+type Shown = (char, usize, usize);
 
-/// [`find`], with `joins` saying which characters continue a match: one
-/// next to either end, where the match itself ends in one, cuts it.
-fn find_whole(source: &str, wanted: &str, limit: usize, joins: fn(char) -> bool) -> Vec<(usize, usize)> {
+/// The spans where `wanted` is the rendered text and `whole` says the match
+/// at `at..end` stands on its own.
+fn find_where(
+    source: &str,
+    wanted: &str,
+    limit: usize,
+    whole: fn(&[Shown], &[char], usize, usize) -> bool,
+) -> Vec<(usize, usize)> {
     let want: Vec<char> = wanted.chars().collect();
     let page = rendered(source);
     let mut found = Vec::new();
@@ -131,25 +135,42 @@ fn find_whole(source: &str, wanted: &str, limit: usize, joins: fn(char) -> bool)
         if found.len() >= limit {
             break;
         }
-        if at >= free && matches_at(&page, &want, at, joins) {
-            found.push((page[at].1, page[at + want.len() - 1].2));
-            free = at + want.len();
+        let end = at + want.len();
+        if at >= free && page[at..end].iter().map(|(c, _, _)| *c).eq(want.iter().copied()) && whole(&page, &want, at, end) {
+            found.push((page[at].1, page[end - 1].2));
+            free = end;
         }
     }
     found
 }
 
-/// Whether `want` is the rendered text at `at` in `page`, whole: a
-/// character that `joins` it next to either end cuts it.
-fn matches_at(page: &[(char, usize, usize)], want: &[char], at: usize, joins: fn(char) -> bool) -> bool {
-    let end = at + want.len();
-    let joined = |i: Option<usize>| {
-        i.and_then(|i| page.get(i))
-            .is_some_and(|(c, _, _)| joins(*c))
+/// Whether `want`, found at `at..end`, is whole words: a letter or digit
+/// on either side of one it starts or ends with cuts it.
+fn whole_words(page: &[Shown], want: &[char], at: usize, end: usize) -> bool {
+    let alnum = |i: Option<usize>| i.and_then(|i| page.get(i)).is_some_and(|(c, _, _)| c.is_alphanumeric());
+    let cut_word = (want[0].is_alphanumeric() && alnum(at.checked_sub(1)))
+        || (want[want.len() - 1].is_alphanumeric() && alnum(Some(end)));
+    !cut_word
+}
+
+/// Whether the match at `at..end` is a reference as a page uses one: it
+/// opens the file, follows a quote or `(` (`src="…"`, `url(…)`, Markdown's
+/// `](…)`), or follows a space that follows one of those or a comma (a
+/// srcset's next candidate); and it ends the file or is followed by a
+/// quote, `)`, `>`, a space, `?` or `#` (a query or fragment), or `,` (a
+/// srcset). Every other character (`/`, `.`, `@`, `:`, `=`, `+`, `,` before
+/// it, a letter) continues a URL, so a match there is part of a longer one.
+/// An unquoted attribute value (`src=hero.jpg`) is not found.
+fn whole_reference(page: &[Shown], _want: &[char], at: usize, end: usize) -> bool {
+    let opens = |c: char| matches!(c, '"' | '\'' | '`' | '(');
+    let before = |back: usize| at.checked_sub(back).map(|i| page[i].0);
+    let opened = match before(1) {
+        None => true,
+        Some(' ') => before(2).is_none_or(|c| opens(c) || c == ','),
+        Some(c) => opens(c),
     };
-    let cut_word = (joins(want[0]) && joined(at.checked_sub(1)))
-        || (joins(want[want.len() - 1]) && joined(Some(end)));
-    !cut_word && page[at..end].iter().map(|(c, _, _)| *c).eq(want.iter().copied())
+    let closed = page.get(end).is_none_or(|(c, _, _)| matches!(c, '"' | '\'' | '`' | ')' | '>' | ' ' | '?' | '#' | ','));
+    opened && closed
 }
 
 #[cfg(test)]
@@ -165,18 +186,51 @@ mod tests {
         find_reference(source, wanted, 3).into_iter().map(|(a, b)| &source[a..b]).collect::<Vec<_>>()
     }
 
-    /// (review) A reference is a whole path: never the tail or the head of
-    /// a longer one.
+    /// (review) A reference is a whole URL: never the tail or the head of
+    /// a longer one, whatever URL characters surround it.
     #[test]
-    fn a_reference_is_never_found_inside_a_longer_path() {
+    fn a_reference_is_never_found_inside_a_longer_url() {
         assert!(spans("<img src=\"/assets/hero.jpg\">", "hero.jpg").is_empty());
         assert!(spans("<img src=\"/hero.jpg.bak\">", "/hero.jpg").is_empty());
         assert!(spans("<img src=\"my_hero.jpg\"><img src=\"x-hero.jpg\">", "hero.jpg").is_empty());
+        assert!(spans("<img src=\"/img/logo@2x.png\">", "2x.png").is_empty());
+        for joined in ["/a+hero.jpg", "/a~hero.jpg", "/a:hero.jpg", "/a,hero.jpg", "/a=hero.jpg", "/a%20hero.jpg", "/a!hero.jpg"] {
+            assert!(spans(&format!("<img src=\"{joined}\">"), "hero.jpg").is_empty(), "{joined}");
+        }
+        assert!(spans("<img src=\"https://cdn.x.com/hero.jpg\">", "//cdn.x.com/hero.jpg").is_empty());
+        assert!(spans("<img src=\"../hero.jpg\">", "./hero.jpg").is_empty());
+        assert!(spans("const u = `${base}/hero.jpg`;", "/hero.jpg").is_empty());
         let src = "<img src=\"/hero.jpg\"><img src=\"/thumbs/hero.jpg\">";
         assert_eq!(spans(src, "/hero.jpg"), ["/hero.jpg"]);
-        assert_eq!(spans("url(/hero.jpg) '/hero.jpg?v=2'", "/hero.jpg"), ["/hero.jpg", "/hero.jpg"]);
         // A hand edit's words still end at a slash or a dot, as prose does.
         assert_eq!(one("<p>tea/coffee</p>", "coffee").as_deref(), Some("coffee"));
+    }
+
+    /// (review) Words in a page's text are not a reference the page uses.
+    #[test]
+    fn a_reference_is_never_found_in_a_pages_text() {
+        assert!(spans("<img src=\"/hero.jpg\"> See hero.jpg, the hero.jpg.", "hero.jpg").is_empty());
+        assert!(spans("<p>hero.jpg</p>\nhero.jpg is here", "hero.jpg").is_empty());
+    }
+
+    /// (review) Every place a page names an image is still found: a query
+    /// or fragment after it, `url(...)`, a srcset, Markdown, unquoted ends of
+    /// the file, CRLF, a Unicode name, and an entity the page decodes.
+    #[test]
+    fn a_reference_is_found_wherever_a_page_uses_one() {
+        assert_eq!(spans("<img src=\"/hero.jpg?v=2\">", "/hero.jpg"), ["/hero.jpg"]);
+        assert_eq!(spans("<img src='/hero.jpg#top'>", "/hero.jpg"), ["/hero.jpg"]);
+        assert_eq!(spans(".a { background: url(/hero.jpg); }", "/hero.jpg"), ["/hero.jpg"]);
+        assert_eq!(spans(".a { background: url( \"/hero.jpg\" ); }", "/hero.jpg"), ["/hero.jpg"]);
+        assert_eq!(spans("<img srcset=\"/a.jpg 1x, /hero.jpg 2x\">", "/hero.jpg"), ["/hero.jpg"]);
+        assert_eq!(spans("<img srcset=\"/hero.jpg 1x, /b.jpg 2x\">", "/hero.jpg"), ["/hero.jpg"]);
+        assert_eq!(spans("<img srcset=\"/a.jpg 1x,\r\n  /hero.jpg 2x\">", "/hero.jpg"), ["/hero.jpg"]);
+        assert_eq!(spans("![Hero](./hero.jpg \"title\")", "./hero.jpg"), ["./hero.jpg"]);
+        assert_eq!(spans("<img src={\"/hero.jpg\"} />", "/hero.jpg"), ["/hero.jpg"]);
+        assert_eq!(spans("/hero.jpg", "/hero.jpg"), ["/hero.jpg"], "the whole file");
+        assert_eq!(spans("<img src=\"/héros/été.jpg\">", "/héros/été.jpg"), ["/héros/été.jpg"]);
+        assert_eq!(spans("<img src=\"/a.jpg?x=1&amp;y=2\">", "/a.jpg?x=1&y=2"), ["/a.jpg?x=1&amp;y=2"]);
+        assert_eq!(spans("<img src=\"/hero.jpg\">\r\n<img src=\"/hero.jpg\">", "/hero.jpg").len(), 2);
     }
 
     #[test]
