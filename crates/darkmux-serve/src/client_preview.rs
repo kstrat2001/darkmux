@@ -927,8 +927,26 @@ const DOCKER_CALL_BOUND: Duration = Duration::from_secs(30);
 /// How long `docker create` may take (the image is already resolved).
 const DOCKER_CREATE_BOUND: Duration = Duration::from_secs(120);
 
+/// (#3112 step 2) Why a preview cannot run on the selected sandbox backend,
+/// if it cannot: a preview runs the runtime image's node and python at
+/// [`WORKSPACE_AT`], which only a backend with images (Docker) has. A
+/// Seatbelt or Landlock sandbox runs this host's programs at host paths, so
+/// it is refused rather than started where the recipe cannot run.
+fn backend_refusal(kind: darkmux_sandbox::BackendKind) -> Option<String> {
+    kind.on_host().then(|| {
+        format!(
+            "a live preview runs in a Docker container; {}={} runs this host's own programs, which previews do not support yet",
+            darkmux_sandbox::SANDBOX_ENV,
+            kind.setting()
+        )
+    })
+}
+
 impl PreviewContainers for Docker {
     fn image_and_user(&self) -> Result<(String, Option<String>), String> {
+        if let Some(why) = backend_refusal(darkmux_sandbox::selected()?) {
+            return Err(why);
+        }
         let image = match &self.image {
             Some(image) => image.clone(),
             None => darkmux_crew::dispatch_internal::resolved_runtime_image()
@@ -2245,6 +2263,18 @@ mod tests {
     /// resolved as a dispatch resolves it, and a Docker that will not answer
     /// says so. The user is the dispatch container's.
     #[cfg(unix)]
+    /// (#3112 step 2) Only Docker runs a preview; a host-process backend is
+    /// refused, naming the setting.
+    #[test]
+    fn a_preview_refuses_a_backend_without_images() {
+        use darkmux_sandbox::BackendKind;
+        assert_eq!(backend_refusal(BackendKind::Docker), None);
+        for kind in [BackendKind::Seatbelt, BackendKind::Landlock] {
+            let why = backend_refusal(kind).unwrap();
+            assert!(why.contains(&format!("DARKMUX_SANDBOX={}", kind.setting())), "{why}");
+        }
+    }
+
     #[test]
     #[serial_test::serial]
     fn the_preview_image_is_the_pinned_one_or_the_resolved_runtime_image() {

@@ -23,6 +23,8 @@ pub use other::OtherPlatform;
 
 mod dates;
 
+pub mod confine;
+
 /// The questions darkmux asks about the host. One method per question; the
 /// answer is data, never an OS name, so a caller can't branch on the OS.
 pub trait Platform: Send + Sync {
@@ -113,6 +115,12 @@ pub trait Platform: Send + Sync {
     /// whose answers differ cannot judge each other's pids. `None` when it
     /// cannot be read; a caller comparing pids then treats them as foreign.
     fn pid_namespace(&self) -> Option<String>;
+
+    /// (#3112) What this host offers a sandbox built from the kernel's own
+    /// pieces (namespaces and Landlock, [`confine`]): the Landlock ABI, and
+    /// whether unprivileged user namespaces work. Where there is no such
+    /// sandbox, nothing.
+    fn confine_support(&self) -> confine::ConfineSupport;
 
     /// The OS as a shared result names it (`macOS 15.1`, `Omarchy (Arch
     /// Linux)`), and when that version was installed where the OS says.

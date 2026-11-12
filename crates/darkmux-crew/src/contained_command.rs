@@ -250,9 +250,9 @@ pub fn remove_container(name: &str) {
 /// not reachable, naming the opt-out.
 pub fn lab_test_image(workload_image: Option<&str>) -> anyhow::Result<String> {
     use anyhow::Context;
-    // (#3112 step 2) A Seatbelt sandbox runs this host's own toolchain: there
-    // is no image to name, resolve or pull.
-    if darkmux_sandbox::selected().map_err(|why| anyhow::anyhow!(why))? == darkmux_sandbox::BackendKind::Seatbelt {
+    // (#3112 step 2) A Seatbelt or Landlock sandbox runs this host's own
+    // toolchain: there is no image to name, resolve or pull.
+    if darkmux_sandbox::selected().map_err(|why| anyhow::anyhow!(why))?.on_host() {
         return Ok("host".to_string());
     }
     if let Some(image) = workload_image {
@@ -270,8 +270,8 @@ pub fn lab_test_image(workload_image: Option<&str>) -> anyhow::Result<String> {
 /// the platform's), so files the tests write into a bind-mounted tree belong
 /// to whoever owns the tree.
 pub fn lab_test_user() -> anyhow::Result<Option<String>> {
-    // (#3112 step 2) A Seatbelt sandbox runs as the caller.
-    if darkmux_sandbox::backend().kind() == darkmux_sandbox::BackendKind::Seatbelt {
+    // (#3112 step 2) A Seatbelt or Landlock sandbox runs as the caller.
+    if darkmux_sandbox::backend().kind().on_host() {
         return Ok(None);
     }
     crate::dispatch_internal::runtime_container_user()

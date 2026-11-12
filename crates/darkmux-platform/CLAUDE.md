@@ -12,6 +12,10 @@ Claude Code loads this file when it works in this directory. The root `CLAUDE.md
 - **Every strategy module compiles on every OS**, so each one's answers are unit-tested in CI on Linux and macOS alike. An OS-only call inside a module (a sysctl, a `/proc` read) is `cfg`-gated at that leaf, with its parsing compiled everywhere (the `gestalt_host::mac_probe` shape).
 - **Answers are facts or capabilities, not OS names.** `container_host_access` answers *how a container reaches this machine*, not *is this Linux*: Docker Desktop for Linux and Docker Engine are both Linux, and the question is what the engine needs.
 
+## Actions, not questions: `confine`
+
+`confine.rs` is the one module here that does something rather than answer: it confines a process with the kernel's own pieces for darkmux-sandbox's Landlock backend (#3112). Its Linux code is `cfg`-gated at the leaf like any other; elsewhere `enter` fails as unsupported. The question it answers, whether this host can, is a `Platform` method like any other (`confine_support`).
+
 ## Adding a question
 
 1. A method on `Platform` returning a type that says what the caller needs (an enum, a struct of facts, `Option` where the platform may not know). Doc it as the question.

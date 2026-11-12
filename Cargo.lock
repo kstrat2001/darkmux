@@ -694,6 +694,7 @@ dependencies = [
  "darkmux-lab",
  "darkmux-platform",
  "darkmux-profiles",
+ "darkmux-sandbox",
  "darkmux-serve",
  "darkmux-trajectory",
  "darkmux-types",
@@ -903,6 +904,7 @@ dependencies = [
 name = "darkmux-sandbox"
 version = "5.9.3"
 dependencies = [
+ "darkmux-platform",
  "serde",
  "serde_json",
  "tempfile",

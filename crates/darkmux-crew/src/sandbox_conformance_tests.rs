@@ -579,3 +579,152 @@ conformance!(
     },
     "needs macOS sandbox-exec"
 );
+
+// (#3112 step 2) Linux only: there is no image, and the probes are the
+// host's own Python (no netcat is assumed). This test binary is the
+// sandbox's helper, as `darkmux` is in production, so it hands its
+// arguments to the helper before `main`.
+darkmux_platform::confine_before_main!(darkmux_sandbox::landlock::helper_if_asked);
+
+conformance!(
+    landlock,
+    darkmux_sandbox::LandlockBackend,
+    super::Host {
+        image: "unused",
+        route_probe: "tail -n +2 /proc/net/route",
+        serve: |port| format!(
+            "while :; do python3 -c \"import socket; s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('127.0.0.1', {port})); s.listen(1); c, _ = s.accept(); c.sendall(b'served\\n'); c.close()\"; done"
+        ),
+        tcp_probe: |port| format!("python3 -c \"import socket; socket.create_connection(('127.0.0.1', {port}), 2)\" 2>/dev/null && echo connected; true"),
+        unix_probe: |path| format!("python3 -c \"import socket; socket.socket(socket.AF_UNIX).connect('{path}')\" 2>/dev/null && echo connected; true"),
+    },
+    "needs Linux with Landlock ABI 6 and unprivileged user namespaces"
+);
+
+/// (#3112 step 2) What the Landlock backend enforces beyond the shared
+/// suite: Docker and Seatbelt differ here (Seatbelt cannot do several), so
+/// these run against Landlock alone.
+mod landlock_only {
+    use super::*;
+    use darkmux_sandbox::LandlockBackend;
+
+    fn run_script(network: Network, script: &str) -> String {
+        let tree = tempfile::TempDir::new().unwrap();
+        run_ok(&LandlockBackend, &SandboxPolicy { network, ..policy(&LandlockBackend, "unused", tree.path(), script) })
+    }
+
+    /// No new privileges, ever: a setuid program gains nothing.
+    #[test]
+    #[ignore = "needs Linux with Landlock ABI 6 and unprivileged user namespaces"]
+    fn the_sandbox_cannot_gain_privileges() {
+        assert_eq!(run_script(Network::None, "grep NoNewPrivs /proc/self/status").split_whitespace().last(), Some("1"));
+    }
+
+    /// Another process's arguments (this test's own) cannot be read: the
+    /// sandbox's `/proc` holds only its own processes.
+    #[test]
+    #[ignore = "needs Linux with Landlock ABI 6 and unprivileged user namespaces"]
+    fn another_processs_arguments_cannot_be_read() {
+        let me = std::process::id();
+        let said = run_script(Network::Default, &format!("cat /proc/{me}/cmdline 2>/dev/null; ls /proc | grep -c '^[0-9]'"));
+        assert!(!said.contains("sandbox_conformance"), "the sandbox read this test's arguments: {said}");
+        let pids: u32 = said.trim().lines().last().unwrap_or("").parse().unwrap_or(u32::MAX);
+        assert!(pids < 10, "the sandbox sees {pids} processes, not only its own");
+    }
+
+    /// `/etc`'s secrets (this machine's identifier among them) are not
+    /// there; the rest of `/etc` is.
+    #[test]
+    #[ignore = "needs Linux with Landlock ABI 6 and unprivileged user namespaces"]
+    fn etcs_secrets_are_not_there() {
+        assert!(Path::new("/etc/machine-id").exists(), "the probe needs a host with /etc/machine-id");
+        let said = run_script(Network::None, "test -e /etc/machine-id && echo id; test -e /etc/shadow && echo shadow; test -e /etc/passwd && echo passwd; true");
+        assert_eq!(said.trim(), "passwd");
+    }
+
+    /// A descendant that leaves the process group (`setsid`) still ends
+    /// with the sandbox: its init's exit ends the whole pid namespace.
+    #[test]
+    #[ignore = "needs Linux with Landlock ABI 6 and unprivileged user namespaces"]
+    fn a_descendant_that_left_the_group_ends_with_the_sandbox() {
+        let tree = tempfile::TempDir::new().unwrap();
+        let beat = tree.path().join("beat");
+        let p = policy(&LandlockBackend, "unused", tree.path(), "setsid sh -c 'while :; do echo x >> beat; sleep 0.2; done' & sleep 300");
+        let (mut cmd, handle) = LandlockBackend.run(&p);
+        let removed = Removed(&LandlockBackend, handle);
+        let mut client = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while len(&beat) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(len(&beat) > 0, "the escaping child never ran");
+        drop(removed);
+        let _ = client.wait();
+        std::thread::sleep(Duration::from_millis(500));
+        let after = len(&beat);
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(len(&beat), after, "a child that left the group outlived its sandbox's removal");
+    }
+
+    /// A stop's grace is the sandbox's: a TERM handler that takes a second
+    /// to finish still finishes, because nothing between the launcher and
+    /// the program ends with the TERM and takes the program down early.
+    #[test]
+    #[ignore = "needs Linux with Landlock ABI 6 and unprivileged user namespaces"]
+    fn a_slow_term_handler_finishes_within_the_grace() {
+        let tree = tempfile::TempDir::new().unwrap();
+        let p = policy(&LandlockBackend, "unused", tree.path(), "trap 'sleep 1; echo bye > bye; exit 0' TERM; echo up > up; while :; do sleep 0.1; done");
+        let (create, handle) = LandlockBackend.create(&p);
+        let _removed = Removed(&LandlockBackend, handle.clone());
+        assert!(matches!(run_bounded(create, Duration::from_secs(60)), Bounded::Finished { success: true, .. }));
+        let start = LandlockBackend.start(&handle);
+        let attached = std::thread::spawn(move || run_bounded(start, Duration::from_secs(60)));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !tree.path().join("up").exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let stopped = run_bounded(LandlockBackend.stop(&handle, Duration::from_secs(5)), Duration::from_secs(30));
+        assert!(matches!(stopped, Bounded::Finished { success: true, .. }), "{}", describe(&stopped));
+        let _ = attached.join();
+        assert_eq!(std::fs::read_to_string(tree.path().join("bye")).unwrap_or_default().trim(), "bye", "the TERM handler was cut short");
+    }
+
+    /// With no network the sandbox still has a loopback of its own: it can
+    /// serve and reach itself there.
+    #[test]
+    #[ignore = "needs Linux with Landlock ABI 6 and unprivileged user namespaces"]
+    fn no_network_keeps_a_loopback_of_its_own() {
+        let script = "python3 -c \"import socket; s = socket.socket(); s.bind(('127.0.0.1', 0)); s.listen(1); socket.create_connection(s.getsockname(), 2); print('self')\"";
+        assert_eq!(run_script(Network::None, script).trim(), "self");
+    }
+
+    /// On the default network, an abstract unix socket outside the sandbox
+    /// (a desktop session's, which no file view can hide) is out of reach.
+    #[test]
+    #[ignore = "needs Linux with Landlock ABI 6 and unprivileged user namespaces"]
+    fn the_default_network_reaches_no_outside_abstract_socket() {
+        use std::os::linux::net::SocketAddrExt;
+        let name = format!("darkmux-conformance-{}", std::process::id());
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind_addr(&addr).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let script = format!("python3 -c \"import socket; socket.socket(socket.AF_UNIX).connect(b'\\\\0{name}')\" 2>/dev/null && echo connected; true");
+        let said = run_script(Network::Default, &script);
+        assert!(!said.contains("connected"), "a sandbox reached an abstract socket outside it: {said}");
+        assert!(listener.accept().is_err(), "the outside abstract socket took a connection from a sandbox");
+    }
+
+    /// On the default network a sandbox binds only the ports its policy
+    /// publishes.
+    #[test]
+    #[ignore = "needs Linux with Landlock ABI 6 and unprivileged user namespaces"]
+    fn the_default_network_binds_only_published_ports() {
+        let free = || std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let (published, other) = (free(), free());
+        let bind = |port: u16| format!("python3 -c \"import socket; socket.socket().bind(('127.0.0.1', {port}))\" 2>/dev/null && echo bound-{port}; ");
+        let tree = tempfile::TempDir::new().unwrap();
+        let script = format!("{}{}true", bind(published), bind(other));
+        let p = SandboxPolicy { network: Network::Default, ports: vec![published], ..policy(&LandlockBackend, "unused", tree.path(), &script) };
+        assert_eq!(run_ok(&LandlockBackend, &p).trim(), format!("bound-{published}"));
+    }
+}

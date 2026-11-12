@@ -95,6 +95,8 @@ darkmux-serve = { path = "crates/darkmux-serve" }
 # previously wired as a DIRECT dependency of the binary itself.
 darkmux-gestalt = { path = "crates/darkmux-gestalt" }
 darkmux-trajectory = { path = "crates/darkmux-trajectory", features = ["schemars"] }
+# (#3112) `main` hands a Landlock sandbox's helper its arguments first.
+darkmux-sandbox = { path = "crates/darkmux-sandbox" }
 anyhow = "1.0"
 axum = "0.7"
 clap = { version = "4.5", features = ["derive"] }

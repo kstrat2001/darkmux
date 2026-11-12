@@ -2901,16 +2901,17 @@ pub(crate) fn agentic_brain_flags(
 }
 
 /// (#3112 step 2) `url` as the sandbox dials it: unchanged under a backend
-/// whose sandbox shares this host's loopback (Seatbelt runs on the host
-/// itself), else [`loopback_to_docker_host`].
+/// whose sandbox shares this host's loopback (Seatbelt and Landlock run on
+/// the host itself), else [`loopback_to_docker_host`].
 fn url_for_sandbox(url: &str) -> String {
     url_for(url, darkmux_sandbox::backend().kind())
 }
 
 fn url_for(url: &str, kind: darkmux_sandbox::BackendKind) -> String {
-    match kind {
-        darkmux_sandbox::BackendKind::Seatbelt => url.to_string(),
-        darkmux_sandbox::BackendKind::Docker => loopback_to_docker_host(url),
+    if kind.on_host() {
+        url.to_string()
+    } else {
+        loopback_to_docker_host(url)
     }
 }
 
@@ -7039,34 +7040,35 @@ struct RuntimeImage {
     image: String,
     /// What `docker run` is given.
     run_image: String,
-    /// (#3112 step 2) The host-built runtime a Seatbelt sandbox runs; `None`
-    /// under Docker.
+    /// (#3112 step 2) The host-built runtime a Seatbelt or Landlock sandbox
+    /// runs; `None` under Docker.
     host_runtime: Option<PathBuf>,
 }
 
 /// (#3112 step 2, spike) The env var naming the host-built runtime a
-/// Seatbelt dispatch runs: `cargo build --release --manifest-path
+/// Seatbelt or Landlock dispatch runs: `cargo build --release --manifest-path
 /// runtime/Cargo.toml` writes it to `runtime/target/release/darkmux-runtime`.
 pub const SANDBOX_RUNTIME_ENV: &str = "DARKMUX_SANDBOX_RUNTIME";
 
-/// (#3112 step 2) What a Seatbelt dispatch runs in place of an image: the
-/// host-built runtime [`SANDBOX_RUNTIME_ENV`] names, else a `darkmux-runtime`
-/// beside this executable. No image is checked or pulled, and `--image` is
-/// refused: there is no image to name.
-fn host_runtime_image(image_arg: Option<&str>) -> Result<RuntimeImage> {
+/// (#3112 step 2) What a dispatch on a host-process sandbox (Seatbelt,
+/// Landlock; `sandbox` is its setting's value) runs in place of an image:
+/// the host-built runtime [`SANDBOX_RUNTIME_ENV`] names, else a
+/// `darkmux-runtime` beside this executable. No image is checked or pulled,
+/// and `--image` is refused: there is no image to name.
+fn host_runtime_image(image_arg: Option<&str>, sandbox: &str) -> Result<RuntimeImage> {
     if let Some(image) = image_arg {
-        bail!("--image {image}: the Seatbelt sandbox ({}=seatbelt) runs this host's own programs, not an image", darkmux_sandbox::SANDBOX_ENV);
+        bail!("--image {image}: the {sandbox} sandbox ({}={sandbox}) runs this host's own programs, not an image", darkmux_sandbox::SANDBOX_ENV);
     }
     let named = std::env::var_os(SANDBOX_RUNTIME_ENV).filter(|v| !v.is_empty()).map(PathBuf::from);
     let beside = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|d| d.join("darkmux-runtime")));
     let Some(binary) = named.or(beside).filter(|p| p.is_file()) else {
         bail!(
-            "the Seatbelt sandbox needs a host-built runtime: run `cargo build --release --manifest-path runtime/Cargo.toml` \
+            "the {sandbox} sandbox needs a host-built runtime: run `cargo build --release --manifest-path runtime/Cargo.toml` \
              and set {SANDBOX_RUNTIME_ENV} to runtime/target/release/darkmux-runtime"
         );
     };
     let shown = binary.display().to_string();
-    darkmux_types::diag_eprintln!("darkmux dispatch: runtime=internal, sandbox=seatbelt, runtime binary: {shown}");
+    darkmux_types::diag_eprintln!("darkmux dispatch: runtime=internal, sandbox={sandbox}, runtime binary: {shown}");
     Ok(RuntimeImage {
         inject: true,
         darkmux_image: crate::runtime_image::ResolvedImage { reference: shown.clone(), id: shown.clone() },
@@ -7079,8 +7081,9 @@ fn host_runtime_image(image_arg: Option<&str>) -> Result<RuntimeImage> {
 /// Resolve and check the runtime image, then say which one runs.
 fn resolve_runtime_image(image_arg: Option<&str>, skip_preflight: bool) -> Result<RuntimeImage> {
     // (#3112 step 2) A refused backend setting refuses the dispatch (contract 9).
-    if darkmux_sandbox::selected().map_err(|why| anyhow!(why))? == darkmux_sandbox::BackendKind::Seatbelt {
-        return host_runtime_image(image_arg);
+    let kind = darkmux_sandbox::selected().map_err(|why| anyhow!(why))?;
+    if kind.on_host() {
+        return host_runtime_image(image_arg, kind.setting());
     }
     // (#703) `inject` is true only when the operator named a NON-darkmux image
     // (e.g. `rust:slim`) — then darkmux's static runtime binary is injected
@@ -8377,7 +8380,7 @@ fn container_run_config(
         resume_checkpoint: opts.resume_from.is_some(),
         container_host_access: darkmux_platform::current().container_host_access(),
         container_user: if run.image.host_runtime.is_some() {
-            // (#3112 step 2) Seatbelt runs as the caller; there is no user to switch to.
+            // (#3112 step 2) A host-process sandbox runs as the caller; there is no user to switch to.
             darkmux_platform::ContainerUser::Image
         } else {
             resolve_container_user(
@@ -8407,7 +8410,7 @@ fn container_run_config(
 
 /// (#3112 step 2) The backend's own `Command` for the dispatch, as it
 /// planned it: its environment, process group and stdin are part of the
-/// sandbox (a Seatbelt sandbox clears the host's environment), so it is
+/// sandbox (a Seatbelt or Landlock sandbox clears the host's environment), so it is
 /// never flattened to an argv and rebuilt, which would drop them.
 fn container_command(config: &DockerRunConfig, backend: &dyn darkmux_sandbox::SandboxBackend) -> Command {
     backend.run(&dispatch_policy_for(config, backend)).0

@@ -123,6 +123,12 @@ impl Platform for LinuxPlatform {
         pid_namespace_from_link(&read_link("/proc/self/ns/pid")?)
     }
 
+    /// (#3112) The kernel's Landlock ABI, and a user namespace tried in a
+    /// short-lived child.
+    fn confine_support(&self) -> crate::confine::ConfineSupport {
+        crate::confine::support()
+    }
+
     /// `/proc/meminfo`'s `MemAvailable`.
     fn reclaimable_memory_bytes(&self) -> Option<u64> {
         reclaimable_from_meminfo(&read_to_string("/proc/meminfo")?)

@@ -78,6 +78,11 @@ impl Platform for OtherPlatform {
         None
     }
 
+    /// No namespaces or Landlock here.
+    fn confine_support(&self) -> crate::confine::ConfineSupport {
+        crate::confine::ConfineSupport::default()
+    }
+
     fn os_release(&self) -> Option<crate::OsRelease> {
         None
     }

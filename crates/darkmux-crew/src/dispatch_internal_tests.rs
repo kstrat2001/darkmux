@@ -6373,6 +6373,7 @@ S(("127.0.0.1", port), H).serve_forever()
         use darkmux_sandbox::BackendKind;
         let url = "http://127.0.0.1:1234/v1";
         assert_eq!(url_for(url, BackendKind::Seatbelt), url);
+        assert_eq!(url_for(url, BackendKind::Landlock), url);
         assert_eq!(url_for(url, BackendKind::Docker), "http://host.docker.internal:1234/v1");
     }
 

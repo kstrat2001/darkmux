@@ -144,6 +144,9 @@ pub(crate) fn test_run() -> darkmux_types::session_id::RunId {
 }
 
 fn main() -> Result<()> {
+    // (#3112) A Landlock sandbox's helper is this executable: hand it its
+    // arguments first, while this process is still single-threaded.
+    darkmux_sandbox::landlock::helper_if_asked(std::env::args_os().collect());
     providers::register_builtins()?;
     let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
     let cli = Cli::parse_from(argv);

@@ -2,7 +2,9 @@
 //! ([`SandboxPolicy`]), the identity of one that runs ([`SandboxHandle`]),
 //! and the backend that turns a policy into a process ([`SandboxBackend`]).
 //!
-//! Docker is the only backend ([`DockerBackend`]). Callers build a policy and
+//! Docker is the default backend ([`DockerBackend`]); Seatbelt
+//! ([`SeatbeltBackend`], macOS) and Landlock ([`LandlockBackend`], Linux) run
+//! this host's own programs instead, picked by [`SANDBOX_ENV`]. Callers build a policy and
 //! spawn the command a backend gives them; they never spell a container
 //! engine's command line. Bounding a run (deadline, interrupt, process-group
 //! kill) stays with the caller's runner, so a backend only plans processes.
@@ -20,6 +22,8 @@ pub mod docker;
 pub use docker::DockerBackend;
 pub mod seatbelt;
 pub use seatbelt::SeatbeltBackend;
+pub mod landlock;
+pub use landlock::LandlockBackend;
 
 #[cfg(test)]
 mod docker_calls;
@@ -107,6 +111,30 @@ pub enum BackendKind {
     Docker,
     /// (#3112 step 2, spike) macOS `sandbox-exec`.
     Seatbelt,
+    /// (#3112 step 2) Linux namespaces and Landlock.
+    Landlock,
+}
+
+impl BackendKind {
+    /// Whether this backend's sandbox runs this host's own programs and
+    /// shares its loopback (Seatbelt, Landlock), rather than an image's in a
+    /// network of its own (Docker): there is no image to resolve, no user to
+    /// switch to, and a model server on `127.0.0.1` is reached as it is.
+    pub fn on_host(self) -> bool {
+        match self {
+            BackendKind::Docker => false,
+            BackendKind::Seatbelt | BackendKind::Landlock => true,
+        }
+    }
+
+    /// Its [`SANDBOX_ENV`] value.
+    pub fn setting(self) -> &'static str {
+        match self {
+            BackendKind::Docker => docker::SETTING,
+            BackendKind::Seatbelt => "seatbelt",
+            BackendKind::Landlock => "landlock",
+        }
+    }
 }
 
 /// A running (or once-running) sandbox, as a record can store it: which
@@ -156,23 +184,30 @@ pub struct Listed {
 }
 
 /// (#3112 step 2, spike) The env var that picks the backend: `docker` (the
-/// default) or `seatbelt`. A spike's switch, not yet a `config.json` key.
+/// default), `seatbelt` or `landlock`. A spike's switch, not yet a
+/// `config.json` key.
 pub const SANDBOX_ENV: &str = "DARKMUX_SANDBOX";
 
 /// The backend [`SANDBOX_ENV`] names, or why it names none this host can
 /// use. Unset or empty is Docker; any other unknown value is refused, never
-/// defaulted, and `seatbelt` is refused where `sandbox-exec` is missing.
+/// defaulted; `seatbelt` is refused where `sandbox-exec` is missing, and
+/// `landlock` where the kernel lacks what it needs (saying what).
 pub fn selected() -> Result<BackendKind, String> {
-    selected_from(std::env::var(SANDBOX_ENV).ok().as_deref(), SeatbeltBackend::available())
+    selected_from(std::env::var(SANDBOX_ENV).ok().as_deref(), SeatbeltBackend::available, LandlockBackend::available)
 }
 
-fn selected_from(value: Option<&str>, seatbelt_available: bool) -> Result<BackendKind, String> {
+fn selected_from(
+    value: Option<&str>,
+    seatbelt_available: impl FnOnce() -> bool,
+    landlock_available: impl FnOnce() -> Result<(), String>,
+) -> Result<BackendKind, String> {
     match value.map(str::trim) {
         None | Some("") => Ok(BackendKind::Docker),
         Some(v) if v == docker::SETTING => Ok(BackendKind::Docker),
-        Some("seatbelt") if seatbelt_available => Ok(BackendKind::Seatbelt),
+        Some("seatbelt") if seatbelt_available() => Ok(BackendKind::Seatbelt),
         Some("seatbelt") => Err(format!("{SANDBOX_ENV}=seatbelt: this host has no {}", seatbelt::SANDBOX_EXEC)),
-        Some(other) => Err(format!("{SANDBOX_ENV}={other:?} is not a sandbox backend; use `docker` or `seatbelt`")),
+        Some("landlock") => landlock_available().map(|()| BackendKind::Landlock).map_err(|why| format!("{SANDBOX_ENV}=landlock: {why}")),
+        Some(other) => Err(format!("{SANDBOX_ENV}={other:?} is not a sandbox backend; use `docker`, `seatbelt` or `landlock`")),
     }
 }
 
@@ -182,6 +217,7 @@ fn selected_from(value: Option<&str>, seatbelt_available: bool) -> Result<Backen
 pub fn backend() -> &'static dyn SandboxBackend {
     match selected() {
         Ok(BackendKind::Seatbelt) => &SeatbeltBackend,
+        Ok(BackendKind::Landlock) => &LandlockBackend,
         _ => &DockerBackend,
     }
 }
@@ -249,20 +285,41 @@ pub trait SandboxBackend: Send + Sync {
 mod tests {
     use super::*;
 
-    /// A handle is stored by a reaper or a resume record and read back as
-    /// the same handle; its backend is spelled in snake case.
     /// Unset, empty or `docker` is Docker; `seatbelt` is Seatbelt where it
-    /// is installed and refused where not; anything else is refused.
+    /// is installed, `landlock` Landlock where the kernel has what it needs,
+    /// each refused (saying why) where not; anything else is refused.
     #[test]
     fn the_backend_setting_refuses_what_it_does_not_know() {
-        assert_eq!(selected_from(None, true), Ok(BackendKind::Docker));
-        assert_eq!(selected_from(Some(""), true), Ok(BackendKind::Docker));
-        assert_eq!(selected_from(Some(docker::SETTING), false), Ok(BackendKind::Docker));
-        assert_eq!(selected_from(Some("seatbelt"), true), Ok(BackendKind::Seatbelt));
-        assert!(selected_from(Some("seatbelt"), false).is_err());
-        assert!(selected_from(Some("podman"), true).unwrap_err().contains("podman"));
+        let (yes, no) = (|| true, || false);
+        let (fits, short) = (|| Ok(()), || Err("this kernel's Landlock ABI is 4".to_string()));
+        assert_eq!(selected_from(None, yes, fits), Ok(BackendKind::Docker));
+        assert_eq!(selected_from(Some(""), yes, fits), Ok(BackendKind::Docker));
+        assert_eq!(selected_from(Some(docker::SETTING), no, short), Ok(BackendKind::Docker));
+        assert_eq!(selected_from(Some("seatbelt"), yes, fits), Ok(BackendKind::Seatbelt));
+        assert!(selected_from(Some("seatbelt"), no, fits).is_err());
+        assert_eq!(selected_from(Some("landlock"), no, fits), Ok(BackendKind::Landlock));
+        assert!(selected_from(Some("landlock"), yes, short).unwrap_err().contains("ABI is 4"));
+        assert!(selected_from(Some("podman"), yes, fits).unwrap_err().contains("podman"));
     }
 
+    /// Only Docker runs an image in a network of its own; Seatbelt and
+    /// Landlock run this host's programs on its loopback.
+    #[test]
+    fn only_docker_is_off_the_host() {
+        assert!(!BackendKind::Docker.on_host());
+        assert!(BackendKind::Seatbelt.on_host() && BackendKind::Landlock.on_host());
+    }
+
+    /// Each backend's setting value selects it back.
+    #[test]
+    fn a_backends_setting_selects_it() {
+        for kind in [BackendKind::Docker, BackendKind::Seatbelt, BackendKind::Landlock] {
+            assert_eq!(selected_from(Some(kind.setting()), || true, || Ok(())), Ok(kind));
+        }
+    }
+
+    /// A handle is stored by a reaper or a resume record and read back as
+    /// the same handle; its backend is spelled in snake case.
     #[test]
     fn a_handle_round_trips_through_a_record() {
         let handle = SandboxHandle { backend: BackendKind::Docker, id: "darkmux-gate-1-0".into() };

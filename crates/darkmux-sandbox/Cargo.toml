@@ -12,6 +12,9 @@ rust-version = "1.86"
 [dependencies]
 # A handle is stored in records a reaper or a resume reads back.
 serde = { version = "1.0", features = ["derive"] }
+# (#3112) The Landlock backend confines a process with the kernel's own
+# pieces, which live with the other OS differences.
+darkmux-platform = { path = "../darkmux-platform" }
 
 [dev-dependencies]
 serde_json.workspace = true

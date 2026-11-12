@@ -315,7 +315,7 @@ fn refused(name: &str) -> Command {
 /// `path` with its symlinks resolved (Seatbelt matches real paths, and
 /// `/tmp` and `/var` are links); as given when it cannot be resolved. A
 /// path whose own last part does not exist yet resolves its parent.
-fn canonical(path: &Path) -> PathBuf {
+pub(crate) fn canonical(path: &Path) -> PathBuf {
     if let Ok(real) = path.canonicalize() {
         return real;
     }
@@ -334,12 +334,12 @@ fn subpath(path: &Path) -> String {
     format!("(subpath {})", quote(&path.to_string_lossy()))
 }
 
-fn join(parts: impl Iterator<Item = String>) -> String {
+pub(crate) fn join(parts: impl Iterator<Item = String>) -> String {
     parts.collect::<Vec<_>>().join(" ")
 }
 
 /// One line of the start script: each argument single-quoted for `sh`.
-fn sh_quote(s: &str) -> String {
+pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
@@ -428,32 +428,39 @@ rm -rf "$d"; exit 0"#
     }
 
     fn parse_list(&self, query: &Query, listing: &str) -> Vec<Listed> {
-        // Each sandbox: its name, whether it runs, and its labels.
-        type Found = (String, bool, Vec<(String, String)>);
-        let mut found: Vec<Found> = Vec::new();
-        for line in listing.lines() {
-            if let Some(rest) = line.strip_prefix("N\t") {
-                let (name, state) = rest.split_once('\t').unwrap_or((rest, ""));
-                found.push((name.to_string(), state == "running", Vec::new()));
-            } else if let (Some(kv), Some(last)) = (line.strip_prefix("L\t"), found.last_mut()) {
-                let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
-                last.2.push((k.to_string(), v.to_string()));
-            }
-        }
-        found
-            .into_iter()
-            .filter(|(_, running, _)| *running || query.stopped_too)
-            .filter(|(name, _, labels)| match &query.having {
-                Having::Label(key) => labels.iter().any(|(k, _)| k == key),
-                Having::NamePrefix(prefix) => name.starts_with(prefix.as_str()),
-                Having::Name(exact) => name == exact,
-            })
-            .map(|(name, _, labels)| Listed {
-                handle: SandboxHandle { backend: BackendKind::Seatbelt, id: name },
-                labels: query.read.iter().map(|key| labels.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())).collect(),
-            })
-            .collect()
+        parse_listing(BackendKind::Seatbelt, query, listing)
     }
+}
+
+/// The sandboxes in a listing of `N<TAB>name<TAB>state` and `L<TAB>key=value`
+/// lines (what a host-process backend's `list` prints) that `query` asks
+/// for, as `kind`'s handles. Seatbelt's and Landlock's share it.
+pub(crate) fn parse_listing(kind: BackendKind, query: &Query, listing: &str) -> Vec<Listed> {
+    // Each sandbox: its name, whether it runs, and its labels.
+    type Found = (String, bool, Vec<(String, String)>);
+    let mut found: Vec<Found> = Vec::new();
+    for line in listing.lines() {
+        if let Some(rest) = line.strip_prefix("N\t") {
+            let (name, state) = rest.split_once('\t').unwrap_or((rest, ""));
+            found.push((name.to_string(), state == "running", Vec::new()));
+        } else if let (Some(kv), Some(last)) = (line.strip_prefix("L\t"), found.last_mut()) {
+            let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+            last.2.push((k.to_string(), v.to_string()));
+        }
+    }
+    found
+        .into_iter()
+        .filter(|(_, running, _)| *running || query.stopped_too)
+        .filter(|(name, _, labels)| match &query.having {
+            Having::Label(key) => labels.iter().any(|(k, _)| k == key),
+            Having::NamePrefix(prefix) => name.starts_with(prefix.as_str()),
+            Having::Name(exact) => name == exact,
+        })
+        .map(|(name, _, labels)| Listed {
+            handle: SandboxHandle { backend: kind, id: name },
+            labels: query.read.iter().map(|key| labels.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())).collect(),
+        })
+        .collect()
 }
 
 #[cfg(test)]

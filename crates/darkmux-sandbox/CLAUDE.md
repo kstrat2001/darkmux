@@ -12,7 +12,8 @@ Claude Code loads this file when it works in this directory.
 - **Some things are not in the policy because no caller may turn them off:** every sandbox is removed when it exits, has an init as its first process, drops every capability and cannot gain privileges.
 - **A backend plans processes; it runs nothing.** Bounding a run (deadline, interrupt, process-group kill) stays with the caller's runner (`darkmux-crew`'s `bounded_command`). A run cut short is followed by `remove(handle)`, because killing the client need not stop the sandbox.
 - **A `SandboxHandle` is what a record stores** (a reaper's, a resume's): the backend and the sandbox's id there.
-- **Which backend runs on which host is a `darkmux-platform` question, later.** Today every caller uses `DockerBackend`.
+- **Which backend runs is `DARKMUX_SANDBOX` for now** (`docker`, the default; `seatbelt` on macOS; `landlock` on Linux), refused where the host cannot run it; it becomes the `runtime.sandbox` setting with a per-platform default. A caller that needs to know whether its sandbox runs this host's own programs on its loopback (no image, no user to switch to) asks `BackendKind::on_host`, never compares a kind.
+- **Landlock (`src/landlock.rs`) is Seatbelt's Linux twin, built differently.** The kernel pieces (user, mount, pid and network namespaces, Landlock) live in `darkmux_platform::confine`, since only that crate may name an OS. The confined process is started by a helper, the executable that planned it run with `__darkmux-landlock` first: `darkmux`'s `main` hands its arguments to `landlock::helper_if_asked` before anything else, and a test binary that starts Landlock sandboxes does it before `main` (`darkmux_platform::confine_before_main!`). Its doc lists what it cannot do.
 
 ## The ratchet (`docker-calls.allow`, `src/docker_calls.rs`)
 
@@ -20,7 +21,7 @@ Outside `src/docker.rs`, no production line spells the `docker` program (`"docke
 
 ## Conformance
 
-What every backend must do is one suite, `crates/darkmux-crew/src/sandbox_conformance_tests.rs`, instantiated per backend by its `conformance!` line. It starts real sandboxes, so it is opt-in: `cargo nextest run -p darkmux-crew sandbox_conformance --run-ignored only`. A new backend adds one `conformance!` line and passes every case before any caller uses it.
+What every backend must do is one suite, `crates/darkmux-crew/src/sandbox_conformance_tests.rs`, instantiated per backend by its `conformance!` line. It starts real sandboxes, so it is opt-in: `cargo nextest run -p darkmux-crew sandbox_conformance --run-ignored only`. A new backend adds one `conformance!` line and passes every case before any caller uses it. On Linux, run Landlock's alone: `cargo nextest run -p darkmux-crew --lib sandbox_conformance_tests::landlock --run-ignored only` (its own extra cases, `landlock_only`, match that filter too).
 
 ## Migration (step 1 of #3112): done
 

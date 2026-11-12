@@ -14,6 +14,7 @@ pub struct FakePlatform {
     /// `(pid, bytes)` pairs [`Platform::process_footprint`] answers.
     pub process_footprints: Vec<(u32, u64)>,
     pub pid_namespace: Option<String>,
+    pub confine_support: crate::confine::ConfineSupport,
     pub os_release: Option<crate::OsRelease>,
     pub secret_store: crate::SecretStore,
     pub machine_config: crate::MachineConfig,
@@ -52,6 +53,7 @@ impl Default for FakePlatform {
             process_start_stamps: Vec::new(),
             process_footprints: Vec::new(),
             pid_namespace: None,
+            confine_support: Default::default(),
             os_release: None,
             secret_store: crate::SecretStore::PrivateFile,
             machine_config: crate::MachineConfig::default(),
@@ -140,6 +142,10 @@ impl Platform for FakePlatform {
 
     fn pid_namespace(&self) -> Option<String> {
         self.pid_namespace.clone()
+    }
+
+    fn confine_support(&self) -> crate::confine::ConfineSupport {
+        self.confine_support
     }
 
     fn os_release(&self) -> Option<crate::OsRelease> {
