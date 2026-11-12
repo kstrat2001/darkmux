@@ -47,6 +47,40 @@ export function residentsUnknownNote(specs: ResidentSpecs | null): string | null
   return "LM Studio could not be asked (`lms ps` failed); what it holds is unknown.";
 }
 
+/** (#3554) What LM Studio holds for darkmux, as a fleet card counts it: a
+ *  count, or why the list is not known. The servers darkmux started are the
+ *  count line's other half (`countLine`). */
+export type CardResidents = { known: true; count: number } | { known: false; why: string };
+
+/** darkmux's namespace on a resident's identifier (contract 4): the test
+ *  `darkmux_profiles::ownership::is_darkmux_owned` applies. */
+const DARKMUX_NAMESPACE = "darkmux:";
+
+type ResidentsInput = ResidentSpecs & Pick<MachineSpecsResponse, "loaded_models"> & Partial<Pick<MachineSpecsResponse, "utility_model">>;
+
+/** (#3554) How many models the engine holds for darkmux: its residents in
+ *  darkmux's namespace, never a model another app loaded (the fleet card is a
+ *  darkmux card, not an LM Studio one). A loaded utility model counts too,
+ *  once, as the utility robot says "resident" for it: the daemon matches it
+ *  on a bare identifier or model key (`darkmux-serve`'s `utility_model`).
+ *
+ *  When the list is not the engine's answer, why, so a card never says
+ *  "0 loaded" about a list nobody read. `null` with no specs: no card was
+ *  read, so nothing is claimed. */
+export function darkmuxResidents(specs: ResidentsInput | null): CardResidents | null {
+  if (!specs) return null;
+  const why = residentsUnknownNote(specs);
+  if (why !== null) return { known: false, why };
+  // A peer's card is read off the wire: one that leaves the list out claims
+  // nothing, rather than "0 loaded" or taking the fleet page down with it.
+  const listed: unknown = specs.loaded_models;
+  if (!Array.isArray(listed)) return null;
+  const counted = specs.loaded_models.filter((m) => m.identifier.startsWith(DARKMUX_NAMESPACE));
+  const utility = specs.utility_model;
+  const utilityApart = utility?.loaded === true && !counted.some((m) => m.identifier === utility.id || m.model === utility.id);
+  return { known: true, count: counted.length + (utilityApart ? 1 : 0) };
+}
+
 /** Machine info's engine row: the name, and what it does not report or that
  *  it cannot be used; empty with no specs (the row then hides). */
 export function engineRow(specs: EngineSpecs | null | undefined): string {
