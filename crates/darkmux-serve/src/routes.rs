@@ -135,7 +135,7 @@ pub(crate) struct ClientRoute {
 
 /// A client route: the type is checked to exist, and named in the golden.
 macro_rules! client_json {
-    ($method:ident, $ty:ty, $path:literal, $handler:expr) => {{
+    ($method:ident, $ty:ty, $path:expr, $handler:expr) => {{
         let _: Option<$ty> = None;
         ClientRoute { method: stringify!($method), path: $path, reply: stringify!($ty), handler: axum::routing::$method($handler) }
     }};
@@ -163,7 +163,7 @@ pub(crate) fn client_table() -> Vec<ClientRoute> {
         client_json!(delete, WorkspaceRemoved, "/client/workspaces/:name", workspace_remove_handler),
         client_json!(get, BranchChanges, "/client/workspaces/:name/changes", workspace_changes_handler),
         client_json!(post, EditReply, "/client/workspaces/:name/edit", workspace_edit_handler),
-        client_json!(post, ImageReply, "/client/workspaces/:name/image", workspace_image_handler),
+        client_json!(post, ImageReply, IMAGE_ROUTE, workspace_image_handler),
         client_json!(post, PreviewState, "/client/workspaces/:name/preview", preview_start_handler),
         client_json!(get, PreviewState, "/client/workspaces/:name/preview", preview_status_handler),
         client_json!(delete, StatusWord, "/client/workspaces/:name/preview", preview_stop_handler),

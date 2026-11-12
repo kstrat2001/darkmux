@@ -9,6 +9,36 @@ pub const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 /// static) site serves it at `/`, so `public/images/x.png` is `/images/x.png`.
 pub const IMAGE_FOLDER: &str = "public/images";
 
+/// [`IMAGE_FOLDER`] with each folder spelled the way `tracked` (the index's
+/// paths) already spells it. Under `core.ignorecase` (a Mac's default) git
+/// files a new path under a folder its index holds in another case by the
+/// index's spelling (`Public/images/x.png` for `public/images/x.png`), and a
+/// commit naming `public/...` then matches nothing; so the caller spells it
+/// git's way. A folder the index holds exactly as named, or not at all, is
+/// kept as named.
+pub fn folder_as_indexed(tracked: &[&str]) -> String {
+    let mut spelled: Vec<&str> = Vec::new();
+    for want in IMAGE_FOLDER.split('/') {
+        let depth = spelled.len();
+        let names: Vec<&str> = tracked
+            .iter()
+            .filter_map(|p| {
+                let parts: Vec<&str> = p.split('/').collect();
+                // A folder at this depth: a name with more after it, under
+                // the folders spelled so far.
+                (parts.len() > depth + 1 && parts[..depth] == spelled[..]).then(|| parts[depth])
+            })
+            .collect();
+        let name = if names.contains(&want) {
+            want
+        } else {
+            names.into_iter().find(|n| n.eq_ignore_ascii_case(want)).unwrap_or(want)
+        };
+        spelled.push(name);
+    }
+    spelled.join("/")
+}
+
 /// The kinds darkmux takes, by their first bytes, never by the name the app
 /// sent. SVG is not among them: it can carry script.
 pub fn sniff(bytes: &[u8]) -> Option<&'static str> {
@@ -108,6 +138,29 @@ mod tests {
         );
         assert_eq!(sniff(b"hello"), None);
         assert_eq!(sniff(b""), None);
+    }
+
+    /// (review) RIFF is a container: a WAV or an AVI starts with it too,
+    /// and is not an image.
+    #[test]
+    fn a_riff_file_that_is_not_webp_is_refused() {
+        assert_eq!(sniff(b"RIFF\x24\0\0\0WAVEfmt "), None);
+        assert_eq!(sniff(b"RIFF\x24\0\0\0AVI LIST"), None);
+        assert_eq!(sniff(b"RIFF\0\0\0\0WEB"), None, "too short to say");
+    }
+
+    #[test]
+    fn the_image_folder_is_spelled_as_the_index_spells_it() {
+        assert_eq!(folder_as_indexed(&[]), "public/images");
+        assert_eq!(folder_as_indexed(&["README.md", "src/main.ts"]), "public/images");
+        assert_eq!(folder_as_indexed(&["Public/x.txt"]), "Public/images");
+        assert_eq!(folder_as_indexed(&["Public/Images/a.png", "Public/x.txt"]), "Public/Images");
+        // Exactly as named wins over another case of it.
+        assert_eq!(folder_as_indexed(&["PUBLIC/a", "public/b"]), "public/images");
+        // A file named like the folder is not the folder.
+        assert_eq!(folder_as_indexed(&["Public", "x/public/images/a"]), "public/images");
+        // `images` is looked for only under the folder chosen for `public`.
+        assert_eq!(folder_as_indexed(&["public/a", "Other/IMAGES/b"]), "public/images");
     }
 
     #[test]

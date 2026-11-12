@@ -19,13 +19,19 @@ darkmux release.
 - **An app can add a picture to a workspace (#3545).** `POST /client/workspaces/{name}/image`
   takes `{"name", "data", "replace"?}`: the image's bytes as base64, never a path, so darkmux never
   reads a file a client names. darkmux takes only PNG, JPEG, GIF and WebP, recognized by their first
-  bytes (never SVG, which can carry script), at most 10 MB. It picks the file's name itself, a slug
-  of `name` plus a short content hash, under `public/images/`, and never writes through a symlink.
-  It commits the image as a work record with no model, like a hand edit, so `/client/work/{id}/undo`
-  takes it out again. With `replace` (an `<img>`'s `src` as the source has it), the one place in the
-  tracked files that holds it points at the new image in the same commit. Found zero times or more
-  than once, nothing changes and the reply gives `matches`. Sending the same image again with no
-  `replace` commits nothing and replies with its `path` and `url`. New reply type `ImageReply`.
+  bytes (never SVG, which can carry script), at most 10 MB decoded. Only this route reads a body
+  past 64 KB, enough for a 10 MB image however the app's JSON escapes its base64 (`\/`, line
+  breaks); every other route still refuses past 64 KB. It picks the file's name itself, a slug of
+  `name` plus a short content hash, under `public/images/` (spelled as the repository's index
+  already spells it when git ignores case, as on a Mac), and never writes through a symlink. It
+  commits the image as a work record with no model, like a hand edit, so `/client/work/{id}/undo`
+  takes it out again; a write or commit that fails leaves the work copy, its index and HEAD as they
+  were, with no half-written file or empty folder. With `replace` (an `<img>`'s `src` as the source
+  has it), the one place in the tracked files that holds that whole path (never the end of a longer
+  one: `hero.jpg` is not found in `/assets/hero.jpg`) points at the new image in the same commit.
+  Found zero times or more than once, nothing changes and the reply gives `matches`. Sending the
+  same image again with no `replace` commits nothing and replies with its `path` and `url`. New
+  reply type `ImageReply`.
 
 ### Changed
 

@@ -1688,10 +1688,10 @@ pub(crate) async fn only_this_machines_apps(
 
 /// Once `client serve` has begun to stop, a request that could start or
 /// change something (every method but GET and HEAD) is refused with
-/// `unavailable`. Its body is read first (the limit every handler applies),
-/// so the check lands when the whole request has arrived: one whose body
-/// was still coming when the stop began is refused too, never acted on
-/// after the previews were stopped.
+/// `unavailable`. Its body is read first (the limit its route applies,
+/// [`body_cap`]), so the check lands when the whole request has arrived: one
+/// whose body was still coming when the stop began is refused too, never
+/// acted on after the previews were stopped.
 async fn refused_while_stopping(
     state: &ClientServerState,
     req: axum::extract::Request,
@@ -1700,17 +1700,44 @@ async fn refused_while_stopping(
     if matches!(*req.method(), Method::GET | Method::HEAD) {
         return Ok(req);
     }
+    let (limit, too_large) = body_cap(&req);
     let (parts, body) = req.into_parts();
-    let bytes = axum::body::to_bytes(body, MAX_BODY_BYTES).await.map_err(|_| {
-        err(
-            StatusCode::PAYLOAD_TOO_LARGE, ClientCode::PayloadTooLarge,
-            format!("body larger than {MAX_BODY_BYTES} bytes"),
-        )
-    })?;
+    let bytes = axum::body::to_bytes(body, limit).await.map_err(|_| too_large())?;
     if state.previews.stopping() {
         return Err(stopping_refusal());
     }
     Ok(axum::extract::Request::from_parts(parts, Body::from(bytes)))
+}
+
+/// The most a request's body may hold, and the refusal past it: the image
+/// route ([`IMAGE_ROUTE`], matched by the router before this gate runs)
+/// reads [`MAX_IMAGE_BODY_BYTES`]; every other route, and a path no route
+/// takes, [`MAX_BODY_BYTES`].
+fn body_cap(req: &axum::extract::Request) -> (usize, fn() -> Response) {
+    let route = req.extensions().get::<axum::extract::MatchedPath>();
+    if route.is_some_and(|r| r.as_str() == IMAGE_ROUTE) {
+        (MAX_IMAGE_BODY_BYTES, image_too_large)
+    } else {
+        (MAX_BODY_BYTES, body_too_large)
+    }
+}
+
+/// The refusal of a body past [`MAX_BODY_BYTES`].
+fn body_too_large() -> Response {
+    err(
+        StatusCode::PAYLOAD_TOO_LARGE, ClientCode::PayloadTooLarge,
+        format!("body larger than {MAX_BODY_BYTES} bytes"),
+    )
+}
+
+/// The refusal of an image past [`crate::client_image::MAX_IMAGE_BYTES`]
+/// (decoded), or of a body past what the image route reads.
+fn image_too_large() -> Response {
+    err(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        ClientCode::PayloadTooLarge,
+        format!("an image is at most {} MB", crate::client_image::MAX_IMAGE_BYTES / (1024 * 1024)),
+    )
 }
 
 /// The refusal of a request that could start something once `client serve`
@@ -1831,14 +1858,7 @@ fn internal(e: anyhow::Error) -> Response {
 
 /// Read and parse a capped JSON body; every refusal is JSON.
 async fn json_body<T: serde::de::DeserializeOwned>(body: Body) -> Result<T, Response> {
-    let bytes = axum::body::to_bytes(body, MAX_BODY_BYTES)
-        .await
-        .map_err(|_| {
-            err(
-                StatusCode::PAYLOAD_TOO_LARGE, ClientCode::PayloadTooLarge,
-                format!("body larger than {MAX_BODY_BYTES} bytes"),
-            )
-        })?;
+    let bytes = axum::body::to_bytes(body, MAX_BODY_BYTES).await.map_err(|_| body_too_large())?;
     serde_json::from_slice(&bytes)
         .map_err(|e| err(StatusCode::BAD_REQUEST, ClientCode::BadRequest, format!("bad JSON body: {e}")))
 }
@@ -4152,12 +4172,7 @@ fn status_of_code(code: ClientCode) -> StatusCode {
 /// A body that may be absent (or empty): its default then; anything else
 /// is parsed strictly, an unknown key refused with `bad_request`.
 async fn optional_json_body<T: serde::de::DeserializeOwned + Default>(body: Body) -> Result<T, Response> {
-    let bytes = axum::body::to_bytes(body, MAX_BODY_BYTES).await.map_err(|_| {
-        err(
-            StatusCode::PAYLOAD_TOO_LARGE, ClientCode::PayloadTooLarge,
-            format!("body larger than {MAX_BODY_BYTES} bytes"),
-        )
-    })?;
+    let bytes = axum::body::to_bytes(body, MAX_BODY_BYTES).await.map_err(|_| body_too_large())?;
     if bytes.iter().all(u8::is_ascii_whitespace) {
         return Ok(T::default());
     }
@@ -4593,9 +4608,14 @@ struct EditDone {
 /// One place `old` was found: the file, the span, and the file's text.
 type EditHit = (String, (usize, usize), String);
 
-/// Where `old` is in the work copy's tracked regular text files, counted up
-/// to two (more than one is already too many).
-fn find_in_tracked(wc: &WorkCopy, old: &str) -> Result<Vec<EditHit>, Refused> {
+/// The places `find` finds `old` at in a file's text, at most `limit` of them
+/// ([`crate::client_edit::find`] for a hand edit's words,
+/// [`crate::client_edit::find_reference`] for an image's reference).
+type Finder = fn(&str, &str, usize) -> Vec<(usize, usize)>;
+
+/// Where `old` is in the work copy's tracked regular text files, as `find`
+/// finds it, counted up to two (more than one is already too many).
+fn find_in_tracked(wc: &WorkCopy, old: &str, find: Finder) -> Result<Vec<EditHit>, Refused> {
     let listing = crate::client_git::run_or_why(wc, None, &["ls-files", "-z"]).map_err(|e| {
         Box::new(internal(anyhow!(
             "listing the workspace's files failed: {e}"
@@ -4607,7 +4627,7 @@ fn find_in_tracked(wc: &WorkCopy, old: &str) -> Result<Vec<EditHit>, Refused> {
         let Some(text) = tracked_text(wc, path) else {
             continue;
         };
-        for span in crate::client_edit::find(&text, old, 2 - hits.len()) {
+        for span in find(&text, old, 2 - hits.len()) {
             hits.push((path.to_string(), span, text.clone()));
         }
         if hits.len() >= 2 {
@@ -4641,7 +4661,7 @@ fn edit_in(
     new: &str,
     work_id: &str,
 ) -> Result<EditDone, Refused> {
-    let mut hits = find_in_tracked(wc, old)?;
+    let mut hits = find_in_tracked(wc, old, crate::client_edit::find)?;
     if hits.len() != 1 {
         return Err(Box::new(
             Json(EditReply {
@@ -4749,10 +4769,21 @@ fn edit_title(old: &str, new: &str) -> String {
 
 // ─── Added images (#3545) ────────────────────────────────────────────────
 
-/// The largest body the image route reads: the largest image as base64,
-/// plus room for the other fields. Only this route reads this much.
-const MAX_IMAGE_BODY_BYTES: usize =
-    crate::client_image::MAX_IMAGE_BYTES.div_ceil(3) * 4 + 64 * 1024;
+/// The image route's path, as the client table declares it.
+pub(crate) const IMAGE_ROUTE: &str = "/client/workspaces/:name/image";
+
+/// The largest body the image route reads; only this route reads more than
+/// [`MAX_BODY_BYTES`] ([`body_cap`]). The real limit is the image decoded
+/// ([`crate::client_image::MAX_IMAGE_BYTES`], checked once decoded); this
+/// only has to fit the largest image however a client's JSON encodes it:
+/// base64 whose every character may be a `/` that Swift's `JSONEncoder`
+/// writes as `\/` (two bytes each; an image of `0xFF` bytes is all `/`),
+/// broken into lines as short as 64 characters whose CR LF is written
+/// `\r\n` (four bytes a line), and room for the other fields.
+const MAX_IMAGE_BODY_BYTES: usize = {
+    let base64 = crate::client_image::MAX_IMAGE_BYTES.div_ceil(3) * 4;
+    base64 * 2 + base64.div_ceil(64) * 4 + 64 * 1024
+};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -4789,16 +4820,7 @@ pub(crate) async fn workspace_image_handler(
     };
     let bytes = match axum::body::to_bytes(body, MAX_IMAGE_BODY_BYTES).await {
         Ok(b) => b,
-        Err(_) => {
-            return err(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                ClientCode::PayloadTooLarge,
-                format!(
-                    "an image is at most {} MB",
-                    crate::client_image::MAX_IMAGE_BYTES / (1024 * 1024)
-                ),
-            )
-        }
+        Err(_) => return image_too_large(),
     };
     let req: ImageBody = match serde_json::from_slice(&bytes) {
         Ok(b) => b,
@@ -4832,11 +4854,7 @@ fn image_input(req: &ImageBody) -> Result<(Vec<u8>, &'static str, Option<String>
         )
     })?;
     if bytes.len() > MAX_IMAGE_BYTES {
-        return Err(refuse(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            ClientCode::PayloadTooLarge,
-            format!("an image is at most {} MB", MAX_IMAGE_BYTES / (1024 * 1024)),
-        ));
+        return Err(Box::new(image_too_large()));
     }
     let kind = sniff(&bytes).ok_or_else(|| {
         refuse(
@@ -4881,7 +4899,7 @@ fn image_checked(
     let _in_use = held_work_copy(st, Some(&wc))?;
     let file_name = crate::client_image::file_name(&req.name, &bytes, kind);
     let image = Image {
-        path: format!("{}/{file_name}", crate::client_image::IMAGE_FOLDER),
+        path: format!("{}/{file_name}", image_folder(&wc)?),
         url: format!("/images/{file_name}"),
         bytes,
     };
@@ -4904,6 +4922,21 @@ fn image_checked(
         commit: Some(landed.commit),
         branch: Some(landed.branch),
     })
+}
+
+/// [`crate::client_image::IMAGE_FOLDER`] as git will file it here: under
+/// `core.ignorecase` (a Mac's default), spelled as the index already spells
+/// it ([`crate::client_image::folder_as_indexed`]), so the commit names the
+/// path git staged and a failed one is unstaged by that name.
+fn image_folder(wc: &WorkCopy) -> Result<String, Refused> {
+    use crate::client_image::{folder_as_indexed, IMAGE_FOLDER};
+    if git_line(wc, &["config", "--type=bool", "core.ignorecase"]).as_deref() != Some("true") {
+        return Ok(IMAGE_FOLDER.to_string());
+    }
+    let listing = crate::client_git::run_or_why(wc, None, &["ls-files", "-z"])
+        .map_err(|e| Box::new(internal(anyhow!("listing the workspace's files failed: {e}"))))?;
+    let paths = String::from_utf8_lossy(&listing.stdout).into_owned();
+    Ok(folder_as_indexed(&paths.split('\0').collect::<Vec<_>>()))
 }
 
 /// An image to add: where it goes, how the page reaches it, its bytes.
@@ -4954,8 +4987,8 @@ fn image_in(
     }
     let before = snapshot_tree(wc)
         .map_err(|e| Box::new(internal(anyhow!("reading the work copy failed: {e}"))))?;
-    let files = place_image(wc, image, already, hit.as_ref())?;
-    commit_image(wc, image, already, files, before.tree, work_id)
+    let placed = place_image(wc, image, already, hit.as_ref())?;
+    commit_image(wc, image, placed, before.tree, work_id)
 }
 
 /// Commits the placed image (and the file pointed at it); a failed commit
@@ -4963,8 +4996,7 @@ fn image_in(
 fn commit_image(
     wc: &WorkCopy,
     image: &Image,
-    already: bool,
-    files: Vec<String>,
+    placed: Placed,
     baseline: String,
     work_id: &str,
 ) -> Result<EditDone, Refused> {
@@ -4973,14 +5005,14 @@ fn commit_image(
         Err(e) => (None, Some(format!("reading the image's changes failed: {e}"))),
     };
     let message = format!("image: {} (work {work_id})", image.path);
-    let (commit, branch) = commit_run(wc, &files, &message).map_err(|e| {
+    let (commit, branch) = commit_run(wc, &placed.files, &message).map_err(|e| {
         let _ = git_quiet(wc, &["--literal-pathspecs", "reset", "--quiet", "HEAD", "--", &image.path]);
-        put_image_back(wc, image, already, files.get(1).map(String::as_str));
+        put_image_back(wc, image, &placed, placed.files.get(1).map(String::as_str));
         conflict(format!("couldn't commit the image: {e}"))
     })?;
     Ok(EditDone {
         result: serde_json::json!({"image": {"path": image.path, "url": image.url}}),
-        files,
+        files: placed.files,
         commit,
         branch,
         baseline,
@@ -4989,10 +5021,12 @@ fn commit_image(
     })
 }
 
-/// The one place `old` is in the tracked files, in a file with no
-/// uncommitted change; else the reply naming how many places hold it.
+/// The one place `old` is in the tracked files as a whole reference
+/// ([`crate::client_edit::find_reference`]: never the tail of a longer
+/// path), in a file with no uncommitted change; else the reply naming how
+/// many places hold it.
 fn one_reference(wc: &WorkCopy, old: &str) -> Result<EditHit, Refused> {
-    let mut hits = find_in_tracked(wc, old)?;
+    let mut hits = find_in_tracked(wc, old, crate::client_edit::find_reference)?;
     if hits.len() != 1 {
         return Err(image_not_committed(Some(hits.len() as u32), None));
     }
@@ -5019,31 +5053,49 @@ fn image_already_there(wc: &WorkCopy, image: &Image) -> Result<bool, Refused> {
     Ok(true)
 }
 
-/// Writes the image (unless `already` there) and points `hit` at it: the
-/// files to commit, image first. A failed step puts back what it changed.
-fn place_image(wc: &WorkCopy, image: &Image, already: bool, hit: Option<&EditHit>) -> Result<Vec<String>, Refused> {
+/// What [`place_image`] changed: the files to commit (the image first), and
+/// what it made that a failure takes out again.
+struct Placed {
+    files: Vec<String>,
+    /// darkmux wrote the image (it was not already there).
+    wrote: bool,
+    /// The folders it made for the image, outermost first.
+    made: Vec<String>,
+}
+
+/// Writes the image (unless `already` there) and points `hit` at it. A
+/// failed step puts back what it changed (a write that fails part way
+/// leaves nothing, [`crate::client_preview::at::write_new_making_folders`]).
+fn place_image(wc: &WorkCopy, image: &Image, already: bool, hit: Option<&EditHit>) -> Result<Placed, Refused> {
     use crate::client_preview::at;
-    if !already {
+    let made = if already {
+        Vec::new()
+    } else {
         at::write_new_making_folders(&wc.work_tree, &image.path, &image.bytes, 0o644)
-            .map_err(|e| conflict(format!("darkmux didn't add {}: {e}", image.path)))?;
-    }
-    let mut files = vec![image.path.clone()];
+            .map_err(|e| conflict(format!("darkmux didn't add {}: {e}", image.path)))?
+    };
+    let mut placed = Placed { files: vec![image.path.clone()], wrote: !already, made };
     if let Some((file, (start, end), text)) = hit {
         let edited = format!("{}{}{}", &text[..*start], image.url, &text[*end..]);
         if let Err(e) = at::replace_regular(&wc.work_tree, file, text.as_bytes(), edited.as_bytes()) {
-            put_image_back(wc, image, already, None);
+            put_image_back(wc, image, &placed, None);
             return Err(conflict(format!("darkmux didn't edit {file}: {e}")));
         }
-        files.push(file.clone());
+        placed.files.push(file.clone());
     }
-    Ok(files)
+    Ok(placed)
 }
 
 /// Takes out an image darkmux wrote (never one that was already there) and
-/// puts `edited` back as committed.
-fn put_image_back(wc: &WorkCopy, image: &Image, already: bool, edited: Option<&str>) {
-    if !already {
-        let _ = crate::client_preview::at::remove(&wc.work_tree, &image.path);
+/// the folders it made for it (innermost first; one that now holds anything
+/// stays), and puts `edited` back as committed.
+fn put_image_back(wc: &WorkCopy, image: &Image, placed: &Placed, edited: Option<&str>) {
+    use crate::client_preview::at;
+    if placed.wrote {
+        let _ = at::remove(&wc.work_tree, &image.path);
+    }
+    for folder in placed.made.iter().rev() {
+        let _ = at::remove_empty_folder(&wc.work_tree, folder);
     }
     if let Some(f) = edited {
         let _ = git_quiet(wc, &["--literal-pathspecs", "checkout", "HEAD", "--", f]);

@@ -96,9 +96,29 @@ fn push_shown(out: &mut Vec<(char, usize, usize)>, c: char, start: usize, end: u
 }
 
 /// The byte spans in `source` whose rendered text is `wanted` (already
-/// [`normalize`]d), without overlap, at most `limit` of them. Each place
-/// is looked at once, so it always ends.
+/// [`normalize`]d), without overlap, at most `limit` of them, as whole
+/// words: "more" is not found inside "furthermore". Each place is looked at
+/// once, so it always ends.
 pub fn find(source: &str, wanted: &str, limit: usize) -> Vec<(usize, usize)> {
+    find_whole(source, wanted, limit, char::is_alphanumeric)
+}
+
+/// [`find`] for an image reference (an `<img>`'s `src`, #3545): a path
+/// character ([`is_path_char`]) next to either end means the match is part
+/// of a longer path, so `hero.jpg` is not found inside `/assets/hero.jpg`,
+/// nor `/hero.jpg` inside `/thumbs/hero.jpg` or `/hero.jpg.bak`.
+pub fn find_reference(source: &str, wanted: &str, limit: usize) -> Vec<(usize, usize)> {
+    find_whole(source, wanted, limit, is_path_char)
+}
+
+/// A character that continues a path: a letter, a digit, `/`, `.`, `-`, `_`.
+fn is_path_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '/' | '.' | '-' | '_')
+}
+
+/// [`find`], with `joins` saying which characters continue a match: one
+/// next to either end, where the match itself ends in one, cuts it.
+fn find_whole(source: &str, wanted: &str, limit: usize, joins: fn(char) -> bool) -> Vec<(usize, usize)> {
     let want: Vec<char> = wanted.chars().collect();
     let page = rendered(source);
     let mut found = Vec::new();
@@ -111,7 +131,7 @@ pub fn find(source: &str, wanted: &str, limit: usize) -> Vec<(usize, usize)> {
         if found.len() >= limit {
             break;
         }
-        if at >= free && matches_at(&page, &want, at) {
+        if at >= free && matches_at(&page, &want, at, joins) {
             found.push((page[at].1, page[at + want.len() - 1].2));
             free = at + want.len();
         }
@@ -119,16 +139,16 @@ pub fn find(source: &str, wanted: &str, limit: usize) -> Vec<(usize, usize)> {
     found
 }
 
-/// Whether `want` is the rendered text at `at` in `page`, as whole words:
-/// "more" is not found inside "furthermore".
-fn matches_at(page: &[(char, usize, usize)], want: &[char], at: usize) -> bool {
+/// Whether `want` is the rendered text at `at` in `page`, whole: a
+/// character that `joins` it next to either end cuts it.
+fn matches_at(page: &[(char, usize, usize)], want: &[char], at: usize, joins: fn(char) -> bool) -> bool {
     let end = at + want.len();
-    let alnum = |i: Option<usize>| {
+    let joined = |i: Option<usize>| {
         i.and_then(|i| page.get(i))
-            .is_some_and(|(c, _, _)| c.is_alphanumeric())
+            .is_some_and(|(c, _, _)| joins(*c))
     };
-    let cut_word = (want[0].is_alphanumeric() && alnum(at.checked_sub(1)))
-        || (want[want.len() - 1].is_alphanumeric() && alnum(Some(end)));
+    let cut_word = (joins(want[0]) && joined(at.checked_sub(1)))
+        || (joins(want[want.len() - 1]) && joined(Some(end)));
     !cut_word && page[at..end].iter().map(|(c, _, _)| *c).eq(want.iter().copied())
 }
 
@@ -139,6 +159,24 @@ mod tests {
     fn one(source: &str, wanted: &str) -> Option<String> {
         let hits = find(source, &normalize(wanted), 2);
         (hits.len() == 1).then(|| source[hits[0].0..hits[0].1].to_string())
+    }
+
+    fn spans<'a>(source: &'a str, wanted: &str) -> Vec<&'a str> {
+        find_reference(source, wanted, 3).into_iter().map(|(a, b)| &source[a..b]).collect::<Vec<_>>()
+    }
+
+    /// (review) A reference is a whole path: never the tail or the head of
+    /// a longer one.
+    #[test]
+    fn a_reference_is_never_found_inside_a_longer_path() {
+        assert!(spans("<img src=\"/assets/hero.jpg\">", "hero.jpg").is_empty());
+        assert!(spans("<img src=\"/hero.jpg.bak\">", "/hero.jpg").is_empty());
+        assert!(spans("<img src=\"my_hero.jpg\"><img src=\"x-hero.jpg\">", "hero.jpg").is_empty());
+        let src = "<img src=\"/hero.jpg\"><img src=\"/thumbs/hero.jpg\">";
+        assert_eq!(spans(src, "/hero.jpg"), ["/hero.jpg"]);
+        assert_eq!(spans("url(/hero.jpg) '/hero.jpg?v=2'", "/hero.jpg"), ["/hero.jpg", "/hero.jpg"]);
+        // A hand edit's words still end at a slash or a dot, as prose does.
+        assert_eq!(one("<p>tea/coffee</p>", "coffee").as_deref(), Some("coffee"));
     }
 
     #[test]
