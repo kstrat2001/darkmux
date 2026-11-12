@@ -8425,9 +8425,15 @@ async fn an_image_body_past_the_image_cap_gets_the_image_routes_own_refusal() {
     let h = harness();
     let token = paired(&h).await;
     let _wt = image_workspace(&h);
+    // Worked out here, not read from the constant: 10 MiB as base64 is
+    // 13,981,016 characters; every one escaped (two bytes), CR LF written
+    // `\r\n` (four bytes) for each of its 218,454 64-character lines, and
+    // 64 KiB for the other fields.
+    let cap = 13_981_016 * 2 + 218_454 * 4 + 65_536;
+    assert_eq!(cap, 28_901_384);
     let at_cap = |extra: usize| {
         let json = format!("{{\"name\":\"a.png\",\"data\":\"{}\"}}", b64(PNG));
-        let pad = MAX_IMAGE_BODY_BYTES + extra - json.len();
+        let pad = cap + extra - json.len();
         format!("{json}{}", " ".repeat(pad))
     };
     let (code, v) = add_image_raw(&h, &token, at_cap(0)).await;
@@ -8933,6 +8939,18 @@ async fn an_image_whose_commit_fails_keeps_an_identical_image_already_staged() {
     assert_eq!(code, 409, "{v}");
     assert_eq!(work_copy_state(&wt), before, "still staged, as the person left it");
     assert_eq!(std::fs::read(wt.join(&at)).unwrap(), PNG, "their file stays");
+    // Other bytes staged at that name, the file since deleted: darkmux
+    // writes and stages its image there, and a failed commit puts the
+    // person's entry back as it was.
+    run_git(Some(&wt), &["rm", "--cached", "--quiet", &at]);
+    std::fs::remove_file(wt.join(&at)).unwrap();
+    index_only(&wt, &at, "theirs\n");
+    std::fs::remove_file(wt.join(&at)).unwrap();
+    let before = work_copy_state(&wt);
+    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "/hero.jpg"})).await;
+    assert_eq!(code, 409, "{v}");
+    assert_eq!(work_copy_state(&wt), before, "their staged entry as it was");
+    assert!(!wt.join(&at).exists(), "the image darkmux wrote is gone");
     std::fs::remove_file(lock).unwrap();
 }
 
