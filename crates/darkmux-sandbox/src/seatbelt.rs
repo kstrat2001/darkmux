@@ -104,9 +104,9 @@ mkdir -m 700 "$d/tmp" && printf '%s' "$2" > "$d/profile.sb" && printf '%s' "$3" 
 /// Runs the sandbox attached: `$d` set, `$1` the working directory (empty
 /// for none), then the program and its arguments. Records its own pid (the
 /// group's), survives the group's SIGTERM long enough to see the sandbox
-/// out, and removes the directory when it exits (with [`DRAIN`] and
-/// [`LAUNCHED`]: [`launcher`]). When its program ends, whatever the program
-/// left running in its process group is killed, until none is left (#3112).
+/// out, and removes the directory when it exits (with [`LAUNCHED`]:
+/// [`launcher`]). When its program ends, whatever the program left running
+/// in its process group is killed, until none is left (#3112).
 /// A process that moved to a group of its own (`setsid`, `setpgid`) is not
 /// reached: unlike a container's, this sandbox does not end everything in it.
 const LAUNCH: &str = r#"wd=$1; shift
@@ -119,33 +119,34 @@ rc=$?
 g=$$
 "#;
 
-/// Kills every process in group `$g` but `$$`, over and over until none is
-/// left (a fork-hopper's new pid appears after any one look), at most 200
-/// rounds. The look's own processes (the command substitution, itself in
-/// the group when `$g` is `$$`) have ended by the time each pid is checked,
-/// so they never count. A process that moved to a group of its own is not
-/// in it.
-const DRAIN: &str = r#"i=0
-while [ "$i" -lt 200 ]; do
-  live=
-  for m in $(/usr/bin/pgrep -g "$g" 2>/dev/null); do
-    [ "$m" = "$$" ] || ! kill -0 "$m" 2>/dev/null || live="$live $m"
-  done
-  [ -n "$live" ] || break
-  kill -KILL $live 2>/dev/null
-  i=$((i + 1))
+/// Ends every process in group `$g` from outside it (stop, remove and kill
+/// run in a group of their own): the whole group is killed at once, again
+/// and again until no process is left in it, at most 1000 times. One kill
+/// of a group reaches every member at that instant, so a process that keeps
+/// forking a new pid (a fork-hopper) is caught where a list of pids, always
+/// a step behind, is not. A process that moved to a group of its own is
+/// not in it.
+const DRAIN: &str = r#"n=0
+while [ "$n" -lt 1000 ] && kill -0 -- "-$g" 2>/dev/null; do
+  kill -KILL -- "-$g" 2>/dev/null
+  n=$((n + 1))
 done
 "#;
 
-/// The launcher's end: the group drained, the directory removed, the
-/// program's exit status its own.
-const LAUNCHED: &str = r#"rm -rf "$d"
+/// The launcher's end. It leads the group it must empty, so it cannot kill
+/// the group itself: it starts a helper in a group of its own that waits
+/// for the launcher to exit and then empties the group as [`DRAIN`] does,
+/// removes the directory, and exits with the program's status. Whatever the
+/// program left running in its group ends a few milliseconds after the
+/// launcher does.
+const LAUNCHED: &str = r#"/usr/bin/perl -e 'setpgrp(0, 0); my ($l, $g) = @ARGV; select(undef, undef, undef, 0.005) while kill(0, $l); for (1 .. 1000) { last unless kill(0, -$g); kill("KILL", -$g); }' "$$" "$g" </dev/null >/dev/null 2>&1 &
+rm -rf "$d"
 exit $rc
 "#;
 
 /// The whole launcher script.
 fn launcher() -> String {
-    format!("{LAUNCH}{DRAIN}{LAUNCHED}")
+    format!("{LAUNCH}{LAUNCHED}")
 }
 
 /// Whether `$d` is a sandbox's directory at all: only a directory holding

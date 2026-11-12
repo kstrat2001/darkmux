@@ -447,7 +447,8 @@ fn a_sandbox_ends_with_its_program(backend: &dyn SandboxBackend, host: &Host) {
         std::thread::sleep(Duration::from_millis(1200));
         len(&tree.path().join(name)) > before
     };
-    let hopper = "(h() { echo x >> hops; (h) & exit 0; }; h) &";
+    // Eight at once, so one snapshot of the group almost surely misses one.
+    let hopper = "for n in 1 2 3 4 5 6 7 8; do (h() { echo x >> hops; (h) & exit 0; }; h) & done;";
     let grouped = (host.new_group)("echo $$ > group.pid; while :; do echo x >> group; sleep 0.1; done");
     let script = format!("(sleep 2; echo outlived > left) & {hopper} {grouped} sleep 0.5; echo started");
     let p = policy(backend, host.image, tree.path(), &script);
@@ -463,6 +464,30 @@ fn a_sandbox_ends_with_its_program(backend: &dyn SandboxBackend, host: &Host) {
     assert!(!left, "a background process outlived its sandbox's program");
     assert!(!hops, "a fork-hopper outlived its sandbox's program");
     assert_eq!(group, host.a_new_group_outlives_the_program, "a process in a group of its own, after the program ended");
+}
+
+/// Removing a running sandbox ends fork-hoppers in it (eight at once), not
+/// only the processes one look at it would list.
+fn a_removal_ends_fork_hoppers(backend: &dyn SandboxBackend, host: &Host) {
+    let tree = tempfile::TempDir::new().unwrap();
+    let hops = tree.path().join("hops");
+    let script = "for n in 1 2 3 4 5 6 7 8; do (h() { echo x >> hops; (h) & exit 0; }; h) & done; sleep 300";
+    let p = policy(backend, host.image, tree.path(), script);
+    let (mut cmd, handle) = backend.run(&p);
+    let mut client = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while len(&hops) == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(len(&hops) > 0, "the hoppers never ran");
+    let removed = run_bounded(backend.remove(&handle), Duration::from_secs(30));
+    assert!(matches!(removed, Bounded::Finished { success: true, .. }), "{}", describe(&removed));
+    let _ = client.kill();
+    let _ = client.wait();
+    std::thread::sleep(Duration::from_millis(500));
+    let after = len(&hops);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(len(&hops), after, "a fork-hopper outlived its sandbox's removal");
 }
 
 /// A server on a port the policy does not name is never reached from the
@@ -691,6 +716,11 @@ macro_rules! conformance {
             #[ignore = $needs]
             fn a_server_on_an_unassigned_port_is_never_reached() {
                 super::a_server_on_an_unassigned_port_is_never_reached(&$make, &$host)
+            }
+            #[test]
+            #[ignore = $needs]
+            fn a_removal_ends_fork_hoppers() {
+                super::a_removal_ends_fork_hoppers(&$make, &$host)
             }
             #[test]
             #[ignore = $needs]

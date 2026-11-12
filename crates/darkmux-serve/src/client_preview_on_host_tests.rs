@@ -636,3 +636,25 @@ fn a_backend_switch_never_deletes_through_a_linked_folder() {
     assert!(refused.is_err(), "deleted through a link");
     assert!(outside.join("node_modules/keep").is_dir(), "deleted outside the workspace");
 }
+
+/// (#3112 review, MINOR 7) A preview on the host names its sandbox as a
+/// sandbox, never a container: its start line, a start that never came,
+/// and a stale heartbeat. Docker's wording is the one it always was.
+#[test]
+fn a_preview_on_the_host_is_never_called_a_container() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let at = a_run_in(&root);
+    let recipe = a_recipe(serde_json::json!({"schema_version": "1.1", "command": "x"}));
+    let spec = spec_in(BackendKind::Seatbelt, &recipe, &at, false, ("seatbelt".into(), None), Vec::new(), &Toolchain::default());
+    assert!(spec.script.starts_with("echo 'darkmux-preview: sandbox started'"), "{}", spec.script);
+    let log = root.join("log");
+    std::fs::write(&log, "sandbox-exec: something failed\n").unwrap();
+    let never = exit_reason_in(BackendKind::Seatbelt, &recipe, &log, Err(std::io::Error::other("gone")));
+    assert!(never.starts_with("the preview sandbox did not start"), "{never}");
+    std::fs::write(&log, format!("{ON_HOST_STARTED_LINE}\n{STALE_LINE}\n")).unwrap();
+    let stale = exit_reason_in(BackendKind::Seatbelt, &recipe, &log, Err(std::io::Error::other("gone")));
+    assert_eq!(stale, "the preview's sandbox stopped itself: darkmux stopped answering");
+    std::fs::write(&log, format!("{STARTED_LINE}\n{STALE_LINE}\n")).unwrap();
+    assert_eq!(exit_reason(&recipe, &log, Err(std::io::Error::other("gone"))), "the preview's container stopped itself: darkmux stopped answering");
+}
