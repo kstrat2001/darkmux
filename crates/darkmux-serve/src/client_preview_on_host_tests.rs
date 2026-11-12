@@ -373,6 +373,9 @@ fn a_stale_seatbelt_preview_ends_with_its_dev_server() {
         child.try_wait().unwrap()
     });
     let grown = |f: &Path| std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
+    // The launcher's guard empties the group a moment after the launcher
+    // exits (it looks every 50 ms; a loaded CI runner is slower): let it.
+    std::thread::sleep(Duration::from_millis(600));
     let after = grown(&at.workdir.join("beat.txt"));
     std::thread::sleep(Duration::from_millis(800));
     let later = grown(&at.workdir.join("beat.txt"));
