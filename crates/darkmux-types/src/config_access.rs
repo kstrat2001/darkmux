@@ -794,6 +794,56 @@ fn clients_preview_idle_minutes_with_source_in(cfg: &DarkmuxConfig) -> (u64, Sou
     );
     (v.unwrap_or(CLIENTS_PREVIEW_IDLE_MINUTES_DEFAULT), s)
 }
+/// (#3544) The developer team that signs Mux Bot: the built-in
+/// `clients.pairing.verified_teams`.
+pub const CLIENTS_PAIRING_VERIFIED_TEAMS_DEFAULT: &[&str] = &["5LDXYW8B6T"];
+/// (#3544) The teams whose signed Mux Bot pairs on this machine with no
+/// dialog, against `cfg`: `env(DARKMUX_CLIENTS_PAIRING_VERIFIED_TEAMS)`
+/// (comma-separated, trimmed, empty entries dropped) >
+/// `cfg.clients.pairing.verified_teams` > Mux Bot's team. Empty: none.
+pub fn clients_pairing_verified_teams_in(cfg: &DarkmuxConfig) -> Vec<String> {
+    clients_pairing_verified_teams_with_source_in(cfg).0
+}
+/// [`clients_pairing_verified_teams_in`] and the tier that set it.
+fn clients_pairing_verified_teams_with_source_in(cfg: &DarkmuxConfig) -> (Vec<String>, Source) {
+    if let Some(s) = env_str("DARKMUX_CLIENTS_PAIRING_VERIFIED_TEAMS") {
+        return (s.split(',').map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).collect(), Source::Env);
+    }
+    match cfg.clients.as_ref().and_then(|c| c.pairing.as_ref()).and_then(|p| p.verified_teams.clone()) {
+        Some(list) => (list, Source::Config),
+        None => (CLIENTS_PAIRING_VERIFIED_TEAMS_DEFAULT.iter().map(|t| t.to_string()).collect(), Source::BuiltIn),
+    }
+}
+/// (#3544) Whether an app that does not verify gets a native Allow dialog,
+/// against `cfg`: `env(DARKMUX_CLIENTS_PAIRING_DIALOG)` >
+/// `cfg.clients.pairing.dialog` > `true`. An unrecognized env token leaves it on.
+pub fn clients_pairing_dialog_in(cfg: &DarkmuxConfig) -> bool {
+    clients_pairing_dialog_with_source_in(cfg).0
+}
+/// [`clients_pairing_dialog_in`] and the tier that set it.
+fn clients_pairing_dialog_with_source_in(cfg: &DarkmuxConfig) -> (bool, Source) {
+    if let Some(s) = env_str("DARKMUX_CLIENTS_PAIRING_DIALOG") {
+        return (parse_bool_token(&s).unwrap_or(true), Source::Env);
+    }
+    match cfg.clients.as_ref().and_then(|c| c.pairing.as_ref()).and_then(|p| p.dialog) {
+        Some(on) => (on, Source::Config),
+        None => (true, Source::BuiltIn),
+    }
+}
+/// [`clients_pairing_verified_teams_in`] against this process's config tier.
+pub fn clients_pairing_verified_teams() -> Vec<String> {
+    clients_pairing_verified_teams_in(config())
+}
+/// [`clients_pairing_verified_teams_in`] against this process's config tier,
+/// and the tier that set it.
+pub fn clients_pairing_verified_teams_with_source() -> (Vec<String>, Source) {
+    clients_pairing_verified_teams_with_source_in(config())
+}
+/// [`clients_pairing_dialog_in`] against this process's config tier, and
+/// the tier that set it.
+pub fn clients_pairing_dialog_with_source() -> (bool, Source) {
+    clients_pairing_dialog_with_source_in(config())
+}
 /// [`clients_profiles_in`] against this process's config tier.
 pub fn clients_profiles() -> Option<Vec<String>> {
     clients_profiles_in(config())
@@ -1907,6 +1957,58 @@ pub fn memory_pressure_gate() -> Result<crate::config::PressureGate, crate::conf
     resolve_enum("runtime.memory.pressure_gate").map(|(v, _)| v)
 }
 
+// ── Sandbox (#3112) ──
+/// The sandbox every isolated run uses (a dispatch, a lab run's tests, the
+/// mods gate): `env(DARKMUX_SANDBOX) > config.runtime.sandbox > this host's
+/// default` ([`sandbox_default`]). An unregistered value is an error naming
+/// the key, never a fallback: every entry point refuses it at preflight.
+pub fn sandbox() -> Result<crate::config::SandboxKind, crate::config_enum::BadEnumValue> {
+    sandbox_with_source().map(|(v, _)| v)
+}
+
+/// [`sandbox`] plus WHICH tier resolved it.
+pub fn sandbox_with_source(
+) -> Result<(crate::config::SandboxKind, Source), crate::config_enum::BadEnumValue> {
+    resolve_enum("runtime.sandbox")
+}
+
+/// [`sandbox_with_source`] against `cfg` (a `config.json` read fresh), the
+/// env tier still live: for a long-running process that reads its config
+/// per request (`darkmux client serve`).
+pub fn sandbox_with_source_in(
+    cfg: &DarkmuxConfig,
+) -> Result<(crate::config::SandboxKind, Source), crate::config_enum::BadEnumValue> {
+    let setting = crate::config_enum::setting("runtime.sandbox").expect("runtime.sandbox is registered");
+    let (token, source) = crate::config_enum::resolve_in(setting, cfg, env_str)?;
+    let kind = <crate::config::SandboxKind as crate::config_enum::ConfigEnum>::from_token(token)
+        .expect("a resolved token is a token of the registered enum");
+    Ok((kind, source))
+}
+
+/// The sandbox an absent `runtime.sandbox` resolves to on this host: the
+/// platform's answer ([`sandbox_default_on`]). A test build (the
+/// `test-support` feature, the same switch that hands it an empty config)
+/// gets Docker on every host, so no test's outcome depends on the machine
+/// it runs on; the platform's answer is tested through
+/// [`sandbox_default_on`].
+pub fn sandbox_default() -> &'static str {
+    sandbox_default_for(cfg!(feature = "test-support"), darkmux_platform::current())
+}
+
+/// [`sandbox_default`] for a build that is (`test_build`) or is not a test
+/// build, on `platform`.
+fn sandbox_default_for(test_build: bool, platform: &dyn darkmux_platform::Platform) -> &'static str {
+    if test_build {
+        return crate::config::SandboxKind::Docker.as_str();
+    }
+    sandbox_default_on(platform)
+}
+
+/// The default sandbox `platform` names, as its `runtime.sandbox` token.
+fn sandbox_default_on(platform: &dyn darkmux_platform::Platform) -> &'static str {
+    crate::config::SandboxKind::from(platform.default_sandbox()).as_str()
+}
+
 /// OS thermal state at or above which the governor pauses. Default
 /// `serious`. (#2947) An unrecognized state is an error: it used to pass
 /// through, and the governor disarmed its soft tiers on it, so a typo
@@ -2747,6 +2849,9 @@ mod location_guard {
         ("cmd_allowed_verbs", "CLI verb names"),
         ("clients_profiles", "profile names a paired client app may run on"),
         ("clients_profiles_in", "profile names a paired client app may run on, against a given config"),
+        ("CLIENTS_PAIRING_VERIFIED_TEAMS_DEFAULT", "developer team ids, public in the source"),
+        ("clients_pairing_verified_teams_in", "developer team ids, against a given config"),
+        ("clients_pairing_verified_teams", "developer team ids"),
         ("hooks_enabled_provenance", "which tier set a switch"),
         ("check_retired_env", "the same leftovers as `retired_env_leftovers`, split by policy"),
         ("role_profiles", "role and profile names"),
@@ -2755,6 +2860,10 @@ mod location_guard {
         ("detection_degeneracy_policy", "an enum value"),
         ("thermal_pause_at", "an enum value"),
         ("memory_pressure_gate", "an enum value"),
+        ("sandbox", "an enum value"),
+        ("sandbox_with_source", "an enum value and its tier"),
+        ("sandbox_default", "an enum token"),
+        ("sandbox_with_source_in", "an enum value and its tier"),
         ("MEMORY_PRESSURE_GATE_DEFAULT", "the default memory pressure gate token, public in the source"),
         ("thermal_resume_at", "an enum value"),
         ("resolved_locations", "the union of LOCATION_ACCESSORS itself"),
@@ -3011,6 +3120,49 @@ mod location_guard {
     }
 }
 
+
+#[cfg(test)]
+mod sandbox_setting {
+    use super::*;
+    use darkmux_platform::{DefaultSandbox, FakePlatform};
+
+    /// (#3112) Absent `runtime.sandbox`, a host runs the sandbox its
+    /// platform names: Seatbelt on a Mac with `sandbox-exec`, Docker else.
+    #[test]
+    fn the_default_sandbox_is_the_platforms_answer() {
+        let on = |d| sandbox_default_on(&FakePlatform { default_sandbox: d, ..FakePlatform::default() });
+        assert_eq!(on(DefaultSandbox::Seatbelt), "seatbelt");
+        assert_eq!(on(DefaultSandbox::Docker), "docker");
+    }
+
+    /// (#3112 review) A release build takes the platform's answer; only a
+    /// test build pins Docker. Both branches, on a fake platform.
+    #[test]
+    fn a_release_build_takes_the_platforms_default_and_a_test_build_pins_docker() {
+        let mac = FakePlatform { default_sandbox: DefaultSandbox::Seatbelt, ..FakePlatform::default() };
+        assert_eq!(sandbox_default_for(false, &mac), "seatbelt");
+        assert_eq!(sandbox_default_for(true, &mac), "docker");
+        let linux = FakePlatform { default_sandbox: DefaultSandbox::Docker, ..FakePlatform::default() };
+        assert_eq!(sandbox_default_for(false, &linux), "docker");
+    }
+
+    /// `env > config.json > the host's default`, each tier named.
+    #[test]
+    fn the_sandbox_resolves_env_over_config_over_the_default() {
+        let s = crate::config_enum::setting("runtime.sandbox").unwrap();
+        let cfg: crate::config::DarkmuxConfig =
+            serde_json::from_value(serde_json::json!({"runtime": {"sandbox": "seatbelt"}})).unwrap();
+        let none = |_: &str| None;
+        let env_docker = |v: &str| (v == "DARKMUX_SANDBOX").then(|| "docker".to_string());
+        assert_eq!(crate::config_enum::resolve_in(s, &cfg, none), Ok(("seatbelt", Source::Config)));
+        assert_eq!(crate::config_enum::resolve_in(s, &cfg, env_docker), Ok(("docker", Source::Env)));
+        assert_eq!(
+            crate::config_enum::resolve_in(s, &crate::config::DarkmuxConfig::default(), none),
+            Ok(("docker", Source::BuiltIn))
+        );
+        assert_eq!(sandbox(), Ok(crate::config::SandboxKind::Docker));
+    }
+}
 
 #[cfg(test)]
 mod detection_policy_regression {
@@ -4414,6 +4566,48 @@ mod tests {
             match prev {
                 Some(v) => std::env::set_var(key, v),
                 None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    /// (#3544) `clients.pairing.*`: env > config > Mux Bot's team and the
+    /// dialog on; an empty team list is none, not the default.
+    #[serial_test::serial]
+    #[test]
+    fn clients_pairing_settings_are_env_then_config_then_default() {
+        let keys = ["DARKMUX_CLIENTS_PAIRING_VERIFIED_TEAMS", "DARKMUX_CLIENTS_PAIRING_DIALOG"];
+        let prev: Vec<Option<String>> = keys.iter().map(|k| std::env::var(k).ok()).collect();
+        for k in keys {
+            unsafe { std::env::remove_var(k); }
+        }
+        let with = |teams: Option<Vec<String>>, dialog: Option<bool>| crate::config::DarkmuxConfig {
+            clients: Some(crate::config::ClientsConfig {
+                pairing: Some(crate::config::ClientsPairingConfig { verified_teams: teams, dialog, ..Default::default() }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let unset = crate::config::DarkmuxConfig::default();
+        assert_eq!(clients_pairing_verified_teams_with_source_in(&unset), (vec!["5LDXYW8B6T".to_string()], Source::BuiltIn));
+        assert_eq!(clients_pairing_dialog_with_source_in(&unset), (true, Source::BuiltIn));
+        let empty = with(Some(vec![]), Some(false));
+        assert_eq!(clients_pairing_verified_teams_with_source_in(&empty), (vec![], Source::Config), "empty is none");
+        assert_eq!(clients_pairing_dialog_with_source_in(&empty), (false, Source::Config));
+        unsafe {
+            std::env::set_var(keys[0], " AAAAAAAAAA, ,BBBBBBBBBB ");
+            std::env::set_var(keys[1], "off");
+        }
+        assert_eq!(
+            clients_pairing_verified_teams_with_source_in(&empty),
+            (vec!["AAAAAAAAAA".to_string(), "BBBBBBBBBB".to_string()], Source::Env)
+        );
+        assert_eq!(clients_pairing_dialog_with_source_in(&with(None, Some(true))), (false, Source::Env));
+        for (k, v) in keys.iter().zip(prev) {
+            unsafe {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
             }
         }
     }

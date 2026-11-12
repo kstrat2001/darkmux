@@ -115,6 +115,8 @@ mod client_cli;
 pub use darkmux_serve as serve;
 mod skills;
 mod phase_review;
+// (#3112) Hidden helper subcommands (`darkmux runtime …`), routed first.
+mod multicall;
 // #463 workspace split (PR2) — profiles/ownership extracted to the
 // darkmux-profiles crate. These re-exports keep crate::{profiles,
 // ownership}::* paths resolving. (2.0, #1405: the `runtime` module — the
@@ -143,7 +145,22 @@ pub(crate) fn test_run() -> darkmux_types::session_id::RunId {
     darkmux_types::session_id::RunId::mission("m-test").expect("a literal run id is never empty")
 }
 
-fn main() -> Result<()> {
+fn main() -> multicall::Exit {
+    // (#3112) A hidden helper (`darkmux runtime …`) is handed over before
+    // anything else runs (`multicall`'s module doc says why).
+    match multicall::hand_over() {
+        Some(code) => multicall::Exit::Helper(code),
+        None => {
+            // (#3112 review) Which file this process started from, before
+            // anything can replace it: a Seatbelt dispatch runs only that.
+            darkmux_crew::dispatch_internal::note_executable_at_start();
+            multicall::Exit::Darkmux(darkmux_main())
+        }
+    }
+}
+
+/// Every darkmux command but the runtime.
+fn darkmux_main() -> Result<()> {
     providers::register_builtins()?;
     let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
     let cli = Cli::parse_from(argv);
@@ -2105,11 +2122,27 @@ fn cmd_init(opts: init::InitOptions) -> Result<i32> {
                 .unwrap_or_else(|| "the profile registry".to_string());
             step(&format!("Edit {path} to point at a downloaded model (`lms ls` lists them)"));
         }
-        step("First answer, no Docker needed: `darkmux radio \"do you have a brain?\"`");
-        step("Check the setup: `darkmux doctor`");
-        step("With Docker running, a first dispatch: `darkmux dispatch code-reviewer \"What do you do?\"` (the runtime image is pulled on first use)");
+        first_steps(darkmux_types::config_access::sandbox().ok()).into_iter().for_each(&mut step);
     }
     Ok(0)
+}
+
+/// (#3112) `init`'s last three next steps. The first dispatch runs in the
+/// configured sandbox (`sandbox`, `None` when the setting is refused): Docker
+/// is named only when that is Docker.
+fn first_steps(sandbox: Option<darkmux_types::config::SandboxKind>) -> [&'static str; 3] {
+    match sandbox {
+        Some(darkmux_types::config::SandboxKind::Seatbelt) => [
+            "First answer: `darkmux radio \"do you have a brain?\"`",
+            "Check the setup: `darkmux doctor`",
+            "A first dispatch, in macOS's own sandbox (no Docker needed): `darkmux dispatch code-reviewer \"What do you do?\"`",
+        ],
+        _ => [
+            "First answer, no Docker needed: `darkmux radio \"do you have a brain?\"`",
+            "Check the setup: `darkmux doctor`",
+            "With Docker running, a first dispatch: `darkmux dispatch code-reviewer \"What do you do?\"` (the runtime image is pulled on first use; `runtime.sandbox` is `docker`)",
+        ],
+    }
 }
 
 fn profile_matches(

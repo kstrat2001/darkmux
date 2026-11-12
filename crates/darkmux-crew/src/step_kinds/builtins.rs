@@ -39,6 +39,32 @@ use std::sync::Mutex;
 /// identical across both. `input` iterates in `BTreeMap` key order
 /// (dependency step id), so the composed text is deterministic regardless
 /// of completion order.
+/// (#3112 review) The placeholder a step's `message` names its dispatch's
+/// workspace with.
+pub const WORKSPACE_ROOT_PLACEHOLDER: &str = "${WORKSPACE_ROOT}";
+
+/// (#3112 review) `message` with [`WORKSPACE_ROOT_PLACEHOLDER`] replaced by
+/// where a `kind` sandbox sees `workdir`: `/workspace` in a container, the
+/// workdir's own path in a sandbox on the host. With no workdir yet (a
+/// fresh tempdir the dispatch makes later) the placeholder is left for the
+/// dispatch, which expands it against that tempdir when it writes the
+/// prompt file (`dispatch_internal::prompt_file_text`). A message without
+/// the placeholder, every user-copied config written before it, is returned
+/// unchanged. The placeholder is darkmux's in every dispatch message, a
+/// CLI `darkmux dispatch` one included.
+pub(crate) fn expand_workspace_root(
+    message: &str,
+    kind: Option<darkmux_sandbox::BackendKind>,
+    workdir: Option<&std::path::Path>,
+) -> String {
+    match workdir {
+        Some(w) if message.contains(WORKSPACE_ROOT_PLACEHOLDER) => {
+            message.replace(WORKSPACE_ROOT_PLACEHOLDER, &darkmux_sandbox::seen_at(kind, w, "/workspace"))
+        }
+        _ => message.to_string(),
+    }
+}
+
 fn compose_message(base: &str, input: &BTreeMap<String, String>) -> String {
     if input.is_empty() {
         return base.to_string();
@@ -543,12 +569,13 @@ pub(crate) fn dispatch_opts_for(
         // method returns, so the message is byte-identical to before.
         anyhow!("step `{}`: `dispatch.internal` requires task.role_id or config.role_id", step.id)
     })?;
-    let message = compose_message(cfg.message.as_deref().unwrap_or_default(), input);
     let timeout_seconds = cfg.timeout_seconds.map_or(3600, |c| c.saturating_u32());
     let profile_name = task.profile_name.clone().or(cfg.profile_name);
     let image = task.image.clone().or(cfg.image);
     let config_path = cfg.config_path;
     let workdir = task.workdir.clone().or_else(|| cfg.workdir.map(std::path::PathBuf::from));
+    let base = expand_workspace_root(cfg.message.as_deref().unwrap_or_default(), darkmux_sandbox::selected().ok(), workdir.as_deref());
+    let message = compose_message(&base, input);
     // The owning Task names the phase for every step minted from a mission
     // config; the step config's own `phase_id` (the crew-of-one's way of
     // passing the CLI's `--phase`) wins when present. Without the task
@@ -4221,6 +4248,65 @@ mod tests {
              actually addresses, not the bare config.model: {:?}",
             error_bookends[0]
         );
+    }
+
+    #[test]
+    fn a_step_message_names_the_workspace_where_the_sandbox_sees_it() {
+        // (#3112 review) `${WORKSPACE_ROOT}` in a step's message is where its
+        // dispatch's sandbox sees the workdir: `/workspace` in a container
+        // (the shipped configs' old literal, byte for byte), the workdir's own
+        // path in a sandbox on the host. A message without it is untouched.
+        use darkmux_sandbox::BackendKind;
+        let dir = tempfile::TempDir::new().unwrap();
+        let real = dir.path().canonicalize().unwrap().display().to_string();
+        let msg = "mounted at `${WORKSPACE_ROOT}/<source>`, so `${WORKSPACE_ROOT}/<source>/src/x.ts`";
+        assert_eq!(
+            expand_workspace_root(msg, Some(BackendKind::Docker), Some(dir.path())),
+            "mounted at `/workspace/<source>`, so `/workspace/<source>/src/x.ts`"
+        );
+        assert_eq!(
+            expand_workspace_root(msg, Some(BackendKind::Seatbelt), Some(dir.path())),
+            format!("mounted at `{real}/<source>`, so `{real}/<source>/src/x.ts`")
+        );
+        let plain = "a user's own message names /workspace";
+        assert_eq!(expand_workspace_root(plain, Some(BackendKind::Seatbelt), Some(dir.path())), plain);
+    }
+
+    /// (#3112 review) The production wiring: `dispatch.internal` expands the
+    /// placeholder through `selected()`, never leaving it for the model.
+    /// Under Docker (a test build's default) it is `/workspace`; under
+    /// `DARKMUX_SANDBOX=seatbelt` (on a Mac) the workdir's own path.
+    #[test]
+    #[serial_test::serial]
+    fn dispatch_internal_expands_the_workspace_placeholder_through_the_selection() {
+        let dir = TempDir::new().unwrap();
+        let cfg = json!({"role_id": "coder", "workdir": dir.path().display().to_string(),
+            "message": "read `${WORKSPACE_ROOT}/<source>/x`"});
+        let opts_now = || dispatch_opts_for(&step("s1", "dispatch.internal", cfg.clone()), &empty_task(), &BTreeMap::new(), &StepRunCtx::for_test()).unwrap();
+        assert_eq!(opts_now().message, "read `/workspace/<source>/x`");
+        if !darkmux_sandbox::SeatbeltBackend::available() {
+            return;
+        }
+        let prev = std::env::var_os("DARKMUX_SANDBOX");
+        unsafe { std::env::set_var("DARKMUX_SANDBOX", "seatbelt") };
+        let seatbelt = opts_now().message;
+        unsafe {
+            match prev { Some(v) => std::env::set_var("DARKMUX_SANDBOX", v), None => std::env::remove_var("DARKMUX_SANDBOX") }
+        }
+        let real = dir.path().canonicalize().unwrap().display().to_string();
+        assert_eq!(seatbelt, format!("read `{real}/<source>/x`"));
+    }
+
+    /// (#3112 review) The shipped mod-writer messages name the repository
+    /// through the placeholder, never the container-only literal.
+    #[test]
+    fn the_shipped_mod_writer_messages_use_the_workspace_placeholder() {
+        for name in ["review.json", "crawl.json"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates/builtin/mission-configs").join(name);
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(text.contains("${WORKSPACE_ROOT}/<source>"), "{name}");
+            assert!(!text.contains("`/workspace/<source>"), "{name} still names the container path");
+        }
     }
 
     #[test]

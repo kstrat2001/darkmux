@@ -3283,6 +3283,132 @@ fn the_unit_dispatch_message_is_frozen_with_and_without_intent() {
     assert_ne!(plain, with_intent, "the intent block must actually render");
 }
 
+/// (#3112 review) The production wiring, through `selected()`: under
+/// `DARKMUX_SANDBOX=seatbelt` (on a Mac) a unit's dispatch is briefed with
+/// the tree's own path and stamps it as `context.root`; under Docker (a test
+/// build's default) it says `/workspace` and stamps nothing.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME and DARKMUX_SANDBOX, process-globals
+fn a_units_dispatch_is_briefed_with_the_tree_where_the_selected_sandbox_sees_it() {
+    let dispatched = |sandbox: Option<&str>| {
+        let home = TempDir::new().unwrap();
+        let _g = HomeGuard::set(home.path());
+        save_phase(PHASE, MISSION);
+        let ws = TempDir::new().unwrap();
+        let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"a".repeat(40));
+        let out = seeded_out_dir(ws.path(), 0);
+        let seen: Arc<std::sync::Mutex<Option<DispatchOpts>>> = Arc::new(std::sync::Mutex::new(None));
+        let captured = seen.clone();
+        let kind = DispatchUnitStepKind::with_dispatch(Arc::new(move |opts: DispatchOpts| {
+            *captured.lock().unwrap() = Some(opts);
+            ok_result(envelope("stop", 100, 20, 5_000), out.clone())
+        }));
+        let step = unit_step(serde_json::json!({"plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "unnamed-predicate"}));
+        let prev = std::env::var_os("DARKMUX_SANDBOX");
+        if let Some(v) = sandbox {
+            unsafe { std::env::set_var("DARKMUX_SANDBOX", v) };
+        }
+        let ran = kind.run(&step, &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap()));
+        unsafe {
+            match prev { Some(v) => std::env::set_var("DARKMUX_SANDBOX", v), None => std::env::remove_var("DARKMUX_SANDBOX") }
+        }
+        ran.unwrap();
+        let opts = seen.lock().unwrap().take().unwrap();
+        (opts, ws.path().join("tree").canonicalize().unwrap().display().to_string(), ws)
+    };
+    let (docker, _, _ws) = dispatched(None);
+    assert!(docker.message.contains("- /workspace/app/src/a.ts"), "{}", docker.message);
+    assert_eq!(docker.record_context.as_ref().unwrap().root, None);
+    if !darkmux_sandbox::SeatbeltBackend::available() {
+        return;
+    }
+    let (seatbelt, tree, _ws) = dispatched(Some("seatbelt"));
+    assert!(seatbelt.message.contains(&format!("- {tree}/app/src/a.ts")) && !seatbelt.message.contains("/workspace"), "{}", seatbelt.message);
+    assert_eq!(seatbelt.record_context.as_ref().unwrap().root.as_deref(), Some(tree.as_str()));
+}
+
+/// (#3112 review) Under a sandbox on the host the unit's brief names the
+/// tree where that sandbox sees it, in every path it lists and in the
+/// finding instructions; under Docker it is the frozen `/workspace` message,
+/// byte for byte.
+#[test]
+fn a_unit_brief_names_the_tree_where_the_sandbox_sees_it() {
+    let rule = builtin_rule("swallowed-error");
+    let mut rules_by_id = BTreeMap::new();
+    rules_by_id.insert(rule.id.clone(), rule.clone());
+    let site = Unit::Site {
+        id: "u-1".into(),
+        rule: rule.id.clone(),
+        source: "app".into(),
+        sites: vec![Site { file: "src/orders.ts".into(), line: 41, start: 30, end: 55, hits: vec![41] }],
+        est_tokens: 120,
+    };
+    let read = Unit::Read {
+        id: "u-2".into(),
+        rules: vec![rule.id.clone()],
+        source: "app".into(),
+        files: vec![ReadFileEntry::Whole("src/util.ts".into())],
+        est_tokens: 10,
+    };
+    for unit in [&site, &read] {
+        let docker = build_message_at("/workspace", &rules_by_id, unit, None).unwrap();
+        assert_eq!(docker, build_message(&rules_by_id, unit, None).unwrap(), "Docker is the frozen message");
+        let host = build_message_at("/Users/op/tree", &rules_by_id, unit, None).unwrap();
+        assert!(!host.contains("/workspace"), "{host}");
+        assert!(host.contains("`/Users/op/tree/app`") && host.contains("- /Users/op/tree/app/src/"), "{host}");
+        assert!(host.contains("starting with `/Users/op/tree/`"), "{host}");
+    }
+}
+
+/// (#3112 review) The unit's dispatch stamps where its sandbox saw the tree
+/// on every record (`context.root`), off `/workspace` only, so the finding
+/// store maps a host-seen finding back to the source and a Docker run's
+/// records are unchanged.
+#[test]
+fn a_units_dispatch_stamps_the_host_seen_root_on_its_context() {
+    let src = include_str!("unit_step.rs");
+    let ctx_at = src.find("record_context: Some(RecordContext {").expect("the unit's record context");
+    let block = &src[ctx_at..ctx_at + 400];
+    assert!(
+        block.contains("root: darkmux_crew::findings::host_root(Some(&ctx.tree_seen)).map(str::to_string),"),
+        "the unit's context must carry the host-seen root: {block}"
+    );
+    assert_eq!(darkmux_crew::findings::host_root(Some("/workspace")), None);
+    assert_eq!(darkmux_crew::findings::host_root(Some("/Users/op/tree/")), Some("/Users/op/tree"));
+}
+
+/// (#3112 review) The unit's run-local findings map back from the root its
+/// brief named: a finding under a host-seen root is stored exactly as one
+/// under `/workspace`.
+#[test]
+fn a_units_readback_maps_a_host_seen_finding_like_a_workspace_one() {
+    let stored = |tree_seen: &str, file: &str| {
+        let tmp = TempDir::new().unwrap();
+        let out = tmp.path().join("out");
+        fs::create_dir_all(out.join(".darkmux-runtime")).unwrap();
+        fs::write(out.join(".darkmux-runtime/findings.jsonl"), format!("{}\n", json!({"file": file, "line": 3}))).unwrap();
+        let run = RunId::lab("r3112").unwrap();
+        let ctx = UnitContext {
+            workspace: "ws".into(),
+            unit_id: "u-1".into(),
+            source: "app".into(),
+            sha: "abc".into(),
+            rule_ids: vec!["r".into()],
+            sites: json!([]),
+            session_id: SessionId::adhoc(run, "crawler", "u-1"),
+            tree_root: tmp.path().join("tree"),
+            tree_seen: tree_seen.to_string(),
+        };
+        let into = tmp.path().join("findings.jsonl");
+        let session = ctx.session_id.clone();
+        readback_findings(&ctx, &out, &into, None, &session, None);
+        let line: Value = serde_json::from_str(fs::read_to_string(&into).unwrap().lines().next().unwrap()).unwrap();
+        line[FINDING_FILE_KEY].clone()
+    };
+    assert_eq!(stored("/workspace", "/workspace/app/src/x.ts"), json!("src/x.ts"));
+    assert_eq!(stored("/Users/op/tree", "/Users/op/tree/app/src/x.ts"), json!("src/x.ts"));
+}
+
 // ── (#2310 fix-loop E2) `draws`: a named ceiling, and dedup that only
 //    fires when there is more than one draw to dedup ACROSS ──────────────
 

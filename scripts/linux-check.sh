@@ -13,7 +13,9 @@ fi
 step() { printf '\n== %s\n' "$1"; }
 
 step "clippy: whole workspace, all targets, no warnings"
-cargo clippy --workspace --all-targets -- -D warnings
+# (#3112) darkmux-runtime-linked's library is runtime/src, whose tests need
+# runtime/'s own dev-dependencies; they are linted from runtime/.
+cargo clippy --workspace --exclude darkmux-runtime-linked --all-targets -- -D warnings
 
 step "tests: the crates whose answers differ by OS"
 if command -v cargo-nextest >/dev/null; then

@@ -2542,6 +2542,9 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn health_reports_whether_the_daemon_finds_docker_to_this_machine_only() {
+        // Its own process: it empties `PATH`, which a test spawning git
+        // alongside in this binary would read.
+        darkmux_types::run_in_own_process!();
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join("docker"), "").unwrap();
         #[cfg(unix)]
@@ -2565,6 +2568,70 @@
         assert!(proxied["docker_on_path"].is_null(), "{proxied}");
         assert_eq!(missing["docker_on_path"], false, "{missing}");
         assert!(!found.to_string().contains(&dir.path().display().to_string()), "the path never appears");
+        // (#3112) The sandbox the daemon runs isolated work in, to this
+        // machine only (a test build's default is Docker on every host).
+        assert_eq!(found["sandbox"], "docker", "{found}");
+        assert!(proxied["sandbox"].is_null(), "{proxied}");
+    }
+
+    /// (#3112 review) The daemon pins nothing: a process it starts reads
+    /// `config.json` as it is then, so `config set runtime.sandbox` takes
+    /// effect for them at once and they report its true source. `/health`
+    /// says both: `sandbox`, what this daemon's own work runs in (its
+    /// start-time setting), and `sandbox_configured`, what a process started
+    /// now (every child included) runs in.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn health_names_the_daemons_own_sandbox_and_the_configured_one() {
+        darkmux_types::run_in_own_process!();
+        let home = tempfile::TempDir::new().unwrap();
+        let (prev_home, prev_sb) = (std::env::var_os("DARKMUX_HOME"), std::env::var_os("DARKMUX_SANDBOX"));
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", home.path());
+            std::env::remove_var("DARKMUX_SANDBOX");
+        }
+        std::fs::write(home.path().join("config.json"), r#"{"runtime": {"sandbox": "docker"}}"#).unwrap();
+        let docker = loopback_health(&[]).await;
+        let seatbelt_here = darkmux_sandbox::SeatbeltBackend::available();
+        if seatbelt_here {
+            std::fs::write(home.path().join("config.json"), r#"{"runtime": {"sandbox": "seatbelt"}}"#).unwrap();
+        }
+        let after_set = loopback_health(&[]).await;
+        unsafe {
+            match prev_home { Some(v) => std::env::set_var("DARKMUX_HOME", v), None => std::env::remove_var("DARKMUX_HOME") }
+            if let Some(v) = prev_sb { std::env::set_var("DARKMUX_SANDBOX", v) }
+        }
+        assert_eq!(docker["sandbox"], "docker", "{docker}");
+        assert_eq!(docker["sandbox_configured"], "docker", "{docker}");
+        if seatbelt_here {
+            assert_eq!(after_set["sandbox"], "docker", "this daemon keeps its start-time setting: {after_set}");
+            assert_eq!(after_set["sandbox_configured"], "seatbelt", "what a process started now runs in: {after_set}");
+            assert!(!after_set["docker_on_path"].is_null(), "its own work still needs docker: {after_set}");
+        }
+        let src = include_str!("lib.rs");
+        assert!(!src.contains("fn pin_sandbox_for_children"), "the daemon pins no sandbox into its children's environment");
+    }
+
+    /// (#3112) A daemon whose sandbox is Seatbelt needs no docker: `/health`
+    /// says which sandbox it runs, and does not answer `docker_on_path`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn health_under_seatbelt_names_it_and_asks_nothing_of_docker() {
+        darkmux_types::run_in_own_process!();
+        if !darkmux_sandbox::SeatbeltBackend::available() {
+            return; // Seatbelt is refused off macOS; nothing to show here.
+        }
+        let prev = std::env::var_os("DARKMUX_SANDBOX");
+        unsafe { std::env::set_var("DARKMUX_SANDBOX", "seatbelt") };
+        let health = loopback_health(&[]).await;
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_SANDBOX", v),
+                None => std::env::remove_var("DARKMUX_SANDBOX"),
+            }
+        }
+        assert_eq!(health["sandbox"], "seatbelt", "{health}");
+        assert!(health["docker_on_path"].is_null(), "{health}");
     }
 
     /// `/health` tells this machine whether the daemon can publish to the
@@ -9940,7 +10007,7 @@ fn reap_dispatch_children_on_shutdown_kills_a_real_registered_child() {
     assert!(
         darkmux_types::interrupt::is_set(),
         "reap_dispatch_children_on_shutdown must mark_interrupted() so dispatch_internal.rs's \
-         own post-wait docker_kill_by_name check can fire — kill_all alone only kills the \
+         own post-wait kill_dispatch_sandbox check can fire — kill_all alone only kills the \
          `docker run` CLIENT pid, never the container itself"
     );
 

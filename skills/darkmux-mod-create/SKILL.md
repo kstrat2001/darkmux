@@ -47,15 +47,16 @@ finding was observed in, pinned.
 
 **The STORED record's `file` is already repo-relative** — `darkmux finding show`
 gives you the path the kit needs, as-is. The host mapped it at write time: the
-model wrote its sandbox's coordinates (`/workspace/<source>/src/a.ts`), and
-`build_record` maps the `/workspace/<source>/` prefix off before storing,
+model wrote its sandbox's coordinates (`/workspace/<source>/src/a.ts` in a
+container; under a sandbox on the host, the tree's own path, which the record's
+`context.root` names), and `build_record` maps that prefix off before storing,
 keeping the source id in the record's own `source` field so nothing is lost
 (`findings.rs`, `FindingRecord::emitted` / `::source`).
 
 Where you WILL see the container path is the **raw hook or flow record** —
 `payload.emitted.file` on the fired `dispatch.tool` record is the model's
 verbatim argument, unmapped. So if you are working from the stream rather than
-the store, strip the `/workspace/<source>/` prefix yourself, or just read the
+the store, strip the `/workspace/<source>/` prefix (or `<context.root>/<source>/`) yourself, or just read the
 stored record instead, which is the simpler move. Either way the kit's paths are
 repo-relative: `--- a/src/a.ts`, never the mount path.
 

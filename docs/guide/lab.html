@@ -53,8 +53,8 @@
 <section>
   <div class="wrap">
     <h2>Prerequisites for lab</h2>
-    <p><code>darkmux lab run</code> uses the same internal Docker-bounded runtime as <code>darkmux dispatch</code>. Workloads dispatch through a per-invocation <code>darkmux-runtime</code> container. darkmux pulls the image built for your version on first use; to build one yourself instead, run <code>docker build --build-arg DARKMUX_VERSION=&lt;version&gt; -f runtime/Dockerfile -t darkmux-runtime:latest .</code> from the darkmux repo root at that version. An image built for another version, or without the build-arg, is not used.</p>
-    <p>If you don't have Docker, the <code>profile</code> / <code>machine</code> / <code>doctor</code> verbs still work. You just can't run lab dispatches.</p>
+    <p><code>darkmux lab run</code> uses the same internal runtime as <code>darkmux dispatch</code>, in the same sandbox (<code>runtime.sandbox</code>): macOS’s own Seatbelt by default on a Mac, Docker on Linux or when set to <code>docker</code>. Under Docker, workloads dispatch through a per-invocation <code>darkmux-runtime</code> container, and darkmux pulls the image built for your version on first use; to build one yourself instead, run <code>docker build --build-arg DARKMUX_VERSION=&lt;version&gt; -f runtime/Dockerfile -t darkmux-runtime:latest .</code> from the darkmux repo root at that version. An image built for another version, or without the build-arg, is not used.</p>
+    <p>Under <code>runtime.sandbox docker</code> without Docker, the <code>profile</code> / <code>machine</code> / <code>doctor</code> verbs still work; you just can't run lab dispatches until Docker runs, or until you choose a sandbox this machine can run (<code>darkmux doctor</code>’s <code>sandbox</code> row says which).</p>
   </div>
 </section>
 

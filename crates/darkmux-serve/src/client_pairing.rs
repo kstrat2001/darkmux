@@ -13,9 +13,12 @@
 //!
 //! **Pairing.** The app `POST`s `/client/pair` with a device name, a code it
 //! shows its user and a random `pair_secret` (a `scopes` field is accepted
-//! and ignored: what an app may run is machine policy, not the app's ask). The
-//! operator runs `darkmux client approve --code <CODE>` here with the code the
-//! app shows, sees the device, code and age, and approves (or denies). A
+//! and ignored: what an app may run is machine policy, not the app's ask). A
+//! Mux Bot on this machine whose code signature verifies (a verified team, or
+//! an app the operator allowed before) is approved at once; any other app gets
+//! a native Allow dialog ([`crate::client_trust`], #3544). Either way, the
+//! operator can run `darkmux client approve --code <CODE>` here with the code
+//! the app shows, see the device, code and age, and approve (or deny). A
 //! pairing records identity only. The app polls `/client/pair/{id}` with
 //! `X-Pair-Secret`; on the first poll after approval this listener mints the
 //! token (32 random bytes, hex), stores ONLY its BLAKE3 hash as an approved
@@ -158,6 +161,10 @@ const KEEP_WORK_SECS: u64 = 3600;
 /// 1.2: every client has a stable random `id`, minted at approval, which its
 /// workspaces and runs are keyed by (never its display name, which a later
 /// pairing can reuse). A 1.1 store's clients get one when it is read.
+/// Additive in 1.2 (#3544, unreleased with it): `auto_approved` on a request
+/// and a client (the signing identity that approved it with no operator
+/// step) and `remembered_apps` (apps the operator allowed in the dialog,
+/// which then pair at once).
 pub const CLIENTS_SCHEMA_VERSION: &str = "1.2";
 
 // ─── Store ───────────────────────────────────────────────────────────────
@@ -189,6 +196,9 @@ pub struct PendingRequest {
     /// The id the client will have, minted at approval.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
+    /// (#3544) The signing identity that approved it with no operator step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_approved: Option<SigningIdentity>,
 }
 
 impl PendingRequest {
@@ -213,6 +223,54 @@ pub struct ApprovedClient {
     pub created: u64,
     /// BLAKE3 of the bearer token, hex. The token itself is never stored.
     pub token_hash: String,
+    /// (#3544) The signing identity that approved it with no operator step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_approved: Option<SigningIdentity>,
+}
+
+/// (#3544) An app as its code signature names it: the developer team and
+/// the bundle id. Written `<team>/<bundle>`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SigningIdentity {
+    pub team: String,
+    pub bundle: String,
+}
+
+impl SigningIdentity {
+    /// `<team>/<bundle>`, as `client list` writes it.
+    pub fn parse(s: &str) -> Option<Self> {
+        let (team, bundle) = s.trim().split_once('/')?;
+        (!team.is_empty() && !bundle.is_empty()).then(|| Self { team: team.to_string(), bundle: bundle.to_string() })
+    }
+}
+
+impl From<&darkmux_platform::SignedApp> for SigningIdentity {
+    fn from(app: &darkmux_platform::SignedApp) -> Self {
+        Self { team: app.team.clone(), bundle: app.bundle.clone() }
+    }
+}
+
+impl std::fmt::Display for SigningIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.team, self.bundle)
+    }
+}
+
+/// (#3544) An app the operator allowed in the pairing dialog, remembered by
+/// its signing identity: a later pairing from a process that verifies as it
+/// is approved at once, until `client forget`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RememberedApp {
+    pub team: String,
+    pub bundle: String,
+    /// Unix seconds.
+    pub allowed: u64,
+}
+
+impl RememberedApp {
+    pub fn identity(&self) -> SigningIdentity {
+        SigningIdentity { team: self.team.clone(), bundle: self.bundle.clone() }
+    }
 }
 
 /// `~/.darkmux/clients.json`.
@@ -229,6 +287,9 @@ pub struct ClientsFile {
     /// Decided once, at the migration; never set otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_owner: Option<String>,
+    /// (#3544) Apps the operator allowed in the pairing dialog.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remembered_apps: Vec<RememberedApp>,
 }
 
 impl Default for ClientsFile {
@@ -238,6 +299,7 @@ impl Default for ClientsFile {
             pending: Vec::new(),
             clients: Vec::new(),
             legacy_owner: None,
+            remembered_apps: Vec::new(),
         }
     }
 }
@@ -530,27 +592,89 @@ pub fn find_by_code(store: &ClientStore, code: &str, now: u64) -> Result<Pending
     }
 }
 
+/// How a pairing request is approved (#3544). Every way goes through
+/// [`approve_as`], the one approval path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Approval {
+    /// The operator: `darkmux client approve`.
+    Operator,
+    /// Allow in the dialog; `remember` is the requesting app's signing
+    /// identity when it had one, kept so it pairs at once next time.
+    Dialog { remember: Option<SigningIdentity> },
+    /// No operator step: the requesting process verified as this identity.
+    Verified(SigningIdentity),
+}
+
 /// Approve a live request; the token is minted when the app collects it.
 /// Returns the client name it will have.
 pub fn approve(store: &ClientStore, request_id: &str, now: u64) -> Result<String> {
+    approve_as(store, request_id, now, &Approval::Operator)
+}
+
+/// [`approve`], saying how it was approved: one write records the approval,
+/// the identity that approved it on its own, and the app the dialog's Allow
+/// remembers.
+pub fn approve_as(store: &ClientStore, request_id: &str, now: u64, how: &Approval) -> Result<String> {
     store.update(|f| {
-        prune(f, now);
-        let mut taken: Vec<String> = f.clients.iter().map(|c| c.name.clone()).collect();
-        taken.extend(f.pending.iter().filter_map(|p| p.client_name.clone()));
-        let p = f
-            .pending
-            .iter_mut()
-            .find(|p| p.request_id == request_id)
-            .ok_or_else(|| anyhow!("no pairing request {request_id}"))?;
-        if !p.live(now) {
-            bail!("pairing request {request_id} is no longer pending (expired or already decided)");
+        let name = approve_in(f, request_id, now)?;
+        match how {
+            Approval::Operator | Approval::Dialog { remember: None } => {}
+            Approval::Verified(app) => {
+                if let Some(p) = f.pending.iter_mut().find(|p| p.request_id == request_id) {
+                    p.auto_approved = Some(app.clone());
+                }
+            }
+            Approval::Dialog { remember: Some(app) } => remember_in(f, app, now),
         }
-        let name = client_name_for(&p.device_name, &taken);
-        p.status = PendingStatus::Approved;
-        p.client_name = Some(name.clone());
-        p.client_id = Some(new_client_id()?);
         Ok(name)
     })
+}
+
+/// Adds `app` to the remembered apps, once. A container engine's team is
+/// never remembered: every container behind it would then pair on its own.
+fn remember_in(f: &mut ClientsFile, app: &SigningIdentity, now: u64) {
+    if darkmux_platform::container_engine_of_team(&app.team).is_some() {
+        return;
+    }
+    if !f.remembered_apps.iter().any(|r| &r.identity() == app) {
+        f.remembered_apps.push(RememberedApp { team: app.team.clone(), bundle: app.bundle.clone(), allowed: now });
+    }
+}
+
+/// The apps the operator allowed in the dialog (`client list`).
+pub fn remembered_apps(store: &ClientStore) -> Result<Vec<RememberedApp>> {
+    Ok(store.read()?.remembered_apps)
+}
+
+/// Forgets a remembered app: its next pairing asks again. `false` when it
+/// was not remembered. Its paired clients stay paired (`client revoke`).
+pub fn forget(store: &ClientStore, app: &SigningIdentity) -> Result<bool> {
+    store.update(|f| {
+        let before = f.remembered_apps.len();
+        f.remembered_apps.retain(|r| &r.identity() != app);
+        Ok(f.remembered_apps.len() != before)
+    })
+}
+
+/// [`approve`]'s change to the store: the request marked approved, with the
+/// client name and id it will have.
+fn approve_in(f: &mut ClientsFile, request_id: &str, now: u64) -> Result<String> {
+    prune(f, now);
+    let mut taken: Vec<String> = f.clients.iter().map(|c| c.name.clone()).collect();
+    taken.extend(f.pending.iter().filter_map(|p| p.client_name.clone()));
+    let p = f
+        .pending
+        .iter_mut()
+        .find(|p| p.request_id == request_id)
+        .ok_or_else(|| anyhow!("no pairing request {request_id}"))?;
+    if !p.live(now) {
+        bail!("pairing request {request_id} is no longer pending (expired or already decided)");
+    }
+    let name = client_name_for(&p.device_name, &taken);
+    p.status = PendingStatus::Approved;
+    p.client_name = Some(name.clone());
+    p.client_id = Some(new_client_id()?);
+    Ok(name)
 }
 
 /// Deny a live request, or take back an approval its app has not collected
@@ -568,6 +692,7 @@ pub fn deny(store: &ClientStore, request_id: &str, now: u64) -> Result<()> {
         p.status = PendingStatus::Denied;
         p.client_name = None;
         p.client_id = None;
+        p.auto_approved = None;
         Ok(())
     })
 }
@@ -603,6 +728,7 @@ pub fn revoke(store: &ClientStore, name: &str) -> Result<bool> {
                 p.status = PendingStatus::Denied;
                 p.client_name = None;
                 p.client_id = None;
+                p.auto_approved = None;
                 found = true;
             }
         }
@@ -819,6 +945,9 @@ pub type PathSource = Arc<dyn Fn() -> Result<PathBuf, String> + Send + Sync>;
 pub type PathAction = Arc<dyn Fn(&Path) -> Result<(), crate::client_workspace::Coded> + Send + Sync>;
 /// `clients.preview.enabled`, read per request.
 pub type PreviewSwitch = Arc<dyn Fn() -> Result<bool, String> + Send + Sync>;
+/// (#3112) This machine's sandbox as `config.json` says now, read per
+/// preview start.
+pub type PreviewSandbox = Arc<dyn Fn() -> Result<darkmux_sandbox::BackendKind, String> + Send + Sync>;
 /// `clients.preview.idle_minutes`, read per idle check.
 pub type PreviewMinutes = Arc<dyn Fn() -> Result<u64, String> + Send + Sync>;
 /// (role, work id) -> what that running work's dispatch is doing besides its
@@ -826,11 +955,13 @@ pub type PreviewMinutes = Arc<dyn Fn() -> Result<u64, String> + Send + Sync>;
 pub type WorkActivity = Arc<dyn Fn(&str, &str) -> (Option<crate::runs::RunActivity>, Option<u64>) + Send + Sync>;
 /// (peer, the listener's address) -> the process on this machine that sent
 /// a request from `peer`; `None` when that cannot be told.
-/// (the listener's address, the peers asked about) -> the process on this
-/// machine at each of those peers' ends that can be told, from one look at
-/// every connection to the listener; `None` when none can be told.
+/// (the listener's address, the peers asked about) -> every process on this
+/// machine holding each of those peers' ends that can be told (sorted, each
+/// once: a socket can be held by more than one process, one that inherited
+/// it), from one look at every connection to the listener; `None` when none
+/// can be told.
 pub type PeerProcesses =
-    Arc<dyn Fn(Option<SocketAddr>, &[SocketAddr]) -> Option<HashMap<SocketAddr, u32>> + Send + Sync>;
+    Arc<dyn Fn(Option<SocketAddr>, &[SocketAddr]) -> Option<HashMap<SocketAddr, Vec<u32>>> + Send + Sync>;
 
 /// Who sent each waiting pairing request, found in rounds: one look at every
 /// connection to the listener ([`ClientServerState::peer_processes`]) at a
@@ -844,7 +975,7 @@ pub struct PeerRounds {
     /// Rounds begun so far.
     begun: std::sync::atomic::AtomicU64,
     /// The latest finished round's number and answers.
-    last: Mutex<(u64, HashMap<SocketAddr, u32>)>,
+    last: Mutex<(u64, HashMap<SocketAddr, Vec<u32>>)>,
     /// The peers of the requests waiting for an answer, each once per
     /// request.
     waiting: Mutex<Vec<SocketAddr>>,
@@ -853,9 +984,9 @@ pub struct PeerRounds {
 impl PeerRounds {
     /// The answer for `peer` from a round that began after `after`, if one
     /// has finished.
-    fn answer_since(&self, after: u64, peer: SocketAddr) -> Option<Option<u32>> {
+    fn answer_since(&self, after: u64, peer: SocketAddr) -> Option<Vec<u32>> {
         let last = self.last.lock().unwrap();
-        (last.0 > after).then(|| last.1.get(&peer).copied())
+        (last.0 > after).then(|| last.1.get(&peer).cloned().unwrap_or_default())
     }
 }
 
@@ -940,6 +1071,9 @@ pub struct ClientServerState {
     /// This machine's `clients.preview.enabled`, read per request (`Err`:
     /// unreadable, so previews are refused).
     pub preview_enabled: PreviewSwitch,
+    /// (#3112 review) This machine's `runtime.sandbox`, read per preview
+    /// start, so the refusal ends with the `config set` it recommends.
+    pub preview_sandbox: PreviewSandbox,
     /// This machine's `clients.preview.idle_minutes`, read at every idle
     /// check (`Err`: unreadable, so that check stops nothing).
     pub preview_idle_minutes: PreviewMinutes,
@@ -954,6 +1088,16 @@ pub struct ClientServerState {
     /// [`PAIR_REQUESTS_PER_PROCESS`] of them. In memory only; a restart
     /// forgets it (those requests then count only toward [`MAX_PENDING`]).
     pub pair_peers: Arc<Mutex<HashMap<String, u32>>>,
+    /// (#3544) `clients.pairing.*`, read per pairing request.
+    pub pairing_policy: crate::client_trust::PairingPolicySource,
+    /// (#3544) Who signed a process on this machine.
+    pub signed_app: crate::client_trust::SignedAppCheck,
+    /// (#3544) The Allow dialog, blocking until answered or given up.
+    pub ask_allow: crate::client_trust::AskAllow,
+    /// (#3544) A notice nobody waits on.
+    pub notify: crate::client_trust::Notify,
+    /// (#3544) The Allow dialogs open now.
+    pub dialogs: Arc<crate::client_trust::DialogSlots>,
 }
 
 impl ClientServerState {
@@ -988,10 +1132,16 @@ impl ClientServerState {
             previews: Arc::new(crate::client_preview::Previews::production()),
             bound: None,
             preview_enabled: Arc::new(read_preview_enabled),
+            preview_sandbox: Arc::new(read_preview_sandbox),
             preview_idle_minutes: Arc::new(read_preview_idle_minutes),
             peer_processes: Arc::new(peer_processes_here),
             pair_peers: Arc::new(Mutex::new(HashMap::new())),
             pair_lookups: Arc::new(PeerRounds::default()),
+            pairing_policy: Arc::new(read_pairing_policy),
+            signed_app: Arc::new(|pid| darkmux_platform::current().signed_app(pid)),
+            ask_allow: Arc::new(|message, icon, timeout| darkmux_platform::current().ask_allow(message, icon, timeout)),
+            notify: Arc::new(|message| darkmux_platform::current().notify(message)),
+            dialogs: Arc::new(crate::client_trust::DialogSlots::default()),
         })
     }
 }
@@ -1039,11 +1189,25 @@ fn canonical_base(base: &Path) -> Result<PathBuf, String> {
     base.canonicalize().map_err(named)
 }
 
-/// The process at each of `wanted`'s ends, from one look at every connection
-/// to the listener at `bound` ([`darkmux_platform::Platform::tcp_peers_of`]).
-fn peer_processes_here(bound: Option<SocketAddr>, wanted: &[SocketAddr]) -> Option<HashMap<SocketAddr, u32>> {
+/// Every process holding each of `wanted`'s ends, from one look at every
+/// connection to the listener at `bound`
+/// ([`darkmux_platform::Platform::tcp_peers_of`]).
+fn peer_processes_here(bound: Option<SocketAddr>, wanted: &[SocketAddr]) -> Option<HashMap<SocketAddr, Vec<u32>>> {
     let all = darkmux_platform::current().tcp_peers_of(bound?)?;
-    Some(all.into_iter().filter(|(peer, _)| wanted.contains(peer)).collect())
+    Some(holders_by_peer(all.into_iter().filter(|(peer, _)| wanted.contains(peer))))
+}
+
+/// `(peer, pid)` pairs grouped by peer: each peer's holders sorted, each once.
+pub(crate) fn holders_by_peer(pairs: impl Iterator<Item = (SocketAddr, u32)>) -> HashMap<SocketAddr, Vec<u32>> {
+    let mut by_peer: HashMap<SocketAddr, Vec<u32>> = HashMap::new();
+    for (peer, pid) in pairs {
+        by_peer.entry(peer).or_default().push(pid);
+    }
+    for pids in by_peer.values_mut() {
+        pids.sort_unstable();
+        pids.dedup();
+    }
+    by_peer
 }
 
 /// `clients.profiles` from `config.json` as it is NOW (the process-wide
@@ -1054,6 +1218,21 @@ fn read_profiles_policy() -> Result<Option<Vec<String>>, String> {
     read_profiles_policy_at(
         &darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config,
     )
+}
+
+/// (#3544) `clients.pairing.*` from `config.json` as it is now, env first
+/// (read per request, so `config set` applies without a restart).
+fn read_pairing_policy() -> Result<crate::client_trust::PairingPolicy, String> {
+    read_pairing_policy_at(&darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config)
+}
+
+/// [`read_pairing_policy`] against the config at `path`.
+pub(crate) fn read_pairing_policy_at(path: &Path) -> Result<crate::client_trust::PairingPolicy, String> {
+    use darkmux_types::config_access as ca;
+    read_config_at(path).map(|cfg| crate::client_trust::PairingPolicy {
+        verified_teams: ca::clients_pairing_verified_teams_in(&cfg),
+        dialog: ca::clients_pairing_dialog_in(&cfg),
+    })
 }
 
 /// The config gate `client serve` runs before it listens, the same one
@@ -1076,6 +1255,17 @@ fn read_preview_enabled() -> Result<bool, String> {
     read_preview_enabled_at(
         &darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config,
     )
+}
+
+/// (#3112 review) `runtime.sandbox` from `config.json` as it is now, env
+/// first, for a preview start.
+fn read_preview_sandbox() -> Result<darkmux_sandbox::BackendKind, String> {
+    read_preview_sandbox_at(&darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config)
+}
+
+/// [`read_preview_sandbox`] against the config at `path`.
+pub(crate) fn read_preview_sandbox_at(path: &Path) -> Result<darkmux_sandbox::BackendKind, String> {
+    darkmux_sandbox::selected_in(&read_config_at(path)?)
 }
 
 /// [`read_preview_enabled`] against the config at `path`.
@@ -1695,17 +1885,21 @@ pub(crate) async fn pair_handler(
         return *r;
     }
     let now = (state.now)();
-    let (record, from) = match new_request(&state, req, peer, now).await {
+    let (record, holders) = match new_request(&state, req, peer, now).await {
         Ok(made) => made,
         Err(e) => return internal(e),
     };
-    let request_id = record.request_id.clone();
+    let (request_id, code) = (record.request_id.clone(), record.code.clone());
+    // The per-process bound counts a shared connection against its lowest
+    // holder; trust needs exactly one ([`crate::client_trust::sender_of`]).
+    let from = holders.first().copied();
+    let sender = crate::client_trust::sender_of(&state, &holders).await;
     match add_pending(&state, record, from, now) {
-        Ok(true) => (
-            StatusCode::ACCEPTED,
-            Json(PairAccepted { request_id }),
-        )
-            .into_response(),
+        Ok(true) => {
+            let peer = peer.map(|axum::extract::ConnectInfo(p)| p);
+            log_lines(crate::client_trust::decide(&state, (&request_id, &code), peer, from, sender).await);
+            (StatusCode::ACCEPTED, Json(PairAccepted { request_id })).into_response()
+        }
         Ok(false) => err(
             StatusCode::TOO_MANY_REQUESTS, ClientCode::TooManyRequests,
             "too many pairing requests are waiting; try again later",
@@ -1714,16 +1908,16 @@ pub(crate) async fn pair_handler(
     }
 }
 
-/// A new pending request for `req`, and the process it came from when that
-/// is asked ([`request_process`]).
+/// A new pending request for `req`, and the processes holding the
+/// connection it came on, as far as that can be told ([`peer_holders_of`]).
 async fn new_request(
     state: &ClientServerState,
     req: PairBody,
     peer: Option<axum::extract::ConnectInfo<SocketAddr>>,
     now: u64,
-) -> Result<(PendingRequest, Option<u32>)> {
+) -> Result<(PendingRequest, Vec<u32>)> {
     let request_id = format!("r-{}", random_hex(16)?);
-    let from = request_process(state, peer, now).await?;
+    let from = peer_holders_of(state, peer).await;
     let record = PendingRequest {
         request_id,
         device_name: req.device_name,
@@ -1733,34 +1927,22 @@ async fn new_request(
         status: PendingStatus::Pending,
         client_name: None,
         client_id: None,
+        auto_approved: None,
     };
     Ok((record, from))
 }
 
-/// The process on this machine a new pairing request came from, asked only
-/// when another request is waiting already: to one alone in the queue the
-/// per-process bound has nothing to say, so a lone app's pairing asks the
-/// OS nothing.
-async fn request_process(
-    state: &ClientServerState,
-    peer: Option<axum::extract::ConnectInfo<SocketAddr>>,
-    now: u64,
-) -> Result<Option<u32>> {
-    let others_waiting = state.store.read()?.pending.iter().any(|p| p.live(now));
-    Ok(match others_waiting {
-        true => peer_process_of(state, peer).await,
-        false => None,
-    })
-}
-
-/// The process on this machine a pairing request came from, when that can
-/// be told, from a round ([`PeerRounds`]) that began after it arrived: the
-/// one that finished while it queued, else one it runs itself, off the
-/// async workers, for every request waiting. A request whose sender went
-/// away while it queued is dropped before it starts a round.
-async fn peer_process_of(state: &ClientServerState, peer: Option<axum::extract::ConnectInfo<SocketAddr>>) -> Option<u32> {
+/// Every process on this machine holding the connection a pairing request
+/// came on (empty when that cannot be told), from a round ([`PeerRounds`])
+/// that began after it arrived: the one that finished while it queued, else
+/// one it runs itself, off the async workers, for every request waiting. A
+/// request whose sender went away while it queued is dropped before it
+/// starts a round.
+pub(crate) async fn peer_holders_of(state: &ClientServerState, peer: Option<axum::extract::ConnectInfo<SocketAddr>>) -> Vec<u32> {
     use std::sync::atomic::Ordering::SeqCst;
-    let axum::extract::ConnectInfo(p) = peer?;
+    let Some(axum::extract::ConnectInfo(p)) = peer else {
+        return Vec::new();
+    };
     let rounds = state.pair_lookups.clone();
     let _waiting = Waiting::new(&rounds, p);
     let arrived = rounds.begun.load(SeqCst);
@@ -1776,12 +1958,12 @@ async fn peer_process_of(state: &ClientServerState, peer: Option<axum::extract::
     tokio::task::spawn_blocking(move || {
         let _one_round_at_a_time = turn;
         let found = (st.peer_processes)(st.bound, &wanted).unwrap_or_default();
-        let pid = found.get(&p).copied();
+        let holders = found.get(&p).cloned().unwrap_or_default();
         *r.last.lock().unwrap() = (round, found);
-        pid
+        holders
     })
     .await
-    .unwrap_or(None)
+    .unwrap_or_default()
 }
 
 /// Stores a new pairing request from process `from` under the bounds
@@ -1861,6 +2043,7 @@ fn poll_pending(f: &mut ClientsFile, request_id: &str, secret: &str, now: u64) -
         id,
         created: now,
         token_hash: hash_hex(&token),
+        auto_approved: p.auto_approved.clone(),
     });
     f.pending.remove(i);
     Ok(PollOutcome::Approved { client_name, token })
@@ -3528,6 +3711,34 @@ fn previews_allowed(state: &ClientServerState) -> Result<(), Refused> {
     }
 }
 
+/// (#3112) Why a preview cannot start under `selected` (the configured
+/// sandbox), or `None` under Docker. A preview runs in a Docker container
+/// (`client_preview`) and has no other backend yet, so any other sandbox
+/// refuses it, naming the setting that would allow it.
+pub(crate) fn preview_sandbox_refusal(selected: &Result<darkmux_sandbox::BackendKind, String>) -> Option<String> {
+    let docker = darkmux_sandbox::setting_value(darkmux_sandbox::BackendKind::Docker);
+    match selected {
+        Ok(darkmux_sandbox::BackendKind::Docker) => None,
+        Ok(kind) => Some(format!(
+            "previews need `{key}` `{docker}` for now: a preview runs in a Docker container, and this \
+             machine's sandbox is `{}`. To run previews here: `darkmux config set {key} {docker}` \
+             (Docker installed and running)",
+            darkmux_sandbox::setting_value(*kind),
+            key = darkmux_sandbox::SANDBOX_KEY,
+        )),
+        Err(why) => Some(format!("no preview can start: {why}")),
+    }
+}
+
+/// (#3112) [`preview_sandbox_refusal`] for this machine's sandbox as
+/// `config.json` says now, as a 403 `forbidden`.
+fn previews_run_here(state: &ClientServerState) -> Result<(), Refused> {
+    match preview_sandbox_refusal(&(state.preview_sandbox)()) {
+        None => Ok(()),
+        Some(why) => Err(refuse(StatusCode::FORBIDDEN, ClientCode::Forbidden, why)),
+    }
+}
+
 /// (#3484) `POST /client/workspaces/{name}/preview`'s optional body.
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -3548,7 +3759,10 @@ async fn preview_start_body(body: Body) -> Result<PreviewStartBody, Response> {
 /// Starts workspace `name`'s preview from its trusted recipe; with `clean`,
 /// first stops it and clears its install ([`crate::client_preview::Previews::clean`]).
 fn start_preview(state: &ClientServerState, client: &ApprovedClient, name: &str, clean: bool) -> Response {
-    if let Err(r) = previews_allowed(state).and_then(|()| owned_workspace(state, client, name).map(|_| ())) {
+    let allowed = previews_allowed(state)
+        .and_then(|()| owned_workspace(state, client, name).map(|_| ()))
+        .and_then(|()| previews_run_here(state));
+    if let Err(r) = allowed {
         return *r;
     }
     let (dir, source) = match workspace_and_recipe_source(state, name) {

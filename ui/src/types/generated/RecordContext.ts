@@ -48,6 +48,13 @@ locality?: string,
  */
 profile?: string, 
 /**
+ * (flow 2.8.0, #3112) Where the dispatch's sandbox saw the workspace,
+ * stamped only when that is not the container's `/workspace` (a sandbox
+ * on the host sees it at its own path). A finding naming a file under
+ * it is mapped to the source the same way as one under `/workspace`.
+ */
+root?: string, 
+/**
  * On a finding record: the planned span that holds the finding.
  */
 site?: ContextSite, };

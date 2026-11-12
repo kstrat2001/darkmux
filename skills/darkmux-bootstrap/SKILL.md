@@ -83,15 +83,20 @@ Once profiles + models are in place, confirm a dispatch can load them and run. A
 darkmux lab run quick-q
 ```
 
-This runs a single-turn smoke prompt through the internal runtime, loading the active profile's models on the way.
+This runs a single-turn smoke prompt through the internal runtime, loading the active profile's models on the way. It runs in the sandbox `runtime.sandbox` names: on a Mac, macOS's own Seatbelt by default, so there is no Docker to install or start; on Linux, Docker. Before running it, read doctor's `sandbox` row: it names the sandbox in effect and whether it can run here. Docker is the opt-in on a Mac (`darkmux config set runtime.sandbox docker`); propose it only if the operator asks for container isolation, and then doctor's `docker runtime` row says what Docker still needs.
 
-Three outcomes:
+Four outcomes:
 
 **A. The run completes.** The dispatch path is wired up. Move on.
 
 **B. It errors on a missing model.** Back to Step 2: download the model first.
 
 **C. It errors on RAM headroom.** Trim the profile's context length so the loadout fits the resident budget, then re-run.
+
+**D. It errors on the sandbox.** The error names `runtime.sandbox` and the fix; `darkmux doctor`'s `sandbox` row says the same thing. Then re-run.
+
+- Under `seatbelt` (a Mac's default), the runtime is darkmux itself (`darkmux runtime`), so there is nothing to install. The usual cause is a darkmux replaced while a process was running (an upgrade or `brew cleanup`): restart that process, often the `darkmux serve` daemon (`brew services restart darkmux`). To run in Docker instead, propose `darkmux config set runtime.sandbox docker`.
+- Under `docker`, Docker is not installed or not running: start it, or on a Mac propose `darkmux config set runtime.sandbox seatbelt`, which needs no Docker.
 
 ## Step 5 — Optional: enable the audit and coordination substrates
 

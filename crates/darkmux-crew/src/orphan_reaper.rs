@@ -2,14 +2,14 @@
 //! running, and the reaper `darkmux serve` runs over them.
 //!
 //! A caught stop (SIGINT, SIGTERM, the watchdog) kills the dispatch
-//! container itself (`docker_kill_by_name`). A host that dies without its
+//! container itself (`kill_dispatch_sandbox`). A host that dies without its
 //! handlers running (SIGKILL, an OOM kill) cannot: its `docker run` client
 //! is reparented and the `darkmux-dispatch-*` container runs on until its
 //! own limits (turns, tokens, the inactivity bound) end it. Nothing can
 //! collect its result any more, so the reaper ends it sooner.
 //!
 //! **Identity at spawn.** Every dispatch container carries four labels
-//! naming the darkmux process that started it ([`host_label_args`]): its
+//! naming the darkmux process that started it ([`host_labels`]): its
 //! pid, that process's start time (so a reused pid is not mistaken for the
 //! host), this machine's uid (so a docker daemon another machine can also
 //! reach never has this machine judge a container it did not start), and
@@ -26,8 +26,10 @@
 //! label's. A pid whose start time cannot be read is kept (fail safe). The
 //! same pid-plus-start-time test as the residency lease (#2917).
 //!
-//! **What it does to one.** `docker kill`, nothing else: the workspace and
-//! out-dir are bind mounts and survive the container.
+//! **What it does to one.** Kills it through the sandbox backend
+//! (`darkmux_sandbox`, #3112), nothing else: the workspace and out-dir are
+//! bind mounts and survive the container. A kill succeeds only against a
+//! running container, so "killed" names only one the reaper ended.
 //!
 //! **Client previews (#3456)** carry the same four labels and are judged by
 //! the same rule under their own name prefix ([`PREVIEW_CONTAINER_PREFIX`],
@@ -35,7 +37,7 @@
 //! Each reaper lists only its own prefix, so neither touches the other's.
 
 use crate::bounded_command::{run_bounded, Bounded};
-use std::process::Command;
+use darkmux_sandbox::{Having, Listed, Query, SandboxHandle};
 use std::time::Duration;
 
 /// The prefix every dispatch container's name carries
@@ -84,15 +86,7 @@ impl HostIdentity {
     }
 }
 
-/// The `docker run` options that label a container with its host.
-pub fn host_label_args(host: &HostIdentity) -> Vec<String> {
-    host_labels(host)
-        .into_iter()
-        .flat_map(|l| ["--label".to_string(), l])
-        .collect()
-}
-
-/// The four host labels, each `key=value`.
+/// The four host labels, each `key=value`, as a sandbox policy carries them.
 pub fn host_labels(host: &HostIdentity) -> Vec<String> {
     vec![
         format!("{HOST_PID_LABEL}={}", host.pid),
@@ -211,41 +205,28 @@ fn host_is_gone(labeled_start: u64, now: HostLiveness) -> bool {
     }
 }
 
-/// The `docker ps` arguments the reaper lists the containers named
-/// `prefix*` with: one line per running container, name then the four
-/// labels, tab-separated.
-fn docker_ps_args_named(prefix: &str) -> Vec<String> {
-    vec![
-        "ps".to_string(),
-        "--filter".to_string(),
-        format!("name=^{prefix}"),
-        "--format".to_string(),
-        format!(
-            "{{{{.Names}}}}\t{{{{.Label \"{HOST_PID_LABEL}\"}}}}\t{{{{.Label \"{HOST_START_LABEL}\"}}}}\t{{{{.Label \"{HOST_MACHINE_LABEL}\"}}}}\t{{{{.Label \"{HOST_PID_NS_LABEL}\"}}}}"
-        ),
-    ]
+/// The listing a reaper reads: running sandboxes named `prefix*`, with
+/// the four host labels.
+fn host_query(prefix: &str) -> Query {
+    Query {
+        having: Having::NamePrefix(prefix.to_string()),
+        stopped_too: false,
+        read: [HOST_PID_LABEL, HOST_START_LABEL, HOST_MACHINE_LABEL, HOST_PID_NS_LABEL]
+            .map(String::from)
+            .to_vec(),
+    }
 }
 
-/// Parse [`docker_ps_args_named`]'s output. An empty label renders as an empty
-/// field and reads as absent.
-pub fn parse_docker_ps(stdout: &str) -> Vec<ListedContainer> {
-    let field = |s: Option<&str>| {
-        s.map(str::trim)
-            .filter(|s| !s.is_empty() && *s != "<no value>")
-            .map(str::to_string)
-    };
-    stdout
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|line| {
-            let mut parts = line.split('\t');
-            let name = parts.next().unwrap_or_default().trim().to_string();
-            let pid = field(parts.next());
-            let start = field(parts.next());
-            let machine = field(parts.next());
-            let pid_ns = field(parts.next());
+/// The listed sandboxes as containers with their host labels, a label that
+/// does not parse read as absent.
+pub fn listed_containers(listed: Vec<Listed>) -> Vec<ListedContainer> {
+    listed
+        .into_iter()
+        .map(|l| {
+            let [pid, start, machine, pid_ns]: [Option<String>; 4] =
+                l.labels.try_into().unwrap_or_default();
             ListedContainer {
-                name,
+                name: l.handle.id,
                 host_pid: pid.and_then(|p| p.parse().ok()),
                 host_start: start.and_then(|s| s.parse().ok()),
                 host_machine: machine,
@@ -266,21 +247,22 @@ pub fn host_liveness(pid: u32) -> HostLiveness {
     }
 }
 
-/// How long one `docker ps` or `docker kill` may take before the tick gives
-/// up on it. A wedged Docker Desktop must not wedge the reaper thread.
+/// How long one listing or kill may take before the tick gives up on
+/// it. A wedged Docker Desktop must not wedge the reaper thread.
 const DOCKER_CALL_BOUND: Duration = Duration::from_secs(10);
 
 /// One reaper pass.
 #[derive(Debug)]
 pub enum ReapTick {
-    /// `docker ps` answered; each orphan found, with whether its kill
+    /// The listing answered; each orphan found, with whether its kill
     /// succeeded.
     Listed { reaped: Vec<(Orphan, bool)> },
-    /// `docker ps` did not answer (no docker, a stopped daemon, a timeout).
-    DockerUnavailable,
+    /// No backend's listing answered (no docker or a stopped daemon, no
+    /// `sandbox-exec`, a timeout).
+    ListingUnavailable,
 }
 
-/// List the dispatch containers, decide, and `docker kill` each orphan.
+/// List the dispatch containers, decide, and kill each orphan.
 pub fn reap_tick(local: Option<&LocalHost>, liveness: impl Fn(u32) -> HostLiveness) -> ReapTick {
     reap_tick_named(DISPATCH_CONTAINER_PREFIX, local, liveness)
 }
@@ -292,29 +274,27 @@ pub fn reap_tick_named(
     local: Option<&LocalHost>,
     liveness: impl Fn(u32) -> HostLiveness,
 ) -> ReapTick {
-    let mut ps = Command::new("docker");
-    ps.args(docker_ps_args_named(prefix));
-    let stdout = match run_bounded(ps, DOCKER_CALL_BOUND) {
-        Bounded::Finished {
-            success: true,
-            stdout,
-            ..
-        } => stdout,
-        _ => return ReapTick::DockerUnavailable,
-    };
-    let listed = parse_docker_ps(&String::from_utf8_lossy(&stdout));
-    let reaped = orphaned_containers_named(&listed, prefix, local, liveness)
-        .into_iter()
-        .map(|orphan| {
-            let mut kill = Command::new("docker");
-            kill.args(["kill", &orphan.name]);
-            let ok = matches!(
-                run_bounded(kill, DOCKER_CALL_BOUND),
-                Bounded::Finished { success: true, .. }
-            );
-            (orphan, ok)
-        })
-        .collect();
+    // (#3112 review) Every backend this host runs, not only the configured
+    // one: a sandbox made before `runtime.sandbox` (or its default) changed
+    // is still this host's to reap, in the backend that made it.
+    let query = host_query(prefix);
+    let mut answered = false;
+    let mut reaped = Vec::new();
+    for backend in darkmux_sandbox::available_backends() {
+        let Bounded::Finished { success: true, stdout, .. } = run_bounded(backend.list(&query), DOCKER_CALL_BOUND) else {
+            continue;
+        };
+        answered = true;
+        let listed = listed_containers(backend.parse_list(&query, &String::from_utf8_lossy(&stdout)));
+        for orphan in orphaned_containers_named(&listed, prefix, local, &liveness) {
+            let handle = SandboxHandle { backend: backend.kind(), id: orphan.name.clone() };
+            let ok = matches!(run_bounded(backend.kill(&handle), DOCKER_CALL_BOUND), Bounded::Finished { success: true, .. });
+            reaped.push((orphan, ok));
+        }
+    }
+    if !answered {
+        return ReapTick::ListingUnavailable;
+    }
     ReapTick::Listed { reaped }
 }
 

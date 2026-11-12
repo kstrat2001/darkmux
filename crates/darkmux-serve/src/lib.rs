@@ -55,6 +55,7 @@ mod client_changes;
 pub mod client_pairing;
 pub mod client_preview;
 pub mod client_profiles;
+pub mod client_trust;
 pub mod client_wire;
 pub mod client_workspace;
 mod fleet_listener;
@@ -1524,6 +1525,18 @@ pub fn listen_socket_addr(bind: &str, port: u16) -> Result<std::net::SocketAddr>
     })
 }
 
+/// (#3112 review) The sandbox a process started now runs in: `config.json`
+/// as it is now (read fresh, leniently; the env tier live), the setting every
+/// process this daemon starts reads. `None` when that is refused. The daemon
+/// pins nothing into its children's environment, so a `config set` takes
+/// effect for them at once and they report its true source; the daemon's
+/// own work keeps its start-time setting until it restarts (`/health` names
+/// both, and doctor says when they differ).
+fn sandbox_configured_now() -> Option<darkmux_sandbox::BackendKind> {
+    let path = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config;
+    darkmux_sandbox::selected_in(&darkmux_types::config::DarkmuxConfig::load_from(&path)).ok()
+}
+
 pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>) -> Result<()> {
     // (#2988 review) The config gate every entry point runs: a wrong-typed
     // value (`serve.read_auth: "true"`) or a retired key would otherwise be
@@ -1833,6 +1846,10 @@ async fn health(
     // loopback request that did not come through a reverse proxy and names
     // this daemon in its Host.
     let loopback_caller = is_local_request(peer.map(|c| c.0), &headers);
+    // (#3112) The sandbox this daemon runs isolated work in; `None` when the
+    // setting is refused (every launch through the daemon refuses it too).
+    let daemon_sandbox = darkmux_sandbox::selected().ok();
+    let configured = if loopback_caller { sandbox_configured_now() } else { None };
     axum::Json(wire::HealthResponse {
         darkmux_version: env!("CARGO_PKG_VERSION").to_string(),
         build: darkmux_types::build_version(),
@@ -1850,7 +1867,18 @@ async fn health(
         fleet_token_set: loopback_caller.then(darkmux_flow::serve_token_present),
         // (#3423) Whether THIS process's PATH finds `docker`, for the same
         // reason: `darkmux doctor` runs from a shell whose PATH may differ.
-        docker_on_path: loopback_caller.then(|| darkmux_types::on_path("docker")),
+        // (#3112) Not asked when this daemon's sandbox is another one: it
+        // then needs no docker, and `sandbox` says which it runs.
+        // Asked while either this daemon's own work or a process it starts
+        // would run in Docker.
+        docker_on_path: (loopback_caller
+            && !(daemon_sandbox.is_some_and(darkmux_sandbox::BackendKind::on_host)
+                && configured.is_some_and(darkmux_sandbox::BackendKind::on_host)))
+            .then(darkmux_sandbox::DockerBackend::on_path),
+        sandbox: daemon_sandbox
+            .filter(|_| loopback_caller)
+            .map(|kind| darkmux_sandbox::setting_value(kind).to_string()),
+        sandbox_configured: configured.map(|kind| darkmux_sandbox::setting_value(kind).to_string()),
         // Whether this daemon can publish to the fleet hub's flow stream
         // (`null` when no hub is configured), for this machine only: an
         // outage's reason is operator detail, not something a peer needs.

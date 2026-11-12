@@ -37,9 +37,25 @@ fleet_token_set: boolean | null,
  * (#3423) Whether this daemon's own `PATH` finds `docker`, which every
  * dispatch it runs or accepts needs; never the path. A brew service once
  * ran with launchd's bare PATH and failed every dispatch while the
- * operator's shell found docker (#3418). This machine only.
+ * operator's shell found docker (#3418). This machine only. (#3112)
+ * Also `null` when neither this daemon's own sandbox (`sandbox`) nor
+ * the configured one (`sandbox_configured`) is Docker: it then needs no
+ * docker.
  */
 docker_on_path: boolean | null, 
+/**
+ * (#3112) The sandbox this daemon's own work runs in, its
+ * `runtime.sandbox` value when it started (`docker` or `seatbelt`);
+ * `null` when the setting is refused. This machine only.
+ */
+sandbox: string | null, 
+/**
+ * (#3112 review) The sandbox a process started now runs in, every
+ * process this daemon starts included: `runtime.sandbox` as
+ * `config.json` says now. Differs from `sandbox` after a `config set`
+ * until the daemon restarts. This machine only.
+ */
+sandbox_configured: string | null, 
 /**
  * Whether this daemon can publish to the fleet hub's flow stream, and
  * since when it could not; `null` when no hub is configured. This machine

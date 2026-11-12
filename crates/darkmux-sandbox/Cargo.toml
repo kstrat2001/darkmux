@@ -1,0 +1,27 @@
+[package]
+name = "darkmux-sandbox"
+version = "5.9.3"
+edition = "2021"
+description = "darkmux sandbox seam — what a sandbox may see and do, one backend trait, and Docker as its backend"
+license = "MIT"
+homepage = "https://darkmux.com"
+repository = "https://github.com/kstrat2001/darkmux"
+authors = ["Kain Osterholt"]
+rust-version = "1.86"
+
+[dependencies]
+# (#3112) Which backend runs is the `runtime.sandbox` setting, resolved by
+# the types crate (env > config.json > the platform's default); this crate
+# parses no config itself.
+darkmux-types = { path = "../darkmux-types" }
+# Where `sandbox-exec` lives: one constant, which the platform's default reads too.
+darkmux-platform = { path = "../darkmux-platform" }
+# A handle is stored in records a reaper or a resume reads back.
+serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]
+serial_test = "3.1"
+# A test build reads no operator config (the types crate's test isolation).
+darkmux-types = { path = "../darkmux-types", features = ["test-support"] }
+serde_json.workspace = true
+tempfile = "3.10"

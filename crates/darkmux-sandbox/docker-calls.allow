@@ -1,0 +1,7 @@
+# Production lines spelling the `docker` program ("docker" as a string literal)
+# outside the sandbox backend (src/docker.rs), per file, when the seam arrived.
+# The ratchet test (src/docker_calls.rs) fails if a file gains one, or a new file
+# has one: build a `SandboxPolicy` and spawn what a `SandboxBackend` returns
+# instead. It also fails if a count drops, so moving a call behind the seam
+# lowers its line here in the same commit. This list only shrinks.
+# Empty since #3112 step 1: no production file outside the backend spells it.

@@ -209,7 +209,8 @@ pub fn response(reply: &Value) -> Result<ChatResponse> {
     let blocks = reply
         .get("content")
         .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("messages reply has no content array: {reply}"))?;
+        // (#3112) A parsed reply in the message: the standalone build's key order.
+        .ok_or_else(|| anyhow!("messages reply has no content array: {}", crate::key_order::sorted(reply.clone())))?;
     let mut text = String::new();
     let mut calls = Vec::new();
     for b in blocks {
@@ -220,7 +221,11 @@ pub fn response(reply: &Value) -> Result<ChatResponse> {
                 kind: "function".into(),
                 function: FunctionCall {
                     name: str_of(b, "name"),
-                    arguments: b.get("input").map(Value::to_string).unwrap_or_else(|| "{}".into()),
+                    // (#3112) The key order the standalone build records and sends back.
+                    arguments: b
+                        .get("input")
+                        .map(|input| crate::key_order::sorted(input.clone()).to_string())
+                        .unwrap_or_else(|| "{}".into()),
                 },
                 extra_content: None,
             }),
@@ -284,7 +289,10 @@ impl StreamTranslator {
             "content_block_delta" => self.block_delta(event),
             "message_delta" => self.message_delta(event),
             "message_stop" => Translated::Done,
-            "error" => return Err(anyhow!("endpoint sent an error event mid-stream: {event}")),
+            // (#3112) A parsed event in the message: the standalone build's key order.
+            "error" => {
+                return Err(anyhow!("endpoint sent an error event mid-stream: {}", crate::key_order::sorted(event.clone())))
+            }
             _ => Translated::Skip,
         })
     }

@@ -29,12 +29,12 @@ DISPATCHES
 MacBook-Pro
 Apple M5 Max · 128 GB
 idle
-0 running
+0 running · 2 loaded
 idle
 m1-max-32gb-studio
 hardware not reported
 idle
-0 running
+0 running · 0 loaded
 idle
 RECENT ACTIVITY
 10M

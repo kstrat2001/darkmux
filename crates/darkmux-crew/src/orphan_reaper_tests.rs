@@ -149,26 +149,9 @@ fn each_prefix_reaps_only_its_own_containers() {
         1,
         "the dispatch reaper's rule is unchanged"
     );
-    let args = docker_ps_args_named(PREVIEW_CONTAINER_PREFIX);
-    assert_eq!(args[..3], ["ps", "--filter", "name=^darkmux-preview-"]);
-}
-
-/// (#3456) The host labels as `key=value`, the form a container spec
-/// carries them in.
-#[test]
-fn host_labels_are_the_label_args_values() {
-    let host = HostIdentity {
-        pid: 7,
-        start: 70,
-        machine: "M".into(),
-        pid_ns: "N".into(),
-    };
-    let values: Vec<String> = host_label_args(&host)
-        .into_iter()
-        .skip(1)
-        .step_by(2)
-        .collect();
-    assert_eq!(host_labels(&host), values);
+    let query = host_query(PREVIEW_CONTAINER_PREFIX);
+    assert_eq!(query.having, darkmux_sandbox::Having::NamePrefix("darkmux-preview-".into()));
+    assert!(!query.stopped_too, "a reaper lists running sandboxes only");
 }
 
 /// The reaper cannot read its own machine or namespace: nothing is reaped.
@@ -182,7 +165,7 @@ fn an_unknown_machine_identity_reaps_nothing() {
 fn parse_reads_labels_and_treats_empty_as_absent() {
     let out =
         "darkmux-dispatch-a\t200\t1000\tMACHINE-A\tpid:4026531836\ndarkmux-dispatch-b\t\t\t\t\n\n";
-    let got = parse_docker_ps(out);
+    let got = listed_containers(darkmux_sandbox::backend_of(darkmux_sandbox::BackendKind::Docker).parse_list(&host_query(DISPATCH_CONTAINER_PREFIX), out));
     assert_eq!(
         got,
         vec![
@@ -199,7 +182,7 @@ fn parse_reads_labels_and_treats_empty_as_absent() {
 }
 
 #[test]
-fn host_label_args_are_four_labels() {
+fn host_labels_are_four_key_value_labels() {
     let host = HostIdentity {
         pid: 7,
         start: 70,
@@ -207,15 +190,11 @@ fn host_label_args_are_four_labels() {
         pid_ns: "N".into(),
     };
     assert_eq!(
-        host_label_args(&host),
+        host_labels(&host),
         vec![
-            "--label",
             "darkmux.dispatch.host-pid=7",
-            "--label",
             "darkmux.dispatch.host-start=70",
-            "--label",
             "darkmux.dispatch.host-machine=M",
-            "--label",
             "darkmux.dispatch.host-pid-ns=N",
         ]
     );
@@ -279,8 +258,11 @@ fn restore_path(prev: Option<String>) {
     }
 }
 
-/// One tick against a fake docker: it lists dispatch containers only, kills
-/// exactly the orphan, and leaves the live host's and the unlabeled one.
+/// One tick against a fake docker: it lists dispatch containers only,
+/// removes exactly the orphan, and leaves the live host's and the unlabeled
+/// one. (#3112) Through the sandbox backend's `kill`, whose success, like
+/// `docker kill`'s, means the container was running: the reaper's "killed"
+/// line names only a container it actually ended.
 #[test]
 #[serial]
 fn a_tick_lists_once_and_kills_only_the_orphan() {
@@ -307,24 +289,48 @@ fn a_tick_lists_once_and_kills_only_the_orphan() {
     let calls = std::fs::read_to_string(&record).unwrap();
     let calls: Vec<&str> = calls.lines().collect();
     assert_eq!(calls.len(), 2, "one ps, one kill: {calls:?}");
-    assert!(
-        calls[0].starts_with("ps --filter name=^darkmux-dispatch- --format"),
-        "{calls:?}"
+    assert_eq!(
+        calls[0],
+        "ps --filter name=^darkmux-dispatch- --format {{.Names}}\t\
+         {{.Label \"darkmux.dispatch.host-pid\"}}\t\
+         {{.Label \"darkmux.dispatch.host-start\"}}\t\
+         {{.Label \"darkmux.dispatch.host-machine\"}}\t\
+         {{.Label \"darkmux.dispatch.host-pid-ns\"}}",
+        "the listing: running containers named for dispatch, name then the four host labels"
     );
     assert_eq!(calls[1], "kill darkmux-dispatch-dead");
 }
 
-/// No docker on `PATH`: the tick says so and does nothing else.
+/// No docker on `PATH`: Docker is not listed. (#3112 review) The tick
+/// lists every other backend this host runs, whatever `runtime.sandbox`
+/// says (Docker in a test build): on a Mac, Seatbelt answers, so a sandbox
+/// left there from before the setting changed is still found. Where no
+/// backend answers, the tick says so and does nothing else.
 #[test]
 #[serial]
-fn a_tick_without_docker_does_nothing() {
+fn a_tick_without_docker_lists_the_other_backends() {
     let empty = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
     let prev = std::env::var("PATH").ok();
+    let prev_state = std::env::var_os(darkmux_sandbox::seatbelt::STATE_DIR_ENV);
     // SAFETY: `#[serial]`.
-    unsafe { std::env::set_var("PATH", empty.path()) };
+    unsafe {
+        std::env::set_var("PATH", empty.path());
+        std::env::set_var(darkmux_sandbox::seatbelt::STATE_DIR_ENV, state.path());
+    }
     let tick = reap_tick(Some(&local()), liveness);
     restore_path(prev);
-    assert!(matches!(tick, ReapTick::DockerUnavailable), "{tick:?}");
+    unsafe {
+        match prev_state {
+            Some(v) => std::env::set_var(darkmux_sandbox::seatbelt::STATE_DIR_ENV, v),
+            None => std::env::remove_var(darkmux_sandbox::seatbelt::STATE_DIR_ENV),
+        }
+    }
+    if darkmux_sandbox::SeatbeltBackend::available() {
+        assert!(matches!(&tick, ReapTick::Listed { reaped } if reaped.is_empty()), "{tick:?}");
+    } else {
+        assert!(matches!(tick, ReapTick::ListingUnavailable), "{tick:?}");
+    }
 }
 
 /// (#3200 review) `kill(pid, 0)` answers `EPERM` for a live process owned by

@@ -195,6 +195,31 @@ pub fn record_path_at(root: &Path, execution: &str, seq: u64) -> PathBuf {
 /// The one definition, shared: `darkmux_lab::crawl::unit_step`'s readback
 /// of the unit's own local artifact calls this too, so the run-local file
 /// and the store cannot disagree about a path again (they did, live).
+pub fn strip_source_prefix_under(root: Option<&str>, source_id: &str, raw: &str) -> String {
+    let container = in_container_coords(root, raw);
+    let mapped = strip_source_prefix(source_id, &container);
+    // A path the source prefix did not match keeps the spelling it came in.
+    if mapped == container { strip_source_prefix(source_id, raw) } else { mapped }
+}
+
+/// (#3112 review) The host-seen workspace root a sandbox on the host
+/// reported (`context.root`), trimmed; `None` for none, or for the
+/// container's own `/workspace`.
+pub fn host_root(root: Option<&str>) -> Option<&str> {
+    root.map(|r| r.trim_end_matches('/')).filter(|r| !r.is_empty() && *r != "/workspace")
+}
+
+/// (#3112 review) `raw` with a leading host-seen `root` rewritten to the
+/// container's `/workspace`: the coordinates every mapping below reads. A
+/// path not under `root`, or no root, is returned unchanged.
+pub fn in_container_coords(root: Option<&str>, raw: &str) -> String {
+    match host_root(root).and_then(|r| raw.strip_prefix(r)).filter(|rest| rest.starts_with('/')) {
+        Some(rest) => format!("/workspace{rest}"),
+        None => raw.to_string(),
+    }
+}
+
+/// [`strip_source_prefix_under`] for the container's `/workspace` only.
 pub fn strip_source_prefix(source_id: &str, raw: &str) -> String {
     if source_id.is_empty() {
         return raw.to_string();
@@ -222,12 +247,12 @@ pub fn source_id_of(context: Option<&darkmux_flow::payload::RecordContext>) -> O
 /// into the repo's, using the HOST-known source id. Every other field is
 /// untouched, and a non-object emission (or one with no string `file`) is
 /// returned exactly as it came.
-fn map_emitted_paths(source_id: &str, mut emitted: serde_json::Value) -> serde_json::Value {
+fn map_emitted_paths(source_id: &str, root: Option<&str>, mut emitted: serde_json::Value) -> serde_json::Value {
     let Some(obj) = emitted.as_object_mut() else { return emitted };
     let Some(raw) = obj.get("file").and_then(|v| v.as_str()).map(str::to_string) else {
         return emitted;
     };
-    let mapped = strip_source_prefix(source_id, &raw);
+    let mapped = strip_source_prefix_under(root, source_id, &raw);
     if mapped != raw {
         obj.insert("file".to_string(), serde_json::Value::from(mapped));
     }
@@ -255,8 +280,12 @@ pub fn build_record(
     emitted: serde_json::Value,
 ) -> FindingRecord {
     let source = source_id_of(context.as_ref());
+    // (#3112 review) A sandbox on the host stamps where it saw the
+    // workspace (`context.root`); a finding under it maps like one under
+    // `/workspace`.
+    let root = context.as_ref().and_then(|c| c.root.clone());
     let emitted = match source.as_deref() {
-        Some(id) => map_emitted_paths(id, emitted),
+        Some(id) => map_emitted_paths(id, root.as_deref(), emitted),
         None => emitted,
     };
     FindingRecord {
@@ -716,6 +745,41 @@ mod tests {
             serde_json::json!({"file": "app/src/auth.ts"}),
         );
         assert_eq!(bare.emitted["file"], "src/auth.ts");
+    }
+
+    /// (#3112 review) A sandbox on the host sees the workspace at its own
+    /// path (`context.root`), so a finding naming `<root>/<source>/...` is
+    /// stored exactly as one naming `/workspace/<source>/...`. A path under
+    /// the root but outside the source, or a root a context does not name,
+    /// is untouched.
+    #[test]
+    fn a_finding_under_the_host_seen_root_is_stored_like_one_under_workspace() {
+        let rec = |context: serde_json::Value, file: &str| {
+            build_record(
+                "sess-fix",
+                1,
+                "2026-09-05T00:00:00Z".into(),
+                "create_finding",
+                Proposer { handle: "reviewer".into(), model: "m".into(), machine_id: None },
+                Scope::default(),
+                Some(ctx(context)),
+                serde_json::json!({"file": file, "line": 3}),
+            )
+        };
+        let docker = rec(serde_json::json!({"source": "app"}), "/workspace/app/src/auth.ts");
+        let host = rec(serde_json::json!({"source": "app", "root": "/Users/op/tree"}), "/Users/op/tree/app/src/auth.ts");
+        assert_eq!(host.emitted, docker.emitted);
+        assert_eq!(docker.emitted["file"], "src/auth.ts");
+        let outside = rec(serde_json::json!({"source": "app", "root": "/Users/op/tree"}), "/Users/op/tree/lib/x.ts");
+        assert_eq!(outside.emitted["file"], "/Users/op/tree/lib/x.ts");
+        let unnamed = rec(serde_json::json!({"source": "app"}), "/Users/op/tree/app/src/auth.ts");
+        assert_eq!(unnamed.emitted["file"], "/Users/op/tree/app/src/auth.ts");
+        assert_eq!(strip_source_prefix_under(Some("/Users/op/tree/"), "app", "/Users/op/tree/app/x"), "x", "a trailing slash on the root");
+        // (#3112 review) The root ends at a `/`: a sibling whose name only
+        // starts with it is another tree.
+        assert_eq!(strip_source_prefix_under(Some("/tmp/ws"), "app", "/tmp/ws2/app/x"), "/tmp/ws2/app/x");
+        assert_eq!(in_container_coords(Some("/tmp/ws"), "/tmp/ws2/app/x"), "/tmp/ws2/app/x");
+        assert_eq!(in_container_coords(Some("/tmp/ws"), "/tmp/ws/app/x"), "/workspace/app/x");
     }
 
     /// The mapping is driven by the source id and NOTHING else: a context

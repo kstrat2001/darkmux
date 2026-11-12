@@ -202,6 +202,11 @@ fn darkmux_std_cmd() -> std::process::Command {
     // its own fake `docker` earlier on PATH (`fake_docker_for_runtime_image`).
     let real_path = std::env::var("PATH").unwrap_or_default();
     cmd.env("PATH", format!("{}:{real_path}", docker_shim_dir().display()));
+    // (#3112) Every spawn runs under the Docker sandbox, whatever this host's
+    // default (Seatbelt on a Mac), so no CLI test's outcome depends on the
+    // machine it runs on: the same rule as the `test-support` build. A test
+    // about another sandbox, or the host's default, sets or removes it.
+    cmd.env("DARKMUX_SANDBOX", "docker");
     cmd
 }
 
@@ -9497,7 +9502,7 @@ fn mod_create_mints_per_call_copies_attachments_and_finding_show_lists_the_mods(
         &fs::read_to_string(home.path().join("mods").join(&key_a).join("mod.json")).unwrap(),
     )
     .expect("the record is on disk where the key says");
-    assert_eq!(rec["schema_version"], "2.1");
+    assert_eq!(rec["schema_version"], "2.2");
     assert!(rec["change_key"].as_str().is_some_and(|k| k.starts_with("chg-") && k.len() == 68), "{rec}");
     assert!(rec.get("proposer").is_none(), "a CLI mod names no darkmux role");
     assert_eq!(rec["by"], "sonnet");
@@ -11683,7 +11688,8 @@ fn the_create_mod_message_names_the_kit_shape_and_is_shared_by_both_configs() {
         "exactly as they appear",
         "not inside a code fence",
         "end with a newline",
-        "mounted at `/workspace/<source>`",
+        // (#3112) Expanded where the dispatch's sandbox sees the workdir.
+        "mounted at `${WORKSPACE_ROOT}/<source>`",
         "A diff written into your reply is not a mod",
     ] {
         assert!(crawl.contains(needle), "the message must name the kit shape ({needle:?}):\n{crawl}");
@@ -14719,6 +14725,18 @@ fn init_lms_stub(dir: &std::path::Path, catalog: &str) -> std::path::PathBuf {
 #[cfg(unix)]
 /// `darkmux init <args>` against a fixed `(home, darkmux_home)` and `lms`.
 fn init_in(home: &std::path::Path, darkmux_home: &std::path::Path, lms: &std::path::Path, args: &[&str]) -> std::process::Output {
+    init_with(home, darkmux_home, lms, args, &[])
+}
+
+/// [`init_in`] with extra environment for the spawn.
+#[cfg(unix)]
+fn init_with(
+    home: &std::path::Path,
+    darkmux_home: &std::path::Path,
+    lms: &std::path::Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> std::process::Output {
     // (#3020) `init` sizes the utility window from this machine's AI headroom.
     // Pinned at 62 GiB (64 GiB reclaimable less doctor's 2 GiB margin) through
     // the test hook, so these tests read the same on a 12 GB Linux CI runner
@@ -14729,6 +14747,7 @@ fn init_in(home: &std::path::Path, darkmux_home: &std::path::Path, lms: &std::pa
     // (#316) `init` probes OpenAI-compatible servers on this machine; none
     // answers here, so a server the host runs on 8080 cannot change a result.
     cmd.env("DARKMUX_TEST_INIT_SERVERS", "").env_remove("DARKMUX_DEFAULT_ENGINE").env_remove("DARKMUX_PROFILES");
+    cmd.envs(env.iter().copied());
     cmd.arg("init").args(args).output().unwrap()
 }
 
@@ -14780,6 +14799,23 @@ fn init_first_run_reports_what_it_created_and_the_models_it_chose() {
     assert!(!out.contains("already"), "{out}");
     assert!(fs::read_to_string(&reg).unwrap().contains("\"only-llm\""));
     assert!(home.join(".claude").join("settings.json").is_file());
+}
+
+/// (#3112) Under Seatbelt, `init`'s next steps ask for no Docker: the first
+/// dispatch runs in macOS's own sandbox. (Seatbelt is refused off macOS.)
+#[cfg(unix)]
+#[test]
+fn init_under_seatbelt_asks_for_no_docker() {
+    if !std::path::Path::new("/usr/bin/sandbox-exec").is_file() {
+        return;
+    }
+    let (home, dm) = isolated_roots();
+    let lms = init_lms_stub(&home.join("stub"), r#"[{"modelKey":"only-llm","sizeBytes":2000000000,"type":"llm"}]"#);
+    let out = init_with(&home, &dm, &lms, &[], &[("DARKMUX_SANDBOX", "seatbelt")]);
+    let out = stdout_of(&out);
+    assert!(out.contains("  3. A first dispatch, in macOS's own sandbox (no Docker needed): `darkmux dispatch code-reviewer"), "{out}");
+    let steps = &out[out.find("Next steps:").unwrap()..];
+    assert!(!steps.contains("Docker running") && !steps.contains("image"), "{steps}");
 }
 
 #[cfg(unix)]

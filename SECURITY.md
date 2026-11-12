@@ -81,10 +81,14 @@ frame:
 ### What darkmux does NOT defend (by design)
 
 - **AI-generated code is not sandboxed for security.** The internal runtime
-  runs each dispatch in a per-invocation Docker container with kernel-enforced
-  *workspace* isolation — better than a bare directory, but Docker on macOS is
-  a VM boundary, not a guarantee against a determined adversary. Run only on a
-  machine where that risk is acceptable. (See [DISCLAIMER.md](./DISCLAIMER.md).)
+  runs each dispatch in the sandbox `runtime.sandbox` names, with
+  kernel-enforced *workspace* isolation: on a Mac by default, macOS Seatbelt
+  (`sandbox-exec`), which lets the run read only the system's own paths and
+  its mounts and write only its mounts and its own directory, but runs it as
+  you, on the host, with no memory or process limit; under `docker`, a
+  per-invocation Docker container, which on macOS is a VM boundary. Either is
+  better than a bare directory, and neither is a guarantee against a
+  determined adversary. Run only on a machine where that risk is acceptable. (See [DISCLAIMER.md](./DISCLAIMER.md).)
 - **The daemon's reads are unauthenticated by default.** With `serve.read_auth`
   off (the default), anyone who can reach the daemon, directly or through
   `tailscale serve`, can read your flow records and load the viewer, whether or

@@ -742,6 +742,7 @@ ModRecord
   phase_id: string | null
   step_id: string | null
   source?: string | null
+  source_root?: string | null
   gate?: GateOutcome | null
   gate_skipped_reason?: string | null
   change_key?: string | null
@@ -899,6 +900,7 @@ RecordContext
   model?: string | null
   locality?: string | null
   profile?: string | null
+  root?: string | null
   site?: ContextSite | null
 RecordsEmitted
   by_action: { [key: string]: uint64 }

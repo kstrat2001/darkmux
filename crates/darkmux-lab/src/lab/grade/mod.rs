@@ -582,7 +582,7 @@ fn run_suite_in(runner: &Runner, spec: &SuiteGrade, root: &Path, dir: &Path) -> 
         name_prefix: "darkmux-grade",
     };
     let ran = contained_command::run(&runner.placement, &run, Duration::from_secs(seconds))
-        .map_err(|why| anyhow!("the suite did not run in its container: {why}"))?;
+        .map_err(|why| anyhow!("the suite did not run in {}: {why}", darkmux_sandbox::placed_in_configured()))?;
     let outcome = match ran {
         Bounded::Finished { code, .. } => SuiteOutcome::Exited { code },
         Bounded::TimedOut { seconds } => SuiteOutcome::TimedOut { seconds },
@@ -1088,7 +1088,7 @@ pub(crate) fn apply(
         .as_ref()
         .and_then(|v| v.coverage_min_pct);
     let (ungraded, tests_added) = ungraded_verdict(spec, coverage, raw, gate);
-    let graded = match (crate::providers::coding_task::dispatched_prompt(loaded), Runner::for_workload(loaded)) {
+    let graded = match (crate::providers::coding_task::graded_prompt(loaded), Runner::for_workload(loaded)) {
         (Ok(prompt), Ok(runner)) => grade_run(run_dir, spec, &prompt, fixture, result, dispatch, &runner)?,
         (Err(e), _) => cannot_grade(&anyhow!("resolving the prompt: {e:#}")),
         (_, Err(e)) => cannot_grade(&e),
@@ -1227,7 +1227,7 @@ pub fn grade_runs(runs: &[String], fixture: Option<&Path>, write: bool) -> i32 {
 
 /// The prompt the model was given, and where the suite runs.
 fn prompt_and_runner(loaded: &crate::workloads::types::LoadedWorkload) -> Result<(String, Runner)> {
-    Ok((crate::providers::coding_task::dispatched_prompt(loaded)?, Runner::for_workload(loaded)?))
+    Ok((crate::providers::coding_task::graded_prompt(loaded)?, Runner::for_workload(loaded)?))
 }
 
 /// The workload's `verify.grade`, which a regrade needs.

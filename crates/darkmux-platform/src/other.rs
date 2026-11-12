@@ -1,7 +1,7 @@
 //! Any OS with no strategy of its own: every answer is what darkmux did
 //! before platform strategies existed, so nothing changes there.
 
-use crate::{ContainerHostAccess, ContainerUser, Platform};
+use crate::{ContainerHostAccess, ContainerUser, DefaultSandbox, Platform};
 
 pub struct OtherPlatform;
 
@@ -16,6 +16,11 @@ impl Platform for OtherPlatform {
 
     fn container_user(&self) -> ContainerUser {
         ContainerUser::Image
+    }
+
+    /// Docker, what darkmux ran before it had a choice.
+    fn default_sandbox(&self) -> DefaultSandbox {
+        DefaultSandbox::Docker
     }
 
     fn machine_uid(&self) -> Option<String> {
@@ -109,4 +114,14 @@ impl Platform for OtherPlatform {
     fn secret_store(&self) -> crate::SecretStore {
         crate::SecretStore::PrivateFile
     }
+
+    fn signed_app(&self, _pid: u32) -> Result<crate::SignedApp, String> {
+        Err("darkmux cannot check code signatures on this platform".to_string())
+    }
+
+    fn ask_allow(&self, _message: &str, _icon: Option<&std::path::Path>, _timeout_secs: u64) -> crate::AllowAnswer {
+        crate::AllowAnswer::NoDialog("darkmux shows no dialogs on this platform".to_string())
+    }
+
+    fn notify(&self, _message: &str) {}
 }

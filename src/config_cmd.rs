@@ -235,6 +235,9 @@ const KEYS: &[(&str, Ty)] = &[
     ("clients.preview.enabled", Ty::Bool),
     // (#3459) How long a preview no app asks about runs — see `ClientsPreviewConfig`.
     ("clients.preview.idle_minutes", Ty::Uint),
+    // (#3544) How a pairing is approved — see `ClientsPairingConfig`.
+    ("clients.pairing.verified_teams", Ty::StrList),
+    ("clients.pairing.dialog", Ty::Bool),
     // (#2093) The flow-record hook sink — see `HooksConfig`'s own doc.
     // `hooks.rules` is deliberately NOT a per-field-settable structure (a
     // rule is an object, not a scalar) — it's settable only as a whole,
@@ -1637,7 +1640,7 @@ mod tests {
                 Ty::Float => serde_json::json!(0.5),
                 Ty::Str => Value::String("standalone".into()),
                 // (#2947) The entry's own shipped token.
-                Ty::Enum(s) => Value::String(s.shipped.expect("a scalar enum setting has a shipped value").into()),
+                Ty::Enum(s) => Value::String(s.shipped().expect("a scalar enum setting has a shipped value").into()),
                 Ty::StrList => serde_json::json!(["sentinel"]),
                 // An empty array is valid JSON that parses cleanly to an
                 // empty `Vec<HookRule>` — sufficient to prove the KEY

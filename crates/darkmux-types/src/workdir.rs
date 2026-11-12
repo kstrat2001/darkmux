@@ -135,7 +135,7 @@ pub fn validate_workdir(path: &Path) -> Result<PathBuf> {
 ///
 /// Either way the real git directory lives outside the workdir's own tree
 /// and is therefore never bind-mounted alongside it (only `workdir` itself
-/// gets mounted at `/workspace`, per `apply_volume_mounts`), so any git
+/// gets mounted at `/workspace`, per `volume_mounts`), so any git
 /// command run inside the dispatch container fails with `fatal: not a git
 /// repository: <that path>` (#2294) — a confusing failure to debug from
 /// inside a sandbox, since nothing about it names the real cause.

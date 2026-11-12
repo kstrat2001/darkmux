@@ -450,7 +450,23 @@ use std::path::Path;
 //           `warning`, `critical` or `off`, default `warning`), the memory
 //           pressure at which darkmux refuses to start or load a model. An
 //           older binary refuses a config carrying it.
-pub const CONFIG_SCHEMA_VERSION: &str = "2.8";
+//           Also ADDED (#3544, unreleased with 2.8, so folded into it):
+//           `clients.pairing.verified_teams` (string list;
+//           `DARKMUX_CLIENTS_PAIRING_VERIFIED_TEAMS`, comma-separated; default
+//           `["5LDXYW8B6T"]`, empty = none), the teams whose signed Mux Bot
+//           pairs on this machine with no dialog, and `clients.pairing.dialog`
+//           (bool, default true; `DARKMUX_CLIENTS_PAIRING_DIALOG`), whether an
+//           app that does not verify gets a native Allow dialog. An older
+//           binary refuses a config carrying either.
+//   2.9 (#3112): additive `runtime.sandbox` (`DARKMUX_SANDBOX`; `docker` or
+//           `seatbelt`), the sandbox every isolated run (a dispatch, a lab
+//           run's tests, the mods gate) runs in. Absent = this host's
+//           default (`darkmux_platform::Platform::default_sandbox`): Seatbelt
+//           on a Mac with `sandbox-exec`, Docker elsewhere. Not written by
+//           `init`: the right value depends on the platform, so a literal
+//           would be wrong somewhere (the `container_user` rule). An older
+//           binary refuses a config carrying it.
+pub const CONFIG_SCHEMA_VERSION: &str = "2.9";
 
 /// A `config.json` key an older darkmux read (and `init` may have written)
 /// that this one does not. The unknown-key gate (`user_files`) names it with
@@ -1158,6 +1174,13 @@ pub struct RuntimeBehaviorConfig {
     /// parse refuses the dispatch. Not written by `init`: the right value
     /// depends on the platform, so a literal would be wrong somewhere.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub container_user: Option<String>,
+    /// (#3112, 2.9) The sandbox every isolated run uses: `docker` or
+    /// `seatbelt` ([`SandboxKind`]). Unset, the platform decides
+    /// (`darkmux_platform::Platform::default_sandbox`): Seatbelt on a Mac
+    /// with `sandbox-exec`, Docker elsewhere. Resolved through
+    /// `config_access::sandbox()`; an unregistered value refuses every entry
+    /// point. Not written by `init`, for the `container_user` reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub sandbox: Option<String>,
     /// (#906, 2.6) Run a lab run's verify command and grader suites, which
     /// execute model-written tests, on this machine as the darkmux user
     /// instead of in a container with no network and only the tree mounted.
@@ -1875,6 +1898,27 @@ pub struct ClientsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub profiles: Option<Vec<String>>,
     /// Live previews of a workspace's dev server — see [`ClientsPreviewConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")] pub preview: Option<ClientsPreviewConfig>,
+    /// (#3544) How a pairing request is approved — see [`ClientsPairingConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub pairing: Option<ClientsPairingConfig>,
+    #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+/// (CONFIG 2.8, #3544) How `client serve` approves a pairing request from an
+/// app on this machine. A Mux Bot signed by one of `verified_teams` (and
+/// verified against its running process) is approved at once; any other app
+/// gets a native Allow dialog, unless `dialog` is off. `darkmux client
+/// approve` works either way.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ClientsPairingConfig {
+    /// The developer team ids whose signed Mux Bot pairs with no dialog.
+    /// Absent: `["5LDXYW8B6T"]`, the team that signs Mux Bot. Empty: none,
+    /// so every pairing asks (an app the operator allowed and darkmux
+    /// remembered still pairs at once until `darkmux client forget`).
+    /// `darkmux config set clients.pairing.verified_teams <comma-separated-list>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub verified_teams: Option<Vec<String>>,
+    /// Whether an app that does not verify gets the Allow dialog. Absent:
+    /// `true`. `false`: no dialog; `darkmux client approve` is the way.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub dialog: Option<bool>,
     #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -2223,6 +2267,34 @@ impl From<FleetMode> for DeclaredFleetMode {
     }
 }
 
+/// (#3112) `runtime.sandbox`: what every isolated run (a dispatch, a lab
+/// run's tests, the mods gate, the reapers that end them) runs in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxKind {
+    Docker,
+    Seatbelt,
+}
+
+impl SandboxKind {
+    pub fn as_str(self) -> &'static str {
+        crate::config_enum::ConfigEnum::token(self)
+    }
+}
+
+impl From<darkmux_platform::DefaultSandbox> for SandboxKind {
+    fn from(d: darkmux_platform::DefaultSandbox) -> Self {
+        match d {
+            darkmux_platform::DefaultSandbox::Docker => SandboxKind::Docker,
+            darkmux_platform::DefaultSandbox::Seatbelt => SandboxKind::Seatbelt,
+        }
+    }
+}
+
+crate::config_enum!(SandboxKind, "sandbox", [
+    Docker = "docker" => "a Docker container: needs Docker installed and its daemon running",
+    Seatbelt = "seatbelt" => "macOS Seatbelt (sandbox-exec): part of macOS, nothing to install",
+]);
+
 /// (#3538) `runtime.memory.pressure_gate`: the memory pressure at which
 /// darkmux refuses to start an engine server or load a model into LM Studio,
 /// however much memory the arithmetic says is free
@@ -2403,6 +2475,9 @@ impl DarkmuxConfig {
                 turn_delay_ms: Some(0),
                 // Not written: the platform decides (a literal would be wrong somewhere).
                 container_user: None,
+                // (#3112) Not written, for the same reason: the platform
+                // decides (`Platform::default_sandbox`).
+                sandbox: None,
                 // (#2107, #1833) Visible `5000` — the machine stats
                 // drawer's daemon-side sampler cadence, discoverable and
                 // one edit from `0` (disabled) or a tighter/looser value.

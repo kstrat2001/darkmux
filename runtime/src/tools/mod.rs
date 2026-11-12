@@ -3,7 +3,7 @@
 //! Tools shipped in the runtime palette:
 //!
 //! - `echo`   — round-trip probe, retained for unit-test coverage only;
-//!   NOT exposed in the dispatch palette — see `main.rs`
+//!   NOT exposed in the dispatch palette — see `lib.rs`
 //! - `bash`   — run a bash command with cwd=/workspace
 //! - `read`   — read a file from inside /workspace (requires offset+limit)
 //! - `write`  — write a file to inside /workspace
@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 
 use crate::lmstudio::{FunctionDef, ToolDef};
 use workspace::{
-    read_file_nofollow, resolve_read, resolve_write, write_file_nofollow, DEFAULT_WORKSPACE,
+    read_file_nofollow, resolve_read, resolve_write, write_file_nofollow,
 };
 
 /// Hard cap on how much content a Read tool returns. Anything bigger
@@ -479,14 +479,15 @@ impl Tool {
             kind: "function".into(),
             function: FunctionDef {
                 name: self.name().into(),
-                description: self.description().into(),
-                parameters: self.parameters_schema(),
+                description: workspace::naming_root(self.description()),
+                parameters: schema_naming_root(self.parameters_schema()),
             },
         }
     }
 
     pub fn execute(self, raw_args: &str) -> Result<ToolRun> {
-        let ws = Path::new(DEFAULT_WORKSPACE);
+        let root = workspace::root();
+        let ws = root.as_path();
         match self {
             Tool::Echo => execute_echo(raw_args).map(ToolRun::text),
             Tool::Bash => execute_bash(raw_args, ws).map(ToolRun::text),
@@ -503,6 +504,17 @@ impl Tool {
         }
     }
 
+}
+
+/// A parameters schema with its descriptions naming this run's workspace
+/// root ([`workspace::naming_root`]); unchanged under the default root.
+fn schema_naming_root(schema: serde_json::Value) -> serde_json::Value {
+    match schema {
+        serde_json::Value::String(s) => serde_json::Value::String(workspace::naming_root(&s)),
+        serde_json::Value::Array(items) => items.into_iter().map(schema_naming_root).collect(),
+        serde_json::Value::Object(map) => map.into_iter().map(|(k, v)| (k, schema_naming_root(v))).collect(),
+        other => other,
+    }
 }
 
 /// Dispatch a tool by name with raw JSON args. Returns the string the
@@ -583,7 +595,8 @@ fn format_dispatch_error(tool: Tool, name: &str, e: &anyhow::Error) -> String {
     let err_str = format!("{e:#}");
     let arg_parse_marker = format!("parsing {name} arguments");
     if err_str.contains(&arg_parse_marker) {
-        let schema = tool.parameters_schema();
+        // (#3112) Model-facing text: the key order the standalone build shows.
+        let schema = crate::key_order::sorted(tool.parameters_schema());
         let schema_text = serde_json::to_string_pretty(&schema)
             .unwrap_or_else(|_| schema.to_string());
         format!(
@@ -3981,7 +3994,8 @@ fn execute_create_finding_with(
     });
 
 
-    let mut line = serde_json::to_string(&record).context("serializing finding")?;
+    // (#3112) The standalone build's key order, in every build.
+    let mut line = serde_json::to_string(&crate::key_order::sorted(record)).context("serializing finding")?;
     line.push('\n');
     let mut f = std::fs::OpenOptions::new()
         .create(true)
@@ -4320,7 +4334,8 @@ fn execute_create_mod_with(
         "attach": attached,
         "ts": crate::trajectory::unix_ms(),
     });
-    let mut line = serde_json::to_string(&record).context("serializing mod")?;
+    // (#3112) The standalone build's key order, in every build.
+    let mut line = serde_json::to_string(&crate::key_order::sorted(record)).context("serializing mod")?;
     line.push('\n');
     let mut f = std::fs::OpenOptions::new()
         .create(true)

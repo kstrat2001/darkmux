@@ -1,10 +1,11 @@
 //! A platform whose every answer is set by the test using it.
 
-use crate::{ContainerHostAccess, ContainerUser, Platform};
+use crate::{ContainerHostAccess, ContainerUser, DefaultSandbox, Platform};
 
 pub struct FakePlatform {
     pub container_host_access: ContainerHostAccess,
     pub container_user: ContainerUser,
+    pub default_sandbox: DefaultSandbox,
     pub machine_uid: Option<String>,
     pub reclaimable_memory_bytes: Option<u64>,
     pub memory_pressure: Option<crate::MemoryPressure>,
@@ -32,6 +33,10 @@ pub struct FakePlatform {
     pub tcp_peers: Vec<(std::net::SocketAddr, u32)>,
     /// `(pid, group)` pairs [`Platform::process_group`] answers.
     pub process_groups: Vec<(u32, u32)>,
+    /// `(pid, app)` pairs [`Platform::signed_app`] names; any other pid is unsigned.
+    pub signed_apps: Vec<(u32, crate::SignedApp)>,
+    /// What [`Platform::ask_allow`] answers.
+    pub allow_answer: crate::AllowAnswer,
 }
 
 /// Every answer at its "nothing to report" value, so a test sets only the
@@ -42,6 +47,7 @@ impl Default for FakePlatform {
         FakePlatform {
             container_host_access: ContainerHostAccess::Builtin,
             container_user: ContainerUser::Image,
+            default_sandbox: DefaultSandbox::Docker,
             machine_uid: None,
             reclaimable_memory_bytes: None,
             memory_pressure: None,
@@ -58,6 +64,8 @@ impl Default for FakePlatform {
             tcp_listeners_unreadable_reads: std::sync::atomic::AtomicU32::new(0),
             tcp_peers: Vec::new(),
             process_groups: Vec::new(),
+            signed_apps: Vec::new(),
+            allow_answer: crate::AllowAnswer::NoDialog("a fake platform shows no dialog".to_string()),
         }
     }
 }
@@ -73,6 +81,10 @@ impl Platform for FakePlatform {
 
     fn container_user(&self) -> ContainerUser {
         self.container_user
+    }
+
+    fn default_sandbox(&self) -> DefaultSandbox {
+        self.default_sandbox
     }
 
     fn machine_uid(&self) -> Option<String> {
@@ -176,4 +188,14 @@ impl Platform for FakePlatform {
     fn secret_store(&self) -> crate::SecretStore {
         self.secret_store
     }
+
+    fn signed_app(&self, pid: u32) -> Result<crate::SignedApp, String> {
+        self.signed_apps.iter().find(|(p, _)| *p == pid).map(|(_, a)| a.clone()).ok_or_else(|| "unsigned".to_string())
+    }
+
+    fn ask_allow(&self, _message: &str, _icon: Option<&std::path::Path>, _timeout_secs: u64) -> crate::AllowAnswer {
+        self.allow_answer.clone()
+    }
+
+    fn notify(&self, _message: &str) {}
 }

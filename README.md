@@ -20,10 +20,10 @@ brew tap kstrat2001/tap
 brew install darkmux
 
 darkmux init      # config + profiles + agent skills (never overwrites)
-darkmux doctor    # pre-flight: LMStudio, models, Docker, runtime, RAM
+darkmux doctor    # pre-flight: LMStudio, models, sandbox, runtime, RAM
 ```
 
-Local seats run on [LMStudio](https://lmstudio.ai/) (one downloaded model minimum). Any seat can instead be staffed by a hosted OpenAI-compatible endpoint, or by Claude with prompt caching on every turn ([guide](https://darkmux.com/guide/claude.html)): a machine with zero local models still runs full reviews. [Docker](https://www.docker.com/products/docker-desktop) hosts the dispatch runtime; the image pulls from GHCR on first use. Building from source, hub setup, updating, configuration: [docs/OPERATIONS.md](docs/OPERATIONS.md) · [full guide](https://darkmux.com/guide/).
+Local seats run on [LMStudio](https://lmstudio.ai/) (one downloaded model minimum). Any seat can instead be staffed by a hosted OpenAI-compatible endpoint, or by Claude with prompt caching on every turn ([guide](https://darkmux.com/guide/claude.html)): a machine with zero local models still runs full reviews. On a Mac, dispatches run in macOS's own sandbox (Seatbelt): there is no Docker to install. [Docker](https://www.docker.com/products/docker-desktop) is optional there (`darkmux config set runtime.sandbox docker`) and the default on Linux; under it the runtime image pulls from GHCR on first use. Building from source, hub setup, updating, configuration: [docs/OPERATIONS.md](docs/OPERATIONS.md) · [full guide](https://darkmux.com/guide/).
 
 ## Your first mission
 
@@ -76,7 +76,7 @@ darkmux exists because the [Genesis series](https://darklyenergized.substack.com
 
 ## Status
 
-**v5.9.3** on the [Homebrew tap](https://github.com/kstrat2001/homebrew-tap), moving fast: breaking changes ship clean with migration notes, and every release is dogfooded on real work before it tags. Full history: [CHANGELOG.md](CHANGELOG.md).
+**v5.10.0** on the [Homebrew tap](https://github.com/kstrat2001/homebrew-tap), moving fast: breaking changes ship clean with migration notes, and every release is dogfooded on real work before it tags. Full history: [CHANGELOG.md](CHANGELOG.md).
 
 ## Security
 
