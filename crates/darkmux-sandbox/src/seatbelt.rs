@@ -120,7 +120,7 @@ mkdir -m 700 "$d/tmp" && printf '%s' "$2" > "$d/profile.sb" && printf '%s' "$3" 
 /// reached: unlike a container's, this sandbox does not end everything in it.
 const LAUNCH: &str = r#"wd=$1; shift
 echo $$ > "$d/pid" && ps -o lstart= -p $$ > "$d/started" || exit 125
-/usr/bin/perl -e 'setpgrp(0, 0); my $l = $ARGV[0]; select(undef, undef, undef, 0.05) while getppid() == $l; for (1 .. 1000) { last unless kill(0, -$l); kill("KILL", -$l); }' "$$" </dev/null >/dev/null 2>&1 &
+{GUARD} "$$" </dev/null >/dev/null 2>&1 &
 trap : TERM INT HUP
 [ -z "$wd" ] || cd "$wd" || { rm -rf "$d"; exit 125; }
 [ -n "$1" ] || { echo "seatbelt: no program to run (a policy needs an entrypoint)" >&2; rm -rf "$d"; exit 125; }
@@ -152,8 +152,11 @@ exit $rc
 
 /// The whole launcher script.
 fn launcher() -> String {
-    format!("{LAUNCH}{LAUNCHED}")
+    format!("{}{LAUNCHED}", LAUNCH.replacen("{GUARD}", GUARD, 1))
 }
+
+/// The launcher's guard ([`LAUNCH`]), its launcher's pid its argument.
+const GUARD: &str = r#"/usr/bin/perl -e 'setpgrp(0, 0); my $l = $ARGV[0]; select(undef, undef, undef, 0.05) while getppid() == $l; for (1 .. 1000) { last unless kill(0, -$l); kill("KILL", -$l); }'"#;
 
 /// Whether `$d` is a sandbox's directory at all: only a directory holding
 /// the profile this backend wrote is ever listed, stopped or deleted.
@@ -686,6 +689,11 @@ mod tests {
                 Some(v) => std::env::set_var(STATE_DIR_ENV, v),
                 None => std::env::remove_var(STATE_DIR_ENV),
             }
+        }
+        // And the guard alone, under a parent that is gone before it starts:
+        // it must not mistake launchd (its new parent) for its launcher.
+        for _ in 0..5 {
+            Command::new(SH).arg("-c").arg(format!("{GUARD} \"$$\" </dev/null >/dev/null 2>&1 & exit 0")).status().unwrap();
         }
         std::thread::sleep(Duration::from_millis(500));
         // A guard is a perl that moved itself to a group of its own; once its
