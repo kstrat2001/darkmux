@@ -193,25 +193,21 @@ impl Platform for LinuxPlatform {
         Some(pids)
     }
 
-    /// (#3112) The LISTEN sockets in `/proc/net/tcp` and `tcp6`, matched to
-    /// the fds of every process in group `pgid` (a process this user cannot
-    /// read is left out).
-    fn tcp_group_listeners(&self, pgid: u32) -> Option<Vec<crate::GroupListener>> {
+    /// (#3112) The LISTEN sockets on `port` in `/proc/net/tcp` and `tcp6`
+    /// (the kernel's table), each with the process holding it when this user
+    /// can read that process's fds.
+    fn tcp_port_listeners(&self, port: u16) -> Option<Vec<crate::PortListener>> {
         let mut listening = listening_sockets(&read_to_string("/proc/net/tcp")?);
         listening.extend(listening_sockets(&read_to_string("/proc/net/tcp6").unwrap_or_default()));
-        let mut found = Vec::new();
-        for pid in list_dir("/proc").into_iter().filter_map(|name| name.parse::<u32>().ok()) {
-            if crate::unix_process_group(pid) != Some(pgid) {
-                continue;
-            }
-            for fd in list_dir(&format!("/proc/{pid}/fd")) {
-                let inode = read_link(&format!("/proc/{pid}/fd/{fd}")).and_then(|l| socket_inode(&l));
-                if let Some((at, _)) = listening.iter().find(|(_, i)| Some(*i) == inode) {
-                    found.push(crate::GroupListener { pid, addr: at.ip(), port: at.port() });
-                }
-            }
-        }
-        Some(found)
+        listening.retain(|(at, _)| at.port() == port);
+        let owner = |inode: u64| {
+            list_dir("/proc").into_iter().filter_map(|name| name.parse::<u32>().ok()).find(|pid| {
+                list_dir(&format!("/proc/{pid}/fd"))
+                    .iter()
+                    .any(|fd| read_link(&format!("/proc/{pid}/fd/{fd}")).and_then(|l| socket_inode(&l)) == Some(inode))
+            })
+        };
+        Some(listening.into_iter().map(|(at, inode)| crate::PortListener { addr: at.ip(), scope: None, pid: owner(inode) }).collect())
     }
 
     /// The ESTABLISHED sockets in `/proc/net/tcp` and `tcp6` (where a

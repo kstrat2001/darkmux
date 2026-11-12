@@ -22,6 +22,7 @@ pub mod docker;
 pub use docker::DockerBackend;
 pub mod seatbelt;
 pub use seatbelt::SeatbeltBackend;
+pub mod toolchain;
 
 #[cfg(test)]
 mod docker_calls;

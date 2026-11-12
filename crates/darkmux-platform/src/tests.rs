@@ -1681,22 +1681,84 @@ fn a_fake_answers_the_default_sandbox_the_test_set() {
     assert_eq!(fake.default_sandbox(), DefaultSandbox::Seatbelt);
 }
 
-/// (#3112) `lsof -Fptn` for a process group's listeners: one entry per
-/// socket, under its `p<pid>` line, its address read with its family (`*`
-/// is every address of that family), brackets off an IPv6 one.
+/// (#3112) `netstat -anv -p tcp`'s LISTEN rows on a port, read from the
+/// kernel's own socket table (no walk over processes, which a fork-hopper
+/// races): every address (`*`, by its family), IPv4 and IPv6 loopback, a
+/// scoped address (`fe80::1%lo0`), and the owner's pid at the end of a
+/// `process:pid` field whose name holds spaces. Another port or state is
+/// not one. A header that is not netstat's, or a LISTEN row on the port that
+/// does not read, is no answer at all (`None`), never "nothing listens".
 #[test]
-fn lsof_group_listener_lines_parse_to_addresses() {
-    use std::net::IpAddr;
-    let out = "p66893\nf3\ntIPv6\nn*:55390\nf4\ntIPv4\nn127.0.0.1:55391\np66894\nf5\ntIPv6\nn[::1]:55392\nf6\ntIPv4\nn*:55393\nf7\ntIPv4\nnbogus\n";
-    let got = crate::group_listeners_from_lsof(out);
-    let want = vec![
-        GroupListener { pid: 66893, addr: "::".parse::<IpAddr>().unwrap(), port: 55390 },
-        GroupListener { pid: 66893, addr: "127.0.0.1".parse().unwrap(), port: 55391 },
-        GroupListener { pid: 66894, addr: "::1".parse().unwrap(), port: 55392 },
-        GroupListener { pid: 66894, addr: "0.0.0.0".parse().unwrap(), port: 55393 },
-    ];
-    assert_eq!(got, want);
-    assert!(crate::group_listeners_from_lsof("").is_empty());
+fn netstat_listen_rows_on_a_port_parse_to_addresses_and_owners() {
+    let head = "Active Internet connections (including servers)\nProto Recv-Q Send-Q  Local Address          Foreign Address        (state)          rxbytes      txbytes  rhiwat  shiwat          process:pid    state  options           gencnt    flags   flags1 usecnt rtncnt fltrs\n";
+    let row = |proto: &str, local: &str, state: &str, who: &str| {
+        format!("{proto}       0      0  {local}                *.*                    {state}                 0            0  131072  131072           {who}   00000 00000002 0000000000ff626a 00000000 00000800      1      0 000000\n")
+    };
+    let table = [
+        head.to_string(),
+        row("tcp4", "*.47996", "LISTEN", "Python:2900"),
+        row("tcp6", "::1.47996", "LISTEN", "Python:2901"),
+        row("tcp4", "127.0.0.1.47996", "LISTEN", "Grok Bot:82871"),
+        row("tcp46", "*.47996", "LISTEN", "node:7"),
+        row("tcp6", "fe80::1%lo0.47996", "LISTEN", "node:8"),
+        row("tcp4", "127.0.0.1.47997", "LISTEN", "Python:2900"),
+        "tcp4       0      0  127.0.0.1.47996        127.0.0.1.50000        ESTABLISHED         1 2 3 4 x:9 00 0 0 0 0 0 0 0\n".to_string(),
+    ]
+    .concat();
+    let at = |addr: &str, scope: Option<&str>, pid| PortListener { addr: addr.parse().unwrap(), scope: scope.map(str::to_string), pid: Some(pid) };
+    assert_eq!(
+        crate::port_listeners_from_netstat(&table, 47996),
+        Some(vec![at("0.0.0.0", None, 2900), at("::1", None, 2901), at("127.0.0.1", None, 82871), at("::", None, 7), at("fe80::1", Some("lo0"), 8)])
+    );
+    assert_eq!(crate::port_listeners_from_netstat(&table, 1), Some(vec![]), "no listener on the port");
+    assert_eq!(crate::port_listeners_from_netstat("not netstat\n", 1), None, "a header that is not netstat's");
+    let broken = format!("{head}{}", row("tcp4", "nonsense", "LISTEN", "x:1").replace("nonsense", "garbage.47996x"));
+    assert_eq!(crate::port_listeners_from_netstat(&broken, 47996), None, "a LISTEN row that does not read");
+    let unparsed = format!("{head}{}", row("tcp4", "not-an-ip.47996", "LISTEN", "x:1"));
+    assert_eq!(crate::port_listeners_from_netstat(&unparsed, 47996), None);
+}
+
+/// (#3112 review) Only a netstat that exited 0 answers; any other exit,
+/// or none (killed at the bound), is no answer.
+#[test]
+fn only_a_netstat_that_succeeded_answers() {
+    assert_eq!(crate::macos::netstat_answer(Some(0), "x"), Some("x".to_string()));
+    for code in [Some(1), Some(2), None] {
+        assert_eq!(crate::macos::netstat_answer(code, "x"), None, "{code:?}");
+    }
+}
+
+/// (#3112) Who listens on a port and at which address, asked of this
+/// host's strategy: a child listening on every address and one on the
+/// loopback, on two ports, each read with its address and owner; a port
+/// with none reads empty. An OS with no strategy cannot say; the fake
+/// answers what was set.
+#[test]
+fn the_host_lists_a_ports_listeners_with_their_addresses() {
+    let host = current();
+    if host.tcp_port_listeners(1).is_none() {
+        return; // no strategy reads sockets here
+    }
+    let mut child = std::process::Command::new("/usr/bin/python3")
+        .args(["-c", "import socket,sys,time\na=socket.socket();a.bind(('0.0.0.0',0));a.listen()\nb=socket.socket();b.bind(('127.0.0.1',0));b.listen()\nprint(a.getsockname()[1],b.getsockname()[1],flush=True)\ntime.sleep(30)"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut std::io::BufReader::new(child.stdout.take().unwrap()), &mut line).unwrap();
+    let ports: Vec<u16> = line.split_whitespace().map(|p| p.parse().unwrap()).collect();
+    let (wide, near) = (host.tcp_port_listeners(ports[0]), host.tcp_port_listeners(ports[1]));
+    let _ = child.kill();
+    let _ = child.wait();
+    let pid = Some(child.id());
+    assert_eq!(wide, Some(vec![PortListener { addr: "0.0.0.0".parse().unwrap(), scope: None, pid }]));
+    assert_eq!(near, Some(vec![PortListener { addr: "127.0.0.1".parse().unwrap(), scope: None, pid }]));
+    let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    assert_eq!(host.tcp_port_listeners(free).map(|l| l.into_iter().filter(|l| l.pid != Some(std::process::id())).count()), Some(0));
+    assert_eq!(OtherPlatform.tcp_port_listeners(1), None);
+    let one = PortListener { addr: "0.0.0.0".parse().unwrap(), scope: None, pid: Some(7) };
+    let fake = FakePlatform { port_listeners: vec![(5, vec![one.clone()])], ..Default::default() };
+    assert_eq!((fake.tcp_port_listeners(5), fake.tcp_port_listeners(6)), (Some(vec![one]), Some(vec![])));
 }
 
 /// (#3112) `/proc/net/tcp{,6}`'s LISTEN rows as (address, inode), whatever
@@ -1711,40 +1773,4 @@ fn proc_net_listen_rows_read_with_their_address() {
         crate::linux::listening_sockets(table),
         vec![("127.0.0.1:8080".parse().unwrap(), 41231), ("0.0.0.0:8081".parse().unwrap(), 41232)]
     );
-}
-
-/// (#3112) Every TCP listener in a process group, asked of this host's
-/// strategy: a child in a group of its own that listens on every address
-/// and on loopback is read with both addresses; a group with none reads
-/// empty. An OS with no strategy cannot say; the fake answers what was set.
-#[test]
-fn the_host_lists_a_process_groups_listeners() {
-    use std::os::unix::process::CommandExt;
-    let host = current();
-    if host.tcp_group_listeners(unsafe { libc::getpgid(0) } as u32).is_none() {
-        return; // no strategy reads sockets here
-    }
-    let mut child = std::process::Command::new("/usr/bin/python3")
-        .args(["-c", "import socket,sys,time\na=socket.socket();a.bind(('0.0.0.0',0));a.listen()\nb=socket.socket();b.bind(('127.0.0.1',0));b.listen()\nprint(a.getsockname()[1],b.getsockname()[1],flush=True)\ntime.sleep(30)"])
-        .stdout(std::process::Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .unwrap();
-    let mut line = String::new();
-    std::io::BufRead::read_line(&mut std::io::BufReader::new(child.stdout.take().unwrap()), &mut line).unwrap();
-    let ports: Vec<u16> = line.split_whitespace().map(|p| p.parse().unwrap()).collect();
-    let mut got = host.tcp_group_listeners(child.id()).expect("this host reads its sockets");
-    got.sort_by_key(|l| l.port);
-    let _ = child.kill();
-    let _ = child.wait();
-    let want = vec![
-        GroupListener { pid: child.id(), addr: "0.0.0.0".parse().unwrap(), port: ports[0] },
-        GroupListener { pid: child.id(), addr: "127.0.0.1".parse().unwrap(), port: ports[1] },
-    ];
-    assert_eq!(got, want);
-    assert_eq!(host.tcp_group_listeners(u32::MAX >> 1), Some(vec![]), "no such group, no listeners");
-    assert_eq!(OtherPlatform.tcp_group_listeners(1), None);
-    let one = GroupListener { pid: 7, addr: "0.0.0.0".parse().unwrap(), port: 9 };
-    let fake = FakePlatform { group_listeners: vec![(5, vec![one.clone()])], ..Default::default() };
-    assert_eq!((fake.tcp_group_listeners(5), fake.tcp_group_listeners(6)), (Some(vec![one]), Some(vec![])));
 }

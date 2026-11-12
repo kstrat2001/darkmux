@@ -159,13 +159,14 @@ pub trait Platform: Send + Sync {
     /// connection.
     fn tcp_peers_of(&self, local: std::net::SocketAddr) -> Option<Vec<(std::net::SocketAddr, u32)>>;
 
-    /// (#3112) Every TCP socket listening in process group `pgid`, with the
-    /// address it is bound to: `Some(vec![])` when none does (or no such
-    /// group), `None` when this platform cannot say. What tells a sandbox on
-    /// the host (a client preview under Seatbelt, which cannot hold a bind to
-    /// the loopback, #3559) that something in it listens beyond this machine.
-    /// A process that left the group (`setsid`) is not in it.
-    fn tcp_group_listeners(&self, pgid: u32) -> Option<Vec<GroupListener>>;
+    /// (#3112) Every TCP socket listening on `port`, whatever the process,
+    /// with the address it is bound to and its owner when known, read from
+    /// the kernel's socket table (no walk over processes, which one that
+    /// keeps forking can race): `Some(vec![])` when none does, `None` when
+    /// this platform cannot say or its answer does not read (never "none").
+    /// What tells a sandbox on the host (which can hold a bind to a port but
+    /// not to the loopback, #3559) listening beyond this machine.
+    fn tcp_port_listeners(&self, port: u16) -> Option<Vec<PortListener>>;
 
     /// The process group `pid` is in; `None` for no such process, or where
     /// the platform has no reader.
@@ -579,42 +580,49 @@ pub fn xdg_data_home_from(
     xdg.or_else(|| home.filter(|h| !h.is_empty()).map(|h| std::path::PathBuf::from(h).join(".local").join("share")))
 }
 
-/// (#3112) One TCP socket listening in a process group
-/// ([`Platform::tcp_group_listeners`]): the process holding it, the address
-/// it is bound to (`0.0.0.0` or `::` for every address of that family) and
-/// its port.
+/// (#3112) One TCP socket listening on a port
+/// ([`Platform::tcp_port_listeners`]): the address it is bound to (`0.0.0.0`
+/// or `::` for every address of that family), the interface an address is
+/// scoped to (`lo0` for `fe80::1%lo0`), and the process that owns it when
+/// the platform says (the last one to use it, which may since have exited).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GroupListener {
-    pub pid: u32,
+pub struct PortListener {
     pub addr: std::net::IpAddr,
-    pub port: u16,
+    pub scope: Option<String>,
+    pub pid: Option<u32>,
 }
 
-/// (#3112) The listeners in `lsof -Fptn`'s answer: under each `p<pid>`,
-/// one `t<family>` and `n<address>:<port>` per socket, `*` for every
-/// address of that family, an IPv6 address in brackets. A line that does
-/// not read whole is skipped.
-pub(crate) fn group_listeners_from_lsof(out: &str) -> Vec<GroupListener> {
-    let (mut pid, mut v6) = (None, false);
+/// (#3112) The listeners on `port` in `netstat -anv -p tcp`'s answer. Its
+/// columns: proto, the two queues, the local address (`<addr>.<port>`, `*`
+/// for every address), the foreign one, the state, four counters, then
+/// `process:pid` (a name may hold spaces) and eight more. `None` when the
+/// header is not netstat's, or a LISTEN row's local address does not read.
+pub(crate) fn port_listeners_from_netstat(out: &str, port: u16) -> Option<Vec<PortListener>> {
+    let mut lines = out.lines();
+    lines.find(|l| l.starts_with("Proto") && l.contains("Local Address") && l.contains("process:pid"))?;
     let mut found = Vec::new();
-    for line in out.lines() {
-        if let Some(p) = line.strip_prefix('p') {
-            pid = p.trim().parse().ok();
-        } else if let Some(t) = line.strip_prefix('t') {
-            v6 = t == "IPv6";
-        } else if let (Some(n), Some(pid)) = (line.strip_prefix('n'), pid) {
-            let Some((host, port)) = n.rsplit_once(':') else { continue };
-            let addr = match host {
-                "*" if v6 => Some(std::net::IpAddr::from(std::net::Ipv6Addr::UNSPECIFIED)),
-                "*" => Some(std::net::IpAddr::from(std::net::Ipv4Addr::UNSPECIFIED)),
-                h => h.trim_start_matches('[').trim_end_matches(']').parse().ok(),
-            };
-            if let (Some(addr), Ok(port)) = (addr, port.parse()) {
-                found.push(GroupListener { pid, addr, port });
-            }
+    for line in lines {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if !f.first().is_some_and(|p| p.starts_with("tcp")) || f.get(5) != Some(&"LISTEN") {
+            continue;
         }
+        let (host, at) = f.get(3)?.rsplit_once('.')?;
+        if at.parse::<u16>().ok()? != port {
+            continue;
+        }
+        let (host, scope) = match host.split_once('%') {
+            Some((h, s)) => (h, Some(s.to_string())),
+            None => (host, None),
+        };
+        let addr = match host {
+            "*" if f[0] == "tcp4" => std::net::IpAddr::from(std::net::Ipv4Addr::UNSPECIFIED),
+            "*" => std::net::IpAddr::from(std::net::Ipv6Addr::UNSPECIFIED),
+            h => h.parse().ok()?,
+        };
+        let pid = f.len().checked_sub(9).and_then(|i| f.get(i)).and_then(|w| w.rsplit_once(':')).and_then(|(_, p)| p.parse().ok());
+        found.push(PortListener { addr, scope, pid });
     }
-    found
+    Some(found)
 }
 
 /// The pids in `lsof -Fp`'s answer: one `p<pid>` line per process; every

@@ -19,12 +19,17 @@
 //!   is reachable from the LAN. SBPL's address filter (`local ip`) takes only
 //!   `*` or `localhost`, and for a bind `localhost` matches every local
 //!   address (measured on macOS 26.6), so the profile can allow binding or
-//!   deny it, never tell loopback from the rest. A caller that needs
-//!   loopback-only listeners watches them itself (client previews do).
+//!   deny it, never tell loopback from the rest. It can hold binds to PORTS:
+//!   a policy naming `ports` may bind only those numbers, every other bind
+//!   refused by the kernel. A caller that needs loopback-only listeners
+//!   watches the address itself (client previews do).
 //!   [`Network::None`] allows no network at all, the loopback included.
 //! - **Reach every descendant.** A sandbox is the process group its launcher
-//!   leads; a descendant that leaves the group (`setsid`) outlives a kill,
-//!   though still inside the sandbox.
+//!   leads, killed over and over until it is empty (a process that keeps
+//!   forking is caught). A descendant that leaves the group (`setsid`, or
+//!   `setpgid` to a group of its own, which job control does by itself)
+//!   outlives every kill, still inside the sandbox: it keeps its file and
+//!   network rules (no bind but the named ports) and nothing ends it.
 //!
 //! Each sandbox has a directory under [`state_root`] while it exists: its
 //! profile, its labels, its launcher's pid once started, its own `tmp`

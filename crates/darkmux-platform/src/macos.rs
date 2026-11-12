@@ -188,10 +188,10 @@ impl Platform for MacPlatform {
         lsof_established(local.port()).map(|out| crate::peers_from_lsof_fpn(&out, local))
     }
 
-    /// (#3112) `lsof -nP -a -g <pgid> -iTCP -sTCP:LISTEN -Fptn`: about 50 ms
-    /// wall, 5 ms CPU, measured on an M5 Max.
-    fn tcp_group_listeners(&self, pgid: u32) -> Option<Vec<crate::GroupListener>> {
-        lsof_group_listeners(pgid).map(|out| crate::group_listeners_from_lsof(&out))
+    /// (#3112) One `netstat -anv -p tcp` (the kernel's `pcblist`, no walk
+    /// over processes), bounded to 5 s: about 5 ms measured on an M5 Max.
+    fn tcp_port_listeners(&self, port: u16) -> Option<Vec<crate::PortListener>> {
+        netstat_tcp().and_then(|out| crate::port_listeners_from_netstat(&out, port))
     }
 
     fn process_group(&self, pid: u32) -> Option<u32> {
@@ -645,25 +645,28 @@ fn lsof_listen_pids(_port: u16) -> Option<String> {
     None
 }
 
-/// `lsof`'s `-Fptn` answer for the TCP listeners in process group `pgid`.
-/// It exits 1 when nothing matched, and also when a process it was reading
-/// ended meanwhile, keeping what it printed: both are an answer.
+/// How long one `netstat` may take before it is no answer.
+const NETSTAT_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// `netstat -anv -p tcp`'s answer, when it ran to success within
+/// [`NETSTAT_BOUND`].
 #[cfg(target_os = "macos")]
-fn lsof_group_listeners(pgid: u32) -> Option<String> {
-    let out = std::process::Command::new("/usr/sbin/lsof")
-        .args(["-nP", "-a", "-g", &pgid.to_string(), "-iTCP", "-sTCP:LISTEN", "-Fptn"])
-        .current_dir("/")
-        .output()
-        .ok()?;
-    match out.status.code() {
-        Some(0 | 1) => Some(String::from_utf8_lossy(&out.stdout).into_owned()),
-        _ => None,
-    }
+fn netstat_tcp() -> Option<String> {
+    let mut cmd = std::process::Command::new("/usr/sbin/netstat");
+    cmd.args(["-anv", "-p", "tcp"]).current_dir("/");
+    let out = crate::output_within(cmd, NETSTAT_BOUND)?;
+    netstat_answer(out.status.code(), &String::from_utf8_lossy(&out.stdout))
 }
 
 #[cfg(not(target_os = "macos"))]
-fn lsof_group_listeners(_pgid: u32) -> Option<String> {
+fn netstat_tcp() -> Option<String> {
+    let _ = NETSTAT_BOUND;
     None
+}
+
+/// A netstat's output is an answer only when it exited 0.
+pub(crate) fn netstat_answer(code: Option<i32>, stdout: &str) -> Option<String> {
+    (code == Some(0)).then(|| stdout.to_string())
 }
 
 /// `lsof`'s `-Fpn` answer for the established TCP connections on `port`

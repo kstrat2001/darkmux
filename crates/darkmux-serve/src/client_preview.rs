@@ -61,15 +61,23 @@
 //!   heartbeat folder, its own log (its output goes there) and its
 //!   toolchain; its `HOME` and `TMPDIR` are a private folder removed with
 //!   it. Never your home, `~/.npmrc` included, or another host file.
-//! - **The toolchain is this Mac's.** Each program the recipe's `command`
-//!   and `install.command` run (and the interpreter a script asks `env` for:
-//!   npm's node) is found on the PATH `client serve` runs with, and the
-//!   install folder of each one the sandbox cannot already read is granted
-//!   read-only: nvm's version folder (`~/.nvm/versions/node/vX`), a
-//!   `.volta` or `.pyenv`, never the home or a folder above it. Its PATH is
-//!   those folders and the system's. One not on PATH is refused, naming it
-//!   and where darkmux looked. The install fingerprint counts the programs'
-//!   real paths in place of an image id, so a new node reinstalls.
+//! - **The toolchain is this Mac's** ([`darkmux_sandbox::toolchain`]). Each
+//!   program the recipe's `command` and `install.command` run (the first
+//!   word of each simple command, quotes respected), and the interpreter a
+//!   script asks `env` for (npm's node), is found on the PATH `client serve`
+//!   runs with. Granted read-only: the folder it is in and the folder its
+//!   link leads to, wider only for a known layout (nvm's, fnm's or asdf's
+//!   version folder, a pyenv version, a Volta image, a Homebrew keg); never
+//!   the home, a folder above it, a top-level dot-folder of it (`~/.cargo`,
+//!   `~/.lmstudio`) or a git repository's root, where only the program's file
+//!   is granted. A workspace script the command names
+//!   (`./node_modules/.bin/vite`) has its interpreter granted only when it is
+//!   a known runtime (node, python, bun, deno). A version manager's shim
+//!   (pyenv's or asdf's `shims`, Volta's) is refused: it reads the manager's
+//!   files in your home. One not on PATH is refused, naming it and where
+//!   darkmux looked. Its PATH is those folders and the system's. The install
+//!   fingerprint counts the programs' real paths in place of an image id, so
+//!   a new node reinstalls.
 //! - **Its dev server binds this Mac's ports directly,** the same free app
 //!   and HMR ports darkmux picks for a container (nothing is published).
 //!   darkmux gives it the loopback: `{host}` in a recipe's `env` is
@@ -77,32 +85,41 @@
 //!   (`0.0.0.0`, `::`) is given as `127.0.0.1`, so a recipe written for
 //!   Docker runs unchanged. A `--host 0.0.0.0` written in the `command`
 //!   itself is not rewritten.
-//! - **Loopback is watched, not enforced (#3559).** Seatbelt cannot hold a
-//!   bind to the loopback: its address filter knows only `*` and
-//!   `localhost`, and `localhost` matches every local address. So darkmux
-//!   reads what the preview's process group listens on
-//!   (`Platform::tcp_group_listeners`, one `lsof` on macOS) before it reports
-//!   the preview ready and every [`EXPOSURE_CHECK_EVERY`] after, and stops a
-//!   preview that listens beyond the loopback (`0.0.0.0`, `::`, a LAN
-//!   address), saying which socket and the fix; listeners it cannot read
-//!   stop it too. This is detection with a window, not a kernel boundary: a
-//!   server that binds every address is reachable from the LAN for up to
-//!   about two seconds (its first read, before ready, is when it starts
-//!   answering), and a process that leaves the group (`setsid`) is not
-//!   watched at all. UDP is not watched. A Vite HMR server with its own port
-//!   binds every address unless `server.hmr.host` names the loopback.
+//! - **Two ports, enforced; their address, watched (#3559).** The kernel
+//!   lets the preview bind only its app and HMR ports: any other listener,
+//!   on any address, is refused. Seatbelt cannot hold those two to the
+//!   loopback (its address filter knows only `*` and `localhost`, and
+//!   `localhost` matches every local address), so darkmux reads both ports
+//!   from the kernel's socket table (`Platform::tcp_port_listeners`, one
+//!   `netstat` on macOS; no walk over processes, which one that keeps forking
+//!   races) before it reports the preview ready and every
+//!   [`EXPOSURE_CHECK_EVERY`] after, and stops a preview listening on either
+//!   beyond the loopback (`0.0.0.0`, `::`, a LAN address), saying which
+//!   socket and the fix. A read that fails twice running, or does not parse,
+//!   stops it too: never "nothing listens". This is detection with a window,
+//!   not a kernel boundary: a server binding every address on one of those
+//!   ports is reachable from the LAN for up to about two seconds. UDP is not
+//!   watched. A Vite HMR server with its own port binds every address unless
+//!   `server.hmr.host` names the loopback.
 //! - **It reaches what this Mac's loopback serves,** directly: `client
 //!   serve`'s pairing routes, LM Studio, the darkmux daemon, a local
 //!   database, as a container does through `host.docker.internal`. No unix
 //!   socket but the resolver's (never Docker's). Outbound network is open
 //!   on both backends: an install fetches packages.
 //! - **Lifecycle.** Created, then started, so a stop finds it; a stop, the
-//!   idle check, `client serve`'s shutdown and any end remove it. The sandbox
-//!   ends with its script, as a container does (whatever it left running in
-//!   its process group is killed), so the heartbeat watchdog's end of the
-//!   script ends the dev server too. One left by a killed `client serve` is
-//!   found by its labels in the sandbox's state folder and removed at the
-//!   next start, like a container.
+//!   idle check, `client serve`'s shutdown and any end remove it. When its
+//!   script ends, everything left in its process group is killed until none
+//!   is left, so the heartbeat watchdog's end of the script ends the dev
+//!   server too. One left by a killed `client serve` is found by its labels
+//!   in the sandbox's state folder and removed at the next start, like a
+//!   container. **Unlike a container**, a process that moves to a process
+//!   group of its own (`setsid`, `setpgid`; job control does it by itself)
+//!   is not ended with the sandbox. It keeps the sandbox's rules (no write
+//!   outside the workspace, no bind but the two ports), and after a stop
+//!   darkmux kills whatever still holds either port and started since the
+//!   preview did ([`OnHost`]'s sweep). One that holds no port is not found:
+//!   no mark on it is one a sweep could read reliably. It runs until it
+//!   exits or this Mac restarts.
 //! - **`node_modules` from the other backend.** A workspace installed in a
 //!   container holds Linux builds (esbuild's binary, say) that this Mac's
 //!   node cannot load, and the other way round. The install record names the
@@ -203,7 +220,8 @@ use darkmux_sandbox::{Access, BackendKind, DockerBackend, Limits, Mount, Network
 /// listener watch.
 #[path = "client_preview_on_host.rs"]
 mod on_host;
-pub use on_host::{OnHost, Toolchain};
+pub use darkmux_sandbox::toolchain::Toolchain;
+pub use on_host::OnHost;
 use darkmux_types::data_version::PREVIEW_RECIPE_SCHEMA_VERSION;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -343,7 +361,7 @@ fn check_version(doc: &serde_json::Value) -> Result<(), RecipeRefusal> {
         )));
     }
     match doc.get("schema_version").and_then(serde_json::Value::as_str) {
-        Some(PREVIEW_RECIPE_SCHEMA_VERSION) => Ok(()),
+        Some(PREVIEW_RECIPE_SCHEMA_VERSION | "1.0") => Ok(()),
         other => Err(RecipeRefusal::Invalid(format!(
             "{RECIPE_PATH}: `schema_version` {} is not one this darkmux reads (write \"{PREVIEW_RECIPE_SCHEMA_VERSION}\")",
             other.map_or_else(|| "is missing; it".to_string(), |v| format!("\"{v}\""))
@@ -764,6 +782,17 @@ pub const POLLING_ENV: &[(&str, &str)] = &[
 /// The first line a preview container prints: without it, its exit is
 /// Docker's (no image, a bad mount), not the recipe's.
 const STARTED_LINE: &str = "darkmux-preview: container started";
+/// (#3112) The same line in a sandbox on the host.
+const ON_HOST_STARTED_LINE: &str = "darkmux-preview: sandbox started";
+
+/// The first line a preview in `kind` prints.
+fn started_line(kind: BackendKind) -> &'static str {
+    if kind.on_host() {
+        ON_HOST_STARTED_LINE
+    } else {
+        STARTED_LINE
+    }
+}
 /// Printed after the install step, before the dev server starts.
 const SERVING_LINE: &str = "darkmux-preview: starting the dev server";
 /// Printed when the install step fails, followed by its exit code.
@@ -796,12 +825,13 @@ const HEARTBEAT_CHECK_SECS: &str = "10";
 /// seconds: a dev server that ignores TERM still ends.
 const STALE_KILL_GRACE_SECS: &str = "5";
 
-/// (#3112) How often a preview in a sandbox on the host has its process
-/// group's listeners read, to stop one that listens beyond the loopback
-/// (Seatbelt cannot hold that bind, #3559). One read is one `lsof` on macOS:
-/// about 50 ms wall and 5 ms CPU measured, so every 2 s is about 0.25% of
-/// one core per running preview, and a server that binds every address is
-/// reachable for at most about 2 s before it is stopped.
+/// (#3112) How often a preview in a sandbox on the host has its two ports'
+/// listeners read, to stop one listening beyond the loopback (Seatbelt can
+/// hold it to the ports, not to the loopback, #3559). A look is one
+/// `netstat` per port on macOS: about 9 ms wall and 8 ms CPU each, measured
+/// over 50 reads with 444 sockets open, so every 2 s is about 0.85% of one
+/// core per running preview, and a server that binds every address on one
+/// of them is reachable for at most about 2 s before it is stopped.
 pub const EXPOSURE_CHECK_EVERY: Duration = Duration::from_secs(2);
 
 /// What the container's watchdog reads, and when it gives up.
@@ -1001,15 +1031,20 @@ fn dev_server_host(kind: BackendKind) -> &'static str {
 }
 
 /// A recipe `env` value as the dev server gets it under `kind`: ports and
-/// `{host}` filled in, and, on the host, an every-address value (`0.0.0.0`,
+/// (recipe 1.1 on, `has_host`) `{host}` filled in, and, on the host, an every-address value (`0.0.0.0`,
 /// `::`, `[::]`) given as the loopback, so a recipe written for Docker runs
 /// unchanged.
-fn env_value(value: &str, port: u16, hmr_port: u16, kind: BackendKind) -> String {
+fn env_value(value: &str, port: u16, hmr_port: u16, kind: BackendKind, has_host: bool) -> String {
     let host = dev_server_host(kind);
     if kind.on_host() && matches!(value, "0.0.0.0" | "::" | "[::]") {
         return host.to_string();
     }
-    substitute(value, port, hmr_port).replace("{host}", host)
+    let filled = substitute(value, port, hmr_port);
+    if has_host {
+        filled.replace("{host}", host)
+    } else {
+        filled
+    }
 }
 
 /// [`container_env`] under `kind`, after `path` (the toolchain's `PATH` on
@@ -1017,13 +1052,16 @@ fn env_value(value: &str, port: u16, hmr_port: u16, kind: BackendKind) -> String
 fn container_env_for(recipe: &Recipe, port: u16, hmr_port: u16, kind: BackendKind, path: Option<&str>) -> Vec<(String, String)> {
     let mut recipe_env: Vec<(&String, &String)> = recipe.env.iter().collect();
     recipe_env.sort();
+    // (#3112) `{host}` means the dev server's address from recipe 1.1 on; a
+    // 1.0 recipe keeps the text it always had.
+    let has_host = recipe.schema_version != "1.0";
     path.map(|p| ("PATH".to_string(), p.to_string()))
         .into_iter()
         .chain(POLLING_ENV.iter().map(|(k, v)| (k.to_string(), v.to_string())))
         .chain(
             recipe_env
                 .into_iter()
-                .map(|(k, v)| (k.clone(), env_value(v, port, hmr_port, kind))),
+                .map(|(k, v)| (k.clone(), env_value(v, port, hmr_port, kind, has_host))),
         )
         .chain([
             ("DARKMUX_PREVIEW_PORT".to_string(), port.to_string()),
@@ -1043,8 +1081,10 @@ pub trait PreviewContainers: Send + Sync {
     }
     /// (#3112) The host toolchain `recipe` runs with; a container's is its
     /// image's ([`Toolchain::default`]).
-    fn toolchain(&self, recipe: &Recipe) -> Result<Toolchain, String> {
-        let _ = recipe;
+    /// (#3112) The host toolchain `recipe` runs with in `workdir`; a
+    /// container's is its image's ([`Toolchain::default`]).
+    fn toolchain(&self, recipe: &Recipe, workdir: &Path) -> Result<Toolchain, String> {
+        let _ = (recipe, workdir);
         Ok(Toolchain::default())
     }
     /// The image and `--user` a preview container runs with, resolved as a
@@ -1062,18 +1102,16 @@ pub trait PreviewContainers: Send + Sync {
     /// dev server never answered; `None` when they cannot be read.
     fn listeners(&self, name: &str) -> Option<String>;
     /// (#3112) Why the dev server never answered on `port`: in a container,
-    /// from its socket tables; on the host, from what process group `group`
-    /// (the started sandbox's) listens on.
-    fn not_ready_reason(&self, name: &str, port: u16, group: u32) -> String {
-        let _ = group;
+    /// from its socket tables; on the host, from what listens on the port.
+    fn not_ready_reason(&self, name: &str, port: u16) -> String {
         not_ready_reason(port, self.listeners(name).as_deref())
     }
-    /// (#3112) The listeners in process group `group` bound beyond the
-    /// loopback, which stop a preview on the host (its sandbox cannot hold a
-    /// bind to the loopback, #3559); `Err` when they cannot be read. A
-    /// container publishes only its loopback ports: nothing to watch.
-    fn exposed(&self, group: u32) -> Result<Vec<darkmux_platform::GroupListener>, String> {
-        let _ = group;
+    /// (#3112) The listeners on the preview's two `ports` bound beyond the
+    /// loopback, which stop a preview on the host (its sandbox holds it to
+    /// those ports but not to the loopback, #3559); `Err` when they cannot be
+    /// read. A container publishes only its loopback ports: nothing to watch.
+    fn exposed(&self, ports: [u16; 2]) -> Result<Vec<(u16, darkmux_platform::PortListener)>, String> {
+        let _ = ports;
         Ok(Vec::new())
     }
     /// Stops and removes the container: TERM, KILL after five seconds.
@@ -1281,7 +1319,7 @@ impl Previews {
             .map(|p| p.join("previews"))
             .unwrap_or_else(|| PathBuf::from("previews"));
         Self::new(dir, Arc::new(Docker { image: None }))
-            .with_backend(BackendKind::Seatbelt, Arc::new(OnHost { kind: BackendKind::Seatbelt }))
+            .with_backend(BackendKind::Seatbelt, Arc::new(OnHost::new(BackendKind::Seatbelt)))
     }
 
     fn snapshot(name: &str, e: &Entry) -> PreviewState {
@@ -1951,7 +1989,7 @@ fn spec_in(
         user: user.filter(|_| !on_host),
         labels,
         env: container_env_for(recipe, at.port, at.hmr_port, kind, toolchain.path.as_deref()),
-        script: container_script(recipe, install_due, &Watch::production_at(&beat_at)),
+        script: container_script(recipe, install_due, &Watch::production_at(&beat_at)).replacen(STARTED_LINE, started_line(kind), 1),
         read_only: if on_host { toolchain.read_only.iter().cloned().chain([at.log.clone()]).collect() } else { Vec::new() },
     }
 }
@@ -2021,7 +2059,7 @@ fn serve(
     // Ready: wait for it to end, and say why unless it was stopped. On the
     // host, watch its listeners meanwhile.
     let status = if kind.on_host() { watch_until_ended(entry, &mut child, (&spec.name, containers), at)? } else { child.wait() };
-    Err(Halt::Failed(exit_reason(recipe, &at.log, status)))
+    Err(Halt::Failed(exit_reason_in(kind, recipe, &at.log, status)))
 }
 
 /// The preview's sandbox spec, its image (or toolchain) resolved and its
@@ -2036,8 +2074,8 @@ fn planned_spec(
     let kind = containers.kind();
     let resolved = containers
         .image_and_user()
-        .map_err(|e| format!("a preview runs in a container: {e}"))?;
-    let toolchain = containers.toolchain(recipe)?;
+        .map_err(|e| if kind.on_host() { format!("a preview runs in {}: {e}", darkmux_sandbox::placed_in(kind)) } else { format!("a preview runs in a container: {e}") })?;
+    let toolchain = containers.toolchain(recipe, &at.workdir)?;
     // On the host the toolchain stands in for the image an install counts.
     let image = if kind.on_host() { format!("{}|{}", resolved.0, toolchain.identity) } else { resolved.0.clone() };
     let plan = install_plan_in(kind, recipe, at, &image);
@@ -2060,6 +2098,12 @@ fn reinstall_for(kind: BackendKind, made: BackendKind, recipe: &Recipe, at: &Run
     let Some(rel) = recipe.install.as_ref().and_then(|i| i.unless_exists.as_deref()) else {
         return Ok(());
     };
+    if at.checkout.as_deref().is_some_and(|c| same_dir(c, &at.workdir)) {
+        return Err(Halt::Failed(format!(
+            "{} is your own checkout, not darkmux's workspace; refusing to delete {rel} in it to reinstall",
+            at.workdir.display()
+        )));
+    }
     remove_inside(&at.workdir, rel)?;
     let line = format!(
         "{rel} was installed in {}, which this preview no longer runs in: deleted {} in darkmux's workspace copy \
@@ -2130,7 +2174,7 @@ impl ExposureWatch {
 /// loopback (or none readable) removes the sandbox, waits for `child`, and
 /// halts saying why.
 fn stop_if_exposed(child: &mut std::process::Child, (name, containers): (&str, &dyn PreviewContainers), at: &RunIn) -> Result<(), Halt> {
-    let checked = check_exposure(containers, child.id(), at);
+    let checked = check_exposure(containers, at);
     if checked.is_err() {
         containers.remove(name);
         let _ = child.wait();
@@ -2141,8 +2185,8 @@ fn stop_if_exposed(child: &mut std::process::Child, (name, containers): (&str, &
 /// (#3112) Whether a preview's process group `group` listens beyond the
 /// loopback: a failure naming each listener when it does, or when its
 /// listeners cannot be read.
-fn check_exposure(containers: &dyn PreviewContainers, group: u32, at: &RunIn) -> Result<(), Halt> {
-    match containers.exposed(group) {
+fn check_exposure(containers: &dyn PreviewContainers, at: &RunIn) -> Result<(), Halt> {
+    match containers.exposed([at.port, at.hmr_port]) {
         Ok(found) if found.is_empty() => Ok(()),
         Ok(found) => Err(Halt::Failed(on_host::exposure_reason(containers.kind(), &found, at.port, at.hmr_port))),
         Err(why) => Err(Halt::Failed(why)),
@@ -2156,23 +2200,35 @@ fn exit_reason(
     log: &Path,
     status: std::io::Result<std::process::ExitStatus>,
 ) -> String {
+    exit_reason_in(BackendKind::Docker, recipe, log, status)
+}
+
+/// (#3112) [`exit_reason`] for a preview in `kind`, which names its sandbox
+/// as a container or a sandbox and knows its start line.
+fn exit_reason_in(
+    kind: BackendKind,
+    recipe: &Recipe,
+    log: &Path,
+    status: std::io::Result<std::process::ExitStatus>,
+) -> String {
     let text = std::fs::read_to_string(log).unwrap_or_default();
     let status = status.map(|s| s.to_string()).unwrap_or_default();
-    if !text.lines().any(|l| l == STARTED_LINE) {
+    let noun = if kind.on_host() { "sandbox" } else { "container" };
+    if !text.lines().any(|l| l == started_line(kind)) {
         let said = text
             .lines()
             .rev()
             .find(|l| !l.trim().is_empty())
             .unwrap_or("")
             .trim();
-        return format!("the preview container did not start ({status}): {said}");
+        return format!("the preview {noun} did not start ({status}): {said}");
     }
     let install_code = text
         .lines()
         .find_map(|l| l.strip_prefix(INSTALL_FAILED_LINE))
         .map(str::trim);
     if text.lines().any(|l| l == STALE_LINE) {
-        return "the preview's container stopped itself: darkmux stopped answering".to_string();
+        return format!("the preview's {noun} stopped itself: darkmux stopped answering");
     }
     match (install_code, &recipe.install) {
         (Some(code), Some(install)) => {
@@ -2244,7 +2300,7 @@ fn wait_ready(
             return Ok(());
         }
         if serving_since.is_some_and(|t| t.elapsed() > at.ready_within) {
-            return Err(Halt::Failed(containers.not_ready_reason(name, at.port, child.id())));
+            return Err(Halt::Failed(containers.not_ready_reason(name, at.port)));
         }
         std::thread::sleep(Duration::from_millis(300));
     }
@@ -2259,7 +2315,8 @@ fn ended_or_stopped(
     at: &RunIn,
 ) -> Result<(), Halt> {
     if let Ok(Some(status)) = child.try_wait() {
-        return Err(Halt::Failed(exit_reason(recipe, &at.log, Ok(status))));
+        let kind = entry.lock().unwrap().containers.kind();
+        return Err(Halt::Failed(exit_reason_in(kind, recipe, &at.log, Ok(status))));
     }
     if entry.lock().unwrap().status == Status::Stopped {
         let _ = child.wait();
@@ -2388,17 +2445,17 @@ impl PreviewContainers for HostEmulator {
         }
     }
 
-    fn not_ready_reason(&self, name: &str, port: u16, group: u32) -> String {
+    fn not_ready_reason(&self, name: &str, port: u16) -> String {
         if *self.on_host.lock().unwrap() {
-            on_host::not_ready_reason(self.kind(), port, darkmux_platform::current().tcp_group_listeners(group).as_deref())
+            on_host::not_ready_reason(self.kind(), port, darkmux_platform::current().tcp_port_listeners(port).as_deref())
         } else {
             not_ready_reason(port, self.listeners(name).as_deref())
         }
     }
 
-    fn exposed(&self, group: u32) -> Result<Vec<darkmux_platform::GroupListener>, String> {
+    fn exposed(&self, ports: [u16; 2]) -> Result<Vec<(u16, darkmux_platform::PortListener)>, String> {
         if *self.on_host.lock().unwrap() {
-            on_host::exposed_in(darkmux_platform::current(), self.kind(), group)
+            on_host::exposed_in(darkmux_platform::current(), self.kind(), ports)
         } else {
             Ok(Vec::new())
         }
@@ -3906,7 +3963,7 @@ mod tests {
         );
         let dir = tempfile::tempdir().unwrap();
         let previews = Previews::new(dir.path().join("p"), Arc::new(Docker { image: Some(image) }));
-        let ((), name) = super::tests_shared::preview_with_no_host_files_or_host_env(dir.path(), previews, BackendKind::Docker, |_| ());
+        let ((), name) = super::tests_shared::preview_with_no_host_files_or_host_env(dir.path(), previews, BackendKind::Docker, |_, _| ());
         let listed = std::process::Command::new("docker")
             .args([
                 "ps",
@@ -4279,13 +4336,14 @@ pub(crate) mod tests_shared {
     /// with (a key exported in this process), it cannot read a host path
     /// beside the workspace, and once stopped nothing answers. Its recipe
     /// asks for every address (`HOST` `0.0.0.0`), as one written for Docker
-    /// does. `while_running` sees it ready, by its sandbox's name. Returns
+    /// does. `while_running` sees it ready, by its sandbox's name and its
+    /// app port. Returns
     /// what that returned and the name.
     pub(crate) fn preview_with_no_host_files_or_host_env<T>(
         dir: &Path,
         previews: Previews,
         kind: BackendKind,
-        while_running: impl FnOnce(&str) -> T,
+        while_running: impl FnOnce(&str, u16) -> T,
     ) -> (T, String) {
         let (wt, outside) = (dir.join("ws"), dir.join("outside"));
         std::fs::create_dir_all(wt.join(".darkmux")).unwrap();
@@ -4347,7 +4405,7 @@ pub(crate) mod tests_shared {
             "read a host path outside the workspace: {leak}"
         );
         let name = container.expect("the container was adopted");
-        let seen = while_running(&name);
+        let seen = while_running(&name, state.port);
         assert!(previews.stop("ws"));
         assert!(!http_ok(state.port, "/"), "nothing answers any more");
         (seen, name)

@@ -107,7 +107,7 @@ impl Platform for OtherPlatform {
         None
     }
 
-    fn tcp_group_listeners(&self, _pgid: u32) -> Option<Vec<crate::GroupListener>> {
+    fn tcp_port_listeners(&self, _port: u16) -> Option<Vec<crate::PortListener>> {
         None
     }
 

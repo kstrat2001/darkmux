@@ -40,13 +40,21 @@ darkmux release.
   your home); a program not on PATH is refused, naming it and where darkmux looked. darkmux gives
   the dev server the loopback: a recipe's new `{host}` is `127.0.0.1` there (`0.0.0.0` in a
   container), and a `HOST` of `0.0.0.0` is given as `127.0.0.1`, so a recipe written for Docker
-  runs unchanged. Seatbelt cannot hold that bind (#3559), so darkmux reads the preview's listeners
-  before it reports it ready and every 2 s after, and stops one that listens beyond the loopback,
-  naming the socket: detection with a short window, not a kernel boundary. A workspace installed
-  in the other sandbox has its `install.unless_exists` path (Linux-built `node_modules`) deleted in
-  darkmux's workspace copy and reinstalled, saying so in the logs. Previews stay off by default.
-- **Seatbelt: a sandbox ends with its program (#3112).** Whatever the program left running in its
-  process group is killed when it exits, as a container's init does.
+  runs unchanged (`{host}` is preview recipe schema 1.1; a 1.0 recipe keeps `{host}` as text, and
+  an older darkmux refuses a 1.1 recipe as newer). The kernel lets the preview bind only its app
+  and HMR ports; it cannot hold them to the loopback (#3559), so darkmux reads those two ports
+  from the kernel's socket table before it reports the preview ready and every 2 s after, and
+  stops one listening beyond the loopback, naming the socket: on those two ports, detection with
+  a short window, not a kernel boundary. After a stop, whatever still holds either port and
+  started since the preview did is killed. A workspace installed in the other sandbox has its
+  `install.unless_exists` path (Linux-built `node_modules`) deleted in darkmux's workspace copy
+  and reinstalled, saying so in the logs. Previews stay off by default.
+- **Seatbelt: a sandbox's process group ends with its program (#3112).** Whatever the program
+  left running in its process group is killed when it exits, over and over until none is left.
+  Unlike a container's init, it does not reach a process that moved to a group of its own
+  (`setsid`, `setpgid`).
+- **Seatbelt can hold a sandbox to named ports (#3112).** A policy naming ports may bind only
+  those; every other bind is refused by the kernel.
 - **Seatbelt does not hold a bind to the loopback (#3559).** The docs no longer claim it: a
   dispatch under Seatbelt can listen on every address. Recorded by a conformance case; dispatches
   are not watched yet.
