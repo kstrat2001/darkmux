@@ -1163,6 +1163,7 @@ fn the_grader_in_a_container_reaches_the_hosts_verdicts() {
     let contained = Runner {
         placement: Placement::Container("node:22-bookworm-slim".into()),
         user: None,
+        sandbox: Some(darkmux_sandbox::BackendKind::Docker),
     };
     for (result, passed) in [(&good, true), (&weak, false)] {
         let mut verdicts = vec![];

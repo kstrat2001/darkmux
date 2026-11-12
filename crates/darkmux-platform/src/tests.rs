@@ -1654,3 +1654,29 @@ fn every_listed_container_engine_is_never_named() {
         assert!(e.contains(engine) && e.contains("container traffic"), "{e}");
     }
 }
+
+/// (#3112) Which sandbox a host runs when `runtime.sandbox` is unset: a Mac
+/// with `sandbox-exec` runs Seatbelt and needs no Docker; one without it
+/// (never seen, but not assumed away) falls back to Docker.
+#[test]
+fn a_mac_with_sandbox_exec_defaults_to_seatbelt() {
+    assert_eq!(crate::macos::default_sandbox_given(true), DefaultSandbox::Seatbelt);
+    assert_eq!(crate::macos::default_sandbox_given(false), DefaultSandbox::Docker);
+    let present = std::path::Path::new(SANDBOX_EXEC).is_file();
+    assert_eq!(MacPlatform.default_sandbox(), crate::macos::default_sandbox_given(present));
+}
+
+/// (#3112) Linux and every other OS keep Docker until they have a backend
+/// of their own (Landlock is the Linux step).
+#[test]
+fn linux_and_other_default_to_docker_for_now() {
+    assert_eq!(LinuxPlatform.default_sandbox(), DefaultSandbox::Docker);
+    assert_eq!(OtherPlatform.default_sandbox(), DefaultSandbox::Docker);
+}
+
+#[test]
+fn a_fake_answers_the_default_sandbox_the_test_set() {
+    assert_eq!(FakePlatform::default().default_sandbox(), DefaultSandbox::Docker);
+    let fake = FakePlatform { default_sandbox: DefaultSandbox::Seatbelt, ..FakePlatform::default() };
+    assert_eq!(fake.default_sandbox(), DefaultSandbox::Seatbelt);
+}

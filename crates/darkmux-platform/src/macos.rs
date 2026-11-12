@@ -1,6 +1,6 @@
 //! macOS: the platform darkmux was built on.
 
-use crate::{ContainerHostAccess, ContainerUser, Platform};
+use crate::{ContainerHostAccess, ContainerUser, DefaultSandbox, Platform};
 
 pub struct MacPlatform;
 
@@ -18,6 +18,12 @@ impl Platform for MacPlatform {
     /// user can use them.
     fn container_user(&self) -> ContainerUser {
         ContainerUser::Image
+    }
+
+    /// Seatbelt, which ships with macOS, whenever `sandbox-exec` is there:
+    /// a new user needs no Docker. Docker only on a Mac without it.
+    fn default_sandbox(&self) -> DefaultSandbox {
+        default_sandbox_given(std::path::Path::new(crate::SANDBOX_EXEC).is_file())
     }
 
     /// The `IOPlatformUUID` (`ioreg -rd1 -c IOPlatformExpertDevice`).
@@ -1041,4 +1047,14 @@ pub(crate) fn reclaimable_from_vm_stat(vm_stat: &str, page_size: u64) -> Option<
 pub(crate) fn parse_pages_field(s: &str) -> Option<u64> {
     let cleaned: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
     cleaned.parse().ok()
+}
+
+/// The default sandbox on a Mac where `sandbox-exec` is (`true`) or is not
+/// present: the answer's logic, apart from the filesystem read.
+pub(crate) fn default_sandbox_given(sandbox_exec_present: bool) -> DefaultSandbox {
+    if sandbox_exec_present {
+        DefaultSandbox::Seatbelt
+    } else {
+        DefaultSandbox::Docker
+    }
 }

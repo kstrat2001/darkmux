@@ -94,6 +94,13 @@ pub struct RecordContext {
     #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub profile: Option<String>,
+    /// (flow 2.8.0, #3112) Where the dispatch's sandbox saw the workspace,
+    /// stamped only when that is not the container's `/workspace` (a sandbox
+    /// on the host sees it at its own path). A finding naming a file under
+    /// it is mapped to the source the same way as one under `/workspace`.
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub root: Option<String>,
     /// On a finding record: the planned span that holds the finding.
     #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
@@ -103,4 +110,23 @@ pub struct RecordContext {
     #[schemars(skip)]
     #[cfg_attr(feature = "ts-export", ts(skip))]
     pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// (flow 2.8.0, #3112) `root`: where the dispatch's sandbox saw the
+    /// workspace, when that is not the container's `/workspace`. It
+    /// round-trips, and a context without it reads and re-serializes
+    /// without it (a Docker run's records are unchanged).
+    #[test]
+    fn the_workspace_root_round_trips_and_is_absent_by_default() {
+        let with: RecordContext = serde_json::from_value(serde_json::json!({"source": "app", "root": "/Users/op/tree"})).unwrap();
+        assert_eq!(with.root.as_deref(), Some("/Users/op/tree"));
+        assert_eq!(serde_json::to_value(&with).unwrap(), serde_json::json!({"source": "app", "root": "/Users/op/tree"}));
+        let without: RecordContext = serde_json::from_value(serde_json::json!({"source": "app"})).unwrap();
+        assert_eq!(without.root, None);
+        assert_eq!(serde_json::to_value(&without).unwrap(), serde_json::json!({"source": "app"}));
+    }
 }

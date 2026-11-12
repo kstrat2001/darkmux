@@ -346,24 +346,24 @@ fn search_instruction(recipe: &darkmux_crew::rules::SearchRecipe) -> String {
     }
 }
 
-fn render_sites(source: &str, sites: &[Site]) -> String {
+fn render_sites(root: &str, source: &str, sites: &[Site]) -> String {
     // Full container paths: the workspace root is the MATERIALIZED tree, so a
     // path relative to the source (`ui/src/x.ts`) does not resolve and the
     // tool boundary rejects it (observed on the first live mission, #1959).
     sites
         .iter()
-        .map(|s| format!("- /workspace/{source}/{}:{} (read lines {}-{})", s.file, s.line, s.start, s.end))
+        .map(|s| format!("- {root}/{source}/{}:{} (read lines {}-{})", s.file, s.line, s.start, s.end))
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-fn render_files(source: &str, files: &[ReadFileEntry]) -> String {
+fn render_files(root: &str, source: &str, files: &[ReadFileEntry]) -> String {
     files
         .iter()
         .map(|f| match f {
-            ReadFileEntry::Whole(path) => format!("- /workspace/{source}/{path}"),
+            ReadFileEntry::Whole(path) => format!("- {root}/{source}/{path}"),
             ReadFileEntry::Range { file, start, end } => {
-                format!("- /workspace/{source}/{file} (lines {start}-{end})")
+                format!("- {root}/{source}/{file} (lines {start}-{end})")
             }
         })
         .collect::<Vec<_>>()
@@ -376,7 +376,11 @@ fn render_files(source: &str, files: &[ReadFileEntry]) -> String {
 /// load-bearing sentences (the tool's exact five keys; the coverage
 /// request), so a model already tuned against that workload sees familiar
 /// phrasing here.
-const REPORT_FINDING_INSTRUCTIONS: &str = "\nFor each match, call `create_finding` with these five keys exactly: `file`, `line`, `pattern`, `evidence`, `why`. `file` must be the full path exactly as listed above, starting with `/workspace/`. `evidence` must be the source line copied verbatim, and `line` must be where it appears.\n\nWhen you are done, say which files or sites you examined, which you did not get to, and whether you covered the whole scope.\n";
+/// (#3112 review) `root` is where the sandbox sees the tree (`/workspace` in a
+/// container, so the text is the frozen one there).
+fn report_finding_instructions(root: &str) -> String {
+    format!("\nFor each match, call `create_finding` with these five keys exactly: `file`, `line`, `pattern`, `evidence`, `why`. `file` must be the full path exactly as listed above, starting with `{root}/`. `evidence` must be the source line copied verbatim, and `line` must be where it appears.\n\nWhen you are done, say which files or sites you examined, which you did not get to, and whether you covered the whole scope.\n")
+}
 
 /// Build the dispatch message for one unit. Model-facing (AI-convention
 /// terms; the words `unit`/`ledger`/`corpus`/`packet` never appear —
@@ -393,6 +397,17 @@ const REPORT_FINDING_INSTRUCTIONS: &str = "\nFor each match, call `create_findin
 /// entirely rather than rendered empty, so a unit's message is unchanged
 /// from before this parameter existed whenever there is nothing to say.
 pub fn build_message(rules_by_id: &BTreeMap<String, Rule>, unit: &Unit, intent: Option<&str>) -> Result<String> {
+    build_message_at(CONTAINER_TREE_ROOT, rules_by_id, unit, intent)
+}
+
+/// Where a container sees the unit's tree.
+const CONTAINER_TREE_ROOT: &str = "/workspace";
+
+/// (#3112 review) [`build_message`] naming the tree at `root`, where the
+/// unit's sandbox sees it: `/workspace` in a container (the frozen message,
+/// byte for byte), the tree's own host path in a sandbox on the host, where
+/// `/workspace` is a directory that does not exist.
+pub fn build_message_at(root: &str, rules_by_id: &BTreeMap<String, Rule>, unit: &Unit, intent: Option<&str>) -> Result<String> {
     let missing = |rule: &str| {
         anyhow!(
             "dispatch.unit: no rule resolved for id `{rule}`: the plan names a rule the current \
@@ -410,8 +425,8 @@ pub fn build_message(rules_by_id: &BTreeMap<String, Rule>, unit: &Unit, intent: 
             let r = rules_by_id.get(rule).ok_or_else(|| missing(rule))?;
             out.push_str(&pattern_block(r));
             out.push_str(&format!(
-                "Your scope is these sites in `/workspace/{source}`. For each, read lines noted below and decide whether the cited line matches the pattern. `read` numbers every line it returns as `N: content`, so the cited line is the one beginning `<line>: ` — do not count lines. Cite it as `file:line`. Sites:\n{}\n",
-                render_sites(source, sites)
+                "Your scope is these sites in `{root}/{source}`. For each, read lines noted below and decide whether the cited line matches the pattern. `read` numbers every line it returns as `N: content`, so the cited line is the one beginning `<line>: ` — do not count lines. Cite it as `file:line`. Sites:\n{}\n",
+                render_sites(root, source, sites)
             ));
         }
         Unit::Read { rules: rule_ids, files, source, .. } => {
@@ -420,8 +435,8 @@ pub fn build_message(rules_by_id: &BTreeMap<String, Rule>, unit: &Unit, intent: 
                 out.push_str(&pattern_block(r));
             }
             out.push_str(&format!(
-                "Your scope is these files in `/workspace/{source}`. Read each one in full and apply every pattern above:\n{}\n",
-                render_files(source, files)
+                "Your scope is these files in `{root}/{source}`. Read each one in full and apply every pattern above:\n{}\n",
+                render_files(root, source, files)
             ));
         }
         Unit::Edge {
@@ -438,16 +453,16 @@ pub fn build_message(rules_by_id: &BTreeMap<String, Rule>, unit: &Unit, intent: 
             let r = rules_by_id.get(rule).ok_or_else(|| missing(rule))?;
             out.push_str(&pattern_block(r));
             out.push_str(&format!(
-                "Your scope is these import sites in `/workspace/{source}`. `read` numbers every line it returns as `N: content`, so the cited line is the one beginning `<line>: `. Cite it as `file:line`.\n{}\n\n",
-                render_sites(source, sites)
+                "Your scope is these import sites in `{root}/{source}`. `read` numbers every line it returns as `N: content`, so the cited line is the one beginning `<line>: `. Cite it as `file:line`.\n{}\n\n",
+                render_sites(root, source, sites)
             ));
             out.push_str(&format!(
-                "The library `{package}` at the version being examined is at `/workspace/{library}`; its entry files and changelog are: {}. The consumer pins `{pinned}`; the library version is `{library_version}`.\n",
+                "The library `{package}` at the version being examined is at `{root}/{library}`; its entry files and changelog are: {}. The consumer pins `{pinned}`; the library version is `{library_version}`.\n",
                 if library_surface.is_empty() { "(none)".to_string() } else { library_surface.join(", ") }
             ));
         }
     }
-    out.push_str(REPORT_FINDING_INSTRUCTIONS);
+    out.push_str(&report_finding_instructions(root));
     Ok(out)
 }
 
@@ -669,7 +684,7 @@ pub fn finding_rule_for(pattern: Option<&str>, rule_ids: &[String]) -> (String, 
 /// live only here, so this run-local artifact normalized while the stored
 /// record kept the container path, and every host-side consumer (the diff
 /// test, the gate's scratch checkout) read a path that did not exist.
-use darkmux_crew::findings::strip_source_prefix;
+use darkmux_crew::findings::strip_source_prefix_under;
 
 /// Read this unit's accepted findings, stamp the crawl's provenance onto
 /// each, and write them beside the run as `<rule>.<unit>.findings.jsonl` (#2360 —
@@ -719,7 +734,7 @@ fn readback_findings(
         if let Some(obj) = rec.as_object_mut() {
             let raw_file = obj.get(FINDING_FILE_KEY).and_then(Value::as_str).unwrap_or("").to_string();
             obj.insert("file_raw".to_string(), json!(raw_file));
-            obj.insert(FINDING_FILE_KEY.to_string(), json!(strip_source_prefix(&ctx.source, &raw_file)));
+            obj.insert(FINDING_FILE_KEY.to_string(), json!(strip_source_prefix_under(Some(&ctx.tree_seen), &ctx.source, &raw_file)));
             obj.insert("workspace".to_string(), json!(ctx.workspace));
             obj.insert("unit".to_string(), json!(ctx.unit_id));
             obj.insert("source".to_string(), json!(ctx.source));
@@ -873,6 +888,10 @@ struct UnitContext {
     /// own source tree, so the container's `/workspace/<source>/…` paths
     /// (which every message renders) resolve.
     tree_root: PathBuf,
+    /// (#3112 review) Where the unit's sandbox sees `tree_root`: `/workspace`
+    /// in a container, the tree's own path in a sandbox on the host. Every
+    /// path the brief lists starts here, and findings map back from it.
+    tree_seen: String,
 }
 
 /// Resolve one unit out of an already-loaded plan: its source's sha and
@@ -940,6 +959,7 @@ fn unit_context(the_plan: &Plan, unit: &Unit, run: &RunId, role_id: &str, rule_s
         rule_ids: unit_rules(unit),
         sites: planned_sites(unit),
         session_id: SessionId::adhoc(run.clone(), role_id, format!("{rule_segment}-{}", unit.id())),
+        tree_seen: darkmux_sandbox::seen_at_configured(&tree_root, CONTAINER_TREE_ROOT),
         tree_root,
     })
 }
@@ -1300,7 +1320,9 @@ impl StepKind for DispatchUnitStepKind {
                 None
             }
         });
-        let message = build_message(&rules_by_id, unit, intent_text.as_deref())?;
+        // (#3112 review) Every path the brief lists starts where this unit's
+        // sandbox sees the tree.
+        let message = build_message_at(&ctx.tree_seen, &rules_by_id, unit, intent_text.as_deref())?;
 
         // Mint this unit's own out dir BEFORE dispatch (#2153): the dir is
         // then known and recorded even if the dispatch returns `Err` with
@@ -1439,6 +1461,9 @@ impl StepKind for DispatchUnitStepKind {
                 // tailer under `payload.context` on every record this unit's
                 // dispatch produces.
                 record_context: Some(RecordContext {
+                    // (#3112 review) Stamped only off `/workspace`, so a
+                    // Docker run's records are unchanged.
+                    root: darkmux_crew::findings::host_root(Some(&ctx.tree_seen)).map(str::to_string),
                     workspace: Some(ctx.workspace.clone()),
                     source: Some(ctx.source.clone()),
                     sha: Some(ctx.sha.clone()),

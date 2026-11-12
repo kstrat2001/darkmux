@@ -65,8 +65,10 @@ leave a dangling launchd plist until the next reboot.
 `fleet`, `flow`, `init`), the `serve` daemon, the keychain wrapper, and
 the bundled skills.
 
-**Not bundled, but not a manual step:** the `darkmux-runtime` Docker image
-that `darkmux dispatch` and `darkmux lab run` run in. On the first dispatch,
+**Not needed on a Mac:** dispatches run in macOS's own sandbox (Seatbelt) by
+default. **Under `runtime.sandbox docker`** (Linux's default, a Mac's opt-in),
+the `darkmux-runtime` Docker image that `darkmux dispatch` and
+`darkmux lab run` run in is not bundled, but not a manual step either. On the first dispatch,
 darkmux pulls the image built for its own version,
 `ghcr.io/kstrat2001/darkmux-runtime:<version>` (#759); you need Docker
 running. From a source checkout at the same version you can build it instead

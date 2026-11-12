@@ -51,24 +51,34 @@ fn who(user: ContainerUser) -> String {
     }
 }
 
-const NAME: &str = "container user";
+pub(crate) const NAME: &str = "container user";
 
 /// (#906) Where a lab run's model-written tests (its verify command and
-/// grader suites) run. In a container passes; on the host warns, because
-/// code a model wrote then runs as the operator, with their files and
-/// network.
-pub fn check_lab_tests_placement() -> Check {
+/// grader suites) run. In the configured sandbox (#3112: `runtime.sandbox`)
+/// passes; on the host warns, because code a model wrote then runs as the
+/// operator, with their files and network.
+pub fn check_lab_tests_placement(sandbox: &Result<darkmux_sandbox::BackendKind, String>) -> Check {
     let (on_host, source) = darkmux_types::config_access::tests_on_host_with_source();
-    describe_tests_placement(on_host, source)
+    // (#3112 review) The selection every start uses (a Seatbelt without
+    // `sandbox-exec` is refused there too); a refused one has its own Fail
+    // row (`sandbox`), so name the setting.
+    let sandbox = sandbox.as_ref().map_or("runtime.sandbox", |k| darkmux_sandbox::setting_value(*k));
+    describe_tests_placement(on_host, source, sandbox)
 }
 
-fn describe_tests_placement(on_host: bool, source: Source) -> Check {
+fn describe_tests_placement(on_host: bool, source: Source, sandbox: &str) -> Check {
     let name = "lab tests".to_string();
+    let docker = darkmux_types::config::SandboxKind::Docker.as_str();
+    let place = if sandbox == docker {
+        format!("a Docker container (`runtime.sandbox` is `{docker}`)")
+    } else {
+        format!("the `{sandbox}` sandbox (`runtime.sandbox`)")
+    };
     if !on_host {
         return Check {
             name,
             status: Status::Pass,
-            message: "a lab run's verify command and grader suites run in a container: no network, only the run's tree mounted".into(),
+            message: format!("a lab run's verify command and grader suites run in {place}: no network, only the run's tree writable"),
             hint: None,
         };
     }
@@ -80,7 +90,10 @@ fn describe_tests_placement(on_host: bool, source: Source) -> Check {
             "a lab run's verify command and grader suites run on this machine as you (`{setting}` is on): \
              code a model wrote runs with your files and network"
         ),
-        hint: Some("Only for fixtures and models you trust. `darkmux config set runtime.tests_on_host false` puts them back in a container.".into()),
+        hint: Some(format!(
+            "Only for fixtures and models you trust. `darkmux config set runtime.tests_on_host false` puts them back in {}.",
+            if sandbox == docker { "a Docker container".to_string() } else { format!("the `{sandbox}` sandbox") }
+        )),
     }
 }
 
@@ -92,12 +105,25 @@ mod tests {
     /// setting the operator turned on.
     #[test]
     fn lab_tests_on_the_host_warn_naming_the_setting() {
-        assert_eq!(describe_tests_placement(false, Source::BuiltIn).status, Status::Pass);
-        let config = describe_tests_placement(true, Source::Config);
+        assert_eq!(describe_tests_placement(false, Source::BuiltIn, "docker").status, Status::Pass);
+        let config = describe_tests_placement(true, Source::Config, "docker");
         assert_eq!(config.status, Status::Warn);
         assert!(config.message.contains("runtime.tests_on_host"), "{}", config.message);
-        let env = describe_tests_placement(true, Source::Env);
+        let env = describe_tests_placement(true, Source::Env, "docker");
         assert!(env.message.contains("DARKMUX_TESTS_ON_HOST"), "{}", env.message);
+    }
+
+    /// (#3112) Off the host, the row names the sandbox the tests run in:
+    /// a container only under Docker.
+    #[test]
+    fn lab_tests_in_a_sandbox_name_the_configured_one() {
+        let seatbelt = describe_tests_placement(false, Source::BuiltIn, "seatbelt");
+        assert!(seatbelt.message.contains("the `seatbelt` sandbox (`runtime.sandbox`)"), "{}", seatbelt.message);
+        assert!(!seatbelt.message.contains("container"), "{}", seatbelt.message);
+        let docker = describe_tests_placement(false, Source::BuiltIn, "docker");
+        assert!(docker.message.contains("a Docker container (`runtime.sandbox` is `docker`)"), "{}", docker.message);
+        let back = describe_tests_placement(true, Source::Config, "seatbelt").hint.unwrap_or_default();
+        assert!(back.contains("back in the `seatbelt` sandbox"), "{back}");
     }
     use darkmux_platform::FakePlatform;
     use darkmux_types::config_access::Source;

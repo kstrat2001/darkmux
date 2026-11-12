@@ -16,7 +16,7 @@ Not *designed* as team tooling or a multi-tenant platform. The technical surface
 
 ## How darkmux runs
 
-With just Docker + LMStudio, darkmux dispatches through its own built-in, container-bounded runtime: no external agent runtime to install or configure. This is the only dispatch path: `darkmux dispatch`, `darkmux lab run`, and the mission/phase lifecycle all run through it. (Earlier versions offered an opt-in shell-out to a separately-installed agent runtime; that path was removed pre-1.0 to keep the build and test surface small. See [#1405](https://github.com/kstrat2001/darkmux/issues/1405).)
+With just LMStudio, darkmux dispatches through its own built-in, sandboxed runtime: no external agent runtime to install or configure. The sandbox is `runtime.sandbox`: macOS's own Seatbelt by default on a Mac (nothing to install), Docker by default on Linux and the opt-in on a Mac. This is the only dispatch path: `darkmux dispatch`, `darkmux lab run`, and the mission/phase lifecycle all run through it. (Earlier versions offered an opt-in shell-out to a separately-installed agent runtime; that path was removed pre-1.0 to keep the build and test surface small. See [#1405](https://github.com/kstrat2001/darkmux/issues/1405).)
 
 See [DESIGN.md](DESIGN.md) for the implementation reasoning.
 
@@ -51,13 +51,13 @@ The third one is opt-in (the daemon binds localhost by default for safety). To e
 
 ### Prerequisites
 
-**Out of the box, darkmux works with LMStudio + Docker.** Nothing else is required for the full dispatch + lab path. Other agent runtimes are opt-in.
+**Out of the box on a Mac, darkmux works with LMStudio alone.** Nothing else is required for the full dispatch + lab path: dispatches run in macOS's own sandbox (Seatbelt). On Linux, and on a Mac that opts in, Docker is the sandbox. Other agent runtimes are opt-in.
 
 | Required | Why | Install |
 |---|---|---|
 | **[LMStudio](https://lmstudio.ai/)** | Loads/unloads models. darkmux drives it via the `lms` CLI. | macOS / Windows / Linux installer |
 | **At least one model in LMStudio** | Nothing to dispatch to without one. | Download via the LMStudio UI; verify with `lms ls`. |
-| **[Docker](https://www.docker.com/products/docker-desktop)** | Hosts darkmux's internal Rust runtime, the default for `darkmux dispatch` and `darkmux lab run`. Each dispatch runs in a per-invocation `darkmux-runtime` container with kernel-enforced workspace isolation. darkmux pulls the version-pinned image from GHCR on demand (or `docker build --build-arg DARKMUX_VERSION=<version> -f runtime/Dockerfile -t darkmux-runtime:latest .` from the root of a source checkout at that version; a local image whose version label does not match the binary is skipped, #2923). **Required only for that dispatch + lab path:** the `machine` / `profile` read core needs only LMStudio + a model. | Docker Desktop or equivalent daemon |
+| **[Docker](https://www.docker.com/products/docker-desktop)** (optional on macOS) | The sandbox when `runtime.sandbox` is `docker`: the default on Linux, the opt-in on a Mac (`darkmux config set runtime.sandbox docker`), and what client previews need for now. Each dispatch then runs in a per-invocation `darkmux-runtime` container with kernel-enforced workspace isolation. darkmux pulls the version-pinned image from GHCR on demand (or `docker build --build-arg DARKMUX_VERSION=<version> -f runtime/Dockerfile -t darkmux-runtime:latest .` from the root of a source checkout at that version; a local image whose version label does not match the binary is skipped, #2923). **Required only for that dispatch + lab path:** the `machine` / `profile` read core needs only LMStudio + a model. | Docker Desktop or equivalent daemon |
 
 > **`brew install` needs no toolchain.** Homebrew handles the build for you (and bottled binaries, once published, ship precompiled). The **Rust toolchain** is required only if you build from source (Option B below), which documents `rustup` at its first step.
 
@@ -88,7 +88,7 @@ brew services start darkmux
 
 The brew formula installs both the `darkmux` binary AND a keychain-aware wrapper script (`libexec/darkmux-serve-wrapped`) that resolves `DARKMUX_REDIS_URL` from macOS Keychain at process-start, so the Redis password never lives in the launchd plist. See [the always-on hub guide](docs/guide/always-on-hub.html) for the production-grade setup.
 
-**Scope of the brew install.** What you get: the `darkmux` CLI (dispatch, mission, machine, profile, flow, doctor, init), the `serve` daemon, the keychain wrapper, and the bundled skills. The `darkmux-runtime` Docker image that `darkmux dispatch` / `darkmux lab run` need is **not bundled in the formula** but you don't build it by hand: on the first dispatch with no local image, darkmux **pulls the version-pinned image from GHCR on demand** (`ghcr.io/kstrat2001/darkmux-runtime:<version>`, [#759](https://github.com/kstrat2001/darkmux/issues/759)). You just need Docker running. (A `runtime/` source checkout + `docker build` is the offline/dev alternative.) So the brew path is a complete install end to end: the `machine` / `profile` core, the hub posture (Redis + serve), **and** local dispatches.
+**Scope of the brew install.** What you get: the `darkmux` CLI (dispatch, mission, machine, profile, flow, doctor, init), the `serve` daemon, the keychain wrapper, and the bundled skills. Under `runtime.sandbox docker`, the `darkmux-runtime` Docker image that `darkmux dispatch` / `darkmux lab run` need is **not bundled in the formula** but you don't build it by hand: on the first dispatch with no local image, darkmux **pulls the version-pinned image from GHCR on demand** (`ghcr.io/kstrat2001/darkmux-runtime:<version>`, [#759](https://github.com/kstrat2001/darkmux/issues/759)). You just need Docker running. (A `runtime/` source checkout + `docker build` is the offline/dev alternative.) So the brew path is a complete install end to end: the `machine` / `profile` core, the hub posture (Redis + serve), **and** local dispatches.
 
 **Option B: from source via cargo** (for dev work, contributors, or if you need the `darkmux-runtime` Docker image alongside the binary):
 
@@ -102,7 +102,8 @@ git clone https://github.com/kstrat2001/darkmux
 cd darkmux
 cargo install --path .      # builds the self-contained binary, drops it on $PATH
 
-# 3. Build the internal-runtime container image (one-time, ~50 MB). The
+# 3. Only under `runtime.sandbox docker` (Linux's default, a Mac's opt-in):
+#    build the internal-runtime container image (one-time, ~50 MB). The
 #    build-arg stamps the version label; dispatch skips an image whose label
 #    does not match the installed binary (#2923).
 docker build --build-arg DARKMUX_VERSION="$(darkmux --version | awk '{print $2}')" \
@@ -224,7 +225,7 @@ darkmux is a CLI binary, not an HTTP proxy. Your frontier session (Claude Code) 
 
 4. **Observability daemon.** `darkmux serve` is a local HTTP daemon (default bind `127.0.0.1:8765`) that serves the viewer at `/` plus flow records and mission/phase state as JSON. The route list, and the response type of each route, is in the [observability guide](guide/observability.html); routes and shapes are semver contracts, pinned by `crates/darkmux-serve/route-table.golden`. Foreground process: run in a separate terminal tab. `darkmux doctor` includes a `daemon: reachable` check; dispatches print a one-line stderr nudge when the daemon isn't reachable.
 
-Both `dispatch` and `lab run` use the internal Docker-bounded runtime. The frontier session (Claude Code) orchestrates the whole thing: see the `/darkmux-bootstrap` skill for a guided walkthrough.
+Both `dispatch` and `lab run` use the internal runtime, in the sandbox `runtime.sandbox` names. The frontier session (Claude Code) orchestrates the whole thing: see the `/darkmux-bootstrap` skill for a guided walkthrough.
 
 ## Why "darkmux"
 
@@ -258,7 +259,7 @@ The `m-series-128` provider's rules are empirically validated against lab measur
 
 ## Runtime
 
-`darkmux dispatch` uses the **internal runtime** by default: an in-house Rust agent loop running inside a per-dispatch `darkmux-runtime` Docker container with a mounted workspace tempdir. Kernel-enforced workspace isolation, no cross-task context leak by construction. The image is small (~50 MB) and built once from `runtime/`:
+`darkmux dispatch` uses the **internal runtime** by default: an in-house Rust agent loop running in the sandbox `runtime.sandbox` names (`darkmux doctor`'s `sandbox` row shows which, and where the value came from). On a Mac the default is `seatbelt`, macOS's own `sandbox-exec`: the runtime runs on the host, writing only its workspace tempdir. Under `docker` (the default on Linux, `darkmux config set runtime.sandbox docker` on a Mac), it runs inside a per-dispatch `darkmux-runtime` Docker container with a mounted workspace tempdir. Kernel-enforced workspace isolation either way, no cross-task context leak by construction. Under Docker, the image is small (~50 MB) and built once from `runtime/`:
 
 ```bash
 # build the image once from the darkmux repo root, stamped with the version
@@ -284,7 +285,7 @@ machine.
 
 The `lab` subcommand mirrors `dispatch`'s contract: the internal runtime, no external agent runtime to install or configure. The `machine` / `profile` subcommands don't depend on any runtime at all. They read LMStudio and the registry directly.
 
-This means **darkmux's dispatch path needs nothing beyond Docker + LMStudio**: `dispatch` ships with a self-contained internal runtime, so a new user never installs a second agent-runtime tool to get going. The empirical findings in the article series were measured against this runtime.
+This means **darkmux's dispatch path needs nothing beyond LMStudio on a Mac** (and Docker under `runtime.sandbox docker`): `dispatch` ships with a self-contained internal runtime, so a new user never installs a second agent-runtime tool to get going. The empirical findings in the article series were measured against this runtime.
 
 ### Internal-runtime safety net + model-facing telemetry
 

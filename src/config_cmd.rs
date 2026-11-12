@@ -1640,7 +1640,7 @@ mod tests {
                 Ty::Float => serde_json::json!(0.5),
                 Ty::Str => Value::String("standalone".into()),
                 // (#2947) The entry's own shipped token.
-                Ty::Enum(s) => Value::String(s.shipped.expect("a scalar enum setting has a shipped value").into()),
+                Ty::Enum(s) => Value::String(s.shipped().expect("a scalar enum setting has a shipped value").into()),
                 Ty::StrList => serde_json::json!(["sentinel"]),
                 // An empty array is valid JSON that parses cleanly to an
                 // empty `Vec<HookRule>` — sufficient to prove the KEY

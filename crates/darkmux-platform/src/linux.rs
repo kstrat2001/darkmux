@@ -1,6 +1,6 @@
 //! Linux (first target: Omarchy on Apple Silicon, under Asahi).
 
-use crate::{ContainerHostAccess, ContainerUser, Platform};
+use crate::{ContainerHostAccess, ContainerUser, DefaultSandbox, Platform};
 
 pub struct LinuxPlatform;
 
@@ -14,6 +14,13 @@ impl Platform for LinuxPlatform {
     /// accepts the same mapping, so no engine detection is needed.
     fn container_host_access(&self) -> ContainerHostAccess {
         ContainerHostAccess::HostGateway
+    }
+
+    /// Docker, for now. The seam for a sandbox that needs nothing installed
+    /// here (Landlock, #3112's Linux step): a `DefaultSandbox` variant for
+    /// it, answered here once its backend passes the conformance suite.
+    fn default_sandbox(&self) -> DefaultSandbox {
+        DefaultSandbox::Docker
     }
 
     /// Docker Engine keeps the host's ownership on bind mounts, and darkmux

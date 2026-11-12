@@ -48,6 +48,7 @@ pub mod inputs;
 pub mod interpret;
 pub mod prune;
 pub mod load;
+pub mod workspace_paths;
 
 pub use grow::{grow_task, items_from_artifact, GrownFrom};
 pub use inputs::{
