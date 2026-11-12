@@ -220,9 +220,17 @@ fn git_checkout(workdir: &Path, found: &darkmux_types::workdir::SplitGitdir) -> 
 /// workdir at `/workspace`, so a checkout AT the workdir is `/workspace`
 /// and one one level under it is `/workspace/<child>`.
 pub(crate) fn container_path_for(workdir: &Path, checkout: &Path) -> String {
+    seen_path_for(darkmux_sandbox::selected().ok(), workdir, checkout)
+}
+
+/// (#3112 review) [`container_path_for`] under `kind`: beneath where the
+/// sandbox sees the workdir (`/workspace` in a container, the workdir's own
+/// host path in a sandbox on the host).
+pub(crate) fn seen_path_for(kind: Option<darkmux_sandbox::BackendKind>, workdir: &Path, checkout: &Path) -> String {
+    let root = darkmux_sandbox::seen_at(kind, workdir, "/workspace");
     match checkout.strip_prefix(workdir) {
-        Ok(rel) if rel.as_os_str().is_empty() => "/workspace".to_string(),
-        Ok(rel) => format!("/workspace/{}", rel.display()),
+        Ok(rel) if rel.as_os_str().is_empty() => root,
+        Ok(rel) => format!("{root}/{}", rel.display()),
         // Not under the workdir (shouldn't happen — `find_split_gitdirs`
         // only ever returns the workdir or a child of it) — name the host
         // path rather than inventing a container path.

@@ -508,9 +508,10 @@ impl WorkloadProvider for CodingTaskProvider {
 /// command with the sandbox's path as its reader sees it. This is what lets
 /// a workload manifest be portable: it names `${SANDBOX_DIR}` and the run
 /// supplies the path. A dispatched prompt and a contained verify command see
-/// the sandbox at `/workspace` (where the container mounts it; a host path
-/// there is a file the agent cannot find, and an empty trajectory); a verify
-/// command on the host sees the host path (`sandbox_view`).
+/// the sandbox where their sandbox places it: `/workspace` in a container (a
+/// host path there is a file the agent cannot find, and an empty
+/// trajectory), its own host path in a sandbox on the host (#3112); a verify
+/// command on the host sees the host path.
 fn expand_placeholders_with(input: &str, view_path: &str) -> String {
     input
         .replace("${SANDBOX_DIR}", view_path)
@@ -628,10 +629,31 @@ fn reject_escaping_relpath(raw: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-/// The prompt as the dispatch gives it to the model: the sandbox
-/// placeholders expanded to the container's `/workspace`.
-pub(crate) fn dispatched_prompt(loaded: &LoadedWorkload) -> Result<String> {
-    Ok(expand_placeholders_with(&resolve_prompt(loaded)?, "/workspace"))
+/// Where a dispatch mounts the workspace inside a container.
+const WORKSPACE_AT: &str = "/workspace";
+
+/// The prompt as the dispatch gives it to the model, whose workspace is
+/// `sandbox_dir`: the sandbox placeholders expanded to where the configured
+/// sandbox sees it.
+pub(crate) fn dispatched_prompt(loaded: &LoadedWorkload, sandbox_dir: &Path) -> Result<String> {
+    dispatched_prompt_for(loaded, sandbox_dir, darkmux_sandbox::selected().ok())
+}
+
+/// [`dispatched_prompt`] under `kind`: `/workspace` in a container (byte for
+/// byte what every Docker run was told), the workspace's own host path in a
+/// sandbox on the host (#3112 review: a Seatbelt brief that said
+/// `/workspace` sent the model looking for files that are not there). The
+/// same answer the dispatch's own mount gives (`SandboxBackend::place`).
+pub(crate) fn dispatched_prompt_for(loaded: &LoadedWorkload, sandbox_dir: &Path, kind: Option<darkmux_sandbox::BackendKind>) -> Result<String> {
+    let seen = darkmux_sandbox::seen_at(kind, sandbox_dir, WORKSPACE_AT);
+    Ok(expand_placeholders_with(&resolve_prompt(loaded)?, &seen))
+}
+
+/// The prompt as the eval wrote it for grading: the placeholders expanded
+/// to `/workspace` whatever the sandbox, so a grader's quoted sentences match
+/// word for word on every machine.
+pub(crate) fn graded_prompt(loaded: &LoadedWorkload) -> Result<String> {
+    Ok(expand_placeholders_with(&resolve_prompt(loaded)?, WORKSPACE_AT))
 }
 
 pub(crate) fn resolve_prompt(loaded: &LoadedWorkload) -> Result<String> {
@@ -1118,7 +1140,7 @@ pub(crate) struct VerifyPlan {
 /// The prompt as dispatched, and the verify plan: everything a run resolves
 /// before it dispatches.
 fn prompt_and_verify_plan(loaded: &LoadedWorkload, sandbox_dir: &Path) -> Result<(String, Option<VerifyPlan>)> {
-    let prompt = dispatched_prompt(loaded)?;
+    let prompt = dispatched_prompt(loaded, sandbox_dir)?;
     Ok((prompt, verify_plan(loaded, sandbox_dir, TestRunner::for_workload)?))
 }
 
@@ -2829,6 +2851,32 @@ mod tests {
         let plan = verify_plan(&loaded, tmp.path(), |_| panic!("no runner without a command")).unwrap();
         assert!(plan.is_none());
         assert!(run_verify_command(None, tmp.path(), tmp.path()).unwrap().is_none());
+    }
+
+    /// (#3112 review, live-proven) The dispatched prompt names the
+    /// workspace where the sandbox sees it: `/workspace` in a container,
+    /// byte for byte as before; its own host path in a sandbox on the host.
+    /// A Seatbelt brief that said `/workspace` sent the model looking for a
+    /// file that is not there. The graded prompt keeps the eval's own words.
+    #[test]
+    fn the_prompt_names_the_workspace_where_the_sandbox_sees_it() {
+        use darkmux_sandbox::BackendKind;
+        let tmp = TempDir::new().unwrap();
+        let sandbox = tmp.path().join("sb");
+        fs::create_dir_all(&sandbox).unwrap();
+        let mut spec = basic_spec();
+        spec.prompt = Some("Fix ${SANDBOX}/bug.py so the tests in ${SANDBOX_DIR} pass.".into());
+        let loaded = make_loaded(spec, tmp.path().to_path_buf());
+        let real = sandbox.canonicalize().unwrap().display().to_string();
+        assert_eq!(
+            dispatched_prompt_for(&loaded, &sandbox, Some(BackendKind::Docker)).unwrap(),
+            "Fix /workspace/bug.py so the tests in /workspace pass."
+        );
+        assert_eq!(
+            dispatched_prompt_for(&loaded, &sandbox, Some(BackendKind::Seatbelt)).unwrap(),
+            format!("Fix {real}/bug.py so the tests in {real} pass.")
+        );
+        assert_eq!(graded_prompt(&loaded).unwrap(), "Fix /workspace/bug.py so the tests in /workspace pass.");
     }
 
     /// What a run resolves before it dispatches: the prompt, and no plan for

@@ -314,6 +314,24 @@ pub fn for_handle(handle: &SandboxHandle) -> &'static dyn SandboxBackend {
     backend_of(handle.backend)
 }
 
+/// (#3112 review) Where a sandbox of `kind` sees host path `host` mounted
+/// at `at`: what a brief, a prompt or a note must name for the model to find
+/// it. `at` in a container (byte for byte what it always was); the host
+/// path itself, canonical, in a sandbox on the host ([`BackendKind::on_host`]),
+/// which cannot place a mount elsewhere. `None` (a refused selection, which
+/// runs nothing) is `at`.
+pub fn seen_at(kind: Option<BackendKind>, host: &std::path::Path, at: &str) -> String {
+    match kind {
+        Some(kind) => backend_of(kind).place(&Mount { host: host.to_path_buf(), at: at.to_string(), access: Access::ReadOnly }),
+        None => at.to_string(),
+    }
+}
+
+/// [`seen_at`] under the configured sandbox.
+pub fn seen_at_configured(host: &std::path::Path, at: &str) -> String {
+    seen_at(selected().ok(), host, at)
+}
+
 /// Every backend this host can run (Docker when `docker` is on `PATH`,
 /// Seatbelt where `sandbox-exec` is), for a reaper: a sandbox left from
 /// before the setting (or the default) changed is still found.
@@ -481,6 +499,19 @@ mod tests {
         if darkmux_platform::current().id() == "macos" {
             assert!(SeatbeltBackend::available(), "{} is missing on this Mac", seatbelt::SANDBOX_EXEC);
         }
+    }
+
+    /// (#3112 review) What a model is told a path is: where the sandbox
+    /// sees the mount. `at` in a container, byte for byte; the host path
+    /// itself (canonical) in a sandbox on the host; `at` when the selection
+    /// is refused (nothing runs then).
+    #[test]
+    fn a_path_is_named_where_the_sandbox_sees_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let real = dir.path().canonicalize().unwrap().display().to_string();
+        assert_eq!(seen_at(Some(BackendKind::Docker), dir.path(), "/workspace"), "/workspace");
+        assert_eq!(seen_at(Some(BackendKind::Seatbelt), dir.path(), "/workspace"), real);
+        assert_eq!(seen_at(None, dir.path(), "/workspace"), "/workspace");
     }
 
     /// (#3112) A backend whose sandbox is a process on this host (Seatbelt;

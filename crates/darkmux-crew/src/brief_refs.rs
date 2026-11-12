@@ -128,7 +128,7 @@ fn resolve(r: &BriefRef, dirs: &StoreDirs) -> Result<(String, BriefRef)> {
                     dirs.mods.display()
                 )
             })?;
-            let mount = crate::mods::attachments_container_dir(&record.key);
+            let mount = attachments_seen(darkmux_sandbox::selected().ok(), &dirs.mods, &record.key);
             let canonical = BriefRef::mod_(record.key.clone());
             Ok((crate::mods::brief_block(&record, &mount), canonical))
         }
@@ -205,9 +205,28 @@ pub fn mod_attachment_mounts(
     Ok(out)
 }
 
+/// (#3112 review) Where the model reads a mod's attachments: their mount
+/// as the sandbox sees it (`/darkmux-mods/<key>/attachments` in a
+/// container, unchanged; the store's own path in a sandbox on the host).
+fn attachments_seen(kind: Option<darkmux_sandbox::BackendKind>, mods_root: &Path, key: &str) -> String {
+    darkmux_sandbox::seen_at(kind, &crate::mods::attachments_dir_at(mods_root, key), &crate::mods::attachments_container_dir(key))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (#3112 review) The brief names a mod's attachments where the sandbox
+    /// mounts them: unchanged in a container, the store's path on the host.
+    #[test]
+    fn a_mods_attachments_are_named_where_the_sandbox_sees_them() {
+        use darkmux_sandbox::BackendKind;
+        let m = TempDir::new().unwrap();
+        write_mod(m.path(), "mod-9-zzz", Some("kit"), &["one.patch"]);
+        assert_eq!(attachments_seen(Some(BackendKind::Docker), m.path(), "mod-9-zzz"), "/darkmux-mods/mod-9-zzz/attachments");
+        let real = crate::mods::attachments_dir_at(m.path(), "mod-9-zzz").canonicalize().unwrap();
+        assert_eq!(attachments_seen(Some(BackendKind::Seatbelt), m.path(), "mod-9-zzz"), real.display().to_string());
+    }
     use std::fs;
     use tempfile::TempDir;
 

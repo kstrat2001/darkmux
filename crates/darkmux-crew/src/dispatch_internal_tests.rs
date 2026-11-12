@@ -7405,6 +7405,22 @@ S(("127.0.0.1", port), H).serve_forever()
         );
     }
 
+    /// (#3112 review) A split-gitdir checkout is named where the sandbox
+    /// sees it: `/workspace/<child>` in a container, unchanged; the
+    /// checkout's own host path in a sandbox on the host.
+    #[test]
+    fn a_split_gitdir_checkout_is_named_where_the_sandbox_sees_it() {
+        use darkmux_sandbox::BackendKind;
+        let root = TempDir::new().unwrap();
+        let child = root.path().join("src-a");
+        std::fs::create_dir_all(&child).unwrap();
+        assert_eq!(seen_path_for(Some(BackendKind::Docker), root.path(), &child), "/workspace/src-a");
+        assert_eq!(seen_path_for(Some(BackendKind::Docker), root.path(), root.path()), "/workspace");
+        let real = root.path().canonicalize().unwrap();
+        assert_eq!(seen_path_for(Some(BackendKind::Seatbelt), root.path(), &child), real.join("src-a").display().to_string());
+        assert_eq!(seen_path_for(Some(BackendKind::Seatbelt), root.path(), root.path()), real.display().to_string());
+    }
+
     /// (#3112 review) The origin records the sandbox it ran in, and a resume
     /// in another sandbox is refused naming both, like a different image:
     /// across the macOS default's move to Seatbelt, a Docker checkpoint is
