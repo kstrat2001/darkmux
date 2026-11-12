@@ -214,3 +214,46 @@ fn a_managed_toolchain_folder_is_searched_first_and_granted_the_same_way() {
     assert!(got.path.as_deref().unwrap().starts_with(&managed.join("bin").display().to_string()), "{:?}", got.path);
     assert!(got.identity.contains(&managed.join("bin/node").display().to_string()), "{}", got.identity);
 }
+
+/// (#3112 review, BLOCKER B) Nothing a workspace file names is ever
+/// granted: a script whose `#!` is a workspace path linked to a host secret
+/// (an SSH key, gh's `hosts.yml`, not even executable) grants neither the
+/// secret nor its folder. Only the interpreter's NAME counts, and only a
+/// known runtime's, found on PATH like a recipe program: `<ws>/evil/node`
+/// resolves to the PATH's node; `<ws>/evil/hosts.yml` grants nothing.
+#[test]
+fn a_workspace_shebang_never_grants_the_path_it_names() {
+    let host = a_fake_host();
+    std::fs::create_dir_all(host.home.join(".ssh")).unwrap();
+    std::fs::write(host.home.join(".ssh/id_ed25519"), "secret").unwrap();
+    std::fs::create_dir_all(host.home.join(".config/gh")).unwrap();
+    std::fs::write(host.home.join(".config/gh/hosts.yml"), "token: secret").unwrap();
+    let ws = tempfile::TempDir::new().unwrap();
+    let ws = ws.path().canonicalize().unwrap();
+    link(&host.home.join(".ssh/id_ed25519"), &ws.join("evil/node"));
+    link(&host.home.join(".config/gh/hosts.yml"), &ws.join("evil/hosts.yml"));
+    program(&ws.join("a.sh"), &format!("#!{}\n", ws.join("evil/node").display()));
+    program(&ws.join("b.sh"), &format!("#!{}\n", ws.join("evil/hosts.yml").display()));
+    program(&ws.join("c.sh"), &format!("#!/usr/bin/env {}\n", ws.join("evil/node").display()));
+    let secrets = [host.home.join(".ssh/id_ed25519"), host.home.join(".config/gh/hosts.yml")];
+    for script in ["./a.sh", "./b.sh", "./c.sh"] {
+        let got = host.resolve(&[script], Some(&ws)).unwrap();
+        for secret in &secrets {
+            assert!(!got.read_only.iter().any(|g| secret.starts_with(g)), "{script} granted {}: {:?}", secret.display(), got.read_only);
+        }
+        assert!(got.read_only.iter().all(|g| g == &host.nvm), "{script} granted beyond the PATH's node: {:?}", got.read_only);
+    }
+    assert_eq!(host.resolve(&["./a.sh"], Some(&ws)).unwrap().read_only, vec![host.nvm.clone()], "`<ws>/evil/node` is the PATH's node");
+    assert!(host.resolve(&["./b.sh"], Some(&ws)).unwrap().read_only.is_empty(), "hosts.yml is no runtime");
+}
+
+/// (#3112 review, M07) A home that is itself shaped like a version folder
+/// (`/…/versions/<name>`) is never granted as one: `~/bin`'s program gets
+/// `~/bin`.
+#[test]
+fn a_version_shaped_home_is_never_granted_as_a_version_folder() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let home = dir.path().canonicalize().unwrap().join("versions/me");
+    program(&home.join("bin/tool"), "\x7fELF");
+    assert_eq!(grant_for(&home.join("bin/tool"), Some(&home)), Ok(home.join("bin")));
+}

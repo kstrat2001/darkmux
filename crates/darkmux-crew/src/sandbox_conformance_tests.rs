@@ -61,6 +61,37 @@ pub struct Host {
     /// process in it); in a sandbox on the host, it does (the launcher can
     /// end only its own group), recorded, not wanted.
     pub a_new_group_outlives_the_program: bool,
+    /// The host process group a running sandbox's processes are in, when
+    /// they are host processes (a sandbox on the host): `None` for a
+    /// container, whose processes are gone with it.
+    pub host_group: fn(&str) -> Option<u32>,
+}
+
+/// How many live processes are in host process group `group`, from the
+/// whole process table (a killed one not yet reaped, a zombie, runs nothing
+/// and is not counted).
+fn group_members(group: u32) -> usize {
+    let ps = std::process::Command::new("/bin/ps").args(["-A", "-o", "pgid=,stat="]).output().unwrap();
+    String::from_utf8_lossy(&ps.stdout)
+        .lines()
+        .filter(|l| {
+            let mut f = l.split_whitespace();
+            f.next() == Some(group.to_string().as_str()) && !f.next().is_some_and(|stat| stat.starts_with('Z'))
+        })
+        .count()
+}
+
+/// Whether host group `group` is empty within `within` (its guard runs a
+/// moment after its launcher ends).
+fn group_empties(group: u32, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    while group_members(group) > 0 {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    true
 }
 
 /// Where the sandbox sees `tree` when it is mounted at `/workspace`.
@@ -481,6 +512,7 @@ fn a_sandbox_whose_client_was_killed_ends_on_removal(backend: &dyn SandboxBacken
         std::thread::sleep(Duration::from_millis(100));
     }
     assert!(len(&beat) > 0, "the background loop never ran");
+    let group = (host.host_group)(&p.name);
     client.kill().unwrap();
     client.wait().unwrap();
     drop(removed);
@@ -488,14 +520,26 @@ fn a_sandbox_whose_client_was_killed_ends_on_removal(backend: &dyn SandboxBacken
     let after = len(&beat);
     std::thread::sleep(Duration::from_millis(1500));
     assert_eq!(len(&beat), after, "a background loop outlived its sandbox's removal after its client was killed");
+    if let Some(group) = group {
+        assert!(group_empties(group, Duration::from_secs(2)), "processes left in group {group}");
+    }
 }
 
 /// Removing a running sandbox ends fork-hoppers in it (eight at once), not
 /// only the processes one look at it would list.
 fn a_removal_ends_fork_hoppers(backend: &dyn SandboxBackend, host: &Host) {
+    // Three rounds: a drain that is only sometimes enough fails one of them.
+    for _ in 0..3 {
+        a_removal_ends_fork_hoppers_once(backend, host);
+    }
+}
+
+fn a_removal_ends_fork_hoppers_once(backend: &dyn SandboxBackend, host: &Host) {
     let tree = tempfile::TempDir::new().unwrap();
     let hops = tree.path().join("hops");
-    let script = "for n in 1 2 3 4 5 6 7 8; do (h() { echo x >> hops; (h) & exit 0; }; h) & done; sleep 300";
+    // Thirty-two at once: a single kill of the group, or two, leaves one
+    // that forked in between often enough to see.
+    let script = "n=0; while [ $n -lt 32 ]; do (h() { echo x >> hops; (h) & exit 0; }; h) & n=$((n + 1)); done; sleep 300";
     let p = policy(backend, host.image, tree.path(), script);
     let (mut cmd, handle) = backend.run(&p);
     let mut client = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
@@ -504,8 +548,13 @@ fn a_removal_ends_fork_hoppers(backend: &dyn SandboxBackend, host: &Host) {
         std::thread::sleep(Duration::from_millis(100));
     }
     assert!(len(&hops) > 0, "the hoppers never ran");
+    let group = (host.host_group)(&p.name);
     let removed = run_bounded(backend.remove(&handle), Duration::from_secs(30));
     assert!(matches!(removed, Bounded::Finished { success: true, .. }), "{}", describe(&removed));
+    // The removal itself empties the group: checked as soon as it returns.
+    if let Some(group) = group {
+        assert_eq!(group_members(group), 0, "the removal returned with processes left in its group {group}");
+    }
     let _ = client.kill();
     let _ = client.wait();
     std::thread::sleep(Duration::from_millis(500));
@@ -775,6 +824,7 @@ conformance!(
         every_address_reaches_the_lan: false,
         new_group: |script| format!("setsid sh -c '{script}' &"),
         a_new_group_outlives_the_program: false,
+        host_group: |_| None,
     },
     "needs Docker and alpine:3.22"
 );
@@ -796,6 +846,10 @@ conformance!(
         new_group: |script| format!("/usr/bin/perl -e 'setpgrp(0, 0); exec @ARGV' sh -c '{script}' &"),
         // Recorded, not wanted: the launcher ends only its own group.
         a_new_group_outlives_the_program: true,
+        host_group: |name| {
+            let pid = std::fs::read_to_string(darkmux_sandbox::seatbelt::state_root().join(name).join("pid")).ok()?;
+            pid.trim().parse().ok()
+        },
     },
     "needs macOS sandbox-exec"
 );

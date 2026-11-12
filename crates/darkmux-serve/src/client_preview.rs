@@ -86,8 +86,13 @@
 //!   Docker runs unchanged. A `--host 0.0.0.0` written in the `command`
 //!   itself is not rewritten.
 //! - **Two ports, enforced; their address, watched (#3559).** The kernel
-//!   lets the preview bind only its app and HMR ports: any other listener,
-//!   on any address, is refused. Seatbelt cannot hold those two to the
+//!   holds the preview to its app and HMR ports: it binds and takes in
+//!   traffic only on them. A bind to any other port is refused, so is a
+//!   `listen` with no bind (which would get an ephemeral port), and a UDP
+//!   socket bound implicitly by a send receives nothing back; outbound
+//!   connections are open. So a dev server that opens internal listeners on
+//!   ephemeral ports (Next.js-style workers) fails under Seatbelt: run it with
+//!   `runtime.sandbox docker`. Seatbelt cannot hold those two to the
 //!   loopback (its address filter knows only `*` and `localhost`, and
 //!   `localhost` matches every local address), so darkmux reads both ports
 //!   from the kernel's socket table (`Platform::tcp_port_listeners`, one
@@ -98,8 +103,11 @@
 //!   socket and the fix. A read that fails twice running, or does not parse,
 //!   stops it too: never "nothing listens". This is detection with a window,
 //!   not a kernel boundary: a server binding every address on one of those
-//!   ports is reachable from the LAN for up to about two seconds. UDP is not
-//!   watched. A Vite HMR server with its own port binds every address unless
+//!   ports is reachable from the LAN for up to about two seconds. A UDP
+//!   socket on one of the two ports, on any address, is not watched. netstat
+//!   prints at most 16 characters of an IPv6 address; one that long is never
+//!   read as loopback, so a preview bound to a long IPv6 address is stopped
+//!   as exposed. A Vite HMR server with its own port binds every address unless
 //!   `server.hmr.host` names the loopback.
 //! - **It reaches what this Mac's loopback serves,** directly: `client
 //!   serve`'s pairing routes, LM Studio, the darkmux daemon, a local
@@ -114,12 +122,16 @@
 //!   in the sandbox's state folder and removed at the next start, like a
 //!   container. **Unlike a container**, a process that moves to a process
 //!   group of its own (`setsid`, `setpgid`; job control does it by itself)
-//!   is not ended with the sandbox. It keeps the sandbox's rules (no write
-//!   outside the workspace, no bind but the two ports), and after a stop
-//!   darkmux kills whatever still holds either port and started since the
-//!   preview did ([`OnHost`]'s sweep). One that holds no port is not found:
-//!   no mark on it is one a sweep could read reliably. It runs until it
-//!   exits or this Mac restarts.
+//!   is not ended with the sandbox. A stop kills only what darkmux can prove
+//!   is the sandbox's, its process group; nothing marks a process that left
+//!   the group as the sandbox's (the two ports come from the ephemeral range,
+//!   so another program may hold one by chance), so nothing else is killed.
+//!   What still listens on the two ports after a stop is reported in the
+//!   serve log, never killed. Such an escapee keeps the sandbox's rules (no
+//!   write outside the workspace, binds and inbound only on the two old
+//!   ports), and once the preview is stopped nothing watches it: one that
+//!   waits and then listens on `0.0.0.0` at an old port is reachable from the
+//!   LAN until it exits or this Mac restarts.
 //! - **`node_modules` from the other backend.** A workspace installed in a
 //!   container holds Linux builds (esbuild's binary, say) that this Mac's
 //!   node cannot load, and the other way round. The install record names the

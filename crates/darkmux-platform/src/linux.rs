@@ -207,7 +207,12 @@ impl Platform for LinuxPlatform {
                     .any(|fd| read_link(&format!("/proc/{pid}/fd/{fd}")).and_then(|l| socket_inode(&l)) == Some(inode))
             })
         };
-        Some(listening.into_iter().map(|(at, inode)| crate::PortListener { addr: at.ip(), scope: None, pid: owner(inode) }).collect())
+        Some(
+            listening
+                .into_iter()
+                .map(|(at, inode)| crate::PortListener { addr: Some(at.ip()), text: at.ip().to_string(), scope: None, pid: owner(inode) })
+                .collect(),
+        )
     }
 
     /// The ESTABLISHED sockets in `/proc/net/tcp` and `tcp6` (where a

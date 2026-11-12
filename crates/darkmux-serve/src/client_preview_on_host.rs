@@ -3,10 +3,12 @@
 //! machine's own toolchain, granted read-only
 //! ([`darkmux_sandbox::toolchain`]); no published port, so the dev server
 //! binds host ports itself. The kernel holds it to its two assigned ports
-//! (the policy names them: every other bind is refused), but not to the
-//! loopback (#3559), so darkmux reads what listens on those two ports from
-//! the kernel's socket table ([`exposed_in`]), and after a stop removes
-//! whatever still holds them ([`OnHost::sweep`]).
+//! (the policy names them: no bind and no inbound traffic on any other
+//! local port), but not to the loopback (#3559), so darkmux reads what
+//! listens on those two ports from the kernel's socket table
+//! ([`exposed_in`]). A stop kills only the sandbox's own process group;
+//! anything still listening on its ports afterwards is reported, never
+//! killed ([`lingering`]).
 
 use super::{ContainerSpec, PreviewContainers, Recipe};
 use darkmux_platform::PortListener;
@@ -53,14 +55,25 @@ pub(crate) fn resolve_toolchain(
 }
 
 /// Whether `l` is on the loopback: `127.x`, `::1`, `::ffff:127.x`, or an
-/// address scoped to the loopback interface (`fe80::1%lo0`).
+/// address scoped to the loopback interface (`fe80::1%lo0`). An address the
+/// platform could not read whole (cut short) is never loopback.
 fn on_loopback(l: &PortListener) -> bool {
+    let Some(addr) = l.addr else { return false };
     let scoped = l.scope.as_deref().is_some_and(|s| s == "lo0" || s == "lo");
     scoped
-        || match l.addr {
+        || match addr {
             std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
             v4 => v4.is_loopback(),
         }
+}
+
+/// `l` on `port` as a message names it: `0.0.0.0:4100`, `[::]:4100`, or a
+/// cut IPv6 address with a note that it was cut.
+fn named_at(l: &PortListener, port: u16) -> String {
+    match l.addr {
+        Some(addr) => std::net::SocketAddr::new(addr, port).to_string(),
+        None => format!("[{}…]:{port} (an IPv6 address netstat cut short; not a loopback one)", l.text),
+    }
 }
 
 /// The listeners bound beyond the loopback: every address (`0.0.0.0`,
@@ -75,7 +88,7 @@ pub(crate) fn exposure_reason(kind: BackendKind, exposed: &[(u16, PortListener)]
     let named: Vec<String> = exposed
         .iter()
         .map(|(on, l)| {
-            let at = std::net::SocketAddr::new(l.addr, *on);
+            let at = named_at(l, *on);
             let role = if *on == port { "the app port" } else if *on == hmr_port { "the HMR port" } else { "a port" };
             match l.pid {
                 Some(pid) => format!("{at} ({role}, pid {pid})"),
@@ -105,7 +118,7 @@ pub(crate) fn not_ready_reason(kind: BackendKind, port: u16, listeners: Option<&
             "nothing listens on port {port} after 3 minutes: in {sandbox} the dev server runs on this machine and must \
              listen on 127.0.0.1 at $PORT (the recipe's `{{port}}`), the only port it may bind besides its HMR port"
         ),
-        Some(all) if all.iter().all(|l| l.addr == v6_loopback) => format!(
+        Some(all) if all.iter().all(|l| l.addr == Some(v6_loopback)) => format!(
             "the dev server listens on [::1]:{port} (IPv6 loopback) only; the preview is reached at 127.0.0.1: bind it \
              to 127.0.0.1 (the recipe's HOST `{{host}}`)"
         ),
@@ -136,92 +149,46 @@ pub(crate) fn exposed_in(platform: &dyn darkmux_platform::Platform, kind: Backen
     Ok(exposed)
 }
 
-/// What a running preview's sandbox holds: its two ports, and its
-/// launcher's start stamp once started.
-#[derive(Debug, Clone, Copy)]
-struct Held {
-    ports: [u16; 2],
-    started: Option<u64>,
-}
-
 /// The production [`PreviewContainers`] for a sandbox on the host: the
 /// backend's own commands for the preview's policy, this machine's
-/// toolchain, the listener watch and the post-stop sweep through
-/// `darkmux-platform`.
+/// toolchain, and the listener watch through `darkmux-platform`.
 pub struct OnHost {
     kind: BackendKind,
-    held: Mutex<HashMap<String, Held>>,
+    /// Each running preview's two ports, by its sandbox's name, for the
+    /// report after a stop.
+    ports: Mutex<HashMap<String, [u16; 2]>>,
 }
 
 /// How long one lifecycle command of a sandbox on the host may take.
 const CALL_BOUND: Duration = Duration::from_secs(30);
 
-/// How many looks the post-stop sweep takes, 50 ms apart.
-const SWEEP_LOOKS: u32 = 40;
-
 impl OnHost {
     pub fn new(kind: BackendKind) -> Self {
-        OnHost { kind, held: Mutex::new(HashMap::new()) }
+        OnHost { kind, ports: Mutex::new(HashMap::new()) }
     }
 
     fn handle(&self, name: &str) -> SandboxHandle {
         SandboxHandle { backend: self.kind, id: name.to_string() }
     }
-
-    /// (#3112 review) After a stop, whatever still listens on the sandbox's
-    /// two ports and started no earlier than its launcher is killed, until
-    /// both are free: a process that left the sandbox's process group
-    /// (`setsid`, `setpgid`) outlives the group's kill, and the kernel lets
-    /// it bind only these two ports. Returns what still listens. A process
-    /// that left the group and holds no port is not found: there is no mark
-    /// on it a sweep could read reliably.
-    pub(crate) fn sweep(&self, name: &str) -> Vec<(u16, PortListener)> {
-        let held = self.held.lock().unwrap().remove(name);
-        let Some(Held { ports, started: Some(started) }) = held else {
-            return Vec::new();
-        };
-        sweep_ports(darkmux_platform::current(), ports, started, |pid| {
-            // SAFETY: a plain signal to a pid.
-            unsafe { libc::kill(pid as i32, libc::SIGKILL) == 0 }
-        })
-    }
 }
 
-/// [`OnHost::sweep`] against `platform`, killing with `kill`: each look,
-/// every owner of a listener on `ports` (the kernel's last user of the
-/// socket, and every process the platform finds holding it) whose start
-/// stamp is no earlier than `started` (a process older than the sandbox is
-/// never one of its own). Up to [`SWEEP_LOOKS`] looks, 50 ms apart; returns
-/// what still listens after the last.
-pub(crate) fn sweep_ports(
-    platform: &dyn darkmux_platform::Platform,
-    ports: [u16; 2],
-    started: u64,
-    kill: impl Fn(u32) -> bool,
-) -> Vec<(u16, PortListener)> {
-    let mut left = Vec::new();
-    for look in 0..SWEEP_LOOKS {
-        left = ports
-            .iter()
-            .flat_map(|&p| platform.tcp_port_listeners(p).unwrap_or_default().into_iter().map(move |l| (p, l)))
-            .collect::<Vec<_>>();
-        if left.is_empty() {
-            break;
-        }
-        let mut owners: Vec<u32> = left.iter().filter_map(|(_, l)| l.pid).collect();
-        for &port in &ports {
-            owners.extend(platform.tcp_listeners(port).unwrap_or_default());
-        }
-        owners.sort_unstable();
-        owners.dedup();
-        for pid in owners.into_iter().filter(|&pid| platform.process_start_stamp(pid).is_some_and(|s| s >= started)) {
-            kill(pid);
-        }
-        if look + 1 < SWEEP_LOOKS {
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-    left
+/// (#3112 review) What still listens on a stopped preview's `ports`, one
+/// serve-log line each. Reported, never killed: nothing ties a port's holder
+/// to the sandbox once it left the sandbox's process group (the ports come
+/// from the ephemeral range, so another app may hold one by chance), and a
+/// stop kills only what it can prove is the sandbox's.
+pub(crate) fn lingering(platform: &dyn darkmux_platform::Platform, name: &str, ports: [u16; 2]) -> Vec<String> {
+    ports
+        .iter()
+        .flat_map(|&port| platform.tcp_port_listeners(port).unwrap_or_default().into_iter().map(move |l| (port, l)))
+        .map(|(port, l)| {
+            format!(
+                "darkmux client serve: preview sandbox {name} stopped, but {} still listens on its port {port}{}:                  left running (a process that left the sandbox's process group, or another program on that port)",
+                l.text,
+                l.pid.map(|p| format!(" (pid {p})")).unwrap_or_default()
+            )
+        })
+        .collect()
 }
 
 impl PreviewContainers for OnHost {
@@ -251,7 +218,7 @@ impl PreviewContainers for OnHost {
         let (cmd, _) = darkmux_sandbox::backend_of(self.kind).create(&super::preview_policy(spec));
         match run_bounded(cmd, CALL_BOUND) {
             Bounded::Finished { success: true, .. } => {
-                self.held.lock().unwrap().insert(spec.name.clone(), Held { ports: spec.ports, started: None });
+                self.ports.lock().unwrap().insert(spec.name.clone(), spec.ports);
                 Ok(())
             }
             Bounded::Finished { stderr, .. } => Err(format!("making the preview's sandbox: {}", String::from_utf8_lossy(&stderr).trim())),
@@ -270,12 +237,7 @@ impl PreviewContainers for OnHost {
         // preview itself.
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
-        let child = cmd.spawn().map_err(|e| format!("starting the preview's sandbox: {e}"))?;
-        let stamp = darkmux_platform::current().process_start_stamp(child.id());
-        if let Some(held) = self.held.lock().unwrap().get_mut(name) {
-            held.started = stamp;
-        }
-        Ok(child)
+        cmd.spawn().map_err(|e| format!("starting the preview's sandbox: {e}"))
     }
 
     fn listeners(&self, _name: &str) -> Option<String> {
@@ -300,12 +262,10 @@ impl PreviewContainers for OnHost {
         let backend = darkmux_sandbox::for_handle(&handle);
         let _ = run_bounded(quiet(backend.stop(&handle, Duration::from_secs(5))), CALL_BOUND);
         let _ = run_bounded(quiet(backend.remove(&handle)), CALL_BOUND);
-        for (port, l) in self.sweep(name) {
-            eprintln!(
-                "darkmux client serve: preview sandbox {name}: {} still listens on its port {port} after it was stopped \
-                 and swept",
-                std::net::SocketAddr::new(l.addr, port)
-            );
+        if let Some(ports) = self.ports.lock().unwrap().remove(name) {
+            for line in lingering(darkmux_platform::current(), name, ports) {
+                eprintln!("{line}");
+            }
         }
     }
 

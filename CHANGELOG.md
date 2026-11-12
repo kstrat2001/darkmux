@@ -41,20 +41,26 @@ darkmux release.
   the dev server the loopback: a recipe's new `{host}` is `127.0.0.1` there (`0.0.0.0` in a
   container), and a `HOST` of `0.0.0.0` is given as `127.0.0.1`, so a recipe written for Docker
   runs unchanged (`{host}` is preview recipe schema 1.1; a 1.0 recipe keeps `{host}` as text, and
-  an older darkmux refuses a 1.1 recipe as newer). The kernel lets the preview bind only its app
-  and HMR ports; it cannot hold them to the loopback (#3559), so darkmux reads those two ports
-  from the kernel's socket table before it reports the preview ready and every 2 s after, and
-  stops one listening beyond the loopback, naming the socket: on those two ports, detection with
-  a short window, not a kernel boundary. After a stop, whatever still holds either port and
-  started since the preview did is killed. A workspace installed in the other sandbox has its
+  an older darkmux refuses a 1.1 recipe as newer). The kernel holds the preview to its app and HMR
+  ports: it binds only on them and takes in traffic only on them (a bind to any other port, and a
+  `listen` with no bind, are refused; a UDP socket bound implicitly by a send receives nothing
+  back; outbound connections are open). It cannot hold them to the loopback (#3559), so darkmux
+  reads those two TCP ports from the kernel's socket table before it reports the preview ready and
+  every 2 s after, and stops one listening beyond the loopback, naming the socket: on those two
+  ports, detection with a short window, not a kernel boundary (UDP on them is not watched). A
+  dev server that opens internal listeners on ephemeral ports (Next.js-style workers) is refused
+  under Seatbelt; run it with `runtime.sandbox docker`. A stop kills only the preview's own
+  process group; anything still listening on its ports afterwards is reported in the serve log,
+  never killed. A workspace installed in the other sandbox has its
   `install.unless_exists` path (Linux-built `node_modules`) deleted in darkmux's workspace copy
   and reinstalled, saying so in the logs. Previews stay off by default.
 - **Seatbelt: a sandbox's process group ends with its program (#3112).** Whatever the program
   left running in its process group is killed when it exits, over and over until none is left.
   Unlike a container's init, it does not reach a process that moved to a group of its own
   (`setsid`, `setpgid`).
-- **Seatbelt can hold a sandbox to named ports (#3112).** A policy naming ports may bind only
-  those; every other bind is refused by the kernel.
+- **Seatbelt can hold a sandbox to named ports (#3112).** A policy naming ports binds and takes in
+  traffic only on those: a bind to any other port and a `listen` with no bind are refused, and an
+  implicitly bound UDP socket receives nothing back; outbound connections are open.
 - **Seatbelt does not hold a bind to the loopback (#3559).** The docs no longer claim it: a
   dispatch under Seatbelt can listen on every address. Recorded by a conformance case; dispatches
   are not watched yet.

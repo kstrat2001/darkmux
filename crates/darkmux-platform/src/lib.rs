@@ -106,11 +106,9 @@ pub trait Platform: Send + Sync {
     /// `None` when it cannot be read (no such process, or the platform has
     /// no reader). Compare it only for EQUALITY against a stamp this same
     /// method produced for the same pid on this same machine: two equal
-    /// stamps mean the pid was not reused in between. (#3112) Two stamps of
-    /// different pids on one machine since its last boot also order their
-    /// starts (microseconds since the epoch on macOS, clock ticks since boot
-    /// on Linux): the preview sweep kills only a process started no earlier
-    /// than its sandbox.
+    /// stamps mean the pid was not reused in between. Never compare two
+    /// pids' stamps for order: on macOS a stamp is wall-clock time, which
+    /// steps.
     fn process_start_stamp(&self, pid: u32) -> Option<u64>;
     /// (#3448) How much memory process `pid` holds, in bytes: macOS's
     /// physical footprint (what Activity Monitor's Memory column shows, which
@@ -586,12 +584,15 @@ pub fn xdg_data_home_from(
 
 /// (#3112) One TCP socket listening on a port
 /// ([`Platform::tcp_port_listeners`]): the address it is bound to (`0.0.0.0`
-/// or `::` for every address of that family), the interface an address is
-/// scoped to (`lo0` for `fe80::1%lo0`), and the process that owns it when
-/// the platform says (the last one to use it, which may since have exited).
+/// or `::` for every address of that family; `None` when the platform's
+/// text of it may be cut short and so cannot be trusted as any address), that
+/// text as the platform printed it, the interface an address is scoped to
+/// (`lo0` for `fe80::1%lo0`), and the process that owns it when the platform
+/// says (the last one to use it, which may since have exited).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortListener {
-    pub addr: std::net::IpAddr,
+    pub addr: Option<std::net::IpAddr>,
+    pub text: String,
     pub scope: Option<String>,
     pub pid: Option<u32>,
 }
@@ -614,8 +615,10 @@ pub(crate) fn port_listeners_from_netstat(out: &str, port: u16) -> Option<Vec<Po
 }
 
 /// One netstat row: a listener on `port` (`Some(Some(_))`), another row
-/// (`Some(None)`), or a LISTEN row whose local address does not read
-/// (`None`).
+/// (`Some(None)`), or an IPv4 LISTEN row whose local address does not read
+/// (`None`). netstat prints at most [`NETSTAT_V6_WIDTH`] characters of an
+/// IPv6 address: one that long may be cut, so it is kept as text with no
+/// address, never read as one.
 fn netstat_listener(line: &str, port: u16) -> Option<Option<PortListener>> {
     let f: Vec<&str> = line.split_whitespace().collect();
     if !f.first().is_some_and(|p| p.starts_with("tcp")) || f.get(5) != Some(&"LISTEN") {
@@ -625,10 +628,22 @@ fn netstat_listener(line: &str, port: u16) -> Option<Option<PortListener>> {
     if at.parse::<u16>().ok()? != port {
         return Some(None);
     }
-    let (addr, scope) = netstat_address(f[0], host)?;
     let pid = f.len().checked_sub(9).and_then(|i| f.get(i)).and_then(|w| w.rsplit_once(':')).and_then(|(_, p)| p.parse().ok());
-    Some(Some(PortListener { addr, scope, pid }))
+    if netstat_may_cut(f[0], host) {
+        return Some(Some(PortListener { addr: None, text: host.to_string(), scope: None, pid }));
+    }
+    let (addr, scope) = netstat_address(f[0], host)?;
+    Some(Some(PortListener { addr: Some(addr), text: host.to_string(), scope, pid }))
 }
+
+/// Whether netstat may have cut `host` short: an IPv6 one at its width.
+fn netstat_may_cut(proto: &str, host: &str) -> bool {
+    proto != "tcp4" && host != "*" && host.len() >= NETSTAT_V6_WIDTH
+}
+
+/// The most characters of an IPv6 address `netstat -anv` prints (measured:
+/// `fe80::1823:f45e:` and `2001:f40:974:5c8` for longer addresses).
+const NETSTAT_V6_WIDTH: usize = 16;
 
 /// A netstat local address without its port: `*` is every address of
 /// `proto`'s family (`tcp4`, else IPv6), a `%` names its scope.

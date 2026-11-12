@@ -1686,8 +1686,11 @@ fn a_fake_answers_the_default_sandbox_the_test_set() {
 /// races): every address (`*`, by its family), IPv4 and IPv6 loopback, a
 /// scoped address (`fe80::1%lo0`), and the owner's pid at the end of a
 /// `process:pid` field whose name holds spaces. Another port or state is
-/// not one. A header that is not netstat's, or a LISTEN row on the port that
-/// does not read, is no answer at all (`None`), never "nothing listens".
+/// not one. A header that is not netstat's, or an IPv4 LISTEN row on the
+/// port that does not read, is no answer at all (`None`), never "nothing
+/// listens". (#3112 review) netstat prints at most 16 characters of an IPv6
+/// address: one that long is never read as an address (it may be cut), so
+/// it is no address at all (`addr: None`), never loopback.
 #[test]
 fn netstat_listen_rows_on_a_port_parse_to_addresses_and_owners() {
     let head = "Active Internet connections (including servers)\nProto Recv-Q Send-Q  Local Address          Foreign Address        (state)          rxbytes      txbytes  rhiwat  shiwat          process:pid    state  options           gencnt    flags   flags1 usecnt rtncnt fltrs\n";
@@ -1701,18 +1704,29 @@ fn netstat_listen_rows_on_a_port_parse_to_addresses_and_owners() {
         row("tcp4", "127.0.0.1.47996", "LISTEN", "Grok Bot:82871"),
         row("tcp46", "*.47996", "LISTEN", "node:7"),
         row("tcp6", "fe80::1%lo0.47996", "LISTEN", "node:8"),
+        row("tcp6", "fe80::1823:f45e:.47996", "LISTEN", "node:9"),
+        row("tcp6", "2001:f40:974:5c8.47996", "LISTEN", "node:10"),
         row("tcp4", "127.0.0.1.47997", "LISTEN", "Python:2900"),
         "tcp4       0      0  127.0.0.1.47996        127.0.0.1.50000        ESTABLISHED         1 2 3 4 x:9 00 0 0 0 0 0 0 0\n".to_string(),
     ]
     .concat();
-    let at = |addr: &str, scope: Option<&str>, pid| PortListener { addr: addr.parse().unwrap(), scope: scope.map(str::to_string), pid: Some(pid) };
+    let at = |addr: &str, text: &str, scope: Option<&str>, pid| PortListener { addr: Some(addr.parse().unwrap()), text: text.to_string(), scope: scope.map(str::to_string), pid: Some(pid) };
+    let cut = |text: &str, pid| PortListener { addr: None, text: text.to_string(), scope: None, pid: Some(pid) };
     assert_eq!(
         crate::port_listeners_from_netstat(&table, 47996),
-        Some(vec![at("0.0.0.0", None, 2900), at("::1", None, 2901), at("127.0.0.1", None, 82871), at("::", None, 7), at("fe80::1", Some("lo0"), 8)])
+        Some(vec![
+            at("0.0.0.0", "*", None, 2900),
+            at("::1", "::1", None, 2901),
+            at("127.0.0.1", "127.0.0.1", None, 82871),
+            at("::", "*", None, 7),
+            at("fe80::1", "fe80::1%lo0", Some("lo0"), 8),
+            cut("fe80::1823:f45e:", 9),
+            cut("2001:f40:974:5c8", 10),
+        ])
     );
     assert_eq!(crate::port_listeners_from_netstat(&table, 1), Some(vec![]), "no listener on the port");
     assert_eq!(crate::port_listeners_from_netstat("not netstat\n", 1), None, "a header that is not netstat's");
-    let broken = format!("{head}{}", row("tcp4", "nonsense", "LISTEN", "x:1").replace("nonsense", "garbage.47996x"));
+    let broken = format!("{head}{}", row("tcp4", "garbage.47996x", "LISTEN", "x:1"));
     assert_eq!(crate::port_listeners_from_netstat(&broken, 47996), None, "a LISTEN row that does not read");
     let unparsed = format!("{head}{}", row("tcp4", "not-an-ip.47996", "LISTEN", "x:1"));
     assert_eq!(crate::port_listeners_from_netstat(&unparsed, 47996), None);
@@ -1751,12 +1765,13 @@ fn the_host_lists_a_ports_listeners_with_their_addresses() {
     let _ = child.kill();
     let _ = child.wait();
     let pid = Some(child.id());
-    assert_eq!(wide, Some(vec![PortListener { addr: "0.0.0.0".parse().unwrap(), scope: None, pid }]));
-    assert_eq!(near, Some(vec![PortListener { addr: "127.0.0.1".parse().unwrap(), scope: None, pid }]));
+    let read = |l: Option<Vec<PortListener>>| l.map(|l| l.into_iter().map(|l| (l.addr, l.pid)).collect::<Vec<_>>());
+    assert_eq!(read(wide), Some(vec![(Some("0.0.0.0".parse().unwrap()), pid)]));
+    assert_eq!(read(near), Some(vec![(Some("127.0.0.1".parse().unwrap()), pid)]));
     let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     assert_eq!(host.tcp_port_listeners(free).map(|l| l.into_iter().filter(|l| l.pid != Some(std::process::id())).count()), Some(0));
     assert_eq!(OtherPlatform.tcp_port_listeners(1), None);
-    let one = PortListener { addr: "0.0.0.0".parse().unwrap(), scope: None, pid: Some(7) };
+    let one = PortListener { addr: Some("0.0.0.0".parse().unwrap()), text: "0.0.0.0".into(), scope: None, pid: Some(7) };
     let fake = FakePlatform { port_listeners: vec![(5, vec![one.clone()])], ..Default::default() };
     assert_eq!((fake.tcp_port_listeners(5), fake.tcp_port_listeners(6)), (Some(vec![one]), Some(vec![])));
 }

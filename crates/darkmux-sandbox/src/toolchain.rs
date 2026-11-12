@@ -20,11 +20,13 @@
 //! the home, which a sandbox on the host cannot read; put the real
 //! install's `bin` on PATH instead.
 //!
-//! **Untrusted scripts.** A command naming a workspace script
-//! (`./node_modules/.bin/vite`) has the script's `#!` interpreter resolved
-//! too, but only when it is a known runtime ([`RUNTIMES`]): the workspace
-//! is written by a run, so its scripts cannot widen what is granted beyond
-//! a language runtime.
+//! **Untrusted scripts.** Nothing a workspace file names is granted: the
+//! workspace is written by a run, and a `#!` path in it can be a link to any
+//! host file. A command naming a workspace script
+//! (`./node_modules/.bin/vite`) has only its interpreter's NAME taken (the
+//! last part of the `#!` path, or the name `env` is given), only when it is
+//! a known runtime ([`RUNTIMES`]), and that name is found on PATH exactly as
+//! a recipe program is.
 //!
 //! **One seam for managed toolchains.** [`search_path`] puts toolchain
 //! folders darkmux manages itself (#3561: a darkmux-verified Node.js under
@@ -370,42 +372,53 @@ impl Found<'_> {
         Ok(())
     }
 
-    /// A program file, where a link to it is and where it really is, and
-    /// the interpreter a script names (any one, for a trusted program; only
-    /// a known runtime, for a workspace script), `depth` levels down.
-    fn program(&mut self, at: &Path, trusted: bool, depth: usize) -> Result<(), Unresolved> {
+    /// A program the recipe names (or one found on PATH): where a link to it
+    /// is and where it really is, and the interpreter its `#!` names, `depth`
+    /// levels down.
+    fn program(&mut self, at: &Path, depth: usize) -> Result<(), Unresolved> {
         let real = at.canonicalize().unwrap_or_else(|_| at.to_path_buf());
         let line = format!("{}={}", at.file_name().map(|n| n.to_string_lossy()).unwrap_or_default(), real.display());
         if self.identity.contains(&line) {
             return Ok(());
         }
-        if trusted {
-            self.identity.push(line);
-            self.grant(at)?;
-            if real != at {
-                self.grant(&real)?;
-            }
+        self.identity.push(line);
+        self.grant(at)?;
+        if real != at {
+            self.grant(&real)?;
         }
-        let interpreter = interpreter_of(&real).filter(|i| trusted || RUNTIMES.contains(&i.name().as_str()));
-        match (interpreter, depth < SHEBANG_DEPTH) {
+        match (interpreter_of(&real), depth < SHEBANG_DEPTH) {
             (Some(Interpreter::OnPath(name)), true) => self.on_path(&name, depth + 1),
-            (Some(Interpreter::At(path)), true) => self.program(&path, true, depth + 1),
+            (Some(Interpreter::At(path)), true) => self.program(&path, depth + 1),
+            _ => Ok(()),
+        }
+    }
+
+    /// (#3112 review) A workspace script: nothing it names is granted. Only
+    /// its interpreter's NAME counts (the last part of a `#!` path, or the
+    /// name `env` is given), only when it is a known runtime ([`RUNTIMES`]),
+    /// and that name is found on PATH like a recipe program: a `#!` path
+    /// into the workspace, linked anywhere, grants nothing of its own.
+    fn workspace_script(&mut self, script: &Path) -> Result<(), Unresolved> {
+        let name = interpreter_of(script).map(|i| i.name());
+        match name.as_deref().map(|n| n.rsplit('/').next().unwrap_or(n)) {
+            Some(runtime) if RUNTIMES.contains(&runtime) => self.on_path(runtime, 1),
             _ => Ok(()),
         }
     }
 
     fn on_path(&mut self, name: &str, depth: usize) -> Result<(), Unresolved> {
         let at = find_program(name, &self.dirs).ok_or_else(|| Unresolved::Missing(name.to_string()))?;
-        self.program(&at, true, depth)
+        self.program(&at, depth)
     }
 
     /// A program a command line runs.
     fn run(&mut self, program: &Program) -> Result<(), Unresolved> {
         match program {
             Program::OnPath(name) => self.on_path(name, 0),
-            Program::At(path) if path.starts_with('/') => self.program(Path::new(path), executable_file(Path::new(path)), 0),
+            Program::At(path) if path.starts_with('/') && executable_file(Path::new(path)) => self.program(Path::new(path), 0),
+            Program::At(path) if path.starts_with('/') => Ok(()),
             Program::At(rel) => match self.ask.workdir.map(|w| w.join(rel)).filter(|s| s.exists()) {
-                Some(script) => self.program(&script, false, 0),
+                Some(script) => self.workspace_script(&script),
                 None => Ok(()),
             },
         }

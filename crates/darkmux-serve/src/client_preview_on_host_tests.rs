@@ -88,13 +88,16 @@ fn the_dev_server_host_is_loopback_on_the_host_and_every_address_in_a_container(
 /// the preview, and the fix.
 #[test]
 fn a_listener_beyond_the_loopback_is_exposed_and_named() {
-    let at = |pid, addr: &str, scope: Option<&str>| PortListener { pid: Some(pid), addr: addr.parse().unwrap(), scope: scope.map(str::to_string) };
-    let all = vec![at(1, "127.0.0.1", None), at(1, "::1", None), at(1, "::ffff:127.0.0.1", None), at(1, "fe80::1", Some("lo0")), at(2, "::", None), at(3, "0.0.0.0", None), at(3, "192.168.1.5", None), at(4, "fe80::1", Some("en0"))];
+    let at = |pid, addr: &str, scope: Option<&str>| PortListener { pid: Some(pid), addr: Some(addr.parse().unwrap()), text: addr.to_string(), scope: scope.map(str::to_string) };
+    // An IPv6 address netstat cut short is no address: never loopback, even
+    // when what is left of it starts like one.
+    let cut = PortListener { pid: Some(5), addr: None, text: "::1:2:3:4:5:6:7".into(), scope: None };
+    let all = vec![at(1, "127.0.0.1", None), at(1, "::1", None), at(1, "::ffff:127.0.0.1", None), at(1, "fe80::1", Some("lo0")), at(2, "::", None), at(3, "0.0.0.0", None), at(3, "192.168.1.5", None), at(4, "fe80::1", Some("en0")), cut.clone()];
     let exposed = on_host::beyond_loopback(&all);
-    assert_eq!(exposed, all[4..].to_vec(), "every address, a LAN address and a link-local one off the loopback interface");
-    let found = vec![(4200, all[4].clone()), (4100, all[5].clone()), (4100, PortListener { pid: None, ..all[6].clone() })];
+    assert_eq!(exposed, all[4..].to_vec(), "every address, a LAN address, a link-local one off the loopback interface, a cut one");
+    let found = vec![(4200, all[4].clone()), (4100, all[5].clone()), (4100, PortListener { pid: None, ..all[6].clone() }), (4100, cut)];
     let why = on_host::exposure_reason(BackendKind::Seatbelt, &found, 4100, 4200);
-    for part in ["[::]:4200 (the HMR port, pid 2)", "0.0.0.0:4100 (the app port, pid 3)", "192.168.1.5:4100 (the app port)", "seatbelt", "127.0.0.1", "#3559", "server.hmr.host"] {
+    for part in ["[::]:4200 (the HMR port, pid 2)", "0.0.0.0:4100 (the app port, pid 3)", "192.168.1.5:4100 (the app port)", "[::1:2:3:4:5:6:7…]:4100 (an IPv6 address netstat cut short", "seatbelt", "127.0.0.1", "#3559", "server.hmr.host"] {
         assert!(why.contains(part), "missing `{part}` in: {why}");
     }
 }
@@ -103,7 +106,7 @@ fn a_listener_beyond_the_loopback_is_exposed_and_named() {
 /// group listens on: nothing, IPv6 loopback only, or loopback but no answer.
 #[test]
 fn an_on_host_dev_server_that_never_answered_says_why_from_its_listeners() {
-    let at = |addr: &str| PortListener { pid: Some(1), addr: addr.parse().unwrap(), scope: None };
+    let at = |addr: &str| PortListener { pid: Some(1), addr: Some(addr.parse().unwrap()), text: addr.to_string(), scope: None };
     let none = on_host::not_ready_reason(BackendKind::Seatbelt, 4100, Some(&[]));
     assert!(none.contains("nothing listens on port 4100") && none.contains("127.0.0.1"), "{none}");
     let v6 = on_host::not_ready_reason(BackendKind::Seatbelt, 4100, Some(&[at("::1")]));
@@ -336,7 +339,7 @@ fn a_seatbelt_preview_runs_with_no_host_files_or_host_env() {
         }
     }
     let listened = listened.expect("the dev server's listeners were read");
-    assert!(!listened.is_empty() && listened.iter().all(|l| l.addr.is_loopback()), "{listened:?}");
+    assert!(!listened.is_empty() && listened.iter().all(|l| l.addr.is_some_and(|a| a.is_loopback())), "{listened:?}");
     assert!(gone, "a stop ends the whole process group");
 }
 
@@ -408,8 +411,8 @@ fn a_backend_with_no_preview_runner_is_refused() {
 #[test]
 fn the_watch_asks_once_more_then_stops_what_it_cannot_read() {
     use std::sync::atomic::AtomicU32;
-    let wide = PortListener { pid: Some(7), addr: "0.0.0.0".parse().unwrap(), scope: None };
-    let near = PortListener { pid: Some(7), addr: "127.0.0.1".parse().unwrap(), scope: None };
+    let wide = PortListener { pid: Some(7), addr: Some("0.0.0.0".parse().unwrap()), text: "*".into(), scope: None };
+    let near = PortListener { pid: Some(7), addr: Some("127.0.0.1".parse().unwrap()), text: "127.0.0.1".into(), scope: None };
     let once = darkmux_platform::FakePlatform { port_listeners: vec![(5, vec![wide.clone(), near.clone()]), (6, vec![near])], ..Default::default() };
     assert_eq!(on_host::exposed_in(&once, BackendKind::Seatbelt, [5, 6]), Ok(vec![(5, wide)]));
     assert_eq!(on_host::exposed_in(&once, BackendKind::Seatbelt, [6, 7]), Ok(vec![]));
@@ -420,32 +423,17 @@ fn the_watch_asks_once_more_then_stops_what_it_cannot_read() {
     assert!(why.contains("cannot read what listens on its port 5") && why.contains("darkmux config set runtime.sandbox docker"), "{why}");
 }
 
-/// (#3112 review) The post-stop sweep kills what still holds the preview's
-/// ports, every owner the platform names (the socket's last user and every
-/// holder found), but only one that started no earlier than the sandbox:
-/// an older process on the port is never touched. It stops looking once
-/// the ports are free.
+/// (#3112 review, BLOCKER C) After a stop, what still listens on the
+/// preview's ports is reported (address, port, pid), never killed: the
+/// report is a line per listener and the stop has no way to kill at all.
 #[test]
-fn the_sweep_kills_only_port_holders_started_since_the_sandbox() {
-    let holder = |pid| PortListener { pid: Some(pid), addr: "0.0.0.0".parse().unwrap(), scope: None };
-    let fake = darkmux_platform::FakePlatform {
-        port_listeners: vec![(4100, vec![holder(7), holder(8)])],
-        tcp_listeners: vec![(4100, vec![9])],
-        process_start_stamps: vec![(7, 200), (8, 50), (9, 100)],
-        ..Default::default()
-    };
-    let killed = Mutex::new(Vec::new());
-    let left = on_host::sweep_ports(&fake, [4100, 4200], 100, |pid| {
-        killed.lock().unwrap().push(pid);
-        true
-    });
-    let mut killed = killed.into_inner().unwrap();
-    killed.sort_unstable();
-    killed.dedup();
-    assert_eq!(killed, [7, 9], "the holders started since the sandbox (100), never the older 8");
-    assert_eq!(left.len(), 2, "this fake keeps listening, so it is reported");
-    let free = darkmux_platform::FakePlatform::default();
-    assert!(on_host::sweep_ports(&free, [4100, 4200], 100, |_| panic!("nothing to kill")).is_empty());
+fn what_lingers_on_a_stopped_previews_ports_is_reported() {
+    let holder = PortListener { pid: Some(7), addr: Some("0.0.0.0".parse().unwrap()), text: "*".into(), scope: None };
+    let fake = darkmux_platform::FakePlatform { port_listeners: vec![(4200, vec![holder])], ..Default::default() };
+    let lines = on_host::lingering(&fake, "darkmux-preview-w", [4100, 4200]);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("* still listens on its port 4200 (pid 7)") && lines[0].contains("left running"), "{lines:?}");
+    assert!(on_host::lingering(&darkmux_platform::FakePlatform::default(), "w", [4100, 4200]).is_empty());
 }
 
 /// A real Seatbelt preview's sandbox root for the duration of a test.
@@ -559,14 +547,45 @@ refused 0.0.0.0 1
 ", "binds on port {other}");
 }
 
-/// (#3112 review, MAJOR 2) A dev server that moves to a process group of
-/// its own (`setpgid`) escapes the sandbox's group kill; after a stop, the
-/// sweep finds it on the port it holds and kills it, so the port is free
-/// and nothing answers. One that left the group and holds no port is not
-/// found (documented).
+/// Kills, when dropped, the process listening on `port` whose command
+/// line holds `marker` (and nothing else), so a test that records an escape
+/// never leaves the escapee behind.
+struct KillListener {
+    port: u16,
+    marker: &'static str,
+}
+
+impl Drop for KillListener {
+    fn drop(&mut self) {
+        for _ in 0..50 {
+            let owners: Vec<u32> = darkmux_platform::current().tcp_listeners(self.port).unwrap_or_default();
+            let ours: Vec<u32> = owners
+                .into_iter()
+                .filter(|pid| {
+                    let cmd = std::process::Command::new("/bin/ps").args(["-o", "command=", "-p", &pid.to_string()]).output();
+                    cmd.is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(self.marker))
+                })
+                .collect();
+            if ours.is_empty() && !listened(self.port) {
+                return;
+            }
+            for pid in ours {
+                // SAFETY: a signal to a process this test started, by marker.
+                unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+/// (#3112 review, MAJOR E: a documented limit) A dev server that moves to
+/// a process group of its own (`setpgid`) is not ended by a stop: darkmux
+/// can prove only its group's members are the sandbox's, and it kills
+/// nothing else. It still answers on its old port after the stop (the only
+/// ports the kernel lets it bind or take in). The test kills it itself.
 #[test]
 #[serial_test::serial]
-fn a_dev_server_that_leaves_the_group_is_swept_off_its_port() {
+fn a_dev_server_that_leaves_the_group_outlives_the_stop() {
     if !darkmux_sandbox::SeatbeltBackend::available() || !host_lists_sockets() {
         return;
     }
@@ -574,14 +593,77 @@ fn a_dev_server_that_leaves_the_group_is_swept_off_its_port() {
     let dir = tempfile::TempDir::new().unwrap();
     let previews = real_seatbelt(dir.path());
     let escape = r#"python3 -c "import os; os.setpgid(0, 0); os.execvp('sh', ['sh', '-c', os.environ['SERVE']])""#;
-    let wt = a_workspace(dir.path(), serde_json::json!({"schema_version": "1.1", "command": escape, "env": {"PORT": "{port}", "HOST": "{host}", "SERVE": serve_on(HOST_ENV)}}));
+    let serve = serve_on(HOST_ENV).replace("serve_forever()", "serve_forever()  # darkmux-test-escapee");
+    let wt = a_workspace(dir.path(), serde_json::json!({"schema_version": "1.1", "command": escape, "env": {"PORT": "{port}", "HOST": "{host}", "SERVE": serve}}));
     previews.start_in(BackendKind::Seatbelt, "w", &wt, &RecipeSource::Checkout(wt.clone())).unwrap();
     let v = until_status(&previews, "w", &["failed", "ready"], Duration::from_secs(30));
     assert_eq!(v["status"], "ready", "{v}");
     let port = v["port"].as_u64().unwrap() as u16;
+    let _cleanup = KillListener { port, marker: "darkmux-test-escapee" };
     assert!(previews.stop("w"));
-    assert!(!listened(port), "the escaped server still holds port {port}");
-    assert!(!http_ok(port, "/"), "the escaped server still answers");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(http_ok(port, "/"), "recorded limit: the escaped server outlives the stop on port {port}");
+}
+
+/// (#3112 review, BLOCKER C) A stop never kills a process outside the
+/// sandbox: a program the user started after the preview, listening on the
+/// preview's unused HMR port, is still running after the stop.
+#[test]
+#[serial_test::serial]
+fn a_stop_never_kills_a_process_outside_the_sandbox() {
+    if !darkmux_sandbox::SeatbeltBackend::available() || !host_lists_sockets() {
+        return;
+    }
+    let _state = StateDir::set();
+    let dir = tempfile::TempDir::new().unwrap();
+    let previews = real_seatbelt(dir.path());
+    let wt = a_workspace(dir.path(), serde_json::json!({"schema_version": "1.1", "command": serve_on(HOST_ENV), "env": {"PORT": "{port}", "HOST": "{host}"}}));
+    previews.start_in(BackendKind::Seatbelt, "w", &wt, &RecipeSource::Checkout(wt.clone())).unwrap();
+    let v = until_status(&previews, "w", &["failed", "ready"], Duration::from_secs(30));
+    assert_eq!(v["status"], "ready", "{v}");
+    let hmr = v["hmr_port"].as_u64().unwrap();
+    let mut user = std::process::Command::new("/usr/bin/python3")
+        .args(["-c", &format!("import socket,time;s=socket.socket();s.bind(('127.0.0.1',{hmr}));s.listen();print('up',flush=True);time.sleep(60)")])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut std::io::BufReader::new(user.stdout.take().unwrap()), &mut line).unwrap();
+    assert!(previews.stop("w"));
+    std::thread::sleep(Duration::from_millis(300));
+    let alive = user.try_wait().unwrap().is_none();
+    let _ = user.kill();
+    let _ = user.wait();
+    assert!(alive, "a stop killed a process outside the sandbox");
+}
+
+/// (#3112 review, BLOCKER A) A listen with no bind (the kernel would give
+/// it an ephemeral port on every address, which the watch never reads) is
+/// refused by the kernel; the assigned port still serves.
+#[test]
+#[serial_test::serial]
+fn an_unbound_listen_is_refused_by_the_kernel() {
+    if !darkmux_sandbox::SeatbeltBackend::available() || !host_lists_sockets() {
+        return;
+    }
+    let _state = StateDir::set();
+    let dir = tempfile::TempDir::new().unwrap();
+    let previews = real_seatbelt(dir.path());
+    let probe = format!(
+        r#"python3 -c "import socket
+s = socket.socket()
+try:
+    s.listen(); print('listened', s.getsockname()[1])
+except OSError as e:
+    print('refused', e.errno)" > probe.txt; {}"#,
+        serve_on(HOST_ENV)
+    );
+    let wt = a_workspace(dir.path(), serde_json::json!({"schema_version": "1.1", "command": probe, "env": {"PORT": "{port}", "HOST": "{host}"}}));
+    previews.start_in(BackendKind::Seatbelt, "w", &wt, &RecipeSource::Checkout(wt.clone())).unwrap();
+    let v = until_status(&previews, "w", &["failed", "ready"], Duration::from_secs(30));
+    previews.stop("w");
+    assert_eq!(v["status"], "ready", "the assigned port serves: {v}");
+    assert_eq!(std::fs::read_to_string(wt.join("probe.txt")).unwrap_or_default(), "refused 1\n");
 }
 
 /// (#3112 review, MINOR 6) `{host}` is new meaning in the recipe format, so
