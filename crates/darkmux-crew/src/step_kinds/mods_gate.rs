@@ -215,7 +215,7 @@ impl StepKind for ModsGateStepKind {
             .and_then(|d| d.file_name().and_then(|n| n.to_str()).map(str::to_string));
         // (#3112 review) Where the proposing sandbox saw the workdir, recorded
         // beside the source so the deliverer maps a host-seen kit too.
-        let tree_seen = workdir.map(|w| darkmux_sandbox::seen_at_configured(Path::new(w), "/workspace"));
+        let tree_seen = gate_tree_seen(workdir);
         let mut mods_gated = 0usize;
         for m in &targets {
             // A mutation self-check on this line is documented in this
@@ -347,6 +347,12 @@ fn scratch_copy(source_dir: &Path) -> Result<(tempfile::TempDir, PathBuf), Strin
     // (below), which is the mode this kind already wants.
     strip_git_dir(&scratch_checkout).map_err(|e| format!("could not detach the scratch copy from git: {e}"))?;
     Ok((scratch, scratch_checkout))
+}
+
+/// (#3112 review) Where the configured sandbox saw the gate's workdir (the
+/// tree the proposing dispatch ran in), recorded on each gated mod.
+fn gate_tree_seen(workdir: Option<&str>) -> Option<String> {
+    workdir.map(|w| darkmux_sandbox::seen_at_configured(Path::new(w), "/workspace"))
 }
 
 /// `kit` in the coordinates of the checkout `source_dir` (whose directory
@@ -1045,6 +1051,40 @@ mod tests {
         let host = gate_kit_mapped("--- /Users/op/tree/src1/x.txt\n+++ /Users/op/tree/src1/x.txt\n", source, "/Users/op/tree");
         assert_eq!(docker, "--- x.txt\n+++ x.txt\n");
         assert_eq!(host, docker);
+    }
+
+    /// (#3112 review) The production wiring, through `selected()`: under
+    /// `DARKMUX_SANDBOX=seatbelt` (on a Mac) the gate maps a kit written
+    /// under the tree's own path and records that path; under Docker (a test
+    /// build's default) it maps `/workspace` and records none.
+    #[test]
+    #[serial_test::serial]
+    fn the_gate_follows_the_selected_sandbox() {
+        let tree = tempfile::TempDir::new().unwrap();
+        let source = tree.path().join("src1");
+        std::fs::create_dir_all(&source).unwrap();
+        let scratch = tempfile::TempDir::new().unwrap();
+        let docker_kit = "--- /workspace/src1/x.txt\n+++ /workspace/src1/x.txt\n";
+        let path = write_kit_patch(scratch.path(), &source, docker_kit).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "--- x.txt\n+++ x.txt\n");
+        let w = tree.path().display().to_string();
+        assert_eq!(gate_tree_seen(Some(&w)).as_deref(), Some("/workspace"));
+        let src = include_str!("mods_gate.rs");
+        assert!(src.contains("let tree_seen = gate_tree_seen(workdir);"));
+        if !darkmux_sandbox::SeatbeltBackend::available() {
+            return;
+        }
+        let real = tree.path().canonicalize().unwrap().display().to_string();
+        let host_kit = format!("--- {real}/src1/x.txt\n+++ {real}/src1/x.txt\n");
+        let prev = std::env::var_os("DARKMUX_SANDBOX");
+        unsafe { std::env::set_var("DARKMUX_SANDBOX", "seatbelt") };
+        let mapped = write_kit_patch(scratch.path(), &source, &host_kit).map(|p| std::fs::read_to_string(p).unwrap());
+        let seen = gate_tree_seen(Some(&w));
+        unsafe {
+            match prev { Some(v) => std::env::set_var("DARKMUX_SANDBOX", v), None => std::env::remove_var("DARKMUX_SANDBOX") }
+        }
+        assert_eq!(mapped.unwrap(), "--- x.txt\n+++ x.txt\n");
+        assert_eq!(seen.as_deref(), Some(real.as_str()));
     }
 
     /// With a `test_command` but no placement chosen, every mod records the

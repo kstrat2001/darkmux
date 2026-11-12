@@ -2,7 +2,7 @@
 //! running, and the reaper `darkmux serve` runs over them.
 //!
 //! A caught stop (SIGINT, SIGTERM, the watchdog) kills the dispatch
-//! container itself (`docker_kill_by_name`). A host that dies without its
+//! container itself (`kill_dispatch_sandbox`). A host that dies without its
 //! handlers running (SIGKILL, an OOM kill) cannot: its `docker run` client
 //! is reparented and the `darkmux-dispatch-*` container runs on until its
 //! own limits (turns, tokens, the inactivity bound) end it. Nothing can

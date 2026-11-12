@@ -38,7 +38,7 @@ pub(crate) fn sandbox_row(
     };
     let named = format!("`{}` ({})", darkmux_sandbox::setting_value(kind), from(source));
     match (kind, docker) {
-        (BackendKind::Seatbelt, _) => seatbelt_row(&named, host_runtime),
+        (BackendKind::Seatbelt, _) => seatbelt_row(&named, host_runtime, source),
         (BackendKind::Docker, Some(row)) if row.status == Status::Pass => {
             check(Status::Pass, format!("{named}: every isolated run here runs in a Docker container ({})", row.message), None)
         }
@@ -54,21 +54,66 @@ pub(crate) fn sandbox_row(
 
 /// Seatbelt: present (the selection already refused it where not), so the
 /// row is whether its runtime can run.
-fn seatbelt_row(named: &str, host_runtime: Option<&Result<String, String>>) -> Check {
+fn seatbelt_row(named: &str, host_runtime: Option<&Result<String, String>>, source: Source) -> Check {
     let check = |status, message: String, hint: Option<String>| Check { name: SANDBOX_CHECK_NAME.into(), status, message, hint };
     let exec = darkmux_sandbox::seatbelt::SANDBOX_EXEC;
     match host_runtime {
         Some(Err(why)) => check(
             Status::Fail,
             format!("{named}: macOS Seatbelt ({exec}) is here, but no dispatch can start: its runtime cannot run: {why}"),
-            Some("restart the darkmux process that will dispatch, or run in Docker: `darkmux config set runtime.sandbox docker`".into()),
+            Some(format!("restart the darkmux process that will dispatch; or: {}", darkmux_sandbox::way_back_to_docker_given(source))),
         ),
         Some(Ok(program)) => check(
             Status::Pass,
-            format!("{named}: macOS Seatbelt ({exec}) runs every isolated run here, with `{program}`; Docker is not needed"),
+            format!(
+                "{named}: macOS Seatbelt ({exec}); a darkmux started now runs its runtime as `{program}`, so Docker is \
+                 not needed. A darkmux process already running since this one was replaced (the daemon after an upgrade) \
+                 is not seen here, and refuses until it restarts"
+            ),
             None,
         ),
         None => check(Status::Pass, format!("{named}: macOS Seatbelt ({exec}) runs every isolated run here; Docker is not needed"), None),
+    }
+}
+
+/// (#3112 review) The row naming user mission configs whose step messages
+/// say the container's `/workspace`, read from `darkmux`'s own mission-config
+/// directory.
+pub(crate) fn check_mission_config_workspace_paths() -> Check {
+    check_mission_config_workspace_paths_in(&darkmux_crew::loader::mission_configs_dir())
+}
+
+/// [`check_mission_config_workspace_paths`] over the `*.json` files in `dir`.
+pub(crate) fn check_mission_config_workspace_paths_in(dir: &std::path::Path) -> Check {
+    let name = "mission config workspace paths";
+    let mut found: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .filter_map(|p| {
+            let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p).ok()?).ok()?;
+            let at = darkmux_crew::mission_config::workspace_paths::container_workspace_messages(&doc);
+            (!at.is_empty()).then(|| format!("{} ({})", p.display(), at.join(", ")))
+        })
+        .collect();
+    found.sort();
+    if found.is_empty() {
+        return Check { name: name.into(), status: Status::Pass, message: "no user mission config names `/workspace` in a step message".into(), hint: None };
+    }
+    Check {
+        name: name.into(),
+        status: Status::Warn,
+        message: format!(
+            "a step message names the container's `/workspace`: {}. Under a sandbox on the host the runtime renames it \
+             at run time, but only in the text the model reads",
+            found.join("; ")
+        ),
+        hint: Some(
+            "write `${WORKSPACE_ROOT}` in its place: the step names the tree where its sandbox sees it, `/workspace` in a container"
+                .into(),
+        ),
     }
 }
 
@@ -99,6 +144,27 @@ pub(crate) fn docker_only(selected: &Result<BackendKind, String>, name: &str, pr
 mod tests {
     use super::*;
 
+    /// (#3112 review) A user mission config whose step message names the
+    /// container's `/workspace` is named, with the placeholder to use; a
+    /// directory with none, or none at all, passes.
+    #[test]
+    fn a_user_mission_config_naming_workspace_is_named_with_the_placeholder() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("review-judged.json"),
+            r#"{"phases":[{"tasks":[{"steps":[{"config":{"message":"mounted at `/workspace/<source>`"}}]}]}]}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("fine.json"), r#"{"message":"at `${WORKSPACE_ROOT}/<source>`"}"#).unwrap();
+        let c = check_mission_config_workspace_paths_in(dir.path());
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.message.contains("review-judged.json") && !c.message.contains("fine.json"), "{}", c.message);
+        assert!(c.hint.as_deref().unwrap_or("").contains("${WORKSPACE_ROOT}"), "{:?}", c.hint);
+        std::fs::remove_file(dir.path().join("review-judged.json")).unwrap();
+        assert_eq!(check_mission_config_workspace_paths_in(dir.path()).status, Status::Pass);
+        assert_eq!(check_mission_config_workspace_paths_in(&dir.path().join("none")).status, Status::Pass);
+    }
+
     fn row(status: Status, message: &str) -> Check {
         Check { name: "docker runtime".into(), status, message: message.into(), hint: Some("Start Docker Desktop".into()) }
     }
@@ -115,8 +181,10 @@ mod tests {
 
     /// (#3112 review, regression) Seatbelt as this machine's default with
     /// no runtime it can run fails, naming why and the way back: doctor
-    /// asks the same identity check a dispatch does, so a green row means a
-    /// dispatch can start.
+    /// asks the same identity check a dispatch does, about THIS process's
+    /// executable: a green row means a darkmux started now can dispatch; a
+    /// long-running process whose binary was replaced is not seen (the row
+    /// says so); it refuses on its own.
     #[test]
     fn a_seatbelt_default_with_no_runnable_runtime_fails() {
         let why = "darkmux was replaced since this process started; Restart this darkmux process";
@@ -124,6 +192,10 @@ mod tests {
         assert_eq!(c.status, Status::Fail);
         assert!(c.message.contains(why) && c.message.contains("`seatbelt`"), "{}", c.message);
         assert!(c.hint.as_deref().unwrap_or("").contains("darkmux config set runtime.sandbox docker"), "{:?}", c.hint);
+        // (#3112 review) When the env var chose Seatbelt, the way back is
+        // the env var's own; a `config set` under it would change nothing.
+        let env = sandbox_row(&Ok(BackendKind::Seatbelt), Source::Env, None, true, Some(&Err(why.into())));
+        assert!(env.hint.as_deref().unwrap_or("").contains("export DARKMUX_SANDBOX=docker"), "{:?}", env.hint);
         let ok = sandbox_row(&Ok(BackendKind::Seatbelt), Source::BuiltIn, None, true, Some(&Ok("/opt/homebrew/bin/darkmux runtime".into())));
         assert_eq!(ok.status, Status::Pass);
         assert!(ok.message.contains("/opt/homebrew/bin/darkmux runtime"), "{}", ok.message);

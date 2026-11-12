@@ -1420,13 +1420,19 @@ pub(crate) fn claim_resume_origin(resume_from: &Path) -> Result<ExecutionLock> {
         );
     };
     // The lock lives only as long as the darkmux process: after a SIGKILL of
-    // it the container keeps running with no lock held. Ask docker too.
-    for name in origin_containers(resume_from) {
-        if probe_container_liveness(&name) == Liveness::Running {
+    // it the container keeps running with no lock held. Ask its sandbox
+    // too: the one the origin recorded, not the one configured now.
+    for sandbox in origin_sandboxes(resume_from) {
+        if probe_container_liveness(&sandbox) == Liveness::Running {
+            let name = &sandbox.id;
+            let stop = match sandbox.backend {
+                darkmux_sandbox::BackendKind::Docker => format!("`docker kill {name}`"),
+                darkmux_sandbox::BackendKind::Seatbelt => "end the darkmux runtime process running it".to_string(),
+            };
             bail_resume!(
-                "darkmux dispatch: RESUME REFUSED: {named} (out-dir {}) still has its container `{name}` \
-                 running, though the darkmux process that started it is gone. Stop it \
-                 (`docker kill {name}`), then resume",
+                "darkmux dispatch: RESUME REFUSED: {named} (out-dir {}) still has its sandbox `{name}` \
+                 running, though the darkmux process that started it is gone. Stop it ({stop}), then \
+                 resume",
                 resume_from.display()
             );
         }
@@ -1496,6 +1502,20 @@ fn origin_containers(out_dir: &Path) -> Vec<String> {
         .and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok())
         .and_then(|o| o.get("container").and_then(|v| v.as_str()).map(str::to_string));
     own.into_iter().chain(origin_resume_containers(out_dir)).collect()
+}
+
+/// (#3112 review, round 3) [`origin_containers`] as handles in the sandbox
+/// the origin recorded (resume origin 1.1 `sandbox`; an origin from before
+/// it ran in Docker). A resume runs in its origin's sandbox
+/// ([`resume_sandbox_matches`]), so one kind covers the whole chain.
+fn origin_sandboxes(out_dir: &Path) -> Vec<darkmux_sandbox::SandboxHandle> {
+    let backend = read_resume_origin(out_dir)
+        .ok()
+        .and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok())
+        .and_then(|o| o.get("sandbox").cloned())
+        .and_then(|v| serde_json::from_value::<darkmux_sandbox::BackendKind>(v).ok())
+        .unwrap_or(darkmux_sandbox::BackendKind::Docker);
+    origin_containers(out_dir).into_iter().map(|id| darkmux_sandbox::SandboxHandle { backend, id }).collect()
 }
 
 fn resume_origin_completed(out_dir: &Path) -> bool {
@@ -5426,23 +5446,15 @@ impl Drop for StopFlagGuard {
 /// swallowed, matching every call site's prior behavior — there is
 /// nowhere left to report it to at a teardown point, and the caller
 /// (`dispatch`) still returns its own real error either way.
-fn docker_kill_by_name(container_name: &str) {
-    if let Some(backend) = dispatch_sandbox() {
-        let _ = backend.kill(&sandbox_named(backend, container_name)).output();
-    }
-}
-
-/// (#3112 review) The backend this process's dispatches started their
-/// sandboxes in. `None` when `runtime.sandbox` is refused: then no dispatch
-/// started one (`resolve_runtime_image` refuses it before any sandbox), so
-/// there is nothing to stop, and no stop falls back to Docker.
-fn dispatch_sandbox() -> Option<&'static dyn darkmux_sandbox::SandboxBackend> {
-    darkmux_sandbox::backend().ok()
-}
-
-/// (#3112) A dispatch's sandbox handle in `backend`, by its name.
-fn sandbox_named(backend: &dyn darkmux_sandbox::SandboxBackend, container_name: &str) -> darkmux_sandbox::SandboxHandle {
-    darkmux_sandbox::SandboxHandle { backend: backend.kind(), id: container_name.to_string() }
+///
+/// (#3112 review, round 3) `sandbox` is the handle the backend returned at
+/// spawn, so the stop goes to the backend the sandbox was started in, never
+/// to whatever `runtime.sandbox` says at kill time: a `config set` while a
+/// Docker dispatch runs must not send its kill to Seatbelt and leave the
+/// container running. Every stop, probe and watchdog kill in this file takes
+/// that handle.
+fn kill_dispatch_sandbox(sandbox: &darkmux_sandbox::SandboxHandle) {
+    let _ = darkmux_sandbox::for_handle(sandbox).kill(sandbox).output();
 }
 
 /// (#2925) A stop that ends ONE dispatch: the budget pacer saw this run's
@@ -5457,7 +5469,8 @@ fn sandbox_named(backend: &dyn darkmux_sandbox::SandboxBackend, container_name: 
 #[derive(Clone)]
 struct DispatchStop {
     reason: Arc<Mutex<Option<String>>>,
-    container_name: String,
+    /// (#3112) The sandbox as spawned: see [`kill_dispatch_sandbox`].
+    sandbox: darkmux_sandbox::SandboxHandle,
     /// The watchdog's "main thread is gone, kill now" flag (its retried,
     /// probe-confirmed kill). Set when this stop's own single `docker kill`
     /// fails, so a stuck container is never left to the inactivity timeout,
@@ -5466,10 +5479,10 @@ struct DispatchStop {
 }
 
 impl DispatchStop {
-    fn new(container_name: String) -> Self {
+    fn new(sandbox: darkmux_sandbox::SandboxHandle) -> Self {
         Self {
             reason: Arc::new(Mutex::new(None)),
-            container_name,
+            sandbox,
             watchdog_handoff: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -5491,9 +5504,10 @@ impl DispatchStop {
     /// Stop this dispatch's container, and only it. A failed `docker kill`
     /// hands the container to the watchdog's retried kill at once.
     fn kill_container(&self) {
-        let killed = dispatch_sandbox().is_some_and(|backend| {
-            backend.kill(&sandbox_named(backend, &self.container_name)).output().is_ok_and(|o| o.status.success())
-        });
+        let killed = darkmux_sandbox::for_handle(&self.sandbox)
+            .kill(&self.sandbox)
+            .output()
+            .is_ok_and(|o| o.status.success());
         if !killed {
             self.watchdog_handoff.store(true, Ordering::SeqCst);
         }
@@ -5647,7 +5661,7 @@ fn join_sampler(
 /// the sampler, then stop and join the tailer. The tailer needs `stop_flag`
 /// on the failed-wait path, where nothing else ends its loop.
 fn teardown_container_threads(
-    container_name: &str,
+    sandbox: &darkmux_sandbox::SandboxHandle,
     watchdog_done: &AtomicBool,
     watchdog_handle: thread::JoinHandle<WatchdogWake>,
     sampler: SamplerThread<'_>,
@@ -5655,7 +5669,7 @@ fn teardown_container_threads(
     tailer_handle: thread::JoinHandle<TrajectorySummary>,
 ) -> TrajectorySummary {
     watchdog_done.store(true, Ordering::SeqCst);
-    docker_kill_by_name(container_name);
+    kill_dispatch_sandbox(sandbox);
     let _ = watchdog_handle.join();
     sampler.stop.store(true, Ordering::SeqCst);
     let _ = join_within(sampler.handle, sampler.bound);
@@ -5828,7 +5842,7 @@ enum Liveness {
     Unknown,
 }
 
-fn probe_container_liveness(container_name: &str) -> Liveness {
+fn probe_container_liveness(sandbox: &darkmux_sandbox::SandboxHandle) -> Liveness {
     // A listing by exact name, running containers only. The backend
     // anchors the name and escapes it (Docker's `name` filter is a Go
     // regexp, and the sanitizer upstream lets `.` through), so only this
@@ -5836,11 +5850,9 @@ fn probe_container_liveness(container_name: &str) -> Liveness {
     // listing: a stopped container would read as alive, and a prefix would
     // match every container whose name merely STARTS with this one's.
     // (#2232, #3552)
-    let Some(backend) = dispatch_sandbox() else {
-        return Liveness::Unknown;
-    };
+    let backend = darkmux_sandbox::for_handle(sandbox);
     let running = darkmux_sandbox::Query {
-        having: darkmux_sandbox::Having::Name(container_name.to_string()),
+        having: darkmux_sandbox::Having::Name(sandbox.id.clone()),
         stopped_too: false,
         read: Vec::new(),
     };
@@ -5887,7 +5899,9 @@ fn probe_container_liveness(container_name: &str) -> Liveness {
 /// production call site passes `CONTAINER_KILL_BASE_BACKOFF`. It is
 /// deliberately not an operator knob — nothing about a transient dockerd
 /// failure is engagement-specific.
-fn kill_container_persistently(container_name: &str, base_backoff: Duration) -> KillOutcome {
+fn kill_container_persistently(sandbox: &darkmux_sandbox::SandboxHandle, base_backoff: Duration) -> KillOutcome {
+    let container_name = sandbox.id.as_str();
+    let backend = darkmux_sandbox::for_handle(sandbox);
     let mut last_error = String::new();
     // Has anything in THIS loop proved the container actually exists?
     let mut observed = false;
@@ -5897,15 +5911,8 @@ fn kill_container_persistently(container_name: &str, base_backoff: Duration) -> 
     let mut probe_inconclusive = false;
     for attempt in 1..=CONTAINER_KILL_MAX_ATTEMPTS {
         let killing = attempt <= CONTAINER_KILL_ESCALATE_AFTER;
-        let Some(backend) = dispatch_sandbox() else {
-            // Fail closed: nothing proves the sandbox gone.
-            last_error = "runtime.sandbox is refused, so no backend can be asked".to_string();
-            probe_inconclusive = true;
-            continue;
-        };
-        let sandbox = sandbox_named(backend, container_name);
         let (verb, mut cmd) =
-            if killing { ("kill", backend.kill(&sandbox)) } else { ("rm -f", backend.remove(&sandbox)) };
+            if killing { ("kill", backend.kill(sandbox)) } else { ("rm -f", backend.remove(sandbox)) };
         match cmd.output() {
             Ok(o) if o.status.success() => {
                 // A successful `docker kill` is itself an observation — it
@@ -5935,7 +5942,7 @@ fn kill_container_persistently(container_name: &str, base_backoff: Duration) -> 
         // The attempt settled nothing — and "already gone", "not created
         // yet" and "daemon trouble" all look identical from the exit code
         // alone. Ask.
-        match probe_container_liveness(container_name) {
+        match probe_container_liveness(sandbox) {
             Liveness::Running => observed = true,
             // Only meaningful once we have seen the container ourselves:
             // then, and only then, does "not running" mean "stopped".
@@ -6070,13 +6077,13 @@ fn inactivity_timeout_stderr(
 /// has to capture the process's stderr to see it. The one production caller
 /// does the `eprintln!`.
 fn watchdog_finalize_kill(
-    container_name: &str,
+    sandbox: &darkmux_sandbox::SandboxHandle,
     base_backoff: Duration,
     kill_disposition: &AtomicU8,
 ) -> Option<String> {
-    let outcome = kill_container_persistently(container_name, base_backoff);
+    let outcome = kill_container_persistently(sandbox, base_backoff);
     kill_disposition.store(outcome.disposition().code(), Ordering::SeqCst);
-    outcome.warning(container_name)
+    outcome.warning(&sandbox.id)
 }
 
 /// Why `run_watchdog` stopped waiting, and therefore what it did next. The
@@ -6127,7 +6134,7 @@ enum WatchdogWake {
 /// deadline wait, kill sooner) and never SUPPRESS the one kill this thread
 /// exists to guarantee.
 fn run_watchdog(
-    container_name: String,
+    sandbox: darkmux_sandbox::SandboxHandle,
     inactivity_deadline: Arc<Mutex<Instant>>,
     watchdog_done: Arc<AtomicBool>,
     watchdog_abandoned: Arc<AtomicBool>,
@@ -6192,7 +6199,7 @@ fn run_watchdog(
         // that decided whether the operator is told the truth. (#2232, round
         // 3)
         if let Some(warning) =
-            watchdog_finalize_kill(&container_name, CONTAINER_KILL_BASE_BACKOFF, &kill_disposition)
+            watchdog_finalize_kill(&sandbox, CONTAINER_KILL_BASE_BACKOFF, &kill_disposition)
         {
             eprintln!("{warning}");
         }
@@ -6289,7 +6296,7 @@ fn wait_for_watchdog_wake(
 #[allow(clippy::too_many_arguments)]
 fn spawn_guarded_watchdog(
     watchdog_abandoned: &Arc<AtomicBool>,
-    container_name: String,
+    sandbox: darkmux_sandbox::SandboxHandle,
     inactivity_deadline: Arc<Mutex<Instant>>,
     watchdog_done: Arc<AtomicBool>,
     timeout_fired: Arc<AtomicBool>,
@@ -6307,7 +6314,7 @@ fn spawn_guarded_watchdog(
     // thread's name instead of logging `<unnamed>`.
     let handle = crate::concurrent_dispatch::spawn_detached_named(move || {
         run_watchdog(
-            container_name,
+            sandbox,
             inactivity_deadline,
             watchdog_done,
             abandoned,
@@ -6343,7 +6350,7 @@ fn spawn_guarded_watchdog(
 /// its own container at scope exit; see the disarm call site's comment for
 /// why that specific point is the hand-off.
 ///
-/// Double-kill is a non-issue: the Drop routes through `docker_kill_by_name`,
+/// Double-kill is a non-issue: the Drop routes through `kill_dispatch_sandbox`,
 /// which is fire-and-forget (`let _ = …output()`), so killing a container the
 /// watchdog already SIGKILLed — or one that exited on its own — is a docker
 /// CLI error nobody reads, exactly as it already is for the watchdog and the
@@ -6354,15 +6361,16 @@ fn spawn_guarded_watchdog(
 /// Panic paths come free with the shape (Drop runs on unwind), same as the
 /// bookend guard's — no extra machinery for it.
 struct ContainerKillGuard {
-    container_name: String,
+    /// (#3112) The sandbox as spawned: see [`kill_dispatch_sandbox`].
+    sandbox: darkmux_sandbox::SandboxHandle,
     armed: bool,
 }
 
 impl ContainerKillGuard {
     /// Armed on construction — call this the moment the spawn succeeds, so
     /// there is no window the container exists unguarded.
-    fn new(container_name: String) -> Self {
-        Self { container_name, armed: true }
+    fn new(sandbox: darkmux_sandbox::SandboxHandle) -> Self {
+        Self { sandbox, armed: true }
     }
 
     /// Hand the container off — call this ONLY once the container is known
@@ -6384,7 +6392,7 @@ impl ContainerKillGuard {
 impl Drop for ContainerKillGuard {
     fn drop(&mut self) {
         if self.armed {
-            docker_kill_by_name(&self.container_name);
+            kill_dispatch_sandbox(&self.sandbox);
         }
     }
 }
@@ -7251,10 +7259,7 @@ fn runtime_program(image: &RuntimeImage) -> Result<(Option<PathBuf>, Vec<String>
 
 /// (#3112 review) The way back from a Seatbelt refusal, for its last line.
 fn seatbelt_way_back() -> String {
-    format!(
-        "`{key}` is `seatbelt`; to run in a Docker container instead, `darkmux config set {key} docker`",
-        key = darkmux_sandbox::SANDBOX_KEY
-    )
+    darkmux_sandbox::way_back_to_docker()
 }
 
 /// (#3112 review) The runtime a Seatbelt dispatch runs ([`host_runtime`]),
@@ -7755,6 +7760,15 @@ fn materialize_dirs(
 ///
 /// Then, in order: this dispatch's own origin stamp, any staged resume
 /// checkpoint, and the prompt file.
+/// (#3112 review) The message as the prompt file carries it: a
+/// `${WORKSPACE_ROOT}` still in it (a step with no workdir, whose workspace
+/// is a fresh tempdir; a CLI `dispatch` message: the placeholder is
+/// darkmux's in any dispatch message) names `workspace` where the
+/// configured sandbox sees it. A message without it is unchanged.
+fn prompt_file_text(message: &str, workspace: &Path) -> String {
+    crate::step_kinds::builtins::expand_workspace_root(message, darkmux_sandbox::selected().ok(), Some(workspace))
+}
+
 fn prepare_host_out(
     opts: &DispatchOpts,
     unix_micros: u128,
@@ -7811,7 +7825,7 @@ fn prepare_host_out(
     // substantial brief never lands on the `docker run` command line — where it
     // would both hit ARG_MAX (the very case `--message-from-file` exists for)
     // and be visible in `ps`. The container reads it back from the bind mount.
-    fs::write(host_out.join(PROMPT_FILE_NAME), &opts.message)
+    fs::write(host_out.join(PROMPT_FILE_NAME), prompt_file_text(&opts.message, workspace))
         .with_context(|| format!("writing dispatch prompt file under {}", host_out.display()))?;
     Ok(host_out)
 }
@@ -7964,7 +7978,7 @@ fn run_container(opts: &DispatchOpts, execution: &ExecutionId, mut run: Containe
         }));
     })?;
     // (#2925) This dispatch's own stop: see `DispatchStop`.
-    let local_stop = DispatchStop::new(launched.container_name.clone());
+    let local_stop = DispatchStop::new(launched.sandbox.clone());
     let (_observer_guards, threads) = spawn_observers(opts, execution, &run, &launched, &local_stop)?;
     panic_after_guard_spawn_if_asked();
 
@@ -8004,7 +8018,7 @@ fn run_container(opts: &DispatchOpts, execution: &ExecutionId, mut run: Containe
             // thread leaked: its own loop only exits on `stop_flag` or a
             // caught signal, neither of which this branch used to touch, so
             // it polled `trajectory.jsonl` forever in the background.
-            let trajectory_summary = threads.teardown(&launched.container_name);
+            let trajectory_summary = threads.teardown(&launched.sandbox);
             let err = anyhow::Error::from(e).context("waiting for darkmux-runtime container");
             close_ended_mid_run(&mut bookend, &err, &trajectory_summary);
             // (#2131 review round 2, NEW-2) No explicit deregister here —
@@ -8033,7 +8047,7 @@ fn run_container(opts: &DispatchOpts, execution: &ExecutionId, mut run: Containe
     // So a success status is the ONLY evidence the container actually
     // finished, and it is the only case that disarms. Every non-success path
     // leaves the guard armed, and its Drop is fire-and-forget
-    // (`docker_kill_by_name` discards both stdout and stderr, emits no flow
+    // (`kill_dispatch_sandbox` discards both stdout and stderr, emits no flow
     // record) — so on the paths that already kill (the `Err` arm above, the
     // interrupt teardown below, the watchdog) it is a silent redundant kill
     // of a container that is dead or dying. There is no path on which the
@@ -8077,7 +8091,7 @@ fn run_container(opts: &DispatchOpts, execution: &ExecutionId, mut run: Containe
     // signal-observed-but-clean-exit run means — its own guard already
     // reads this same global flag independently.
     if run_was_killed(&local_stop, output.status.success()) {
-        let trajectory_summary = threads.teardown(&launched.container_name);
+        let trajectory_summary = threads.teardown(&launched.sandbox);
         stop_session_emitter(session_emitter);
         // (#2131 review round 2, F1) `container_child_registration` is
         // already deregistered by this point — this branch only runs
@@ -8214,6 +8228,9 @@ struct LaunchedContainer {
     container_child_registration: PidRegistration,
     child: ReapedChild,
     container_name: String,
+    /// (#3112 review, round 3) The handle the backend returned at spawn,
+    /// which every stop, probe and watchdog kill of this dispatch uses.
+    sandbox: darkmux_sandbox::SandboxHandle,
     compaction: crate::dispatch::CompactionDispatchArgs,
     utility_model: Option<String>,
     unmanaged_compactor: Option<crate::target::UtilityTarget>,
@@ -8293,7 +8310,8 @@ fn launch_container(
     )?;
     // (#2640) Wrapped at once: every path below that drops it un-waited
     // (an early `?`, a panic) still reaps the docker CLI.
-    let mut child = ReapedChild(Some(spawn_container(&argv_config, opts.max_turns_override)?));
+    let (spawned, sandbox) = spawn_container(&argv_config, opts.max_turns_override)?;
+    let mut child = ReapedChild(Some(spawned));
 
     // (#2131 review round 2, MUST-FIX 2 / NEW-2) Registered the moment
     // the child exists — mirrors the hosted-curl path's own
@@ -8325,7 +8343,7 @@ fn launch_container(
     // NAME and never consults the registry, and deregistering never touches
     // docker, so neither order is observable. Do not build on it. See the
     // guard's own doc.
-    let container_kill_guard = ContainerKillGuard::new(container_name.clone());
+    let container_kill_guard = ContainerKillGuard::new(sandbox.clone());
 
     // (#1187) Pipe the remote auth secret over stdin IMMEDIATELY after spawn —
     // before the trajectory tailer starts, before anything else runs. The
@@ -8346,6 +8364,7 @@ fn launch_container(
         container_child_registration,
         child,
         container_name,
+        sandbox,
         compaction,
         utility_model,
         unmanaged_compactor,
@@ -8629,20 +8648,29 @@ fn container_run_config(
 /// planned it: its environment, process group and stdin are part of the
 /// sandbox (a Seatbelt sandbox clears the host's environment), so it is
 /// never flattened to an argv and rebuilt, which would drop them.
-fn container_command(config: &DockerRunConfig, backend: &dyn darkmux_sandbox::SandboxBackend) -> Command {
-    backend.run(&dispatch_policy_for(config, backend)).0
+///
+/// (#3112 review, round 3) The handle `run` returns is kept, not dropped:
+/// it is how this dispatch is stopped and probed later, in this backend.
+fn container_command(
+    config: &DockerRunConfig,
+    backend: &dyn darkmux_sandbox::SandboxBackend,
+) -> (Command, darkmux_sandbox::SandboxHandle) {
+    backend.run(&dispatch_policy_for(config, backend))
 }
 
 /// Check the run config, build the `docker run` command from it, and spawn
 /// it with its output piped (and its stdin, when a secret rides it).
-fn spawn_container(argv_config: &DockerRunConfig, max_turns_override: Option<u32>) -> Result<std::process::Child> {
+fn spawn_container(
+    argv_config: &DockerRunConfig,
+    max_turns_override: Option<u32>,
+) -> Result<(std::process::Child, darkmux_sandbox::SandboxHandle)> {
     // (#907) Validate the image ref before it reaches docker as a positional
     // arg. The `--` fence in build_docker_run_argv already prevents flag
     // interpretation; this rejects malformed refs (leading `-`, whitespace,
     // control chars) so the contract is explicit, not just fence-dependent.
     preflight_docker_config(argv_config)?;
     let backend = darkmux_sandbox::backend().map_err(|why| anyhow!(why))?;
-    let mut cmd = container_command(argv_config, backend);
+    let (mut cmd, sandbox) = container_command(argv_config, backend);
 
     // TODO (#839): Network hardening — the runtime must reach host LMStudio
     // via `host.docker.internal`. Constraining networking (e.g. `--network none`
@@ -8661,7 +8689,7 @@ fn spawn_container(argv_config: &DockerRunConfig, max_turns_override: Option<u32
         cmd.stdin(Stdio::piped());
     }
 
-    cmd.spawn().context("spawning darkmux-runtime container")
+    cmd.spawn().map(|child| (child, sandbox)).context("spawning darkmux-runtime container")
 }
 
 /// (#threshold) Effective compaction threshold the runtime triggers at:
@@ -8710,9 +8738,9 @@ struct ContainerThreads {
 impl ContainerThreads {
     /// The teardown both early exits share; see
     /// [`teardown_container_threads`].
-    fn teardown(self, container_name: &str) -> TrajectorySummary {
+    fn teardown(self, sandbox: &darkmux_sandbox::SandboxHandle) -> TrajectorySummary {
         teardown_container_threads(
-            container_name,
+            sandbox,
             &self.watchdog_done,
             self.watchdog_handle,
             SamplerThread {
@@ -8728,6 +8756,24 @@ impl ContainerThreads {
 
 /// Start the three threads that watch the container: the live trajectory
 /// tailer, the inactivity watchdog and the telemetry sampler, in that order.
+/// (#3112 review) The context the tailer stamps and maps by: the launcher's,
+/// plus where the sandbox saw the workspace (`seen`) when it is not the
+/// container's `/workspace` and the launcher named no root (a
+/// `dispatch.internal` create-mod step, a CLI dispatch). A kit or finding
+/// is then stored in one form whichever sandbox proposed it. A container's
+/// context is returned exactly as it came.
+fn tailer_record_context(
+    launcher: Option<darkmux_flow::payload::RecordContext>,
+    seen: &str,
+) -> Option<darkmux_flow::payload::RecordContext> {
+    let Some(root) = crate::findings::host_root(Some(seen)) else { return launcher };
+    let mut context = launcher.unwrap_or_default();
+    if context.root.is_none() {
+        context.root = Some(root.to_string());
+    }
+    Some(context)
+}
+
 fn spawn_observers(
     opts: &DispatchOpts,
     execution: &ExecutionId,
@@ -8735,8 +8781,14 @@ fn spawn_observers(
     launched: &LaunchedContainer,
     local_stop: &DispatchStop,
 ) -> Result<(ObserverGuards, ContainerThreads)> {
-    let ContainerRun { brain, model, resolved_profile, host_out, unmanaged_endpoint_raw_label, .. } = run;
-    let LaunchedContainer { container_name, compaction, utility_model, unmanaged_compactor, .. } = launched;
+    let ContainerRun { brain, model, resolved_profile, host_out, unmanaged_endpoint_raw_label, workspace, image, .. } = run;
+    // (#3112 review) Where this run's sandbox sees its workspace.
+    let workspace_seen = match image.host_runtime {
+        // The sandbox this dispatch was spawned in, as its kills use.
+        Some(_) => darkmux_sandbox::seen_at(Some(launched.sandbox.backend), workspace, "/workspace"),
+        None => "/workspace".to_string(),
+    };
+    let LaunchedContainer { sandbox, compaction, utility_model, unmanaged_compactor, .. } = launched;
     let limits_pm = brain.limits_pm();
     let session = &opts.session;
     let phase_id = &opts.phase_id;
@@ -8818,7 +8870,7 @@ fn spawn_observers(
         // (#2794) The utility model that performs compaction, so its records
         // name it rather than the specialist this dispatch is for.
         compaction.compactor_model.clone(),
-        opts.record_context.clone(),
+        tailer_record_context(opts.record_context.clone(), &workspace_seen),
         // (#2902 step 1a) The endpoint fact on every per-turn usage record:
         // the hosted label when the brain is endpoint-staffed, else the
         // resolved LMStudio base (host-side form; see `usage::lmstudio_endpoint`).
@@ -8891,7 +8943,7 @@ fn spawn_observers(
     // red-prove.
     let (_watchdog_abandon_guard, watchdog_handle) = spawn_guarded_watchdog(
         &watchdog_abandoned,
-        container_name.clone(),
+        sandbox.clone(),
         Arc::clone(&inactivity_deadline),
         Arc::clone(&watchdog_done),
         Arc::clone(&timeout_fired),

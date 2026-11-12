@@ -183,7 +183,7 @@ pub fn run(placement: &Placement, run: &Run, timeout: Duration) -> Result<Bounde
     let Some(handle) = container else {
         return Ok(run_bounded(cmd, timeout));
     };
-    reap_orphaned_containers();
+    reap_orphaned_containers_in(darkmux_sandbox::for_handle(&handle));
     let sentinel_dir = sentinel_dir_for(&handle.id, run.tree)
         .ok_or_else(|| NotRun(format!("{} has no parent directory to hold the mount check", run.tree.display())))?;
     if let Err(e) = write_sentinel(&sentinel_dir) {
@@ -232,19 +232,27 @@ pub fn orphaned_containers(listed: &[(String, Option<u32>)], alive: impl Fn(u32)
 /// found). Best effort and bounded: a backend that cannot list them is the
 /// next run's failure to name.
 pub fn reap_orphaned_containers() {
-    let query = Query::labeled(PID_LABEL);
     for backend in darkmux_sandbox::available_backends() {
-        let Bounded::Finished { success: true, stdout, .. } = run_bounded(backend.list(&query), Duration::from_secs(30)) else {
-            continue;
-        };
-        let listed: Vec<(String, Option<u32>)> = backend
-            .parse_list(&query, &String::from_utf8_lossy(&stdout))
-            .into_iter()
-            .map(|l| (l.handle.id, l.labels[0].as_deref().and_then(|v| v.parse().ok())))
-            .collect();
-        for name in orphaned_containers(&listed, crate::host_sampler_lock::pid_alive) {
-            remove_container(&SandboxHandle { backend: backend.kind(), id: name });
-        }
+        reap_orphaned_containers_in(backend);
+    }
+}
+
+/// [`reap_orphaned_containers`] in `backend` alone. A contained run reaps
+/// only its own backend before it starts (#3112 review): under Seatbelt it
+/// makes no `docker` call, so a wedged Docker cannot add its timeout to
+/// every run; a leftover in another backend is the daemon reaper's.
+pub fn reap_orphaned_containers_in(backend: &dyn SandboxBackend) {
+    let query = Query::labeled(PID_LABEL);
+    let Bounded::Finished { success: true, stdout, .. } = run_bounded(backend.list(&query), Duration::from_secs(30)) else {
+        return;
+    };
+    let listed: Vec<(String, Option<u32>)> = backend
+        .parse_list(&query, &String::from_utf8_lossy(&stdout))
+        .into_iter()
+        .map(|l| (l.handle.id, l.labels[0].as_deref().and_then(|v| v.parse().ok())))
+        .collect();
+    for name in orphaned_containers(&listed, crate::host_sampler_lock::pid_alive) {
+        remove_container(&SandboxHandle { backend: backend.kind(), id: name });
     }
 }
 
@@ -543,6 +551,45 @@ mod tests {
         }
         let why = ran.expect_err("a refused sandbox never runs").0;
         assert!(why.contains("podman") && why.contains("runtime.sandbox"), "{why}");
+    }
+
+    /// (#3112 review) A contained run under Seatbelt reaps only Seatbelt
+    /// sandboxes before it starts: it makes no `docker` call at all, even
+    /// with `docker` on PATH (a wedged Docker Desktop would otherwise add
+    /// its timeout to every run). A Docker leftover from before the switch
+    /// is the daemon reaper's.
+    #[test]
+    #[serial_test::serial]
+    fn a_seatbelt_contained_run_makes_no_docker_call() {
+        darkmux_types::run_in_own_process!();
+        if !darkmux_sandbox::SeatbeltBackend::available() {
+            return;
+        }
+        let shim = tempfile::TempDir::new().unwrap();
+        let calls = shim.path().join("calls");
+        let docker = shim.path().join("docker");
+        std::fs::write(&docker, format!("#!/bin/sh\necho \"$@\" >> {}\nexit 1\n", calls.display())).unwrap();
+        std::fs::set_permissions(&docker, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let root = tempfile::TempDir::new().unwrap();
+        let tree = root.path().join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        let state = tempfile::TempDir::new().unwrap();
+        let (prev_path, prev_sb, prev_state) =
+            (std::env::var_os("PATH"), std::env::var_os("DARKMUX_SANDBOX"), std::env::var_os(darkmux_sandbox::seatbelt::STATE_DIR_ENV));
+        unsafe {
+            std::env::set_var("PATH", format!("{}:/usr/bin:/bin", shim.path().display()));
+            std::env::set_var("DARKMUX_SANDBOX", "seatbelt");
+            std::env::set_var(darkmux_sandbox::seatbelt::STATE_DIR_ENV, state.path());
+        }
+        let r = Run { command: "true", tree: &tree, workdir: "", mounts: &[], user: None, name_prefix: "darkmux-test" };
+        let ran = run(&Placement::Container("host".into()), &r, Duration::from_secs(30));
+        unsafe {
+            match prev_path { Some(v) => std::env::set_var("PATH", v), None => std::env::remove_var("PATH") }
+            match prev_sb { Some(v) => std::env::set_var("DARKMUX_SANDBOX", v), None => std::env::remove_var("DARKMUX_SANDBOX") }
+            match prev_state { Some(v) => std::env::set_var(darkmux_sandbox::seatbelt::STATE_DIR_ENV, v), None => std::env::remove_var(darkmux_sandbox::seatbelt::STATE_DIR_ENV) }
+        }
+        assert!(matches!(ran, Ok(Bounded::Finished { success: true, .. })), "{ran:?}");
+        assert!(!calls.exists(), "docker was called: {}", std::fs::read_to_string(&calls).unwrap_or_default());
     }
 
     /// On the host the command runs in the tree's working directory.

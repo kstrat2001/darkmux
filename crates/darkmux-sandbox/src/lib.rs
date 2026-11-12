@@ -248,6 +248,26 @@ pub fn placed_in_configured() -> String {
     }
 }
 
+/// (#3112 review) The way back from a sandbox on the host to Docker, naming
+/// what decided the sandbox: the env var when it did (a `config set` under
+/// it changes nothing), else `config set`.
+pub fn way_back_to_docker() -> String {
+    let source = darkmux_types::config_access::sandbox_with_source().map_or(darkmux_types::config_access::Source::BuiltIn, |(_, s)| s);
+    way_back_to_docker_given(source)
+}
+
+/// [`way_back_to_docker`] for the tier `source` that chose the sandbox.
+pub fn way_back_to_docker_given(source: darkmux_types::config_access::Source) -> String {
+    let (seatbelt, docker) = (setting_value(BackendKind::Seatbelt), setting_value(BackendKind::Docker));
+    match source {
+        darkmux_types::config_access::Source::Env => format!(
+            "{SANDBOX_ENV} is `{seatbelt}`; to run in a Docker container instead, `export {SANDBOX_ENV}={docker}`, \
+             or unset {SANDBOX_ENV} and `darkmux config set {SANDBOX_KEY} {docker}`"
+        ),
+        _ => format!("`{SANDBOX_KEY}` is `{seatbelt}`; to run in a Docker container instead, `darkmux config set {SANDBOX_KEY} {docker}`"),
+    }
+}
+
 /// (#3112) For a message saying Docker could not run something: why Docker
 /// was needed (the setting that chose it) and, where Seatbelt can run, how
 /// to need no Docker. `None` unless the configured sandbox is Docker (a
@@ -454,6 +474,20 @@ mod tests {
         let needs = docker_needs_given(BackendKind::Docker, Source::Config, true).unwrap();
         assert!(needs.starts_with("Docker must be installed and running;") && !needs.contains("is `docker`"), "{needs}");
         assert_eq!(docker_needs_given(BackendKind::Seatbelt, Source::Config, true), None);
+    }
+
+    /// (#3112 review) The way back to Docker names what decided the
+    /// sandbox: a `config set` when `config.json` (or the default) did; the
+    /// env var when it did, since a `config set` under it changes nothing.
+    #[test]
+    fn the_way_back_to_docker_names_what_decided() {
+        use darkmux_types::config_access::Source;
+        let config = way_back_to_docker_given(Source::Config);
+        assert!(config.starts_with("`runtime.sandbox` is `seatbelt`") && config.contains("darkmux config set runtime.sandbox docker"), "{config}");
+        assert_eq!(way_back_to_docker_given(Source::BuiltIn), config);
+        let env = way_back_to_docker_given(Source::Env);
+        assert!(env.starts_with("DARKMUX_SANDBOX is `seatbelt`") && env.contains("DARKMUX_SANDBOX=docker"), "{env}");
+        assert!(env.contains("unset DARKMUX_SANDBOX"), "{env}");
     }
 
     /// (#3112 review) Starting a sandbox goes through `backend()`, which

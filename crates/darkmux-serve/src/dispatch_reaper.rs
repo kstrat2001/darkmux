@@ -67,6 +67,11 @@ fn idle_line(kinds: &[darkmux_sandbox::BackendKind]) -> String {
 /// One production tick: this host's own machine and pid namespace, and this
 /// machine's real liveness answers. The thread runs exactly this.
 pub(crate) fn this_host_tick_lines(docker_warned: &mut bool) -> Vec<String> {
+    // (#3112 review) Contained runs (a lab run's tests, the mods gate) whose
+    // owner is gone, in every backend this host runs: a contained run reaps
+    // only its own backend, so a leftover from before `runtime.sandbox`
+    // changed is this tick's.
+    darkmux_crew::contained_command::reap_orphaned_containers();
     tick_lines(
         LocalHost::this_host().as_ref(),
         host_liveness,
@@ -257,6 +262,16 @@ mod tests {
         assert_eq!(first.len(), 1, "{first:?}");
         assert!(second.is_empty(), "{second:?}");
         assert!(first[0].contains("no sandbox backend"), "{first:?}");
+    }
+
+    /// (#3112 review) The daemon's tick reaps orphaned contained runs in
+    /// every backend, the leftovers a contained run no longer lists.
+    #[test]
+    fn the_daemon_tick_reaps_contained_runs_in_every_backend() {
+        let src = include_str!("dispatch_reaper.rs");
+        let tick = &src[src.find("pub(crate) fn this_host_tick_lines").unwrap()..];
+        let tick = &tick[..tick.find("\n}\n").unwrap()];
+        assert!(tick.contains("darkmux_crew::contained_command::reap_orphaned_containers();"), "{tick}");
     }
 
     /// (#3112) The idle line names every backend the tick asked, or says

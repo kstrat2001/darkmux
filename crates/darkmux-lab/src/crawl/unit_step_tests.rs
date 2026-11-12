@@ -3283,6 +3283,50 @@ fn the_unit_dispatch_message_is_frozen_with_and_without_intent() {
     assert_ne!(plain, with_intent, "the intent block must actually render");
 }
 
+/// (#3112 review) The production wiring, through `selected()`: under
+/// `DARKMUX_SANDBOX=seatbelt` (on a Mac) a unit's dispatch is briefed with
+/// the tree's own path and stamps it as `context.root`; under Docker (a test
+/// build's default) it says `/workspace` and stamps nothing.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME and DARKMUX_SANDBOX, process-globals
+fn a_units_dispatch_is_briefed_with_the_tree_where_the_selected_sandbox_sees_it() {
+    let dispatched = |sandbox: Option<&str>| {
+        let home = TempDir::new().unwrap();
+        let _g = HomeGuard::set(home.path());
+        save_phase(PHASE, MISSION);
+        let ws = TempDir::new().unwrap();
+        let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"a".repeat(40));
+        let out = seeded_out_dir(ws.path(), 0);
+        let seen: Arc<std::sync::Mutex<Option<DispatchOpts>>> = Arc::new(std::sync::Mutex::new(None));
+        let captured = seen.clone();
+        let kind = DispatchUnitStepKind::with_dispatch(Arc::new(move |opts: DispatchOpts| {
+            *captured.lock().unwrap() = Some(opts);
+            ok_result(envelope("stop", 100, 20, 5_000), out.clone())
+        }));
+        let step = unit_step(serde_json::json!({"plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "unnamed-predicate"}));
+        let prev = std::env::var_os("DARKMUX_SANDBOX");
+        if let Some(v) = sandbox {
+            unsafe { std::env::set_var("DARKMUX_SANDBOX", v) };
+        }
+        let ran = kind.run(&step, &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap()));
+        unsafe {
+            match prev { Some(v) => std::env::set_var("DARKMUX_SANDBOX", v), None => std::env::remove_var("DARKMUX_SANDBOX") }
+        }
+        ran.unwrap();
+        let opts = seen.lock().unwrap().take().unwrap();
+        (opts, ws.path().join("tree").canonicalize().unwrap().display().to_string(), ws)
+    };
+    let (docker, _, _ws) = dispatched(None);
+    assert!(docker.message.contains("- /workspace/app/src/a.ts"), "{}", docker.message);
+    assert_eq!(docker.record_context.as_ref().unwrap().root, None);
+    if !darkmux_sandbox::SeatbeltBackend::available() {
+        return;
+    }
+    let (seatbelt, tree, _ws) = dispatched(Some("seatbelt"));
+    assert!(seatbelt.message.contains(&format!("- {tree}/app/src/a.ts")) && !seatbelt.message.contains("/workspace"), "{}", seatbelt.message);
+    assert_eq!(seatbelt.record_context.as_ref().unwrap().root.as_deref(), Some(tree.as_str()));
+}
+
 /// (#3112 review) Under a sandbox on the host the unit's brief names the
 /// tree where that sandbox sees it, in every path it lists and in the
 /// finding instructions; under Docker it is the frozen `/workspace` message,

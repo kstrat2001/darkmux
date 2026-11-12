@@ -52,13 +52,19 @@ pub struct HealthResponse {
     /// dispatch it runs or accepts needs; never the path. A brew service once
     /// ran with launchd's bare PATH and failed every dispatch while the
     /// operator's shell found docker (#3418). This machine only. (#3112)
-    /// Also `null` when this daemon's sandbox is not Docker (`sandbox`):
-    /// it then needs no docker.
+    /// Also `null` when neither this daemon's own sandbox (`sandbox`) nor
+    /// the configured one (`sandbox_configured`) is Docker: it then needs no
+    /// docker.
     pub docker_on_path: Option<bool>,
-    /// (#3112) The sandbox this daemon runs isolated work in, its
-    /// `runtime.sandbox` value (`docker` or `seatbelt`); `null` when the
-    /// setting is refused. This machine only.
+    /// (#3112) The sandbox this daemon's own work runs in, its
+    /// `runtime.sandbox` value when it started (`docker` or `seatbelt`);
+    /// `null` when the setting is refused. This machine only.
     pub sandbox: Option<String>,
+    /// (#3112 review) The sandbox a process started now runs in, every
+    /// process this daemon starts included: `runtime.sandbox` as
+    /// `config.json` says now. Differs from `sandbox` after a `config set`
+    /// until the daemon restarts. This machine only.
+    pub sandbox_configured: Option<String>,
     /// Whether this daemon can publish to the fleet hub's flow stream, and
     /// since when it could not; `null` when no hub is configured. This machine
     /// only.

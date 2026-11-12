@@ -1332,6 +1332,18 @@ pub(crate) fn run_isolation(
     }
 }
 
+/// (#3112 review) The isolation of a run whose work is only dispatches (no
+/// tests of its own, as tool-bench's trials): the sandbox they ran in.
+pub(crate) fn dispatch_isolation(
+    sandbox: std::result::Result<darkmux_sandbox::BackendKind, String>,
+) -> crate::lab::manifest::RunIsolation {
+    crate::lab::manifest::RunIsolation {
+        sandbox: sandbox.ok().map(|k| darkmux_sandbox::setting_value(k).to_string()),
+        tests: None,
+        image_not_used: None,
+    }
+}
+
 /// What `finish_run` needs besides the dispatch itself.
 pub(crate) struct FinishInputs<'a> {
     pub loaded: &'a LoadedWorkload,
@@ -1715,6 +1727,19 @@ mod tests {
             let found = notes.iter().find(|n| n.starts_with("outcome=")).map(String::as_str);
             assert_eq!(found, want, "{notes:?}");
         }
+    }
+
+    /// (#3112 review) A run whose work is only dispatches (tool-bench: no
+    /// tests of its own) records the sandbox they ran in and nothing about
+    /// tests; tool-bench's manifest carries it.
+    #[test]
+    fn a_dispatch_only_run_records_its_sandbox() {
+        use darkmux_sandbox::BackendKind;
+        let seatbelt = dispatch_isolation(Ok(BackendKind::Seatbelt));
+        assert_eq!((seatbelt.sandbox.as_deref(), seatbelt.tests, seatbelt.image_not_used), (Some("seatbelt"), None, None));
+        assert_eq!(dispatch_isolation(Err("bad".into())).sandbox, None);
+        let src = include_str!("tool_bench.rs");
+        assert!(src.contains("isolation: Some(crate::providers::coding_task::dispatch_isolation(darkmux_sandbox::selected()))"));
     }
 
     /// (#3112 review) Where a run's tests ran is a measured variable: the
@@ -2877,6 +2902,32 @@ mod tests {
             format!("Fix {real}/bug.py so the tests in {real} pass.")
         );
         assert_eq!(graded_prompt(&loaded).unwrap(), "Fix /workspace/bug.py so the tests in /workspace pass.");
+    }
+
+    /// (#3112 review) The production wiring, through `selected()`: under
+    /// `DARKMUX_SANDBOX=seatbelt` (on a Mac) the dispatched prompt names the
+    /// sandbox dir's own path; under Docker (a test build's default)
+    /// `/workspace`.
+    #[test]
+    #[serial_test::serial]
+    fn the_dispatched_prompt_follows_the_selected_sandbox() {
+        let tmp = TempDir::new().unwrap();
+        let sandbox = tmp.path().join("sb");
+        fs::create_dir_all(&sandbox).unwrap();
+        let mut spec = basic_spec();
+        spec.prompt = Some("Fix ${SANDBOX}/bug.py".into());
+        let loaded = make_loaded(spec, tmp.path().to_path_buf());
+        assert_eq!(dispatched_prompt(&loaded, &sandbox).unwrap(), "Fix /workspace/bug.py");
+        if !darkmux_sandbox::SeatbeltBackend::available() {
+            return;
+        }
+        let prev = std::env::var_os("DARKMUX_SANDBOX");
+        unsafe { std::env::set_var("DARKMUX_SANDBOX", "seatbelt") };
+        let seatbelt = dispatched_prompt(&loaded, &sandbox).unwrap();
+        unsafe {
+            match prev { Some(v) => std::env::set_var("DARKMUX_SANDBOX", v), None => std::env::remove_var("DARKMUX_SANDBOX") }
+        }
+        assert_eq!(seatbelt, format!("Fix {}/bug.py", sandbox.canonicalize().unwrap().display()));
     }
 
     /// What a run resolves before it dispatches: the prompt, and no plan for

@@ -775,6 +775,11 @@ mod tests {
         let unnamed = rec(serde_json::json!({"source": "app"}), "/Users/op/tree/app/src/auth.ts");
         assert_eq!(unnamed.emitted["file"], "/Users/op/tree/app/src/auth.ts");
         assert_eq!(strip_source_prefix_under(Some("/Users/op/tree/"), "app", "/Users/op/tree/app/x"), "x", "a trailing slash on the root");
+        // (#3112 review) The root ends at a `/`: a sibling whose name only
+        // starts with it is another tree.
+        assert_eq!(strip_source_prefix_under(Some("/tmp/ws"), "app", "/tmp/ws2/app/x"), "/tmp/ws2/app/x");
+        assert_eq!(in_container_coords(Some("/tmp/ws"), "/tmp/ws2/app/x"), "/tmp/ws2/app/x");
+        assert_eq!(in_container_coords(Some("/tmp/ws"), "/tmp/ws/app/x"), "/workspace/app/x");
     }
 
     /// The mapping is driven by the source id and NOTHING else: a context

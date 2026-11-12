@@ -26,15 +26,22 @@ darkmux release.
   effect, where the value came from, and whether it can run here) and asks Docker's rows
   (`docker runtime`, `daemon docker`, `runtime image freshness`, `runtime binary cache`,
   `container user`) only under Docker; under Seatbelt each says Docker is not needed. `/health`
-  gains `sandbox`, and answers `docker_on_path` only under Docker. `init`'s next steps, the guide
+  gains `sandbox` (the daemon's own) and `sandbox_configured` (the setting now; a running daemon
+  keeps its own until it restarts, the processes it starts read the setting fresh), and answers
+  `docker_on_path` only when either is Docker; doctor's `daemon sandbox` row warns when the two
+  differ. `init`'s next steps, the guide
   and the README ask for Docker only under Docker. Client previews (`darkmux client serve`) still
   need Docker: under Seatbelt a preview start is refused (403 `forbidden`), naming
   `darkmux config set runtime.sandbox docker`.
 
   Under a sandbox on the host every model-facing path names where that sandbox sees it: the lab
   prompt, crawl unit briefs, split-gitdir notes, mod attachments, and the shipped `review` and
-  `crawl` mod-writer messages, which now say `${WORKSPACE_ROOT}` (a step message placeholder,
-  expanded to `/workspace` in a container; a config without it is unchanged). Findings and mod
+  `crawl` mod-writer messages, which now say `${WORKSPACE_ROOT}` (a placeholder in any dispatch message, a
+  `darkmux dispatch` one included, expanded to the run's actual workspace: `/workspace` in a
+  container). The runtime renames `/workspace` to the host-seen root in the system prompt and
+  the user's message alike, at a path boundary only. A user mission config whose step message
+  names `/workspace` literally is renamed with it; `darkmux doctor` warns about it and suggests
+  `${WORKSPACE_ROOT}`. Findings and mod
   kits that name the host-seen root are stored exactly as `/workspace` ones are: flow schema
   2.8.0 adds `payload.context.root`, mod records 2.2 add `source_root`, both additive and absent
   on Docker runs.

@@ -190,6 +190,7 @@ fn run_with(configured: (Result<darkmux_sandbox::BackendKind, String>, darkmux_t
         // (#3423) Does the RUNNING daemon find `docker` on its own PATH?
         // (#3112 review) Gated by the daemon's own sandbox, inside.
         check_daemon_docker(&sandbox),
+        check_daemon_sandbox(),
         check_binary_vs_source(),
         checks_sandbox::docker_only(&sandbox, RUNTIME_IMAGE_CHECK_NAME, check_runtime_image_freshness),
         checks_sandbox::docker_only(&sandbox, RUNTIME_BINARY_CACHE_CHECK_NAME, check_runtime_binary_cache),
@@ -232,6 +233,8 @@ fn run_with(configured: (Result<darkmux_sandbox::BackendKind, String>, darkmux_t
         // (#3112) Read only by a Docker sandbox: Seatbelt runs as you.
         checks_sandbox::docker_only(&sandbox, checks_container::NAME, checks_container::check_container_user),
         checks_container::check_lab_tests_placement(&sandbox),
+        // (#3112 review) User mission configs naming the container's `/workspace`.
+        checks_sandbox::check_mission_config_workspace_paths(),
         check_unmanaged_endpoint_credentials(),
         check_endpoints(),
         check_default_engine(),
@@ -5568,6 +5571,34 @@ fn check_daemon_freshness() -> Check {
 
 const DAEMON_DOCKER_CHECK_NAME: &str = "daemon docker";
 
+/// (#3112 review) The running daemon's own sandbox against the configured
+/// one: they differ after a `config set` until the daemon restarts (it pins
+/// nothing, so the processes it starts already use the new one).
+fn check_daemon_sandbox() -> Check {
+    let addr = darkmux_types::config_access::serve_client_addr();
+    let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or("127.0.0.1").to_string();
+    let health = loopback_http_body(&host, darkmux_types::config_access::serve_client_port(), "/health");
+    daemon_sandbox_row(&health.as_deref().map(daemon_reported_sandbox).unwrap_or_default())
+}
+
+/// [`check_daemon_sandbox`]'s row for what the daemon reported.
+fn daemon_sandbox_row(reported: &DaemonSandbox) -> Check {
+    let name = "daemon sandbox";
+    match (&reported.own, &reported.configured) {
+        (Some(own), Some(configured)) if own != configured => Check {
+            name: name.into(),
+            status: Status::Warn,
+            message: format!(
+                "the running darkmux serve daemon's own work runs in `{own}` (its start-time setting) until it restarts; \
+                 `runtime.sandbox` is now `{configured}`, which every process it starts already uses"
+            ),
+            hint: Some("restart the daemon to bring its own work in line: `brew services restart darkmux`, or restart `darkmux serve`".into()),
+        },
+        (Some(own), _) => Check { name: name.into(), status: Status::Pass, message: format!("the running darkmux serve daemon runs `{own}`"), hint: None },
+        _ => not_applicable(name, "no running darkmux serve daemon reports its sandbox"),
+    }
+}
+
 /// (#3423) Whether the RUNNING daemon finds `docker` on its own PATH
 /// (`/health`'s `docker_on_path`). Doctor's own shell is not the daemon's: a
 /// brew service once ran with launchd's bare PATH and failed every dispatch
@@ -5579,8 +5610,8 @@ fn check_daemon_docker(cli: &Result<darkmux_sandbox::BackendKind, String>) -> Ch
     let addr = darkmux_types::config_access::serve_client_addr();
     let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or("127.0.0.1").to_string();
     let health = loopback_http_body(&host, darkmux_types::config_access::serve_client_port(), "/health");
-    let reported = health.as_deref().and_then(daemon_reported_sandbox);
-    if let Some(reason) = daemon_docker_gate(reported.as_deref(), cli) {
+    let reported = health.as_deref().map(daemon_reported_sandbox).unwrap_or_default();
+    if let Some(reason) = daemon_docker_gate(&reported, cli) {
         return not_applicable(DAEMON_DOCKER_CHECK_NAME, &reason);
     }
     let (daemon, listener_on) = health.as_deref().map(parse_daemon_docker).unwrap_or((None, false));
@@ -5588,28 +5619,39 @@ fn check_daemon_docker(cli: &Result<darkmux_sandbox::BackendKind, String>) -> Ch
     classify_daemon_docker(daemon, darkmux_sandbox::DockerBackend::on_path(), listener_on, in_panel)
 }
 
-/// (#3112) `/health`'s `sandbox`: the one the running daemon (and every
-/// process it starts) uses. `None` from a daemon older than it, or none.
-fn daemon_reported_sandbox(health_body: &str) -> Option<String> {
-    let v = serde_json::from_str::<serde_json::Value>(health_body).ok()?;
-    v.get("sandbox")?.as_str().map(str::to_string)
+/// (#3112) What the running daemon reports about sandboxes (`/health`):
+/// `own`, what its own work runs in (its start-time setting), and
+/// `configured`, what a process started now runs in (its children
+/// included). Each `None` from a daemon older than it, or none.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct DaemonSandbox {
+    own: Option<String>,
+    configured: Option<String>,
+}
+
+fn daemon_reported_sandbox(health_body: &str) -> DaemonSandbox {
+    let v = serde_json::from_str::<serde_json::Value>(health_body).unwrap_or_default();
+    let field = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+    DaemonSandbox { own: field("sandbox"), configured: field("sandbox_configured") }
 }
 
 /// (#3112) `/health`'s `sandbox` when it names one other than Docker.
 #[cfg(test)]
 fn daemon_sandbox_other_than_docker(health_body: &str) -> Option<String> {
-    daemon_reported_sandbox(health_body).filter(|s| s != darkmux_types::config::SandboxKind::Docker.as_str())
+    daemon_reported_sandbox(health_body).own.filter(|s| s != darkmux_types::config::SandboxKind::Docker.as_str())
 }
 
 /// (#3112 review) Why the `daemon docker` row does not apply, or `None`
-/// when it does. The daemon's own reported sandbox decides (its children
-/// run in it); this shell's (`cli`) only when the daemon reports none.
-fn daemon_docker_gate(daemon_sandbox: Option<&str>, cli: &Result<darkmux_sandbox::BackendKind, String>) -> Option<String> {
+/// when it does. The daemon's reports decide: it needs docker when its own
+/// work or a process it starts runs in Docker; this shell's (`cli`) only
+/// when the daemon reports nothing.
+fn daemon_docker_gate(daemon: &DaemonSandbox, cli: &Result<darkmux_sandbox::BackendKind, String>) -> Option<String> {
     let docker = darkmux_types::config::SandboxKind::Docker.as_str();
-    match daemon_sandbox {
-        Some(s) if s == docker => None,
-        Some(other) => Some(format!("the running darkmux serve daemon's sandbox is `{other}`, so it needs no docker")),
-        None => match cli {
+    let reported: Vec<&str> = [daemon.own.as_deref(), daemon.configured.as_deref()].into_iter().flatten().collect();
+    match reported.as_slice() {
+        r if r.contains(&docker) => None,
+        [other, ..] => Some(format!("the running darkmux serve daemon's sandbox is `{other}`, so it needs no docker")),
+        [] => match cli {
             Ok(darkmux_sandbox::BackendKind::Docker) => None,
             Ok(kind) => Some(format!("Docker is not needed: `runtime.sandbox` is `{}`", darkmux_sandbox::setting_value(*kind))),
             Err(_) => Some("no sandbox can run here, so Docker is not asked (see `sandbox`)".to_string()),
@@ -9715,13 +9757,32 @@ mod tests {
 
     #[test]
     fn the_daemon_docker_row_follows_the_daemons_own_sandbox() {
-        // (#3112 review) The daemon's reported sandbox decides; this shell's
+        // (#3112 review) The daemon's reported sandboxes decide (its own
+        // work's and the one a process it starts now runs in); this shell's
         // only when the daemon reports none.
         use darkmux_sandbox::BackendKind;
-        assert!(daemon_docker_gate(Some("seatbelt"), &Ok(BackendKind::Docker)).unwrap().contains("daemon's sandbox is `seatbelt`"));
-        assert_eq!(daemon_docker_gate(Some("docker"), &Ok(BackendKind::Seatbelt)), None, "the daemon needs docker");
-        assert!(daemon_docker_gate(None, &Ok(BackendKind::Seatbelt)).unwrap().contains("Docker is not needed"));
-        assert_eq!(daemon_docker_gate(None, &Ok(BackendKind::Docker)), None);
+        let gate = |own: Option<&str>, configured: Option<&str>, cli| daemon_docker_gate(&DaemonSandbox { own: own.map(String::from), configured: configured.map(String::from) }, &cli);
+        assert!(gate(Some("seatbelt"), Some("seatbelt"), Ok(BackendKind::Docker)).unwrap().contains("daemon's sandbox is `seatbelt`"));
+        assert_eq!(gate(Some("docker"), Some("docker"), Ok(BackendKind::Seatbelt)), None, "the daemon needs docker");
+        assert_eq!(gate(Some("seatbelt"), Some("docker"), Ok(BackendKind::Seatbelt)), None, "a process it starts now needs docker");
+        assert!(gate(None, None, Ok(BackendKind::Seatbelt)).unwrap().contains("Docker is not needed"));
+        assert_eq!(gate(None, None, Ok(BackendKind::Docker)), None);
+    }
+
+    /// (#3112 review) A daemon whose own sandbox (its start-time setting)
+    /// differs from the configured one is named, with the restart that
+    /// brings it in line; equal, or unreported, passes.
+    #[test]
+    fn a_daemon_running_a_different_sandbox_than_configured_is_named() {
+        let row = |own: Option<&str>, configured: Option<&str>| {
+            daemon_sandbox_row(&DaemonSandbox { own: own.map(String::from), configured: configured.map(String::from) })
+        };
+        let differs = row(Some("docker"), Some("seatbelt"));
+        assert_eq!(differs.status, Status::Warn);
+        assert!(differs.message.contains("`docker`") && differs.message.contains("`seatbelt`"), "{}", differs.message);
+        assert!(differs.hint.as_deref().unwrap_or("").contains("restart"), "{:?}", differs.hint);
+        assert_eq!(row(Some("seatbelt"), Some("seatbelt")).status, Status::Pass);
+        assert_eq!(row(None, None).status, Status::Pass);
     }
 
     /// (#3112 review) The whole doctor under Seatbelt: the `sandbox` row
@@ -9735,11 +9796,13 @@ mod tests {
         let sandbox = row("sandbox");
         assert_eq!(sandbox.status, Status::Pass);
         assert!(sandbox.message.contains("`seatbelt`"), "{}", sandbox.message);
-        // (#3112 review) It names the runtime a dispatch would run, from the
-        // dispatch's own choice and identity check (here, this test binary).
+        // (#3112 review) It names the runtime a darkmux started now would
+        // run, by the dispatch's own choice and identity check over this
+        // process's executable (here, this test binary). A long-running
+        // process whose binary was replaced is not seen, and the row says so.
         let this = std::env::current_exe().unwrap().canonicalize().unwrap();
         assert!(
-            sandbox.message.contains(&format!("runs every isolated run here, with `{} runtime`", this.display())),
+            sandbox.message.contains(&format!("a darkmux started now runs its runtime as `{} runtime`", this.display())),
             "{}",
             sandbox.message
         );
@@ -12882,11 +12945,14 @@ mod tests {
         // (#3544) 78: two more `clients.*` rows, `clients.pairing.verified_teams`
         // and `clients.pairing.dialog`.
         //
+        // (#3112 review) 81: `checks_sandbox::check_mission_config_workspace_paths`
+        // and `check_daemon_sandbox`.
+        //
         // (#3112) 79: `checks_sandbox::sandbox_row` joined before the
         // `docker runtime` row (the `runtime.sandbox` enum row is counted by
         // `ENUM_SETTINGS.len()`).
         let expected =
-            79 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            81 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

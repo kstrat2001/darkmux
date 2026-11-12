@@ -45,23 +45,24 @@ pub const WORKSPACE_ROOT_PLACEHOLDER: &str = "${WORKSPACE_ROOT}";
 
 /// (#3112 review) `message` with [`WORKSPACE_ROOT_PLACEHOLDER`] replaced by
 /// where a `kind` sandbox sees `workdir`: `/workspace` in a container, the
-/// workdir's own path in a sandbox on the host. With no workdir (a fresh
-/// tempdir the dispatch makes later) it is the container's `/workspace`. A
-/// message without the placeholder, every user-copied config written before
-/// it, is returned unchanged.
+/// workdir's own path in a sandbox on the host. With no workdir yet (a
+/// fresh tempdir the dispatch makes later) the placeholder is left for the
+/// dispatch, which expands it against that tempdir when it writes the
+/// prompt file (`dispatch_internal::prompt_file_text`). A message without
+/// the placeholder, every user-copied config written before it, is returned
+/// unchanged. The placeholder is darkmux's in every dispatch message, a
+/// CLI `darkmux dispatch` one included.
 pub(crate) fn expand_workspace_root(
     message: &str,
     kind: Option<darkmux_sandbox::BackendKind>,
     workdir: Option<&std::path::Path>,
 ) -> String {
-    if !message.contains(WORKSPACE_ROOT_PLACEHOLDER) {
-        return message.to_string();
+    match workdir {
+        Some(w) if message.contains(WORKSPACE_ROOT_PLACEHOLDER) => {
+            message.replace(WORKSPACE_ROOT_PLACEHOLDER, &darkmux_sandbox::seen_at(kind, w, "/workspace"))
+        }
+        _ => message.to_string(),
     }
-    let seen = match workdir {
-        Some(w) => darkmux_sandbox::seen_at(kind, w, "/workspace"),
-        None => "/workspace".to_string(),
-    };
-    message.replace(WORKSPACE_ROOT_PLACEHOLDER, &seen)
 }
 
 fn compose_message(base: &str, input: &BTreeMap<String, String>) -> String {
@@ -4269,6 +4270,31 @@ mod tests {
         );
         let plain = "a user's own message names /workspace";
         assert_eq!(expand_workspace_root(plain, Some(BackendKind::Seatbelt), Some(dir.path())), plain);
+    }
+
+    /// (#3112 review) The production wiring: `dispatch.internal` expands the
+    /// placeholder through `selected()`, never leaving it for the model.
+    /// Under Docker (a test build's default) it is `/workspace`; under
+    /// `DARKMUX_SANDBOX=seatbelt` (on a Mac) the workdir's own path.
+    #[test]
+    #[serial_test::serial]
+    fn dispatch_internal_expands_the_workspace_placeholder_through_the_selection() {
+        let dir = TempDir::new().unwrap();
+        let cfg = json!({"role_id": "coder", "workdir": dir.path().display().to_string(),
+            "message": "read `${WORKSPACE_ROOT}/<source>/x`"});
+        let opts_now = || dispatch_opts_for(&step("s1", "dispatch.internal", cfg.clone()), &empty_task(), &BTreeMap::new(), &StepRunCtx::for_test()).unwrap();
+        assert_eq!(opts_now().message, "read `/workspace/<source>/x`");
+        if !darkmux_sandbox::SeatbeltBackend::available() {
+            return;
+        }
+        let prev = std::env::var_os("DARKMUX_SANDBOX");
+        unsafe { std::env::set_var("DARKMUX_SANDBOX", "seatbelt") };
+        let seatbelt = opts_now().message;
+        unsafe {
+            match prev { Some(v) => std::env::set_var("DARKMUX_SANDBOX", v), None => std::env::remove_var("DARKMUX_SANDBOX") }
+        }
+        let real = dir.path().canonicalize().unwrap().display().to_string();
+        assert_eq!(seatbelt, format!("read `{real}/<source>/x`"));
     }
 
     /// (#3112 review) The shipped mod-writer messages name the repository

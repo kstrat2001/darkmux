@@ -680,7 +680,7 @@
         write_status(crate::lifecycle::mission_path("m-ph"), "active");
         write_status(crate::lifecycle::phase_path("m-ph", "p1"), "abandoned");
         write_status(crate::lifecycle::phase_path("m-ph", "p2"), "running");
-        let (stop_1, stop_2) = (DispatchStop::new("c1".into()), DispatchStop::new("c2".into()));
+        let (stop_1, stop_2) = (DispatchStop::new(docker_sandbox("c1")), DispatchStop::new(docker_sandbox("c2")));
         let (flag_1, t1) = spawn_paced_sampler("m-ph", "p1", stop_1.clone());
         let (flag_2, t2) = spawn_paced_sampler("m-ph", "p2", stop_2.clone());
         let ended = wait_requested(&[&stop_1]);
@@ -709,7 +709,7 @@
         write_status(crate::lifecycle::mission_path("m-ab"), "aborted");
         write_status(crate::lifecycle::phase_path("m-ab", "p1"), "running");
         write_status(crate::lifecycle::phase_path("m-ab", "p2"), "running");
-        let (stop_1, stop_2) = (DispatchStop::new("c1".into()), DispatchStop::new("c2".into()));
+        let (stop_1, stop_2) = (DispatchStop::new(docker_sandbox("c1")), DispatchStop::new(docker_sandbox("c2")));
         let (flag_1, t1) = spawn_paced_sampler("m-ab", "p1", stop_1.clone());
         let (flag_2, t2) = spawn_paced_sampler("m-ab", "p2", stop_2.clone());
         let ended = wait_requested(&[&stop_1, &stop_2]);
@@ -736,7 +736,7 @@
         let shim_dir = TempDir::new().unwrap();
         let (record_path, prev_path) = install_fake_docker(&shim_dir);
         let out = TempDir::new().unwrap();
-        let local_stop = DispatchStop::new("darkmux-test-local-stop".into());
+        let local_stop = DispatchStop::new(docker_sandbox("darkmux-test-local-stop"));
         local_stop.request("phase `p` of mission `m` is abandoned".into());
         let handoff = local_stop.watchdog_handoff();
         let handle = thread::spawn(move || {
@@ -810,10 +810,10 @@
     fn a_failed_local_stop_kill_hands_off_to_the_watchdogs_retried_kill() {
         let dir = TempDir::new().unwrap();
         let (record, prev_path) = install_scripted_docker(&dir);
-        let stop = DispatchStop::new("darkmux-test-handoff".into());
+        let stop = DispatchStop::new(docker_sandbox("darkmux-test-handoff"));
         let (_guard, handle) = spawn_guarded_watchdog(
             &stop.watchdog_handoff(),
-            "darkmux-test-handoff".to_string(),
+            docker_sandbox("darkmux-test-handoff"),
             Arc::new(Mutex::new(Instant::now() + Duration::from_secs(600))),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
@@ -839,7 +839,7 @@
     fn a_successful_local_stop_kill_does_not_wake_the_watchdog() {
         let dir = TempDir::new().unwrap();
         let (_record, prev_path) = install_fake_docker(&dir);
-        let stop = DispatchStop::new("darkmux-test-ok".into());
+        let stop = DispatchStop::new(docker_sandbox("darkmux-test-ok"));
         stop.kill_container();
         restore_path(prev_path);
         assert!(!stop.watchdog_handoff().load(Ordering::SeqCst));
@@ -865,6 +865,36 @@
         assert!(allowed, "allowed once the container is gone");
         let ps = std::fs::read_to_string(&record).unwrap();
         assert!(ps.contains("name=^darkmux-dispatch-orphan$"), "asked docker about the recorded name: {ps}");
+    }
+
+    /// (#3112 review, round 3) The resume's liveness probe asks the sandbox
+    /// the origin RECORDED, not the one configured now: an origin that ran in
+    /// Docker, resumed after `runtime.sandbox` became `seatbelt`, still has
+    /// its container asked about in Docker, and is refused while it runs.
+    #[test]
+    #[serial]
+    fn a_resume_asks_the_origins_own_sandbox_whether_its_container_runs() {
+        let (_ws, prior, _) = origin_dir();
+        record_origin_container(prior.path(), "darkmux-dispatch-orphan-3112", None);
+        let dir = TempDir::new().unwrap();
+        let (record, prev_path) = install_scripted_docker(&dir);
+        std::fs::write(dir.path().join("running"), "").unwrap();
+        let prev = std::env::var_os("DARKMUX_SANDBOX");
+        // SAFETY: serialized via #[serial].
+        unsafe { std::env::set_var("DARKMUX_SANDBOX", "seatbelt") };
+        let refused = claim_resume_origin(prior.path()).err().map(|e| format!("{e:#}"));
+        // SAFETY: serialized via #[serial].
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_SANDBOX", v),
+                None => std::env::remove_var("DARKMUX_SANDBOX"),
+            }
+        }
+        restore_path(prev_path);
+        let msg = refused.expect("refused while the origin's Docker container is up");
+        assert!(msg.contains("darkmux-dispatch-orphan-3112") && msg.contains("docker kill"), "{msg}");
+        let ps = std::fs::read_to_string(&record).unwrap_or_default();
+        assert!(ps.contains("name=^darkmux-dispatch-orphan-3112$"), "asked docker, where it ran: {ps}");
     }
 
     /// `record_origin_container` writes the dispatch's own container into its
@@ -6649,7 +6679,7 @@ S(("127.0.0.1", port), H).serve_forever()
         let mut cfg = argv_config_with_base_url(None);
         cfg.workspace = root.path().join("ws");
         cfg.host_out = root.path().join("out");
-        let cmd = container_command(&cfg, &darkmux_sandbox::SeatbeltBackend);
+        let (cmd, _) = container_command(&cfg, &darkmux_sandbox::SeatbeltBackend);
         let envs: Vec<(String, Option<String>)> = cmd
             .get_envs()
             .map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned())))
@@ -7697,6 +7727,32 @@ S(("127.0.0.1", port), H).serve_forever()
             msg.contains("RESUME IMAGE MISMATCH") && msg.contains("rust:latest") && msg.contains("python:3.12"),
             "{msg}"
         );
+    }
+
+    /// (#3112 review) A `${WORKSPACE_ROOT}` still in the message when the
+    /// dispatch writes its prompt file (a step with no workdir, whose
+    /// workspace is a fresh tempdir; a CLI `dispatch` message) names that
+    /// workspace where the sandbox sees it, through `selected()`. Under
+    /// `DARKMUX_SANDBOX=seatbelt` (on a Mac) it is the tempdir's own path.
+    #[test]
+    #[serial]
+    fn the_prompt_file_names_the_actual_workspace_for_the_placeholder() {
+        let ws = TempDir::new().unwrap();
+        let msg = "look in `${WORKSPACE_ROOT}/src`";
+        assert_eq!(prompt_file_text(msg, ws.path()), "look in `/workspace/src`");
+        assert_eq!(prompt_file_text("no placeholder", ws.path()), "no placeholder");
+        let src = include_str!("dispatch_internal.rs");
+        assert!(src.contains("fs::write(host_out.join(PROMPT_FILE_NAME), prompt_file_text(&opts.message, workspace))"));
+        if !darkmux_sandbox::SeatbeltBackend::available() {
+            return;
+        }
+        let prev = std::env::var_os("DARKMUX_SANDBOX");
+        unsafe { std::env::set_var("DARKMUX_SANDBOX", "seatbelt") };
+        let seatbelt = prompt_file_text(msg, ws.path());
+        unsafe {
+            match prev { Some(v) => std::env::set_var("DARKMUX_SANDBOX", v), None => std::env::remove_var("DARKMUX_SANDBOX") }
+        }
+        assert_eq!(seatbelt, format!("look in `{}/src`", ws.path().canonicalize().unwrap().display()));
     }
 
     /// (#3112 review) A split-gitdir checkout is named where the sandbox
@@ -10356,7 +10412,7 @@ S(("127.0.0.1", port), H).serve_forever()
                 None, // (#3035) dispatch cap
                 None, // (#2902 step 1b) compactor endpoint
                 None, // (#2928) live sender
-                DispatchStop::new("test-container".into()),
+                DispatchStop::new(docker_sandbox("test-container")),
             )
         });
 
@@ -11430,6 +11486,57 @@ S(("127.0.0.1", port), H).serve_forever()
         assert_eq!(stored(Some("/Users/op/tree"), "/Users/op/tree"), docker);
     }
 
+    /// (#3112 review) A dispatch with no launcher context (the
+    /// `dispatch.internal` create-mod step, a CLI dispatch) under a sandbox
+    /// on the host still tells its tailer where the workspace was seen, so a
+    /// kit it proposes is stored in one form whichever sandbox proposed it.
+    /// A container's context is left exactly as it came.
+    #[test]
+    fn the_tailer_learns_the_host_seen_root_when_the_launcher_named_none() {
+        let host = tailer_record_context(None, "/Users/op/ws").expect("a context naming the root");
+        assert_eq!(host.root.as_deref(), Some("/Users/op/ws"));
+        assert_eq!(tailer_record_context(None, "/workspace"), None);
+        let launcher = ctx(serde_json::json!({"source": "app", "root": "/Users/op/tree"}));
+        assert_eq!(tailer_record_context(Some(launcher.clone()), "/Users/op/other"), Some(launcher), "the launcher's own root wins");
+        let src = include_str!("dispatch_internal.rs");
+        assert!(src.contains("tailer_record_context(opts.record_context.clone(), &workspace_seen)"));
+    }
+
+    /// (#3112 review) Kits from a `dispatch.internal` create-mod step (no
+    /// source) are stored in the same container coordinates whichever
+    /// sandbox proposed them, once the tailer knows the host-seen root.
+    #[test]
+    #[serial]
+    fn a_sourceless_mod_kit_is_stored_alike_from_either_sandbox() {
+        let stored = |context: Option<serde_json::Value>, header: &str| {
+            let tmp = TempDir::new().unwrap();
+            let mods_store = tmp.path().join("mods");
+            let findings_store = tmp.path().join("findings");
+            let prev = mod_test_env(tmp.path(), &mods_store, &findings_store);
+            let mut state = TailerState::new_for_test(
+                tmp.path().join("trajectory.jsonl"),
+                crate::test_session("sess-noctx"),
+                "coder".into(),
+                "darkmux:qwen3.6".into(),
+            )
+            .with_record_context(context.map(ctx));
+            let kit = format!("--- {header}/app/src/a.ts\n+++ {header}/app/src/a.ts\n");
+            state.handle_event(
+                &serde_json::json!({
+                    "type": "tool.completed", "seq": 1, "tool_seq": 0, "tool_name": "create_mod",
+                    "args": "{}", "result": "Recorded mod 1.", "ok": true,
+                    "emitted": {"kit": kit, "for": [], "attach": []}, "emit_seq": 1,
+                })
+                .to_string(),
+            );
+            let all = crate::mods::load_all_at(&mods_store).unwrap();
+            restore_env(prev);
+            all[0].kit.clone()
+        };
+        let docker = stored(None, "/workspace");
+        assert_eq!(stored(Some(serde_json::json!({"root": "/Users/op/ws"})), "/Users/op/ws"), docker);
+    }
+
     /// (#2265, 5.0) Through the REAL spawned tailer (the wiring `dispatch()`
     /// uses): the resolved profile names the proposer, a finding gets the
     /// planned span holding it as `context.site` and the mod inherits it, and
@@ -11490,7 +11597,7 @@ S(("127.0.0.1", port), H).serve_forever()
             None,
             None,
             None,
-            DispatchStop::new("test-container".into()),
+            DispatchStop::new(docker_sandbox("test-container")),
         );
         handle.join().expect("tailer thread");
 
@@ -18440,7 +18547,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             None, // (#3035) dispatch cap
             None, // (#2902 step 1b) compactor endpoint
             None, // (#2928) live sender
-            DispatchStop::new("test-container".into()),
+            DispatchStop::new(docker_sandbox("test-container")),
         );
         let elapsed = started.elapsed();
 
@@ -18475,7 +18582,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         darkmux_types::child_registry::reset_for_test();
     }
 
-    // (#2131 review round 2, NEW-1) `docker_kill_by_name` is the ONE place
+    // (#2131 review round 2, NEW-1) `kill_dispatch_sandbox` is the ONE place
     // that stops a container by its deterministic name — shared now by the
     // inactivity watchdog, the wait-error teardown, and the interrupt
     // teardown, so a single test covers all three call sites at once.
@@ -18488,7 +18595,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
     // binary this function shells out to.
     #[test]
     #[serial]
-    fn docker_kill_by_name_invokes_docker_kill_with_the_exact_container_name() {
+    fn kill_dispatch_sandbox_invokes_docker_kill_with_the_exact_container_name() {
         let dir = TempDir::new().unwrap();
         let record_path = dir.path().join("invoked-with.txt");
         let fake_docker_path = dir.path().join("docker");
@@ -18518,7 +18625,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             );
         }
 
-        docker_kill_by_name("darkmux-test-container-2131");
+        kill_dispatch_sandbox(&docker_sandbox("darkmux-test-container-2131"));
 
         // SAFETY: serialized via #[serial].
         unsafe {
@@ -18529,7 +18636,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         }
 
         let recorded = std::fs::read_to_string(&record_path)
-            .expect("docker_kill_by_name must have invoked the fake `docker` on PATH");
+            .expect("kill_dispatch_sandbox must have invoked the fake `docker` on PATH");
         assert_eq!(
             recorded.trim(),
             "kill darkmux-test-container-2131",
@@ -18540,10 +18647,16 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
 
     // ─── (#2233) ContainerKillGuard — the container's RAII backstop ───────
 
+    /// (#3112) A dispatch sandbox spawned in Docker, by its name: the handle
+    /// the kill paths take.
+    fn docker_sandbox(name: &str) -> darkmux_sandbox::SandboxHandle {
+        darkmux_sandbox::SandboxHandle { backend: darkmux_sandbox::BackendKind::Docker, id: name.to_string() }
+    }
+
     /// Drops a fake `docker` executable that records its own argv into
     /// `<dir>/invoked-with.txt`, and prepends `dir` to `PATH`. Returns the
     /// record path plus the previous `PATH` so the caller can restore it.
-    /// Same seam `docker_kill_by_name_invokes_docker_kill_with_the_exact_container_name`
+    /// Same seam `kill_dispatch_sandbox_invokes_docker_kill_with_the_exact_container_name`
     /// above already uses — no real Docker CLI or daemon exists in this
     /// sandbox, so a script on `PATH` standing in for the `docker` binary is
     /// how this file proves WHAT gets shelled out (#2233).
@@ -18590,6 +18703,58 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         }
     }
 
+    /// (#3112 review, round 3) A dispatch is stopped, probed and reaped in the
+    /// sandbox it was spawned in, never in whatever `runtime.sandbox` says at
+    /// kill time. A `config set runtime.sandbox seatbelt` (or an env change)
+    /// while a Docker dispatch runs must not leave its container running
+    /// while every kill path asks Seatbelt. Each kill path is checked on its
+    /// own, so a mutation of any one of them reverting to the current setting
+    /// fails here.
+    #[test]
+    #[serial]
+    fn a_dispatch_is_stopped_in_the_sandbox_it_started_in() {
+        let dir = TempDir::new().unwrap();
+        let (record_path, prev_path) = install_fake_docker(&dir);
+        let name = "darkmux-test-3112-started-in-docker";
+        let started = docker_sandbox(name);
+        let stop = DispatchStop::new(started.clone());
+        let guard = ContainerKillGuard::new(started.clone());
+        let prev = std::env::var_os("DARKMUX_SANDBOX");
+        // SAFETY: serialized via #[serial].
+        unsafe { std::env::set_var("DARKMUX_SANDBOX", "seatbelt") };
+        let calls = || std::fs::read_to_string(&record_path).unwrap_or_default().lines().count();
+        stop.kill_container();
+        let after_stop = calls();
+        kill_dispatch_sandbox(&started);
+        let after_teardown = calls();
+        let _ = probe_container_liveness(&started);
+        let after_probe = calls();
+        let _ = kill_container_persistently(&started, TEST_BACKOFF);
+        let after_watchdog = calls();
+        drop(guard);
+        let after_guard = calls();
+        // SAFETY: serialized via #[serial].
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_SANDBOX", v),
+                None => std::env::remove_var("DARKMUX_SANDBOX"),
+            }
+        }
+        restore_path(prev_path);
+        assert_eq!(after_stop, 1, "the local stop kills in the spawn-time backend");
+        assert_eq!(after_teardown, 2, "the teardown kills in the spawn-time backend");
+        assert_eq!(after_probe, 3, "the liveness probe asks the spawn-time backend");
+        assert_eq!(after_watchdog, after_probe + 1, "the watchdog's persistent kill lands at once in the spawn-time backend");
+        assert_eq!(after_guard, after_watchdog + 1, "the kill guard kills in the spawn-time backend");
+        let recorded = std::fs::read_to_string(&record_path).unwrap();
+        let lines: Vec<&str> = recorded.lines().collect();
+        let kill = format!("kill {name}");
+        for (at, why) in [(0, "local stop"), (1, "teardown"), (3, "watchdog"), (4, "kill guard")] {
+            assert_eq!(lines[at], kill, "the {why} sends `docker kill` to the container: {recorded}");
+        }
+        assert!(lines[2].starts_with("ps ") && lines[2].contains(name), "the probe lists it in Docker: {recorded}");
+    }
+
     #[test]
     #[serial]
     fn container_kill_guard_armed_kills_the_container_on_drop() {
@@ -18606,7 +18771,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         let (record_path, prev_path) = install_fake_docker(&dir);
 
         {
-            let _guard = ContainerKillGuard::new("darkmux-test-container-2233-armed".to_string());
+            let _guard = ContainerKillGuard::new(docker_sandbox("darkmux-test-container-2233-armed"));
             // drop here (end of scope) — no disarm, exactly as an early `?`
             // return out of the stdin block would leave it.
         }
@@ -18635,7 +18800,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
 
         {
             let mut guard =
-                ContainerKillGuard::new("darkmux-test-container-2233-disarmed".to_string());
+                ContainerKillGuard::new(docker_sandbox("darkmux-test-container-2233-disarmed"));
             guard.disarm();
         }
 
@@ -18662,7 +18827,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let result = std::panic::catch_unwind(|| {
-            let _guard = ContainerKillGuard::new("darkmux-test-container-2233-panic".to_string());
+            let _guard = ContainerKillGuard::new(docker_sandbox("darkmux-test-container-2233-panic"));
             panic!("simulated mid-dispatch panic between spawn and hand-off");
         });
         std::panic::set_hook(prev_hook);
@@ -18807,7 +18972,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
                 None, // (#3035) dispatch cap
                 None, // (#2902 step 1b) compactor endpoint
                 None, // (#2928) live sender
-                DispatchStop::new("test-container".into()),
+                DispatchStop::new(docker_sandbox("test-container")),
             );
             *handle_holder_for_closure.lock().unwrap() = Some(handle);
             panic!("simulated panic between the tailer's spawn and dispatch()'s own stores");
@@ -18896,7 +19061,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
                 None,
                 crate::thermal_governor::ThermalGovernorConfig::from_env().unwrap(),
                 None, // (#2902 step 5) no endpoint budget
-                DispatchStop::new("test-container".into()),
+                DispatchStop::new(docker_sandbox("test-container")),
                 true,
             );
             *handle_holder_for_closure.lock().unwrap() = Some(handle);
@@ -18993,7 +19158,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         let result = std::panic::catch_unwind(move || {
             let (_guard, handle) = spawn_guarded_watchdog(
                 &watchdog_abandoned_for_closure,
-                "darkmux-test-container-2641-watchdog".to_string(),
+                docker_sandbox("darkmux-test-container-2641-watchdog"),
                 inactivity_deadline_for_closure,
                 watchdog_done_for_closure,
                 timeout_fired_for_closure,
@@ -19239,7 +19404,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         let (record_path, prev_path) =
             install_failing_docker(&dir, "darkmux-test-container-2232-hung\n", 0);
 
-        let outcome = kill_container_persistently("darkmux-test-container-2232-hung", TEST_BACKOFF);
+        let outcome = kill_container_persistently(&docker_sandbox("darkmux-test-container-2232-hung"), TEST_BACKOFF);
 
         restore_path(prev_path);
 
@@ -19344,7 +19509,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         let (record_path, prev_path) =
             install_docker_with_ps_sequence(&dir, "darkmux-test-container-2232-gone\n", "");
 
-        let outcome = kill_container_persistently("darkmux-test-container-2232-gone", TEST_BACKOFF);
+        let outcome = kill_container_persistently(&docker_sandbox("darkmux-test-container-2232-gone"), TEST_BACKOFF);
 
         restore_path(prev_path);
 
@@ -19373,7 +19538,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         let (_record_path, prev_path) = install_failing_docker(&dir, "", 1);
 
         let outcome =
-            kill_container_persistently("darkmux-test-container-2232-nodaemon", TEST_BACKOFF);
+            kill_container_persistently(&docker_sandbox("darkmux-test-container-2232-nodaemon"), TEST_BACKOFF);
 
         restore_path(prev_path);
 
@@ -19392,7 +19557,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         let dir = TempDir::new().unwrap();
         let (record_path, prev_path) = install_fake_docker(&dir);
 
-        let outcome = kill_container_persistently("darkmux-test-container-2232-ok", TEST_BACKOFF);
+        let outcome = kill_container_persistently(&docker_sandbox("darkmux-test-container-2232-ok"), TEST_BACKOFF);
 
         restore_path(prev_path);
 
@@ -19432,7 +19597,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         let dir = TempDir::new().unwrap();
         let (record_path, prev_path) = install_absent_container_docker(&dir);
 
-        let outcome = kill_container_persistently("darkmux-dispatch-absent-2232", TEST_BACKOFF);
+        let outcome = kill_container_persistently(&docker_sandbox("darkmux-dispatch-absent-2232"), TEST_BACKOFF);
 
         restore_path(prev_path);
         let recorded = std::fs::read_to_string(&record_path).unwrap_or_default();
@@ -19508,7 +19673,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         let dir = TempDir::new().unwrap();
         let (_record_path, prev_path) = install_failing_docker(&dir, "", 1);
 
-        let outcome = kill_container_persistently("darkmux-test-container-2232-mute", TEST_BACKOFF);
+        let outcome = kill_container_persistently(&docker_sandbox("darkmux-test-container-2232-mute"), TEST_BACKOFF);
 
         restore_path(prev_path);
 
@@ -19672,7 +19837,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         // than the atomic merely happening to hold the right byte.
         let disposition = super::AtomicU8::new(KillDisposition::Confirmed.code());
         let warning = watchdog_finalize_kill(
-            "darkmux-dispatch-finalize-absent-2232",
+            &docker_sandbox("darkmux-dispatch-finalize-absent-2232"),
             TEST_BACKOFF,
             &disposition,
         );
@@ -19710,7 +19875,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         // round 3, fail closed) — so a pass proves the store ran.
         let disposition = super::AtomicU8::new(KillDisposition::Unconfirmed.code());
         let warning =
-            watchdog_finalize_kill("darkmux-dispatch-finalize-ok-2232", TEST_BACKOFF, &disposition);
+            watchdog_finalize_kill(&docker_sandbox("darkmux-dispatch-finalize-ok-2232"), TEST_BACKOFF, &disposition);
 
         restore_path(prev_path);
 
@@ -22122,7 +22287,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
             None,
             Some(CompactorEndpoint { label: "openai:127.0.0.1:8080/mlx-util".into(), id: Some("mlx-local".into()) }),
             None,
-            DispatchStop::new("test-container".into()),
+            DispatchStop::new(docker_sandbox("test-container")),
         );
         handle.join().expect("tailer thread");
         let records = drain_flow_records_for_session(&flows, &crate::test_session("sess-unmanaged-compactor"));
@@ -23092,7 +23257,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
             None, // dispatch cap
             None, // compactor endpoint
             None, // live sender
-            DispatchStop::new("test-container".into()),
+            DispatchStop::new(docker_sandbox("test-container")),
         );
         assert_eq!(summary.fold.compactions(), 1, "the event at the end of a 20 MiB backlog was dropped");
     }
@@ -23418,7 +23583,7 @@ fn decide_preflight_normalizes_a_namespaced_profile_id() {
         let timeout_fired = Arc::new(AtomicBool::new(false));
         let (_guard, handle) = spawn_guarded_watchdog(
             &abandoned,
-            "darkmux-test-late-container".to_string(),
+            docker_sandbox("darkmux-test-late-container"),
             Arc::new(Mutex::new(Instant::now())),
             Arc::clone(&done),
             Arc::clone(&timeout_fired),
@@ -23565,7 +23730,7 @@ fn teardown_returns_at_the_sampler_bound_when_the_sampler_hangs() {
     let tailer = thread::spawn(TrajectorySummary::default);
     let started = Instant::now();
     teardown_container_threads(
-        "darkmux-test-no-such-container",
+        &docker_sandbox("darkmux-test-no-such-container"),
         &done,
         watchdog,
         SamplerThread { stop: &sampler_stop, handle: sampler, bound: Duration::from_millis(100) },
@@ -23596,7 +23761,7 @@ fn every_sampler_join_in_dispatch_is_the_bounded_one() {
         "the early-exit teardown hands the sampler over with the derived bound"
     );
     assert_eq!(
-        src.matches("let trajectory_summary = threads.teardown(&launched.container_name);").count(),
+        src.matches("let trajectory_summary = threads.teardown(&launched.sandbox);").count(),
         2,
         "both early exits tear down through that one teardown"
     );
