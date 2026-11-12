@@ -35,64 +35,48 @@ describe("machineEngine (#316 stage 4.5)", () => {
     expect(engineRow({ engine: bogus })).toBe("nope · cannot be used (darkmux doctor names why)");
   });
 
-  // (#3554) The fleet card's idle count line: what the machine holds for
-  // darkmux, never a model another app loaded (contract 4), and never a
-  // count when the list is not the engine's answer.
+  // (#3554) The fleet card's idle count line, LM Studio's half: what the
+  // engine holds for darkmux, never a model another app loaded (contract 4),
+  // and never a count when the list is not the engine's answer. The servers
+  // darkmux started are the count line's other half (`countLine`).
   describe("darkmuxResidents", () => {
     const model = (identifier: string) => ({ identifier, model: identifier.replace(/^darkmux:/, ""), status: "idle", size: "1 GB", context: 4096 });
+    const known = { engine: lms, lms_unreachable: false, utility_model: null };
     it("counts the residents in darkmux's namespace only", () => {
-      const specs = { engine: lms, lms_unreachable: false, loaded_models: [model("darkmux:qwen"), model("darkmux:util-4b"), model("user-loaded")] };
-      expect(darkmuxResidents(specs)).toEqual({ known: true, count: 2 });
+      expect(darkmuxResidents({ ...known, loaded_models: [model("darkmux:qwen"), model("darkmux:util-4b"), model("user-loaded")] })).toEqual({ known: true, count: 2 });
     });
     it("counts zero for an engine that answered with nothing of darkmux's", () => {
-      expect(darkmuxResidents({ engine: lms, lms_unreachable: false, loaded_models: [model("user-loaded")] })).toEqual({ known: true, count: 0 });
+      expect(darkmuxResidents({ ...known, loaded_models: [model("user-loaded")] })).toEqual({ known: true, count: 0 });
     });
     it("is unknown, with the reason, when the list is not the engine's answer", () => {
-      expect(darkmuxResidents({ engine: mlx, lms_unreachable: true, loaded_models: [] })).toEqual({
+      expect(darkmuxResidents({ engine: mlx, lms_unreachable: true, loaded_models: [], utility_model: null })).toEqual({
         known: false,
         why: "local-8080 does not report which models it has loaded.",
-        servers: 0,
       });
-    });
-
-    // (#3554, operator) The servers darkmux started are darkmux's own
-    // residents too (#3450): "N loaded" counts them.
-    const server = (served_name: string, port: number, answering = true) => ({ endpoint: "local", engine: "flint", model: served_name, served_name, n_ctx: 4096, port, pid: 1, started_at_ms: 0, answering });
-    it("counts the servers darkmux started: a Flint-only machine holds one", () => {
-      expect(darkmuxResidents({ engine: lms, lms_unreachable: false, loaded_models: [model("user-loaded")], engine_servers: [server("flint", 8092)] })).toEqual({ known: true, count: 1 });
-    });
-    it("adds the servers to LM Studio's darkmux residents", () => {
-      expect(darkmuxResidents({ engine: lms, lms_unreachable: false, loaded_models: [model("darkmux:qwen")], engine_servers: [server("flint", 8092)] })).toEqual({ known: true, count: 2 });
-    });
-    it("never counts a server twice when the engine's list names it too", () => {
-      const specs = { engine: lms, lms_unreachable: false, loaded_models: [model("darkmux:qwen3.8-27b"), model("darkmux:qwen")], engine_servers: [server("darkmux:qwen3.8-27b", 8093)] };
-      expect(darkmuxResidents(specs)).toEqual({ known: true, count: 2 });
-    });
-    it("keeps the servers' count when the engine's list is unknown, without a total", () => {
-      expect(darkmuxResidents({ engine: lms, lms_unreachable: true, loaded_models: [], engine_servers: [server("flint", 8092)] })).toEqual({
-        known: false,
-        why: "LM Studio could not be asked (`lms ps` failed); what it holds is unknown.",
-        servers: 1,
-      });
-    });
-    // (#3554, operator) Only a server that answers holds its model; one still
-    // starting adds nothing, known list or not.
-    it("counts an answering server and never one still starting its model", () => {
-      const lmsKnown = { engine: lms, lms_unreachable: false, loaded_models: [] };
-      expect(darkmuxResidents({ ...lmsKnown, engine_servers: [server("flint", 8092, false)] })).toEqual({ known: true, count: 0 });
-      expect(darkmuxResidents({ ...lmsKnown, engine_servers: [server("flint", 8092, true)] })).toEqual({ known: true, count: 1 });
-      expect(darkmuxResidents({ ...lmsKnown, engine_servers: [server("flint", 8092, true), server("tf", 8093, false)] })).toEqual({ known: true, count: 1 });
-      expect(darkmuxResidents({ ...lmsKnown, lms_unreachable: true, engine_servers: [server("flint", 8092, false)] })).toMatchObject({ known: false, servers: 0 });
-    });
-
-    it("reads a card from a darkmux before 5.10, which lists no servers, as none", () => {
-      expect(darkmuxResidents({ engine: lms, lms_unreachable: false, loaded_models: [model("darkmux:qwen")] } as never)).toEqual({ known: true, count: 1 });
     });
     it("claims nothing when no card was read", () => {
       expect(darkmuxResidents(null)).toBeNull();
     });
     it("claims nothing for a card that leaves the list out", () => {
       expect(darkmuxResidents({ engine: lms, lms_unreachable: false } as never)).toBeNull();
+    });
+
+    // (#3554 re-review) The utility robot says "resident" when the daemon
+    // matched the utility model on a bare identifier or model key
+    // (`darkmux-serve` `utility_model`); the count must not contradict it.
+    describe("the utility model", () => {
+      const utility = (id: string, loaded = true) => ({ id, loaded, n_ctx: null });
+      it("counts a loaded utility model the namespace test missed (the probe shape: a bare resident)", () => {
+        expect(darkmuxResidents({ ...known, loaded_models: [model("qwen3-4b-instruct-2507")], utility_model: utility("qwen3-4b-instruct-2507") })).toEqual({ known: true, count: 1 });
+      });
+      it("counts it once when it is a namespaced resident already", () => {
+        expect(darkmuxResidents({ ...known, loaded_models: [model("darkmux:util-4b")], utility_model: utility("darkmux:util-4b") })).toEqual({ known: true, count: 1 });
+        // Matched by its model key, as the daemon matches it.
+        expect(darkmuxResidents({ ...known, loaded_models: [model("darkmux:util-4b")], utility_model: utility("util-4b") })).toEqual({ known: true, count: 1 });
+      });
+      it("adds nothing when the utility model is not loaded", () => {
+        expect(darkmuxResidents({ ...known, loaded_models: [model("qwen3-4b-instruct-2507")], utility_model: utility("qwen3-4b-instruct-2507", false) })).toEqual({ known: true, count: 0 });
+      });
     });
   });
 

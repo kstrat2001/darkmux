@@ -48,9 +48,9 @@ import { machineAvailability, type MachineAvailability } from "../../lib/machine
 import { CardStatus } from "./cardStatus";
 import { RUNNING_WORD } from "../../components/WorkStatus";
 import type { CardResidents } from "../../lib/machineEngine";
-import { parseEndpointRoute, routeKindLabel, type EndpointRoute } from "../../lib/endpointRoute";
+import { parseEndpointRoute, type EndpointRoute } from "../../lib/endpointRoute";
 import { shortModel } from "../../lib/format";
-import { modelShortName } from "../../lib/modelName";
+import { cardModelName } from "../../lib/modelName";
 import { serverStateWord } from "../../lib/engineServers";
 
 /** A machine's runs in flight as of `t`: its run- and execution-grain runs
@@ -899,95 +899,115 @@ function startedServerAt(host: string, servers: readonly Pick<EngineServer, "eng
   return servers.find((s) => s.port === port);
 }
 
+/** (#3554) Azure OpenAI's own hosts, as darkmux's provider registry lists
+ *  them (`darkmux_types::provider::PROVIDERS`): one label, then the suffix.
+ *  Azure AI Foundry (`*.services.ai.azure.com`) is another provider. */
+const AZURE_OPENAI_HOSTS = [".openai.azure.com", ".cognitiveservices.azure.com"];
+
+/** Whether `hostport` is an Azure OpenAI host (its port and case ignored). */
+function isAzureOpenAi(hostport: string): boolean {
+  const host = hostport.replace(/:\d+$/, "").replace(/\.$/, "").toLowerCase();
+  return AZURE_OPENAI_HOSTS.some((suffix) => host.endsWith(suffix) && /^[a-z0-9-]+$/.test(host.slice(0, -suffix.length)));
+}
+
 /** (#3554) The engine a hosted execution ran on: a server darkmux started on
- *  this machine by its engine, Azure by name, and any other endpoint by its
- *  address (`openai:` is every host that is not Azure's, so a server on this
- *  machine or another vendor's endpoint is never misnamed). */
+ *  this machine by its engine, Azure OpenAI by name on its own hosts, and any
+ *  other endpoint by its address (the route's `kind` is only a guess from the
+ *  host, so a server on this machine or another provider is never misnamed). */
 function routeEngine(route: EndpointRoute, servers: readonly Pick<EngineServer, "engine" | "port">[]): string {
   const server = startedServerAt(route.host, servers);
   if (server) return server.engine;
-  return route.kind === "azure" ? routeKindLabel(route.kind) : route.host;
+  return isAzureOpenAi(route.host) ? "Azure OpenAI" : route.host;
+}
+
+/** (#3554) The model an execution ran, as its records name it: the endpoint's
+ *  tail is the profile model id on every path that writes an endpoint, while
+ *  the start's own `model` can be the wire name (`flint` on the container
+ *  path, `Target::wire_model`), so the tail wins. */
+export function executionModelId(e: Pick<ExecutionTokenReading, "model" | "endpoint">): string {
+  return (e.endpoint ? parseEndpointRoute(e.endpoint).model : "") || shortModel(e.model) || "";
 }
 
 /** (#3554) What the shown execution runs on, in words: its model (without
  *  darkmux's namespace) and, when it is not this machine's managed LM Studio,
- *  its engine. The text shows only the model's name (`modelShortName`), and
- *  the engine once when that name already is it (`flint-int4` on `flint`);
- *  the title has the whole id and the engine's address. `null` when nothing
- *  names either. */
+ *  its engine. The text shows only the model's name (`cardModelName`: what
+ *  tells it apart from the card's other executions), and the engine once when
+ *  that name already is it (`flint-int4` on `flint`); the title has the whole
+ *  id and the engine's address. `null` when nothing names either. */
 function routeWords(
   shown: Pick<ExecutionTokenReading, "model" | "endpoint">,
   servers: readonly Pick<EngineServer, "engine" | "port">[],
+  executionModels: readonly string[],
 ): { text: string; title: string } | null {
   const route = shown.endpoint ? parseEndpointRoute(shown.endpoint) : null;
-  // The endpoint's tail is the profile model id on every path that writes an
-  // endpoint; the start's own `model` can be the wire name (`flint` on the
-  // container path, `Target::wire_model`), so the tail wins.
-  const model = route?.model || shortModel(shown.model) || "";
+  const model = executionModelId(shown);
   const engine = route ? routeEngine(route, servers) : "";
   const engineTitle = route && engine !== route.host ? `${engine} on ${route.host}` : engine;
-  const name = modelShortName(model);
+  const name = cardModelName(model, executionModels);
   const text = [name, engine.toLowerCase() === name.toLowerCase() ? "" : engine].filter(Boolean).join(" · ");
   return text ? { text, title: [model, engineTitle].filter(Boolean).join(" · ") } : null;
 }
 
-/** (#3554) An idle count line with what the machine holds: "0 running · 2
- *  loaded" when its engine said. When the engine's list is not known, never a
- *  total that says it holds none: the servers darkmux started as a lower bound
- *  ("1+ loaded", the unknown half in the title), else the plain count with
- *  the reason in the title. The plain count when no card was read. */
-function residentsLine(count: string, residents: CardResidents | null): { text: string; title: string } {
-  if (!residents) return { text: count, title: count };
-  if (!residents.known) return unknownResidentsLine(count, residents);
-  const text = `${count} · ${residents.count} loaded`;
-  return { text, title: text };
-}
-
 type CardServer = Pick<EngineServer, "engine" | "port" | "answering" | "started_at_ms">;
 
+const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+
 /** (#3554) The servers that hold no model yet, in the servers line's own
- *  words ("1 server starting the model"), for the idle line's title: they
- *  add nothing to "N loaded". Empty when every server answers. */
-function pendingServers(servers: readonly CardServer[], nowMs: number): string {
+ *  words ("1 server starting the model", "1 server not answering"), for the
+ *  idle line's title. Empty when every server answers. */
+function pendingServers(words: readonly string[]): string {
   const counts = new Map<string, number>();
-  for (const s of servers) {
-    const word = serverStateWord(s, nowMs);
-    if (word !== "resident") counts.set(word, (counts.get(word) ?? 0) + 1);
-  }
-  return [...counts].map(([word, n]) => `${n} ${n === 1 ? "server" : "servers"} ${word}`).join(" · ");
+  for (const word of words) if (word !== "resident") counts.set(word, (counts.get(word) ?? 0) + 1);
+  return [...counts].map(([word, n]) => `${plural(n, "server", "servers")} ${word}`).join(" · ");
 }
 
-/** The idle line when the engine's list is not known: the servers as a lower
- *  bound when there are any. */
-function unknownResidentsLine(count: string, r: { why: string; servers: number }): { text: string; title: string } {
-  if (r.servers === 0) return { text: count, title: `${count} · loaded models unknown: ${r.why}` };
-  const text = `${count} · ${r.servers}+ loaded`;
-  const servers = `${r.servers} ${r.servers === 1 ? "server" : "servers"} darkmux started`;
-  return { text, title: `${text}: ${servers}; the rest is unknown: ${r.why}` };
+/** The title's note on an engine list nobody read: what the lower bound
+ *  counted, and why the rest is unknown. */
+function unknownListNote(residents: CardResidents, answering: number): string {
+  if (residents.known) return "";
+  if (answering === 0) return `loaded models unknown: ${residents.why}`;
+  return `${plural(answering, "server", "servers")} darkmux started; the rest is unknown: ${residents.why}`;
 }
 
-/** A line with the servers that hold nothing yet named in its title. */
-function withPending(line: { text: string; title: string }, pending: string): { text: string; title: string } {
-  return pending ? { text: line.text, title: `${line.title} · ${pending}` } : line;
+/** (#3554) An idle count line with what the machine holds: LM Studio's
+ *  darkmux residents (`residents`) plus the servers darkmux started that
+ *  answer, "0 running · 2 loaded". A server still starting adds nothing. When
+ *  the total is not exact (the engine's list unknown, or a server past its
+ *  start bound that does not answer, which may be a resident too busy to)
+ *  the count is a lower bound, "1+ loaded", and never "0+": nothing to count
+ *  leaves the plain count. The title names why. The plain count when no card
+ *  was read. */
+function idleLine(count: string, residents: CardResidents | null, servers: readonly CardServer[], nowMs: number): { text: string; title: string } {
+  if (!residents) return { text: count, title: count };
+  const words = servers.map((s) => serverStateWord(s, nowMs));
+  const answering = words.filter((w) => w === "resident").length;
+  const total = (residents.known ? residents.count : 0) + answering;
+  const exact = residents.known && !words.includes("not answering");
+  const text = exact ? `${count} · ${total} loaded` : total > 0 ? `${count} · ${total}+ loaded` : count;
+  const notes = [unknownListNote(residents, answering), pendingServers(words)].filter(Boolean);
+  return { text, title: [text, ...notes].join(" · ") };
 }
 
 /** (#3554) The count line's words and its tooltip. While something runs it
  *  names what the SHOWN execution (the tube's page) runs on after the count;
- *  idle, what the machine holds. `residents` is the caller's to withhold
- *  where it is not a fact about the moment shown (a scrubbed playhead). The
- *  line is one ellipsized line, so the title carries it whole. */
+ *  idle, what the machine holds. `residents` and `engineServers` are the
+ *  caller's to withhold where they are not facts about the moment shown (a
+ *  scrubbed playhead, a static build). The line is one ellipsized line, so
+ *  the title carries it whole. */
 export function countLine(f: {
   runsCount: number;
   executions: number;
   position: number;
   shown: Pick<ExecutionTokenReading, "model" | "endpoint"> | null;
+  /** Every execution on the card, as `executionModelId` names its model. */
+  executionModels: readonly string[];
   engineServers: readonly CardServer[];
   residents: CardResidents | null;
   /** The clock a server's start age is read against (its state word). */
   nowMs: number;
 }): { text: string; title: string } {
   const count = executionCountText(f);
-  if (f.runsCount === 0) return withPending(residentsLine(count, f.residents), pendingServers(f.engineServers, f.nowMs));
-  const route = f.shown ? routeWords(f.shown, f.engineServers) : null;
+  if (f.runsCount === 0) return idleLine(count, f.residents, f.engineServers, f.nowMs);
+  const route = f.shown ? routeWords(f.shown, f.engineServers, f.executionModels) : null;
   return route ? { text: `${count} · ${route.text}`, title: `${count} · ${route.title}` } : { text: count, title: count };
 }

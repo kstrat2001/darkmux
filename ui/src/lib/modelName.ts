@@ -19,12 +19,6 @@ const EXTENSION = /\.(gguf|safetensors)$/i;
  *  `turboquant`, ...). Dropped wherever it sits. */
 const STORAGE = /^(\d+bit|u?int\d+|b?f\d+|(mx|nv)?fp\d+|i?q\d+(_[a-z0-9]+)*|mlx|gguf|dwq|awq|gptq|exl2|turboquant)$/i;
 
-/** A generic tuning tag. Dropped only at the end, and only when a part
- *  beyond the family stays: inside a name, or alone after it, it can be what
- *  tells two models apart (`qwen3-4b-instruct-2507` and its thinking twin
- *  share `qwen3-4b-2507`; `deepseek-chat` is not `deepseek`). */
-const TUNING = /^(instruct|chat|it)$/i;
-
 /** A model id's last path segment (`TensorFold/Qwen3.8-27B` → `Qwen3.8-27B`):
  *  the publisher or path prefix dropped, the rest kept as it is. */
 export function lastPathSegment(id: string): string {
@@ -32,13 +26,26 @@ export function lastPathSegment(id: string): string {
 }
 
 /** The id's model name: no namespace, no publisher or path prefix, no file
- *  extension, no storage parts, no trailing tuning tag. The first part always
- *  stays, so a name never shortens to nothing. */
+ *  extension, no storage parts. A tuning tag (`instruct`, `chat`, `it`)
+ *  stays: it names a different model, not a way of storing one. The first
+ *  part always stays, so a name never shortens to nothing. */
 export function modelShortName(id: string): string {
   const base = id.replace(NAMESPACE, "");
   const file = lastPathSegment(base).replace(EXTENSION, "");
   const [first, ...rest] = file.split("-");
-  const kept = rest.filter((part) => !STORAGE.test(part));
-  while (kept.length > 1 && TUNING.test(kept[kept.length - 1])) kept.pop();
-  return [first, ...kept].join("-");
+  return [first, ...rest.filter((part) => !STORAGE.test(part))].join("-");
+}
+
+/** (#3554) A model's name on a card that may show several executions: its
+ *  short name, unless another execution's different id shortens to the same
+ *  (the A/B runs darkmux makes, `-turboquant-mlx` vs `-mlx`). Then its last
+ *  path segment, which keeps the storage parts; and when even that clashes
+ *  (only the publisher differs), the id without its namespace. */
+export function cardModelName(id: string, siblings: readonly string[]): string {
+  const bare = id.replace(NAMESPACE, "");
+  const others = siblings.map((o) => o.replace(NAMESPACE, "")).filter((o) => o !== bare);
+  const short = modelShortName(bare);
+  if (!others.some((o) => modelShortName(o) === short)) return short;
+  const segment = lastPathSegment(bare);
+  return others.some((o) => lastPathSegment(o) === segment) ? bare : segment;
 }

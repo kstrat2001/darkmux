@@ -23,7 +23,7 @@ import { scopeStateOf } from "../../lib/scopeMorph";
 import { dispatchHash } from "../../lib/route";
 import { onIntentClick } from "../../lib/clickIntent";
 import type { ExecutionTokenReading, LiveState } from "../../lib/tokenRate";
-import { countLine, executionCountText, specDimLabel, type CardFace, type FleetCard } from "./cards";
+import { countLine, executionCountText, executionModelId, specDimLabel, type CardFace, type FleetCard } from "./cards";
 import { CardStatus, STATUS_WORD, lampOf, secondLineOf, statusReason } from "./cardStatus";
 import { readingLabel, readingTitle } from "./readingLabel";
 
@@ -217,8 +217,9 @@ function StatusLine({
 /** The count line: "N running" (a link to the run while something runs),
  * "2 running · 1/2" with several executions, then (#3554) what the shown
  * execution runs on ("1 running · qwen3.6-35b-a3b"); idle, what the machine
- * holds ("0 running · 2 loaded"), at the live edge only, since residency is a
- * fact about now. "—" / "not streaming" while there is no count to claim. One
+ * holds ("0 running · 2 loaded"), at the live edge of a live page only (not a
+ * scrubbed playhead, not a static build's committed snapshot), since what is
+ * loaded and which server holds a port are facts about now. "—" / "not streaming" while there is no count to claim. One
  * ellipsized line; the title (and the control's name) carries it whole. */
 function CountLine({
   card,
@@ -249,6 +250,7 @@ function CountLine({
   const line = countLine({
     ...counts,
     shown,
+    executionModels: card.executions.map(executionModelId),
     engineServers: atLiveEdge ? card.engineServers : [],
     residents: atLiveEdge ? card.residents : null,
     // As the servers line reads a server's state: right to the presence poll.
@@ -522,7 +524,8 @@ export function MachineCard({
           executions={execs.length}
           position={selectedIdx + 1}
           shown={selected}
-          atLiveEdge={clock.playhead == null}
+          // Live polling too: a static build's view is a committed snapshot.
+          atLiveEdge={clock.playhead == null && clock.livePolling}
         />
         <ServesLine machine={card.name} profiles={card.servesProfiles} radio={card.servesRadio} />
         <ServersLine servers={card.engineServers} />

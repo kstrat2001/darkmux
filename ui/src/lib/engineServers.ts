@@ -18,7 +18,7 @@ type StateWord = "starting the model" | "not answering" | "resident";
 /** (#3554) Whether a server holds its model: it answered under its served
  *  name when listed, as the daemon decided it (`answering`). The one test
  *  behind "resident" here and a fleet card's "N loaded". */
-export function serverIsResident(s: Pick<EngineServer, "answering">): boolean {
+function serverIsResident(s: Pick<EngineServer, "answering">): boolean {
   return s.answering;
 }
 

@@ -1292,6 +1292,11 @@ describe("executionTokenReading: the model and endpoint", () => {
     expect(reading).toMatchObject({ model: "gpt-4o", endpoint: "openai:api.openai.com/gpt-4o" });
   });
 
+  it("breaks a tie between two starts in the same instant toward the later one listed", () => {
+    const reading = executionTokenReading([start(5, { model: "darkmux:a" }), start(5, { model: "darkmux:b" })], Date.parse(atSec(6)));
+    expect(reading.model).toBe("darkmux:b");
+  });
+
   it("names neither when no start record has landed (a mid-stream execution)", () => {
     const hb = norm({ ts: atSec(0), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: Date.parse(atSec(0)), generated_chars: 0 } });
     const reading = executionTokenReading([hb], Date.parse(atSec(1)));

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { lastPathSegment, modelShortName } from "./modelName";
+import { cardModelName, lastPathSegment, modelShortName } from "./modelName";
 
 // (#3554) Real model ids, grepped from this repo's profiles, fixtures, goldens
 // and docs (the file each came from is beside it), and the short name the
@@ -36,10 +36,9 @@ const TABLE: [id: string, short: string, from: string][] = [
   ["mmproj-gemma-vision-BF16.gguf", "mmproj-gemma-vision", "crates/darkmux-profiles/src/gestalt_host/gguf_facts.rs"],
   ["phi-4-mini.gguf", "phi-4-mini", "crates/darkmux-profiles/src/gestalt_host/gguf_facts.rs"],
   ["devstral.gguf", "devstral", "crates/darkmux-profiles/src/gestalt_host/gguf_facts.rs"],
-  // Generic tuning tags: dropped at the end; kept where a dated variant
-  // follows, since the bare "qwen3-4b-2507" is another model (its thinking
-  // twin shares the date).
-  ["qwen3-4b-instruct", "qwen3-4b", "crates/darkmux-gestalt/src/planner.rs"],
+  // Tuning tags name a different model (an instruct or chat tune, not its
+  // base), so they always stay.
+  ["qwen3-4b-instruct", "qwen3-4b-instruct", "crates/darkmux-gestalt/src/planner.rs"],
   ["darkmux:qwen3-4b-instruct-2507", "qwen3-4b-instruct-2507", "crates/darkmux-crew/src/dispatch_internal.rs"],
   ["darkmux:qwen/qwen3-4b-2507", "qwen3-4b-2507", "crates/darkmux-crew/src/concurrent_dispatch.rs"],
   // Already the relevant part: unchanged.
@@ -57,9 +56,16 @@ describe("modelShortName (#3554)", () => {
   });
 
   // Synthetic cases for the rules' edges, beside the real ids above.
-  it("drops the chat and it tuning tags at the end", () => {
-    expect(modelShortName("llama-3-8b-chat")).toBe("llama-3-8b");
-    expect(modelShortName("gemma-3-27b-it")).toBe("gemma-3-27b");
+  // (#3554 re-review) A tuning tag is part of the model's name: `gpt-5-chat`
+  // is not `gpt-5`, and `gemma-3-27b-it` is not the base `gemma-3-27b`.
+  it("keeps every tuning tag", () => {
+    expect(modelShortName("gpt-5-chat")).toBe("gpt-5-chat");
+    expect(modelShortName("gemma-3-27b-it")).toBe("gemma-3-27b-it");
+    expect(modelShortName("llama-3-8b-chat")).toBe("llama-3-8b-chat");
+    expect(modelShortName("mlx-community/Qwen3-4B-Instruct-2507-4bit")).toBe("Qwen3-4B-Instruct-2507");
+  });
+  it("drops an extension in any case", () => {
+    expect(modelShortName("model-7b.GGUF")).toBe("model-7b");
   });
   it("drops the other quant tags", () => {
     expect(modelShortName("model-7b-int4")).toBe("model-7b");
@@ -76,9 +82,6 @@ describe("modelShortName (#3554)", () => {
     expect(modelShortName("model-7b-exl2")).toBe("model-7b");
     expect(modelShortName("model-7b.safetensors")).toBe("model-7b");
   });
-  it("keeps a tuning tag that is all that tells the model apart", () => {
-    expect(modelShortName("deepseek-chat")).toBe("deepseek-chat");
-  });
   it("never shortens a name to nothing: the first part stays", () => {
     expect(modelShortName("mlx")).toBe("mlx");
     expect(modelShortName("darkmux:instruct")).toBe("instruct");
@@ -94,5 +97,24 @@ describe("lastPathSegment", () => {
   it("keeps what follows the last slash", () => {
     expect(lastPathSegment("TensorFold/Qwen3.8-27B-MLX-4bit")).toBe("Qwen3.8-27B-MLX-4bit");
     expect(lastPathSegment("flint-int4")).toBe("flint-int4");
+  });
+});
+
+// (#3554 re-review) Two executions on one card whose ids differ only in what
+// the shortener drops (the A/B runs darkmux makes) must not read alike.
+describe("cardModelName", () => {
+  it("is the short name when no other execution on the card shares it", () => {
+    expect(cardModelName("darkmux:qwen3.6-35b-a3b-turboquant-mlx", ["darkmux:gpt-oss-120b"])).toBe("qwen3.6-35b-a3b");
+    // The same model twice is no clash.
+    expect(cardModelName("darkmux:qwen3.6-35b-a3b-mlx", ["darkmux:qwen3.6-35b-a3b-mlx"])).toBe("qwen3.6-35b-a3b");
+  });
+  it("keeps the parts that tell two executions apart when their short names clash", () => {
+    const ab = ["darkmux:qwen3.6-35b-a3b-turboquant-mlx", "darkmux:qwen3.6-35b-a3b-mlx"];
+    expect(cardModelName(ab[0], ab)).toBe("qwen3.6-35b-a3b-turboquant-mlx");
+    expect(cardModelName(ab[1], ab)).toBe("qwen3.6-35b-a3b-mlx");
+  });
+  it("keeps the path too when only the publisher tells them apart", () => {
+    const ab = ["lmstudio-community/Qwen3-30B-A3B-4bit", "mlx-community/Qwen3-30B-A3B-4bit"];
+    expect(cardModelName(ab[0], ab)).toBe("lmstudio-community/Qwen3-30B-A3B-4bit");
   });
 });

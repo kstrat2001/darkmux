@@ -6,7 +6,6 @@
 
 import type { MachineEngine } from "../types/generated/MachineEngine";
 import type { MachineSpecsResponse } from "../types/generated/MachineSpecsResponse";
-import { serverIsResident } from "./engineServers";
 
 const LMSTUDIO = "lmstudio";
 
@@ -48,38 +47,38 @@ export function residentsUnknownNote(specs: ResidentSpecs | null): string | null
   return "LM Studio could not be asked (`lms ps` failed); what it holds is unknown.";
 }
 
-/** (#3554) What a machine holds for darkmux, as its fleet card counts it: a
- *  total, or (the engine's list unknown) why, and the servers darkmux started,
- *  which are known whatever the engine answered. */
-export type CardResidents = { known: true; count: number } | { known: false; why: string; servers: number };
+/** (#3554) What LM Studio holds for darkmux, as a fleet card counts it: a
+ *  count, or why the list is not known. The servers darkmux started are the
+ *  count line's other half (`countLine`). */
+export type CardResidents = { known: true; count: number } | { known: false; why: string };
 
 /** darkmux's namespace on a resident's identifier (contract 4): the test
  *  `darkmux_profiles::ownership::is_darkmux_owned` applies. */
 const DARKMUX_NAMESPACE = "darkmux:";
 
-type ResidentsInput = ResidentSpecs & Pick<MachineSpecsResponse, "loaded_models"> & Partial<Pick<MachineSpecsResponse, "engine_servers">>;
+type ResidentsInput = ResidentSpecs & Pick<MachineSpecsResponse, "loaded_models"> & Partial<Pick<MachineSpecsResponse, "utility_model">>;
 
-/** (#3554) How many models the machine holds for darkmux: the engine's
- *  residents in darkmux's namespace (never a model another app loaded: the
- *  fleet card is a darkmux card, not an LM Studio one) plus the servers
- *  darkmux started (#3450) that answer (`serverIsResident`; one still starting
- *  holds nothing yet), a server the engine's list also names counted once. When the engine's list is not known, why, and the servers alone, so
- *  a card never says "0 loaded" about a list nobody read. `null` with no
- *  specs: no card was read, so nothing is claimed. */
+/** (#3554) How many models the engine holds for darkmux: its residents in
+ *  darkmux's namespace, never a model another app loaded (the fleet card is a
+ *  darkmux card, not an LM Studio one). A loaded utility model counts too,
+ *  once, as the utility robot says "resident" for it: the daemon matches it
+ *  on a bare identifier or model key (`darkmux-serve`'s `utility_model`).
+ *
+ *  When the list is not the engine's answer, why, so a card never says
+ *  "0 loaded" about a list nobody read. `null` with no specs: no card was
+ *  read, so nothing is claimed. */
 export function darkmuxResidents(specs: ResidentsInput | null): CardResidents | null {
   if (!specs) return null;
-  // A card from a darkmux before 5.10 lists no servers. A server still
-  // starting its model holds nothing yet.
-  const servers = (Array.isArray(specs.engine_servers) ? specs.engine_servers : []).filter(serverIsResident);
   const why = residentsUnknownNote(specs);
-  if (why !== null) return { known: false, why, servers: servers.length };
+  if (why !== null) return { known: false, why };
   // A peer's card is read off the wire: one that leaves the list out claims
   // nothing, rather than "0 loaded" or taking the fleet page down with it.
   const listed: unknown = specs.loaded_models;
   if (!Array.isArray(listed)) return null;
-  const served = new Set(servers.map((s) => s.served_name));
-  const resident = specs.loaded_models.filter((m) => m.identifier.startsWith(DARKMUX_NAMESPACE) && !served.has(m.identifier));
-  return { known: true, count: resident.length + servers.length };
+  const counted = specs.loaded_models.filter((m) => m.identifier.startsWith(DARKMUX_NAMESPACE));
+  const utility = specs.utility_model;
+  const utilityApart = utility?.loaded === true && !counted.some((m) => m.identifier === utility.id || m.model === utility.id);
+  return { known: true, count: counted.length + (utilityApart ? 1 : 0) };
 }
 
 /** Machine info's engine row: the name, and what it does not report or that

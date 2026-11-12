@@ -62,7 +62,7 @@ const VARIANTS = [
     state: finished,
     self: selfWith({ lms_unreachable: true, engine_servers: [FLINT] }),
     text: "0 running · 1+ loaded",
-    title: /^0 running · 1\+ loaded: 1 server darkmux started; the rest is unknown: LM Studio could not be asked/,
+    title: /^0 running · 1\+ loaded · 1 server darkmux started; the rest is unknown: LM Studio could not be asked/,
   },
   {
     id: "running-local",

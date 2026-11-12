@@ -3849,6 +3849,37 @@ describe("FleetLens: the count line names the model and what is loaded (#3554)",
     await waitFor(() => expect(countEl().textContent).toBe("2 running · 2/2 · reviewer-model"));
   });
 
+  // (#3554 re-review) A static build (the published demo) reads a committed
+  // snapshot of the view: what it says is loaded is not now on any machine.
+  it("a static build names no residents and no server engine", async () => {
+    const metas = [["darkmux-flow-src", "/demo-flow.jsonl"], ["darkmux-fleet-src", "/fleet/view"]].map(([name, content]) => {
+      const m = document.createElement("meta");
+      m.setAttribute("name", name);
+      m.setAttribute("content", content);
+      document.head.appendChild(m);
+      return m;
+    });
+    try {
+      const flint = { endpoint: "local-flint", engine: "flint", model: "flint-int4", served_name: "flint", n_ctx: 4096, port: 8092, pid: 1, started_at_ms: 0, answering: true };
+      mockFleetFetch({ runs: [], specs: { ...SELF, loaded_models: [resident("darkmux:qwen")], engine_servers: [flint] } });
+      renderFleetLens({ records: normAll([{ ...start("s1", { model: "flint" }, { endpoint: "openai:127.0.0.1:8092/flint-int4" }) }]) });
+      await waitFor(() => expect(document.querySelector(".mach .spec")?.textContent).toBe("Apple M5 Max"));
+      await waitFor(() => expect(countEl()?.textContent).toBe("1 running · flint · 127.0.0.1:8092"));
+    } finally {
+      metas.forEach((m) => m.remove());
+    }
+  });
+
+  it("two executions whose ids shorten alike keep what tells them apart (an A/B run)", async () => {
+    mockFleetFetch({
+      runs: [],
+      flowToday: [start("s1", { model: "darkmux:qwen3.6-35b-a3b-turboquant-mlx" }), start("s2", { model: "darkmux:qwen3.6-35b-a3b-mlx" })],
+      specs: SELF,
+    });
+    renderFleetLens();
+    await waitFor(() => expect(countEl()?.textContent).toBe("2 running · 1/2 · qwen3.6-35b-a3b-turboquant-mlx"));
+  });
+
   it("a scrubbed playhead names no residents: what is loaded is a fact about now", async () => {
     mockFleetFetch({ runs: [], specs: { ...SELF, loaded_models: [resident("darkmux:qwen")] } });
     renderFleetLens({ playhead: Date.parse(at("09:00:00")) });
