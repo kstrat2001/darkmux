@@ -51,7 +51,32 @@ describe("machineEngine (#316 stage 4.5)", () => {
       expect(darkmuxResidents({ engine: mlx, lms_unreachable: true, loaded_models: [] })).toEqual({
         known: false,
         why: "local-8080 does not report which models it has loaded.",
+        servers: 0,
       });
+    });
+
+    // (#3554, operator) The servers darkmux started are darkmux's own
+    // residents too (#3450): "N loaded" counts them.
+    const server = (served_name: string, port: number) => ({ endpoint: "local", engine: "flint", model: served_name, served_name, n_ctx: 4096, port, pid: 1, started_at_ms: 0, answering: true });
+    it("counts the servers darkmux started: a Flint-only machine holds one", () => {
+      expect(darkmuxResidents({ engine: lms, lms_unreachable: false, loaded_models: [model("user-loaded")], engine_servers: [server("flint", 8092)] })).toEqual({ known: true, count: 1 });
+    });
+    it("adds the servers to LM Studio's darkmux residents", () => {
+      expect(darkmuxResidents({ engine: lms, lms_unreachable: false, loaded_models: [model("darkmux:qwen")], engine_servers: [server("flint", 8092)] })).toEqual({ known: true, count: 2 });
+    });
+    it("never counts a server twice when the engine's list names it too", () => {
+      const specs = { engine: lms, lms_unreachable: false, loaded_models: [model("darkmux:qwen3.8-27b"), model("darkmux:qwen")], engine_servers: [server("darkmux:qwen3.8-27b", 8093)] };
+      expect(darkmuxResidents(specs)).toEqual({ known: true, count: 2 });
+    });
+    it("keeps the servers' count when the engine's list is unknown, without a total", () => {
+      expect(darkmuxResidents({ engine: lms, lms_unreachable: true, loaded_models: [], engine_servers: [server("flint", 8092)] })).toEqual({
+        known: false,
+        why: "LM Studio could not be asked (`lms ps` failed); what it holds is unknown.",
+        servers: 1,
+      });
+    });
+    it("reads a card from a darkmux before 5.10, which lists no servers, as none", () => {
+      expect(darkmuxResidents({ engine: lms, lms_unreachable: false, loaded_models: [model("darkmux:qwen")] } as never)).toEqual({ known: true, count: 1 });
     });
     it("claims nothing when no card was read", () => {
       expect(darkmuxResidents(null)).toBeNull();

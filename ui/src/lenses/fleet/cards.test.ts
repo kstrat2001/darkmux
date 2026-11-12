@@ -1453,9 +1453,20 @@ describe("the count line's model, engine and residents (#3554)", () => {
   });
 
   it("never says 0 loaded when the list is not known: the reason is in the title", () => {
-    const line = countLine({ ...one, runsCount: 0, executions: 0, position: 0, shown: null, residents: { known: false, why: "LM Studio could not be asked (`lms ps` failed); what it holds is unknown." } });
+    const line = countLine({ ...one, runsCount: 0, executions: 0, position: 0, shown: null, residents: { known: false, why: "LM Studio could not be asked (`lms ps` failed); what it holds is unknown.", servers: 0 } });
     expect(line.text).toBe("0 running");
     expect(line.title).toBe("0 running · loaded models unknown: LM Studio could not be asked (`lms ps` failed); what it holds is unknown.");
+  });
+
+  // (#3554, operator) With the engine's list unknown, the servers are a lower
+  // bound: "1+ loaded", never a total that says LM Studio holds none.
+  it("an unknown list with servers known reads as a lower bound, the unknown half in the title", () => {
+    const why = "LM Studio could not be asked (`lms ps` failed); what it holds is unknown.";
+    expect(countLine({ ...one, runsCount: 0, executions: 0, position: 0, shown: null, residents: { known: false, why, servers: 1 } })).toEqual({
+      text: "0 running · 1+ loaded",
+      title: `0 running · 1+ loaded: 1 server darkmux started; the rest is unknown: ${why}`,
+    });
+    expect(countLine({ ...one, runsCount: 0, executions: 0, position: 0, shown: null, residents: { known: false, why, servers: 2 } }).title).toMatch(/: 2 servers darkmux started;/);
   });
 
   it("claims nothing about residents with no card read", () => {

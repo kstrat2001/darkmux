@@ -3796,6 +3796,15 @@ describe("FleetLens: the count line names the model and what is loaded (#3554)",
     expect(countEl().getAttribute("title")).toBe("0 running · 2 loaded");
   });
 
+  // (#3554, operator) A machine whose only model is a server darkmux started
+  // holds one, never "0 loaded" above its own "1 server" line.
+  it("a Flint-only machine reads 1 loaded", async () => {
+    const flint = { endpoint: "local-flint", engine: "flint", model: "flint-int4", served_name: "flint", n_ctx: 4096, port: 8092, pid: 1, started_at_ms: 0, answering: true };
+    mockFleetFetch({ runs: [], specs: { ...SELF, loaded_models: [resident("user-loaded")], engine_servers: [flint] } });
+    renderFleetLens();
+    await waitFor(() => expect(countEl()?.textContent).toBe("0 running · 1 loaded"));
+  });
+
   it("a machine whose engine could not say what it holds never reads 0 loaded: the title says why", async () => {
     mockFleetFetch({ runs: [], specs: { ...SELF, lms_unreachable: true } });
     renderFleetLens();

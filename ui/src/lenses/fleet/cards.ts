@@ -931,14 +931,24 @@ function routeWords(
 }
 
 /** (#3554) An idle count line with what the machine holds: "0 running · 2
- *  loaded" when its engine said, the plain count with the reason in the title
- *  when the list is not known (never "0 loaded" about a list nobody read), and
- *  the plain count when no card was read. */
+ *  loaded" when its engine said. When the engine's list is not known, never a
+ *  total that says it holds none: the servers darkmux started as a lower bound
+ *  ("1+ loaded", the unknown half in the title), else the plain count with
+ *  the reason in the title. The plain count when no card was read. */
 function residentsLine(count: string, residents: CardResidents | null): { text: string; title: string } {
   if (!residents) return { text: count, title: count };
-  if (!residents.known) return { text: count, title: `${count} · loaded models unknown: ${residents.why}` };
+  if (!residents.known) return unknownResidentsLine(count, residents);
   const text = `${count} · ${residents.count} loaded`;
   return { text, title: text };
+}
+
+/** The idle line when the engine's list is not known: the servers as a lower
+ *  bound when there are any. */
+function unknownResidentsLine(count: string, r: { why: string; servers: number }): { text: string; title: string } {
+  if (r.servers === 0) return { text: count, title: `${count} · loaded models unknown: ${r.why}` };
+  const text = `${count} · ${r.servers}+ loaded`;
+  const servers = `${r.servers} ${r.servers === 1 ? "server" : "servers"} darkmux started`;
+  return { text, title: `${text}: ${servers}; the rest is unknown: ${r.why}` };
 }
 
 /** (#3554) The count line's words and its tooltip. While something runs it

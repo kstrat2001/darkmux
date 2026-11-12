@@ -47,27 +47,37 @@ export function residentsUnknownNote(specs: ResidentSpecs | null): string | null
   return "LM Studio could not be asked (`lms ps` failed); what it holds is unknown.";
 }
 
-/** (#3554) What a machine holds for darkmux, as its fleet card counts it. */
-export type CardResidents = { known: true; count: number } | { known: false; why: string };
+/** (#3554) What a machine holds for darkmux, as its fleet card counts it: a
+ *  total, or (the engine's list unknown) why, and the servers darkmux started,
+ *  which are known whatever the engine answered. */
+export type CardResidents = { known: true; count: number } | { known: false; why: string; servers: number };
 
 /** darkmux's namespace on a resident's identifier (contract 4): the test
  *  `darkmux_profiles::ownership::is_darkmux_owned` applies. */
 const DARKMUX_NAMESPACE = "darkmux:";
 
-/** (#3554) How many models the machine holds for darkmux: the residents in
- *  darkmux's namespace, never a model another app loaded (the fleet card is a
- *  darkmux card, not an LM Studio one); or why the list is not known, so a
- *  card never says "0 loaded" about a list nobody read. `null` with no specs:
- *  no card was read, so nothing is claimed. */
-export function darkmuxResidents(specs: (ResidentSpecs & Pick<MachineSpecsResponse, "loaded_models">) | null): CardResidents | null {
+type ResidentsInput = ResidentSpecs & Pick<MachineSpecsResponse, "loaded_models"> & Partial<Pick<MachineSpecsResponse, "engine_servers">>;
+
+/** (#3554) How many models the machine holds for darkmux: the engine's
+ *  residents in darkmux's namespace (never a model another app loaded: the
+ *  fleet card is a darkmux card, not an LM Studio one) plus the servers
+ *  darkmux started (#3450), a server the engine's list also names counted
+ *  once. When the engine's list is not known, why, and the servers alone, so
+ *  a card never says "0 loaded" about a list nobody read. `null` with no
+ *  specs: no card was read, so nothing is claimed. */
+export function darkmuxResidents(specs: ResidentsInput | null): CardResidents | null {
   if (!specs) return null;
+  // A card from a darkmux before 5.10 lists no servers.
+  const servers = Array.isArray(specs.engine_servers) ? specs.engine_servers : [];
   const why = residentsUnknownNote(specs);
-  if (why !== null) return { known: false, why };
+  if (why !== null) return { known: false, why, servers: servers.length };
   // A peer's card is read off the wire: one that leaves the list out claims
   // nothing, rather than "0 loaded" or taking the fleet page down with it.
   const listed: unknown = specs.loaded_models;
   if (!Array.isArray(listed)) return null;
-  return { known: true, count: specs.loaded_models.filter((m) => m.identifier.startsWith(DARKMUX_NAMESPACE)).length };
+  const served = new Set(servers.map((s) => s.served_name));
+  const resident = specs.loaded_models.filter((m) => m.identifier.startsWith(DARKMUX_NAMESPACE) && !served.has(m.identifier));
+  return { known: true, count: resident.length + servers.length };
 }
 
 /** Machine info's engine row: the name, and what it does not report or that
