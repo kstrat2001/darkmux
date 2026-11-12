@@ -751,6 +751,8 @@ mod tests {
             ("page.html", "<p>🎉🎉/hero.jpg 🎉</p>", "/hero.jpg"),
             ("page.html", "<p>Café crème (/hero.jpg) é</p>", "/hero.jpg"),
             ("a.css", "/* 画像 */ .a { background: 画像/hero.jpg; }", "/hero.jpg"),
+            ("data.yml", "# image: /hero.jpg\n", "/hero.jpg"),
+            ("site.toml", "# image = \"/hero.jpg\"\n", "/hero.jpg"),
         ] {
             assert!(spans(file, source, wanted).is_empty(), "{file}: {source:?}");
         }
