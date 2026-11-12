@@ -6373,7 +6373,8 @@ S(("127.0.0.1", port), H).serve_forever()
 
         for named in [None, Some(std::ffi::OsString::new())] {
             let got = host_runtime(named, &at_start).unwrap();
-            assert_eq!(got, HostRuntime { program: real.clone(), leading_args: vec!["runtime".to_string()] });
+            assert_eq!((got.program, got.leading_args), (real.clone(), vec!["runtime".to_string()]));
+            assert!(got.started_as.is_some(), "this executable is checked again where the command is built");
         }
         let unknown = executable_at_start(Err(std::io::Error::other("no exe")));
         let err = host_runtime(None, &unknown).unwrap_err();
@@ -6425,6 +6426,101 @@ S(("127.0.0.1", port), H).serve_forever()
         assert!(err.contains("was replaced since this process started") && err.contains("Restart this darkmux process"), "{err}");
     }
 
+    /// `path`'s (inode, size, mtime).
+    fn ino_len_mtime(path: &Path) -> (u64, u64, std::time::SystemTime) {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(path).unwrap();
+        (m.ino(), m.len(), m.modified().unwrap())
+    }
+
+    /// `path`'s modification time set to `when`.
+    fn set_mtime(path: &Path, when: std::time::SystemTime) {
+        std::fs::File::options().write(true).open(path).unwrap().set_modified(when).unwrap();
+    }
+
+    /// A refusal names what happened and the remedy.
+    fn assert_replaced(err: anyhow::Error) {
+        let err = format!("{err:#}");
+        assert!(err.contains("was replaced since this process started") && err.contains("Restart this darkmux process"), "{err}");
+    }
+
+    /// (#3112 re-review) Only the inode differs: a reinstall that renames a
+    /// same-size file with the same mtime over it (a Homebrew bottle's files
+    /// keep the bottle's build time).
+    #[test]
+    fn a_replacement_differing_only_in_inode_is_refused() {
+        let root = tempfile::TempDir::new().unwrap();
+        let exe = root.path().join("bin/darkmux");
+        an_executable(&exe, "old");
+        let at_start = executable_at_start(Ok(exe.clone()));
+        let (ino, len, mtime) = ino_len_mtime(&exe);
+        let staged = root.path().join("bin/.darkmux.new");
+        an_executable(&staged, "new");
+        set_mtime(&staged, mtime);
+        std::fs::rename(&staged, &exe).unwrap();
+        let (ino2, len2, mtime2) = ino_len_mtime(&exe);
+        assert!(ino2 != ino && len2 == len && mtime2 == mtime, "the fixture differs in the inode alone");
+        assert_replaced(host_runtime(None, &at_start).unwrap_err());
+    }
+
+    /// (#3112 re-review) Only the size differs: the same inode rewritten in
+    /// place (macOS `cp new dst` keeps the destination's inode), its mtime put
+    /// back.
+    #[test]
+    fn an_in_place_rewrite_differing_only_in_size_is_refused() {
+        let root = tempfile::TempDir::new().unwrap();
+        let exe = root.path().join("bin/darkmux");
+        an_executable(&exe, "old");
+        let at_start = executable_at_start(Ok(exe.clone()));
+        let (ino, len, mtime) = ino_len_mtime(&exe);
+        std::fs::write(&exe, "a longer build").unwrap();
+        set_mtime(&exe, mtime);
+        let (ino2, len2, mtime2) = ino_len_mtime(&exe);
+        assert!(ino2 == ino && len2 != len && mtime2 == mtime, "the fixture differs in the size alone");
+        assert_replaced(host_runtime(None, &at_start).unwrap_err());
+    }
+
+    /// (#3112 re-review) Only the mtime differs: the same inode rewritten in
+    /// place with content of the same length.
+    #[test]
+    fn an_in_place_rewrite_differing_only_in_mtime_is_refused() {
+        let root = tempfile::TempDir::new().unwrap();
+        let exe = root.path().join("bin/darkmux");
+        an_executable(&exe, "old");
+        let at_start = executable_at_start(Ok(exe.clone()));
+        let (ino, len, mtime) = ino_len_mtime(&exe);
+        std::fs::write(&exe, "new").unwrap();
+        set_mtime(&exe, mtime + std::time::Duration::from_secs(5));
+        let (ino2, len2, mtime2) = ino_len_mtime(&exe);
+        assert!(ino2 == ino && len2 == len && mtime2 != mtime, "the fixture differs in the mtime alone");
+        assert_replaced(host_runtime(None, &at_start).unwrap_err());
+    }
+
+    /// (#3112 re-review) The early check fails a dispatch fast; between it
+    /// and the exec come role load, a model load that can wait behind a
+    /// preflight hold, the lease and the workspace copy. A replacement in that
+    /// window is refused where the command is built.
+    #[test]
+    fn a_replacement_after_the_early_check_is_refused_where_the_command_is_built() {
+        let root = tempfile::TempDir::new().unwrap();
+        let exe = root.path().join("bin/darkmux");
+        an_executable(&exe, "old");
+        let at_start = executable_at_start(Ok(exe.clone()));
+        let host = host_runtime(None, &at_start).expect("the early check passes");
+        let image = RuntimeImage {
+            inject: true,
+            darkmux_image: crate::runtime_image::ResolvedImage { reference: "r".into(), id: "r".into() },
+            image: "i".into(),
+            run_image: "host".into(),
+            host_runtime: Some(host),
+        };
+        assert!(runtime_program(&image).is_ok(), "unchanged, the command is built");
+        let staged = root.path().join("bin/.darkmux.new");
+        an_executable(&staged, "new");
+        std::fs::rename(&staged, &exe).unwrap();
+        assert_replaced(runtime_program(&image).unwrap_err());
+    }
+
     /// (#3112) `DARKMUX_SANDBOX_RUNTIME`, for development, runs a standalone
     /// runtime instead, by its real path and with no subcommand. One that is
     /// not an executable file (missing, a directory, not executable) is
@@ -6441,7 +6537,7 @@ S(("127.0.0.1", port), H).serve_forever()
         });
         assert!(relative.is_relative(), "{}", relative.display());
         let got = host_runtime(Some(relative.into_os_string()), &at_start).unwrap();
-        assert_eq!(got, HostRuntime { program: standalone.canonicalize().unwrap(), leading_args: Vec::new() });
+        assert_eq!(got, HostRuntime { program: standalone.canonicalize().unwrap(), leading_args: Vec::new(), started_as: None });
 
         let plain = root.path().join("not-executable");
         std::fs::write(&plain, "").unwrap();
@@ -6478,7 +6574,7 @@ S(("127.0.0.1", port), H).serve_forever()
             run_image: "i".into(),
             host_runtime,
         };
-        let host = HostRuntime { program: PathBuf::from("/real/darkmux"), leading_args: vec!["runtime".to_string()] };
+        let host = HostRuntime { program: PathBuf::from("/real/darkmux"), leading_args: vec!["runtime".to_string()], started_as: None };
         assert_eq!(
             runtime_program(&image(Some(host))).unwrap(),
             (Some(PathBuf::from("/real/darkmux")), vec!["runtime".to_string()])

@@ -117,6 +117,60 @@ fn darkmux_help() -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// (#3112 re-review) A copy of this build at `bin`, started as a Seatbelt
+/// `dispatch` of a role that does not exist, with nothing of the runner's
+/// environment: it stops before any model, image or LM Studio is touched.
+/// `DARKMUX_ACK_DIR` is retired and only warned about, so its warning on
+/// stderr says the process is past `main`'s startup record and waiting for
+/// its message on stdin. `between` runs then; the message follows, and the
+/// run's exit code and whole stderr come back.
+fn seatbelt_dispatch_of_a_copy(bin: &Path, home: &Path, between: impl FnOnce()) -> (Option<i32>, String) {
+    std::fs::copy(darkmux_exe(), bin).unwrap();
+    let mut cmd = Command::new(bin);
+    darkmux_types::test_isolation::neutralize_state_vars(&mut cmd);
+    let mut child = cmd
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", "/usr/bin:/bin")
+        .env("DARKMUX_HOME", home.join(".darkmux"))
+        .env("DARKMUX_SANDBOX", "seatbelt")
+        .env(darkmux_sandbox::seatbelt::STATE_DIR_ENV, home.join("seatbelt"))
+        .env("DARKMUX_ACK_DIR", "retired")
+        .args(["dispatch", "no-such-role-xyz"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let lines = BufReader::new(child.stderr.take().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in lines.lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut stderr = String::new();
+    while !stderr.contains("DARKMUX_ACK_DIR") {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let line = rx.recv_timeout(left).unwrap_or_else(|_| panic!("no startup warning: {stderr}"));
+        stderr.push_str(&line);
+        stderr.push('\n');
+    }
+    between();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"do the task").unwrap();
+    drop(stdin);
+    let status = child.wait().unwrap();
+    while let Ok(line) = rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        stderr.push_str(&line);
+        stderr.push('\n');
+    }
+    (status.code(), stderr)
+}
+
 // ===== DARKMUX-SPAWN-HELPERS: END (#3112) ============================
 
 // ─── the mock model endpoint ───────────────────────────────────────────
@@ -878,59 +932,70 @@ fn the_linked_runtime_declares_the_standalone_runtimes_dependencies() {
     assert_eq!(linked, standalone);
 }
 
-/// `name -> versions` of every package `package` builds with (normal and
-/// build dependencies, transitively), as `manifest`'s lockfile resolves them.
-fn resolved_closure(manifest: &Path, package: &str) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+/// Every package (`name vX.Y.Z`) `package` builds with: normal and build
+/// dependencies, transitively, on every target, as `cargo tree` resolves its
+/// own build graph from `manifest`'s lockfile. The package itself left out.
+fn resolved_closure(manifest: &Path, package: &str) -> std::collections::BTreeSet<String> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let out = Command::new(cargo)
-        .args(["metadata", "--format-version", "1", "--locked", "--manifest-path"])
+        .args(["tree", "--locked", "-e", "normal,build", "--target", "all", "--prefix", "none", "-f", "{p}", "-p", package, "--manifest-path"])
         .arg(manifest)
         .output()
         .unwrap();
-    assert!(out.status.success(), "cargo metadata {}: {}", manifest.display(), String::from_utf8_lossy(&out.stderr));
-    let m: Value = serde_json::from_slice(&out.stdout).unwrap();
-    let name_version = |id: &str| {
-        let p = m["packages"].as_array().unwrap().iter().find(|p| p["id"] == id).unwrap();
-        (p["name"].as_str().unwrap().to_string(), p["version"].as_str().unwrap().to_string())
-    };
-    let nodes = m["resolve"]["nodes"].as_array().unwrap();
-    let start = m["packages"].as_array().unwrap().iter().find(|p| p["name"] == package).unwrap()["id"].as_str().unwrap().to_string();
-    let (mut seen, mut todo) = (std::collections::BTreeSet::new(), vec![start]);
-    while let Some(id) = todo.pop() {
-        let node = nodes.iter().find(|n| n["id"] == id.as_str()).unwrap();
-        for dep in node["deps"].as_array().unwrap() {
-            let built = dep["dep_kinds"].as_array().unwrap().iter().any(|k| k["kind"].is_null() || k["kind"] == "build");
-            let pkg = dep["pkg"].as_str().unwrap().to_string();
-            if built && seen.insert(pkg.clone()) {
-                todo.push(pkg);
-            }
-        }
-    }
-    let mut closure: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> = Default::default();
-    for id in &seen {
-        let (name, version) = name_version(id);
-        closure.entry(name).or_default().insert(version);
-    }
-    closure
+    assert!(out.status.success(), "cargo tree {}: {}", manifest.display(), String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.split(" (").next().unwrap().trim().to_string())
+        .filter(|p| !p.is_empty() && !p.starts_with(&format!("{package} v")))
+        .collect()
 }
 
-/// (#3112) The two lockfiles resolve the runtime's dependencies to the same
-/// versions: a package the standalone runtime builds with is the same version
-/// in darkmux's build (which may add more, for features other crates turn
-/// on). Otherwise the two programs differ in code no parity fixture reaches,
-/// such as the CA roots `webpki-roots` trusts.
+/// (#3112) The two lockfiles resolve the runtime's build graph identically:
+/// every package, at every version, the same in darkmux's build as in the
+/// standalone runtime's. Otherwise the two programs differ in code no parity
+/// fixture reaches, such as the CA roots `webpki-roots` trusts.
 #[test]
 fn both_lockfiles_resolve_the_runtimes_dependencies_to_the_same_versions() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let standalone = resolved_closure(&root.join("runtime/Cargo.toml"), "darkmux-runtime");
     let linked = resolved_closure(&root.join("Cargo.toml"), "darkmux-runtime-linked");
-    assert!(standalone.contains_key("webpki-roots"), "the closure was read: {standalone:?}");
-    let differing: Vec<String> = standalone
-        .iter()
-        .filter(|(name, versions)| linked.get(*name).is_none_or(|l| !versions.is_subset(l)))
-        .map(|(name, versions)| format!("{name}: standalone {versions:?}, linked {:?}", linked.get(name)))
-        .collect();
-    assert!(differing.is_empty(), "align these (`cargo update -p <name> --precise <version>`):\n{}", differing.join("\n"));
+    assert!(standalone.iter().any(|p| p.starts_with("webpki-roots v")), "the graph was read: {standalone:?}");
+    let only = |a: &std::collections::BTreeSet<String>, b: &std::collections::BTreeSet<String>| a.difference(b).cloned().collect::<Vec<_>>();
+    assert_eq!(
+        (only(&standalone, &linked), only(&linked, &standalone)),
+        (Vec::new(), Vec::new()),
+        "(standalone only, darkmux only): align them with `cargo update -p <name> --precise <version>` in one lockfile"
+    );
+}
+
+/// (#3112 re-review) The darkmux binary records which file it started from
+/// before anything else, so a process whose executable is replaced while it
+/// runs (a `cargo install`, a `brew upgrade`) refuses its Seatbelt dispatch
+/// rather than running the new runtime against its own arguments. Unchanged,
+/// the same dispatch gets past that point (and fails later, on the role).
+#[test]
+fn a_seatbelt_dispatch_refuses_once_the_running_binary_is_replaced() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join("bin")).unwrap();
+    let bin = tmp.path().join("bin/darkmux");
+    let replace = || {
+        let staged = tmp.path().join("bin/.darkmux.new");
+        std::fs::copy(&bin, &staged).unwrap();
+        std::fs::OpenOptions::new().append(true).open(&staged).unwrap().write_all(b"\n# another build\n").unwrap();
+        std::fs::rename(&staged, &bin).unwrap();
+    };
+
+    let (code, stderr) = seatbelt_dispatch_of_a_copy(&bin, tmp.path(), replace);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("darkmux was replaced since this process started"), "{stderr}");
+    assert!(stderr.contains("Restart this darkmux process"), "{stderr}");
+
+    // A fresh path: macOS kills a process started from a signed file that
+    // was rewritten in place.
+    std::fs::create_dir(tmp.path().join("unchanged")).unwrap();
+    let (code, stderr) = seatbelt_dispatch_of_a_copy(&tmp.path().join("unchanged/darkmux"), tmp.path(), || {});
+    assert!(!stderr.contains("was replaced"), "an unchanged binary is not refused: {stderr}");
+    assert!(stderr.contains("no-such-role-xyz"), "it got as far as the role: {code:?} {stderr}");
 }
 
 /// (#3112) The subcommand is for sandboxes, not people: `--help` does not

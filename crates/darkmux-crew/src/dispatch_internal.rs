@@ -7050,12 +7050,33 @@ struct RuntimeImage {
     host_runtime: Option<HostRuntime>,
 }
 
-/// (#3112) The runtime a Seatbelt sandbox runs: a host program, and the
-/// arguments it takes before the runtime's own (`run …`).
+/// (#3112) The runtime a Seatbelt sandbox runs: a host program, the
+/// arguments it takes before the runtime's own (`run …`), and, for this
+/// executable, which file it must still be when the command is built.
 #[derive(Debug, Clone, PartialEq)]
 struct HostRuntime {
     program: PathBuf,
     leading_args: Vec<String>,
+    started_as: Option<FileIdentity>,
+}
+
+impl HostRuntime {
+    /// Refuse unless `program` is still the file this process started from.
+    /// Checked when the runtime is chosen (fails fast) and again where the
+    /// command is built: between them come the role, a model load that can
+    /// wait behind a preflight hold, the lease and the workspace copy.
+    fn ensure_unreplaced(&self) -> Result<()> {
+        let Some(started) = &self.started_as else { return Ok(()) };
+        if file_identity(&self.program).ok().as_ref() != Some(started) {
+            bail!(
+                "darkmux was replaced since this process started: {} is no longer the file it started from \
+                 (an upgrade, a reinstall or `brew cleanup`), so its runtime would not match this process. \
+                 Restart this darkmux process and dispatch again",
+                self.program.display()
+            );
+        }
+        Ok(())
+    }
 }
 
 /// (#3112) The subcommand of the darkmux binary that IS the agent runtime
@@ -7087,10 +7108,10 @@ fn file_identity(path: &Path) -> std::io::Result<FileIdentity> {
 
 /// (#3112 review) This executable as the process started from it: its real
 /// path then, and which file was there. A Seatbelt dispatch runs that path,
-/// and only while the same file is still there: a long-lived process
-/// (`darkmux serve`) must never run a NEWER build's runtime against its own
-/// arguments and parsers after an upgrade, and the runtime's `--version`
-/// cannot tell them apart.
+/// and only while the same file is still there: a process that was running
+/// when its install was replaced (a `mission launch` dispatching in-process)
+/// must never run a NEWER build's runtime against its own arguments and
+/// parsers, and the runtime's `--version` cannot tell them apart.
 #[derive(Debug)]
 pub struct ExecutableAtStart(std::result::Result<(PathBuf, FileIdentity), String>);
 
@@ -7131,18 +7152,12 @@ fn host_runtime(override_program: Option<std::ffi::OsString>, at_start: &Executa
                 named.display()
             )
         })?;
-        return Ok(HostRuntime { program, leading_args: Vec::new() });
+        return Ok(HostRuntime { program, leading_args: Vec::new(), started_as: None });
     }
     let (path, started) = at_start.0.as_ref().map_err(|why| anyhow!("{why}"))?;
-    if file_identity(path).ok().as_ref() != Some(started) {
-        bail!(
-            "darkmux was replaced since this process started: {} is no longer the file it started from \
-             (an upgrade, a reinstall or `brew cleanup`), so its runtime would not match this process. \
-             Restart this darkmux process (a running `darkmux serve` included) and dispatch again",
-            path.display()
-        );
-    }
-    Ok(HostRuntime { program: path.clone(), leading_args: vec![RUNTIME_SUBCOMMAND.to_string()] })
+    let runtime = HostRuntime { program: path.clone(), leading_args: vec![RUNTIME_SUBCOMMAND.to_string()], started_as: Some(*started) };
+    runtime.ensure_unreplaced()?;
+    Ok(runtime)
 }
 
 /// A regular file someone may execute.
@@ -7157,7 +7172,11 @@ fn is_executable_file(path: &Path) -> bool {
 /// darkmux image, which has its runtime baked in.
 fn runtime_program(image: &RuntimeImage) -> Result<(Option<PathBuf>, Vec<String>)> {
     match &image.host_runtime {
-        Some(host) => Ok((Some(host.program.clone()), host.leading_args.clone())),
+        Some(host) => {
+            // (#3112 re-review) The last point before the command is built.
+            host.ensure_unreplaced()?;
+            Ok((Some(host.program.clone()), host.leading_args.clone()))
+        }
         None if image.inject => Ok((Some(ensure_runtime_binary_cached(&image.darkmux_image.id)?), Vec::new())),
         None => Ok((None, Vec::new())),
     }
