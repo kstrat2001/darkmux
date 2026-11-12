@@ -193,6 +193,18 @@ pub enum Read {
     Each(fn(&DarkmuxConfig) -> Vec<(String, String)>),
 }
 
+/// What an absent setting resolves to.
+#[derive(Clone, Copy)]
+enum Shipped {
+    /// A per-item setting: absent means "no constraint".
+    None,
+    /// The same token on every machine.
+    Fixed(&'static str),
+    /// (#3112) This machine's answer (`runtime.sandbox`: the platform's
+    /// default sandbox), asked each time the setting resolves.
+    Host(fn() -> &'static str),
+}
+
 /// One enum-typed setting. Built only through [`EnumSetting::of`] /
 /// [`EnumSetting::each`], which is what keeps `values` bound to a real
 /// [`ConfigEnum`].
@@ -211,10 +223,12 @@ pub struct EnumSetting {
     pub values: &'static [(&'static str, &'static str)],
     /// [`ConfigEnum::RETIRED`].
     pub retired: &'static [(&'static str, &'static str)],
-    /// The value an absent setting resolves to (a token of `values`,
-    /// pinned by `every_shipped_value_is_a_registered_token`). `None` for a
-    /// per-item setting, where absent means "no constraint".
-    pub shipped: Option<&'static str>,
+    /// The value an absent setting resolves to: a fixed token of `values`,
+    /// or (#3112) this host's answer; pinned by
+    /// `every_shipped_value_is_a_registered_token`. Absent for a per-item
+    /// setting, where absent means "no constraint". Read it through
+    /// [`EnumSetting::shipped`].
+    shipped: Shipped,
     /// The entry points that could consume this setting, and so refuse on
     /// a bad value, even for a run that would not read it (conservative on
     /// purpose: bad config is bad config). Empty only with a `no_scope_reason`.
@@ -240,7 +254,7 @@ impl EnumSetting {
             kind: T::KIND,
             values: T::TABLE,
             retired: T::RETIRED,
-            shipped: Some(shipped),
+            shipped: Shipped::Fixed(shipped),
             scopes,
             no_scope_reason: None,
             read: Read::One(read),
@@ -260,11 +274,41 @@ impl EnumSetting {
             kind: T::KIND,
             values: T::TABLE,
             retired: T::RETIRED,
-            shipped: None,
+            shipped: Shipped::None,
             scopes,
             no_scope_reason: None,
             read: Read::Each(read),
         }
+    }
+
+    /// (#3112) A scalar setting whose absent value is this machine's
+    /// answer, `host_default()`, a token of `T`, rather than one fixed token.
+    pub const fn of_host<T: ConfigEnum>(
+        key: &'static str,
+        env: Option<&'static str>,
+        host_default: fn() -> &'static str,
+        scopes: &'static [Scope],
+        read: fn(&DarkmuxConfig) -> Option<&str>,
+    ) -> Self {
+        let mut setting = Self::of::<T>(key, env, "", scopes, read);
+        setting.shipped = Shipped::Host(host_default);
+        setting
+    }
+
+    /// The value an absent setting resolves to here, or `None` for a
+    /// per-item setting.
+    pub fn shipped(&self) -> Option<&'static str> {
+        match self.shipped {
+            Shipped::None => None,
+            Shipped::Fixed(t) => Some(t),
+            Shipped::Host(f) => Some(f()),
+        }
+    }
+
+    /// (#3112) Whether [`EnumSetting::shipped`] is this machine's answer
+    /// rather than the same token everywhere.
+    pub fn shipped_by_host(&self) -> bool {
+        matches!(self.shipped, Shipped::Host(_))
     }
 
     /// The same entry, stating why no entry point consumes it.
@@ -301,11 +345,13 @@ impl EnumSetting {
     /// then one line per retired spelling.
     pub fn values_help(&self, indent: &str) -> String {
         let width = self.values.iter().map(|(t, _)| t.len()).max().unwrap_or(0);
+        let shipped = self.shipped();
+        let default = if self.shipped_by_host() { " (default on this machine)" } else { " (default)" };
         let mut lines: Vec<String> = self
             .values
             .iter()
             .map(|(t, m)| {
-                let mark = if Some(*t) == self.shipped { " (default)" } else { "" };
+                let mark = if Some(*t) == shipped { default } else { "" };
                 format!("{indent}{t:<width$}  {m}{mark}")
             })
             .collect();
@@ -442,7 +488,7 @@ pub fn resolve_in(
             .map(|t| (t, Source::Config))
             .ok_or_else(|| setting.bad(raw, SetIn::Config(setting.key.to_string())));
     }
-    Ok((setting.shipped.expect("a scalar setting has a shipped value"), Source::BuiltIn))
+    Ok((setting.shipped().expect("a scalar setting has a shipped value"), Source::BuiltIn))
 }
 
 /// Every bad value of one setting, scalar or per-item. The general
@@ -878,6 +924,9 @@ fn read_thermal_resume_at(c: &DarkmuxConfig) -> Option<&str> {
 fn read_memory_pressure_gate(c: &DarkmuxConfig) -> Option<&str> {
     c.runtime.as_ref()?.memory.as_ref()?.pressure_gate.as_deref()
 }
+fn read_sandbox(c: &DarkmuxConfig) -> Option<&str> {
+    c.runtime.as_ref()?.sandbox.as_deref()
+}
 fn read_fleet_mode(c: &DarkmuxConfig) -> Option<&str> {
     c.fleet.as_ref()?.mode.as_deref()
 }
@@ -950,6 +999,17 @@ pub static ENUM_SETTINGS: &[EnumSetting] = &[
         "warning",
         DISPATCHING,
         read_memory_pressure_gate,
+    ),
+    // (#3112) Every entry point can start a sandbox: a dispatch (and every
+    // run made of dispatches), a lab run's tests, the mods gate a mission
+    // runs, a fleet job, the daemon's own launches and reapers, a paired
+    // app's work and previews.
+    EnumSetting::of_host::<crate::config::SandboxKind>(
+        "runtime.sandbox",
+        Some("DARKMUX_SANDBOX"),
+        crate::config_access::sandbox_default,
+        &Scope::ALL,
+        read_sandbox,
     ),
     EnumSetting::of::<crate::config::FleetMode>(
         "fleet.mode",
@@ -1056,7 +1116,7 @@ mod tests {
     #[test]
     fn every_shipped_value_is_a_registered_token() {
         for s in ENUM_SETTINGS {
-            match s.shipped {
+            match s.shipped() {
                 Some(v) => assert!(
                     s.values.iter().any(|(t, _)| *t == v),
                     "{}: shipped value `{v}` is not one of its own values ({})",
@@ -1119,7 +1179,7 @@ mod tests {
                 assert_eq!(resolve_in(s, &good, no_env), Ok((first, Source::Config)), "{}", s.key);
                 assert_eq!(
                     resolve_in(s, &DarkmuxConfig::default(), no_env),
-                    Ok((s.shipped.unwrap(), Source::BuiltIn))
+                    Ok((s.shipped().unwrap(), Source::BuiltIn))
                 );
             }
             let bad = bad_in(s, &config_with_value(s, "definitely-not-a-value"), no_env);
@@ -1197,7 +1257,7 @@ mod tests {
         assert_eq!(DetectionPolicy::RETIRED, &[("enforce", "conclude"), ("observe", "record")]);
         assert_eq!(DetectionPolicy::default(), DetectionPolicy::Conclude);
         let s = setting("runtime.detection.degeneracy.policy").unwrap();
-        assert_eq!(s.shipped, Some("conclude"));
+        assert_eq!(s.shipped(), Some("conclude"));
         assert!(DetectionPolicy::Conclude.measures() && DetectionPolicy::Conclude.acts() && !DetectionPolicy::Conclude.warns());
         assert!(DetectionPolicy::Warn.measures() && !DetectionPolicy::Warn.acts() && DetectionPolicy::Warn.warns());
         assert!(DetectionPolicy::Record.measures() && !DetectionPolicy::Record.acts() && !DetectionPolicy::Record.warns());
@@ -1219,7 +1279,8 @@ mod tests {
                     .find(|l| l.trim_start().starts_with(&format!("{t} ")))
                     .unwrap_or_else(|| panic!("{}: no line for `{t}` in:\n{help}", s.key));
                 assert!(line.starts_with("    ") && line.contains(m), "{}: `{line}`", s.key);
-                assert_eq!(line.ends_with(" (default)"), s.shipped == Some(*t), "{}: `{line}`", s.key);
+                let marked = line.ends_with(" (default)") || line.ends_with(" (default on this machine)");
+                assert_eq!(marked, s.shipped() == Some(*t), "{}: `{line}`", s.key);
             }
             for (old, new) in s.retired {
                 assert!(help.contains(&format!("`{old}` was renamed to `{new}`")), "{}: {help}", s.key);
@@ -1336,6 +1397,7 @@ mod tests {
     fn every_enum_in_the_config_schema_is_registered() {
         /// Enums in darkmux-types that are not the value of one setting.
         const NOT_SETTINGS: &[(&str, &str)] = &[
+            ("Shipped", "how an enum setting's absent value is found (fixed or this host's answer, #3112), never a setting"),
             ("HeaderValue", "a hook header's value shape (literal string or Keychain item), not a token set"),
             ("Kind", "what kind of fact a withheld `config.json` value is (`panel_audience`), never a setting"),
             ("Verdict", "whether a remote console viewer is shown a `config.json` path (`panel_audience`), never a setting"),
@@ -1477,6 +1539,27 @@ mod tests {
         // Anti-vacuity: the scan must see the allowed boolean vocabulary's
         // own arms, or it is not recognizing match arms at all.
         assert!(literal_arms_seen >= 2, "the literal-arm scan saw {literal_arms_seen} arms");
+    }
+
+    /// (#3112) `runtime.sandbox` picks the sandbox every isolated run uses:
+    /// `DARKMUX_SANDBOX` over the key, `docker`, `seatbelt` or `landlock`, refused at
+    /// every entry point (each one can start a sandbox), and absent it is
+    /// this host's answer, never a fixed value.
+    #[test]
+    fn the_sandbox_setting_is_registered_with_this_hosts_default() {
+        let s = setting("runtime.sandbox").expect("runtime.sandbox is registered");
+        assert_eq!(s.env, Some("DARKMUX_SANDBOX"));
+        assert_eq!(s.rust_name, "SandboxKind");
+        assert_eq!(s.tokens_joined(), "docker, seatbelt, landlock");
+        assert_eq!(s.scopes, &Scope::ALL[..]);
+        assert!(s.shipped_by_host(), "the default is the platform's answer");
+        // A test build never depends on the host it runs on.
+        assert_eq!(s.shipped(), Some("docker"));
+        let help = s.values_help("  ");
+        assert!(help.lines().any(|l| l.contains("docker") && l.ends_with(" (default on this machine)")), "{help}");
+        let bad = bad_in(s, &config_with_value(s, "podman"), no_env);
+        assert_eq!(bad.len(), 1);
+        assert!(bad[0].to_string().contains("runtime.sandbox"), "{}", bad[0]);
     }
 
     /// `docs/ENVIRONMENT.md`'s row for each setting carries the value list

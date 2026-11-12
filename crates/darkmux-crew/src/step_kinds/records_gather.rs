@@ -804,6 +804,7 @@ mod tests {
             phase_id: None,
             step_id: None,
             source: None,
+            source_root: None,
             gate: None,
             gate_skipped_reason: None,
             change_key: None,

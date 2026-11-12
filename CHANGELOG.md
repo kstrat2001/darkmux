@@ -14,6 +14,49 @@ darkmux release.
 
 ## [Unreleased]
 
+### Changed
+
+- **On a Mac, darkmux needs no Docker: the sandbox is a setting, and macOS's own is the default
+  (#3112).** New setting `runtime.sandbox` (env `DARKMUX_SANDBOX`, `config.json` schema 2.9):
+  `docker` or `seatbelt`, the sandbox every isolated run uses (a dispatch, a lab run's verify
+  command and grader suites, the mods gate). Unset, the platform decides: `seatbelt` (macOS's
+  `sandbox-exec`) on a Mac that has it, `docker` on Linux and everywhere else. Any other value is
+  refused by every entry point, naming the key, and `darkmux doctor` fails it; `seatbelt` on a host
+  without `sandbox-exec` is refused too. `darkmux doctor` gains a `sandbox` row (the sandbox in
+  effect, where the value came from, and whether it can run here) and asks Docker's rows
+  (`docker runtime`, `daemon docker`, `runtime image freshness`, `runtime binary cache`,
+  `container user`) only under Docker; under Seatbelt each says Docker is not needed. `/health`
+  gains `sandbox` (the daemon's own) and `sandbox_configured` (the setting now; a running daemon
+  keeps its own until it restarts, the processes it starts read the setting fresh), and answers
+  `docker_on_path` only when either is Docker; doctor's `daemon sandbox` row warns when the two
+  differ. `init`'s next steps, the guide
+  and the README ask for Docker only under Docker. Client previews (`darkmux client serve`) still
+  need Docker: under Seatbelt a preview start is refused (403 `forbidden`), naming
+  `darkmux config set runtime.sandbox docker`.
+
+  Under a sandbox on the host every model-facing path names where that sandbox sees it: the lab
+  prompt, crawl unit briefs, split-gitdir notes, mod attachments, and the shipped `review` and
+  `crawl` mod-writer messages, which now say `${WORKSPACE_ROOT}` (a placeholder in any dispatch message, a
+  `darkmux dispatch` one included, expanded to the run's actual workspace: `/workspace` in a
+  container). The runtime renames `/workspace` to the host-seen root in the system prompt and
+  the user's message alike, at a path boundary only. A user mission config whose step message
+  names `/workspace` literally is renamed with it; `darkmux doctor` warns about it and suggests
+  `${WORKSPACE_ROOT}`. Findings and mod
+  kits that name the host-seen root are stored exactly as `/workspace` ones are: flow schema
+  2.8.0 adds `payload.context.root`, mod records 2.2 add `source_root`, both additive and absent
+  on Docker runs.
+
+  **Upgrading:** on a Mac whose `config.json` names no sandbox, dispatches, lab runs and the mods
+  gate move from Docker to Seatbelt. Under Seatbelt the agent runtime is the darkmux executable
+  itself (`darkmux runtime`, #3558): nothing to build, pull or install, and no Docker. A darkmux
+  process that was running when darkmux was upgraded refuses Seatbelt dispatches until it is
+  restarted (`brew services restart darkmux` for the daemon), and `darkmux doctor`'s `sandbox`
+  row says so. Resuming a checkpoint written under Docker is refused under Seatbelt, naming both
+  sandboxes: resume it with `darkmux config set runtime.sandbox docker`. To keep
+  Docker, `darkmux config set runtime.sandbox docker` (and upgrade every darkmux that reads the
+  same `~/.darkmux` first: an older binary refuses the new key). Linux is unchanged. The Homebrew
+  formula's caveats still say dispatches need Docker; they change with the next release.
+
 ## [5.10.0] - 2026-11-11
 
 The Mux Bot release: darkmux starts the Tensorfold and Flint servers it dispatches to, and a paired

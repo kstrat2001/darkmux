@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// The program that applies a profile and runs a command under it.
-pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+pub const SANDBOX_EXEC: &str = darkmux_platform::SANDBOX_EXEC;
 
 /// The shell every planned command runs: the launcher, and the lifecycle
 /// scripts that read a sandbox's directory.

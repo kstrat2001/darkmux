@@ -104,7 +104,10 @@ impl ConfineSupport {
 /// What this host offers [`enter`]. On Linux it reads the Landlock ABI and
 /// tries a user namespace in a short-lived child (about a millisecond).
 pub fn support() -> ConfineSupport {
-    imp::support()
+    // Probed once per process: the kernel's answer does not change, and the
+    // default sandbox asks it whenever the setting is resolved.
+    static SUPPORT: std::sync::OnceLock<ConfineSupport> = std::sync::OnceLock::new();
+    *SUPPORT.get_or_init(imp::support)
 }
 
 /// Confine this process as `c` says and exec `argv` (the program, then its

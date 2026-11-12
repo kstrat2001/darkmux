@@ -508,9 +508,10 @@ impl WorkloadProvider for CodingTaskProvider {
 /// command with the sandbox's path as its reader sees it. This is what lets
 /// a workload manifest be portable: it names `${SANDBOX_DIR}` and the run
 /// supplies the path. A dispatched prompt and a contained verify command see
-/// the sandbox at `/workspace` (where the container mounts it; a host path
-/// there is a file the agent cannot find, and an empty trajectory); a verify
-/// command on the host sees the host path (`sandbox_view`).
+/// the sandbox where their sandbox places it: `/workspace` in a container (a
+/// host path there is a file the agent cannot find, and an empty
+/// trajectory), its own host path in a sandbox on the host (#3112); a verify
+/// command on the host sees the host path.
 fn expand_placeholders_with(input: &str, view_path: &str) -> String {
     input
         .replace("${SANDBOX_DIR}", view_path)
@@ -628,10 +629,31 @@ fn reject_escaping_relpath(raw: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-/// The prompt as the dispatch gives it to the model: the sandbox
-/// placeholders expanded to the container's `/workspace`.
-pub(crate) fn dispatched_prompt(loaded: &LoadedWorkload) -> Result<String> {
-    Ok(expand_placeholders_with(&resolve_prompt(loaded)?, "/workspace"))
+/// Where a dispatch mounts the workspace inside a container.
+const WORKSPACE_AT: &str = "/workspace";
+
+/// The prompt as the dispatch gives it to the model, whose workspace is
+/// `sandbox_dir`: the sandbox placeholders expanded to where the configured
+/// sandbox sees it.
+pub(crate) fn dispatched_prompt(loaded: &LoadedWorkload, sandbox_dir: &Path) -> Result<String> {
+    dispatched_prompt_for(loaded, sandbox_dir, darkmux_sandbox::selected().ok())
+}
+
+/// [`dispatched_prompt`] under `kind`: `/workspace` in a container (byte for
+/// byte what every Docker run was told), the workspace's own host path in a
+/// sandbox on the host (#3112 review: a Seatbelt brief that said
+/// `/workspace` sent the model looking for files that are not there). The
+/// same answer the dispatch's own mount gives (`SandboxBackend::place`).
+pub(crate) fn dispatched_prompt_for(loaded: &LoadedWorkload, sandbox_dir: &Path, kind: Option<darkmux_sandbox::BackendKind>) -> Result<String> {
+    let seen = darkmux_sandbox::seen_at(kind, sandbox_dir, WORKSPACE_AT);
+    Ok(expand_placeholders_with(&resolve_prompt(loaded)?, &seen))
+}
+
+/// The prompt as the eval wrote it for grading: the placeholders expanded
+/// to `/workspace` whatever the sandbox, so a grader's quoted sentences match
+/// word for word on every machine.
+pub(crate) fn graded_prompt(loaded: &LoadedWorkload) -> Result<String> {
+    Ok(expand_placeholders_with(&resolve_prompt(loaded)?, WORKSPACE_AT))
 }
 
 pub(crate) fn resolve_prompt(loaded: &LoadedWorkload) -> Result<String> {
@@ -1070,6 +1092,8 @@ fn augment_qa_reply_with_workspace_delta(
 pub(crate) struct TestRunner {
     pub placement: Placement,
     pub user: Option<String>,
+    /// (#3112) The sandbox a contained run uses; `None` on the host.
+    pub sandbox: Option<darkmux_sandbox::BackendKind>,
 }
 
 impl TestRunner {
@@ -1079,19 +1103,26 @@ impl TestRunner {
         if darkmux_types::config_access::tests_on_host() {
             return Ok(Self::host());
         }
+        let sandbox = darkmux_sandbox::selected().map_err(|why| anyhow::anyhow!(why))?;
         let image = contained_command::lab_test_image(loaded.manifest.workload.image.as_deref())?;
-        Ok(Self { placement: Placement::Container(image), user: contained_command::lab_test_user()? })
+        Ok(Self { placement: Placement::Container(image), user: contained_command::lab_test_user()?, sandbox: Some(sandbox) })
     }
 
     pub(crate) fn host() -> Self {
-        Self { placement: Placement::Host, user: None }
+        Self { placement: Placement::Host, user: None, sandbox: None }
     }
 
-    /// The path the tests see for `tree`, the directory mounted for them.
+    /// The path the tests see for `tree`, the directory mounted for them:
+    /// where its sandbox places it (#3112 review: Docker's `/workspace`, a
+    /// Seatbelt sandbox's own canonical path), or the host path.
     pub(crate) fn view(&self, tree: &Path) -> String {
-        match self.placement {
-            Placement::Host => tree.display().to_string(),
-            Placement::Container(_) => "/workspace".to_string(),
+        match (&self.placement, self.sandbox) {
+            (Placement::Container(_), Some(kind)) => darkmux_sandbox::backend_of(kind).place(&darkmux_sandbox::Mount {
+                host: tree.to_path_buf(),
+                at: "/workspace".to_string(),
+                access: darkmux_sandbox::Access::ReadWrite,
+            }),
+            _ => tree.display().to_string(),
         }
     }
 }
@@ -1109,7 +1140,7 @@ pub(crate) struct VerifyPlan {
 /// The prompt as dispatched, and the verify plan: everything a run resolves
 /// before it dispatches.
 fn prompt_and_verify_plan(loaded: &LoadedWorkload, sandbox_dir: &Path) -> Result<(String, Option<VerifyPlan>)> {
-    let prompt = dispatched_prompt(loaded)?;
+    let prompt = dispatched_prompt(loaded, sandbox_dir)?;
     Ok((prompt, verify_plan(loaded, sandbox_dir, TestRunner::for_workload)?))
 }
 
@@ -1195,6 +1226,23 @@ fn verify_workdir(cwd: Option<&str>, view: &str) -> Result<String> {
     Ok(parts.join("/"))
 }
 
+/// (#3112) Why a verify command never ran, naming the sandbox it was to run
+/// in (`kind`, the configured one) and, under Docker alone, why Docker.
+fn not_run_details(why: &str, kind: Option<darkmux_sandbox::BackendKind>) -> String {
+    let (place, docker) = match kind {
+        Some(darkmux_sandbox::BackendKind::Docker) => (
+            darkmux_sandbox::placed_in(darkmux_sandbox::BackendKind::Docker),
+            format!("; {}", darkmux_sandbox::docker_needs().unwrap_or_else(|| "Docker must be installed and running".to_string())),
+        ),
+        Some(other) => (darkmux_sandbox::placed_in(other), String::new()),
+        None => ("its sandbox".to_string(), String::new()),
+    };
+    format!(
+        "the verify command did not run in {place}: {why} (model-written tests run in that sandbox{docker}; \
+         to run them on this machine as your user instead, `darkmux config set runtime.tests_on_host true`)",
+    )
+}
+
 /// A verify run's (passed, details, captured output). A container that never
 /// ran the command, or a command that could not start, is a failed verify
 /// that says so, so the run is still recorded (#3355 review); an interrupt
@@ -1203,11 +1251,7 @@ fn verify_result(ran: Result<Bounded, contained_command::NotRun>, cmd: &str) -> 
     let ran = match ran {
         Ok(ran) => ran,
         Err(why) => {
-            let details = format!(
-                "the verify command did not run in its container: {why} \
-                 (model-written tests run in a container, so they need Docker; to run them on this machine \
-                 as your user instead, `darkmux config set runtime.tests_on_host true`)"
-            );
+            let details = not_run_details(&why.to_string(), darkmux_sandbox::selected().ok());
             return Ok((false, details.clone(), format!("{details}\n")));
         }
     };
@@ -1262,6 +1306,44 @@ pub struct RefusedArtifact {
     pub reason: String,
 }
 
+/// (#3112 review) Where a run's isolated work ran, for its manifest:
+/// `declared` is the workload's pinned image, `on_host` is
+/// `runtime.tests_on_host`, `sandbox` the selection in effect.
+pub(crate) fn run_isolation(
+    declared: Option<&str>,
+    on_host: bool,
+    sandbox: std::result::Result<darkmux_sandbox::BackendKind, String>,
+) -> crate::lab::manifest::RunIsolation {
+    use darkmux_sandbox::BackendKind;
+    let kind = sandbox.ok();
+    let tests = match (on_host, kind) {
+        (true, _) => Some("host".to_string()),
+        (false, Some(BackendKind::Docker)) => {
+            Some(format!("docker:{}", declared.unwrap_or(crate::lab::manifest::RUNTIME_IMAGE_TESTS)))
+        }
+        (false, Some(other)) => Some(darkmux_sandbox::setting_value(other).to_string()),
+        (false, None) => None,
+    };
+    let image_used = !on_host && kind == Some(BackendKind::Docker);
+    crate::lab::manifest::RunIsolation {
+        sandbox: kind.map(|k| darkmux_sandbox::setting_value(k).to_string()),
+        tests,
+        image_not_used: declared.filter(|_| !image_used).map(str::to_string),
+    }
+}
+
+/// (#3112 review) The isolation of a run whose work is only dispatches (no
+/// tests of its own, as tool-bench's trials): the sandbox they ran in.
+pub(crate) fn dispatch_isolation(
+    sandbox: std::result::Result<darkmux_sandbox::BackendKind, String>,
+) -> crate::lab::manifest::RunIsolation {
+    crate::lab::manifest::RunIsolation {
+        sandbox: sandbox.ok().map(|k| darkmux_sandbox::setting_value(k).to_string()),
+        tests: None,
+        image_not_used: None,
+    }
+}
+
 /// What `finish_run` needs besides the dispatch itself.
 pub(crate) struct FinishInputs<'a> {
     pub loaded: &'a LoadedWorkload,
@@ -1297,6 +1379,11 @@ pub(crate) fn finish_run(f: FinishInputs<'_>, d: &Dispatched) -> Result<RunResul
             final_hash: f.final_hash.as_deref(),
             refused_artifacts: f.refused_artifacts,
             end: &end,
+            isolation: Some(run_isolation(
+                f.loaded.manifest.workload.image.as_deref(),
+                darkmux_types::config_access::tests_on_host(),
+                darkmux_sandbox::selected(),
+            )),
         },
     )?;
     Ok(RunResult {
@@ -1323,6 +1410,8 @@ pub struct ManifestInputs<'a> {
     /// How the dispatch ended; stamped onto the manifest so an escalation
     /// reads as one on every surface that reads `manifest.json`.
     pub end: &'a DispatchEnd,
+    /// (#3112) Where the run's isolated work ran.
+    pub isolation: Option<crate::lab::manifest::RunIsolation>,
 }
 
 /// Build and write this run's `manifest.json`: the one place the coding-task
@@ -1371,6 +1460,7 @@ pub fn write_manifest(run_dir: &Path, m: &ManifestInputs<'_>) -> Result<()> {
             extras: Default::default(),
         })))),
         session_id: Some(m.session_id.to_string()),
+        isolation: m.isolation.clone(),
         // Always store the sandbox path as absolute in the
         // manifest. Prior to #359 (QA finding), this stored a
         // relative path when sandbox_dir was under cwd — making
@@ -1572,6 +1662,36 @@ mod tests {
         }
     }
 
+    /// (#3112 review) The run's isolation reaches its `manifest.json`.
+    #[test]
+    fn the_manifest_records_the_runs_isolation() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run1");
+        fs::create_dir_all(&run_dir).unwrap();
+        let session = SessionId::adhoc(RunId::lab("run1").unwrap(), "coder", "w");
+        let isolation = run_isolation(Some("node:22"), false, Ok(darkmux_sandbox::BackendKind::Seatbelt));
+        write_manifest(
+            &run_dir,
+            &ManifestInputs {
+                workload_id: "w",
+                profile_name: "p",
+                profile_description: "",
+                duration_ms: 1,
+                session_id: &session,
+                verify: None,
+                sandbox_dir: tmp.path(),
+                final_hash: None,
+                refused_artifacts: &[],
+                end: &DispatchEnd::Failed,
+                isolation: Some(isolation.clone()),
+            },
+        )
+        .unwrap();
+        let written: serde_json::Value = serde_json::from_str(&fs::read_to_string(run_dir.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(written["isolation"], serde_json::json!({"sandbox": "seatbelt", "tests": "seatbelt", "image_not_used": "node:22"}));
+        assert_eq!(written["manifest_schema_version"], "1.4");
+    }
+
     #[test]
     fn inspect_names_the_escalation_the_providers_own_manifest_recorded() {
         let tmp = TempDir::new().unwrap();
@@ -1599,12 +1719,47 @@ mod tests {
                     final_hash: None,
                     refused_artifacts: &[],
                     end: &end,
+                    isolation: None,
                 },
             )
             .unwrap();
             let notes = CodingTaskProvider.inspect(&loaded, &run_dir).unwrap().notes;
             let found = notes.iter().find(|n| n.starts_with("outcome=")).map(String::as_str);
             assert_eq!(found, want, "{notes:?}");
+        }
+    }
+
+    /// (#3112 review) A run whose work is only dispatches (tool-bench: no
+    /// tests of its own) records the sandbox they ran in and nothing about
+    /// tests; tool-bench's manifest carries it.
+    #[test]
+    fn a_dispatch_only_run_records_its_sandbox() {
+        use darkmux_sandbox::BackendKind;
+        let seatbelt = dispatch_isolation(Ok(BackendKind::Seatbelt));
+        assert_eq!((seatbelt.sandbox.as_deref(), seatbelt.tests, seatbelt.image_not_used), (Some("seatbelt"), None, None));
+        assert_eq!(dispatch_isolation(Err("bad".into())).sandbox, None);
+        let src = include_str!("tool_bench.rs");
+        assert!(src.contains("isolation: Some(crate::providers::coding_task::dispatch_isolation(darkmux_sandbox::selected()))"));
+    }
+
+    /// (#3112 review) Where a run's tests ran is a measured variable: the
+    /// manifest records the sandbox, the tests' placement, and a workload's
+    /// pinned image that a Seatbelt sandbox did not use.
+    #[test]
+    fn a_runs_isolation_is_recorded_with_an_unused_pinned_image_named() {
+        use darkmux_sandbox::BackendKind;
+        let docker = run_isolation(Some("node:22"), false, Ok(BackendKind::Docker));
+        assert_eq!((docker.sandbox.as_deref(), docker.tests.as_deref(), docker.image_not_used.as_deref()), (Some("docker"), Some("docker:node:22"), None));
+        let seatbelt = run_isolation(Some("node:22"), false, Ok(BackendKind::Seatbelt));
+        assert_eq!((seatbelt.sandbox.as_deref(), seatbelt.tests.as_deref(), seatbelt.image_not_used.as_deref()), (Some("seatbelt"), Some("seatbelt"), Some("node:22")));
+        let on_host = run_isolation(Some("node:22"), true, Ok(BackendKind::Seatbelt));
+        assert_eq!((on_host.tests.as_deref(), on_host.image_not_used.as_deref()), (Some("host"), Some("node:22")));
+        let runtime_image = run_isolation(None, false, Ok(BackendKind::Docker));
+        assert_eq!(runtime_image.tests.as_deref(), Some("docker:darkmux-runtime"));
+        assert_eq!(run_isolation(None, false, Err("bad".into())).sandbox, None);
+        let note = contained_command::image_not_used_note("node:22");
+        for part in ["`node:22`", "seatbelt", "isolation.image_not_used", "darkmux config set runtime.sandbox docker"] {
+            assert!(note.contains(part), "missing `{part}` in: {note}");
         }
     }
 
@@ -2723,6 +2878,58 @@ mod tests {
         assert!(run_verify_command(None, tmp.path(), tmp.path()).unwrap().is_none());
     }
 
+    /// (#3112 review, live-proven) The dispatched prompt names the
+    /// workspace where the sandbox sees it: `/workspace` in a container,
+    /// byte for byte as before; its own host path in a sandbox on the host.
+    /// A Seatbelt brief that said `/workspace` sent the model looking for a
+    /// file that is not there. The graded prompt keeps the eval's own words.
+    #[test]
+    fn the_prompt_names_the_workspace_where_the_sandbox_sees_it() {
+        use darkmux_sandbox::BackendKind;
+        let tmp = TempDir::new().unwrap();
+        let sandbox = tmp.path().join("sb");
+        fs::create_dir_all(&sandbox).unwrap();
+        let mut spec = basic_spec();
+        spec.prompt = Some("Fix ${SANDBOX}/bug.py so the tests in ${SANDBOX_DIR} pass.".into());
+        let loaded = make_loaded(spec, tmp.path().to_path_buf());
+        let real = sandbox.canonicalize().unwrap().display().to_string();
+        assert_eq!(
+            dispatched_prompt_for(&loaded, &sandbox, Some(BackendKind::Docker)).unwrap(),
+            "Fix /workspace/bug.py so the tests in /workspace pass."
+        );
+        assert_eq!(
+            dispatched_prompt_for(&loaded, &sandbox, Some(BackendKind::Seatbelt)).unwrap(),
+            format!("Fix {real}/bug.py so the tests in {real} pass.")
+        );
+        assert_eq!(graded_prompt(&loaded).unwrap(), "Fix /workspace/bug.py so the tests in /workspace pass.");
+    }
+
+    /// (#3112 review) The production wiring, through `selected()`: under
+    /// `DARKMUX_SANDBOX=seatbelt` (on a Mac) the dispatched prompt names the
+    /// sandbox dir's own path; under Docker (a test build's default)
+    /// `/workspace`.
+    #[test]
+    #[serial_test::serial]
+    fn the_dispatched_prompt_follows_the_selected_sandbox() {
+        let tmp = TempDir::new().unwrap();
+        let sandbox = tmp.path().join("sb");
+        fs::create_dir_all(&sandbox).unwrap();
+        let mut spec = basic_spec();
+        spec.prompt = Some("Fix ${SANDBOX}/bug.py".into());
+        let loaded = make_loaded(spec, tmp.path().to_path_buf());
+        assert_eq!(dispatched_prompt(&loaded, &sandbox).unwrap(), "Fix /workspace/bug.py");
+        if !darkmux_sandbox::SeatbeltBackend::available() {
+            return;
+        }
+        let prev = std::env::var_os("DARKMUX_SANDBOX");
+        unsafe { std::env::set_var("DARKMUX_SANDBOX", "seatbelt") };
+        let seatbelt = dispatched_prompt(&loaded, &sandbox).unwrap();
+        unsafe {
+            match prev { Some(v) => std::env::set_var("DARKMUX_SANDBOX", v), None => std::env::remove_var("DARKMUX_SANDBOX") }
+        }
+        assert_eq!(seatbelt, format!("Fix {}/bug.py", sandbox.canonicalize().unwrap().display()));
+    }
+
     /// What a run resolves before it dispatches: the prompt, and no plan for
     /// a workload with no verify command. A workload with no prompt is
     /// refused before anything is planned.
@@ -2766,8 +2973,14 @@ mod tests {
     #[test]
     fn verify_paths_name_the_sandbox_as_the_placement_sees_it() {
         let sandbox = Path::new("/tmp/sb");
-        let contained = TestRunner { placement: Placement::Container("img".into()), user: None };
+        let contained = TestRunner { placement: Placement::Container("img".into()), user: None, sandbox: Some(darkmux_sandbox::BackendKind::Docker) };
         assert_eq!(contained.view(sandbox), "/workspace");
+        // (#3112 review) A Seatbelt sandbox sees the tree at its own
+        // (canonical) path, so `${SANDBOX}` and a grader's report path name
+        // where the tree is, not Docker's `/workspace`.
+        let real = tempfile::TempDir::new().unwrap();
+        let seatbelt = TestRunner { placement: Placement::Container("host".into()), user: None, sandbox: Some(darkmux_sandbox::BackendKind::Seatbelt) };
+        assert_eq!(seatbelt.view(real.path()), real.path().canonicalize().unwrap().display().to_string());
         assert_eq!(TestRunner::host().view(sandbox), "/tmp/sb");
         assert_eq!(verify_workdir(Some("${SANDBOX_DIR}/app"), "/workspace").unwrap(), "app");
         assert_eq!(verify_workdir(Some("./app/sub/"), "/workspace").unwrap(), "app/sub");
@@ -2787,6 +3000,13 @@ mod tests {
         let never = contained_command::NotRun("Unable to find image".into());
         let (passed, details, output) = verify_result(Err(never), "npm test").unwrap();
         assert!(!passed && details.contains("Unable to find image") && details.contains("runtime.tests_on_host"), "{details}");
+        // (#3112) It names the configured sandbox, and Docker only under it.
+        let docker = not_run_details("x", Some(darkmux_sandbox::BackendKind::Docker));
+        assert!(docker.contains("a Docker container (`runtime.sandbox` is `docker`)") && docker.contains("Docker must be installed"), "{docker}");
+        assert_eq!(docker.matches("`runtime.sandbox` is `docker`").count(), 1, "named once: {docker}");
+        let seatbelt = not_run_details("x", Some(darkmux_sandbox::BackendKind::Seatbelt));
+        assert!(seatbelt.contains("the `seatbelt` sandbox (`runtime.sandbox`)") && !seatbelt.contains("Docker"), "{seatbelt}");
+        assert!(seatbelt.contains("runtime.tests_on_host"), "{seatbelt}");
         assert!(output.contains("Unable to find image"));
         let own_125 = Bounded::Finished { success: false, code: Some(125), stdout: vec![], stderr: vec![] };
         let (passed, details, _) = verify_result(Ok(own_125), "x").unwrap();
@@ -2842,7 +3062,7 @@ mod tests {
         );
         spec.verify.as_mut().unwrap().cwd = Some("app".into());
         let loaded = make_loaded(spec, tmp.path().to_path_buf());
-        let contained = |_: &LoadedWorkload| Ok(TestRunner { placement: Placement::Container("node:22-bookworm-slim".into()), user: None });
+        let contained = |_: &LoadedWorkload| Ok(TestRunner { placement: Placement::Container("node:22-bookworm-slim".into()), user: None, sandbox: Some(darkmux_sandbox::BackendKind::Docker) });
         let plan = verify_plan(&loaded, &sandbox, contained).unwrap();
         let outcome = run_verify_command(plan.as_ref(), &run_dir, &sandbox).unwrap().unwrap();
         let output = fs::read_to_string(run_dir.join("verify-output.txt")).unwrap();

@@ -11,10 +11,6 @@ use std::process::Command;
 /// Asking whether it is installed is [`DockerBackend::on_path`].
 const PROGRAM: &str = "docker";
 
-/// This backend's value of `DARKMUX_SANDBOX` ([`crate::SANDBOX_ENV`]). It
-/// happens to spell the program, so it lives here, behind the ratchet.
-pub(crate) const SETTING: &str = "docker";
-
 /// `--cap-drop`: every Linux capability. A sandbox's code needs none.
 pub const CAP_DROP: &str = "ALL";
 

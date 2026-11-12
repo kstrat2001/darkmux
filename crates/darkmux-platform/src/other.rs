@@ -1,7 +1,7 @@
 //! Any OS with no strategy of its own: every answer is what darkmux did
 //! before platform strategies existed, so nothing changes there.
 
-use crate::{ContainerHostAccess, ContainerUser, Platform};
+use crate::{ContainerHostAccess, ContainerUser, DefaultSandbox, Platform};
 
 pub struct OtherPlatform;
 
@@ -16,6 +16,11 @@ impl Platform for OtherPlatform {
 
     fn container_user(&self) -> ContainerUser {
         ContainerUser::Image
+    }
+
+    /// Docker, what darkmux ran before it had a choice.
+    fn default_sandbox(&self) -> DefaultSandbox {
+        DefaultSandbox::Docker
     }
 
     fn machine_uid(&self) -> Option<String> {

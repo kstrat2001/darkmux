@@ -1261,14 +1261,10 @@ fn render_gated_mod(
     // record with no source). Without this a gate-PASSED change written as
     // `a/<source>/src/x.ts` parses to a path the diff never touched and files
     // as "outside the diff" — how the first passing coder change rendered live.
-    let mapped_kit;
-    let kit = match (m.record.source.as_deref(), m.record.kit.as_deref()) {
-        (Some(source), Some(raw)) if !source.trim().is_empty() => {
-            mapped_kit = crate::mods::strip_kit_source_prefix(source, raw);
-            mapped_kit.as_str()
-        }
-        (_, raw) => raw.unwrap_or(""),
-    };
+    // (#3112 review) `/workspace/<source>/` or, from a sandbox on the host,
+    // `<source_root>/<source>/`.
+    let mapped_kit = crate::mods::kit_in_repo_coords(&m.record).unwrap_or_default();
+    let kit = mapped_kit.as_str();
     if m.record.kit_kind.as_deref() != Some("unified-diff") {
         group.bullets.push(fenced_patch_bullet(window, kit, REASON_NOT_A_PATCH));
         return ModRender { suggestions: 0, patches: 1 };
@@ -1893,6 +1889,7 @@ mod tests {
                 phase_id: None,
                 step_id: None,
                 source: None,
+                source_root: None,
                 gate: None,
                 gate_skipped_reason: None,
                 change_key: None,
@@ -2099,6 +2096,7 @@ mod tests {
                 phase_id: None,
                 step_id: None,
                 source: None,
+                source_root: None,
                 gate: None,
                 gate_skipped_reason: Some("no test_command configured".to_string()),
                 change_key: None,
@@ -2169,6 +2167,7 @@ mod tests {
                 phase_id: None,
                 step_id: None,
                 source: None,
+                source_root: None,
                 gate: None,
                 gate_skipped_reason: Some("no test_command configured".to_string()),
                 change_key: None,
@@ -2195,6 +2194,7 @@ mod tests {
                 phase_id: None,
                 step_id: None,
                 source: None,
+                source_root: None,
                 gate: None,
                 gate_skipped_reason: Some("no test_command configured".to_string()),
                 change_key: None,

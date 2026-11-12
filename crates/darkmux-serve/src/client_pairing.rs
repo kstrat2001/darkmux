@@ -945,6 +945,9 @@ pub type PathSource = Arc<dyn Fn() -> Result<PathBuf, String> + Send + Sync>;
 pub type PathAction = Arc<dyn Fn(&Path) -> Result<(), crate::client_workspace::Coded> + Send + Sync>;
 /// `clients.preview.enabled`, read per request.
 pub type PreviewSwitch = Arc<dyn Fn() -> Result<bool, String> + Send + Sync>;
+/// (#3112) This machine's sandbox as `config.json` says now, read per
+/// preview start.
+pub type PreviewSandbox = Arc<dyn Fn() -> Result<darkmux_sandbox::BackendKind, String> + Send + Sync>;
 /// `clients.preview.idle_minutes`, read per idle check.
 pub type PreviewMinutes = Arc<dyn Fn() -> Result<u64, String> + Send + Sync>;
 /// (role, work id) -> what that running work's dispatch is doing besides its
@@ -1068,6 +1071,9 @@ pub struct ClientServerState {
     /// This machine's `clients.preview.enabled`, read per request (`Err`:
     /// unreadable, so previews are refused).
     pub preview_enabled: PreviewSwitch,
+    /// (#3112 review) This machine's `runtime.sandbox`, read per preview
+    /// start, so the refusal ends with the `config set` it recommends.
+    pub preview_sandbox: PreviewSandbox,
     /// This machine's `clients.preview.idle_minutes`, read at every idle
     /// check (`Err`: unreadable, so that check stops nothing).
     pub preview_idle_minutes: PreviewMinutes,
@@ -1126,6 +1132,7 @@ impl ClientServerState {
             previews: Arc::new(crate::client_preview::Previews::production()),
             bound: None,
             preview_enabled: Arc::new(read_preview_enabled),
+            preview_sandbox: Arc::new(read_preview_sandbox),
             preview_idle_minutes: Arc::new(read_preview_idle_minutes),
             peer_processes: Arc::new(peer_processes_here),
             pair_peers: Arc::new(Mutex::new(HashMap::new())),
@@ -1248,6 +1255,17 @@ fn read_preview_enabled() -> Result<bool, String> {
     read_preview_enabled_at(
         &darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config,
     )
+}
+
+/// (#3112 review) `runtime.sandbox` from `config.json` as it is now, env
+/// first, for a preview start.
+fn read_preview_sandbox() -> Result<darkmux_sandbox::BackendKind, String> {
+    read_preview_sandbox_at(&darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config)
+}
+
+/// [`read_preview_sandbox`] against the config at `path`.
+pub(crate) fn read_preview_sandbox_at(path: &Path) -> Result<darkmux_sandbox::BackendKind, String> {
+    darkmux_sandbox::selected_in(&read_config_at(path)?)
 }
 
 /// [`read_preview_enabled`] against the config at `path`.
@@ -3693,6 +3711,34 @@ fn previews_allowed(state: &ClientServerState) -> Result<(), Refused> {
     }
 }
 
+/// (#3112) Why a preview cannot start under `selected` (the configured
+/// sandbox), or `None` under Docker. A preview runs in a Docker container
+/// (`client_preview`) and has no other backend yet, so any other sandbox
+/// refuses it, naming the setting that would allow it.
+pub(crate) fn preview_sandbox_refusal(selected: &Result<darkmux_sandbox::BackendKind, String>) -> Option<String> {
+    let docker = darkmux_sandbox::setting_value(darkmux_sandbox::BackendKind::Docker);
+    match selected {
+        Ok(darkmux_sandbox::BackendKind::Docker) => None,
+        Ok(kind) => Some(format!(
+            "previews need `{key}` `{docker}` for now: a preview runs in a Docker container, and this \
+             machine's sandbox is `{}`. To run previews here: `darkmux config set {key} {docker}` \
+             (Docker installed and running)",
+            darkmux_sandbox::setting_value(*kind),
+            key = darkmux_sandbox::SANDBOX_KEY,
+        )),
+        Err(why) => Some(format!("no preview can start: {why}")),
+    }
+}
+
+/// (#3112) [`preview_sandbox_refusal`] for this machine's sandbox as
+/// `config.json` says now, as a 403 `forbidden`.
+fn previews_run_here(state: &ClientServerState) -> Result<(), Refused> {
+    match preview_sandbox_refusal(&(state.preview_sandbox)()) {
+        None => Ok(()),
+        Some(why) => Err(refuse(StatusCode::FORBIDDEN, ClientCode::Forbidden, why)),
+    }
+}
+
 /// (#3484) `POST /client/workspaces/{name}/preview`'s optional body.
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -3713,7 +3759,10 @@ async fn preview_start_body(body: Body) -> Result<PreviewStartBody, Response> {
 /// Starts workspace `name`'s preview from its trusted recipe; with `clean`,
 /// first stops it and clears its install ([`crate::client_preview::Previews::clean`]).
 fn start_preview(state: &ClientServerState, client: &ApprovedClient, name: &str, clean: bool) -> Response {
-    if let Err(r) = previews_allowed(state).and_then(|()| owned_workspace(state, client, name).map(|_| ())) {
+    let allowed = previews_allowed(state)
+        .and_then(|()| owned_workspace(state, client, name).map(|_| ()))
+        .and_then(|()| previews_run_here(state));
+    if let Err(r) = allowed {
         return *r;
     }
     let (dir, source) = match workspace_and_recipe_source(state, name) {

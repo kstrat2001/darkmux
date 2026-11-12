@@ -125,7 +125,7 @@ use crate::client_wire::PreviewState;
 #[cfg(unix)]
 #[path = "client_preview_at.rs"]
 pub(crate) mod at;
-use darkmux_sandbox::{backend, Access, DockerBackend, Limits, Mount, Network, SandboxHandle, SandboxPolicy};
+use darkmux_sandbox::{Access, BackendKind, DockerBackend, Limits, Mount, Network, SandboxBackend, SandboxHandle, SandboxPolicy};
 use darkmux_types::data_version::PREVIEW_RECIPE_SCHEMA_VERSION;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -813,14 +813,26 @@ pub fn preview_policy(spec: &ContainerSpec) -> SandboxPolicy {
 /// started after (`docker start -a`), so a stop at any moment finds the
 /// container by name.
 pub fn docker_create_args(spec: &ContainerSpec) -> Vec<String> {
-    let (cmd, _) = backend().create(&preview_policy(spec));
+    let (cmd, _) = preview_backend().create(&preview_policy(spec));
     cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect()
+}
+
+/// (#3112) The one backend a preview runs in: Docker. A preview has no
+/// other backend yet, and a start under any other sandbox is refused at the
+/// client API (`client_pairing::preview_sandbox_refusal`), so a preview's
+/// sandbox is always Docker's and is stopped there whatever
+/// `runtime.sandbox` says later.
+const PREVIEW_BACKEND: BackendKind = BackendKind::Docker;
+
+/// The backend a preview's sandbox is made, started, stopped and removed in.
+fn preview_backend() -> &'static dyn SandboxBackend {
+    darkmux_sandbox::backend_of(PREVIEW_BACKEND)
 }
 
 /// A preview container's handle, by its name.
 fn handle(name: &str) -> SandboxHandle {
     SandboxHandle {
-        backend: backend().kind(),
+        backend: PREVIEW_BACKEND,
         id: name.to_string(),
     }
 }
@@ -927,26 +939,8 @@ const DOCKER_CALL_BOUND: Duration = Duration::from_secs(30);
 /// How long `docker create` may take (the image is already resolved).
 const DOCKER_CREATE_BOUND: Duration = Duration::from_secs(120);
 
-/// (#3112 step 2) Why a preview cannot run on the selected sandbox backend,
-/// if it cannot: a preview runs the runtime image's node and python at
-/// [`WORKSPACE_AT`], which only a backend with images (Docker) has. A
-/// Seatbelt or Landlock sandbox runs this host's programs at host paths, so
-/// it is refused rather than started where the recipe cannot run.
-fn backend_refusal(kind: darkmux_sandbox::BackendKind) -> Option<String> {
-    kind.on_host().then(|| {
-        format!(
-            "a live preview runs in a Docker container; {}={} runs this host's own programs, which previews do not support yet",
-            darkmux_sandbox::SANDBOX_ENV,
-            kind.setting()
-        )
-    })
-}
-
 impl PreviewContainers for Docker {
     fn image_and_user(&self) -> Result<(String, Option<String>), String> {
-        if let Some(why) = backend_refusal(darkmux_sandbox::selected()?) {
-            return Err(why);
-        }
         let image = match &self.image {
             Some(image) => image.clone(),
             None => darkmux_crew::dispatch_internal::resolved_runtime_image()
@@ -965,7 +959,7 @@ impl PreviewContainers for Docker {
 
     fn create(&self, spec: &ContainerSpec) -> Result<(), String> {
         use darkmux_crew::bounded_command::{run_bounded, Bounded};
-        let (cmd, _) = backend().create(&preview_policy(spec));
+        let (cmd, _) = preview_backend().create(&preview_policy(spec));
         match run_bounded(cmd, DOCKER_CREATE_BOUND) {
             Bounded::Finished { success: true, .. } => Ok(()),
             Bounded::Finished { stderr, .. } => Err(format!(
@@ -996,7 +990,7 @@ impl PreviewContainers for Docker {
         let err = out
             .try_clone()
             .map_err(|e| format!("opening {}: {e}", log.display()))?;
-        let mut cmd = backend().start(&handle(name));
+        let mut cmd = darkmux_sandbox::for_handle(&handle(name)).start(&handle(name));
         cmd.stdin(std::process::Stdio::null())
             .stdout(out)
             .stderr(err);
@@ -1017,9 +1011,10 @@ impl PreviewContainers for Docker {
                 .stderr(std::process::Stdio::null());
             c
         };
-        let stop = backend().stop(&handle(name), Duration::from_secs(5));
-        let _ = run_bounded(quiet(stop), DOCKER_CALL_BOUND);
-        let _ = run_bounded(quiet(backend().remove(&handle(name))), DOCKER_CALL_BOUND);
+        let handle = handle(name);
+        let backend = darkmux_sandbox::for_handle(&handle);
+        let _ = run_bounded(quiet(backend.stop(&handle, Duration::from_secs(5))), DOCKER_CALL_BOUND);
+        let _ = run_bounded(quiet(backend.remove(&handle)), DOCKER_CALL_BOUND);
     }
 
     fn reap_orphans(&self) -> Vec<String> {
@@ -1030,7 +1025,7 @@ impl PreviewContainers for Docker {
             host_liveness,
         ) {
             ReapTick::Listed { reaped } => reaped.into_iter().map(|(o, _)| o.name).collect(),
-            ReapTick::DockerUnavailable => Vec::new(),
+            ReapTick::ListingUnavailable => Vec::new(),
         }
     }
 }
@@ -2121,6 +2116,23 @@ impl HostEmulator {
 mod tests {
     use super::*;
 
+    /// (#3112 review) A preview's sandbox is Docker's whatever
+    /// `runtime.sandbox` says: one made before the setting moved to
+    /// Seatbelt is still stopped and removed in Docker.
+    #[test]
+    #[serial_test::serial]
+    fn a_preview_handle_is_dockers_whatever_the_setting() {
+        darkmux_types::run_in_own_process!();
+        let prev = std::env::var_os("DARKMUX_SANDBOX");
+        unsafe { std::env::set_var("DARKMUX_SANDBOX", "seatbelt") };
+        let (h, made) = (handle("darkmux-preview-x"), preview_backend().kind());
+        unsafe {
+            match prev { Some(v) => std::env::set_var("DARKMUX_SANDBOX", v), None => std::env::remove_var("DARKMUX_SANDBOX") }
+        }
+        assert_eq!((h.backend, made), (BackendKind::Docker, BackendKind::Docker));
+        assert_eq!(darkmux_sandbox::for_handle(&h).kind(), BackendKind::Docker);
+    }
+
     #[test]
     fn only_plain_relative_paths() {
         for good in [".env", "node_modules", "config/.env.local"] {
@@ -2263,18 +2275,6 @@ mod tests {
     /// resolved as a dispatch resolves it, and a Docker that will not answer
     /// says so. The user is the dispatch container's.
     #[cfg(unix)]
-    /// (#3112 step 2) Only Docker runs a preview; a host-process backend is
-    /// refused, naming the setting.
-    #[test]
-    fn a_preview_refuses_a_backend_without_images() {
-        use darkmux_sandbox::BackendKind;
-        assert_eq!(backend_refusal(BackendKind::Docker), None);
-        for kind in [BackendKind::Seatbelt, BackendKind::Landlock] {
-            let why = backend_refusal(kind).unwrap();
-            assert!(why.contains(&format!("DARKMUX_SANDBOX={}", kind.setting())), "{why}");
-        }
-    }
-
     #[test]
     #[serial_test::serial]
     fn the_preview_image_is_the_pinned_one_or_the_resolved_runtime_image() {

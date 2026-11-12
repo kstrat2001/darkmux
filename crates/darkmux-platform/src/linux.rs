@@ -1,6 +1,6 @@
 //! Linux (first target: Omarchy on Apple Silicon, under Asahi).
 
-use crate::{ContainerHostAccess, ContainerUser, Platform};
+use crate::{ContainerHostAccess, ContainerUser, DefaultSandbox, Platform};
 
 pub struct LinuxPlatform;
 
@@ -14,6 +14,13 @@ impl Platform for LinuxPlatform {
     /// accepts the same mapping, so no engine detection is needed.
     fn container_host_access(&self) -> ContainerHostAccess {
         ContainerHostAccess::HostGateway
+    }
+
+    /// Landlock where this kernel can confine a process as its backend
+    /// needs ([`crate::confine::ConfineSupport::refusal`] says nothing),
+    /// else Docker.
+    fn default_sandbox(&self) -> DefaultSandbox {
+        default_sandbox_given(self.confine_support().refusal().is_none())
     }
 
     /// Docker Engine keeps the host's ownership on bind mounts, and darkmux
@@ -323,6 +330,17 @@ pub(crate) fn zenity_answer(code: Option<i32>) -> crate::AllowAnswer {
 }
 
 /// An M1 or M2 sold with 8, 16, 24, 32, 64, 96 or 128 GB: the next multiple of 8.
+/// The default sandbox on a Linux whose kernel can (`true`) or cannot
+/// confine a process as the Landlock backend needs: the answer's logic,
+/// apart from the probe.
+pub(crate) fn default_sandbox_given(confinable: bool) -> DefaultSandbox {
+    if confinable {
+        DefaultSandbox::Landlock
+    } else {
+        DefaultSandbox::Docker
+    }
+}
+
 pub(crate) fn sold_size_on_apple(gib: u64) -> u64 {
     gib.div_ceil(8) * 8
 }

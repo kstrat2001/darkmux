@@ -32,13 +32,11 @@ pub(crate) fn tick_lines(
     docker_warned: &mut bool,
 ) -> Vec<String> {
     match reap_tick(local, liveness) {
-        ReapTick::DockerUnavailable if *docker_warned => Vec::new(),
-        ReapTick::DockerUnavailable => {
+        ReapTick::ListingUnavailable if *docker_warned => Vec::new(),
+        ReapTick::ListingUnavailable => {
             *docker_warned = true;
-            vec![
-                "darkmux serve: dispatch-container reaper idle: `docker ps` did not answer"
-                    .to_string(),
-            ]
+            let kinds: Vec<_> = darkmux_sandbox::available_backends().iter().map(|b| b.kind()).collect();
+            vec![idle_line(&kinds)]
         }
         ReapTick::Listed { reaped } => {
             *docker_warned = false;
@@ -56,9 +54,24 @@ pub(crate) fn tick_lines(
     }
 }
 
+/// (#3112) The line for a tick no backend's listing answered, naming the
+/// backends it asked (`kinds`, every one this host runs).
+fn idle_line(kinds: &[darkmux_sandbox::BackendKind]) -> String {
+    if kinds.is_empty() {
+        return "darkmux serve: dispatch reaper idle: this host runs no sandbox backend (no `docker` on PATH, no sandbox-exec)".to_string();
+    }
+    let asked = kinds.iter().map(|k| format!("`{}`", darkmux_sandbox::setting_value(*k))).collect::<Vec<_>>().join(", ");
+    format!("darkmux serve: dispatch reaper idle: no sandbox listing answered (asked {asked})")
+}
+
 /// One production tick: this host's own machine and pid namespace, and this
 /// machine's real liveness answers. The thread runs exactly this.
 pub(crate) fn this_host_tick_lines(docker_warned: &mut bool) -> Vec<String> {
+    // (#3112 review) Contained runs (a lab run's tests, the mods gate) whose
+    // owner is gone, in every backend this host runs: a contained run reaps
+    // only its own backend, so a leftover from before `runtime.sandbox`
+    // changed is this tick's.
+    darkmux_crew::contained_command::reap_orphaned_containers();
     tick_lines(
         LocalHost::this_host().as_ref(),
         host_liveness,
@@ -240,7 +253,36 @@ mod tests {
                 None => std::env::remove_var("PATH"),
             }
         }
+        // (#3112 review) Seatbelt or Landlock, where it runs, still answers:
+        // nothing to say. Where nothing runs, one line, then silence.
+        if darkmux_sandbox::SeatbeltBackend::available() || darkmux_sandbox::LandlockBackend::available().is_ok() {
+            assert!(first.is_empty() && second.is_empty(), "{first:?} {second:?}");
+            return;
+        }
         assert_eq!(first.len(), 1, "{first:?}");
         assert!(second.is_empty(), "{second:?}");
+        assert!(first[0].contains("no sandbox backend"), "{first:?}");
+    }
+
+    /// (#3112 review) The daemon's tick reaps orphaned contained runs in
+    /// every backend, the leftovers a contained run no longer lists.
+    #[test]
+    fn the_daemon_tick_reaps_contained_runs_in_every_backend() {
+        let src = include_str!("dispatch_reaper.rs");
+        let tick = &src[src.find("pub(crate) fn this_host_tick_lines").unwrap()..];
+        let tick = &tick[..tick.find("\n}\n").unwrap()];
+        assert!(tick.contains("darkmux_crew::contained_command::reap_orphaned_containers();"), "{tick}");
+    }
+
+    /// (#3112) The idle line names every backend the tick asked, or says
+    /// there is none.
+    #[test]
+    fn the_idle_line_names_the_backends_it_asked() {
+        use darkmux_sandbox::BackendKind;
+        let both = idle_line(&[BackendKind::Docker, BackendKind::Seatbelt]);
+        assert!(both.contains("asked `docker`, `seatbelt`"), "{both}");
+        let seatbelt = idle_line(&[BackendKind::Seatbelt]);
+        assert!(seatbelt.contains("asked `seatbelt`") && !seatbelt.contains("docker"), "{seatbelt}");
+        assert!(idle_line(&[]).contains("no sandbox backend"), "{}", idle_line(&[]));
     }
 }

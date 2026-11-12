@@ -1261,6 +1261,8 @@ impl WorkloadProvider for ToolBenchProvider {
             duration_ms: Some(u64::try_from(duration_ms).unwrap_or(u64::MAX)),
             ok: Some(true),
             refused_artifacts: crate::providers::coding_task::refused_records(&refused_artifacts),
+            // (#3112 review) The sandbox the trials ran in: a measured variable.
+            isolation: Some(crate::providers::coding_task::dispatch_isolation(darkmux_sandbox::selected())),
             ..RunManifest::default()
         }
         .write(run_dir)?;

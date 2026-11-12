@@ -1654,3 +1654,33 @@ fn every_listed_container_engine_is_never_named() {
         assert!(e.contains(engine) && e.contains("container traffic"), "{e}");
     }
 }
+
+/// (#3112) Which sandbox a host runs when `runtime.sandbox` is unset: a Mac
+/// with `sandbox-exec` runs Seatbelt and needs no Docker; one without it
+/// (never seen, but not assumed away) falls back to Docker.
+#[test]
+fn a_mac_with_sandbox_exec_defaults_to_seatbelt() {
+    assert_eq!(crate::macos::default_sandbox_given(true), DefaultSandbox::Seatbelt);
+    assert_eq!(crate::macos::default_sandbox_given(false), DefaultSandbox::Docker);
+    let present = std::path::Path::new(SANDBOX_EXEC).is_file();
+    assert_eq!(MacPlatform.default_sandbox(), crate::macos::default_sandbox_given(present));
+}
+
+/// (#3112) A Linux whose kernel can confine a process (Landlock ABI 6 and
+/// unprivileged user namespaces) runs Landlock and needs no Docker; one that
+/// cannot keeps Docker, as does every other OS.
+#[test]
+fn a_linux_that_can_confine_defaults_to_landlock() {
+    assert_eq!(crate::linux::default_sandbox_given(true), DefaultSandbox::Landlock);
+    assert_eq!(crate::linux::default_sandbox_given(false), DefaultSandbox::Docker);
+    let confinable = LinuxPlatform.confine_support().refusal().is_none();
+    assert_eq!(LinuxPlatform.default_sandbox(), crate::linux::default_sandbox_given(confinable));
+    assert_eq!(OtherPlatform.default_sandbox(), DefaultSandbox::Docker);
+}
+
+#[test]
+fn a_fake_answers_the_default_sandbox_the_test_set() {
+    assert_eq!(FakePlatform::default().default_sandbox(), DefaultSandbox::Docker);
+    let fake = FakePlatform { default_sandbox: DefaultSandbox::Seatbelt, ..FakePlatform::default() };
+    assert_eq!(fake.default_sandbox(), DefaultSandbox::Seatbelt);
+}

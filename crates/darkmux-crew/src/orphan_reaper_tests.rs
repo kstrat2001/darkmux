@@ -165,7 +165,7 @@ fn an_unknown_machine_identity_reaps_nothing() {
 fn parse_reads_labels_and_treats_empty_as_absent() {
     let out =
         "darkmux-dispatch-a\t200\t1000\tMACHINE-A\tpid:4026531836\ndarkmux-dispatch-b\t\t\t\t\n\n";
-    let got = listed_containers(darkmux_sandbox::backend().parse_list(&host_query(DISPATCH_CONTAINER_PREFIX), out));
+    let got = listed_containers(darkmux_sandbox::backend_of(darkmux_sandbox::BackendKind::Docker).parse_list(&host_query(DISPATCH_CONTAINER_PREFIX), out));
     assert_eq!(
         got,
         vec![
@@ -301,17 +301,36 @@ fn a_tick_lists_once_and_kills_only_the_orphan() {
     assert_eq!(calls[1], "kill darkmux-dispatch-dead");
 }
 
-/// No docker on `PATH`: the tick says so and does nothing else.
+/// No docker on `PATH`: Docker is not listed. (#3112 review) The tick
+/// lists every other backend this host runs, whatever `runtime.sandbox`
+/// says (Docker in a test build): on a Mac, Seatbelt answers, so a sandbox
+/// left there from before the setting changed is still found. Where no
+/// backend answers, the tick says so and does nothing else.
 #[test]
 #[serial]
-fn a_tick_without_docker_does_nothing() {
+fn a_tick_without_docker_lists_the_other_backends() {
     let empty = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
     let prev = std::env::var("PATH").ok();
+    let prev_state = std::env::var_os(darkmux_sandbox::seatbelt::STATE_DIR_ENV);
     // SAFETY: `#[serial]`.
-    unsafe { std::env::set_var("PATH", empty.path()) };
+    unsafe {
+        std::env::set_var("PATH", empty.path());
+        std::env::set_var(darkmux_sandbox::seatbelt::STATE_DIR_ENV, state.path());
+    }
     let tick = reap_tick(Some(&local()), liveness);
     restore_path(prev);
-    assert!(matches!(tick, ReapTick::DockerUnavailable), "{tick:?}");
+    unsafe {
+        match prev_state {
+            Some(v) => std::env::set_var(darkmux_sandbox::seatbelt::STATE_DIR_ENV, v),
+            None => std::env::remove_var(darkmux_sandbox::seatbelt::STATE_DIR_ENV),
+        }
+    }
+    if darkmux_sandbox::SeatbeltBackend::available() || darkmux_sandbox::LandlockBackend::available().is_ok() {
+        assert!(matches!(&tick, ReapTick::Listed { reaped } if reaped.is_empty()), "{tick:?}");
+    } else {
+        assert!(matches!(tick, ReapTick::ListingUnavailable), "{tick:?}");
+    }
 }
 
 /// (#3200 review) `kill(pid, 0)` answers `EPERM` for a live process owned by

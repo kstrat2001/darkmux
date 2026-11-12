@@ -458,7 +458,15 @@ use std::path::Path;
 //           (bool, default true; `DARKMUX_CLIENTS_PAIRING_DIALOG`), whether an
 //           app that does not verify gets a native Allow dialog. An older
 //           binary refuses a config carrying either.
-pub const CONFIG_SCHEMA_VERSION: &str = "2.8";
+//   2.9 (#3112): additive `runtime.sandbox` (`DARKMUX_SANDBOX`; `docker` or
+//           `seatbelt`), the sandbox every isolated run (a dispatch, a lab
+//           run's tests, the mods gate) runs in. Absent = this host's
+//           default (`darkmux_platform::Platform::default_sandbox`): Seatbelt
+//           on a Mac with `sandbox-exec`, Docker elsewhere. Not written by
+//           `init`: the right value depends on the platform, so a literal
+//           would be wrong somewhere (the `container_user` rule). An older
+//           binary refuses a config carrying it.
+pub const CONFIG_SCHEMA_VERSION: &str = "2.9";
 
 /// A `config.json` key an older darkmux read (and `init` may have written)
 /// that this one does not. The unknown-key gate (`user_files`) names it with
@@ -1166,6 +1174,14 @@ pub struct RuntimeBehaviorConfig {
     /// parse refuses the dispatch. Not written by `init`: the right value
     /// depends on the platform, so a literal would be wrong somewhere.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub container_user: Option<String>,
+    /// (#3112, 2.9) The sandbox every isolated run uses: `docker`,
+    /// `seatbelt` or `landlock` ([`SandboxKind`]). Unset, the platform
+    /// decides (`darkmux_platform::Platform::default_sandbox`): Seatbelt on a
+    /// Mac with `sandbox-exec`, Landlock on a Linux whose kernel has what it
+    /// needs, Docker elsewhere. Resolved through
+    /// `config_access::sandbox()`; an unregistered value refuses every entry
+    /// point. Not written by `init`, for the `container_user` reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub sandbox: Option<String>,
     /// (#906, 2.6) Run a lab run's verify command and grader suites, which
     /// execute model-written tests, on this machine as the darkmux user
     /// instead of in a container with no network and only the tree mounted.
@@ -2252,6 +2268,37 @@ impl From<FleetMode> for DeclaredFleetMode {
     }
 }
 
+/// (#3112) `runtime.sandbox`: what every isolated run (a dispatch, a lab
+/// run's tests, the mods gate, the reapers that end them) runs in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxKind {
+    Docker,
+    Seatbelt,
+    Landlock,
+}
+
+impl SandboxKind {
+    pub fn as_str(self) -> &'static str {
+        crate::config_enum::ConfigEnum::token(self)
+    }
+}
+
+impl From<darkmux_platform::DefaultSandbox> for SandboxKind {
+    fn from(d: darkmux_platform::DefaultSandbox) -> Self {
+        match d {
+            darkmux_platform::DefaultSandbox::Docker => SandboxKind::Docker,
+            darkmux_platform::DefaultSandbox::Seatbelt => SandboxKind::Seatbelt,
+            darkmux_platform::DefaultSandbox::Landlock => SandboxKind::Landlock,
+        }
+    }
+}
+
+crate::config_enum!(SandboxKind, "sandbox", [
+    Docker = "docker" => "a Docker container: needs Docker installed and its daemon running",
+    Seatbelt = "seatbelt" => "macOS Seatbelt (sandbox-exec): part of macOS, nothing to install",
+    Landlock = "landlock" => "Linux namespaces and Landlock: part of the kernel (Landlock ABI 6, Linux 6.12, and unprivileged user namespaces), nothing to install",
+]);
+
 /// (#3538) `runtime.memory.pressure_gate`: the memory pressure at which
 /// darkmux refuses to start an engine server or load a model into LM Studio,
 /// however much memory the arithmetic says is free
@@ -2432,6 +2479,9 @@ impl DarkmuxConfig {
                 turn_delay_ms: Some(0),
                 // Not written: the platform decides (a literal would be wrong somewhere).
                 container_user: None,
+                // (#3112) Not written, for the same reason: the platform
+                // decides (`Platform::default_sandbox`).
+                sandbox: None,
                 // (#2107, #1833) Visible `5000` — the machine stats
                 // drawer's daemon-side sampler cadence, discoverable and
                 // one edit from `0` (disabled) or a tighter/looser value.

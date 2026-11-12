@@ -10,12 +10,20 @@ authors = ["Kain Osterholt"]
 rust-version = "1.86"
 
 [dependencies]
+# (#3112) Which backend runs is the `runtime.sandbox` setting, resolved by
+# the types crate (env > config.json > the platform's default); this crate
+# parses no config itself.
+darkmux-types = { path = "../darkmux-types" }
+# Where `sandbox-exec` lives: one constant, which the platform's default reads
+# too; and (#3112) the kernel pieces the Landlock backend confines a process
+# with, which live with the other OS differences.
+darkmux-platform = { path = "../darkmux-platform" }
 # A handle is stored in records a reaper or a resume reads back.
 serde = { version = "1.0", features = ["derive"] }
-# (#3112) The Landlock backend confines a process with the kernel's own
-# pieces, which live with the other OS differences.
-darkmux-platform = { path = "../darkmux-platform" }
 
 [dev-dependencies]
+serial_test = "3.1"
+# A test build reads no operator config (the types crate's test isolation).
+darkmux-types = { path = "../darkmux-types", features = ["test-support"] }
 serde_json.workspace = true
 tempfile = "3.10"
