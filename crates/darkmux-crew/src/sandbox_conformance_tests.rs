@@ -703,15 +703,27 @@ mod landlock_only {
     #[test]
     #[ignore = "needs Linux with Landlock ABI 6 and unprivileged user namespaces"]
     fn the_default_network_reaches_no_outside_abstract_socket() {
-        use std::os::linux::net::SocketAddrExt;
+        use std::io::{BufRead, Read};
+        // The outside listener is a host python3 (abstract names are a Linux
+        // API this file does not name): it says `ready`, then whether a
+        // connection came within 3 s.
         let name = format!("darkmux-conformance-{}", std::process::id());
-        let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
-        let listener = std::os::unix::net::UnixListener::bind_addr(&addr).unwrap();
-        listener.set_nonblocking(true).unwrap();
+        let listen = format!(
+            "import socket; s = socket.socket(socket.AF_UNIX); s.bind(b'\\0{name}'); s.listen(1); s.settimeout(3); print('ready', flush=True)\n\
+             try:\n    s.accept(); print('accepted')\nexcept OSError:\n    print('none')"
+        );
+        let mut outside = std::process::Command::new("python3").arg("-c").arg(listen).stdout(std::process::Stdio::piped()).spawn().unwrap();
+        let mut out = std::io::BufReader::new(outside.stdout.take().unwrap());
+        let mut ready = String::new();
+        out.read_line(&mut ready).unwrap();
+        assert_eq!(ready.trim(), "ready");
         let script = format!("python3 -c \"import socket; socket.socket(socket.AF_UNIX).connect(b'\\\\0{name}')\" 2>/dev/null && echo connected; true");
         let said = run_script(Network::Default, &script);
         assert!(!said.contains("connected"), "a sandbox reached an abstract socket outside it: {said}");
-        assert!(listener.accept().is_err(), "the outside abstract socket took a connection from a sandbox");
+        let mut verdict = String::new();
+        out.read_to_string(&mut verdict).unwrap();
+        outside.wait().unwrap();
+        assert_eq!(verdict.trim(), "none", "the outside abstract socket took a connection from a sandbox");
     }
 
     /// On the default network a sandbox binds only the ports its policy
