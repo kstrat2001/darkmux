@@ -3775,3 +3775,70 @@ describe("absentOrUnknown (#3213)", () => {
     expect(absentOrUnknown(true, "00000000-0000-4000-8000-ABCDEF000001")).toBe(false);
   });
 });
+
+// (#3554) The count line names the model behind "1 running" (and its engine
+// when it is not this machine's managed LM Studio), and says how many models
+// an idle machine holds. The line is one ellipsized line; its full text is the
+// tooltip, and the running count's own control carries it in its name.
+describe("FleetLens: the count line names the model and what is loaded (#3554)", () => {
+  const at = (hms: string) => `${todayUTC()}T${hms}.000Z`;
+  const SELF = { machine_id: "MacBook-Pro", machine_uid: "u-self", cpu_brand: "Apple M5 Max" };
+  const resident = (identifier: string) => ({ identifier, model: identifier.replace(/^darkmux:/, ""), status: "idle", size: "1 GB", context: 4096 });
+  const start = (sid: string, extra: Record<string, unknown>, payload: Record<string, unknown> = {}) => ({
+    ts: at("10:01:00"), machine_uid: "u-self", machine_id: "MacBook-Pro", session_id: sid, action: "dispatch.start", handle: "coder", payload, ...extra,
+  });
+  const countEl = () => document.querySelector(".mach .runs")!;
+
+  it("an idle machine reads how many of darkmux's models it holds, never another app's", async () => {
+    mockFleetFetch({ runs: [], specs: { ...SELF, loaded_models: [resident("darkmux:qwen"), resident("darkmux:util-4b"), resident("user-loaded")] } });
+    renderFleetLens();
+    await waitFor(() => expect(countEl()?.textContent).toBe("0 running · 2 loaded"));
+    expect(countEl().getAttribute("title")).toBe("0 running · 2 loaded");
+  });
+
+  it("a machine whose engine could not say what it holds never reads 0 loaded: the title says why", async () => {
+    mockFleetFetch({ runs: [], specs: { ...SELF, lms_unreachable: true } });
+    renderFleetLens();
+    await waitFor(() => expect(countEl()?.textContent).toBe("0 running"));
+    expect(countEl().getAttribute("title")).toMatch(/^0 running · loaded models unknown: LM Studio could not be asked/);
+  });
+
+  it("one running execution on LM Studio names its model, in the line, its title and its control's name", async () => {
+    mockFleetFetch({ runs: [], flowToday: [start("s1", { model: "darkmux:qwen3.6-35b-a3b" })], specs: { ...SELF, loaded_models: [resident("darkmux:qwen3.6-35b-a3b")] } });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".runs--live")?.textContent).toBe("1 running · qwen3.6-35b-a3b"));
+    const live = document.querySelector(".runs--live")!;
+    expect(live.getAttribute("title")).toBe("1 running · qwen3.6-35b-a3b");
+    expect(live).toHaveAccessibleName("open the 1 running dispatch on MacBook-Pro: 1 running · qwen3.6-35b-a3b");
+  });
+
+  it("a hosted run names its model and engine", async () => {
+    mockFleetFetch({ runs: [], flowToday: [start("s1", { model: "gpt-4o" }, { endpoint: "azure:myorg.openai.azure.com/gpt-4o" })], specs: SELF });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".runs--live")?.textContent).toBe("1 running · gpt-4o · Azure OpenAI"));
+    expect(document.querySelector(".runs--live")!.getAttribute("title")).toBe("1 running · gpt-4o · Azure OpenAI on myorg.openai.azure.com");
+  });
+
+  it("several executions: the line follows the one the tube shows", async () => {
+    mockFleetFetch({
+      runs: [],
+      flowToday: [start("s1", { model: "darkmux:coder-model" }), start("s2", { model: "darkmux:reviewer-model" })],
+      specs: SELF,
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector('.mach-scope[role="button"]')).not.toBeNull());
+    expect(countEl().textContent).toBe("2 running · 1/2 · coder-model");
+    fireEvent.click(document.querySelector('.mach-scope[role="button"]')!);
+    await waitFor(() => expect(countEl().textContent).toBe("2 running · 2/2 · reviewer-model"));
+  });
+
+  it("a scrubbed playhead names no residents: what is loaded is a fact about now", async () => {
+    mockFleetFetch({ runs: [], specs: { ...SELF, loaded_models: [resident("darkmux:qwen")] } });
+    renderFleetLens({ playhead: Date.parse(at("09:00:00")) });
+    await waitFor(() => expect(countEl()?.textContent).toMatch(/^0 running/));
+    // The view has answered (the hardware line is the row's), so the count
+    // line had its chance to name the residents.
+    await waitFor(() => expect(document.querySelector(".mach .spec")!.textContent).toBe("Apple M5 Max"));
+    expect(countEl().textContent).toBe("0 running");
+  });
+});

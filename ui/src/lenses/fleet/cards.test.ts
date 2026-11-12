@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { machActive, specOf, busiestExecution, isStrictlyBusier, specUnknownLabel, cardFace, notStreamedNames, servesLine, servesParts, executionCountText, shownExecution } from "./cards";
+import { machActive, specOf, busiestExecution, isStrictlyBusier, specUnknownLabel, cardFace, notStreamedNames, servesLine, servesParts, executionCountText, countLine, shownExecution } from "./cards";
 import { CardStatus, STATUS_WORD, lampOf, secondLineOf, statusReason } from "./cardStatus";
 import { buildFleetCard, faceOf } from "../../testing/fleetCard";
 import { LampForm } from "../../lib/lamp";
@@ -36,7 +36,7 @@ function beat(overrides: Partial<PresenceBeat>): PresenceBeat {
 
 /** A fleet-view row's facts, as `viewRows.ts::rowFacts` would hand them to a card. */
 function rowFactsFor(overrides: Partial<RowFacts> = {}): RowFacts {
-  return { uid: "u1", known: true, name: null, names: [], spec: "", note: null, standing: "online", liveness: "live", isSelf: false, hub: false, servesRadio: false, servesProfiles: 0, engineServers: [], utility: utilityReading(false, null), ...overrides };
+  return { uid: "u1", known: true, name: null, names: [], spec: "", note: null, standing: "online", liveness: "live", isSelf: false, hub: false, servesRadio: false, servesProfiles: 0, engineServers: [], utility: utilityReading(false, null), residents: null, ...overrides };
 }
 
 function machineSpecs(overrides: Partial<MachineSpecsResponse> & Pick<MachineSpecsResponse, "machine_id">): MachineSpecsResponse {
@@ -1359,6 +1359,87 @@ describe("the count line with several executions (W3)", () => {
   });
   it("a single execution is the plain count", () => {
     expect(executionCountText({ runsCount: 1, executions: 1, position: 1 })).toBe("1 running");
+  });
+});
+
+// (#3554) The count line names what the shown execution runs on, and what an
+// idle machine holds.
+describe("the count line's model, engine and residents (#3554)", () => {
+  const one = { runsCount: 1, executions: 1, position: 1, engineServers: [], residents: null };
+  const flint = { engine: "flint", port: 8123 };
+
+  it("names a managed LM Studio run by its model alone, without darkmux's namespace", () => {
+    expect(countLine({ ...one, shown: { model: "darkmux:qwen3.6-35b-a3b" } })).toEqual({
+      text: "1 running · qwen3.6-35b-a3b",
+      title: "1 running · qwen3.6-35b-a3b",
+    });
+  });
+
+  it("cuts a model id to its last path segment on the card; the title has it whole", () => {
+    expect(countLine({ ...one, shown: { model: "darkmux:mlx-community/Qwen3.6-35B-A3B-4bit" } })).toEqual({
+      text: "1 running · Qwen3.6-35B-A3B-4bit",
+      title: "1 running · mlx-community/Qwen3.6-35B-A3B-4bit",
+    });
+  });
+
+  it("names a hosted run's engine: Azure by name, the host in the title", () => {
+    expect(countLine({ ...one, shown: { model: "gpt-4o", endpoint: "azure:myorg.openai.azure.com/gpt-4o" } })).toEqual({
+      text: "1 running · gpt-4o · Azure OpenAI",
+      title: "1 running · gpt-4o · Azure OpenAI on myorg.openai.azure.com",
+    });
+  });
+
+  it("names any other endpoint by its address, never as having left the machine", () => {
+    expect(countLine({ ...one, shown: { model: "llama-3", endpoint: "openai:127.0.0.1:8080/llama-3" } })).toEqual({
+      text: "1 running · llama-3 · 127.0.0.1:8080",
+      title: "1 running · llama-3 · 127.0.0.1:8080",
+    });
+  });
+
+  it("names a server darkmux started by its engine, matched on the machine's own port", () => {
+    expect(countLine({ ...one, engineServers: [flint], shown: { model: "TensorFold/Qwen3.8-27B", endpoint: "openai:127.0.0.1:8123/TensorFold/Qwen3.8-27B" } })).toEqual({
+      text: "1 running · Qwen3.8-27B · flint",
+      title: "1 running · TensorFold/Qwen3.8-27B · flint on 127.0.0.1:8123",
+    });
+    // Another port on loopback is not that server.
+    expect(countLine({ ...one, engineServers: [flint], shown: { model: "m", endpoint: "openai:127.0.0.1:9000/m" } }).text).toBe("1 running · m · 127.0.0.1:9000");
+    // The same port on another host is not that server either.
+    expect(countLine({ ...one, engineServers: [flint], shown: { model: "m", endpoint: "openai:gpu-box:8123/m" } }).text).toBe("1 running · m · gpu-box:8123");
+  });
+
+  it("reads the model from the endpoint's tail when the start record names none", () => {
+    expect(countLine({ ...one, shown: { endpoint: "azure:myorg.openai.azure.com/gpt-4o" } }).text).toBe("1 running · gpt-4o · Azure OpenAI");
+  });
+
+  it("follows the shown execution, after its position", () => {
+    expect(countLine({ ...one, runsCount: 2, executions: 2, position: 2, shown: { model: "darkmux:reviewer-7b" } }).text).toBe("2 running · 2/2 · reviewer-7b");
+  });
+
+  it("is the plain count while nothing names a model (a lab run between dispatches, a start not yet landed)", () => {
+    expect(countLine({ ...one, shown: null }).text).toBe("1 running");
+    expect(countLine({ ...one, shown: {} }).text).toBe("1 running");
+  });
+
+  it("says how many models an idle machine holds, when its engine said", () => {
+    expect(countLine({ ...one, runsCount: 0, executions: 0, position: 0, shown: null, residents: { known: true, count: 2 } })).toEqual({
+      text: "0 running · 2 loaded",
+      title: "0 running · 2 loaded",
+    });
+    expect(countLine({ ...one, runsCount: 0, executions: 0, position: 0, shown: null, residents: { known: true, count: 0 } }).text).toBe("0 running · 0 loaded");
+  });
+
+  it("never says 0 loaded when the list is not known: the reason is in the title", () => {
+    const line = countLine({ ...one, runsCount: 0, executions: 0, position: 0, shown: null, residents: { known: false, why: "LM Studio could not be asked (`lms ps` failed); what it holds is unknown." } });
+    expect(line.text).toBe("0 running");
+    expect(line.title).toBe("0 running · loaded models unknown: LM Studio could not be asked (`lms ps` failed); what it holds is unknown.");
+  });
+
+  it("claims nothing about residents with no card read", () => {
+    expect(countLine({ ...one, runsCount: 0, executions: 0, position: 0, shown: null, residents: null })).toEqual({ text: "0 running", title: "0 running" });
+  });
+
+  it("names no residents while something runs: the line is the running execution's", () => {
+    expect(countLine({ ...one, shown: { model: "darkmux:q" }, residents: { known: true, count: 3 } }).text).toBe("1 running · q");
   });
 });
 

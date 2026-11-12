@@ -1264,6 +1264,42 @@ describe("executionRole", () => {
   });
 });
 
+// (#3554) The fleet card's running line names what the shown execution runs
+// on: the model and the hosted endpoint its own start record names.
+describe("executionTokenReading: the model and endpoint", () => {
+  const start = (sec: number, extra: Record<string, unknown>, payload: Record<string, unknown> = {}): NormRecord =>
+    norm({ ts: atSec(sec), action: "dispatch.start", session_id: SID, handle: "darkmux/coder", payload, ...extra });
+
+  it("carries the model the start record names, and no endpoint for a managed LM Studio run", () => {
+    const reading = executionTokenReading([start(0, { model: "darkmux:qwen3.6-35b-a3b" })], Date.parse(atSec(1)));
+    expect(reading.model).toBe("darkmux:qwen3.6-35b-a3b");
+    expect(reading.endpoint).toBeUndefined();
+  });
+
+  it("carries the hosted endpoint the start record names", () => {
+    const reading = executionTokenReading(
+      [start(0, { model: "gpt-4o" }, { endpoint: "azure:myorg.openai.azure.com/gpt-4o" })],
+      Date.parse(atSec(1)),
+    );
+    expect(reading).toMatchObject({ model: "gpt-4o", endpoint: "azure:myorg.openai.azure.com/gpt-4o" });
+  });
+
+  it("reads the LATEST start when an execution restarted", () => {
+    const reading = executionTokenReading(
+      [start(0, { model: "darkmux:a" }), start(10, { model: "gpt-4o" }, { endpoint: "openai:api.openai.com/gpt-4o" })],
+      Date.parse(atSec(11)),
+    );
+    expect(reading).toMatchObject({ model: "gpt-4o", endpoint: "openai:api.openai.com/gpt-4o" });
+  });
+
+  it("names neither when no start record has landed (a mid-stream execution)", () => {
+    const hb = norm({ ts: atSec(0), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: Date.parse(atSec(0)), generated_chars: 0 } });
+    const reading = executionTokenReading([hb], Date.parse(atSec(1)));
+    expect(reading.model).toBeUndefined();
+    expect(reading.endpoint).toBeUndefined();
+  });
+});
+
 describe("executionTokenReading", () => {
   const rec = (sec: number, action: string, payload: Record<string, unknown> = {}, handle?: string): NormRecord =>
     norm({ ts: atSec(sec), action, session_id: SID, ...(handle ? { handle } : {}), payload });

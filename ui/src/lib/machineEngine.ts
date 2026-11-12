@@ -47,6 +47,29 @@ export function residentsUnknownNote(specs: ResidentSpecs | null): string | null
   return "LM Studio could not be asked (`lms ps` failed); what it holds is unknown.";
 }
 
+/** (#3554) What a machine holds for darkmux, as its fleet card counts it. */
+export type CardResidents = { known: true; count: number } | { known: false; why: string };
+
+/** darkmux's namespace on a resident's identifier (contract 4): the test
+ *  `darkmux_profiles::ownership::is_darkmux_owned` applies. */
+const DARKMUX_NAMESPACE = "darkmux:";
+
+/** (#3554) How many models the machine holds for darkmux: the residents in
+ *  darkmux's namespace, never a model another app loaded (the fleet card is a
+ *  darkmux card, not an LM Studio one); or why the list is not known, so a
+ *  card never says "0 loaded" about a list nobody read. `null` with no specs:
+ *  no card was read, so nothing is claimed. */
+export function darkmuxResidents(specs: (ResidentSpecs & Pick<MachineSpecsResponse, "loaded_models">) | null): CardResidents | null {
+  if (!specs) return null;
+  const why = residentsUnknownNote(specs);
+  if (why !== null) return { known: false, why };
+  // A peer's card is read off the wire: one that leaves the list out claims
+  // nothing, rather than "0 loaded" or taking the fleet page down with it.
+  const listed: unknown = specs.loaded_models;
+  if (!Array.isArray(listed)) return null;
+  return { known: true, count: specs.loaded_models.filter((m) => m.identifier.startsWith(DARKMUX_NAMESPACE)).length };
+}
+
 /** Machine info's engine row: the name, and what it does not report or that
  *  it cannot be used; empty with no specs (the row then hides). */
 export function engineRow(specs: EngineSpecs | null | undefined): string {

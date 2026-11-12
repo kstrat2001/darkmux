@@ -47,6 +47,9 @@ import { currentRun, runIndex, type RunGroup } from "../../lib/runRef";
 import { machineAvailability, type MachineAvailability } from "../../lib/machineAvailability";
 import { CardStatus } from "./cardStatus";
 import { RUNNING_WORD } from "../../components/WorkStatus";
+import type { CardResidents } from "../../lib/machineEngine";
+import { parseEndpointRoute, routeKindLabel, type EndpointRoute } from "../../lib/endpointRoute";
+import { shortModel } from "../../lib/format";
 
 /** A machine's runs in flight as of `t`: its run- and execution-grain runs
  *  (`runRef.ts`) whose lifecycle (`lifecycle.ts`) is open or waiting. One
@@ -281,6 +284,9 @@ export interface FleetCard {
   /** (#3450) The servers the machine's own card says its darkmux runs
    *  (Tensorfold, rec's Flint): its own residents. Empty shows nothing. */
   engineServers: readonly EngineServer[];
+  /** (#3554) What the machine's own card says it holds for darkmux: a count,
+   *  or why that is not known; `null` when no card was read. */
+  residents: CardResidents | null;
   /** Whether the machine is up: the view's own `liveness` (a card it read
    *  is proof of life), or, for a machine the view does not hold, the flow
    *  window's online/offline edges. */
@@ -422,6 +428,7 @@ function cardIdentity(
       servesRadio: false,
       servesProfiles: 0,
       engineServers: [],
+      residents: null,
       availability: "known" as const,
       self: false,
     };
@@ -440,6 +447,7 @@ function cardIdentity(
     servesRadio: row.servesRadio,
     servesProfiles: row.servesProfiles,
     engineServers: row.engineServers,
+    residents: row.residents,
     standing: row.standing,
     availability: machineAvailability({ self: row.isSelf, seen: rowSeen(row), standing: row.standing }),
     // (#2915) The view says which row is this machine; a peer's model is
@@ -565,6 +573,7 @@ export function buildFleetCardBase(
     servesRadio: id.servesRadio,
     servesProfiles: id.servesProfiles,
     engineServers: id.engineServers,
+    residents: id.residents,
     standing,
     availability: id.availability,
     active,
@@ -873,4 +882,77 @@ export function executionCountText(f: { runsCount: number; executions: number; p
   if (f.executions < 2) return `${f.runsCount} ${RUNNING_WORD}`;
   if (f.runsCount === f.executions) return `${f.runsCount} ${RUNNING_WORD} · ${f.position}/${f.executions}`;
   return `${f.runsCount} ${f.runsCount === 1 ? "run" : "runs"} · ${f.position}/${f.executions} executions`;
+}
+
+/** (#3554) Loopback hosts: a server darkmux started is labeled
+ *  `127.0.0.1:<port>` (`darkmux_crew::target`), the address it serves on. */
+const LOOPBACK = new Set(["127.0.0.1", "localhost", "[::1]"]);
+
+/** The server darkmux started that answers at `host`, when it is one of the
+ *  machine's own: a loopback address on that server's port. */
+function startedServerAt(host: string, servers: readonly Pick<EngineServer, "engine" | "port">[]) {
+  const i = host.lastIndexOf(":");
+  if (i < 0 || !LOOPBACK.has(host.slice(0, i))) return undefined;
+  const port = Number(host.slice(i + 1));
+  return servers.find((s) => s.port === port);
+}
+
+/** (#3554) The engine a hosted execution ran on: a server darkmux started on
+ *  this machine by its engine, Azure by name, and any other endpoint by its
+ *  address (`openai:` names the request FORMAT, not a vendor, so a server on
+ *  this machine is never read as having left it). */
+function routeEngine(route: EndpointRoute, servers: readonly Pick<EngineServer, "engine" | "port">[]): string {
+  const server = startedServerAt(route.host, servers);
+  if (server) return server.engine;
+  return route.kind === "azure" ? routeKindLabel(route.kind) : route.host;
+}
+
+/** A model id's last path segment (`mlx-community/Qwen3.6` → `Qwen3.6`), as
+ *  `serversLine` cuts it: a card is narrow, and the title has the whole id. */
+const lastSegment = (model: string): string => model.slice(model.lastIndexOf("/") + 1);
+
+/** (#3554) What the shown execution runs on, in words: its model (without
+ *  darkmux's namespace) and, when it is not this machine's managed LM Studio,
+ *  its engine. The text cuts the model to its last segment; the title has the
+ *  whole id and the engine's address. `null` when nothing names either. */
+function routeWords(
+  shown: Pick<ExecutionTokenReading, "model" | "endpoint">,
+  servers: readonly Pick<EngineServer, "engine" | "port">[],
+): { text: string; title: string } | null {
+  const route = shown.endpoint ? parseEndpointRoute(shown.endpoint) : null;
+  const model = shortModel(shown.model) || route?.model || "";
+  const engine = route ? routeEngine(route, servers) : "";
+  const engineTitle = route && engine !== route.host ? `${engine} on ${route.host}` : engine;
+  const text = [lastSegment(model), engine].filter(Boolean).join(" · ");
+  return text ? { text, title: [model, engineTitle].filter(Boolean).join(" · ") } : null;
+}
+
+/** (#3554) An idle count line with what the machine holds: "0 running · 2
+ *  loaded" when its engine said, the plain count with the reason in the title
+ *  when the list is not known (never "0 loaded" about a list nobody read), and
+ *  the plain count when no card was read. */
+function residentsLine(count: string, residents: CardResidents | null): { text: string; title: string } {
+  if (!residents) return { text: count, title: count };
+  if (!residents.known) return { text: count, title: `${count} · loaded models unknown: ${residents.why}` };
+  const text = `${count} · ${residents.count} loaded`;
+  return { text, title: text };
+}
+
+/** (#3554) The count line's words and its tooltip. While something runs it
+ *  names what the SHOWN execution (the tube's page) runs on after the count;
+ *  idle, what the machine holds. `residents` is the caller's to withhold
+ *  where it is not a fact about the moment shown (a scrubbed playhead). The
+ *  line is one ellipsized line, so the title carries it whole. */
+export function countLine(f: {
+  runsCount: number;
+  executions: number;
+  position: number;
+  shown: Pick<ExecutionTokenReading, "model" | "endpoint"> | null;
+  engineServers: readonly Pick<EngineServer, "engine" | "port">[];
+  residents: CardResidents | null;
+}): { text: string; title: string } {
+  const count = executionCountText(f);
+  if (f.runsCount === 0) return residentsLine(count, f.residents);
+  const route = f.shown ? routeWords(f.shown, f.engineServers) : null;
+  return route ? { text: `${count} · ${route.text}`, title: `${count} · ${route.title}` } : { text: count, title: count };
 }

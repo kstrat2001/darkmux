@@ -23,7 +23,7 @@ import { scopeStateOf } from "../../lib/scopeMorph";
 import { dispatchHash } from "../../lib/route";
 import { onIntentClick } from "../../lib/clickIntent";
 import type { ExecutionTokenReading, LiveState } from "../../lib/tokenRate";
-import { executionCountText, specDimLabel, type CardFace, type FleetCard } from "./cards";
+import { countLine, executionCountText, specDimLabel, type CardFace, type FleetCard } from "./cards";
 import { CardStatus, STATUS_WORD, lampOf, secondLineOf, statusReason } from "./cardStatus";
 import { readingLabel, readingTitle } from "./readingLabel";
 
@@ -215,8 +215,11 @@ function StatusLine({
 }
 
 /** The count line: "N running" (a link to the run while something runs),
- * "2 running · 1/2" with several executions, or "—" / "not streaming" while
- * there is no count to claim. */
+ * "2 running · 1/2" with several executions, then (#3554) what the shown
+ * execution runs on ("1 running · qwen3.6-35b-a3b"); idle, what the machine
+ * holds ("0 running · 2 loaded"), at the live edge only, since residency is a
+ * fact about now. "—" / "not streaming" while there is no count to claim. One
+ * ellipsized line; the title (and the control's name) carries it whole. */
 function CountLine({
   card,
   face,
@@ -224,6 +227,8 @@ function CountLine({
   machineKey,
   executions,
   position,
+  shown,
+  atLiveEdge,
 }: {
   card: FleetCard;
   face: CardFace;
@@ -231,13 +236,23 @@ function CountLine({
   machineKey: string;
   executions: number;
   position: number;
+  shown: ExecutionTokenReading | null;
+  atLiveEdge: boolean;
 }) {
   const secondLine = secondLineOf(status);
   if (secondLine !== null) return <div className="runs runs--quiet">{secondLine}</div>;
   if (!face.countShown) return <div className="runs runs--quiet">—</div>;
   const runsHash = machineRunsHash(machineKey, card.runningSessionIds);
-  const countText = executionCountText({ runsCount: card.runsCount, executions, position });
-  if (!runsHash) return <div className="runs">{countText}</div>;
+  const counts = { runsCount: card.runsCount, executions, position };
+  const line = countLine({ ...counts, shown, engineServers: card.engineServers, residents: atLiveEdge ? card.residents : null });
+  if (!runsHash) {
+    return (
+      <div className="runs" title={line.title}>
+        {line.text}
+      </div>
+    );
+  }
+  const named = line.title !== executionCountText(counts) ? `: ${line.title}` : "";
   const activate = (e: { stopPropagation: () => void }) => {
     e.stopPropagation();
     location.hash = runsHash;
@@ -253,7 +268,8 @@ function CountLine({
       className="runs runs--live"
       role="button"
       tabIndex={0}
-      aria-label={`open the ${card.runsCount} running ${card.runsCount === 1 ? "dispatch" : "dispatches"} on ${card.name}`}
+      aria-label={`open the ${card.runsCount} running ${card.runsCount === 1 ? "dispatch" : "dispatches"} on ${card.name}${named}`}
+      title={line.title}
       onClick={onCountClick}
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") {
@@ -262,7 +278,7 @@ function CountLine({
         }
       }}
     >
-      {countText}
+      {line.text}
     </div>
   );
 }
@@ -489,7 +505,16 @@ export function MachineCard({
       <CardAsOf asOf={notCurrentAsOf} />
       <div className="mach-body mach-body--scope">
         <StatusLine status={status} note={card.note} reading={reading} />
-        <CountLine card={card} face={face} status={status} machineKey={machineKey} executions={execs.length} position={selectedIdx + 1} />
+        <CountLine
+          card={card}
+          face={face}
+          status={status}
+          machineKey={machineKey}
+          executions={execs.length}
+          position={selectedIdx + 1}
+          shown={selected}
+          atLiveEdge={clock.playhead == null}
+        />
         <ServesLine machine={card.name} profiles={card.servesProfiles} radio={card.servesRadio} />
         <ServersLine servers={card.engineServers} />
         <CardTube card={card} face={face} selected={selected} position={selectedIdx + 1} count={execs.length} onCycle={cycle} clock={clock} />
