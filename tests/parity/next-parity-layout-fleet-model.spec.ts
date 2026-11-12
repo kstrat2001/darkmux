@@ -1,8 +1,9 @@
 // @ts-nocheck
 // (#3554) The fleet card's count line names the model (and engine) behind
 // "1 running", and how many models an idle machine holds ("0 running · 2
-// loaded"). New words go into the count line's one existing slot: a long model
-// name is ellipsized there, never wrapped, so every variant keeps one card
+// loaded"). New words go into the count line's one existing slot: the model's
+// name alone (`modelShortName`), and a line still too wide (a hosted run's
+// engine on a narrow card) is ellipsized there, never wrapped, so every variant keeps one card
 // size (operator: "no layout size changes"), on a desktop and a phone. The full
 // line is the slot's title.
 //
@@ -16,7 +17,8 @@ const fs = require("fs");
 const path = require("path");
 const { STATES, MULTI, VIEWPORTS, SELF_ROW, OFFLINE_ROW, installLayoutRoutes, measure } = require("./lib/layout-fixture.js");
 
-const LONG_MODEL = "darkmux:mlx-community/Qwen3.6-35B-A3B-Instruct-4bit-DWQ";
+// A real id (the parity corpus's resident): the card shows only its name.
+const LONG_MODEL = "darkmux:qwen3.6-35b-a3b-turboquant-mlx";
 const resident = (identifier) => ({ identifier, model: identifier.replace(/^darkmux:/, ""), status: "idle", size: "1 GB", context: 32768 });
 
 /** `SELF_ROW` with its card's specs changed. */
@@ -48,8 +50,8 @@ const VARIANTS = [
     state: generating,
     self: SELF_ROW,
     records: restarted(generating, (r) => ({ ...r, model: LONG_MODEL })),
-    text: "1 running · Qwen3.6-35B-A3B-Instruct-4bit-DWQ",
-    title: "1 running · mlx-community/Qwen3.6-35B-A3B-Instruct-4bit-DWQ",
+    text: "1 running · qwen3.6-35b-a3b",
+    title: "1 running · qwen3.6-35b-a3b-turboquant-mlx",
   },
   {
     id: "running-hosted",

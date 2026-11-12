@@ -50,6 +50,7 @@ import { RUNNING_WORD } from "../../components/WorkStatus";
 import type { CardResidents } from "../../lib/machineEngine";
 import { parseEndpointRoute, routeKindLabel, type EndpointRoute } from "../../lib/endpointRoute";
 import { shortModel } from "../../lib/format";
+import { modelShortName } from "../../lib/modelName";
 
 /** A machine's runs in flight as of `t`: its run- and execution-grain runs
  *  (`runRef.ts`) whose lifecycle (`lifecycle.ts`) is open or waiting. One
@@ -907,14 +908,12 @@ function routeEngine(route: EndpointRoute, servers: readonly Pick<EngineServer, 
   return route.kind === "azure" ? routeKindLabel(route.kind) : route.host;
 }
 
-/** A model id's last path segment (`mlx-community/Qwen3.6` → `Qwen3.6`), as
- *  `serversLine` cuts it: a card is narrow, and the title has the whole id. */
-const lastSegment = (model: string): string => model.slice(model.lastIndexOf("/") + 1);
-
 /** (#3554) What the shown execution runs on, in words: its model (without
  *  darkmux's namespace) and, when it is not this machine's managed LM Studio,
- *  its engine. The text cuts the model to its last segment; the title has the
- *  whole id and the engine's address. `null` when nothing names either. */
+ *  its engine. The text shows only the model's name (`modelShortName`), and
+ *  the engine once when that name already is it (`flint-int4` on `flint`);
+ *  the title has the whole id and the engine's address. `null` when nothing
+ *  names either. */
 function routeWords(
   shown: Pick<ExecutionTokenReading, "model" | "endpoint">,
   servers: readonly Pick<EngineServer, "engine" | "port">[],
@@ -923,7 +922,8 @@ function routeWords(
   const model = shortModel(shown.model) || route?.model || "";
   const engine = route ? routeEngine(route, servers) : "";
   const engineTitle = route && engine !== route.host ? `${engine} on ${route.host}` : engine;
-  const text = [lastSegment(model), engine].filter(Boolean).join(" · ");
+  const name = modelShortName(model);
+  const text = [name, engine.toLowerCase() === name.toLowerCase() ? "" : engine].filter(Boolean).join(" · ");
   return text ? { text, title: [model, engineTitle].filter(Boolean).join(" · ") } : null;
 }
 

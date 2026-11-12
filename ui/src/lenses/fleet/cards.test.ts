@@ -1375,10 +1375,18 @@ describe("the count line's model, engine and residents (#3554)", () => {
     });
   });
 
-  it("cuts a model id to its last path segment on the card; the title has it whole", () => {
+  it("shows only the model's name on the card (modelShortName); the title has the whole id", () => {
     expect(countLine({ ...one, shown: { model: "darkmux:mlx-community/Qwen3.6-35B-A3B-4bit" } })).toEqual({
-      text: "1 running · Qwen3.6-35B-A3B-4bit",
+      text: "1 running · Qwen3.6-35B-A3B",
       title: "1 running · mlx-community/Qwen3.6-35B-A3B-4bit",
+    });
+    expect(countLine({ ...one, shown: { model: "darkmux:qwen/qwen3.6-35b-a3b-mlx-4bit" } }).text).toBe("1 running · qwen3.6-35b-a3b");
+  });
+
+  it("names the engine once when the model's name already is it", () => {
+    expect(countLine({ ...one, engineServers: [flint], shown: { model: "flint-int4", endpoint: "openai:127.0.0.1:8123/flint-int4" } })).toEqual({
+      text: "1 running · flint",
+      title: "1 running · flint-int4 · flint on 127.0.0.1:8123",
     });
   });
 
