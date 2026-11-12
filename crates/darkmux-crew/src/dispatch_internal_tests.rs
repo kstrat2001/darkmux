@@ -2631,26 +2631,16 @@
     // above.
 
     #[test]
-    fn apply_volume_mounts_emits_workspace_and_out_dir() {
+    fn volume_mounts_are_the_workspace_and_out_dir() {
         // The runtime's OWN bookkeeping goes to `/darkmux-out`, SEPARATE
         // from the agent's `/workspace`. This literal MUST stay in sync
         // with `runtime::trajectory::RUNTIME_OUT_BASE` (the two crates
         // can't share the const — the runtime is built into the image).
-        let mut args: Vec<String> = Vec::new();
-        apply_volume_mounts(
-            &mut args,
-            Path::new("/host/workspace"),
-            Path::new("/host/out"),
-            false,
-        );
+        use darkmux_sandbox::{Access, Mount};
+        let args = volume_mounts(Path::new("/host/workspace"), Path::new("/host/out"), false);
         assert_eq!(
             args,
-            vec![
-                "-v",
-                "/host/workspace:/workspace",
-                "-v",
-                "/host/out:/darkmux-out",
-            ],
+            [Mount { host: PathBuf::from("/host/workspace"), at: "/workspace".to_string(), access: Access::ReadWrite }, Mount { host: PathBuf::from("/host/out"), at: "/darkmux-out".to_string(), access: Access::ReadWrite }],
             "both binds present; out-dir mounts at /darkmux-out"
         );
         // Defensive: the runtime must NOT be told to write its
@@ -2658,7 +2648,7 @@
         assert!(
             !args
                 .iter()
-                .any(|a| a.ends_with(":/workspace") && a.contains("/host/out")),
+                .any(|m| m.at == "/workspace" && m.host == Path::new("/host/out")),
             "out-dir must not be mounted at /workspace"
         );
     }
@@ -2670,22 +2660,12 @@
     /// so a role holding only `read`/`exec`/`create_finding` can't write
     /// into the corpus tree even via a shell escape.
     #[test]
-    fn apply_volume_mounts_appends_ro_to_workspace_bind_when_read_only() {
-        let mut args: Vec<String> = Vec::new();
-        apply_volume_mounts(
-            &mut args,
-            Path::new("/host/workspace"),
-            Path::new("/host/out"),
-            true,
-        );
+    fn volume_mounts_make_only_the_workspace_read_only_when_asked() {
+        use darkmux_sandbox::{Access, Mount};
+        let args = volume_mounts(Path::new("/host/workspace"), Path::new("/host/out"), true);
         assert_eq!(
             args,
-            vec![
-                "-v",
-                "/host/workspace:/workspace:ro",
-                "-v",
-                "/host/out:/darkmux-out",
-            ],
+            [Mount { host: PathBuf::from("/host/workspace"), at: "/workspace".to_string(), access: Access::ReadOnly }, Mount { host: PathBuf::from("/host/out"), at: "/darkmux-out".to_string(), access: Access::ReadWrite }],
             "workspace bind gains :ro; out-dir bind is unaffected"
         );
     }
@@ -6025,43 +6005,36 @@ S(("127.0.0.1", port), H).serve_forever()
     }
 
     #[test]
-    fn apply_runtime_injection_mounts_binary_and_overrides_entrypoint() {
+    fn runtime_injection_mounts_the_binary_read_only_at_the_entrypoint() {
         // (#703) Injecting into a non-default image: bind the static binary
         // read-only at /darkmux-runtime and force the entrypoint to it. These
         // are docker-run OPTIONS (must precede the image arg).
-        let mut args: Vec<String> = Vec::new();
-        apply_runtime_injection(&mut args, Path::new("/home/op/.darkmux/runtime/darkmux-runtime"));
+        use darkmux_sandbox::{Access, Mount};
+        let mount = runtime_injection_mount(Path::new("/home/op/.darkmux/runtime/darkmux-runtime"));
         assert_eq!(
-            args,
-            vec![
-                "-v",
-                "/home/op/.darkmux/runtime/darkmux-runtime:/darkmux-runtime:ro",
-                "--entrypoint",
-                "/darkmux-runtime",
-            ],
+            (mount, RUNTIME_INJECTION_PATH),
+            (Mount { host: PathBuf::from("/home/op/.darkmux/runtime/darkmux-runtime"), at: "/darkmux-runtime".to_string(), access: Access::ReadOnly }, "/darkmux-runtime"),
             "binary bound read-only at /darkmux-runtime; entrypoint overridden to it"
         );
     }
 
     #[test]
-    fn apply_cache_mount_binds_cache_and_points_package_managers_at_it() {
+    fn cache_mount_binds_the_cache_and_points_package_managers_at_it() {
         // (#703 Slice 3) Shared toolchain cache mounted at /darkmux-cache with
         // CARGO_HOME / npm / pip env redirected so the inner loop reuses
         // downloads across dispatches.
-        let mut args: Vec<String> = Vec::new();
-        apply_cache_mount(&mut args, Path::new("/home/op/.darkmux/cache"));
+        use darkmux_sandbox::{Access, Mount};
+        let kv = |k: &str, v: &str| (k.to_string(), v.to_string());
         assert_eq!(
-            args,
-            vec![
-                "-v",
-                "/home/op/.darkmux/cache:/darkmux-cache",
-                "-e",
-                "CARGO_HOME=/darkmux-cache/cargo",
-                "-e",
-                "npm_config_cache=/darkmux-cache/npm",
-                "-e",
-                "PIP_CACHE_DIR=/darkmux-cache/pip",
-            ],
+            cache_mount(Path::new("/home/op/.darkmux/cache")),
+            (
+                Mount { host: PathBuf::from("/home/op/.darkmux/cache"), at: "/darkmux-cache".to_string(), access: Access::ReadWrite },
+                vec![
+                    kv("CARGO_HOME", "/darkmux-cache/cargo"),
+                    kv("npm_config_cache", "/darkmux-cache/npm"),
+                    kv("PIP_CACHE_DIR", "/darkmux-cache/pip"),
+                ]
+            ),
             "cache bound at /darkmux-cache; cargo/npm/pip caches redirected into it"
         );
     }
@@ -6169,106 +6142,50 @@ S(("127.0.0.1", port), H).serve_forever()
              can leave behind, and they zombie for the container's whole lifetime"
         );
 
-        // 2. Verify the full argv structure
-        assert_eq!(argv[0], "docker");
-        assert_eq!(argv[1], "run");
-        assert_eq!(argv[2], "--rm");
-        assert_eq!(argv[3], "--name");
-        assert_eq!(argv[4], "darkmux-dispatch-test-123");
-
-        // 3. Verify hardening flags follow immediately after --name
-        assert_eq!(argv[5], format!("--cap-drop={}", DOCKER_CAP_DROP));
-        assert_eq!(argv[6], format!("--security-opt={}", DOCKER_SECURITY_OPT));
-        assert_eq!(argv[7], format!("--pids-limit={}", DOCKER_PIDS_LIMIT));
-        assert_eq!(argv[8], format!("--memory={}", DOCKER_MEMORY));
-
-        // 3b. (#2481) --init follows the other hardening flags, before any
-        // mount — gives the container a real init (docker's tini) that reaps
-        // orphaned grandchildren instead of leaving them zombied on PID 1.
-        assert_eq!(argv[9], "--init");
-
-        // 4. Verify volume mounts (workspace + out-dir)
-        assert_eq!(argv[10], "-v");
-        assert_eq!(argv[11], "/host/workspace:/workspace");
-        assert_eq!(argv[12], "-v");
-        assert_eq!(argv[13], "/host/out:/darkmux-out");
-
-        // 5. Verify cache mount + env vars (real host:container bind, not a
-        // bare anonymous volume).
-        assert_eq!(argv[14], "-v");
-        assert_eq!(argv[15], "/home/op/.darkmux/cache:/darkmux-cache");
-        assert_eq!(argv[16], "-e");
-        assert_eq!(argv[17], "CARGO_HOME=/darkmux-cache/cargo");
-        assert_eq!(argv[18], "-e");
-        assert_eq!(argv[19], "npm_config_cache=/darkmux-cache/npm");
-        assert_eq!(argv[20], "-e");
-        assert_eq!(argv[21], "PIP_CACHE_DIR=/darkmux-cache/pip");
-
-        // 5b. (#1548) Verify the feedback-injection env var is forwarded —
-        // the fix for the #1548 dead surface (`config.feedback_injection: true`
-        // in this test's config → `DARKMUX_FEEDBACK_INJECTION=true` on argv).
-        assert_eq!(argv[22], "-e");
-        assert_eq!(argv[23], "DARKMUX_FEEDBACK_INJECTION=true");
-
-        // 5c. (#2094) Verify the turn-delay env var is forwarded — ALWAYS,
-        // including at nonzero values (`config.turn_delay_ms: 3000` in this
-        // test's config → `DARKMUX_TURN_DELAY_MS=3000` on argv).
-        assert_eq!(argv[24], "-e");
-        assert_eq!(argv[25], "DARKMUX_TURN_DELAY_MS=3000");
-
-        // 5c-bis. (#2846) Verify the degeneracy-detector POLICY is forwarded.
-        // Always emitted, at its default too, for the same reason
-        // `turn_delay_ms` is: an absent var must never be ambiguous between
-        // "defaulted" and "the host forgot to forward it". A run that cannot
-        // say whether its gate was armed is not comparable against one that
-        // can.
-        assert_eq!(argv[26], "-e");
-        assert_eq!(argv[27], "DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY=conclude");
-        // (#2846, review finding I2) The assertion above pins the DEFAULT, so
-        // by itself it cannot tell "forwarded" from "hardcoded". Pin a
-        // NON-default value too. (#2947) The argv builder forwards the
-        // RESOLVED policy the dispatch hands it in `detection_policy`; the
-        // resolution itself (and its refusal of an unknown value) is
-        // `config_access::detection_degeneracy_policy`, tested in
-        // darkmux-types and by the dispatch preflight conformance test.
+        // 2. (#3112) The full options, in the sandbox backend's order: the
+        // program and verb, every sandbox's invariants (removed on exit, an
+        // init: #2481), the name, the hardening (#839), the mounts in order
+        // (workspace and out-dir, the cache, the injected runtime binary
+        // read-only), the environment in order (the cache redirects, then
+        // every forwarded setting: #1548, #2094, #2846, #2165), and the
+        // injected entrypoint.
+        let strings = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            argv[..36],
+            strings(&[
+                "docker", "run", "--rm", "--init", "--name", "darkmux-dispatch-test-123",
+                "--cap-drop=ALL", "--security-opt=no-new-privileges", "--pids-limit=512", "--memory=4g",
+                "-v", "/host/workspace:/workspace",
+                "-v", "/host/out:/darkmux-out",
+                "-v", "/home/op/.darkmux/cache:/darkmux-cache",
+                "-v", "/home/op/.darkmux/runtime/darkmux-runtime:/darkmux-runtime:ro",
+                "-e", "CARGO_HOME=/darkmux-cache/cargo",
+                "-e", "npm_config_cache=/darkmux-cache/npm",
+                "-e", "PIP_CACHE_DIR=/darkmux-cache/pip",
+                "-e", "DARKMUX_FEEDBACK_INJECTION=true",
+                "-e", "DARKMUX_TURN_DELAY_MS=3000",
+                "-e", "DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY=conclude",
+                "-e", "DARKMUX_INACTIVITY_TIMEOUT_SECONDS=900",
+                "-e", "DARKMUX_INACTIVITY_TIMEOUT_SECONDS_SOURCE=config",
+                "--entrypoint", "/darkmux-runtime",
+            ])
+        );
+        // (#2846, review finding I2) The policy above is the DEFAULT, so by
+        // itself it cannot tell "forwarded" from "hardcoded": a non-default
+        // value is forwarded too. (#2947) The argv builder forwards the
+        // RESOLVED policy the dispatch hands it in `detection_policy`.
         {
             let observe = DockerRunConfig {
                 detection_policy: darkmux_types::config::DetectionPolicy::Record,
                 ..config.clone()
             };
             let argv2 = build_docker_run_argv(&observe);
-            assert_eq!(
-                argv2[27], "DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY=record",
+            assert!(
+                argv2.contains(&"DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY=record".to_string()),
                 "the forwarded value must track the RESOLVED policy, not a literal"
             );
         }
 
-        // 5d. (#2094 finding 1) Verify the inactivity-timeout env var is
-        // forwarded too (`config.inactivity_timeout_seconds: 900` in this
-        // test's config → `DARKMUX_INACTIVITY_TIMEOUT_SECONDS=900` on argv)
-        // — the piece #2094's original cut left unforwarded, so the
-        // runtime's soft-warning detector silently used its own 600s
-        // literal default instead of the operator's configured budget.
-        assert_eq!(argv[28], "-e");
-        assert_eq!(argv[29], "DARKMUX_INACTIVITY_TIMEOUT_SECONDS=900");
-
-        // 5e. (#2165) Verify the inactivity-timeout SOURCE env var is
-        // forwarded alongside the value — a distinct, non-default source
-        // (`Config`, not the built-in default) so this assertion actually
-        // pins forwarding rather than coincidentally matching a default.
-        assert_eq!(argv[30], "-e");
-        assert_eq!(argv[31], "DARKMUX_INACTIVITY_TIMEOUT_SECONDS_SOURCE=config");
-
-        // 6. Verify runtime injection (non-default image)
-        assert_eq!(argv[32], "-v");
-        assert_eq!(
-            argv[33],
-            "/home/op/.darkmux/runtime/darkmux-runtime:/darkmux-runtime:ro"
-        );
-        assert_eq!(argv[34], "--entrypoint");
-        assert_eq!(argv[35], "/darkmux-runtime");
-
-        // 7. Verify `--` + image + runtime CLI args
         assert_eq!(argv[36], "--");
         assert_eq!(argv[37], "rust:slim"); // image
         assert_eq!(argv[38], "run"); // runtime subcommand
@@ -6836,6 +6753,127 @@ S(("127.0.0.1", port), H).serve_forever()
 
     /// A minimal valid config: no optional flags set. Each test below flips
     /// exactly one field so the assertion isolates that branch.
+    /// (#3112) A `docker run` line as Docker reads it: its options as a
+    /// sorted set (their order is Docker's business, except mounts and
+    /// environment, kept in order below), its `-v` mounts in order (a later
+    /// one is layered over an earlier), its `-e` environment in order (a
+    /// later key wins), and everything from the image on, in order.
+    fn as_docker_reads_it(argv: &[String]) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+        assert_eq!(argv[..2], ["docker", "run"]);
+        let image_at = argv.iter().position(|a| a == &base_argv_config().image).expect("the image");
+        let (mut options, mut mounts, mut env) = (Vec::new(), Vec::new(), Vec::new());
+        let mut it = argv[2..image_at].iter().filter(|a| *a != "--");
+        while let Some(a) = it.next() {
+            match a.as_str() {
+                "-v" => mounts.push(it.next().unwrap().clone()),
+                "-e" => env.push(it.next().unwrap().clone()),
+                "--name" | "--label" | "--entrypoint" | "-w" => options.push(format!("{a} {}", it.next().unwrap())),
+                _ => options.push(a.clone()),
+            }
+        }
+        options.sort();
+        (options, mounts, env, argv[image_at..].to_vec())
+    }
+
+    /// Every option a dispatch can set, on.
+    fn every_option_argv_config() -> DockerRunConfig {
+        DockerRunConfig {
+            host_identity: Some(crate::orphan_reaper::HostIdentity {
+                pid: 42,
+                start: 4200,
+                machine: "MACHINE-A".into(),
+                pid_ns: "pid:9".into(),
+            }),
+            mod_attachment_mounts: vec![(PathBuf::from("/tmp/mods/m1"), "/darkmux-mods/m1".to_string())],
+            inject: true,
+            runtime_binary: Some(PathBuf::from("/tmp/rt/darkmux-runtime")),
+            cache_dir: Some(PathBuf::from("/tmp/cache")),
+            max_pause_ms_env: Some(250),
+            remote_needs_auth: true,
+            workspace_read_only: true,
+            workdir_git_read_only: Some(PathBuf::from("/tmp/ws/.git")),
+            container_host_access: darkmux_platform::ContainerHostAccess::HostGateway,
+            container_user: darkmux_platform::ContainerUser::Host { uid: 501, gid: Some(20) },
+            ..base_argv_config()
+        }
+    }
+
+    /// (#3112) The whole `docker run` line of a bare dispatch and of one with
+    /// every option on, as Docker reads it, and the `--` fence right before
+    /// the image (#907). Pinned before dispatch moved onto the sandbox seam,
+    /// so the move adds, drops or changes no option, mount, variable or
+    /// runtime argument.
+    #[test]
+    fn a_dispatch_container_is_run_with_exactly_these_options() {
+        let strings = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let env = |extra: &[&str]| {
+            let mut e = strings(&[
+                "CARGO_HOME=/darkmux-cache/cargo",
+                "npm_config_cache=/darkmux-cache/npm",
+                "PIP_CACHE_DIR=/darkmux-cache/pip",
+                "DARKMUX_FEEDBACK_INJECTION=true",
+                "DARKMUX_TURN_DELAY_MS=0",
+                "DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY=conclude",
+                "DARKMUX_INACTIVITY_TIMEOUT_SECONDS=600",
+                "DARKMUX_INACTIVITY_TIMEOUT_SECONDS_SOURCE=built-in",
+            ]);
+            e.extend(strings(extra));
+            e
+        };
+        let tail = strings(&[
+            "darkmux-runtime:latest", "run", "--model", "m", "--role-id", "test-role", "--execution-id", "exec-test",
+            "--system", "role", "--prompt-file", "/darkmux-out/.prompt.txt",
+        ]);
+        let hardening = ["--cap-drop=ALL", "--init", "--memory=4g", "--name darkmux-edge", "--pids-limit=512", "--rm",
+            "--security-opt=no-new-privileges"];
+
+        let bare = build_docker_run_argv(&base_argv_config());
+        assert_eq!(
+            as_docker_reads_it(&bare),
+            (
+                strings(&hardening),
+                strings(&["/tmp/ws:/workspace", "/tmp/out:/darkmux-out", "/tmp/cache:/darkmux-cache"]),
+                env(&[]),
+                tail.clone()
+            )
+        );
+
+        let every = build_docker_run_argv(&every_option_argv_config());
+        let mut options = strings(&hardening);
+        options.extend(strings(&[
+            "--add-host=host.docker.internal:host-gateway",
+            "--entrypoint /darkmux-runtime",
+            "--label darkmux.dispatch.host-machine=MACHINE-A",
+            "--label darkmux.dispatch.host-pid-ns=pid:9",
+            "--label darkmux.dispatch.host-pid=42",
+            "--label darkmux.dispatch.host-start=4200",
+            "--user=501:20",
+            "-i",
+        ]));
+        options.sort();
+        assert_eq!(
+            as_docker_reads_it(&every),
+            (
+                options,
+                strings(&[
+                    "/tmp/ws:/workspace:ro",
+                    "/tmp/out:/darkmux-out",
+                    "/tmp/ws/.git:/workspace/.git:ro",
+                    "/tmp/mods/m1:/darkmux-mods/m1:ro",
+                    "/tmp/cache:/darkmux-cache",
+                    "/tmp/rt/darkmux-runtime:/darkmux-runtime:ro",
+                ]),
+                env(&["DARKMUX_MAX_PAUSE_MS=250", "HOME=/tmp"]),
+                tail
+            )
+        );
+        for argv in [&bare, &every] {
+            let image_at = argv.iter().position(|a| a == "darkmux-runtime:latest").unwrap();
+            assert_eq!(argv[image_at - 1], "--", "the image is fenced from the options (#907)");
+            assert_eq!(argv.iter().filter(|a| *a == "--").count(), 1);
+        }
+    }
+
     fn base_argv_config() -> DockerRunConfig {
         DockerRunConfig {
             host_identity: None,
@@ -6925,7 +6963,7 @@ S(("127.0.0.1", port), H).serve_forever()
     /// (#1959 packet 2) The full-argv wiring: `workspace_read_only: true`
     /// on `DockerRunConfig` must reach the actual `docker run` argv as
     /// `-v /tmp/ws:/workspace:ro`, not just be asserted at the
-    /// `apply_volume_mounts` unit level above.
+    /// `volume_mounts` unit level above.
     #[test]
     fn build_docker_run_argv_appends_ro_to_workspace_mount_when_read_only() {
         let mut config = base_argv_config();
@@ -18771,6 +18809,14 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             "the retries must ESCALATE from `docker kill` to `docker rm -f` rather than \
              repeating one verb that is already failing"
         );
+        // (#2232, #3112) The liveness probe lists RUNNING containers only (an
+        // exited one is not alive) by the exact name, anchored both ends (a
+        // container whose name merely contains this one is not it).
+        let probes: Vec<&str> = recorded.lines().filter(|l| l.starts_with("ps ")).collect();
+        assert!(!probes.is_empty(), "the probe ran: {recorded:?}");
+        for probe in probes {
+            assert_eq!(probe, "ps --filter name=^darkmux-test-container-2232-hung$ --format {{.Names}}");
+        }
         assert_eq!(
             outcome,
             KillOutcome::Unconfirmed {

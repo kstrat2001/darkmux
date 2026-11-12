@@ -5548,7 +5548,7 @@ fn check_daemon_docker() -> Check {
     let health = loopback_http_body(&host, darkmux_types::config_access::serve_client_port(), "/health");
     let (daemon, listener_on) = health.as_deref().map(parse_daemon_docker).unwrap_or((None, false));
     let in_panel = env::var_os("DARKMUX_PANEL").is_some();
-    classify_daemon_docker(daemon, which("docker").is_some(), listener_on, in_panel)
+    classify_daemon_docker(daemon, darkmux_sandbox::DockerBackend::on_path(), listener_on, in_panel)
 }
 
 /// `/health`'s `docker_on_path` (`None` when absent: no daemon, one older than
@@ -5852,12 +5852,9 @@ enum RuntimeImageProbe {
 }
 
 fn probe_runtime_image() -> RuntimeImageProbe {
-    use darkmux_crew::runtime_image::{RUNTIME_IMAGE_REPO, RUNTIME_IMAGE_VERSION_LABEL};
+    use darkmux_crew::runtime_image::RUNTIME_IMAGE_REPO;
     let timeout = std::time::Duration::from_secs(5);
-    let Some(list) = bounded_output(
-        Command::new("docker").args(["images", RUNTIME_IMAGE_REPO, "--format", "{{.Repository}}:{{.Tag}}"]),
-        timeout,
-    ) else {
+    let Some(list) = bounded_output(&mut runtime_image_list_command(), timeout) else {
         return RuntimeImageProbe::NotApplicable("`docker` not available".into());
     };
     if !list.status.success() {
@@ -5868,20 +5865,27 @@ fn probe_runtime_image() -> RuntimeImageProbe {
     if tags.is_empty() {
         return RuntimeImageProbe::NotApplicable(format!("no local `{RUNTIME_IMAGE_REPO}` image"));
     }
-    // One inspect for every tag: one output line per ref, in order.
-    let format = format!("{{{{index .Config.Labels \"{RUNTIME_IMAGE_VERSION_LABEL}\"}}}}");
-    let Some(out) = bounded_output(
-        Command::new("docker")
-            .args(["image", "inspect", "--format", &format, "--"])
-            .args(&tags),
-        timeout,
-    ) else {
+    let Some(out) = bounded_output(&mut runtime_image_labels_command(&tags), timeout) else {
         return RuntimeImageProbe::NotApplicable("`docker image inspect` did not answer".into());
     };
     match pair_runtime_image_labels(&tags, &String::from_utf8_lossy(&out.stdout)) {
         Some(paired) if out.status.success() => RuntimeImageProbe::Tags(paired),
         _ => RuntimeImageProbe::NotApplicable("could not read the local images' labels".into()),
     }
+}
+
+/// `docker images` listing the local runtime images as `repo:tag`, the
+/// lines `parse_runtime_image_tags` reads.
+fn runtime_image_list_command() -> std::process::Command {
+    darkmux_sandbox::DockerBackend::images(darkmux_crew::runtime_image::RUNTIME_IMAGE_REPO, "{{.Repository}}:{{.Tag}}")
+}
+
+/// One `docker image inspect` for every tag, printing each one's version
+/// label on its own line, in order: what `pair_runtime_image_labels` reads.
+fn runtime_image_labels_command(tags: &[String]) -> std::process::Command {
+    let label = darkmux_crew::runtime_image::RUNTIME_IMAGE_VERSION_LABEL;
+    let format = format!("{{{{index .Config.Labels \"{label}\"}}}}");
+    darkmux_sandbox::DockerBackend::image_inspect(&format, &tags.iter().map(String::as_str).collect::<Vec<_>>())
 }
 
 /// `docker images <repo> --format '{{.Repository}}:{{.Tag}}'` → the tagged refs.
@@ -11686,6 +11690,32 @@ mod tests {
         assert_eq!(paired[1].label.as_deref(), Some("3.13.0"));
         // A short answer is never misattributed.
         assert!(pair_runtime_image_labels(&tags, "3.13.0\n").is_none());
+    }
+
+    /// (#3552 review) The listing prints `repo:tag` lines and the inspect
+    /// one version label per tag, in order: what the two parsers above read.
+    #[test]
+    fn runtime_image_probe_commands_print_what_the_parsers_read() {
+        let args = |cmd: std::process::Command| -> Vec<String> {
+            cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect()
+        };
+        assert_eq!(
+            args(runtime_image_list_command()),
+            vec!["images", "darkmux-runtime", "--format", "{{.Repository}}:{{.Tag}}"]
+        );
+        let tags = vec!["darkmux-runtime:latest".to_string(), "darkmux-runtime:4.0-rc".to_string()];
+        assert_eq!(
+            args(runtime_image_labels_command(&tags)),
+            vec![
+                "image",
+                "inspect",
+                "--format",
+                "{{index .Config.Labels \"org.opencontainers.image.version\"}}",
+                "--",
+                "darkmux-runtime:latest",
+                "darkmux-runtime:4.0-rc",
+            ]
+        );
     }
 
     // ─── (#2386 review) the injected runtime binary's own cache ─────────

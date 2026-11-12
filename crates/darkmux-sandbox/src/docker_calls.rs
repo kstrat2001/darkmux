@@ -47,8 +47,9 @@ fn production_files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// `text`'s lines outside `#[cfg(test)]` items. An item is the next line
 /// ending in `;`, `}` or `{` after the attribute (other attributes and a
-/// multi-line signature between); a block item runs to the `}` at its own
-/// indent.
+/// multi-line signature between), or the item's own line when it ends in
+/// `,` (a match arm, a field); a block item runs to the line at its own
+/// indent that is `}` followed only by `)`, `;` or `,` (`}`, `};`, `});`).
 fn production_lines(text: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut lines = text.lines();
@@ -68,6 +69,9 @@ fn skip_test_item<'a>(lines: &mut impl Iterator<Item = &'a str>) {
         let trimmed = line.trim_end();
         if indent.is_none() && !trimmed.trim_start().starts_with("#[") {
             indent = Some(&line[..line.len() - line.trim_start().len()]);
+            if trimmed.ends_with(',') {
+                return;
+            }
         }
         // A declaration, or a one-line item (`fn f() {}`) closed on its own
         // line.
@@ -75,11 +79,19 @@ fn skip_test_item<'a>(lines: &mut impl Iterator<Item = &'a str>) {
             return;
         }
         if trimmed.ends_with('{') {
-            let close = format!("{}}}", indent.unwrap_or_default());
-            lines.by_ref().find(|l| l.trim_end() == close);
+            let indent = indent.unwrap_or_default();
+            lines.by_ref().find(|l| closes_at(l, indent));
             return;
         }
     }
+}
+
+/// Whether `line` closes a block opened at `indent`: that indent, then `}`
+/// and nothing but `)`, `;` or `,` (not a raw string's `}"#;`).
+fn closes_at(line: &str, indent: &str) -> bool {
+    line.strip_prefix(indent)
+        .and_then(|rest| rest.trim_end().strip_prefix('}'))
+        .is_some_and(|tail| tail.chars().all(|c| matches!(c, ')' | ';' | ',')))
 }
 
 /// Every Rust package the repo builds: the root, each one under `crates/`,
@@ -205,10 +217,50 @@ fn test_items_are_skipped_and_production_around_them_counts() {
         "#[cfg(test)]",
         "fn one_line_with_body() -> u8 { 1 }",
         "e \"docker\"",
+        // A struct-literal item closes with `};`, not a bare `}` (#3552
+        // review): the item ends there, not at the end of the file.
+        "#[cfg(test)]",
+        "const R: std::ops::Range<u8> = std::ops::Range {",
+        "    start: 0,",
+        "    end: \"docker\".len() as u8,",
+        "};",
+        "f \"docker\"",
+        "    #[cfg(test)]",
+        "    static S: Wrap = Wrap(Inner {",
+        "        x: \"docker\",",
+        "    });",
+        "g \"docker\"",
+        // A raw string's line at the module's indent that starts with `}`
+        // is not the module's close (#3552 re-review).
+        "#[cfg(test)]",
+        "mod fixtures {",
+        "    const J: &str = r#\"{",
+        "}\"#;",
+        "    \"docker\"",
+        "}",
+        "h \"docker\"",
+        // A `#[cfg(test)]` match arm or field is its own line: the sibling
+        // after it is production (#3552 re-review).
+        "    #[cfg(test)]",
+        "    0 => Command::new(\"true\"),",
+        "    _ => Command::new(\"docker\"),",
     ]
     .join("\n");
     let counted: Vec<&str> = production_lines(&text).into_iter().filter(|l| l.contains(LITERAL)).collect();
-    assert_eq!(counted, vec!["a \"docker\"", "b \"docker\"", "c \"docker\"", "d \"docker\"", "e \"docker\""]);
+    assert_eq!(
+        counted,
+        vec![
+            "a \"docker\"",
+            "b \"docker\"",
+            "c \"docker\"",
+            "d \"docker\"",
+            "e \"docker\"",
+            "f \"docker\"",
+            "g \"docker\"",
+            "h \"docker\"",
+            "    _ => Command::new(\"docker\"),",
+        ]
+    );
 }
 
 /// The walk sees production files only, in every Rust tree the repo builds

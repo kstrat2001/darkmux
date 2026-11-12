@@ -797,6 +797,8 @@ pub fn preview_policy(spec: &ContainerSpec) -> SandboxPolicy {
             mount(&spec.heartbeat, HEARTBEAT_AT, Access::ReadOnly),
         ],
         ports: spec.ports.to_vec(),
+        stdin: false,
+        host_alias: None,
         user: spec.user.clone(),
         env: home.chain(spec.env.iter().cloned()).collect(),
         workdir: Some(WORKSPACE_AT.to_string()),
@@ -2332,7 +2334,7 @@ mod tests {
         );
         assert_eq!(values_of(&args, "-w"), ["/workspace"]);
         let image_at = args.iter().position(|a| a == "sha256:runtime").unwrap();
-        assert_eq!(args[image_at - 2..image_at], ["--entrypoint", "sh"]);
+        assert_eq!(args[image_at - 3..image_at], ["--entrypoint", "sh", "--"]);
         assert_eq!(args[image_at + 1], "-c");
         assert_eq!(args.len(), image_at + 3, "the script is the last argument");
     }
@@ -2347,8 +2349,8 @@ mod tests {
         let recipe = a_recipe(serde_json::json!({"schema_version": "1.0", "command": "npm run dev"}));
         let spec = a_spec(&recipe, Some("501:20".into()));
         let args = docker_create_args(&spec);
-        let (head, tail) = args.split_at(args.len() - 5);
-        assert_eq!(tail, ["--entrypoint", "sh", "sha256:runtime", "-c", spec.script.as_str()]);
+        let (head, tail) = args.split_at(args.len() - 6);
+        assert_eq!(tail, ["--entrypoint", "sh", "--", "sha256:runtime", "-c", spec.script.as_str()]);
         assert_eq!(head[0], "create");
         let mut options = Vec::new();
         let mut it = head[1..].iter();

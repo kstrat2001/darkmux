@@ -4,7 +4,4 @@
 # has one: build a `SandboxPolicy` and spawn what a `SandboxBackend` returns
 # instead. It also fails if a count drops, so moving a call behind the seam
 # lowers its line here in the same commit. This list only shrinks.
-crates/darkmux-crew/src/dispatch_internal.rs 11
-crates/darkmux-crew/src/runtime_image.rs 4
-crates/darkmux-doctor/src/lib.rs 3
-crates/darkmux-serve/src/lib.rs 1
+# Empty since #3112 step 1: no production file outside the backend spells it.

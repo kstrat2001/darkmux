@@ -154,24 +154,6 @@ fn each_prefix_reaps_only_its_own_containers() {
     assert!(!query.stopped_too, "a reaper lists running sandboxes only");
 }
 
-/// (#3456) The host labels as `key=value`, the form a container spec
-/// carries them in.
-#[test]
-fn host_labels_are_the_label_args_values() {
-    let host = HostIdentity {
-        pid: 7,
-        start: 70,
-        machine: "M".into(),
-        pid_ns: "N".into(),
-    };
-    let values: Vec<String> = host_label_args(&host)
-        .into_iter()
-        .skip(1)
-        .step_by(2)
-        .collect();
-    assert_eq!(host_labels(&host), values);
-}
-
 /// The reaper cannot read its own machine or namespace: nothing is reaped.
 #[test]
 fn an_unknown_machine_identity_reaps_nothing() {
@@ -200,7 +182,7 @@ fn parse_reads_labels_and_treats_empty_as_absent() {
 }
 
 #[test]
-fn host_label_args_are_four_labels() {
+fn host_labels_are_four_key_value_labels() {
     let host = HostIdentity {
         pid: 7,
         start: 70,
@@ -208,15 +190,11 @@ fn host_label_args_are_four_labels() {
         pid_ns: "N".into(),
     };
     assert_eq!(
-        host_label_args(&host),
+        host_labels(&host),
         vec![
-            "--label",
             "darkmux.dispatch.host-pid=7",
-            "--label",
             "darkmux.dispatch.host-start=70",
-            "--label",
             "darkmux.dispatch.host-machine=M",
-            "--label",
             "darkmux.dispatch.host-pid-ns=N",
         ]
     );

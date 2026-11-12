@@ -9,7 +9,7 @@
 //! collect its result any more, so the reaper ends it sooner.
 //!
 //! **Identity at spawn.** Every dispatch container carries four labels
-//! naming the darkmux process that started it ([`host_label_args`]): its
+//! naming the darkmux process that started it ([`host_labels`]): its
 //! pid, that process's start time (so a reused pid is not mistaken for the
 //! host), this machine's uid (so a docker daemon another machine can also
 //! reach never has this machine judge a container it did not start), and
@@ -86,15 +86,7 @@ impl HostIdentity {
     }
 }
 
-/// The `docker run` options that label a container with its host.
-pub fn host_label_args(host: &HostIdentity) -> Vec<String> {
-    host_labels(host)
-        .into_iter()
-        .flat_map(|l| ["--label".to_string(), l])
-        .collect()
-}
-
-/// The four host labels, each `key=value`.
+/// The four host labels, each `key=value`, as a sandbox policy carries them.
 pub fn host_labels(host: &HostIdentity) -> Vec<String> {
     vec![
         format!("{HOST_PID_LABEL}={}", host.pid),

@@ -36,7 +36,7 @@
 //! and a coder run's workspace IS the operator's own repo tree, the wrong
 //! place for darkmux's own bookkeeping. It lives in the dispatch's
 //! **out-dir** instead (`host_out`, mounted at `/darkmux-out`; see
-//! `dispatch_internal.rs`'s `apply_volume_mounts`), same home as
+//! `dispatch_internal.rs`'s `volume_mounts`), same home as
 //! `.prompt.txt` and the trajectory. Container path: `/darkmux-out/pace.json`.
 //! The runtime-side reader (`runtime/src/pace.rs`) reads from there —
 //! `pace_file_path_matches_runtime_out_base` below is the conformance test

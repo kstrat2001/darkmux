@@ -5,6 +5,10 @@
 use crate::{Access, BackendKind, Having, Listed, Mount, Network, Query, SandboxBackend, SandboxHandle, SandboxPolicy};
 use std::process::Command;
 
+/// The program every Docker command runs. Private: a caller outside this
+/// crate that could name it could build its own `docker run` past every
+/// policy invariant without the ratchet seeing a literal (#3552 review).
+/// Asking whether it is installed is [`DockerBackend::on_path`].
 const PROGRAM: &str = "docker";
 
 /// `--cap-drop`: every Linux capability. A sandbox's code needs none.
@@ -22,7 +26,8 @@ impl DockerBackend {
     /// `docker run`'s arguments for `policy` (the program itself excluded),
     /// in a fixed order: the sandbox's identity and invariants, its network
     /// and limits, its labels, its mounts in the policy's order, its user
-    /// and environment, its working directory, then the image and command.
+    /// and environment, its working directory, then `--` and the image and
+    /// command.
     pub fn run_args(policy: &SandboxPolicy) -> Vec<String> {
         Self::args("run", policy)
     }
@@ -33,11 +38,15 @@ impl DockerBackend {
         if policy.network == Network::None {
             args.extend(strings(&["--network", "none"]));
         }
+        args.extend(policy.host_alias.as_ref().map(|name| format!("--add-host={name}:host-gateway")));
         args.extend([format!("--cap-drop={CAP_DROP}"), format!("--security-opt={SECURITY_OPT}")]);
         args.extend(policy.limits.pids.map(|n| format!("--pids-limit={n}")));
         args.extend(policy.limits.memory.as_ref().map(|m| format!("--memory={m}")));
         for (key, value) in &policy.labels {
             args.extend(["--label".to_string(), format!("{key}={value}")]);
+        }
+        if policy.stdin {
+            args.push("-i".to_string());
         }
         args.extend(policy.mounts.iter().flat_map(volume));
         for port in &policy.ports {
@@ -54,7 +63,9 @@ impl DockerBackend {
         if let Some(entrypoint) = &policy.entrypoint {
             args.extend(["--entrypoint".to_string(), entrypoint.clone()]);
         }
-        args.push(policy.image.clone());
+        // (#907) `--` fences the image from the options, so an image ref
+        // starting with `-` is never read as one.
+        args.extend(["--".to_string(), policy.image.clone()]);
         args.extend(policy.command.iter().cloned());
         args
     }
@@ -69,11 +80,22 @@ impl DockerBackend {
         }
         let filter = match &query.having {
             Having::Label(key) => format!("label={key}"),
-            Having::NamePrefix(prefix) => format!("name=^{prefix}"),
+            Having::NamePrefix(prefix) => format!("name=^{}", regex_literal(prefix)),
+            Having::Name(name) => format!("name=^{}$", regex_literal(name)),
         };
         let labels: String = query.read.iter().map(|key| format!("\t{{{{.Label \"{key}\"}}}}")).collect();
         args.extend(["--filter".to_string(), filter, "--format".to_string(), format!("{{{{.Names}}}}{labels}")]);
         args
+    }
+
+    /// Whether `PATH` finds the `docker` program: an executable file of
+    /// that name in one of its directories.
+    pub fn on_path() -> bool {
+        Self::on_path_in(std::env::var_os("PATH").as_deref())
+    }
+
+    fn on_path_in(path: Option<&std::ffi::OsStr>) -> bool {
+        path.is_some_and(|p| std::env::split_paths(p).any(|dir| is_executable_file(&dir.join(PROGRAM))))
     }
 
     /// `docker exec`: `argv` in the running container. Docker's alone (a
@@ -85,6 +107,71 @@ impl DockerBackend {
         cmd
     }
 
+    /// (#3112) Docker's image and engine commands. Docker's alone: a
+    /// backend without images has nothing to inspect, pull or copy out of,
+    /// so none of these is part of [`SandboxBackend`]. Each is the exact
+    /// line its caller ran before it moved here.
+    ///
+    /// `docker image inspect --format <format> -- <images…>`.
+    pub fn image_inspect(format: &str, images: &[&str]) -> Command {
+        let mut cmd = Command::new(PROGRAM);
+        cmd.args(["image", "inspect", "--format", format, "--"]).args(images);
+        cmd
+    }
+
+    /// `docker image inspect -f {{.Id}} -- <image>`: the image's
+    /// content-addressed id.
+    pub fn image_id(image: &str) -> Command {
+        let mut cmd = Command::new(PROGRAM);
+        cmd.args(["image", "inspect", "-f", "{{.Id}}", "--", image]);
+        cmd
+    }
+
+    /// `docker pull <image>`.
+    pub fn pull(image: &str) -> Command {
+        let mut cmd = Command::new(PROGRAM);
+        cmd.args(["pull", image]);
+        cmd
+    }
+
+    /// `docker context inspect`: the current context's engine endpoint.
+    pub fn context_host() -> Command {
+        let mut cmd = Command::new(PROGRAM);
+        cmd.args(["context", "inspect", "--format", "{{.Endpoints.docker.Host}}"]);
+        cmd
+    }
+
+    /// `docker images <repo> --format <format>`.
+    pub fn images(repo: &str, format: &str) -> Command {
+        let mut cmd = Command::new(PROGRAM);
+        cmd.args(["images", repo, "--format", format]);
+        cmd
+    }
+
+    /// `docker version`: whether the engine answers, and its version.
+    pub fn version() -> Command {
+        let mut cmd = Command::new(PROGRAM);
+        cmd.args(["version", "--format", "{{.Server.Version}}"]);
+        cmd
+    }
+
+    /// `docker create -- <image>`: a stopped container to copy files out
+    /// of ([`DockerBackend::copy_out`]); it prints the container's id. It
+    /// is not a sandbox and carries none of a policy's invariants, so it
+    /// must never be started: remove it once the copy is done.
+    pub fn create_stopped(image: &str) -> Command {
+        let mut cmd = Command::new(PROGRAM);
+        cmd.args(["create", "--", image]);
+        cmd
+    }
+
+    /// `docker cp <container>:<path> <dest>`.
+    pub fn copy_out(container: &str, path: &str, dest: &str) -> Command {
+        let mut cmd = Command::new(PROGRAM);
+        cmd.args(["cp", &format!("{container}:{path}"), dest]);
+        cmd
+    }
+
     fn handle(id: &str) -> SandboxHandle {
         SandboxHandle { backend: BackendKind::Docker, id: id.to_string() }
     }
@@ -93,6 +180,36 @@ impl DockerBackend {
 /// A listed label's value, `None` when it is empty or Docker's `<no value>`.
 fn present(field: Option<&str>) -> Option<String> {
     field.map(str::trim).filter(|v| !v.is_empty() && *v != "<no value>").map(str::to_string)
+}
+
+/// `name` as a regular expression matching only itself (Docker's `name`
+/// filter is one): every character but a letter, digit, `_` or `-` is
+/// escaped.
+fn regex_literal(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        if !(c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// A regular file exec would run: on unix, one with an exec bit set.
+fn is_executable_file(path: &std::path::Path) -> bool {
+    let Ok(md) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        md.is_file() && md.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        md.is_file()
+    }
 }
 
 fn strings(args: &[&str]) -> Vec<String> {
@@ -193,6 +310,8 @@ mod tests {
             labels: Vec::new(),
             mounts: Vec::new(),
             ports: Vec::new(),
+            stdin: false,
+            host_alias: None,
             user: None,
             env: Vec::new(),
             workdir: None,
@@ -207,7 +326,7 @@ mod tests {
     fn a_bare_policy_carries_only_the_invariants() {
         assert_eq!(
             DockerBackend::run_args(&bare()),
-            strings(&["run", "--rm", "--init", "--name", "s-1", "--cap-drop=ALL", "--security-opt=no-new-privileges", "img:1"])
+            strings(&["run", "--rm", "--init", "--name", "s-1", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--", "img:1"])
         );
     }
 
@@ -224,6 +343,8 @@ mod tests {
                 mount("/h/tree/.git", "/workspace/.git", Access::ReadOnly),
             ],
             ports: vec![4100, 4200],
+            stdin: true,
+            host_alias: Some("host.docker.internal".into()),
             user: Some("501:20".into()),
             env: vec![("HOME".into(), "/tmp".into()), ("K".into(), "v w".into())],
             workdir: Some("/workspace".into()),
@@ -233,11 +354,12 @@ mod tests {
         };
         assert_eq!(
             DockerBackend::run_args(&policy),
-            strings(&["run", "--rm", "--init", "--name", "s-1", "--network", "none", "--cap-drop=ALL",
-                "--security-opt=no-new-privileges", "--pids-limit=512", "--memory=4g", "--label", "a.b=1", "--label", "c=2",
+            strings(&["run", "--rm", "--init", "--name", "s-1", "--network", "none",
+                "--add-host=host.docker.internal:host-gateway", "--cap-drop=ALL",
+                "--security-opt=no-new-privileges", "--pids-limit=512", "--memory=4g", "--label", "a.b=1", "--label", "c=2", "-i",
                 "-v", "/h/tree:/workspace", "-v", "/h/tree/.git:/workspace/.git:ro", "-p", "127.0.0.1:4100:4100",
                 "-p", "127.0.0.1:4200:4200", "--user=501:20", "-e", "HOME=/tmp",
-                "-e", "K=v w", "-w", "/workspace", "--entrypoint", "sh", "img:1", "-c", "echo hi"])
+                "-e", "K=v w", "-w", "/workspace", "--entrypoint", "sh", "--", "img:1", "-c", "echo hi"])
         );
     }
 
@@ -272,6 +394,31 @@ mod tests {
         assert_eq!((cmd.get_program().to_str(), args_of(&cmd)), (Some("docker"), strings(&["exec", "s-1", "cat", "/proc/net/tcp"])));
     }
 
+    /// Docker's image and engine commands are the exact lines their callers
+    /// ran.
+    #[test]
+    fn image_and_engine_commands_are_the_lines_callers_ran() {
+        let line = |cmd: Command| {
+            assert_eq!(cmd.get_program().to_str(), Some("docker"));
+            args_of(&cmd)
+        };
+        assert_eq!(
+            line(DockerBackend::image_inspect("{{.Id}}", &["a:1", "b:2"])),
+            strings(&["image", "inspect", "--format", "{{.Id}}", "--", "a:1", "b:2"])
+        );
+        assert_eq!(line(DockerBackend::image_id("a:1")), strings(&["image", "inspect", "-f", "{{.Id}}", "--", "a:1"]));
+        assert_eq!(line(DockerBackend::pull("a:1")), strings(&["pull", "a:1"]));
+        assert_eq!(
+            line(DockerBackend::context_host()),
+            strings(&["context", "inspect", "--format", "{{.Endpoints.docker.Host}}"])
+        );
+        assert_eq!(line(DockerBackend::images("repo", "{{.Tag}}")), strings(&["images", "repo", "--format", "{{.Tag}}"]));
+        assert_eq!(line(DockerBackend::version()), strings(&["version", "--format", "{{.Server.Version}}"]));
+        assert_eq!(line(DockerBackend::create_stopped("a:1")), strings(&["create", "--", "a:1"]));
+        assert_eq!(line(DockerBackend::copy_out("c1", "/usr/local/bin/x", "/tmp/x")), strings(&["cp", "c1:/usr/local/bin/x", "/tmp/x"]));
+        assert_eq!(PROGRAM, "docker");
+    }
+
     /// Removal is by name and forced. A listing by label shows stopped
     /// containers too and filters on the key; one by name prefix shows
     /// running ones, anchored at the name's start; each prints the name
@@ -288,11 +435,51 @@ mod tests {
                 strings(&["ps", "-a", "--filter", "label=darkmux.gate.pid", "--format", "{{.Names}}\t{{.Label \"darkmux.gate.pid\"}}"])
             )
         );
+        let exact = Query { having: Having::Name("darkmux-dispatch-a.b".into()), stopped_too: false, read: Vec::new() };
+        assert_eq!(
+            DockerBackend::list_args(&exact),
+            strings(&["ps", "--filter", r"name=^darkmux-dispatch-a\.b$", "--format", "{{.Names}}"])
+        );
         let by_name = Query { having: Having::NamePrefix("p-".into()), stopped_too: false, read: strings(&["a", "b"]) };
         assert_eq!(
             DockerBackend::list_args(&by_name),
             strings(&["ps", "--filter", "name=^p-", "--format", "{{.Names}}\t{{.Label \"a\"}}\t{{.Label \"b\"}}"])
         );
+        let dotted_prefix = Query { having: Having::NamePrefix("p.".into()), stopped_too: false, read: Vec::new() };
+        assert_eq!(DockerBackend::list_args(&dotted_prefix)[2], r"name=^p\.");
+    }
+
+    /// Docker's name filter is a regular expression, so a name is matched
+    /// literally only when every character but a letter, digit, `_` or `-`
+    /// is escaped: `a.b` must not match a neighbor `aXb`.
+    #[test]
+    fn a_name_is_escaped_into_its_regular_expression() {
+        assert_eq!(regex_literal("darkmux-dispatch_a1"), "darkmux-dispatch_a1");
+        assert_eq!(regex_literal("a.b"), r"a\.b");
+        assert_eq!(regex_literal("a+b*c?(d)[e]{f}|g^h$i\\j/k"), r"a\+b\*c\?\(d\)\[e\]\{f\}\|g\^h\$i\\j\/k");
+    }
+
+    /// `on_path` finds an executable `docker` in a `PATH` directory, and
+    /// nothing in an empty, absent or non-executable one.
+    #[cfg(unix)]
+    #[test]
+    fn on_path_finds_an_executable_docker_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let empty = tempfile::TempDir::new().unwrap();
+        let bin = dir.path().join("docker");
+        std::fs::write(&bin, "").unwrap();
+        let joined = |dirs: &[&std::path::Path]| std::env::join_paths(dirs).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!DockerBackend::on_path_in(Some(&joined(&[dir.path()]))));
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(DockerBackend::on_path_in(Some(&joined(&[empty.path(), dir.path()]))));
+        assert!(!DockerBackend::on_path_in(Some(&joined(&[empty.path()]))));
+        assert!(!DockerBackend::on_path_in(None));
+        // A directory named like the program, even an executable one, is
+        // not the program.
+        std::fs::create_dir(empty.path().join("docker")).unwrap();
+        assert!(!DockerBackend::on_path_in(Some(&joined(&[empty.path()]))));
     }
 
     /// Each line is one container, with one value per label read, trimmed;
