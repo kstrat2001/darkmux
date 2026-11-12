@@ -31,6 +31,12 @@ pub struct FakePlatform {
     /// The `(peer, pid)` pairs [`Platform::tcp_peers_of`] answers, whatever
     /// the listener.
     pub tcp_peers: Vec<(std::net::SocketAddr, u32)>,
+    /// `(port, listeners)` [`Platform::tcp_port_listeners`] answers; any
+    /// other port has none.
+    pub port_listeners: Vec<(u16, Vec<crate::PortListener>)>,
+    /// How many [`Platform::tcp_port_listeners`] reads cannot say (`None`)
+    /// before the reads answer; each read counts one down.
+    pub port_listeners_unreadable_reads: std::sync::atomic::AtomicU32,
     /// `(pid, group)` pairs [`Platform::process_group`] answers.
     pub process_groups: Vec<(u32, u32)>,
     /// `(pid, app)` pairs [`Platform::signed_app`] names; any other pid is unsigned.
@@ -63,6 +69,8 @@ impl Default for FakePlatform {
             tcp_listeners_unreadable: false,
             tcp_listeners_unreadable_reads: std::sync::atomic::AtomicU32::new(0),
             tcp_peers: Vec::new(),
+            port_listeners: Vec::new(),
+            port_listeners_unreadable_reads: std::sync::atomic::AtomicU32::new(0),
             process_groups: Vec::new(),
             signed_apps: Vec::new(),
             allow_answer: crate::AllowAnswer::NoDialog("a fake platform shows no dialog".to_string()),
@@ -179,6 +187,14 @@ impl Platform for FakePlatform {
 
     fn tcp_peers_of(&self, _local: std::net::SocketAddr) -> Option<Vec<(std::net::SocketAddr, u32)>> {
         Some(self.tcp_peers.clone())
+    }
+
+    fn tcp_port_listeners(&self, port: u16) -> Option<Vec<crate::PortListener>> {
+        use std::sync::atomic::Ordering;
+        if self.port_listeners_unreadable_reads.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
+            return None;
+        }
+        Some(self.port_listeners.iter().find(|(p, _)| *p == port).map(|(_, l)| l.clone()).unwrap_or_default())
     }
 
     fn process_group(&self, pid: u32) -> Option<u32> {

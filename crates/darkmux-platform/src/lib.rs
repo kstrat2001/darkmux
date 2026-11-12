@@ -106,7 +106,9 @@ pub trait Platform: Send + Sync {
     /// `None` when it cannot be read (no such process, or the platform has
     /// no reader). Compare it only for EQUALITY against a stamp this same
     /// method produced for the same pid on this same machine: two equal
-    /// stamps mean the pid was not reused in between.
+    /// stamps mean the pid was not reused in between. Never compare two
+    /// pids' stamps for order: on macOS a stamp is wall-clock time, which
+    /// steps.
     fn process_start_stamp(&self, pid: u32) -> Option<u64>;
     /// (#3448) How much memory process `pid` holds, in bytes: macOS's
     /// physical footprint (what Activity Monitor's Memory column shows, which
@@ -158,6 +160,15 @@ pub trait Platform: Send + Sync {
     /// call answers every connection, so a flood costs one read, not one per
     /// connection.
     fn tcp_peers_of(&self, local: std::net::SocketAddr) -> Option<Vec<(std::net::SocketAddr, u32)>>;
+
+    /// (#3112) Every TCP socket listening on `port`, whatever the process,
+    /// with the address it is bound to and its owner when known, read from
+    /// the kernel's socket table (no walk over processes, which one that
+    /// keeps forking can race): `Some(vec![])` when none does, `None` when
+    /// this platform cannot say or its answer does not read (never "none").
+    /// What tells a sandbox on the host (which can hold a bind to a port but
+    /// not to the loopback, #3559) listening beyond this machine.
+    fn tcp_port_listeners(&self, port: u16) -> Option<Vec<PortListener>>;
 
     /// The process group `pid` is in; `None` for no such process, or where
     /// the platform has no reader.
@@ -311,22 +322,41 @@ pub(crate) fn answer_from_button(label: &str) -> AllowAnswer {
 
 /// Runs `cmd` to its end, or kills it at `deadline`: `None` when it could
 /// not start or was killed. For a tool that waits on a person (a dialog),
-/// so a wedged one never holds its caller forever.
+/// so a wedged one never holds its caller forever. (#3112 review) Its
+/// output is read while it runs, so one that prints more than a pipe holds
+/// (netstat's table on a busy machine) finishes instead of blocking on a
+/// full pipe until the bound kills it. The bound covers the command only:
+/// when it exits leaving a process that still holds its output open, the
+/// read waits for that process too (as it did before the output was
+/// drained), and a command killed at the bound leaves its readers to end
+/// when that process does.
 pub(crate) fn output_within(mut cmd: std::process::Command, deadline: std::time::Duration) -> Option<std::process::Output> {
     use std::process::Stdio;
     let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().ok()?;
+    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>));
+    let stderr = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>));
     let until = std::time::Instant::now() + deadline;
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().ok(),
-            Ok(None) if std::time::Instant::now() < until => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < until => std::thread::sleep(std::time::Duration::from_millis(20)),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
                 return None;
             }
         }
-    }
+    };
+    Some(std::process::Output { status, stdout: stdout.join().ok()?, stderr: stderr.join().ok()? })
 }
 
 /// Starts `cmd` and lets it finish on its own (reaped on a thread), for a
@@ -569,6 +599,84 @@ pub fn xdg_data_home_from(
 ) -> Option<std::path::PathBuf> {
     let xdg = xdg_data_home.map(std::path::PathBuf::from).filter(|p| p.is_absolute());
     xdg.or_else(|| home.filter(|h| !h.is_empty()).map(|h| std::path::PathBuf::from(h).join(".local").join("share")))
+}
+
+/// (#3112) One TCP socket listening on a port
+/// ([`Platform::tcp_port_listeners`]): the address it is bound to (`0.0.0.0`
+/// or `::` for every address of that family; `None` when the platform's
+/// text of it may be cut short and so cannot be trusted as any address), that
+/// text as the platform printed it, the interface an address is scoped to
+/// (`lo0` for `fe80::1%lo0`), and the process that owns it when the platform
+/// says (the last one to use it, which may since have exited).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortListener {
+    pub addr: Option<std::net::IpAddr>,
+    pub text: String,
+    pub scope: Option<String>,
+    pub pid: Option<u32>,
+}
+
+/// (#3112) The listeners on `port` in `netstat -anv -p tcp`'s answer. Its
+/// columns: proto, the two queues, the local address (`<addr>.<port>`, `*`
+/// for every address), the foreign one, the state, four counters, then
+/// `process:pid` (a name may hold spaces) and eight more. `None` when the
+/// header is not netstat's, or a LISTEN row's local address does not read.
+pub(crate) fn port_listeners_from_netstat(out: &str, port: u16) -> Option<Vec<PortListener>> {
+    let mut lines = out.lines();
+    lines.find(|l| l.starts_with("Proto") && l.contains("Local Address") && l.contains("process:pid"))?;
+    let mut found = Vec::new();
+    for line in lines {
+        if let Some(listener) = netstat_listener(line, port)? {
+            found.push(listener);
+        }
+    }
+    Some(found)
+}
+
+/// One netstat row: a listener on `port` (`Some(Some(_))`), another row
+/// (`Some(None)`), or an IPv4 LISTEN row whose local address does not read
+/// (`None`). netstat prints at most [`NETSTAT_V6_WIDTH`] characters of an
+/// IPv6 address: one that long may be cut, so it is kept as text with no
+/// address, never read as one.
+fn netstat_listener(line: &str, port: u16) -> Option<Option<PortListener>> {
+    let f: Vec<&str> = line.split_whitespace().collect();
+    if !f.first().is_some_and(|p| p.starts_with("tcp")) || f.get(5) != Some(&"LISTEN") {
+        return Some(None);
+    }
+    let (host, at) = f.get(3)?.rsplit_once('.')?;
+    if at.parse::<u16>().ok()? != port {
+        return Some(None);
+    }
+    let pid = f.len().checked_sub(9).and_then(|i| f.get(i)).and_then(|w| w.rsplit_once(':')).and_then(|(_, p)| p.parse().ok());
+    if netstat_may_cut(f[0], host) {
+        return Some(Some(PortListener { addr: None, text: host.to_string(), scope: None, pid }));
+    }
+    let (addr, scope) = netstat_address(f[0], host)?;
+    Some(Some(PortListener { addr: Some(addr), text: host.to_string(), scope, pid }))
+}
+
+/// Whether netstat may have cut `host` short: an IPv6 one at its width.
+fn netstat_may_cut(proto: &str, host: &str) -> bool {
+    proto != "tcp4" && host != "*" && host.len() >= NETSTAT_V6_WIDTH
+}
+
+/// The most characters of an IPv6 address `netstat -anv` prints (measured:
+/// `fe80::1823:f45e:` and `2001:f40:974:5c8` for longer addresses).
+const NETSTAT_V6_WIDTH: usize = 16;
+
+/// A netstat local address without its port: `*` is every address of
+/// `proto`'s family (`tcp4`, else IPv6), a `%` names its scope.
+fn netstat_address(proto: &str, host: &str) -> Option<(std::net::IpAddr, Option<String>)> {
+    let (host, scope) = match host.split_once('%') {
+        Some((h, s)) => (h, Some(s.to_string())),
+        None => (host, None),
+    };
+    let addr = match host {
+        "*" if proto == "tcp4" => std::net::IpAddr::from(std::net::Ipv4Addr::UNSPECIFIED),
+        "*" => std::net::IpAddr::from(std::net::Ipv6Addr::UNSPECIFIED),
+        h => h.parse().ok()?,
+    };
+    Some((addr, scope))
 }
 
 /// The pids in `lsof -Fp`'s answer: one `p<pid>` line per process; every

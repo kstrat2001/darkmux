@@ -44,6 +44,54 @@ pub struct Host {
     /// Prints `connected` when a connection to the unix socket at the path
     /// succeeds.
     pub unix_probe: fn(&str) -> String,
+    /// Serves one line, `served`, on `port` on EVERY address (`0.0.0.0`),
+    /// over and over.
+    pub serve_any: fn(u16) -> String,
+    /// (#3559) Whether a server binding every address in this backend's
+    /// default network is reachable at this host's LAN address: never in a
+    /// container (only the published loopback port reaches it); in a
+    /// sandbox on the host, recorded as allowed, since Seatbelt cannot tell a
+    /// loopback bind from any other.
+    pub every_address_reaches_the_lan: bool,
+    /// Runs `script` in a process group of its own (`setsid` in a Linux
+    /// image, `setpgrp` on macOS), in the background of the caller's shell.
+    pub new_group: fn(&str) -> String,
+    /// Whether a process that moved to a group of its own outlives the
+    /// sandbox's program: never in a container (its init's exit ends every
+    /// process in it); in a sandbox on the host, it does (the launcher can
+    /// end only its own group), recorded, not wanted.
+    pub a_new_group_outlives_the_program: bool,
+    /// The host process group a running sandbox's processes are in, when
+    /// they are host processes (a sandbox on the host): `None` for a
+    /// container, whose processes are gone with it.
+    pub host_group: fn(&str) -> Option<u32>,
+}
+
+/// How many live processes are in host process group `group`, from the
+/// whole process table (a killed one not yet reaped, a zombie, runs nothing
+/// and is not counted).
+fn group_members(group: u32) -> usize {
+    let ps = std::process::Command::new("/bin/ps").args(["-A", "-o", "pgid=,stat="]).output().unwrap();
+    String::from_utf8_lossy(&ps.stdout)
+        .lines()
+        .filter(|l| {
+            let mut f = l.split_whitespace();
+            f.next() == Some(group.to_string().as_str()) && !f.next().is_some_and(|stat| stat.starts_with('Z'))
+        })
+        .count()
+}
+
+/// Whether host group `group` is empty within `within` (its guard runs a
+/// moment after its launcher ends).
+fn group_empties(group: u32, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    while group_members(group) > 0 {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    true
 }
 
 /// Where the sandbox sees `tree` when it is mounted at `/workspace`.
@@ -372,6 +420,190 @@ fn a_published_port_answers_on_loopback(backend: &dyn SandboxBackend, host: &Hos
     let _ = client.wait();
 }
 
+/// (#3559) A server that binds every address: what the host reaches.
+/// Docker: the published port on 127.0.0.1, never the host's LAN address.
+/// Seatbelt: the bind succeeds and the LAN address reaches it (recorded,
+/// not wanted: SBPL's `local ip` filter knows only `*` and `localhost`, and
+/// `localhost` matches every local address), so the gap stays visible.
+fn a_server_on_every_address_reaches_only_what_the_backend_allows(backend: &dyn SandboxBackend, host: &Host) {
+    let tree = tempfile::TempDir::new().unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let p = SandboxPolicy { network: Network::Default, ports: vec![port], ..policy(backend, host.image, tree.path(), &(host.serve_any)(port)) };
+    let (mut cmd, handle) = backend.run(&p);
+    let _removed = Removed(backend, handle);
+    let mut client = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let read_line = |ip: std::net::IpAddr| -> String {
+        use std::io::Read;
+        let mut got = String::new();
+        if let Ok(mut conn) = std::net::TcpStream::connect_timeout(&(ip, port).into(), Duration::from_secs(2)) {
+            let _ = conn.set_read_timeout(Some(Duration::from_secs(2)));
+            let _ = conn.read_to_string(&mut got);
+        }
+        got.trim().to_string()
+    };
+    // The server serves one connection at a time and restarts: keep asking
+    // until it answers or the time is up.
+    let served_within = |ip: std::net::IpAddr, within: Duration| {
+        let deadline = Instant::now() + within;
+        loop {
+            if read_line(ip) == "served" {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    };
+    assert!(served_within(std::net::IpAddr::from([127, 0, 0, 1]), Duration::from_secs(30)), "nothing answered on 127.0.0.1:{port}");
+    if let Some(lan) = this_hosts_lan_address() {
+        let reached = served_within(lan, Duration::from_secs(3));
+        assert_eq!(reached, host.every_address_reaches_the_lan, "a server on every address, reached at {lan}:{port}");
+    }
+    let _ = client.kill();
+    let _ = client.wait();
+}
+
+/// A sandbox ends with its program, as a container ends with its init's
+/// child: a background process the program left behind is gone once the
+/// program exits, so it neither writes again nor keeps a port; so is one
+/// that keeps forking a new pid and exiting the old (a fork-hopper, which a
+/// single snapshot of the group misses). A process that moved to a process
+/// group of its own is gone in a container and outlives a sandbox on the
+/// host: what each backend does is asserted, not hoped.
+fn a_sandbox_ends_with_its_program(backend: &dyn SandboxBackend, host: &Host) {
+    let tree = tempfile::TempDir::new().unwrap();
+    let grew = |name: &str| -> bool {
+        let before = len(&tree.path().join(name));
+        std::thread::sleep(Duration::from_millis(1200));
+        len(&tree.path().join(name)) > before
+    };
+    // Eight at once, so one snapshot of the group almost surely misses one.
+    let hopper = "for n in 1 2 3 4 5 6 7 8; do (h() { echo x >> hops; (h) & exit 0; }; h) & done;";
+    let grouped = (host.new_group)("echo $$ > group.pid; while :; do echo x >> group; sleep 0.1; done");
+    let script = format!("(sleep 2; echo outlived > left) & {hopper} {grouped} sleep 0.5; echo started");
+    let p = policy(backend, host.image, tree.path(), &script);
+    assert_eq!(run_ok(backend, &p).trim(), "started");
+    std::thread::sleep(Duration::from_secs(3));
+    let (left, hops, group) = (tree.path().join("left").exists(), grew("hops"), grew("group"));
+    if let Ok(pid) = std::fs::read_to_string(tree.path().join("group.pid")) {
+        if host.a_new_group_outlives_the_program {
+            let _ = std::process::Command::new("kill").args(["-KILL", pid.trim()]).status();
+        }
+    }
+    assert!(len(&tree.path().join("hops")) > 0 && len(&tree.path().join("group")) > 0, "the children never ran");
+    assert!(!left, "a background process outlived its sandbox's program");
+    assert!(!hops, "a fork-hopper outlived its sandbox's program");
+    assert_eq!(group, host.a_new_group_outlives_the_program, "a process in a group of its own, after the program ended");
+}
+
+/// A sandbox whose client was killed outright (SIGKILL: no handler runs)
+/// still ends, its background processes with it, once it is removed, as a
+/// contained run removes one cut short. Nothing outlives it looping.
+fn a_sandbox_whose_client_was_killed_ends_on_removal(backend: &dyn SandboxBackend, host: &Host) {
+    let tree = tempfile::TempDir::new().unwrap();
+    let beat = tree.path().join("beat");
+    let p = policy(backend, host.image, tree.path(), "(while :; do echo x >> beat; sleep 0.1; done) & sleep 300");
+    let (mut cmd, handle) = backend.run(&p);
+    let removed = Removed(backend, handle);
+    let mut client = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while len(&beat) == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(len(&beat) > 0, "the background loop never ran");
+    let group = (host.host_group)(&p.name);
+    client.kill().unwrap();
+    client.wait().unwrap();
+    drop(removed);
+    std::thread::sleep(Duration::from_millis(500));
+    let after = len(&beat);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(len(&beat), after, "a background loop outlived its sandbox's removal after its client was killed");
+    if let Some(group) = group {
+        assert!(group_empties(group, Duration::from_secs(2)), "processes left in group {group}");
+    }
+}
+
+/// Removing a running sandbox ends fork-hoppers in it (eight at once), not
+/// only the processes one look at it would list.
+fn a_removal_ends_fork_hoppers(backend: &dyn SandboxBackend, host: &Host) {
+    // Three rounds: a drain that is only sometimes enough fails one of them.
+    for _ in 0..3 {
+        a_removal_ends_fork_hoppers_once(backend, host);
+    }
+}
+
+fn a_removal_ends_fork_hoppers_once(backend: &dyn SandboxBackend, host: &Host) {
+    let tree = tempfile::TempDir::new().unwrap();
+    let hops = tree.path().join("hops");
+    // Thirty-two at once: a single kill of the group, or two, leaves one
+    // that forked in between often enough to see.
+    let script = "n=0; while [ $n -lt 32 ]; do (h() { echo x >> hops; (h) & exit 0; }; h) & n=$((n + 1)); done; sleep 300";
+    let p = policy(backend, host.image, tree.path(), script);
+    let (mut cmd, handle) = backend.run(&p);
+    let mut client = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while len(&hops) == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(len(&hops) > 0, "the hoppers never ran");
+    let group = (host.host_group)(&p.name);
+    let removed = run_bounded(backend.remove(&handle), Duration::from_secs(30));
+    assert!(matches!(removed, Bounded::Finished { success: true, .. }), "{}", describe(&removed));
+    // The removal itself empties the group: checked as soon as it returns.
+    if let Some(group) = group {
+        assert_eq!(group_members(group), 0, "the removal returned with processes left in its group {group}");
+    }
+    let _ = client.kill();
+    let _ = client.wait();
+    std::thread::sleep(Duration::from_millis(500));
+    let after = len(&hops);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(len(&hops), after, "a fork-hopper outlived its sandbox's removal");
+}
+
+/// A server on a port the policy does not name is never reached from the
+/// host: a container publishes only the named ports, and a sandbox on the
+/// host may bind only those (any address, #3559, but no other port). The
+/// named port answers, so a probe that reaches nothing is not passing.
+fn a_server_on_an_unassigned_port_is_never_reached(backend: &dyn SandboxBackend, host: &Host) {
+    let tree = tempfile::TempDir::new().unwrap();
+    let free = || std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let (named, other) = (free(), free());
+    let script = format!("({}) & {}", (host.serve_any)(other), (host.serve_any)(named));
+    let p = SandboxPolicy { network: Network::Default, ports: vec![named], ..policy(backend, host.image, tree.path(), &script) };
+    let (mut cmd, handle) = backend.run(&p);
+    let _removed = Removed(backend, handle);
+    let mut client = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let served = |ip: std::net::IpAddr, port: u16, within: Duration| {
+        use std::io::Read;
+        let deadline = Instant::now() + within;
+        loop {
+            let mut got = String::new();
+            if let Ok(mut conn) = std::net::TcpStream::connect_timeout(&(ip, port).into(), Duration::from_secs(1)) {
+                let _ = conn.set_read_timeout(Some(Duration::from_secs(1)));
+                let _ = conn.read_to_string(&mut got);
+            }
+            if got.trim() == "served" {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    };
+    let loopback = std::net::IpAddr::from([127, 0, 0, 1]);
+    assert!(served(loopback, named, Duration::from_secs(30)), "the named port never answered");
+    assert!(!served(loopback, other, Duration::from_secs(2)), "a port the policy does not name answered on the loopback");
+    if let Some(lan) = this_hosts_lan_address() {
+        assert!(!served(lan, other, Duration::from_secs(2)), "a port the policy does not name answered at {lan}");
+    }
+    let _ = client.kill();
+    let _ = client.wait();
+}
+
 /// This host's address on its outward interface, when it has one: the
 /// address a connected UDP socket would send from (nothing is sent).
 fn this_hosts_lan_address() -> Option<std::net::IpAddr> {
@@ -545,6 +777,31 @@ macro_rules! conformance {
             }
             #[test]
             #[ignore = $needs]
+            fn a_server_on_every_address_reaches_only_what_the_backend_allows() {
+                super::a_server_on_every_address_reaches_only_what_the_backend_allows(&$make, &$host)
+            }
+            #[test]
+            #[ignore = $needs]
+            fn a_sandbox_ends_with_its_program() {
+                super::a_sandbox_ends_with_its_program(&$make, &$host)
+            }
+            #[test]
+            #[ignore = $needs]
+            fn a_server_on_an_unassigned_port_is_never_reached() {
+                super::a_server_on_an_unassigned_port_is_never_reached(&$make, &$host)
+            }
+            #[test]
+            #[ignore = $needs]
+            fn a_sandbox_whose_client_was_killed_ends_on_removal() {
+                super::a_sandbox_whose_client_was_killed_ends_on_removal(&$make, &$host)
+            }
+            #[test]
+            #[ignore = $needs]
+            fn a_removal_ends_fork_hoppers() {
+                super::a_removal_ends_fork_hoppers(&$make, &$host)
+            }
+            #[test]
+            #[ignore = $needs]
             fn a_listing_by_name_matches_the_name_literally() {
                 super::a_listing_by_name_matches_the_name_literally(&$make, &$host)
             }
@@ -558,9 +815,16 @@ conformance!(
     super::Host {
         image: "alpine:3.22",
         route_probe: "tail -n +2 /proc/net/route",
-        serve: |port| format!("while :; do echo served | nc -l -p {port}; done"),
+        // A listen that fails (the port refused or taken) waits before it
+        // tries again, never spinning.
+        serve: |port| format!("while :; do echo served | nc -l -p {port} || sleep 1; done"),
         tcp_probe: |port| format!("nc -w 2 127.0.0.1 {port} </dev/null >/dev/null 2>&1 && echo connected; true"),
         unix_probe: |path| format!("nc -U '{path}' </dev/null >/dev/null 2>&1 && echo connected; true"),
+        serve_any: |port| format!("while :; do echo served | nc -l -p {port} || sleep 1; done"),
+        every_address_reaches_the_lan: false,
+        new_group: |script| format!("setsid sh -c '{script}' &"),
+        a_new_group_outlives_the_program: false,
+        host_group: |_| None,
     },
     "needs Docker and alpine:3.22"
 );
@@ -573,9 +837,19 @@ conformance!(
     super::Host {
         image: "unused",
         route_probe: "nc -z -G 2 1.1.1.1 53 2>/dev/null && echo route; true",
-        serve: |port| format!("while :; do echo served | nc -l 127.0.0.1 {port}; done"),
+        serve: |port| format!("while :; do echo served | nc -l 127.0.0.1 {port} || sleep 1; done"),
         tcp_probe: |port| format!("nc -z -G 2 127.0.0.1 {port} >/dev/null 2>&1 && echo connected; true"),
         unix_probe: |path| format!("nc -U '{path}' </dev/null >/dev/null 2>&1 && echo connected; true"),
+        serve_any: |port| format!("while :; do echo served | nc -l {port} || sleep 1; done"),
+        // #3559: recorded, not wanted.
+        every_address_reaches_the_lan: true,
+        new_group: |script| format!("/usr/bin/perl -e 'setpgrp(0, 0); exec @ARGV' sh -c '{script}' &"),
+        // Recorded, not wanted: the launcher ends only its own group.
+        a_new_group_outlives_the_program: true,
+        host_group: |name| {
+            let pid = std::fs::read_to_string(darkmux_sandbox::seatbelt::state_root().join(name).join("pid")).ok()?;
+            pid.trim().parse().ok()
+        },
     },
     "needs macOS sandbox-exec"
 );

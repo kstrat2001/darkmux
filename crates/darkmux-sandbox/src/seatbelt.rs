@@ -13,12 +13,29 @@
 //!   supply one.
 //! - **Limit memory or processes, or switch user.** `limits` and `user` are
 //!   unused; the process runs as the caller's user.
-//! - **Publish one port.** The default network may bind any port on the
-//!   loopback and no other address; [`Network::None`] reaches only the
-//!   loopback.
+//! - **Publish one port, or hold a bind to the loopback (#3559).** The
+//!   default network may bind any port on ANY local address: `0.0.0.0` and
+//!   this host's LAN address included, so a server that binds every address
+//!   is reachable from the LAN. SBPL's address filter (`local ip`) takes only
+//!   `*` or `localhost`, and for a bind `localhost` matches every local
+//!   address (measured on macOS 26.6), so the profile can allow binding or
+//!   deny it, never tell loopback from the rest. It can hold a sandbox to
+//!   PORTS: a policy naming `ports` binds and takes in traffic only on those
+//!   numbers: a bind to another port, and a `listen` with no bind, are
+//!   refused, and no socket on another port accepts connections or
+//!   unsolicited datagrams; replies on connections it opened (TCP, connected
+//!   UDP) arrive. An unconnected UDP socket's `recvfrom` is refused, even for
+//!   a reply. A caller that needs loopback-only
+//!   listeners watches the address itself (client previews do).
+//!   [`Network::None`] allows no network at all, the loopback included.
 //! - **Reach every descendant.** A sandbox is the process group its launcher
-//!   leads; a descendant that leaves the group (`setsid`) outlives a kill,
-//!   though still inside the sandbox.
+//!   leads, killed over and over until it is empty (a process that keeps
+//!   forking is caught). A descendant that leaves the group (`setsid`, or
+//!   `setpgid` to a group of its own or to another existing group in its
+//!   session; job control does it by itself)
+//!   outlives every kill, still inside the sandbox: it keeps its file and
+//!   network rules (binds and inbound only on the named ports) and nothing
+//!   ends it: nothing marks it as the sandbox's, so nothing else is killed.
 //!
 //! Each sandbox has a directory under [`state_root`] while it exists: its
 //! profile, its labels, its launcher's pid once started, its own `tmp`
@@ -93,17 +110,56 @@ mkdir -m 700 "$d/tmp" && printf '%s' "$2" > "$d/profile.sb" && printf '%s' "$3" 
 /// Runs the sandbox attached: `$d` set, `$1` the working directory (empty
 /// for none), then the program and its arguments. Records its own pid (the
 /// group's), survives the group's SIGTERM long enough to see the sandbox
-/// out, and removes the directory when it exits.
+/// out, and removes the directory when it exits (with [`LAUNCHED`]:
+/// [`launcher`]). Its guard, a helper in a group of its own started first,
+/// is given the launcher's pid (never reads it from its own parent, which is
+/// launchd already when the launcher ends first), waits for the launcher to
+/// be gone (at once when it already is) (its program ended, or the launcher
+/// itself killed outright, which no handler sees) and then kills the
+/// launcher's whole group again and again until it is empty (#3112): one
+/// kill of a group reaches every member at that instant, a fork-hopper's
+/// newest pid included, where a list of pids is always a step behind.
+/// A process that moved to a group of its own (`setsid`, `setpgid`) is not
+/// reached: unlike a container's, this sandbox does not end everything in it.
 const LAUNCH: &str = r#"wd=$1; shift
 echo $$ > "$d/pid" && ps -o lstart= -p $$ > "$d/started" || exit 125
+{GUARD} "$$" </dev/null >/dev/null 2>&1 &
 trap : TERM INT HUP
 [ -z "$wd" ] || cd "$wd" || { rm -rf "$d"; exit 125; }
 [ -n "$1" ] || { echo "seatbelt: no program to run (a policy needs an entrypoint)" >&2; rm -rf "$d"; exit 125; }
 /usr/bin/sandbox-exec -f "$d/profile.sb" "$@"
 rc=$?
-rm -rf "$d"
+g=$$
+"#;
+
+/// Ends every process in group `$g` from outside it (stop, remove and kill
+/// run in a group of their own): the whole group is killed at once, again
+/// and again until no process is left in it, at most 1000 times. One kill
+/// of a group reaches every member at that instant, so a process that keeps
+/// forking a new pid (a fork-hopper) is caught where a list of pids, always
+/// a step behind, is not. A process that moved to a group of its own is
+/// not in it.
+const DRAIN: &str = r#"n=0
+while [ "$n" -lt 1000 ] && kill -0 -- "-$g" 2>/dev/null; do
+  kill -KILL -- "-$g" 2>/dev/null
+  n=$((n + 1))
+done
+"#;
+
+/// The launcher's end: the directory removed, the program's status its
+/// own. What the program left running in the group is ended by the
+/// launcher's guard ([`LAUNCH`]), once the launcher is gone.
+const LAUNCHED: &str = r#"rm -rf "$d"
 exit $rc
 "#;
+
+/// The whole launcher script.
+fn launcher() -> String {
+    format!("{}{LAUNCHED}", LAUNCH.replacen("{GUARD}", GUARD, 1))
+}
+
+/// The launcher's guard ([`LAUNCH`]), its launcher's pid its argument.
+const GUARD: &str = r#"/usr/bin/perl -e 'setpgrp(0, 0); my $l = $ARGV[0]; select(undef, undef, undef, 0.05) while getppid() == $l; for (1 .. 1000) { last unless kill(0, -$l); kill("KILL", -$l); }'"#;
 
 /// Whether `$d` is a sandbox's directory at all: only a directory holding
 /// the profile this backend wrote is ever listed, stopped or deleted.
@@ -175,19 +231,41 @@ impl SeatbeltBackend {
             }
         }
         match policy.network {
-            // Any address, binding only on the loopback; no unix socket but
-            // the resolver's, so never the Docker daemon's or another
-            // service's (#3553 review).
-            Network::Default => p.push_str(concat!(
-                "(allow network*)\n(deny network-bind)\n(allow network-bind (local ip \"localhost:*\"))\n",
-                "(deny network-outbound (remote unix-socket))\n",
-                "(allow network-outbound (remote unix-socket (path-literal \"/private/var/run/mDNSResponder\")))\n",
-            )),
+            // Any address. The bind rule names `localhost`, but Seatbelt
+            // matches it against every local address, so `0.0.0.0` and the
+            // LAN address bind too (#3559): it holds no bind to the
+            // loopback. No unix socket but the resolver's, so never the
+            // Docker daemon's or another service's (#3553 review).
+            Network::Default => {
+                p.push_str("(allow network*)\n(deny network-bind)\n");
+                p.push_str(&Self::bind_rule(&policy.ports));
+                p.push_str(concat!(
+                    "(deny network-outbound (remote unix-socket))\n",
+                    "(allow network-outbound (remote unix-socket (path-literal \"/private/var/run/mDNSResponder\")))\n",
+                ));
+            }
             // Nothing: a sandbox has no loopback of its own, and the host's
             // runs its databases and model servers (#3553 review).
             Network::None => {}
         }
         p
+    }
+
+    /// What the default network may bind and take in: with `ports` named,
+    /// only those port numbers (on any local address: SBPL's `localhost`
+    /// matches every one, #3559). Every other bind is refused, and so is
+    /// inbound traffic to any other local port: a `listen` with no bind (an
+    /// ephemeral port the bind rule never sees) is refused, and no socket on
+    /// another port accepts connections or unsolicited datagrams. Replies on
+    /// connections the sandbox opened (TCP, connected UDP) arrive; an
+    /// unconnected UDP socket's `recvfrom` is refused, even for a reply.
+    /// With none named, any port, as before.
+    fn bind_rule(ports: &[u16]) -> String {
+        if ports.is_empty() {
+            return "(allow network-bind (local ip \"localhost:*\"))\n".to_string();
+        }
+        let named = join(ports.iter().map(|p| format!("(local ip \"localhost:{p}\")")));
+        format!("(allow network-bind {named})\n(deny network-inbound)\n(allow network-inbound {named})\n")
     }
 
     /// The directories above every path the sandbox may reach, and the
@@ -278,7 +356,7 @@ impl SeatbeltBackend {
 /// Removes `$d`'s sandbox, killing it first if it runs; leaves alone a
 /// directory this backend did not write ([`OURS`]).
 fn remove_script() -> String {
-    format!("{OURS} || exit 0\nif {ALIVE}; then kill -KILL -- \"-$pid\" 2>/dev/null; fi\nrm -rf \"$d\"; exit 0")
+    format!("{OURS} || exit 0\nif {ALIVE}; then kill -KILL -- \"-$pid\" 2>/dev/null; g=$pid\n{DRAIN}fi\nrm -rf \"$d\"; exit 0")
 }
 
 /// Lists the sandboxes under `$1`, skipping any directory this backend did
@@ -353,6 +431,13 @@ impl SandboxBackend for SeatbeltBackend {
         canonical(&mount.host).to_string_lossy().into_owned()
     }
 
+    /// Under [`SYSTEM_READ`] and outside [`DENIED_READ`], where its links
+    /// lead.
+    fn host_reads(&self, path: &Path) -> bool {
+        let real = canonical(path);
+        SYSTEM_READ.iter().any(|s| real.starts_with(s)) && !DENIED_READ.iter().any(|s| real.starts_with(s))
+    }
+
     fn run(&self, policy: &SandboxPolicy) -> (Command, SandboxHandle) {
         let handle = SandboxHandle { backend: BackendKind::Seatbelt, id: policy.name.clone() };
         let Some(dir) = dir_of(&policy.name) else { return (refused(&policy.name), handle) };
@@ -364,7 +449,7 @@ impl SandboxBackend for SeatbeltBackend {
             policy.workdir.clone().unwrap_or_default(),
         ];
         args.extend(Self::program(policy));
-        let mut cmd = Self::script(&format!("{PREPARE}shift 3\n{LAUNCH}"), &args, &Self::environment(policy, &dir));
+        let mut cmd = Self::script(&format!("{PREPARE}shift 3\n{}", launcher()), &args, &Self::environment(policy, &dir));
         if !policy.stdin {
             cmd.stdin(Stdio::null());
         }
@@ -383,7 +468,7 @@ impl SandboxBackend for SeatbeltBackend {
         let start = format!(
             "exec /usr/bin/env -i {} {SH} -c {} sh {}\n",
             join(env.iter().map(|(k, v)| sh_quote(&format!("{k}={v}")))),
-            sh_quote(&format!("d=$1; shift\n{LAUNCH}")),
+            sh_quote(&format!("d=$1; shift\n{}", launcher())),
             join(launch_args.iter().map(|a| sh_quote(a))),
         );
         let args = vec![dir.to_string_lossy().into_owned(), Self::profile(policy, &dir), Self::labels(policy), start];
@@ -405,14 +490,15 @@ if {ALIVE}; then
   kill -TERM -- "-$pid" 2>/dev/null
   i=0; while kill -0 "$pid" 2>/dev/null && [ "$i" -lt "$(($2 * 10))" ]; do sleep 0.1; i=$((i + 1)); done
   kill -KILL -- "-$pid" 2>/dev/null
-fi
+  g=$pid
+{DRAIN}fi
 rm -rf "$d"; exit 0"#
         );
         Self::on_dir(handle, &script, &[grace.as_secs().to_string()])
     }
 
     fn kill(&self, handle: &SandboxHandle) -> Command {
-        Self::on_dir(handle, &format!("{OURS} && {ALIVE} || exit 1\nkill -KILL -- \"-$pid\" && rm -rf \"$d\""), &[])
+        Self::on_dir(handle, &format!("{OURS} && {ALIVE} || exit 1\nkill -KILL -- \"-$pid\" || exit 1\ng=$pid\n{DRAIN}rm -rf \"$d\""), &[])
     }
 
     fn remove(&self, handle: &SandboxHandle) -> Command {
@@ -459,6 +545,7 @@ rm -rf "$d"; exit 0"#
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn policy(mounts: Vec<Mount>, network: Network) -> SandboxPolicy {
         SandboxPolicy {
@@ -484,9 +571,12 @@ mod tests {
     }
 
     /// A read-only mount after a read-write one denies writes beneath it,
-    /// in order, and the default network may bind only the loopback.
+    /// in order, and the default network's bind rule is the one written
+    /// (which, #3559, Seatbelt applies to every local address: the
+    /// conformance suite's `a_server_on_every_address_reaches_only_what_the_backend_allows`
+    /// records what it really allows).
     #[test]
-    fn the_profile_layers_mounts_in_order_and_binds_only_loopback() {
+    fn the_profile_layers_mounts_in_order_and_writes_the_bind_rule() {
         let p = SeatbeltBackend::profile(
             &policy(vec![mount("/nonexistent-ws", Access::ReadWrite), mount("/nonexistent-ws/.git", Access::ReadOnly)], Network::Default),
             Path::new("/nonexistent-state/s"),
@@ -501,6 +591,23 @@ mod tests {
         assert!(p.contains("(deny file-read* file-write* (regex #\"^/dev/ttys\"))"), "no other terminal: {p}");
         assert!(!p.contains("(subpath \"/opt/homebrew\")"), "not all of Homebrew, its var included: {p}");
         assert!(!p.contains("/Users"), "no home is readable: {p}");
+    }
+
+    /// (#3112, #3559) A policy naming ports may bind only those numbers;
+    /// one naming none, any. The address cannot be held either way.
+    #[test]
+    fn named_ports_are_the_only_ones_the_profile_lets_bind() {
+        let mut p = policy(Vec::new(), Network::Default);
+        p.ports = vec![4100, 4200];
+        let named = SeatbeltBackend::profile(&p, Path::new("/s"));
+        assert!(named.contains("(deny network-bind)\n(allow network-bind (local ip \"localhost:4100\") (local ip \"localhost:4200\"))\n"), "{named}");
+        // (#3112 review) A listen with no bind gets an ephemeral port the
+        // bind rule never sees: inbound is held to the named ports too.
+        assert!(named.contains("(deny network-inbound)\n(allow network-inbound (local ip \"localhost:4100\") (local ip \"localhost:4200\"))\n"), "{named}");
+        assert!(!named.contains("localhost:*"), "{named}");
+        let any = SeatbeltBackend::profile(&policy(Vec::new(), Network::Default), Path::new("/s"));
+        assert!(any.contains("(allow network-bind (local ip \"localhost:*\"))"), "{any}");
+        assert!(!any.contains("network-inbound"), "no ports named, inbound as it was: {any}");
     }
 
     /// No network allows no network rule at all, the host's loopback
@@ -542,6 +649,74 @@ mod tests {
         let _ = other.wait();
         assert!(!kill.success(), "a kill claimed a process it did not start");
         assert!(survived, "a kill signaled a process that reused the pid");
+    }
+
+    /// (#3112) What a sandbox reads with no mount: the OS and the system
+    /// toolchain (Homebrew's programs), never a home, never Homebrew's or
+    /// `/usr/local`'s data; a path is judged where its links lead.
+    #[test]
+    fn it_reads_the_system_and_never_a_home() {
+        for yes in ["/usr/bin/env", "/bin/sh", "/opt/homebrew/bin", "/opt/homebrew/Cellar/node", "/usr/local/bin"] {
+            assert!(SeatbeltBackend.host_reads(Path::new(yes)), "{yes}");
+        }
+        for no in ["/Users/someone/.nvm/versions/node/v24/bin", "/opt/homebrew/var", "/opt/homebrew", "/usr/local/var/db", "/usr/local/etc", "/opt/local/bin", "/"] {
+            assert!(!SeatbeltBackend.host_reads(Path::new(no)), "{no}");
+        }
+        let home = tempfile::TempDir::new().unwrap();
+        let link = home.path().join("to-usr");
+        std::os::unix::fs::symlink("/usr/bin", &link).unwrap();
+        assert!(SeatbeltBackend.host_reads(&link), "a link into the system reads where it leads");
+        assert!(!crate::DockerBackend.host_reads(Path::new("/usr/bin")), "a container reads only its image and mounts");
+    }
+
+    /// (#3112 review, MAJOR D) A launcher that ends at once (its working
+    /// folder missing) leaves no guard behind: twenty such launches, then no
+    /// process naming their sandboxes is left.
+    #[test]
+    #[serial_test::serial]
+    fn a_launcher_that_ends_at_once_leaves_no_guard() {
+        if !SeatbeltBackend::available() {
+            return;
+        }
+        let root = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var_os(STATE_DIR_ENV);
+        unsafe { std::env::set_var(STATE_DIR_ENV, root.path()) };
+        for n in 0..20 {
+            let mut p = policy(Vec::new(), Network::None);
+            p.name = format!("darkmux-guard-test-{n}");
+            p.workdir = Some("/nonexistent-darkmux-workdir".into());
+            let (mut cmd, _) = SeatbeltBackend.run(&p);
+            let out = cmd.output().unwrap();
+            assert_eq!(out.status.code(), Some(125), "{}", String::from_utf8_lossy(&out.stderr));
+        }
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(STATE_DIR_ENV, v),
+                None => std::env::remove_var(STATE_DIR_ENV),
+            }
+        }
+        // And the guard alone, under a parent that is gone before it starts:
+        // it must not mistake launchd (its new parent) for its launcher.
+        for _ in 0..5 {
+            Command::new(SH).arg("-c").arg(format!("{GUARD} \"$$\" </dev/null >/dev/null 2>&1 & exit 0")).status().unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        // A guard is a perl that moved itself to a group of its own; once its
+        // launcher is gone, launchd (pid 1) is its parent.
+        let ps = Command::new("/bin/ps").args(["-A", "-o", "pid=,ppid=,command="]).output().unwrap();
+        let pids: Vec<String> = String::from_utf8_lossy(&ps.stdout)
+            .lines()
+            .filter(|l| l.contains("/usr/bin/perl -e setpgrp(0, 0); my $l = "))
+            .filter_map(|l| {
+                let mut f = l.split_whitespace();
+                let (pid, ppid) = (f.next()?, f.next()?);
+                (ppid == "1").then(|| pid.to_string())
+            })
+            .collect();
+        for pid in &pids {
+            let _ = Command::new("/bin/kill").args(["-KILL", pid]).status();
+        }
+        assert!(pids.is_empty(), "guards left behind: {pids:?}");
     }
 
     /// A quote or backslash in a path cannot end the SBPL string.
