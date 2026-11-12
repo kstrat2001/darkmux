@@ -21,8 +21,16 @@ pub(crate) fn configured() -> (Result<BackendKind, String>, Source) {
 /// where `sandbox-exec` is (the selection already refused it where not);
 /// Docker is as ready as the `docker runtime` row (`docker`) says, never
 /// probed twice. `seatbelt_here`: Seatbelt could run on this host, so a
-/// Docker problem can name the way to need no Docker.
-pub(crate) fn sandbox_row(selected: &Result<BackendKind, String>, source: Source, docker: Option<&Check>, seatbelt_here: bool) -> Check {
+/// Docker problem can name the way to need no Docker. `host_runtime`: for a
+/// sandbox on the host, the runtime it would run, as a dispatch chooses and
+/// identity-checks it (#3112 review); `None` reads as not checked.
+pub(crate) fn sandbox_row(
+    selected: &Result<BackendKind, String>,
+    source: Source,
+    docker: Option<&Check>,
+    seatbelt_here: bool,
+    host_runtime: Option<&Result<String, String>>,
+) -> Check {
     let check = |status, message: String, hint: Option<String>| Check { name: SANDBOX_CHECK_NAME.into(), status, message, hint };
     let kind = match selected {
         Ok(kind) => *kind,
@@ -30,11 +38,7 @@ pub(crate) fn sandbox_row(selected: &Result<BackendKind, String>, source: Source
     };
     let named = format!("`{}` ({})", darkmux_sandbox::setting_value(kind), from(source));
     match (kind, docker) {
-        (BackendKind::Seatbelt, _) => check(
-            Status::Pass,
-            format!("{named}: macOS Seatbelt ({}) runs every isolated run here; Docker is not needed", darkmux_sandbox::seatbelt::SANDBOX_EXEC),
-            None,
-        ),
+        (BackendKind::Seatbelt, _) => seatbelt_row(&named, host_runtime),
         (BackendKind::Docker, Some(row)) if row.status == Status::Pass => {
             check(Status::Pass, format!("{named}: every isolated run here runs in a Docker container ({})", row.message), None)
         }
@@ -45,6 +49,26 @@ pub(crate) fn sandbox_row(selected: &Result<BackendKind, String>, source: Source
                 "to need no Docker on this Mac, `darkmux config set runtime.sandbox seatbelt` (macOS's own sandbox)".to_string()
             }),
         ),
+    }
+}
+
+/// Seatbelt: present (the selection already refused it where not), so the
+/// row is whether its runtime can run.
+fn seatbelt_row(named: &str, host_runtime: Option<&Result<String, String>>) -> Check {
+    let check = |status, message: String, hint: Option<String>| Check { name: SANDBOX_CHECK_NAME.into(), status, message, hint };
+    let exec = darkmux_sandbox::seatbelt::SANDBOX_EXEC;
+    match host_runtime {
+        Some(Err(why)) => check(
+            Status::Fail,
+            format!("{named}: macOS Seatbelt ({exec}) is here, but no dispatch can start: its runtime cannot run: {why}"),
+            Some("restart the darkmux process that will dispatch, or run in Docker: `darkmux config set runtime.sandbox docker`".into()),
+        ),
+        Some(Ok(program)) => check(
+            Status::Pass,
+            format!("{named}: macOS Seatbelt ({exec}) runs every isolated run here, with `{program}`; Docker is not needed"),
+            None,
+        ),
+        None => check(Status::Pass, format!("{named}: macOS Seatbelt ({exec}) runs every isolated run here; Docker is not needed"), None),
     }
 }
 
@@ -82,11 +106,27 @@ mod tests {
     /// Seatbelt that can run passes, and says Docker is not needed.
     #[test]
     fn seatbelt_passes_and_needs_no_docker() {
-        let c = sandbox_row(&Ok(BackendKind::Seatbelt), Source::BuiltIn, None, true);
+        let c = sandbox_row(&Ok(BackendKind::Seatbelt), Source::BuiltIn, None, true, Some(&Ok("/x/darkmux runtime".into())));
         assert_eq!((c.name.as_str(), c.status), (SANDBOX_CHECK_NAME, Status::Pass));
         for part in ["`seatbelt`", "this machine's default", "Docker is not needed"] {
             assert!(c.message.contains(part), "missing `{part}` in: {}", c.message);
         }
+    }
+
+    /// (#3112 review, regression) Seatbelt as this machine's default with
+    /// no runtime it can run fails, naming why and the way back: doctor
+    /// asks the same identity check a dispatch does, so a green row means a
+    /// dispatch can start.
+    #[test]
+    fn a_seatbelt_default_with_no_runnable_runtime_fails() {
+        let why = "darkmux was replaced since this process started; Restart this darkmux process";
+        let c = sandbox_row(&Ok(BackendKind::Seatbelt), Source::BuiltIn, None, true, Some(&Err(why.into())));
+        assert_eq!(c.status, Status::Fail);
+        assert!(c.message.contains(why) && c.message.contains("`seatbelt`"), "{}", c.message);
+        assert!(c.hint.as_deref().unwrap_or("").contains("darkmux config set runtime.sandbox docker"), "{:?}", c.hint);
+        let ok = sandbox_row(&Ok(BackendKind::Seatbelt), Source::BuiltIn, None, true, Some(&Ok("/opt/homebrew/bin/darkmux runtime".into())));
+        assert_eq!(ok.status, Status::Pass);
+        assert!(ok.message.contains("/opt/homebrew/bin/darkmux runtime"), "{}", ok.message);
     }
 
     /// A sandbox that cannot run here (Seatbelt with no `sandbox-exec`, or a
@@ -94,7 +134,7 @@ mod tests {
     #[test]
     fn a_sandbox_that_cannot_run_here_fails() {
         let why = "runtime.sandbox is `seatbelt`, but this host has no /usr/bin/sandbox-exec";
-        let c = sandbox_row(&Err(why.into()), Source::Config, None, false);
+        let c = sandbox_row(&Err(why.into()), Source::Config, None, false, None);
         assert_eq!(c.status, Status::Fail);
         assert!(c.message.contains(why), "{}", c.message);
     }
@@ -104,16 +144,16 @@ mod tests {
     /// can run.
     #[test]
     fn docker_is_as_ready_as_its_own_row_says() {
-        let up = sandbox_row(&Ok(BackendKind::Docker), Source::Config, Some(&row(Status::Pass, "ready")), true);
+        let up = sandbox_row(&Ok(BackendKind::Docker), Source::Config, Some(&row(Status::Pass, "ready")), true, None);
         assert_eq!(up.status, Status::Pass);
         assert!(up.message.contains("`docker` (from config.json)"), "{}", up.message);
 
         let down = row(Status::Warn, "the daemon isn't reachable");
-        let mac = sandbox_row(&Ok(BackendKind::Docker), Source::Config, Some(&down), true);
+        let mac = sandbox_row(&Ok(BackendKind::Docker), Source::Config, Some(&down), true, None);
         assert_eq!(mac.status, Status::Warn);
         assert!(mac.message.contains("docker runtime"), "{}", mac.message);
         assert!(mac.hint.as_deref().unwrap_or("").contains("darkmux config set runtime.sandbox seatbelt"), "{:?}", mac.hint);
-        let linux = sandbox_row(&Ok(BackendKind::Docker), Source::BuiltIn, Some(&down), false);
+        let linux = sandbox_row(&Ok(BackendKind::Docker), Source::BuiltIn, Some(&down), false, None);
         assert!(!linux.hint.as_deref().unwrap_or("").contains("seatbelt"), "{:?}", linux.hint);
     }
 

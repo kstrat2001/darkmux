@@ -40,9 +40,15 @@ darkmux release.
   on Docker runs.
 
   **Upgrading:** on a Mac whose `config.json` names no sandbox, dispatches, lab runs and the mods
-  gate move from Docker to Seatbelt. To keep Docker, `darkmux config set runtime.sandbox docker`
-  (and upgrade every darkmux that reads the same `~/.darkmux` first: an older binary refuses the
-  new key). Linux is unchanged.
+  gate move from Docker to Seatbelt. Under Seatbelt the agent runtime is the darkmux executable
+  itself (`darkmux runtime`, #3558): nothing to build, pull or install, and no Docker. A darkmux
+  process that was running when darkmux was upgraded refuses Seatbelt dispatches until it is
+  restarted (`brew services restart darkmux` for the daemon), and `darkmux doctor`'s `sandbox`
+  row says so. Resuming a checkpoint written under Docker is refused under Seatbelt, naming both
+  sandboxes: resume it with `darkmux config set runtime.sandbox docker`. To keep
+  Docker, `darkmux config set runtime.sandbox docker` (and upgrade every darkmux that reads the
+  same `~/.darkmux` first: an older binary refuses the new key). Linux is unchanged. The Homebrew
+  formula's caveats still say dispatches need Docker; they change with the next release.
 
 ## [5.10.0] - 2026-11-11
 

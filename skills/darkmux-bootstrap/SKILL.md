@@ -93,7 +93,10 @@ Four outcomes:
 
 **C. It errors on RAM headroom.** Trim the profile's context length so the loadout fits the resident budget, then re-run.
 
-**D. It errors on the sandbox.** The error names `runtime.sandbox` and the fix. Under `docker`, Docker is not installed or not running: start it, or on a Mac propose `darkmux config set runtime.sandbox seatbelt`, which needs no Docker. Then re-run.
+**D. It errors on the sandbox.** The error names `runtime.sandbox` and the fix; `darkmux doctor`'s `sandbox` row says the same thing. Then re-run.
+
+- Under `seatbelt` (a Mac's default), the runtime is darkmux itself (`darkmux runtime`), so there is nothing to install. The usual cause is a darkmux replaced while a process was running (an upgrade or `brew cleanup`): restart that process, often the `darkmux serve` daemon (`brew services restart darkmux`). To run in Docker instead, propose `darkmux config set runtime.sandbox docker`.
+- Under `docker`, Docker is not installed or not running: start it, or on a Mac propose `darkmux config set runtime.sandbox seatbelt`, which needs no Docker.
 
 ## Step 5 — Optional: enable the audit and coordination substrates
 

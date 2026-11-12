@@ -7214,9 +7214,8 @@ fn host_runtime(override_program: Option<std::ffi::OsString>, at_start: &Executa
     if let Some(named) = override_program.filter(|v| !v.is_empty()).map(PathBuf::from) {
         let program = named.canonicalize().ok().filter(|p| is_executable_file(p)).ok_or_else(|| {
             anyhow!(
-                "{SANDBOX_RUNTIME_ENV}={}: not an executable file. It names a standalone runtime for development \
-                 (`cargo build --release --manifest-path runtime/Cargo.toml` writes \
-                 runtime/target/release/darkmux-runtime); unset it to run this darkmux's own runtime",
+                "{SANDBOX_RUNTIME_ENV}={}: not an executable file. It names a standalone runtime for development; \
+                 unset it to run this darkmux's own runtime",
                 named.display()
             )
         })?;
@@ -7250,15 +7249,45 @@ fn runtime_program(image: &RuntimeImage) -> Result<(Option<PathBuf>, Vec<String>
     }
 }
 
+/// (#3112 review) The way back from a Seatbelt refusal, for its last line.
+fn seatbelt_way_back() -> String {
+    format!(
+        "`{key}` is `seatbelt`; to run in a Docker container instead, `darkmux config set {key} docker`",
+        key = darkmux_sandbox::SANDBOX_KEY
+    )
+}
+
+/// (#3112 review) The runtime a Seatbelt dispatch runs ([`host_runtime`]),
+/// or a refusal that names the setting that chose Seatbelt and the way back:
+/// `--image` (a Seatbelt sandbox runs this host's own programs and has no
+/// image), and any runtime this process cannot run.
+fn seatbelt_runtime_for(
+    image_arg: Option<&str>,
+    override_program: Option<std::ffi::OsString>,
+    at_start: &ExecutableAtStart,
+) -> Result<HostRuntime> {
+    if let Some(image) = image_arg {
+        bail!("--image {image}: the Seatbelt sandbox runs this machine's own programs, not an image. {}", seatbelt_way_back());
+    }
+    host_runtime(override_program, at_start).map_err(|e| anyhow!("{e:#}\n{}", seatbelt_way_back()))
+}
+
+/// (#3112) The runtime a Seatbelt dispatch would run, as `darkmux doctor`
+/// checks it: the same choice and identity check a dispatch makes
+/// ([`host_runtime`]), `Ok` naming the program, `Err` the refusal.
+pub fn seatbelt_runtime_status() -> std::result::Result<String, String> {
+    let at_start = EXECUTABLE_AT_START.get_or_init(|| executable_at_start(std::env::current_exe()));
+    seatbelt_runtime_for(None, std::env::var_os(SANDBOX_RUNTIME_ENV), at_start)
+        .map(|r| std::iter::once(r.program.display().to_string()).chain(r.leading_args).collect::<Vec<_>>().join(" "))
+        .map_err(|e| format!("{e:#}"))
+}
+
 /// (#3112 step 2) What a Seatbelt dispatch runs in place of an image: the
 /// [`host_runtime`]. No image is checked or pulled, and `--image` is
 /// refused: there is no image to name.
 fn host_runtime_image(image_arg: Option<&str>) -> Result<RuntimeImage> {
-    if let Some(image) = image_arg {
-        bail!("--image {image}: the Seatbelt sandbox ({}=seatbelt) runs this host's own programs, not an image", darkmux_sandbox::SANDBOX_ENV);
-    }
     let at_start = EXECUTABLE_AT_START.get_or_init(|| executable_at_start(std::env::current_exe()));
-    let runtime = host_runtime(std::env::var_os(SANDBOX_RUNTIME_ENV), at_start)?;
+    let runtime = seatbelt_runtime_for(image_arg, std::env::var_os(SANDBOX_RUNTIME_ENV), at_start)?;
     let shown = std::iter::once(runtime.program.display().to_string()).chain(runtime.leading_args.iter().cloned()).collect::<Vec<_>>().join(" ");
     darkmux_types::diag_eprintln!("darkmux dispatch: runtime=internal, sandbox=seatbelt, runtime: {shown}");
     Ok(RuntimeImage {

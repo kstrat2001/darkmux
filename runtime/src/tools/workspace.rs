@@ -237,6 +237,13 @@ mod tests {
         assert_eq!(naming(role, Path::new(DEFAULT_WORKSPACE)), role);
         let renamed = naming(role, Path::new("/Users/op/ws"));
         assert!(!renamed.contains("/workspace") && renamed.contains("`/Users/op/ws`"), "{renamed}");
+        // The role reaches the runtime as `--system`, which the runtime's
+        // entry (`lib.rs` since #3558) renames before anything reads it.
+        let entry = include_str!("../lib.rs");
+        assert!(
+            entry.contains("tools::workspace::naming_root(&args.system.take()"),
+            "the runtime's entry must rename the `--system` text"
+        );
     }
 
     /// (#3112 step 2) The root is the env override when set and non-empty,

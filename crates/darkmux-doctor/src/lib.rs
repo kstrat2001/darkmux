@@ -150,11 +150,19 @@ fn run_with(configured: (Result<darkmux_sandbox::BackendKind, String>, darkmux_t
     // can run here, from the `docker runtime` row's one probe under Docker.
     let (sandbox, sandbox_source) = configured;
     let docker_runtime = checks_sandbox::docker_only(&sandbox, "docker runtime", check_docker_runtime);
+    // (#3112 review) Under a sandbox on the host, the runtime a dispatch
+    // would run, by the dispatch's own choice and identity check.
+    let host_runtime = sandbox
+        .as_ref()
+        .ok()
+        .filter(|k| k.on_host())
+        .map(|_| darkmux_crew::dispatch_internal::seatbelt_runtime_status());
     let sandbox_row = checks_sandbox::sandbox_row(
         &sandbox,
         sandbox_source,
         Some(&docker_runtime),
         darkmux_sandbox::SeatbeltBackend::available(),
+        host_runtime.as_ref(),
     );
     let mut checks = vec![
         check_build_info(),
@@ -9727,6 +9735,14 @@ mod tests {
         let sandbox = row("sandbox");
         assert_eq!(sandbox.status, Status::Pass);
         assert!(sandbox.message.contains("`seatbelt`"), "{}", sandbox.message);
+        // (#3112 review) It names the runtime a dispatch would run, from the
+        // dispatch's own choice and identity check (here, this test binary).
+        let this = std::env::current_exe().unwrap().canonicalize().unwrap();
+        assert!(
+            sandbox.message.contains(&format!("runs every isolated run here, with `{} runtime`", this.display())),
+            "{}",
+            sandbox.message
+        );
         for name in ["docker runtime", "daemon docker", RUNTIME_IMAGE_CHECK_NAME, RUNTIME_BINARY_CACHE_CHECK_NAME, "container user"] {
             let c = row(name);
             assert!(c.message.contains("Docker is not needed"), "`{name}`: {}", c.message);

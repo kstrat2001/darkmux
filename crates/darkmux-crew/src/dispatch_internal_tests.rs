@@ -6406,6 +6406,30 @@ S(("127.0.0.1", port), H).serve_forever()
         assert_eq!(got.program, old.canonicalize().unwrap(), "the file this process started from, not the new link target");
     }
 
+    /// (#3112 review) Every Seatbelt refusal names the setting that chose
+    /// Seatbelt and the way back to Docker, never `DARKMUX_SANDBOX=` or a
+    /// build recipe: `--image` (Seatbelt has no images), a runtime this
+    /// process cannot run, and a bad development override.
+    #[test]
+    fn a_seatbelt_refusal_names_the_setting_and_the_way_back() {
+        let root = tempfile::TempDir::new().unwrap();
+        let exe = root.path().join("bin/darkmux");
+        an_executable(&exe, "darkmux");
+        let at_start = executable_at_start(Ok(exe.clone()));
+        let way_back = "darkmux config set runtime.sandbox docker";
+        let refusals = [
+            seatbelt_runtime_for(Some("rust:latest"), None, &at_start).unwrap_err(),
+            seatbelt_runtime_for(None, None, &executable_at_start(Err(std::io::Error::other("gone")))).unwrap_err(),
+            seatbelt_runtime_for(None, Some(root.path().join("nope").into_os_string()), &at_start).unwrap_err(),
+        ];
+        for err in refusals.iter().map(|e| format!("{e:#}")) {
+            assert!(err.contains("`runtime.sandbox` is `seatbelt`") && err.contains(way_back), "{err}");
+            assert!(!err.contains("DARKMUX_SANDBOX=") && !err.contains("cargo build"), "{err}");
+        }
+        assert!(format!("{:#}", refusals[0]).contains("--image rust:latest"));
+        assert_eq!(seatbelt_runtime_for(None, None, &at_start).unwrap().program, exe.canonicalize().unwrap());
+    }
+
     /// (#3112 review) Once the file this process started from is gone or is
     /// another file (`cargo install` replaces by rename; `brew cleanup`
     /// deletes the old Cellar), the dispatch is refused with the remedy,
