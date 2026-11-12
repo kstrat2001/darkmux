@@ -1415,6 +1415,22 @@ describe("the count line's model, engine and residents (#3554)", () => {
     expect(countLine({ ...one, engineServers: [flint], shown: { model: "m", endpoint: "openai:gpu-box:8123/m" } }).text).toBe("1 running · m · gpu-box:8123");
   });
 
+  it("matches a started server on every loopback spelling", () => {
+    expect(countLine({ ...one, engineServers: [flint], shown: { model: "m", endpoint: "openai:localhost:8123/m" } }).text).toBe("1 running · m · flint");
+    expect(countLine({ ...one, engineServers: [flint], shown: { model: "m", endpoint: "openai:[::1]:8123/m" } }).text).toBe("1 running · m · flint");
+  });
+
+  // (#3554 review) On the container path a Flint dispatch's start record names
+  // the wire model ("flint", `Target::wire_model`); the endpoint's tail is the
+  // profile model id on every path that writes an endpoint, so it wins.
+  it("prefers the endpoint's model over the start record's wire model (an agentic Flint dispatch)", () => {
+    const flint8092 = { engine: "flint", port: 8092 };
+    expect(countLine({ ...one, engineServers: [flint8092], shown: { model: "flint", endpoint: "openai:127.0.0.1:8092/flint-int4" } })).toEqual({
+      text: "1 running · flint",
+      title: "1 running · flint-int4 · flint on 127.0.0.1:8092",
+    });
+  });
+
   it("reads the model from the endpoint's tail when the start record names none", () => {
     expect(countLine({ ...one, shown: { endpoint: "azure:myorg.openai.azure.com/gpt-4o" } }).text).toBe("1 running · gpt-4o · Azure OpenAI");
   });

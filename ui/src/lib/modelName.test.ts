@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { modelShortName } from "./modelName";
+import { lastPathSegment, modelShortName } from "./modelName";
 
 // (#3554) Real model ids, grepped from this repo's profiles, fixtures, goldens
 // and docs (the file each came from is beside it), and the short name the
@@ -85,5 +85,14 @@ describe("modelShortName (#3554)", () => {
   });
   it("is empty for no model", () => {
     expect(modelShortName("")).toBe("");
+  });
+});
+
+// (#3554 review) The one last-segment cut, shared by the shortener and the
+// servers line (which keeps the rest of the id).
+describe("lastPathSegment", () => {
+  it("keeps what follows the last slash", () => {
+    expect(lastPathSegment("TensorFold/Qwen3.8-27B-MLX-4bit")).toBe("Qwen3.8-27B-MLX-4bit");
+    expect(lastPathSegment("flint-int4")).toBe("flint-int4");
   });
 });

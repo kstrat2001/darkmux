@@ -3841,4 +3841,25 @@ describe("FleetLens: the count line names the model and what is loaded (#3554)",
     await waitFor(() => expect(document.querySelector(".mach .spec")!.textContent).toBe("Apple M5 Max"));
     expect(countEl().textContent).toBe("0 running");
   });
+
+  // (#3554 review) Which server holds a port is a fact about now: a past run
+  // on 8092 is named by its address off the live edge, never by whatever
+  // engine holds 8092 today.
+  describe("a run on a server darkmux started", () => {
+    const server = { endpoint: "local-flint", engine: "tensorfold", model: "other-model", served_name: "x", n_ctx: 4096, port: 8092, pid: 1, started_at_ms: 0, answering: true };
+    const flintRun = (hms: string) => ({ ...start("s1", { model: "flint" }, { endpoint: "openai:127.0.0.1:8092/flint-int4" }), ts: at(hms) });
+    it("is named by the engine that holds its port at the live edge", async () => {
+      mockFleetFetch({ runs: [], flowToday: [flintRun("10:01:00")], specs: { ...SELF, engine_servers: [server] } });
+      renderFleetLens();
+      await waitFor(() => expect(document.querySelector(".runs--live")?.textContent).toBe("1 running · flint · tensorfold"));
+      expect(document.querySelector(".runs--live")!.getAttribute("title")).toBe("1 running · flint-int4 · tensorfold on 127.0.0.1:8092");
+    });
+    it("is named by its address under a scrubbed playhead", async () => {
+      mockFleetFetch({ runs: [], flowToday: [flintRun("08:59:30")], specs: { ...SELF, engine_servers: [server] } });
+      renderFleetLens({ playhead: Date.parse(at("09:00:00")) });
+      await waitFor(() => expect(document.querySelector(".mach .spec")!.textContent).toBe("Apple M5 Max"));
+      await waitFor(() => expect(countEl()?.textContent).toBe("1 running · flint · 127.0.0.1:8092"));
+      expect(countEl().getAttribute("title")).toBe("1 running · flint-int4 · 127.0.0.1:8092");
+    });
+  });
 });

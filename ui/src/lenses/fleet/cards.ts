@@ -900,8 +900,8 @@ function startedServerAt(host: string, servers: readonly Pick<EngineServer, "eng
 
 /** (#3554) The engine a hosted execution ran on: a server darkmux started on
  *  this machine by its engine, Azure by name, and any other endpoint by its
- *  address (`openai:` names the request FORMAT, not a vendor, so a server on
- *  this machine is never read as having left it). */
+ *  address (`openai:` is every host that is not Azure's, so a server on this
+ *  machine or another vendor's endpoint is never misnamed). */
 function routeEngine(route: EndpointRoute, servers: readonly Pick<EngineServer, "engine" | "port">[]): string {
   const server = startedServerAt(route.host, servers);
   if (server) return server.engine;
@@ -919,7 +919,10 @@ function routeWords(
   servers: readonly Pick<EngineServer, "engine" | "port">[],
 ): { text: string; title: string } | null {
   const route = shown.endpoint ? parseEndpointRoute(shown.endpoint) : null;
-  const model = shortModel(shown.model) || route?.model || "";
+  // The endpoint's tail is the profile model id on every path that writes an
+  // endpoint; the start's own `model` can be the wire name (`flint` on the
+  // container path, `Target::wire_model`), so the tail wins.
+  const model = route?.model || shortModel(shown.model) || "";
   const engine = route ? routeEngine(route, servers) : "";
   const engineTitle = route && engine !== route.host ? `${engine} on ${route.host}` : engine;
   const name = modelShortName(model);

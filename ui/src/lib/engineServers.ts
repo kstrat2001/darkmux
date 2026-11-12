@@ -6,6 +6,7 @@
  */
 
 import type { EngineServer } from "../types/generated/EngineServer";
+import { lastPathSegment } from "./modelName";
 
 /** How long a server's start may run before darkmux gives up and stops it:
  * `darkmux_profiles::engine::server::START_BOUND` (15 minutes), mirrored
@@ -29,12 +30,6 @@ export function serverLabel(s: Pick<EngineServer, "model" | "engine" | "endpoint
   return `${s.model} (${s.engine} on ${s.endpoint})`;
 }
 
-/** A model id's last path segment (`TensorFold/Qwen3.8-27B` → `Qwen3.8-27B`):
- * a card is narrow, and the full id is in the line's title. */
-function shortModel(model: string): string {
-  return model.slice(model.lastIndexOf("/") + 1);
-}
-
 /** The fleet card's line for a machine's servers: the counts first, which a
  * narrow card's ellipsis cannot cut off ("2 servers · 1 starting"), then the
  * models by short name, the ones still starting first and the ones not
@@ -46,7 +41,7 @@ export function serversLine(servers: readonly EngineServer[] | null | undefined,
   const of = (word: StateWord) => all.filter((s) => serverStateWord(s, nowMs) === word);
   const starting = of("starting the model");
   const silent = of("not answering");
-  const names = [...starting, ...silent, ...of("resident")].map((s) => shortModel(s.model));
+  const names = [...starting, ...silent, ...of("resident")].map((s) => lastPathSegment(s.model));
   const counts = [`${all.length} ${all.length === 1 ? "server" : "servers"}`];
   if (starting.length > 0) counts.push(`${starting.length} starting`);
   if (silent.length > 0) counts.push(`${silent.length} not answering`);

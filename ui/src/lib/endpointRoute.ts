@@ -1,10 +1,12 @@
 /**
  * (#2834, #3554) A dispatch record's `endpoint`, the route label darkmux
  * writes for a model reached over HTTP: `<kind>:<host>/<model>`
- * (`darkmux_flow::unmanaged_route_label`). `kind` is the request format
- * (`azure` or `openai`), `host` is the address alone (never a scheme, a path
- * or credentials), and the model id may itself hold `/`. One reading for
- * every surface that words a route.
+ * (`darkmux_flow::unmanaged_route_label`). `kind` is `azure` when the host
+ * contains "azure" and `openai` for every other host: a guess from the
+ * address, not the request format (an Anthropic messages endpoint is labeled
+ * `openai:` too). `host` is the address alone (never a scheme, a path or
+ * credentials), and the model id may itself hold `/`. One reading for every
+ * surface that words a route.
  */
 
 export interface EndpointRoute {
@@ -26,8 +28,10 @@ export function parseEndpointRoute(ep: string): EndpointRoute {
   };
 }
 
-/** The request format by name. `openai` names the FORMAT, not a vendor, so a
- *  surface that must not read a local server as hosted names it by address. */
+/** The kind by name, as the run page's route line words it. Only `azure` says
+ *  something about the host; `openai` is every other host (a local server, an
+ *  Anthropic endpoint), so a surface that must not misname one names it by
+ *  its address instead. */
 export function routeKindLabel(kind: string): string {
   if (kind === "azure") return "Azure OpenAI";
   if (kind === "openai") return "OpenAI";

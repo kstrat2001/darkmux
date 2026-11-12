@@ -25,12 +25,18 @@ const STORAGE = /^(\d+bit|u?int\d+|b?f\d+|(mx|nv)?fp\d+|i?q\d+(_[a-z0-9]+)*|mlx|
  *  share `qwen3-4b-2507`; `deepseek-chat` is not `deepseek`). */
 const TUNING = /^(instruct|chat|it)$/i;
 
+/** A model id's last path segment (`TensorFold/Qwen3.8-27B` → `Qwen3.8-27B`):
+ *  the publisher or path prefix dropped, the rest kept as it is. */
+export function lastPathSegment(id: string): string {
+  return id.slice(id.lastIndexOf("/") + 1);
+}
+
 /** The id's model name: no namespace, no publisher or path prefix, no file
  *  extension, no storage parts, no trailing tuning tag. The first part always
  *  stays, so a name never shortens to nothing. */
 export function modelShortName(id: string): string {
   const base = id.replace(NAMESPACE, "");
-  const file = base.slice(base.lastIndexOf("/") + 1).replace(EXTENSION, "");
+  const file = lastPathSegment(base).replace(EXTENSION, "");
   const [first, ...rest] = file.split("-");
   const kept = rest.filter((part) => !STORAGE.test(part));
   while (kept.length > 1 && TUNING.test(kept[kept.length - 1])) kept.pop();

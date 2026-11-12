@@ -244,7 +244,14 @@ function CountLine({
   if (!face.countShown) return <div className="runs runs--quiet">—</div>;
   const runsHash = machineRunsHash(machineKey, card.runningSessionIds);
   const counts = { runsCount: card.runsCount, executions, position };
-  const line = countLine({ ...counts, shown, engineServers: card.engineServers, residents: atLiveEdge ? card.residents : null });
+  // What the machine holds and which server holds a port are facts about now:
+  // off the live edge neither is read, and an endpoint reads by its address.
+  const line = countLine({
+    ...counts,
+    shown,
+    engineServers: atLiveEdge ? card.engineServers : [],
+    residents: atLiveEdge ? card.residents : null,
+  });
   if (!runsHash) {
     return (
       <div className="runs" title={line.title}>
