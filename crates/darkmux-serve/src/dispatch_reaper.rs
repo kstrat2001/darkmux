@@ -35,7 +35,8 @@ pub(crate) fn tick_lines(
         ReapTick::ListingUnavailable if *docker_warned => Vec::new(),
         ReapTick::ListingUnavailable => {
             *docker_warned = true;
-            vec![idle_line(darkmux_sandbox::backend().kind())]
+            let kinds: Vec<_> = darkmux_sandbox::available_backends().iter().map(|b| b.kind()).collect();
+            vec![idle_line(&kinds)]
         }
         ReapTick::Listed { reaped } => {
             *docker_warned = false;
@@ -53,14 +54,14 @@ pub(crate) fn tick_lines(
     }
 }
 
-/// (#3112) The line for a listing that did not answer, naming the sandbox
-/// it asked (`kind`, the configured one).
-fn idle_line(kind: darkmux_sandbox::BackendKind) -> String {
-    let what = match kind {
-        darkmux_sandbox::BackendKind::Docker => "`docker ps` did not answer (`runtime.sandbox` is `docker`)".to_string(),
-        other => format!("the listing of {} did not answer", darkmux_sandbox::placed_in(other)),
-    };
-    format!("darkmux serve: dispatch reaper idle: {what}")
+/// (#3112) The line for a tick no backend's listing answered, naming the
+/// backends it asked (`kinds`, every one this host runs).
+fn idle_line(kinds: &[darkmux_sandbox::BackendKind]) -> String {
+    if kinds.is_empty() {
+        return "darkmux serve: dispatch reaper idle: this host runs no sandbox backend (no `docker` on PATH, no sandbox-exec)".to_string();
+    }
+    let asked = kinds.iter().map(|k| format!("`{}`", darkmux_sandbox::setting_value(*k))).collect::<Vec<_>>().join(", ");
+    format!("darkmux serve: dispatch reaper idle: no sandbox listing answered (asked {asked})")
 }
 
 /// One production tick: this host's own machine and pid namespace, and this
@@ -247,18 +248,26 @@ mod tests {
                 None => std::env::remove_var("PATH"),
             }
         }
+        // (#3112 review) Seatbelt, where it runs, still answers: nothing to
+        // say. Where nothing runs, one line, then silence.
+        if darkmux_sandbox::SeatbeltBackend::available() {
+            assert!(first.is_empty() && second.is_empty(), "{first:?} {second:?}");
+            return;
+        }
         assert_eq!(first.len(), 1, "{first:?}");
         assert!(second.is_empty(), "{second:?}");
-        // (#3112) The line names the sandbox whose listing did not answer.
-        assert!(first[0].contains("(`runtime.sandbox` is `docker`)"), "{first:?}");
+        assert!(first[0].contains("no sandbox backend"), "{first:?}");
     }
 
-    /// (#3112) Under Seatbelt the idle line names Seatbelt, not docker.
+    /// (#3112) The idle line names every backend the tick asked, or says
+    /// there is none.
     #[test]
-    fn the_idle_line_names_the_configured_sandbox() {
-        let seatbelt = idle_line(darkmux_sandbox::BackendKind::Seatbelt);
-        assert!(seatbelt.contains("the `seatbelt` sandbox (`runtime.sandbox`)") && !seatbelt.contains("docker"), "{seatbelt}");
-        let docker = idle_line(darkmux_sandbox::BackendKind::Docker);
-        assert!(docker.contains("`docker ps` did not answer"), "{docker}");
+    fn the_idle_line_names_the_backends_it_asked() {
+        use darkmux_sandbox::BackendKind;
+        let both = idle_line(&[BackendKind::Docker, BackendKind::Seatbelt]);
+        assert!(both.contains("asked `docker`, `seatbelt`"), "{both}");
+        let seatbelt = idle_line(&[BackendKind::Seatbelt]);
+        assert!(seatbelt.contains("asked `seatbelt`") && !seatbelt.contains("docker"), "{seatbelt}");
+        assert!(idle_line(&[]).contains("no sandbox backend"), "{}", idle_line(&[]));
     }
 }

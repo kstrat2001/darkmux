@@ -1195,6 +1195,9 @@ pub(crate) fn write_resume_origin_meta(
         "workspace": recorded_workspace.display().to_string(),
         "workspace_read_only": workspace_read_only,
         "image": image,
+        // (#3112, resume origin 1.1) The sandbox this dispatch runs in, so a
+        // resume in another one is refused (`resume_sandbox_matches`).
+        "sandbox": darkmux_sandbox::selected().ok().map(darkmux_sandbox::setting_value),
         "execution_id": execution,
     });
     let path = resume_origin_path(host_out);
@@ -1279,6 +1282,38 @@ pub(crate) fn resume_effective_image(
             )
         }
     }
+}
+
+/// (#3112 review) Refuse a resume in another sandbox than its origin's, as
+/// [`resume_effective_image`] refuses another image: a checkpoint written in
+/// a Docker container is not resumed in Seatbelt (or back), where the
+/// workspace, toolchain and paths differ. An origin with no `sandbox` (from
+/// before resume origin 1.1) ran in Docker, the only sandbox then. `current`
+/// is `None` when `runtime.sandbox` is refused, which the runtime image's
+/// resolution refuses next; an unreadable origin defers to the checkpoint
+/// gate, like the image.
+pub(crate) fn resume_sandbox_matches(resume_from: &Path, current: Option<darkmux_sandbox::BackendKind>) -> Result<()> {
+    let Some(current) = current.map(darkmux_sandbox::setting_value) else {
+        return Ok(());
+    };
+    let origin = read_resume_origin(resume_from)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+    let Some(origin) = origin else {
+        return Ok(());
+    };
+    let docker = darkmux_sandbox::setting_value(darkmux_sandbox::BackendKind::Docker);
+    let recorded = origin.get("sandbox").and_then(|v| v.as_str()).unwrap_or(docker);
+    if recorded == current {
+        return Ok(());
+    }
+    bail_resume!(
+        "darkmux dispatch: RESUME SANDBOX MISMATCH — the checkpoint at {} was written in the `{recorded}` sandbox, \
+         but this machine's `{key}` is `{current}`; refusing to resume into a different environment \
+         (`darkmux config set {key} {recorded}` to resume it where it ran)",
+        resume_from.join(CHECKPOINT_FILENAME).display(),
+        key = darkmux_sandbox::SANDBOX_KEY,
+    )
 }
 
 /// A dispatch's own identity at start: its host-only resume-origin record and
@@ -1472,6 +1507,7 @@ fn resume_preflight(resume_from: Option<&Path>, image: Option<&str>) -> Result<(
         return Ok((image.map(str::to_string), ExecutionLock { _guards: Vec::new() }));
     };
     let image = resume_effective_image(resume_from, image).context("darkmux dispatch --resume-from")?;
+    resume_sandbox_matches(resume_from, darkmux_sandbox::selected().ok()).context("darkmux dispatch --resume-from")?;
     let lock = claim_resume_origin(resume_from).context("darkmux dispatch --resume-from")?;
     Ok((image, lock))
 }
@@ -1973,7 +2009,8 @@ fn extract_runtime_binary_to(source_image: &str, tmp: &Path) -> Result<()> {
     })?;
     let cp = darkmux_sandbox::DockerBackend::copy_out(&cid, "/usr/local/bin/darkmux-runtime", tmp_str).output();
     // Best-effort cleanup of the throwaway container regardless of cp result.
-    let _ = darkmux_sandbox::backend().remove(&sandbox_named(&cid)).output();
+    let made = darkmux_sandbox::SandboxHandle { backend: darkmux_sandbox::BackendKind::Docker, id: cid.clone() };
+    let _ = darkmux_sandbox::for_handle(&made).remove(&made).output();
     let cp = cp.context("docker cp (extracting the runtime binary)")?;
     if !cp.status.success() {
         let _ = fs::remove_file(tmp);
@@ -2585,7 +2622,7 @@ impl DockerRunConfig {
 /// The argv is a rendering for tests and records; the dispatch spawns the
 /// backend's own `Command` (`container_command`), never one rebuilt from it.
 pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
-    let (cmd, _) = darkmux_sandbox::backend().run(&dispatch_policy(config));
+    let (cmd, _) = darkmux_sandbox::SandboxBackend::run(&darkmux_sandbox::DockerBackend, &dispatch_policy(config));
     std::iter::once(cmd.get_program())
         .chain(cmd.get_args())
         .map(|a| a.to_string_lossy().into_owned())
@@ -2612,7 +2649,7 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
 /// - `host.docker.internal` where the platform says the engine lacks it,
 ///   and the resolved container user (#3275).
 pub fn dispatch_policy(config: &DockerRunConfig) -> SandboxPolicy {
-    dispatch_policy_for(config, darkmux_sandbox::backend())
+    dispatch_policy_for(config, &darkmux_sandbox::DockerBackend)
 }
 
 /// [`dispatch_policy`] for `backend`: every in-sandbox path is where it
@@ -2904,13 +2941,20 @@ pub(crate) fn agentic_brain_flags(
 /// whose sandbox shares this host's loopback (Seatbelt runs on the host
 /// itself), else [`loopback_to_docker_host`].
 fn url_for_sandbox(url: &str) -> String {
-    url_for(url, darkmux_sandbox::backend().kind())
+    // A refused selection refuses the dispatch before any sandbox starts
+    // (`resolve_runtime_image`), so this URL is then never dialed: it is
+    // left as written.
+    match darkmux_sandbox::selected() {
+        Ok(kind) => url_for(url, kind),
+        Err(_) => url.to_string(),
+    }
 }
 
 fn url_for(url: &str, kind: darkmux_sandbox::BackendKind) -> String {
-    match kind {
-        darkmux_sandbox::BackendKind::Seatbelt => url.to_string(),
-        darkmux_sandbox::BackendKind::Docker => loopback_to_docker_host(url),
+    if kind.on_host() {
+        url.to_string()
+    } else {
+        loopback_to_docker_host(url)
     }
 }
 
@@ -5369,12 +5413,22 @@ impl Drop for StopFlagGuard {
 /// nowhere left to report it to at a teardown point, and the caller
 /// (`dispatch`) still returns its own real error either way.
 fn docker_kill_by_name(container_name: &str) {
-    let _ = darkmux_sandbox::backend().kill(&sandbox_named(container_name)).output();
+    if let Some(backend) = dispatch_sandbox() {
+        let _ = backend.kill(&sandbox_named(backend, container_name)).output();
+    }
 }
 
-/// (#3112) A dispatch container's sandbox handle, by its name.
-fn sandbox_named(container_name: &str) -> darkmux_sandbox::SandboxHandle {
-    darkmux_sandbox::SandboxHandle { backend: darkmux_sandbox::backend().kind(), id: container_name.to_string() }
+/// (#3112 review) The backend this process's dispatches started their
+/// sandboxes in. `None` when `runtime.sandbox` is refused: then no dispatch
+/// started one (`resolve_runtime_image` refuses it before any sandbox), so
+/// there is nothing to stop, and no stop falls back to Docker.
+fn dispatch_sandbox() -> Option<&'static dyn darkmux_sandbox::SandboxBackend> {
+    darkmux_sandbox::backend().ok()
+}
+
+/// (#3112) A dispatch's sandbox handle in `backend`, by its name.
+fn sandbox_named(backend: &dyn darkmux_sandbox::SandboxBackend, container_name: &str) -> darkmux_sandbox::SandboxHandle {
+    darkmux_sandbox::SandboxHandle { backend: backend.kind(), id: container_name.to_string() }
 }
 
 /// (#2925) A stop that ends ONE dispatch: the budget pacer saw this run's
@@ -5423,10 +5477,9 @@ impl DispatchStop {
     /// Stop this dispatch's container, and only it. A failed `docker kill`
     /// hands the container to the watchdog's retried kill at once.
     fn kill_container(&self) {
-        let killed = darkmux_sandbox::backend()
-            .kill(&sandbox_named(&self.container_name))
-            .output()
-            .is_ok_and(|o| o.status.success());
+        let killed = dispatch_sandbox().is_some_and(|backend| {
+            backend.kill(&sandbox_named(backend, &self.container_name)).output().is_ok_and(|o| o.status.success())
+        });
         if !killed {
             self.watchdog_handoff.store(true, Ordering::SeqCst);
         }
@@ -5769,7 +5822,9 @@ fn probe_container_liveness(container_name: &str) -> Liveness {
     // listing: a stopped container would read as alive, and a prefix would
     // match every container whose name merely STARTS with this one's.
     // (#2232, #3552)
-    let backend = darkmux_sandbox::backend();
+    let Some(backend) = dispatch_sandbox() else {
+        return Liveness::Unknown;
+    };
     let running = darkmux_sandbox::Query {
         having: darkmux_sandbox::Having::Name(container_name.to_string()),
         stopped_too: false,
@@ -5828,8 +5883,13 @@ fn kill_container_persistently(container_name: &str, base_backoff: Duration) -> 
     let mut probe_inconclusive = false;
     for attempt in 1..=CONTAINER_KILL_MAX_ATTEMPTS {
         let killing = attempt <= CONTAINER_KILL_ESCALATE_AFTER;
-        let backend = darkmux_sandbox::backend();
-        let sandbox = sandbox_named(container_name);
+        let Some(backend) = dispatch_sandbox() else {
+            // Fail closed: nothing proves the sandbox gone.
+            last_error = "runtime.sandbox is refused, so no backend can be asked".to_string();
+            probe_inconclusive = true;
+            continue;
+        };
+        let sandbox = sandbox_named(backend, container_name);
         let (verb, mut cmd) =
             if killing { ("kill", backend.kill(&sandbox)) } else { ("rm -f", backend.remove(&sandbox)) };
         match cmd.output() {
@@ -7079,7 +7139,7 @@ fn host_runtime_image(image_arg: Option<&str>) -> Result<RuntimeImage> {
 /// Resolve and check the runtime image, then say which one runs.
 fn resolve_runtime_image(image_arg: Option<&str>, skip_preflight: bool) -> Result<RuntimeImage> {
     // (#3112 step 2) A refused backend setting refuses the dispatch (contract 9).
-    if darkmux_sandbox::selected().map_err(|why| anyhow!(why))? == darkmux_sandbox::BackendKind::Seatbelt {
+    if darkmux_sandbox::selected().map_err(|why| anyhow!(why))?.on_host() {
         return host_runtime_image(image_arg);
     }
     // (#703) `inject` is true only when the operator named a NON-darkmux image
@@ -8421,7 +8481,8 @@ fn spawn_container(argv_config: &DockerRunConfig, max_turns_override: Option<u32
     // interpretation; this rejects malformed refs (leading `-`, whitespace,
     // control chars) so the contract is explicit, not just fence-dependent.
     preflight_docker_config(argv_config)?;
-    let mut cmd = container_command(argv_config, darkmux_sandbox::backend());
+    let backend = darkmux_sandbox::backend().map_err(|why| anyhow!(why))?;
+    let mut cmd = container_command(argv_config, backend);
 
     // TODO (#839): Network hardening — the runtime must reach host LMStudio
     // via `host.docker.internal`. Constraining networking (e.g. `--network none`

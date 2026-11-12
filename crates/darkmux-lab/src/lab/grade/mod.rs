@@ -582,7 +582,7 @@ fn run_suite_in(runner: &Runner, spec: &SuiteGrade, root: &Path, dir: &Path) -> 
         name_prefix: "darkmux-grade",
     };
     let ran = contained_command::run(&runner.placement, &run, Duration::from_secs(seconds))
-        .map_err(|why| anyhow!("the suite did not run in its container: {why}"))?;
+        .map_err(|why| anyhow!("the suite did not run in {}: {why}", darkmux_sandbox::placed_in_configured()))?;
     let outcome = match ran {
         Bounded::Finished { code, .. } => SuiteOutcome::Exited { code },
         Bounded::TimedOut { seconds } => SuiteOutcome::TimedOut { seconds },

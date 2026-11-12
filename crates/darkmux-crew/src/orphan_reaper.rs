@@ -257,8 +257,8 @@ pub enum ReapTick {
     /// The listing answered; each orphan found, with whether its kill
     /// succeeded.
     Listed { reaped: Vec<(Orphan, bool)> },
-    /// The configured sandbox's listing did not answer (under Docker: no
-    /// docker, a stopped daemon; any backend: a timeout).
+    /// No backend's listing answered (no docker or a stopped daemon, no
+    /// `sandbox-exec`, a timeout).
     ListingUnavailable,
 }
 
@@ -274,31 +274,27 @@ pub fn reap_tick_named(
     local: Option<&LocalHost>,
     liveness: impl Fn(u32) -> HostLiveness,
 ) -> ReapTick {
-    let backend = darkmux_sandbox::backend();
+    // (#3112 review) Every backend this host runs, not only the configured
+    // one: a sandbox made before `runtime.sandbox` (or its default) changed
+    // is still this host's to reap, in the backend that made it.
     let query = host_query(prefix);
-    let stdout = match run_bounded(backend.list(&query), DOCKER_CALL_BOUND) {
-        Bounded::Finished {
-            success: true,
-            stdout,
-            ..
-        } => stdout,
-        _ => return ReapTick::ListingUnavailable,
-    };
-    let listed = listed_containers(backend.parse_list(&query, &String::from_utf8_lossy(&stdout)));
-    let reaped = orphaned_containers_named(&listed, prefix, local, liveness)
-        .into_iter()
-        .map(|orphan| {
-            let handle = SandboxHandle {
-                backend: backend.kind(),
-                id: orphan.name.clone(),
-            };
-            let ok = matches!(
-                run_bounded(backend.kill(&handle), DOCKER_CALL_BOUND),
-                Bounded::Finished { success: true, .. }
-            );
-            (orphan, ok)
-        })
-        .collect();
+    let mut answered = false;
+    let mut reaped = Vec::new();
+    for backend in darkmux_sandbox::available_backends() {
+        let Bounded::Finished { success: true, stdout, .. } = run_bounded(backend.list(&query), DOCKER_CALL_BOUND) else {
+            continue;
+        };
+        answered = true;
+        let listed = listed_containers(backend.parse_list(&query, &String::from_utf8_lossy(&stdout)));
+        for orphan in orphaned_containers_named(&listed, prefix, local, &liveness) {
+            let handle = SandboxHandle { backend: backend.kind(), id: orphan.name.clone() };
+            let ok = matches!(run_bounded(backend.kill(&handle), DOCKER_CALL_BOUND), Bounded::Finished { success: true, .. });
+            reaped.push((orphan, ok));
+        }
+    }
+    if !answered {
+        return ReapTick::ListingUnavailable;
+    }
     ReapTick::Listed { reaped }
 }
 

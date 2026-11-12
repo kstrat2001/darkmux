@@ -194,7 +194,7 @@ impl StepKind for ModsGateStepKind {
         let test_command = non_blank(cfg.test_command);
         let test_command = test_command.as_deref();
         let workdir = cfg.workdir.as_deref();
-        let placement = gate_placement(non_blank(cfg.gate_image).as_deref(), cfg.gate_on_host.is_some_and(|f| f.0));
+        let placement = configured_gate_placement(non_blank(cfg.gate_image).as_deref(), cfg.gate_on_host.is_some_and(|f| f.0));
 
         let root = mods::mods_dir();
         let all = mods::load_all_at(&root).context("loading the mod store")?;
@@ -469,16 +469,18 @@ fn run_gate_command(placement: &GatePlacement, command: &str, scratch_checkout: 
 }
 
 /// (#3112) Why the gate never ran test_command, naming the sandbox it was to
-/// run in (`kind`, the configured one); Docker's likely causes only under
-/// Docker.
-fn not_run_reason(why: &str, kind: darkmux_sandbox::BackendKind) -> String {
-    let causes = match kind {
-        darkmux_sandbox::BackendKind::Docker => {
-            ": the `gate_image` may be missing, Docker may be down, or the scratch copy was not mounted (a remote Docker daemon)"
-        }
-        _ => "",
-    };
-    format!("the gate did not run test_command in {} ({why}){causes}", darkmux_sandbox::placed_in(kind))
+/// run in (`kind`, the configured one; `None` when `runtime.sandbox` is
+/// refused, which `why` names); Docker's likely causes only under Docker.
+fn not_run_reason(why: &str, kind: Option<darkmux_sandbox::BackendKind>) -> String {
+    match kind {
+        Some(darkmux_sandbox::BackendKind::Docker) => format!(
+            "the gate did not run test_command in {} ({why}): the `gate_image` may be missing, Docker may be down, \
+             or the scratch copy was not mounted (a remote Docker daemon)",
+            darkmux_sandbox::placed_in(darkmux_sandbox::BackendKind::Docker)
+        ),
+        Some(other) => format!("the gate did not run test_command in {} ({why})", darkmux_sandbox::placed_in(other)),
+        None => format!("the gate did not run test_command ({why})"),
+    }
 }
 
 /// What one gate run means. (#2973 review) A container that never ran the
@@ -494,7 +496,7 @@ fn gate_result(
     use crate::bounded_command::Bounded;
     let ran = match ran {
         Ok(ran) => ran,
-        Err(why) => return (None, Some(not_run_reason(&why.to_string(), darkmux_sandbox::backend().kind()))),
+        Err(why) => return (None, Some(not_run_reason(&why.to_string(), darkmux_sandbox::selected().ok()))),
     };
     match ran {
         Bounded::Finished { success, code, .. } => (
@@ -527,19 +529,62 @@ enum GatePlacement {
     Host,
 }
 
-/// (#2973) The placement a gate config chose, or why it is refused.
-fn gate_placement(image: Option<&str>, on_host: bool) -> Result<GatePlacement, String> {
-    match (image, on_host) {
-        (Some(_), true) => Err("set `gate_image` or `gate_on_host`, not both: one decides where the gate runs".to_string()),
-        // (#3177 review) The dispatch path's own image-ref check: empty, a
-        // leading `-`, whitespace or control characters are refused.
-        (Some(image), false) => crate::dispatch_internal::validate_image_ref(image)
+/// (#2973) The placement a gate config chose, or why it is refused. (#3112)
+/// `sandbox` is the configured one: only Docker needs `gate_image`; a
+/// Seatbelt sandbox runs this machine's toolchain (an image named for it is
+/// not used, and [`gate_image_note`] says so).
+fn gate_placement(
+    image: Option<&str>,
+    on_host: bool,
+    sandbox: Result<darkmux_sandbox::BackendKind, String>,
+) -> Result<GatePlacement, String> {
+    match (image, on_host, sandbox) {
+        (Some(_), true, _) => Err("set `gate_image` or `gate_on_host`, not both: one decides where the gate runs".to_string()),
+        (None, true, _) => Ok(GatePlacement::Host),
+        (_, false, Err(why)) => Err(format!("no sandbox can run the gate: {why}")),
+        (image, false, Ok(darkmux_sandbox::BackendKind::Docker)) => docker_gate_placement(image),
+        (Some(image), false, Ok(_)) => crate::dispatch_internal::validate_image_ref(image)
             .map(|()| GatePlacement::Container(image.to_string()))
             .map_err(|e| format!("`gate_image`: {e}")),
-        (None, true) => Ok(GatePlacement::Host),
-        (None, false) => Err("test_command runs model-written code, so the gate needs a place to run it: set \
-            `gate_image` to an image with the project's toolchain (it runs there with no network and only the \
-            patched copy mounted), or `gate_on_host: true` to run it on this machine as the darkmux user"
+        (None, false, Ok(_)) => Ok(GatePlacement::Container("host".to_string())),
+    }
+}
+
+/// [`gate_placement`] under the configured sandbox, saying on stderr when
+/// it does not use the `gate_image` named ([`gate_image_note`]).
+fn configured_gate_placement(image: Option<&str>, on_host: bool) -> Result<GatePlacement, String> {
+    if let Some(note) = gate_image_note(image.filter(|_| !on_host), darkmux_sandbox::selected()) {
+        eprintln!("{note}");
+    }
+    gate_placement(image, on_host, darkmux_sandbox::selected())
+}
+
+/// (#3112 review) The note for a `gate_image` the configured sandbox does
+/// not use, or `None`.
+fn gate_image_note(image: Option<&str>, sandbox: Result<darkmux_sandbox::BackendKind, String>) -> Option<String> {
+    let image = image?;
+    match sandbox {
+        Ok(darkmux_sandbox::BackendKind::Docker) | Err(_) => None,
+        Ok(other) => Some(format!(
+            "mods.gate: `gate_image` `{image}` is not used: the `{}` sandbox runs this machine's own toolchain; \
+             to run the gate in it, `darkmux config set runtime.sandbox docker`",
+            darkmux_sandbox::setting_value(other)
+        )),
+    }
+}
+
+/// Under Docker: `gate_image` or `gate_on_host` decides.
+fn docker_gate_placement(image: Option<&str>) -> Result<GatePlacement, String> {
+    match image {
+        // (#3177 review) The dispatch path's own image-ref check: empty, a
+        // leading `-`, whitespace or control characters are refused.
+        Some(image) => crate::dispatch_internal::validate_image_ref(image)
+            .map(|()| GatePlacement::Container(image.to_string()))
+            .map_err(|e| format!("`gate_image`: {e}")),
+        None => Err("test_command runs model-written code, so the gate needs a place to run it, and \
+            `runtime.sandbox` is `docker`, which needs an image: set `gate_image` to an image with the project's \
+            toolchain (it runs there with no network and only the patched copy mounted), or `gate_on_host: true` \
+            to run it on this machine as the darkmux user"
             .to_string()),
     }
 }
@@ -758,16 +803,35 @@ mod tests {
     /// (or both) is refused with the fix named.
     #[test]
     fn the_gate_runs_in_a_container_unless_the_host_is_chosen_explicitly() {
+        let gate_placement = |image, on_host| gate_placement(image, on_host, Ok(darkmux_sandbox::BackendKind::Docker));
         assert_eq!(gate_placement(Some("rust:1-slim"), false), Ok(GatePlacement::Container("rust:1-slim".into())));
         assert_eq!(gate_placement(None, true), Ok(GatePlacement::Host));
         let neither = gate_placement(None, false).unwrap_err();
         assert!(neither.contains("gate_image") && neither.contains("gate_on_host"), "{neither}");
+        assert!(neither.contains("`runtime.sandbox` is `docker`"), "the image is Docker's need: {neither}");
         let both = gate_placement(Some("rust:1-slim"), true).unwrap_err();
         assert!(both.contains("not both"), "{both}");
         assert!(gate_placement(Some("--privileged"), false).unwrap_err().contains("`--privileged`"));
         for bad in ["rust:1 slim", "rust:1\nslim", "rust\u{7}"] {
             assert!(gate_placement(Some(bad), false).unwrap_err().starts_with("`gate_image`:"), "{bad:?}");
         }
+    }
+
+    /// (#3112 review) Under Seatbelt the gate needs no image: it runs in the
+    /// sandbox on this machine's toolchain. A `gate_image` it cannot use is
+    /// named, never silently dropped. A refused sandbox refuses the gate.
+    #[test]
+    fn under_seatbelt_the_gate_needs_no_image_and_names_one_it_cannot_use() {
+        use darkmux_sandbox::BackendKind;
+        assert_eq!(gate_placement(None, false, Ok(BackendKind::Seatbelt)), Ok(GatePlacement::Container("host".into())));
+        assert_eq!(gate_placement(Some("rust:1-slim"), false, Ok(BackendKind::Seatbelt)), Ok(GatePlacement::Container("rust:1-slim".into())));
+        let note = gate_image_note(Some("rust:1-slim"), Ok(BackendKind::Seatbelt)).expect("named");
+        assert!(note.contains("`rust:1-slim`") && note.contains("darkmux config set runtime.sandbox docker"), "{note}");
+        assert_eq!(gate_image_note(Some("rust:1-slim"), Ok(BackendKind::Docker)), None);
+        assert_eq!(gate_image_note(None, Ok(BackendKind::Seatbelt)), None);
+        let refused = gate_placement(None, false, Err("`x` is not a valid sandbox".into())).unwrap_err();
+        assert!(refused.contains("`x` is not a valid sandbox"), "{refused}");
+        assert_eq!(gate_placement(None, true, Err("x".into())), Ok(GatePlacement::Host), "the host needs no sandbox");
     }
 
     /// The container sees the patched scratch copy and nothing else: no
@@ -880,15 +944,42 @@ mod tests {
         assert!(own.is_some_and(|o| !o.passed && o.exit_code == Some(125)), "the command's own exit 125 fails the kit");
     }
 
+    /// (#3112 review) A refused `runtime.sandbox` is a named skip that says
+    /// why, never a gate run in Docker by default (an empty `PATH` makes any
+    /// Docker attempt a spawn failure instead).
+    #[test]
+    #[serial_test::serial]
+    fn a_refused_sandbox_skips_the_gate_naming_why() {
+        darkmux_types::run_in_own_process!();
+        let root = tempfile::TempDir::new().unwrap();
+        let checkout = root.path().join("tree");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let empty = tempfile::TempDir::new().unwrap();
+        let (prev_path, prev_sb) = (std::env::var_os("PATH"), std::env::var_os("DARKMUX_SANDBOX"));
+        unsafe {
+            std::env::set_var("PATH", empty.path());
+            std::env::set_var("DARKMUX_SANDBOX", "podman");
+        }
+        let (outcome, reason) = run_gate_command(&GatePlacement::Container("rust:1-slim".into()), "true", &checkout);
+        unsafe {
+            match prev_path { Some(v) => std::env::set_var("PATH", v), None => std::env::remove_var("PATH") }
+            match prev_sb { Some(v) => std::env::set_var("DARKMUX_SANDBOX", v), None => std::env::remove_var("DARKMUX_SANDBOX") }
+        }
+        assert!(outcome.is_none(), "{outcome:?}");
+        let reason = reason.unwrap_or_default();
+        assert!(reason.contains("podman") && reason.contains("runtime.sandbox"), "{reason}");
+        assert!(!reason.contains("Docker may be down"), "{reason}");
+    }
+
     /// (#3112) A gate that never ran names the configured sandbox; Docker's
     /// causes are named only under Docker.
     #[test]
     fn a_gate_that_never_ran_names_the_configured_sandbox() {
         use darkmux_sandbox::BackendKind;
-        let docker = not_run_reason("no image", BackendKind::Docker);
+        let docker = not_run_reason("no image", Some(BackendKind::Docker));
         assert!(docker.contains("a Docker container (`runtime.sandbox` is `docker`)"), "{docker}");
         assert!(docker.contains("Docker may be down"), "{docker}");
-        let seatbelt = not_run_reason("sandbox-exec: no such file", BackendKind::Seatbelt);
+        let seatbelt = not_run_reason("sandbox-exec: no such file", Some(BackendKind::Seatbelt));
         assert!(seatbelt.contains("the `seatbelt` sandbox (`runtime.sandbox`)"), "{seatbelt}");
         assert!(!seatbelt.contains("Docker") && !seatbelt.contains("gate_image"), "{seatbelt}");
         assert!(seatbelt.contains("sandbox-exec: no such file"), "{seatbelt}");
@@ -939,7 +1030,7 @@ mod tests {
     #[test]
     fn a_test_command_with_no_placement_runs_nothing_and_says_why() {
         let m = a_mod_kit("mod-refused", "refused/1", "--- a/x\n+++ b/x\n", Some("unified-diff"));
-        let (outcome, reason) = gate_one_mod(&m, "touch /tmp/should-not-run", Some("/nonexistent"), &gate_placement(None, false));
+        let (outcome, reason) = gate_one_mod(&m, "touch /tmp/should-not-run", Some("/nonexistent"), &gate_placement(None, false, Ok(darkmux_sandbox::BackendKind::Docker)));
         assert!(outcome.is_none());
         assert!(reason.unwrap().contains("gate_image"), "the skip names the fix");
     }

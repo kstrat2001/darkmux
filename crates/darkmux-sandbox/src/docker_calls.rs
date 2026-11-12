@@ -127,12 +127,41 @@ fn docker_calls(root: &Path) -> BTreeMap<String, usize> {
             continue;
         }
         let text = std::fs::read_to_string(&file).unwrap_or_default();
-        let n = production_lines(&text).iter().filter(|l| spells_the_program(l)).count();
+        let n = count_in(&rel, &text);
         if n > 0 {
             calls.insert(rel, n);
         }
     }
     calls
+}
+
+/// The one file whose `config_enum!` rows may name a setting's value that
+/// happens to spell the program (`runtime.sandbox`'s `docker`).
+const SETTINGS_FILE: &str = "crates/darkmux-types/src/config.rs";
+
+/// Production lines of `text` (the file at workspace path `rel`) spelling
+/// the program. A token row is exempt only inside a `config_enum!`
+/// invocation in [`SETTINGS_FILE`].
+fn count_in(rel: &str, text: &str) -> usize {
+    let mut in_enum = false;
+    let mut n = 0;
+    for line in production_lines(text) {
+        in_enum |= rel == SETTINGS_FILE && opens_config_enum(line);
+        let exempt = in_enum && !spells_the_program(line);
+        n += usize::from(line.contains(LITERAL) && !exempt);
+        in_enum &= !closes_config_enum(line);
+    }
+    n
+}
+
+fn opens_config_enum(line: &str) -> bool {
+    line.trim_start().starts_with("crate::config_enum!(")
+}
+
+/// The invocation's last line: `]);`, or a `], retired: [...]);` tail.
+fn closes_config_enum(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("]);") || (t.starts_with("], retired:") && t.ends_with(");"))
 }
 
 /// Whether `line` spells the program: it holds the literal, and is not a
@@ -289,6 +318,25 @@ fn a_settings_token_row_is_not_a_program_spelling() {
     assert!(spells_the_program("    let docker = \"docker\";"));
     assert!(spells_the_program("    Command::new(\"docker\")"));
     assert!(spells_the_program("    X = \"docker\" => Command::new(\"docker\"),"));
+}
+
+/// (#3112 review) The token-row exemption holds only inside a
+/// `config_enum!` invocation in the file that registers settings: the same
+/// row shape anywhere else (a `macro_rules!` arm, another file) still
+/// counts, so it cannot carry a real program spelling.
+#[test]
+fn the_token_row_exemption_holds_only_in_a_config_enum_in_the_settings_file() {
+    let row = "    Docker = \"docker\" => \"a Docker container\",";
+    let in_enum = format!("crate::config_enum!(SandboxKind, \"sandbox\", [\n{row}\n]);\n");
+    assert_eq!(count_in(SETTINGS_FILE, &in_enum), 0);
+    let smuggled = "macro_rules! m { ($x:ident) => {} }\n    Smuggled = \"docker\" => \"x\",\n";
+    assert_eq!(count_in("crates/x/src/lib.rs", smuggled), 1);
+    assert_eq!(count_in(SETTINGS_FILE, smuggled), 1, "outside a config_enum! it counts");
+    assert_eq!(count_in("crates/x/src/lib.rs", &in_enum), 1, "another file's config_enum! counts");
+    let after = format!("{in_enum}fn f() {{ Command::new(\"docker\"); }}\n");
+    assert_eq!(count_in(SETTINGS_FILE, &after), 1, "the exemption ends with the invocation");
+    let row_after = format!("{in_enum}{row}\n");
+    assert_eq!(count_in(SETTINGS_FILE, &row_after), 1, "a token row after the invocation counts");
 }
 
 /// The walk sees production files only, in every Rust tree the repo builds

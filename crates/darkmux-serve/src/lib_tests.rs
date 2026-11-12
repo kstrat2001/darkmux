@@ -2574,6 +2574,25 @@
         assert!(proxied["sandbox"].is_null(), "{proxied}");
     }
 
+    /// (#3112 review) A daemon's children re-read `config.json`, which can
+    /// change while it runs; the daemon pins its own sandbox into its
+    /// environment at start, so every process it starts uses the sandbox
+    /// `/health` reports. An operator's own `DARKMUX_SANDBOX` is left alone,
+    /// and a refused selection pins nothing (every start refuses it).
+    #[test]
+    fn the_daemon_pins_its_sandbox_for_the_processes_it_starts() {
+        use darkmux_sandbox::BackendKind;
+        assert_eq!(crate::sandbox_pin(None, Ok(BackendKind::Seatbelt)), Some("seatbelt"));
+        assert_eq!(crate::sandbox_pin(None, Ok(BackendKind::Docker)), Some("docker"));
+        assert_eq!(crate::sandbox_pin(Some("docker"), Ok(BackendKind::Docker)), None, "already set");
+        assert_eq!(crate::sandbox_pin(None, Err("bad".into())), None);
+        // `run` pins it before anything starts.
+        let src = include_str!("lib.rs");
+        let run = &src[src.find("pub fn run(port: u16").unwrap()..];
+        let run = &run[..run.find("rt.block_on").unwrap()];
+        assert!(run.contains("pin_sandbox_for_children();"), "run() must pin the sandbox before serving");
+    }
+
     /// (#3112) A daemon whose sandbox is Seatbelt needs no docker: `/health`
     /// says which sandbox it runs, and does not answer `docker_on_path`.
     #[tokio::test]

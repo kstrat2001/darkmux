@@ -94,7 +94,7 @@ pub fn cmd_register(
             .map(|c| !c.trim().is_empty())
             .unwrap_or(false)
         {
-            msg.push_str(verify_command_note(darkmux_types::config_access::tests_on_host()));
+            msg.push_str(&verify_command_note(darkmux_types::config_access::tests_on_host(), darkmux_sandbox::selected().ok()));
         }
     }
 
@@ -102,15 +102,19 @@ pub fn cmd_register(
 }
 
 /// (#906) What register says about a fixture's verify command, by where it
-/// will run.
-fn verify_command_note(on_host: bool) -> &'static str {
+/// will run: on the host, or (#3112) in the configured sandbox (`sandbox`;
+/// `None` when `runtime.sandbox` is refused).
+fn verify_command_note(on_host: bool, sandbox: Option<darkmux_sandbox::BackendKind>) -> String {
     if on_host {
-        "\n\n  ⚠ This fixture declares a verify_command. `runtime.tests_on_host` is on, so it runs\n    \
+        return "\n\n  ⚠ This fixture declares a verify_command. `runtime.tests_on_host` is on, so it runs\n    \
          on this machine with your privileges. Only register fixtures whose verify_command you trust."
-    } else {
-        "\n\n  This fixture declares a verify_command. It runs in a container with no network\n    \
-         and only the run's sandbox mounted (`runtime.tests_on_host` would put it on this machine)."
+            .to_string();
     }
+    let place = sandbox.map_or("its sandbox".to_string(), darkmux_sandbox::placed_in);
+    format!(
+        "\n\n  This fixture declares a verify_command. It runs in {place}, with no network\n    \
+         and only the run's tree writable (`runtime.tests_on_host` would put it on this machine)."
+    )
 }
 
 /// `dm lab fixture unregister <name>` — remove pointer from registry.
@@ -204,9 +208,14 @@ mod tests {
     /// warning about your privileges only when it really runs on the host.
     #[test]
     fn the_verify_command_note_names_where_it_runs() {
-        assert!(super::verify_command_note(true).contains("with your privileges"));
-        let contained = super::verify_command_note(false);
-        assert!(contained.contains("container") && !contained.contains("your privileges"), "{contained}");
+        use darkmux_sandbox::BackendKind;
+        assert!(super::verify_command_note(true, Some(BackendKind::Docker)).contains("with your privileges"));
+        let contained = super::verify_command_note(false, Some(BackendKind::Docker));
+        assert!(contained.contains("a Docker container") && !contained.contains("your privileges"), "{contained}");
+        // (#3112 review) It names the sandbox it runs in: a container only
+        // under Docker.
+        let seatbelt = super::verify_command_note(false, Some(BackendKind::Seatbelt));
+        assert!(seatbelt.contains("the `seatbelt` sandbox") && !seatbelt.contains("container"), "{seatbelt}");
     }
 
     /// (5.0) The console's lab-fixture-list panel, for a viewer that is not

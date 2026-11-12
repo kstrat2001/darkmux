@@ -908,6 +908,7 @@ dependencies = [
  "darkmux-types",
  "serde",
  "serde_json",
+ "serial_test",
  "tempfile",
 ]
 

@@ -16,6 +16,13 @@ impl Platform for LinuxPlatform {
         ContainerHostAccess::HostGateway
     }
 
+    /// Docker, for now. The seam for a sandbox that needs nothing installed
+    /// here (Landlock, #3112's Linux step): a `DefaultSandbox` variant for
+    /// it, answered here once its backend passes the conformance suite.
+    fn default_sandbox(&self) -> DefaultSandbox {
+        DefaultSandbox::Docker
+    }
+
     /// Docker Engine keeps the host's ownership on bind mounts, and darkmux
     /// creates the workspace and out dirs private (0700) to the host user, so
     /// the container runs as that user. The runtime image's own user (uid
@@ -25,13 +32,6 @@ impl Platform for LinuxPlatform {
     /// Assumes rootful Docker Engine. Under rootless Docker, rootless Podman
     /// or Docker Desktop for Linux, the container's uid 0 is the host user, so
     /// `runtime.container_user = "0:0"` is the setting there (#3276 review).
-    /// Docker, for now. The seam for a sandbox that needs nothing installed
-    /// here (Landlock, #3112's Linux step): a `DefaultSandbox` variant for
-    /// it, answered here once its backend passes the conformance suite.
-    fn default_sandbox(&self) -> DefaultSandbox {
-        DefaultSandbox::Docker
-    }
-
     fn container_user(&self) -> ContainerUser {
         host_ids()
             .map(|(uid, gid)| ContainerUser::Host {

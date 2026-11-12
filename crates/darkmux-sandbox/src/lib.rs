@@ -111,6 +111,19 @@ pub enum BackendKind {
     Seatbelt,
 }
 
+impl BackendKind {
+    /// Whether this backend's sandbox is a process on this host itself
+    /// (Seatbelt; Landlock later, #3556), not a container: it shares the
+    /// host's loopback, toolchain and user, and has no image. Ask this, not
+    /// which backend it is, wherever that is the question.
+    pub fn on_host(self) -> bool {
+        match self {
+            BackendKind::Docker => false,
+            BackendKind::Seatbelt => true,
+        }
+    }
+}
+
 /// A running (or once-running) sandbox, as a record can store it: which
 /// backend made it, and its id there (a container's name for Docker).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,6 +187,13 @@ pub fn selected() -> Result<BackendKind, String> {
     selected_from(resolved, SeatbeltBackend::available())
 }
 
+/// [`selected`] against `cfg`, a `config.json` read fresh (the env tier
+/// still live), for a process that reads its config per request.
+pub fn selected_in(cfg: &darkmux_types::config::DarkmuxConfig) -> Result<BackendKind, String> {
+    let resolved = darkmux_types::config_access::sandbox_with_source_in(cfg).map_err(|bad| bad.to_string());
+    selected_from(resolved, SeatbeltBackend::available())
+}
+
 fn selected_from(
     resolved: Result<(darkmux_types::config::SandboxKind, darkmux_types::config_access::Source), String>,
     seatbelt_available: bool,
@@ -222,43 +242,94 @@ pub fn placed_in(kind: BackendKind) -> String {
 /// (#3112) Where isolated work runs under the configured sandbox (Docker's
 /// wording when the setting is refused: the entry point already refused it).
 pub fn placed_in_configured() -> String {
-    placed_in(selected().unwrap_or(BackendKind::Docker))
+    match selected() {
+        Ok(kind) => placed_in(kind),
+        Err(_) => format!("the sandbox (`{SANDBOX_KEY}` is refused)"),
+    }
 }
 
 /// (#3112) For a message saying Docker could not run something: why Docker
 /// was needed (the setting that chose it) and, where Seatbelt can run, how
-/// to need no Docker. `None` when the configured sandbox is not Docker: a
-/// Docker remedy never appears under another sandbox.
+/// to need no Docker. `None` unless the configured sandbox is Docker (a
+/// refused setting included): a Docker remedy never appears under another.
 pub fn docker_remedy() -> Option<String> {
+    let (kind, source) = configured_kind()?;
+    docker_remedy_given(kind, source, SeatbeltBackend::available())
+}
+
+/// [`docker_remedy`] without naming the setting, for a message whose
+/// [`placed_in`] already does.
+pub fn docker_needs() -> Option<String> {
+    let (kind, source) = configured_kind()?;
+    docker_needs_given(kind, source, SeatbeltBackend::available())
+}
+
+fn configured_kind() -> Option<(BackendKind, darkmux_types::config_access::Source)> {
+    let kind = selected().ok()?;
     let source = darkmux_types::config_access::sandbox_with_source().map_or(darkmux_types::config_access::Source::BuiltIn, |(_, s)| s);
-    docker_remedy_given(selected().unwrap_or(BackendKind::Docker), source, SeatbeltBackend::available())
+    Some((kind, source))
 }
 
 fn docker_remedy_given(kind: BackendKind, source: darkmux_types::config_access::Source, seatbelt_available: bool) -> Option<String> {
+    let needs = docker_needs_given(kind, source, seatbelt_available)?;
+    let setting = if source == darkmux_types::config_access::Source::Env { SANDBOX_ENV.to_string() } else { format!("`{SANDBOX_KEY}`") };
+    Some(format!("{setting} is `{}`, so {needs}", setting_value(kind)))
+}
+
+fn docker_needs_given(kind: BackendKind, source: darkmux_types::config_access::Source, seatbelt_available: bool) -> Option<String> {
     if kind != BackendKind::Docker {
         return None;
     }
-    let from_env = source == darkmux_types::config_access::Source::Env;
-    let setting = if from_env { SANDBOX_ENV.to_string() } else { format!("`{SANDBOX_KEY}`") };
-    let mut out = format!("{setting} is `{}`, so Docker must be installed and running", setting_value(kind));
+    let mut out = "Docker must be installed and running".to_string();
     if seatbelt_available {
         let seatbelt = setting_value(BackendKind::Seatbelt);
         out.push_str(&format!("; to need no Docker on this Mac, `darkmux config set {SANDBOX_KEY} {seatbelt}`"));
-        if from_env {
+        if source == darkmux_types::config_access::Source::Env {
             out.push_str(&format!(" and unset {SANDBOX_ENV}"));
         }
     }
     Some(out)
 }
 
-/// The backend darkmux runs sandboxes through: the one [`selected`] names.
-/// A refused selection falls back to Docker here; every entry point that
-/// starts a sandbox calls [`selected`] first and refuses it there.
-pub fn backend() -> &'static dyn SandboxBackend {
-    match selected() {
-        Ok(BackendKind::Seatbelt) => &SeatbeltBackend,
-        _ => &DockerBackend,
+/// The backend a NEW sandbox starts through: the one [`selected`] names, or
+/// why there is none (an unregistered value, or Seatbelt without
+/// `sandbox-exec`). A refused selection is an error here, never Docker, so
+/// no caller can start a sandbox in a backend nobody chose. A sandbox that
+/// already exists is reached through its handle ([`for_handle`]).
+pub fn backend() -> Result<&'static dyn SandboxBackend, String> {
+    selected().map(backend_of)
+}
+
+/// The backend of `kind`, for a sandbox already made in it.
+pub fn backend_of(kind: BackendKind) -> &'static dyn SandboxBackend {
+    match kind {
+        BackendKind::Docker => &DockerBackend,
+        BackendKind::Seatbelt => &SeatbeltBackend,
     }
+}
+
+/// The backend that made `handle`'s sandbox: stop, kill and remove it
+/// there, whatever `runtime.sandbox` says now.
+pub fn for_handle(handle: &SandboxHandle) -> &'static dyn SandboxBackend {
+    backend_of(handle.backend)
+}
+
+/// Every backend this host can run (Docker when `docker` is on `PATH`,
+/// Seatbelt where `sandbox-exec` is), for a reaper: a sandbox left from
+/// before the setting (or the default) changed is still found.
+pub fn available_backends() -> Vec<&'static dyn SandboxBackend> {
+    available_given(DockerBackend::on_path(), SeatbeltBackend::available())
+}
+
+fn available_given(docker: bool, seatbelt: bool) -> Vec<&'static dyn SandboxBackend> {
+    let mut out: Vec<&'static dyn SandboxBackend> = Vec::new();
+    if docker {
+        out.push(&DockerBackend);
+    }
+    if seatbelt {
+        out.push(&SeatbeltBackend);
+    }
+    out
 }
 
 /// A way to run a policy. Each method plans a process for the caller to
@@ -360,6 +431,64 @@ mod tests {
         let env = docker_remedy_given(BackendKind::Docker, Source::Env, true).unwrap();
         assert!(env.starts_with("DARKMUX_SANDBOX is `docker`"), "{env}");
         assert!(env.contains("unset DARKMUX_SANDBOX"), "{env}");
+        // (#3112 review) Beside a phrase that already names the setting
+        // (`placed_in`), the remedy does not name it again.
+        let needs = docker_needs_given(BackendKind::Docker, Source::Config, true).unwrap();
+        assert!(needs.starts_with("Docker must be installed and running;") && !needs.contains("is `docker`"), "{needs}");
+        assert_eq!(docker_needs_given(BackendKind::Seatbelt, Source::Config, true), None);
+    }
+
+    /// (#3112 review) Starting a sandbox goes through `backend()`, which
+    /// carries a refused selection as an error: no caller can get Docker by
+    /// accident. An existing sandbox is reached through its own handle's
+    /// backend, whatever is configured now.
+    #[test]
+    #[serial_test::serial]
+    fn a_refused_selection_gives_no_backend_and_a_handle_keeps_its_own() {
+        let prev = std::env::var_os(SANDBOX_ENV);
+        unsafe { std::env::set_var(SANDBOX_ENV, "podman") };
+        let refused = backend().err();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(SANDBOX_ENV, v),
+                None => std::env::remove_var(SANDBOX_ENV),
+            }
+        }
+        let why = refused.expect("a refused selection is an error, never Docker");
+        assert!(why.contains("podman") && why.contains("runtime.sandbox"), "{why}");
+        assert_eq!(backend_of(BackendKind::Seatbelt).kind(), BackendKind::Seatbelt);
+        assert_eq!(backend_of(BackendKind::Docker).kind(), BackendKind::Docker);
+        let handle = SandboxHandle { backend: BackendKind::Seatbelt, id: "x".into() };
+        assert_eq!(for_handle(&handle).kind(), BackendKind::Seatbelt);
+    }
+
+    /// (#3112 review) A reaper lists every backend this host can run, so a
+    /// sandbox left from before the default changed is still found.
+    #[test]
+    fn every_runnable_backend_is_listed() {
+        let kinds = |d, s| available_given(d, s).iter().map(|b| b.kind()).collect::<Vec<_>>();
+        assert_eq!(kinds(true, true), vec![BackendKind::Docker, BackendKind::Seatbelt]);
+        assert_eq!(kinds(false, true), vec![BackendKind::Seatbelt]);
+        assert_eq!(kinds(true, false), vec![BackendKind::Docker]);
+        assert!(kinds(false, false).is_empty());
+    }
+
+    /// (#3112 review) Every Mac this suite runs on (CI's macOS job
+    /// included) has `sandbox-exec`, so the tests that return early without
+    /// it really run their Seatbelt branch there.
+    #[test]
+    fn every_mac_this_suite_runs_on_has_sandbox_exec() {
+        if darkmux_platform::current().id() == "macos" {
+            assert!(SeatbeltBackend::available(), "{} is missing on this Mac", seatbelt::SANDBOX_EXEC);
+        }
+    }
+
+    /// (#3112) A backend whose sandbox is a process on this host (Seatbelt;
+    /// Landlock later, #3556) is `on_host`; Docker's container is not.
+    #[test]
+    fn a_host_process_backend_is_on_host_and_docker_is_not() {
+        assert!(BackendKind::Seatbelt.on_host());
+        assert!(!BackendKind::Docker.on_host());
     }
 
     /// A handle is stored by a reaper or a resume record and read back as

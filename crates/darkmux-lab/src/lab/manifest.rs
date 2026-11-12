@@ -126,10 +126,38 @@ pub struct RunManifest {
     /// never sends one.
     #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// (run manifest 1.4, #3112) Where the run's isolated work ran: the
+    /// sandbox, the tests' placement, and a pinned image that was not used.
+    /// A measured variable (the lab loop: one variable at a time), so a
+    /// Seatbelt run is never read as a Docker one. Absent on a run from
+    /// before it was recorded.
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<RunIsolation>,
     /// A key this type does not name (an older run's camelCase spelling, a newer
     /// darkmux's field), kept and re-serialized flat.
     #[serde(flatten)]
     pub extras: Map<String, Value>,
+}
+
+/// The image a Docker run's tests use when the workload pins none: the
+/// darkmux runtime image (recorded by name; the run's own log names the tag).
+pub const RUNTIME_IMAGE_TESTS: &str = "darkmux-runtime";
+
+/// (run manifest 1.4, #3112) Where a run's isolated work ran.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RunIsolation {
+    /// The `runtime.sandbox` in effect (`docker` or `seatbelt`); absent when
+    /// the setting was refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
+    /// Where model-written tests ran: `docker:<image>`, `seatbelt` (this
+    /// machine's own toolchain, sandboxed), or `host` (`runtime.tests_on_host`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tests: Option<String>,
+    /// The workload's pinned image when it was not used (a Seatbelt sandbox,
+    /// or the host, has no images).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_not_used: Option<String>,
 }
 
 /// (#3397) How darkmux knew which machine served a model.
@@ -556,6 +584,20 @@ mod tests {
         assert_eq!(served_model_in(&doc(&[completed(Some("a-1")), completed(Some("a-2"))])), None, "more than one");
         assert_eq!(served_model_in(&doc(&[completed(None), compaction])), None, "none, and the compactor's name is not the run's");
         assert_eq!(served_model_in(&doc(&[completed(Some(" "))])), None);
+    }
+
+    /// (run manifest 1.4, #3112 review) The isolation block round-trips,
+    /// and a manifest without it reads as `None` (a run from before it).
+    #[test]
+    fn the_isolation_block_round_trips() {
+        let m = RunManifest {
+            isolation: Some(RunIsolation { sandbox: Some("seatbelt".into()), tests: Some("seatbelt".into()), image_not_used: Some("node:22".into()) }),
+            ..RunManifest::default()
+        };
+        let v = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["isolation"], json!({"sandbox": "seatbelt", "tests": "seatbelt", "image_not_used": "node:22"}));
+        assert_eq!(serde_json::from_value::<RunManifest>(v).unwrap(), m);
+        assert_eq!(serde_json::from_value::<RunManifest>(json!({"run_id": "r"})).unwrap().isolation, None);
     }
 
     #[test]

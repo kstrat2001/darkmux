@@ -372,6 +372,8 @@ fn harness() -> Harness {
         // On here, so the preview tests can run one; production's default is
         // off (`clients.preview.enabled`).
         preview_enabled: Arc::new(move || Ok(*pe.lock().unwrap())),
+        // (#3112) Docker unless a test says otherwise: previews run there.
+        preview_sandbox: Arc::new(|| Ok(darkmux_sandbox::BackendKind::Docker)),
         preview_idle_minutes: Arc::new(move || pi.lock().unwrap().clone()),
         peer_processes: Arc::new(|_bound, wanted| Some(test_peer_processes(wanted))),
         pair_peers: Arc::new(Mutex::new(HashMap::new())),
@@ -5722,33 +5724,51 @@ fn a_preview_needs_the_docker_sandbox_for_now() {
     assert!(bad.contains("`x` is not a valid sandbox"), "{bad}");
 }
 
-/// (#3112) The route: under Seatbelt (macOS only), a start is a 403 naming
-/// the sandbox, and nothing runs.
+/// (#3112) The route: under another sandbox a start is a 403 naming the
+/// setting, and nothing runs. (#3112 review) The sandbox is read per
+/// request, so after the `config set` the refusal recommends, a start goes
+/// through.
 #[tokio::test]
-#[serial_test::serial]
-async fn a_preview_start_under_seatbelt_is_refused_and_runs_nothing() {
-    darkmux_types::run_in_own_process!();
-    if !darkmux_sandbox::SeatbeltBackend::available() {
-        return;
-    }
-    let h = harness();
+async fn a_preview_start_follows_the_sandbox_read_per_request() {
+    use darkmux_sandbox::BackendKind;
+    let mut h = harness();
     let token = paired(&h).await;
     let (mine, name, ws) = served_workspace(&h, &token).await;
     recipe(&mine, serde_json::json!({"command": format!("touch ran; {}", serve()), "env": {"PORT": "{port}"}}));
-    let prev = std::env::var_os("DARKMUX_SANDBOX");
-    unsafe { std::env::set_var("DARKMUX_SANDBOX", "seatbelt") };
+    let sandbox = Arc::new(Mutex::new(BackendKind::Seatbelt));
+    let read = sandbox.clone();
+    h.state.preview_sandbox = Arc::new(move || Ok(*read.lock().unwrap()));
     let (code, v) = start_preview(&h, &token, &name).await;
-    unsafe {
-        match prev {
-            Some(p) => std::env::set_var("DARKMUX_SANDBOX", p),
-            None => std::env::remove_var("DARKMUX_SANDBOX"),
-        }
-    }
     assert_eq!(code, 403, "{v}");
     assert_eq!(v["code"], "forbidden", "{v}");
     assert!(v["error"].as_str().unwrap().contains("darkmux config set runtime.sandbox docker"), "{v}");
     std::thread::sleep(std::time::Duration::from_millis(300));
     assert!(!ws.join("ran").exists(), "nothing started");
+    *sandbox.lock().unwrap() = BackendKind::Docker;
+    let (code, v) = start_preview(&h, &token, &name).await;
+    assert!(code == 200 || code == 202, "the start goes through once the setting allows it: {code} {v}");
+}
+
+/// (#3112 review) The production reader takes `runtime.sandbox` from
+/// `config.json` as it is now, so a `config set` takes effect without a
+/// restart.
+#[test]
+#[serial_test::serial]
+fn the_preview_sandbox_is_read_from_the_config_as_it_is_now() {
+    darkmux_types::run_in_own_process!();
+    let prev = std::env::var_os("DARKMUX_SANDBOX");
+    unsafe { std::env::remove_var("DARKMUX_SANDBOX") };
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("config.json");
+    std::fs::write(&path, r#"{"runtime": {"sandbox": "docker"}}"#).unwrap();
+    let docker = crate::client_pairing::read_preview_sandbox_at(&path);
+    std::fs::write(&path, r#"{"runtime": {"sandbox": "podman"}}"#).unwrap();
+    let bad = crate::client_pairing::read_preview_sandbox_at(&path);
+    if let Some(v) = prev {
+        unsafe { std::env::set_var("DARKMUX_SANDBOX", v) };
+    }
+    assert_eq!(docker, Ok(darkmux_sandbox::BackendKind::Docker));
+    assert!(bad.unwrap_err().contains("podman"));
 }
 
 /// The switch reads `clients.preview.enabled` fresh, through the config

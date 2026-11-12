@@ -81,11 +81,6 @@ pub struct Run<'a> {
 /// (#3112) What a run's container may see and do: the tree at `/workspace`,
 /// the mount check beside it read-only, the named mounts read-write, no
 /// network, the coder container's limits, the owner's pid as a label, and
-/// `sh` running the command behind the mount check.
-pub fn policy(image: &str, name: &str, run: &Run) -> SandboxPolicy {
-    policy_for(image, name, run, backend())
-}
-
 /// [`policy`] for `backend`: the working directory and the mount check are
 /// where it places the tree and the check's directory (#3112 step 2).
 pub fn policy_for(image: &str, name: &str, run: &Run, backend: &dyn SandboxBackend) -> SandboxPolicy {
@@ -147,23 +142,26 @@ fn mount_check_failure(kind: darkmux_sandbox::BackendKind) -> &'static str {
 
 /// `docker run` arguments for a run in a container.
 pub fn container_args(image: &str, name: &str, run: &Run) -> Vec<String> {
-    DockerBackend::run_args(&policy(image, name, run))
+    DockerBackend::run_args(&policy_for(image, name, run, &DockerBackend))
 }
 
-/// The command to spawn, and the container's name when it runs in one.
-pub fn command(placement: &Placement, run: &Run) -> (Command, Option<String>) {
+/// The command to spawn, and the sandbox's handle when it runs in one: in
+/// the configured sandbox (`runtime.sandbox`), or `NotRun` when that is
+/// refused (#3112 review: never Docker by default).
+pub fn command(placement: &Placement, run: &Run) -> Result<(Command, Option<SandboxHandle>), NotRun> {
     match placement {
         Placement::Host => {
             let mut cmd = Command::new("sh");
             cmd.arg("-c").arg(run.command).current_dir(run.tree.join(run.workdir));
-            (cmd, None)
+            Ok((cmd, None))
         }
         Placement::Container(image) => {
+            let backend = backend().map_err(NotRun)?;
             static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let name = format!("{}-{}-{n}", run.name_prefix, std::process::id());
-            let (cmd, handle) = backend().run(&policy(image, &name, run));
-            (cmd, Some(handle.id))
+            let (cmd, handle) = backend.run(&policy_for(image, &name, run, backend));
+            Ok((cmd, Some(handle)))
         }
     }
 }
@@ -181,12 +179,12 @@ fn sentinel_dir_for(name: &str, tree: &Path) -> Option<PathBuf> {
 /// killed (deadline or signal) is removed by name. `Err` is a container that
 /// never ran the command; `Finished` is always the command's own exit.
 pub fn run(placement: &Placement, run: &Run, timeout: Duration) -> Result<Bounded, NotRun> {
-    let (cmd, container) = command(placement, run);
-    let Some(name) = container else {
+    let (cmd, container) = command(placement, run)?;
+    let Some(handle) = container else {
         return Ok(run_bounded(cmd, timeout));
     };
     reap_orphaned_containers();
-    let sentinel_dir = sentinel_dir_for(&name, run.tree)
+    let sentinel_dir = sentinel_dir_for(&handle.id, run.tree)
         .ok_or_else(|| NotRun(format!("{} has no parent directory to hold the mount check", run.tree.display())))?;
     if let Err(e) = write_sentinel(&sentinel_dir) {
         return Err(NotRun(format!("could not write the mount check in {}: {e}", sentinel_dir.display())));
@@ -194,10 +192,10 @@ pub fn run(placement: &Placement, run: &Run, timeout: Duration) -> Result<Bounde
     let ran = run_bounded(cmd, timeout);
     if matches!(ran, Bounded::TimedOut { .. } | Bounded::Interrupted) {
         // Killing the `docker run` client does not stop its container.
-        remove_container(&name);
+        remove_container(&handle);
     }
     let _ = std::fs::remove_dir_all(&sentinel_dir);
-    started(ran)
+    started(ran, handle.backend)
 }
 
 /// A fresh directory holding the sentinel. `create_dir` and `create_new`
@@ -208,14 +206,14 @@ fn write_sentinel(dir: &Path) -> std::io::Result<()> {
 }
 
 /// A container's result, read by whether it printed [`STARTED_LINE`].
-fn started(ran: Bounded) -> Result<Bounded, NotRun> {
+fn started(ran: Bounded, made_in: darkmux_sandbox::BackendKind) -> Result<Bounded, NotRun> {
     match ran {
         Bounded::Finished { success, code, stdout, stderr } => match stdout.strip_prefix(format!("{STARTED_LINE}\n").as_bytes()) {
             Some(rest) => Ok(Bounded::Finished { success, code, stdout: rest.to_vec(), stderr }),
             None => {
                 let said = String::from_utf8_lossy(&stderr).trim().to_string();
                 let code = code.map_or("a signal".to_string(), |c| format!("exit {c}"));
-                Err(NotRun(if said.is_empty() { format!("{} ended ({code}) before the command started", darkmux_sandbox::placed_in_configured()) } else { said }))
+                Err(NotRun(if said.is_empty() { format!("{} ended ({code}) before the command started", darkmux_sandbox::placed_in(made_in)) } else { said }))
             }
         },
         other => Ok(other),
@@ -229,27 +227,31 @@ pub fn orphaned_containers(listed: &[(String, Option<u32>)], alive: impl Fn(u32)
     listed.iter().filter(|(_, pid)| pid.is_some_and(|p| !alive(p))).map(|(name, _)| name.clone()).collect()
 }
 
-/// Remove containers whose owner is gone. Best effort and bounded: a Docker
-/// that cannot list them is the next `docker run`'s failure to name.
+/// Remove sandboxes whose owner is gone, in every backend this host can run
+/// (#3112 review: one left from before `runtime.sandbox` changed is still
+/// found). Best effort and bounded: a backend that cannot list them is the
+/// next run's failure to name.
 pub fn reap_orphaned_containers() {
     let query = Query::labeled(PID_LABEL);
-    let Bounded::Finished { success: true, stdout, .. } = run_bounded(backend().list(&query), Duration::from_secs(30)) else {
-        return;
-    };
-    let listed: Vec<(String, Option<u32>)> = backend()
-        .parse_list(&query, &String::from_utf8_lossy(&stdout))
-        .into_iter()
-        .map(|l| (l.handle.id, l.labels[0].as_deref().and_then(|v| v.parse().ok())))
-        .collect();
-    for name in orphaned_containers(&listed, crate::host_sampler_lock::pid_alive) {
-        remove_container(&name);
+    for backend in darkmux_sandbox::available_backends() {
+        let Bounded::Finished { success: true, stdout, .. } = run_bounded(backend.list(&query), Duration::from_secs(30)) else {
+            continue;
+        };
+        let listed: Vec<(String, Option<u32>)> = backend
+            .parse_list(&query, &String::from_utf8_lossy(&stdout))
+            .into_iter()
+            .map(|l| (l.handle.id, l.labels[0].as_deref().and_then(|v| v.parse().ok())))
+            .collect();
+        for name in orphaned_containers(&listed, crate::host_sampler_lock::pid_alive) {
+            remove_container(&SandboxHandle { backend: backend.kind(), id: name });
+        }
     }
 }
 
-/// Stop and remove a container whose `docker run` client was killed. Best
-/// effort: a container already gone is the goal, not an error.
-pub fn remove_container(name: &str) {
-    let mut rm = backend().remove(&SandboxHandle { backend: backend().kind(), id: name.to_string() });
+/// Stop and remove a sandbox whose client was killed, in the backend that
+/// made it. Best effort: a sandbox already gone is the goal, not an error.
+pub fn remove_container(handle: &SandboxHandle) {
+    let mut rm = darkmux_sandbox::for_handle(handle).remove(handle);
     rm.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     let _ = run_bounded(rm, Duration::from_secs(30));
 }
@@ -262,7 +264,14 @@ pub fn lab_test_image(workload_image: Option<&str>) -> anyhow::Result<String> {
     use anyhow::Context;
     // (#3112 step 2) A Seatbelt sandbox runs this host's own toolchain: there
     // is no image to name, resolve or pull.
-    if darkmux_sandbox::selected().map_err(|why| anyhow::anyhow!(why))? == darkmux_sandbox::BackendKind::Seatbelt {
+    if darkmux_sandbox::selected().map_err(|why| anyhow::anyhow!(why))?.on_host() {
+        // (#3112 review) A pinned image is a toolchain pin the sandbox cannot
+        // honor: the run says so here and records it in its manifest
+        // (`isolation.image_not_used`) rather than being refused, which would
+        // make Docker a requirement for every pinned workload on a Mac.
+        if let Some(image) = workload_image {
+            eprintln!("{}", image_not_used_note(image));
+        }
         return Ok("host".to_string());
     }
     if let Some(image) = workload_image {
@@ -271,7 +280,7 @@ pub fn lab_test_image(workload_image: Option<&str>) -> anyhow::Result<String> {
     }
     // (#3112) Docker is asked for only here, under `runtime.sandbox docker`:
     // the message says so, and how to need no Docker where that can run.
-    let remedy = darkmux_sandbox::docker_remedy().unwrap_or_else(|| "Docker must be installed and running".to_string());
+    let remedy = darkmux_sandbox::docker_needs().unwrap_or_else(|| "Docker must be installed and running".to_string());
     crate::dispatch_internal::test_runtime_image().with_context(|| {
         format!(
             "model-written tests run in {}: {remedy}; \
@@ -281,13 +290,23 @@ pub fn lab_test_image(workload_image: Option<&str>) -> anyhow::Result<String> {
     })
 }
 
+/// (#3112 review) What a run says when its workload pins an image a
+/// Seatbelt sandbox does not use.
+pub fn image_not_used_note(image: &str) -> String {
+    format!(
+        "darkmux lab: the workload pins image `{image}`, but the seatbelt sandbox runs this machine's own \
+         toolchain, so the image is not used (recorded as isolation.image_not_used in the run's manifest); \
+         to run the tests in it, `darkmux config set runtime.sandbox docker`"
+    )
+}
+
 /// (#906) The user a lab run's test container runs as: the same answer the
 /// dispatch container gets (the operator's `runtime.container_user`, else
 /// the platform's), so files the tests write into a bind-mounted tree belong
 /// to whoever owns the tree.
 pub fn lab_test_user() -> anyhow::Result<Option<String>> {
     // (#3112 step 2) A Seatbelt sandbox runs as the caller.
-    if darkmux_sandbox::backend().kind() == darkmux_sandbox::BackendKind::Seatbelt {
+    if darkmux_sandbox::selected().map_err(|why| anyhow::anyhow!(why))?.on_host() {
         return Ok(None);
     }
     crate::dispatch_internal::runtime_container_user()
@@ -390,8 +409,8 @@ mod tests {
     /// argv, and the container is named `<prefix>-<pid>-<seq>`.
     #[test]
     fn a_contained_command_spawns_docker_with_the_pinned_argv() {
-        let (cmd, name) = command(&Placement::Container("node:22".into()), &a_run(&[], None));
-        let name = name.expect("a container run is named");
+        let (cmd, handle) = command(&Placement::Container("node:22".into()), &a_run(&[], None)).unwrap();
+        let name = handle.expect("a container run is named").id;
         let prefix = format!("darkmux-test-{}-", std::process::id());
         assert!(name.strip_prefix(&prefix).is_some_and(|n| n.parse::<u64>().is_ok()), "{name}");
         assert_eq!(cmd.get_program(), "docker");
@@ -500,10 +519,36 @@ mod tests {
         assert_eq!(calls[2], strings(&["rm", "-f", &name]));
     }
 
+    /// (#3112 review) A refused `runtime.sandbox` refuses the run: it never
+    /// falls back to Docker (an empty `PATH` would make any Docker attempt
+    /// a spawn failure instead of this refusal).
+    #[test]
+    #[serial_test::serial]
+    fn a_refused_sandbox_refuses_a_contained_run_instead_of_using_docker() {
+        darkmux_types::run_in_own_process!();
+        let root = tempfile::TempDir::new().unwrap();
+        let tree = root.path().join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        let empty = tempfile::TempDir::new().unwrap();
+        let (prev_path, prev_sb) = (std::env::var_os("PATH"), std::env::var_os("DARKMUX_SANDBOX"));
+        unsafe {
+            std::env::set_var("PATH", empty.path());
+            std::env::set_var("DARKMUX_SANDBOX", "podman");
+        }
+        let r = Run { command: "true", tree: &tree, workdir: "", mounts: &[], user: None, name_prefix: "darkmux-test" };
+        let ran = run(&Placement::Container("node:22".into()), &r, Duration::from_secs(5));
+        unsafe {
+            match prev_path { Some(v) => std::env::set_var("PATH", v), None => std::env::remove_var("PATH") }
+            match prev_sb { Some(v) => std::env::set_var("DARKMUX_SANDBOX", v), None => std::env::remove_var("DARKMUX_SANDBOX") }
+        }
+        let why = ran.expect_err("a refused sandbox never runs").0;
+        assert!(why.contains("podman") && why.contains("runtime.sandbox"), "{why}");
+    }
+
     /// On the host the command runs in the tree's working directory.
     #[test]
     fn a_host_run_is_sh_in_the_workdir() {
-        let (cmd, name) = command(&Placement::Host, &a_run(&[], None));
+        let (cmd, name) = command(&Placement::Host, &a_run(&[], None)).unwrap();
         assert!(name.is_none());
         assert_eq!(cmd.get_current_dir(), Some(Path::new("/tmp/s/tree/pkg")));
     }
@@ -519,16 +564,16 @@ mod tests {
             stdout: stdout.as_bytes().to_vec(),
             stderr: stderr.as_bytes().to_vec(),
         };
-        let Ok(Bounded::Finished { code, stdout, .. }) = started(finished(&format!("{STARTED_LINE}\nout"), "")) else {
+        let Ok(Bounded::Finished { code, stdout, .. }) = started(finished(&format!("{STARTED_LINE}\nout"), ""), darkmux_sandbox::BackendKind::Docker) else {
             panic!("a started run is the command's")
         };
         assert_eq!((code, stdout), (Some(125), b"out".to_vec()), "the start line is not the command's output");
-        assert_eq!(started(finished("", "Unable to find image")).unwrap_err(), NotRun("Unable to find image".into()));
-        let silent = started(finished("", "")).unwrap_err().0;
+        assert_eq!(started(finished("", "Unable to find image"), darkmux_sandbox::BackendKind::Docker).unwrap_err(), NotRun("Unable to find image".into()));
+        let silent = started(finished("", ""), darkmux_sandbox::BackendKind::Docker).unwrap_err().0;
         assert!(silent.contains("exit 125") && silent.contains("before the command started"), "{silent}");
         // (#3112) It names the configured sandbox (a test build's is Docker).
         assert!(silent.contains("a Docker container (`runtime.sandbox` is `docker`) ended"), "{silent}");
-        assert!(started(Bounded::TimedOut { seconds: 3 }).is_ok());
+        assert!(started(Bounded::TimedOut { seconds: 3 }, darkmux_sandbox::BackendKind::Docker).is_ok());
     }
 
     /// (#3355 review) The mount check is written beside the tree, never in it,

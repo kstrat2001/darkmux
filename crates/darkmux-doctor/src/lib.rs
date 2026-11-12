@@ -139,10 +139,16 @@ fn check_build_info() -> Check {
 }
 
 pub fn run() -> DoctorReport {
+    run_with(checks_sandbox::configured())
+}
+
+/// [`run`] under `configured`, the sandbox selection and its tier (a test
+/// runs the whole doctor under Seatbelt this way).
+fn run_with(configured: (Result<darkmux_sandbox::BackendKind, String>, darkmux_types::config_access::Source)) -> DoctorReport {
     // (#3112) The sandbox every isolated run uses. Docker's rows are asked
     // only under Docker; the `sandbox` row says whether the one configured
     // can run here, from the `docker runtime` row's one probe under Docker.
-    let (sandbox, sandbox_source) = checks_sandbox::configured();
+    let (sandbox, sandbox_source) = configured;
     let docker_runtime = checks_sandbox::docker_only(&sandbox, "docker runtime", check_docker_runtime);
     let sandbox_row = checks_sandbox::sandbox_row(
         &sandbox,
@@ -174,7 +180,8 @@ pub fn run() -> DoctorReport {
         // (#1461) Staleness: what is RUNNING vs what is INSTALLED vs the source.
         check_daemon_freshness(),
         // (#3423) Does the RUNNING daemon find `docker` on its own PATH?
-        checks_sandbox::docker_only(&sandbox, DAEMON_DOCKER_CHECK_NAME, check_daemon_docker),
+        // (#3112 review) Gated by the daemon's own sandbox, inside.
+        check_daemon_docker(&sandbox),
         check_binary_vs_source(),
         checks_sandbox::docker_only(&sandbox, RUNTIME_IMAGE_CHECK_NAME, check_runtime_image_freshness),
         checks_sandbox::docker_only(&sandbox, RUNTIME_BINARY_CACHE_CHECK_NAME, check_runtime_binary_cache),
@@ -216,7 +223,7 @@ pub fn run() -> DoctorReport {
         checks_power::check_power_posture(),
         // (#3112) Read only by a Docker sandbox: Seatbelt runs as you.
         checks_sandbox::docker_only(&sandbox, checks_container::NAME, checks_container::check_container_user),
-        checks_container::check_lab_tests_placement(),
+        checks_container::check_lab_tests_placement(&sandbox),
         check_unmanaged_endpoint_credentials(),
         check_endpoints(),
         check_default_engine(),
@@ -5560,28 +5567,46 @@ const DAEMON_DOCKER_CHECK_NAME: &str = "daemon docker";
 /// fleet listener (`/health`'s `fleet_listener`): it is the only way the
 /// daemon runs a dispatch. Inside the viewer's panel (`DARKMUX_PANEL`) doctor
 /// is the daemon's own child, so its PATH is no comparison.
-fn check_daemon_docker() -> Check {
+fn check_daemon_docker(cli: &Result<darkmux_sandbox::BackendKind, String>) -> Check {
     let addr = darkmux_types::config_access::serve_client_addr();
     let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or("127.0.0.1").to_string();
     let health = loopback_http_body(&host, darkmux_types::config_access::serve_client_port(), "/health");
-    // (#3112) A daemon started with another sandbox (its own env) needs no
-    // docker, whatever this shell's setting says.
-    if let Some(other) = health.as_deref().and_then(daemon_sandbox_other_than_docker) {
-        return not_applicable(
-            DAEMON_DOCKER_CHECK_NAME,
-            &format!("the running darkmux serve daemon's sandbox is `{other}`, so it needs no docker"),
-        );
+    let reported = health.as_deref().and_then(daemon_reported_sandbox);
+    if let Some(reason) = daemon_docker_gate(reported.as_deref(), cli) {
+        return not_applicable(DAEMON_DOCKER_CHECK_NAME, &reason);
     }
     let (daemon, listener_on) = health.as_deref().map(parse_daemon_docker).unwrap_or((None, false));
     let in_panel = env::var_os("DARKMUX_PANEL").is_some();
     classify_daemon_docker(daemon, darkmux_sandbox::DockerBackend::on_path(), listener_on, in_panel)
 }
 
-/// (#3112) `/health`'s `sandbox` when it names one other than Docker.
-fn daemon_sandbox_other_than_docker(health_body: &str) -> Option<String> {
+/// (#3112) `/health`'s `sandbox`: the one the running daemon (and every
+/// process it starts) uses. `None` from a daemon older than it, or none.
+fn daemon_reported_sandbox(health_body: &str) -> Option<String> {
     let v = serde_json::from_str::<serde_json::Value>(health_body).ok()?;
-    let sandbox = v.get("sandbox")?.as_str()?;
-    (sandbox != darkmux_types::config::SandboxKind::Docker.as_str()).then(|| sandbox.to_string())
+    v.get("sandbox")?.as_str().map(str::to_string)
+}
+
+/// (#3112) `/health`'s `sandbox` when it names one other than Docker.
+#[cfg(test)]
+fn daemon_sandbox_other_than_docker(health_body: &str) -> Option<String> {
+    daemon_reported_sandbox(health_body).filter(|s| s != darkmux_types::config::SandboxKind::Docker.as_str())
+}
+
+/// (#3112 review) Why the `daemon docker` row does not apply, or `None`
+/// when it does. The daemon's own reported sandbox decides (its children
+/// run in it); this shell's (`cli`) only when the daemon reports none.
+fn daemon_docker_gate(daemon_sandbox: Option<&str>, cli: &Result<darkmux_sandbox::BackendKind, String>) -> Option<String> {
+    let docker = darkmux_types::config::SandboxKind::Docker.as_str();
+    match daemon_sandbox {
+        Some(s) if s == docker => None,
+        Some(other) => Some(format!("the running darkmux serve daemon's sandbox is `{other}`, so it needs no docker")),
+        None => match cli {
+            Ok(darkmux_sandbox::BackendKind::Docker) => None,
+            Ok(kind) => Some(format!("Docker is not needed: `runtime.sandbox` is `{}`", darkmux_sandbox::setting_value(*kind))),
+            Err(_) => Some("no sandbox can run here, so Docker is not asked (see `sandbox`)".to_string()),
+        },
+    }
 }
 
 /// `/health`'s `docker_on_path` (`None` when absent: no daemon, one older than
@@ -6921,8 +6946,7 @@ fn docker_status_to_check(status: darkmux_crew::dispatch_internal::DockerRuntime
                 .into(),
             hint: Some(
                 "Install Docker Desktop (https://www.docker.com/products/docker-desktop) to run \
-                 isolated work in Docker containers, or choose another sandbox (`darkmux doctor`'s \
-                 `sandbox` row names one this machine can run)."
+                 isolated work in Docker containers."
                     .into(),
             ),
         },
@@ -9682,6 +9706,35 @@ mod tests {
     }
 
     #[test]
+    fn the_daemon_docker_row_follows_the_daemons_own_sandbox() {
+        // (#3112 review) The daemon's reported sandbox decides; this shell's
+        // only when the daemon reports none.
+        use darkmux_sandbox::BackendKind;
+        assert!(daemon_docker_gate(Some("seatbelt"), &Ok(BackendKind::Docker)).unwrap().contains("daemon's sandbox is `seatbelt`"));
+        assert_eq!(daemon_docker_gate(Some("docker"), &Ok(BackendKind::Seatbelt)), None, "the daemon needs docker");
+        assert!(daemon_docker_gate(None, &Ok(BackendKind::Seatbelt)).unwrap().contains("Docker is not needed"));
+        assert_eq!(daemon_docker_gate(None, &Ok(BackendKind::Docker)), None);
+    }
+
+    /// (#3112 review) The whole doctor under Seatbelt: the `sandbox` row
+    /// passes, and every Docker row says Docker is not needed, its probe
+    /// never run.
+    #[test]
+    fn the_whole_doctor_under_seatbelt_asks_nothing_of_docker() {
+        use darkmux_sandbox::BackendKind;
+        let r = with_isolated_darkmux_home(|| run_with((Ok(BackendKind::Seatbelt), darkmux_types::config_access::Source::Config)));
+        let row = |name: &str| r.checks.iter().find(|c| c.name == name).unwrap_or_else(|| panic!("no `{name}` row")).clone();
+        let sandbox = row("sandbox");
+        assert_eq!(sandbox.status, Status::Pass);
+        assert!(sandbox.message.contains("`seatbelt`"), "{}", sandbox.message);
+        for name in ["docker runtime", "daemon docker", RUNTIME_IMAGE_CHECK_NAME, RUNTIME_BINARY_CACHE_CHECK_NAME, "container user"] {
+            let c = row(name);
+            assert!(c.message.contains("Docker is not needed"), "`{name}`: {}", c.message);
+        }
+        assert!(row("lab tests").message.contains("the `seatbelt` sandbox"), "{}", row("lab tests").message);
+    }
+
+    #[test]
     fn a_daemon_whose_sandbox_is_not_docker_needs_no_docker() {
         // (#3112) The daemon's own sandbox, from `/health`.
         assert_eq!(daemon_sandbox_other_than_docker(r#"{"docker_on_path":null,"sandbox":"seatbelt"}"#), Some("seatbelt".into()));
@@ -9783,7 +9836,7 @@ mod tests {
                     env::remove_var("DARKMUX_PANEL");
                 }
             }
-            let c = check_daemon_docker();
+            let c = check_daemon_docker(&Ok(darkmux_sandbox::BackendKind::Docker));
             let _ = server.join();
             c
         };
@@ -11987,7 +12040,12 @@ mod tests {
         use darkmux_crew::dispatch_internal::DockerRuntimeStatus;
         let c = docker_status_to_check(DockerRuntimeStatus::BinaryMissing);
         assert_eq!(c.status, Status::Warn);
-        assert!(c.hint.unwrap().contains("Install Docker Desktop"));
+        let hint = c.hint.unwrap();
+        assert!(hint.contains("Install Docker Desktop"));
+        // (#3112 review) The `docker runtime` row names no other sandbox: on
+        // Linux there is none, and the `sandbox` row names the way to need
+        // no Docker only where one runs.
+        assert!(!hint.contains("another sandbox") && !hint.contains("seatbelt"), "{hint}");
     }
 
     #[test]

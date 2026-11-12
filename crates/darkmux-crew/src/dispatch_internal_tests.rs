@@ -7405,6 +7405,36 @@ S(("127.0.0.1", port), H).serve_forever()
         );
     }
 
+    /// (#3112 review) The origin records the sandbox it ran in, and a resume
+    /// in another sandbox is refused naming both, like a different image:
+    /// across the macOS default's move to Seatbelt, a Docker checkpoint is
+    /// never resumed in Seatbelt. An origin from before the record ran in
+    /// Docker (the only sandbox then).
+    #[test]
+    fn a_resume_keeps_its_origins_sandbox() {
+        use darkmux_sandbox::BackendKind;
+        let ws = TempDir::new().unwrap();
+        let prior = TempDir::new().unwrap();
+        write_resume_origin_meta(prior.path(), ws.path(), false, None, &darkmux_types::execution_id::ExecutionId::mint());
+        let origin: serde_json::Value = serde_json::from_str(&read_resume_origin(prior.path()).unwrap()).unwrap();
+        assert_eq!(origin["sandbox"], "docker", "a test build runs in Docker: {origin}");
+        assert_eq!(origin["schema_version"], "1.1");
+        resume_sandbox_matches(prior.path(), Some(BackendKind::Docker)).unwrap();
+        let err = resume_sandbox_matches(prior.path(), Some(BackendKind::Seatbelt)).unwrap_err();
+        assert!(err.is::<ResumeRefusal>(), "a refusal: {err:#}");
+        let msg = err.to_string();
+        for part in ["RESUME SANDBOX MISMATCH", "`docker`", "`seatbelt`", "darkmux config set runtime.sandbox docker"] {
+            assert!(msg.contains(part), "missing `{part}` in: {msg}");
+        }
+        // An origin with no `sandbox` (before 1.1) ran in Docker.
+        let mut old = origin.clone();
+        old.as_object_mut().unwrap().remove("sandbox");
+        std::fs::write(resume_origin_path(prior.path()), serde_json::to_vec(&old).unwrap()).unwrap();
+        assert!(resume_sandbox_matches(prior.path(), Some(BackendKind::Seatbelt)).unwrap_err().to_string().contains("`docker`"));
+        // A refused selection is the runtime image's refusal to make, not this one.
+        resume_sandbox_matches(prior.path(), None).unwrap();
+    }
+
     /// An origin that ran the default image refuses a resume naming one, and
     /// a resume naming none stays on the default (`None`).
     #[test]

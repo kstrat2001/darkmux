@@ -1524,6 +1524,31 @@ pub fn listen_socket_addr(bind: &str, port: u16) -> Result<std::net::SocketAddr>
     })
 }
 
+/// (#3112 review) The `DARKMUX_SANDBOX` value this daemon pins for the
+/// processes it starts: its own resolved sandbox, unless the operator's env
+/// already names one (that is what resolved), or the selection is refused
+/// (every start refuses it anyway).
+pub(crate) fn sandbox_pin(current_env: Option<&str>, selected: Result<darkmux_sandbox::BackendKind, String>) -> Option<&'static str> {
+    if current_env.is_some_and(|v| !v.trim().is_empty()) {
+        return None;
+    }
+    selected.ok().map(darkmux_sandbox::setting_value)
+}
+
+/// (#3112 review) A process this daemon starts re-reads `config.json`,
+/// which a `config set` may have changed since the daemon started (the
+/// daemon itself keeps its start value until it restarts). Pinning the
+/// daemon's sandbox into its own environment, which every child inherits,
+/// makes the children run what `/health` reports. Called before any thread
+/// starts.
+fn pin_sandbox_for_children() {
+    let current = std::env::var(darkmux_sandbox::SANDBOX_ENV).ok();
+    if let Some(value) = sandbox_pin(current.as_deref(), darkmux_sandbox::selected()) {
+        // SAFETY: called from `run` before the runtime or any thread starts.
+        unsafe { std::env::set_var(darkmux_sandbox::SANDBOX_ENV, value) };
+    }
+}
+
 pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>) -> Result<()> {
     // (#2988 review) The config gate every entry point runs: a wrong-typed
     // value (`serve.read_auth: "true"`) or a retired key would otherwise be
@@ -1544,6 +1569,9 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
     darkmux_flow::set_sink_policy(darkmux_flow::SinkPolicy::LongLived)?;
     // (#2916 review M1) 10240 is macOS's per-process ceiling (OPEN_MAX).
     let _ = raise_open_file_limit(10_240);
+    // (#3112 review) Before any thread starts: the sandbox `/health` reports
+    // is the one every process this daemon starts uses.
+    pin_sandbox_for_children();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1855,7 +1883,7 @@ async fn health(
         // reason: `darkmux doctor` runs from a shell whose PATH may differ.
         // (#3112) Not asked when this daemon's sandbox is another one: it
         // then needs no docker, and `sandbox` says which it runs.
-        docker_on_path: (loopback_caller && daemon_sandbox != Some(darkmux_sandbox::BackendKind::Seatbelt))
+        docker_on_path: (loopback_caller && !daemon_sandbox.is_some_and(darkmux_sandbox::BackendKind::on_host))
             .then(darkmux_sandbox::DockerBackend::on_path),
         sandbox: daemon_sandbox
             .filter(|_| loopback_caller)

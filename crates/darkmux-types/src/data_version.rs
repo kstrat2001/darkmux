@@ -69,8 +69,10 @@ pub const PHASE_SCHEMA_VERSION: &str = "1.0";
 pub const TASK_SCHEMA_VERSION: &str = "1.1";
 /// A step JSON.
 pub const STEP_SCHEMA_VERSION: &str = "1.0";
-/// The `resume_origin` sidecar a resumed run writes.
-pub const RESUME_ORIGIN_SCHEMA_VERSION: &str = "1.0";
+/// The `resume_origin` sidecar a resumed run writes. 1.1 adds `sandbox`
+/// (#3112): the `runtime.sandbox` the dispatch ran in, so a resume in another
+/// is refused.
+pub const RESUME_ORIGIN_SCHEMA_VERSION: &str = "1.1";
 /// A lab run's `manifest.json`, shared by every provider. It is a separate key
 /// ([`RUN_MANIFEST_KEY`]) beside each provider's own integer `schema_version`,
 /// which versions that provider's fields and which the enricher raises.
@@ -81,8 +83,10 @@ pub const RESUME_ORIGIN_SCHEMA_VERSION: &str = "1.0";
 /// run's profile, as the registry said when the run started; `served_model`,
 /// the model the replies said answered; and `effort`, the `reasoning_effort`
 /// the dispatch actually sent, byte for byte (only a hosted call with no
-/// tools sends one; a container's runtime never does).
-pub const RUN_MANIFEST_SCHEMA_VERSION: &str = "1.3";
+/// tools sends one; a container's runtime never does). 1.4 adds `isolation`
+/// (#3112): the sandbox the run used, where its tests ran, and a pinned image
+/// that was not used.
+pub const RUN_MANIFEST_SCHEMA_VERSION: &str = "1.4";
 /// The key the lab run manifest's shared marker lives under.
 pub const RUN_MANIFEST_KEY: &str = "manifest_schema_version";
 /// A mission's `graph-report.json`.

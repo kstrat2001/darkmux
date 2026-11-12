@@ -57,11 +57,12 @@ pub(crate) const NAME: &str = "container user";
 /// grader suites) run. In the configured sandbox (#3112: `runtime.sandbox`)
 /// passes; on the host warns, because code a model wrote then runs as the
 /// operator, with their files and network.
-pub fn check_lab_tests_placement() -> Check {
+pub fn check_lab_tests_placement(sandbox: &Result<darkmux_sandbox::BackendKind, String>) -> Check {
     let (on_host, source) = darkmux_types::config_access::tests_on_host_with_source();
-    // A bad `runtime.sandbox` has its own Fail row; name the setting as
-    // written there, whatever it is.
-    let sandbox = darkmux_types::config_access::sandbox().map_or("runtime.sandbox", |k| k.as_str());
+    // (#3112 review) The selection every start uses (a Seatbelt without
+    // `sandbox-exec` is refused there too); a refused one has its own Fail
+    // row (`sandbox`), so name the setting.
+    let sandbox = sandbox.as_ref().map_or("runtime.sandbox", |k| darkmux_sandbox::setting_value(*k));
     describe_tests_placement(on_host, source, sandbox)
 }
 
