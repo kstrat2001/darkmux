@@ -319,8 +319,13 @@ mod local_engine_tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut files = Vec::new();
         sources(&root.join("src"), &mut files);
+        // (#3112) A crate with no `src` of its own (`darkmux-runtime-linked`,
+        // whose library is `runtime/src`) has nothing here to scan.
         for krate in std::fs::read_dir(root.join("crates")).unwrap().flatten() {
-            sources(&krate.path().join("src"), &mut files);
+            let src = krate.path().join("src");
+            if src.is_dir() {
+                sources(&src, &mut files);
+            }
         }
         assert!(files.len() > 100, "the scan found the workspace sources: {}", files.len());
         let offenders: Vec<String> = files

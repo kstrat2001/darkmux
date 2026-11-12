@@ -3,7 +3,7 @@
 //! Tools shipped in the runtime palette:
 //!
 //! - `echo`   — round-trip probe, retained for unit-test coverage only;
-//!   NOT exposed in the dispatch palette — see `main.rs`
+//!   NOT exposed in the dispatch palette — see `lib.rs`
 //! - `bash`   — run a bash command with cwd=/workspace
 //! - `read`   — read a file from inside /workspace (requires offset+limit)
 //! - `write`  — write a file to inside /workspace
@@ -595,7 +595,8 @@ fn format_dispatch_error(tool: Tool, name: &str, e: &anyhow::Error) -> String {
     let err_str = format!("{e:#}");
     let arg_parse_marker = format!("parsing {name} arguments");
     if err_str.contains(&arg_parse_marker) {
-        let schema = tool.parameters_schema();
+        // (#3112) Model-facing text: the key order the standalone build shows.
+        let schema = crate::key_order::sorted(tool.parameters_schema());
         let schema_text = serde_json::to_string_pretty(&schema)
             .unwrap_or_else(|_| schema.to_string());
         format!(
@@ -3993,7 +3994,8 @@ fn execute_create_finding_with(
     });
 
 
-    let mut line = serde_json::to_string(&record).context("serializing finding")?;
+    // (#3112) The standalone build's key order, in every build.
+    let mut line = serde_json::to_string(&crate::key_order::sorted(record)).context("serializing finding")?;
     line.push('\n');
     let mut f = std::fs::OpenOptions::new()
         .create(true)
@@ -4332,7 +4334,8 @@ fn execute_create_mod_with(
         "attach": attached,
         "ts": crate::trajectory::unix_ms(),
     });
-    let mut line = serde_json::to_string(&record).context("serializing mod")?;
+    // (#3112) The standalone build's key order, in every build.
+    let mut line = serde_json::to_string(&crate::key_order::sorted(record)).context("serializing mod")?;
     line.push('\n');
     let mut f = std::fs::OpenOptions::new()
         .create(true)

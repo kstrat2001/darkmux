@@ -19,7 +19,8 @@ A container-bounded in-house runtime replaces both layers:
 
 | Component | Role |
 |---|---|
-| `src/main.rs` | CLI entry; `--check` / `--version` / `run` subcommands |
+| `src/lib.rs` | The runtime's one entry, `main_with`: `--check` / `--version` / `run` subcommands |
+| `src/main.rs` | The `darkmux-runtime` binary (the Docker image's entrypoint); darkmux runs the same entry as its hidden `darkmux runtime` subcommand (#3112) |
 | `src/loop_runner.rs` | Tool-call loop: send → parse → dispatch tools → loop until `stop` |
 | `src/lmstudio.rs` | OpenAI-compatible chat-completions HTTP client (hand-rolled `ureq`; no openai SDK) |
 | `src/tools/` | Tool implementations: `search`, `read`, `edit`, `write`, `bash` (+ `echo` for unit tests only) |

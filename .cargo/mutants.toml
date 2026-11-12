@@ -1,0 +1,16 @@
+# cargo-mutants configuration for THIS workspace (read from the root of the
+# tree being mutated, so `cargo mutants --manifest-path runtime/Cargo.toml`,
+# whose tree root is runtime/, never reads it).
+#
+# (#3112) `crates/darkmux-runtime-linked` is a workspace member whose library
+# is runtime/src (`[lib] path = "../../runtime/src/lib.rs"`). It has no tests
+# of its own (`test = false`), so a workspace run (`--workspace`, the PR
+# plan's `--in-diff`) would list runtime/src's mutants a second time, under a
+# package where nothing can catch them. Those mutants belong to runtime/'s own
+# mutation job, which runs its tests. The two spellings cover the path as the
+# workspace root sees it and as the linked package's manifest spells it. In
+# the runtime job its files are `src/…`, which neither matches.
+#
+# This is unverified locally (`cargo mutants` is not run on the laptop): watch
+# the PR plan job's listing.
+exclude_globs = ["runtime/src/**", "**/runtime/src/**"]

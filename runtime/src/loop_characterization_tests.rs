@@ -207,7 +207,10 @@ fn render_events(out_dir: &std::path::Path) -> Vec<String> {
             if let Some(obj) = v.as_object_mut() {
                 obj.remove("ts");
             }
-            v.to_string()
+            // (#3112) Rendered in one key order, so the goldens read the same
+            // under the darkmux build's `preserve_order` (the bytes the file
+            // holds are pinned by the repo root's `tests/runtime_parity.rs`).
+            crate::key_order::sorted(v).to_string()
         })
         .collect()
 }

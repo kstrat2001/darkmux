@@ -510,12 +510,12 @@ pub enum EscalationReason {
     MalformedToolCallsExhausted,
 }
 
-/// (#2190) The exact snake_case `escalation_*` string `main.rs` emits as the
+/// (#2190) The exact snake_case `escalation_*` string `lib.rs` emits as the
 /// JSON envelope's `result` field for a given [`EscalationReason`] — single
 /// source of truth so the envelope's `result` and the
 /// `dispatch.escalation.triggered` trajectory event's `reason` field can
 /// never name the same termination two different ways. Lives here (not in
-/// `main.rs`) because this is where [`EscalationReason`] itself is defined —
+/// `lib.rs`) because this is where [`EscalationReason`] itself is defined —
 /// a match over the enum belongs next to the enum, not duplicated at every
 /// consumer.
 pub fn escalation_reason_str(reason: EscalationReason) -> &'static str {
@@ -550,7 +550,7 @@ pub struct LoopOutcome {
     /// (#1221) The turn's ANSWER text when the loop exits with a checkpoint
     /// prefill still pending.
     ///
-    /// `main.rs` derives the deliverable as "the last assistant message", which
+    /// `lib.rs` derives the deliverable as "the last assistant message", which
     /// is the prefill on every non-terminal exit (escalation, cumulative cap,
     /// max turns) — so the operator got the model's raw scratch work as its
     /// answer. The loop knows which region is the answer; nothing downstream
@@ -914,7 +914,7 @@ fn as_deliverable_text(s: &str) -> String {
 /// mutated at seven sites, so it was possible — and it happened twice — to
 /// clear the index while leaving the message it pointed at. An orphaned
 /// prefill is not a cosmetic mess: nothing downstream can reconstruct the
-/// answer from it, so `main.rs` hands raw `<think>` markup over as the
+/// answer from it, so `lib.rs` hands raw `<think>` markup over as the
 /// deliverable.
 ///
 /// So every transition that touches the prefill takes `&mut Vec<Message>` and
@@ -1189,7 +1189,7 @@ impl TurnAccum {
     ///
     /// A concluding turn returns only the SUFFIX (a continuation carries just
     /// the new text), so without this fold the accumulated body stays orphaned
-    /// in the prefill one slot earlier and `main.rs` — which takes the last
+    /// in the prefill one slot earlier and `lib.rs` — which takes the last
     /// assistant message — hands over the tail and nothing else. That is the
     /// MODAL path, not an edge case: most turns conclude rather than
     /// degenerate.
@@ -1435,7 +1435,7 @@ fn recover_intra_turn_stall(
 /// count/duration call [`run_with_sleeper`] directly with a recording
 /// sleeper instead.
 ///
-/// (#2114) No longer `main.rs`'s entry point — production now calls
+/// (#2114) No longer `lib.rs`'s entry point — production now calls
 /// [`run_resumable`], which takes the out-dir root and an optional
 /// checkpoint explicitly. This one is `#[cfg(test)]` because nothing in
 /// the non-test binary calls it anymore, but the bulk of this file's test
@@ -1444,7 +1444,7 @@ fn recover_intra_turn_stall(
 ///
 /// (#2114 finding 3) Each call gets its OWN fresh host tempdir as its
 /// out-dir rather than a hardcoded path: this fn only ever runs on the
-/// TEST host (never inside the container `main.rs` drives), where neither
+/// TEST host (never inside the container `lib.rs` drives), where neither
 /// `/darkmux-out` nor the old `/workspace` exist as writable paths. Before
 /// this, every turn-boundary checkpoint write inside a `run()`-based test
 /// failed and logged — 1,230 "failed to write checkpoint" lines across the
@@ -1619,7 +1619,7 @@ fn observed_dispatch(name: &str, raw_args: &str) -> crate::tools::ToolRun {
 /// that have no reason to learn about pace files or checkpoints), and
 /// every one of them would otherwise need a `Path::new(trajectory::
 /// RUNTIME_OUT_BASE), None,` tacked onto its argument list for a feature
-/// it doesn't touch. `main.rs` (the only real caller that needs a
+/// it doesn't touch. `lib.rs` (the only real caller that needs a
 /// non-default out-dir root or a resume) calls this one instead.
 #[allow(clippy::too_many_arguments)]
 pub fn run_resumable(
@@ -1931,7 +1931,7 @@ fn run_streaming_turn(
         // (#2836 stage 2) A SILENT stream ends the turn; it does not kill the
         // dispatch.
         //
-        // The read timeout used to propagate as an `Err`, which `main.rs`
+        // The read timeout used to propagate as an `Err`, which `lib.rs`
         // turns into `result: "error"` with no deliverable — every banked checkpoint of a long turn lost because
         // the endpoint stopped talking at the end of it. The runtime already
         // knows how to end a call and hand the accumulation back; this routes
@@ -6946,7 +6946,7 @@ mod tests {
     /// A prefill and its state are created, folded, and abandoned as a UNIT.
     /// Clearing the index while leaving the message is the leak that produced
     /// both of this feature's shipped defects: nothing downstream can
-    /// reconstruct an answer from an orphaned prefill, so `main.rs` hands raw
+    /// reconstruct an answer from an orphaned prefill, so `lib.rs` hands raw
     /// `<think>` markup over as the deliverable.
     /// (#2836) The degeneracy judge must never be handed an empty string
     /// while the model is producing output.
@@ -8689,7 +8689,7 @@ mod tests {
             "repeated blank calls must still exhaust the recovery budget and escalate, got {:?}",
             outcome.terminal_reason
         );
-        // The banked work is reachable EXACTLY as main.rs reaches it.
+        // The banked work is reachable EXACTLY as lib.rs reaches it.
         let deliverable = outcome
             .final_answer
             .clone()
@@ -8716,11 +8716,11 @@ mod tests {
     }
 
     /// (#1221) A turn that CONCLUDES after checkpointing must keep its whole
-    /// answer where `main.rs` looks for it.
+    /// answer where `lib.rs` looks for it.
     ///
     /// A prefill continuation returns only the SUFFIX. Pushing that as a fresh
     /// message left the accumulated body orphaned in the stale prefill one slot
-    /// earlier, and `main.rs` takes "the last assistant message" as the
+    /// earlier, and `lib.rs` takes "the last assistant message" as the
     /// deliverable — so the envelope, the JSON content and the operator preview
     /// got the tail and nothing else. Modal path, not an edge case: most turns
     /// conclude rather than degenerate.
@@ -8770,7 +8770,7 @@ mod tests {
         )
         .expect("concluding checkpointed turn returns Ok");
 
-        // Exactly what main.rs does to produce the deliverable.
+        // Exactly what lib.rs does to produce the deliverable.
         let final_assistant = outcome
             .messages
             .iter()
@@ -8839,7 +8839,7 @@ mod tests {
         // delimiters left lying in history: the terminal fold removes the
         // prefill and hands back the answer region, so a concluded turn
         // correctly leaves no `<think>` behind at all.
-        // Exactly what main.rs does: prefer the answer the loop identified.
+        // Exactly what lib.rs does: prefer the answer the loop identified.
         let final_assistant = outcome
             .final_answer
             .clone()
@@ -9077,7 +9077,7 @@ mod tests {
     /// `loop_runs_against_mock_and_terminates_on_stop` (Stop case)
     /// to lock both terminal reasons. MaxTurns specifically asserts
     /// the loop returns Ok(outcome) — the JSON envelope path in
-    /// main.rs reads outcome.terminal_reason and emits result=max_turns.
+    /// lib.rs reads outcome.terminal_reason and emits result=max_turns.
     #[test]
     #[serial_test::serial]
     fn loop_returns_maxturns_terminal_reason_when_cap_hit() {
@@ -13454,7 +13454,7 @@ mod tests {
                 "the answer bound this test set via max_tokens_per_call, got {cp:?}"
             );
         }
-        // Exactly what main.rs does to produce the deliverable.
+        // Exactly what lib.rs does to produce the deliverable.
         let delivered = outcome
             .final_answer
             .clone()

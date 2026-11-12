@@ -255,7 +255,7 @@ pub fn read_checkpoint(path: &Path) -> anyhow::Result<RunCheckpoint> {
 /// `read_checkpoint` above only validates the SHAPE (parses, schema
 /// version matches); this validates the cross-role/cross-prompt SAFETY
 /// this function actually can, against context this run has, never the
-/// file's own claims. Called from `main.rs` once `tools`/`initial_messages`
+/// file's own claims. Called from `lib.rs` once `tools`/`initial_messages`
 /// are resolved — `read_checkpoint` alone stays callable standalone
 /// (tests, the "missing/corrupt" early-fail path) without needing that
 /// context. The host closes a THIRD leg (workspace mount-mode/path) that
