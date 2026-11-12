@@ -31,6 +31,9 @@ pub struct FakePlatform {
     /// The `(peer, pid)` pairs [`Platform::tcp_peers_of`] answers, whatever
     /// the listener.
     pub tcp_peers: Vec<(std::net::SocketAddr, u32)>,
+    /// `(pgid, listeners)` [`Platform::tcp_group_listeners`] answers; any
+    /// other group has none.
+    pub group_listeners: Vec<(u32, Vec<crate::GroupListener>)>,
     /// `(pid, group)` pairs [`Platform::process_group`] answers.
     pub process_groups: Vec<(u32, u32)>,
     /// `(pid, app)` pairs [`Platform::signed_app`] names; any other pid is unsigned.
@@ -63,6 +66,7 @@ impl Default for FakePlatform {
             tcp_listeners_unreadable: false,
             tcp_listeners_unreadable_reads: std::sync::atomic::AtomicU32::new(0),
             tcp_peers: Vec::new(),
+            group_listeners: Vec::new(),
             process_groups: Vec::new(),
             signed_apps: Vec::new(),
             allow_answer: crate::AllowAnswer::NoDialog("a fake platform shows no dialog".to_string()),
@@ -179,6 +183,10 @@ impl Platform for FakePlatform {
 
     fn tcp_peers_of(&self, _local: std::net::SocketAddr) -> Option<Vec<(std::net::SocketAddr, u32)>> {
         Some(self.tcp_peers.clone())
+    }
+
+    fn tcp_group_listeners(&self, pgid: u32) -> Option<Vec<crate::GroupListener>> {
+        Some(self.group_listeners.iter().find(|(g, _)| *g == pgid).map(|(_, l)| l.clone()).unwrap_or_default())
     }
 
     fn process_group(&self, pid: u32) -> Option<u32> {

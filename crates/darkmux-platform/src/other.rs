@@ -107,6 +107,10 @@ impl Platform for OtherPlatform {
         None
     }
 
+    fn tcp_group_listeners(&self, _pgid: u32) -> Option<Vec<crate::GroupListener>> {
+        None
+    }
+
     fn process_group(&self, _pid: u32) -> Option<u32> {
         None
     }

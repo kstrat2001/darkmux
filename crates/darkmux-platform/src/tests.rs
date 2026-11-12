@@ -1680,3 +1680,71 @@ fn a_fake_answers_the_default_sandbox_the_test_set() {
     let fake = FakePlatform { default_sandbox: DefaultSandbox::Seatbelt, ..FakePlatform::default() };
     assert_eq!(fake.default_sandbox(), DefaultSandbox::Seatbelt);
 }
+
+/// (#3112) `lsof -Fptn` for a process group's listeners: one entry per
+/// socket, under its `p<pid>` line, its address read with its family (`*`
+/// is every address of that family), brackets off an IPv6 one.
+#[test]
+fn lsof_group_listener_lines_parse_to_addresses() {
+    use std::net::IpAddr;
+    let out = "p66893\nf3\ntIPv6\nn*:55390\nf4\ntIPv4\nn127.0.0.1:55391\np66894\nf5\ntIPv6\nn[::1]:55392\nf6\ntIPv4\nn*:55393\nf7\ntIPv4\nnbogus\n";
+    let got = crate::group_listeners_from_lsof(out);
+    let want = vec![
+        GroupListener { pid: 66893, addr: "::".parse::<IpAddr>().unwrap(), port: 55390 },
+        GroupListener { pid: 66893, addr: "127.0.0.1".parse().unwrap(), port: 55391 },
+        GroupListener { pid: 66894, addr: "::1".parse().unwrap(), port: 55392 },
+        GroupListener { pid: 66894, addr: "0.0.0.0".parse().unwrap(), port: 55393 },
+    ];
+    assert_eq!(got, want);
+    assert!(crate::group_listeners_from_lsof("").is_empty());
+}
+
+/// (#3112) `/proc/net/tcp{,6}`'s LISTEN rows as (address, inode), whatever
+/// the port; an ESTABLISHED row is not one.
+#[test]
+fn proc_net_listen_rows_read_with_their_address() {
+    let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 41231 1 0000000000000000 100 0 0 10 0\n\
+   1: 00000000:1F91 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 41232 1 0000000000000000 100 0 0 10 0\n\
+   3: 0100007F:1F90 0100007F:D431 01 00000000:00000000 00:00000000 00000000  1000        0 41234 1 0000000000000000 100 0 0 10 0\n";
+    assert_eq!(
+        crate::linux::listening_sockets(table),
+        vec![("127.0.0.1:8080".parse().unwrap(), 41231), ("0.0.0.0:8081".parse().unwrap(), 41232)]
+    );
+}
+
+/// (#3112) Every TCP listener in a process group, asked of this host's
+/// strategy: a child in a group of its own that listens on every address
+/// and on loopback is read with both addresses; a group with none reads
+/// empty. An OS with no strategy cannot say; the fake answers what was set.
+#[test]
+fn the_host_lists_a_process_groups_listeners() {
+    use std::os::unix::process::CommandExt;
+    let host = current();
+    if host.tcp_group_listeners(unsafe { libc::getpgid(0) } as u32).is_none() {
+        return; // no strategy reads sockets here
+    }
+    let mut child = std::process::Command::new("/usr/bin/python3")
+        .args(["-c", "import socket,sys,time\na=socket.socket();a.bind(('0.0.0.0',0));a.listen()\nb=socket.socket();b.bind(('127.0.0.1',0));b.listen()\nprint(a.getsockname()[1],b.getsockname()[1],flush=True)\ntime.sleep(30)"])
+        .stdout(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut std::io::BufReader::new(child.stdout.take().unwrap()), &mut line).unwrap();
+    let ports: Vec<u16> = line.split_whitespace().map(|p| p.parse().unwrap()).collect();
+    let mut got = host.tcp_group_listeners(child.id()).expect("this host reads its sockets");
+    got.sort_by_key(|l| l.port);
+    let _ = child.kill();
+    let _ = child.wait();
+    let want = vec![
+        GroupListener { pid: child.id(), addr: "0.0.0.0".parse().unwrap(), port: ports[0] },
+        GroupListener { pid: child.id(), addr: "127.0.0.1".parse().unwrap(), port: ports[1] },
+    ];
+    assert_eq!(got, want);
+    assert_eq!(host.tcp_group_listeners(u32::MAX >> 1), Some(vec![]), "no such group, no listeners");
+    assert_eq!(OtherPlatform.tcp_group_listeners(1), None);
+    let one = GroupListener { pid: 7, addr: "0.0.0.0".parse().unwrap(), port: 9 };
+    let fake = FakePlatform { group_listeners: vec![(5, vec![one.clone()])], ..Default::default() };
+    assert_eq!((fake.tcp_group_listeners(5), fake.tcp_group_listeners(6)), (Some(vec![one]), Some(vec![])));
+}
