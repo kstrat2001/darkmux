@@ -382,6 +382,8 @@ mod tests {
             ("data.yml", "alt: /hero.jpg\n", "/hero.jpg"),
             ("post.md", "# Post\n\nimage: /hero.jpg\n", "/hero.jpg"),
             ("post.md", "---\ntitle: x\n---\n\nimage: /hero.jpg\n", "/hero.jpg"),
+            ("post.md", "# Post\n\nimage: /hero.jpg\n\n---\n\nMore.\n", "/hero.jpg"),
+            ("post.md", "---\ntitle: x\n---\n\nimage: /hero.jpg\n\n---\n", "/hero.jpg"),
             ("README.md", "![logo](/hero.jpg)\n", "/hero.jpg"),
             ("docs/CHANGELOG.md", "![logo](/hero.jpg)\n", "/hero.jpg"),
             ("notes.txt", "src=\"/hero.jpg\"", "/hero.jpg"),
