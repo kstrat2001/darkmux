@@ -436,8 +436,9 @@ pub fn envelope_candidate(stdout: &str) -> &str {
 /// # This is for dispatch STDOUT, and only for dispatch stdout
 ///
 /// The input must be what the internal runtime prints: `serde_json::to_string`
-/// (COMPACT) + `println!` (`runtime/src/lib.rs:1110`, `:1216`), i.e. the
-/// envelope occupies exactly one line, possibly preceded by noise.
+/// (COMPACT) + `println!` (`print_success` and `print_failure` in
+/// `runtime/src/lib.rs`), i.e. the envelope occupies exactly one line,
+/// possibly preceded by noise.
 ///
 /// Do NOT route a stored, PRETTY-PRINTED artifact through this. The last line
 /// starting with `{` in a pretty-printed document is an inner array-element

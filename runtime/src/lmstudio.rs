@@ -1226,9 +1226,10 @@ fn error_event(data: &str) -> Option<anyhow::Error> {
     let event = serde_json::from_str::<serde_json::Value>(data).ok()?;
     let err = event.get("error")?;
     let message = err.get("message").unwrap_or(err);
+    // (#3112) A parsed object in the message: the standalone build's key order.
     let message = message
         .as_str()
-        .map_or_else(|| message.to_string(), str::to_string);
+        .map_or_else(|| crate::key_order::sorted(message.clone()).to_string(), str::to_string);
     Some(anyhow!(
         "endpoint sent an error event mid-stream: {message}"
     ))

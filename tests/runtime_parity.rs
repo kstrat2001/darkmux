@@ -340,6 +340,23 @@ fn messages_stream_error(_: usize, _: &str) -> Reply {
     Reply { status: 200, content_type: "text/event-stream", body: format!("event: error\ndata: {event}\n\n"), delay_ms: 0 }
 }
 
+/// A chat-completions stream whose payload is the engine's error with no
+/// string `message`: an error that prints the error object.
+fn stream_error_object(_: usize, _: &str) -> Reply {
+    let event = json!({ "error": { "type": "server_error", "code": "overloaded" } });
+    Reply { status: 200, content_type: "text/event-stream", body: format!("data: {event}\n\n"), delay_ms: 0 }
+}
+
+/// The structured-slot compactor answering with slots of the wrong type,
+/// unsorted: the parse error names the first bad field it meets.
+fn compaction_bad_slots(n: usize, body: &str) -> Reply {
+    if body.contains("\"util-model\"") {
+        let slots = json!({ "verify_criteria": 5, "objective": 7 }).to_string();
+        return chat(json!({ "role": "assistant", "content": slots }), "stop", 40);
+    }
+    compaction_turns(n, body)
+}
+
 fn server_error(_: usize, _: &str) -> Reply {
     Reply { status: 500, content_type: "application/json", body: r#"{"error":"boom"}"#.into(), delay_ms: 0 }
 }
@@ -663,6 +680,29 @@ fn compaction_matches_under_both_strategies() {
     }
 }
 
+/// A streamed engine error whose `error` has no string `message`: the
+/// message prints the error object.
+#[test]
+fn a_streamed_error_object_matches() {
+    let o = assert_parity("stream error object", case(&dispatch(&["--json"]).iter().map(String::as_str).collect::<Vec<_>>(), stream_error_object));
+    assert_eq!(o.code, Some(1), "{o:?}");
+    assert!(o.stderr.contains("error event mid-stream"), "{}", o.stderr);
+}
+
+/// A structured-slot compaction whose slots do not parse: the reason the
+/// runtime gives names the same field in both programs.
+#[test]
+fn a_compaction_parse_failure_matches() {
+    let extra = [
+        "--no-stream", "--json", "--compactor-model", "util-model", "--compact-threshold-tokens", "1000",
+        "--max-turns", "3", "--compact-strategy", "structured-slot",
+    ];
+    let args: Vec<String> = dispatch(&extra).into_iter().filter(|a| a != "--context-window" && a != "32000").collect();
+    let o = assert_parity("compaction parse failure", case(&args.iter().map(String::as_str).collect::<Vec<_>>(), compaction_bad_slots));
+    let said = format!("{}{}", o.stderr, o.files.iter().map(|f| f.1.as_str()).collect::<String>());
+    assert!(said.contains("parsing compactor JSON failed"), "the parse failed and was reported: {said}");
+}
+
 /// A loop error: exit 1, the error envelope, the human failure block.
 #[test]
 fn a_loop_error_matches() {
@@ -788,44 +828,109 @@ fn the_runtime_subcommand_runs_inside_a_seatbelt_sandbox() {
 
 // ─── the linked package stays the standalone one ───────────────────────
 
-/// `name = value` for each line of `manifest`'s `[dependencies]` table,
-/// comments and blank lines dropped, a `path` resolved to the directory it
-/// names (the two manifests sit at different depths).
-fn dependencies(manifest: &Path) -> Vec<(String, String)> {
+/// The tables of `manifest` that decide how its library is built, by
+/// header (`[dependencies]`, `[features]`, `[target.….dependencies]`), each
+/// as its `key = value` lines: comments and blank lines dropped, a `path`
+/// resolved to the directory it names (the two manifests sit at different
+/// depths).
+fn build_tables(manifest: &Path) -> Vec<(String, Vec<(String, String)>)> {
     let text = std::fs::read_to_string(manifest).unwrap();
     let dir = manifest.parent().unwrap();
-    let mut in_table = false;
-    let mut deps = Vec::new();
+    let wanted = |h: &str| h == "[dependencies]" || h == "[features]" || (h.starts_with("[target.") && h.ends_with(".dependencies]"));
+    let mut tables: Vec<(String, Vec<(String, String)>)> = Vec::new();
+    let mut current: Option<usize> = None;
     for line in text.lines().map(|l| l.split('#').next().unwrap().trim()) {
         if line.starts_with('[') {
-            in_table = line == "[dependencies]";
+            current = wanted(line).then(|| {
+                tables.push((line.to_string(), Vec::new()));
+                tables.len() - 1
+            });
             continue;
         }
-        let Some((name, value)) = line.split_once('=').filter(|_| in_table) else { continue };
+        let (Some(at), Some((name, value))) = (current, line.split_once('=')) else { continue };
         let mut value = value.trim().to_string();
-        if let Some(at) = value.find("path = \"") {
-            let rest = &value[at + 8..];
+        if let Some(i) = value.find("path = \"") {
+            let rest = &value[i + 8..];
             let rel = &rest[..rest.find('"').unwrap()];
             let real = dir.join(rel).canonicalize().unwrap().display().to_string();
             value = value.replace(rel, &real);
         }
-        deps.push((name.trim().to_string(), value));
+        tables[at].1.push((name.trim().to_string(), value));
     }
-    deps.sort();
-    deps
+    for (_, entries) in &mut tables {
+        entries.sort();
+    }
+    tables.sort();
+    tables
 }
 
-/// (#3112) `crates/darkmux-runtime-linked` compiles `runtime/src` against the
-/// dependencies it declares; they must be the standalone runtime's own,
-/// names and features, or the copy in darkmux is built differently from the
-/// one in the Docker image.
+/// (#3112) `crates/darkmux-runtime-linked` compiles `runtime/src` against what
+/// its manifest declares; its dependencies, features and per-target
+/// dependencies must be the standalone runtime's own, names and features, or
+/// the copy in darkmux is built differently from the one in the Docker image.
 #[test]
 fn the_linked_runtime_declares_the_standalone_runtimes_dependencies() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let standalone = dependencies(&root.join("runtime/Cargo.toml"));
-    let linked = dependencies(&root.join("crates/darkmux-runtime-linked/Cargo.toml"));
-    assert!(standalone.iter().any(|(n, _)| n == "ureq"), "the reader found the table: {standalone:?}");
+    let standalone = build_tables(&root.join("runtime/Cargo.toml"));
+    let linked = build_tables(&root.join("crates/darkmux-runtime-linked/Cargo.toml"));
+    let deps = standalone.iter().find(|(h, _)| h == "[dependencies]").expect("the reader found the table");
+    assert!(deps.1.iter().any(|(n, _)| n == "ureq"), "{standalone:?}");
     assert_eq!(linked, standalone);
+}
+
+/// `name -> versions` of every package `package` builds with (normal and
+/// build dependencies, transitively), as `manifest`'s lockfile resolves them.
+fn resolved_closure(manifest: &Path, package: &str) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let out = Command::new(cargo)
+        .args(["metadata", "--format-version", "1", "--locked", "--manifest-path"])
+        .arg(manifest)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "cargo metadata {}: {}", manifest.display(), String::from_utf8_lossy(&out.stderr));
+    let m: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let name_version = |id: &str| {
+        let p = m["packages"].as_array().unwrap().iter().find(|p| p["id"] == id).unwrap();
+        (p["name"].as_str().unwrap().to_string(), p["version"].as_str().unwrap().to_string())
+    };
+    let nodes = m["resolve"]["nodes"].as_array().unwrap();
+    let start = m["packages"].as_array().unwrap().iter().find(|p| p["name"] == package).unwrap()["id"].as_str().unwrap().to_string();
+    let (mut seen, mut todo) = (std::collections::BTreeSet::new(), vec![start]);
+    while let Some(id) = todo.pop() {
+        let node = nodes.iter().find(|n| n["id"] == id.as_str()).unwrap();
+        for dep in node["deps"].as_array().unwrap() {
+            let built = dep["dep_kinds"].as_array().unwrap().iter().any(|k| k["kind"].is_null() || k["kind"] == "build");
+            let pkg = dep["pkg"].as_str().unwrap().to_string();
+            if built && seen.insert(pkg.clone()) {
+                todo.push(pkg);
+            }
+        }
+    }
+    let mut closure: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> = Default::default();
+    for id in &seen {
+        let (name, version) = name_version(id);
+        closure.entry(name).or_default().insert(version);
+    }
+    closure
+}
+
+/// (#3112) The two lockfiles resolve the runtime's dependencies to the same
+/// versions: a package the standalone runtime builds with is the same version
+/// in darkmux's build (which may add more, for features other crates turn
+/// on). Otherwise the two programs differ in code no parity fixture reaches,
+/// such as the CA roots `webpki-roots` trusts.
+#[test]
+fn both_lockfiles_resolve_the_runtimes_dependencies_to_the_same_versions() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let standalone = resolved_closure(&root.join("runtime/Cargo.toml"), "darkmux-runtime");
+    let linked = resolved_closure(&root.join("Cargo.toml"), "darkmux-runtime-linked");
+    assert!(standalone.contains_key("webpki-roots"), "the closure was read: {standalone:?}");
+    let differing: Vec<String> = standalone
+        .iter()
+        .filter(|(name, versions)| linked.get(*name).is_none_or(|l| !versions.is_subset(l)))
+        .map(|(name, versions)| format!("{name}: standalone {versions:?}, linked {:?}", linked.get(name)))
+        .collect();
+    assert!(differing.is_empty(), "align these (`cargo update -p <name> --precise <version>`):\n{}", differing.join("\n"));
 }
 
 /// (#3112) The subcommand is for sandboxes, not people: `--help` does not

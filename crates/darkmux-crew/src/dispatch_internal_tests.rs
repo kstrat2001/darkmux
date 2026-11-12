@@ -6346,45 +6346,124 @@ S(("127.0.0.1", port), H).serve_forever()
         assert_eq!(prompt(&docker).as_deref(), Some("/darkmux-out/.prompt.txt"));
     }
 
+    /// An executable file (mode 755) at `path`, its directory created.
+    fn an_executable(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     /// (#3112) With no override, a Seatbelt dispatch runs THIS executable's
-    /// `runtime` subcommand, by its real path: a link into an install (how
-    /// Homebrew puts `bin/darkmux` on PATH, pointing into its Cellar) is
-    /// followed, so the program the sandbox runs is the file its profile
-    /// allows. An empty override is no override.
+    /// `runtime` subcommand, by the real path it had when the process
+    /// started: a link into an install (how Homebrew puts `bin/darkmux` on
+    /// PATH, pointing into its Cellar) is followed, so the program the
+    /// sandbox runs is the file its profile allows. An empty override is no
+    /// override.
     #[test]
     fn a_seatbelt_dispatch_runs_this_executables_runtime_subcommand_by_its_real_path() {
         let root = tempfile::TempDir::new().unwrap();
-        let cellar = root.path().join("Cellar/darkmux/9.9.9/bin");
-        std::fs::create_dir_all(&cellar).unwrap();
-        std::fs::write(cellar.join("darkmux"), "").unwrap();
-        std::fs::create_dir(root.path().join("bin")).unwrap();
+        let cellar = root.path().join("Cellar/darkmux/9.9.9/bin/darkmux");
+        an_executable(&cellar, "old");
         let link = root.path().join("bin/darkmux");
-        std::os::unix::fs::symlink(cellar.join("darkmux"), &link).unwrap();
-        let real = cellar.join("darkmux").canonicalize().unwrap();
+        std::fs::create_dir(root.path().join("bin")).unwrap();
+        std::os::unix::fs::symlink(&cellar, &link).unwrap();
+        let at_start = executable_at_start(Ok(link.clone()));
+        let real = cellar.canonicalize().unwrap();
 
         for named in [None, Some(std::ffi::OsString::new())] {
-            let got = host_runtime(named, Ok(link.clone())).unwrap();
+            let got = host_runtime(named, &at_start).unwrap();
             assert_eq!(got, HostRuntime { program: real.clone(), leading_args: vec!["runtime".to_string()] });
         }
-        let err = host_runtime(None, Err(std::io::Error::other("no exe"))).unwrap_err();
+        let unknown = executable_at_start(Err(std::io::Error::other("no exe")));
+        let err = host_runtime(None, &unknown).unwrap_err();
         assert!(format!("{err:#}").contains("finding this darkmux executable"), "{err:#}");
     }
 
+    /// (#3112 review) A long-lived process (a `darkmux serve`) whose install
+    /// was upgraded keeps running the runtime it was built with while that
+    /// file is still there: a relink of `bin/darkmux` to a new Cellar does
+    /// not change what it runs.
+    #[test]
+    fn a_relinked_install_keeps_running_the_runtime_this_process_started_from() {
+        let root = tempfile::TempDir::new().unwrap();
+        let old = root.path().join("Cellar/darkmux/1.0.0/bin/darkmux");
+        let new = root.path().join("Cellar/darkmux/2.0.0/bin/darkmux");
+        an_executable(&old, "old");
+        an_executable(&new, "new build");
+        std::fs::create_dir(root.path().join("bin")).unwrap();
+        let link = root.path().join("bin/darkmux");
+        std::os::unix::fs::symlink(&old, &link).unwrap();
+        let at_start = executable_at_start(Ok(link.clone()));
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&new, &link).unwrap();
+
+        let got = host_runtime(None, &at_start).unwrap();
+        assert_eq!(got.program, old.canonicalize().unwrap(), "the file this process started from, not the new link target");
+    }
+
+    /// (#3112 review) Once the file this process started from is gone or is
+    /// another file (`cargo install` replaces by rename; `brew cleanup`
+    /// deletes the old Cellar), the dispatch is refused with the remedy,
+    /// never run against a runtime that does not match this process.
+    #[test]
+    fn a_replaced_or_removed_executable_is_refused_with_restart_as_the_remedy() {
+        let root = tempfile::TempDir::new().unwrap();
+        let exe = root.path().join("bin/darkmux");
+        an_executable(&exe, "old");
+        let at_start = executable_at_start(Ok(exe.clone()));
+
+        // Replaced by rename: same path, another file (same size, too).
+        let staged = root.path().join("bin/.darkmux.new");
+        an_executable(&staged, "new");
+        std::fs::rename(&staged, &exe).unwrap();
+        let err = format!("{:#}", host_runtime(None, &at_start).unwrap_err());
+        assert!(err.contains("was replaced since this process started") && err.contains("Restart this darkmux process"), "{err}");
+
+        std::fs::remove_file(&exe).unwrap();
+        let err = format!("{:#}", host_runtime(None, &at_start).unwrap_err());
+        assert!(err.contains("was replaced since this process started") && err.contains("Restart this darkmux process"), "{err}");
+    }
+
     /// (#3112) `DARKMUX_SANDBOX_RUNTIME`, for development, runs a standalone
-    /// runtime instead, as given and with no subcommand; one that names no
-    /// file is refused, naming the variable, never silently replaced.
+    /// runtime instead, by its real path and with no subcommand. One that is
+    /// not an executable file (missing, a directory, not executable) is
+    /// refused, naming the variable, never silently replaced.
     #[test]
     fn the_sandbox_runtime_override_runs_a_standalone_runtime_or_is_refused() {
         let root = tempfile::TempDir::new().unwrap();
-        let standalone = root.path().join("darkmux-runtime");
-        std::fs::write(&standalone, "").unwrap();
-        let exe = Ok(root.path().join("darkmux"));
-        let got = host_runtime(Some(standalone.clone().into_os_string()), exe).unwrap();
-        assert_eq!(got, HostRuntime { program: standalone, leading_args: Vec::new() });
+        let standalone = root.path().join("rt/darkmux-runtime");
+        an_executable(&standalone, "");
+        let at_start = executable_at_start(Ok(root.path().join("darkmux")));
+        // Relative to the working directory (`root/rt/../rt/…`): resolved.
+        let relative = standalone.strip_prefix(std::env::current_dir().unwrap()).map(Path::to_path_buf).unwrap_or_else(|_| {
+            pathdiff_to(&std::env::current_dir().unwrap(), &standalone)
+        });
+        assert!(relative.is_relative(), "{}", relative.display());
+        let got = host_runtime(Some(relative.into_os_string()), &at_start).unwrap();
+        assert_eq!(got, HostRuntime { program: standalone.canonicalize().unwrap(), leading_args: Vec::new() });
 
-        let missing = root.path().join("nope");
-        let err = host_runtime(Some(missing.into_os_string()), Ok(root.path().join("darkmux"))).unwrap_err();
-        assert!(format!("{err:#}").contains("DARKMUX_SANDBOX_RUNTIME="), "{err:#}");
+        let plain = root.path().join("not-executable");
+        std::fs::write(&plain, "").unwrap();
+        for refused in [root.path().join("nope"), root.path().join("rt"), plain] {
+            let err = format!("{:#}", host_runtime(Some(refused.clone().into_os_string()), &at_start).unwrap_err());
+            assert!(err.contains("DARKMUX_SANDBOX_RUNTIME=") && err.contains("not an executable file"), "{}: {err}", refused.display());
+        }
+    }
+
+    /// `to` relative to `from`, by `..` up to their common ancestor.
+    fn pathdiff_to(from: &Path, to: &Path) -> PathBuf {
+        let from: Vec<_> = from.components().collect();
+        let to: Vec<_> = to.components().collect();
+        let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+        let mut rel = PathBuf::new();
+        for _ in common..from.len() {
+            rel.push("..");
+        }
+        for c in &to[common..] {
+            rel.push(c);
+        }
+        rel
     }
 
     /// (#3112) The dispatch's config carries the host runtime's program AND

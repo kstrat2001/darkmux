@@ -41,6 +41,14 @@ Narrower still is better when you know the name: `cargo nextest run -p
 darkmux-flow integrity_exit_code` runs one function's tests in under a second.
 A filter is almost always the right first move after an edit.
 
+**`--workspace --all-targets` needs `--exclude darkmux-runtime-linked` (#3112).**
+That package's library is `runtime/src`, and `--all-targets` compiles a
+library's test code even with `test = false`; those tests need runtime/'s own
+dev-dependencies, which this workspace does not carry. They run from
+`runtime/` (`cargo t-runtime`, `cargo t-runtime-linked`), and CI lints the
+library alone as darkmux builds it (`cargo clippy -p darkmux-runtime-linked`).
+`nextest run --workspace` is unaffected.
+
 **Why nextest rather than `cargo test`** — and it is NOT mainly speed. On a
 single area the two are equivalent (measured 4.6s vs 4.5s); the gap only opens
 on `--workspace` (~75s vs ~10min), which you rarely run. The real reason is

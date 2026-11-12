@@ -1523,6 +1523,9 @@ pub(crate) fn parse_compactor_response_content(content: &str) -> Result<Structur
         );
     }
 
+    // (#3112) Sorted first: which invalid field the error names follows the
+    // object's order, which is the standalone build's in every build.
+    let patched_value = crate::key_order::sorted(patched_value);
     let mut out = serde_json::from_value::<StructuredCompactionOutput>(patched_value).map_err(|e| {
         anyhow!(
             "parsing compactor JSON failed (even after repair + schema patch): {e} \

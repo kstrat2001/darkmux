@@ -150,7 +150,12 @@ fn main() -> runtime_cmd::Exit {
     // anything else runs (`runtime_cmd`'s module doc says why).
     match runtime_cmd::run_if_invoked() {
         Some(code) => runtime_cmd::Exit::Runtime(code),
-        None => runtime_cmd::Exit::Darkmux(darkmux_main()),
+        None => {
+            // (#3112 review) Which file this process started from, before
+            // anything can replace it: a Seatbelt dispatch runs only that.
+            darkmux_crew::dispatch_internal::note_executable_at_start();
+            runtime_cmd::Exit::Darkmux(darkmux_main())
+        }
     }
 }
 

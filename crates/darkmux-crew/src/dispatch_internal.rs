@@ -7068,27 +7068,87 @@ pub const RUNTIME_SUBCOMMAND: &str = "runtime";
 /// place of this executable's own runtime.
 pub const SANDBOX_RUNTIME_ENV: &str = "DARKMUX_SANDBOX_RUNTIME";
 
+/// (#3112 review) Which file a path names: replacing it (a rename over it,
+/// a reinstall) or deleting it changes this, an edit-free relink of
+/// something else does not.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct FileIdentity {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+fn file_identity(path: &Path) -> std::io::Result<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path)?;
+    Ok(FileIdentity { dev: meta.dev(), ino: meta.ino(), len: meta.len(), modified: meta.modified().ok() })
+}
+
+/// (#3112 review) This executable as the process started from it: its real
+/// path then, and which file was there. A Seatbelt dispatch runs that path,
+/// and only while the same file is still there: a long-lived process
+/// (`darkmux serve`) must never run a NEWER build's runtime against its own
+/// arguments and parsers after an upgrade, and the runtime's `--version`
+/// cannot tell them apart.
+#[derive(Debug)]
+pub struct ExecutableAtStart(std::result::Result<(PathBuf, FileIdentity), String>);
+
+/// What `exe` (this process's `current_exe()`) named, resolved now.
+fn executable_at_start(exe: std::io::Result<PathBuf>) -> ExecutableAtStart {
+    let found = exe
+        .map_err(|e| format!("finding this darkmux executable, whose `runtime` subcommand the Seatbelt sandbox runs: {e}"))
+        .and_then(|exe| {
+            let real = exe.canonicalize().map_err(|e| format!("resolving this darkmux executable's path ({}): {e}", exe.display()))?;
+            let identity = file_identity(&real).map_err(|e| format!("reading this darkmux executable ({}): {e}", real.display()))?;
+            Ok((real, identity))
+        });
+    ExecutableAtStart(found)
+}
+
+static EXECUTABLE_AT_START: std::sync::OnceLock<ExecutableAtStart> = std::sync::OnceLock::new();
+
+/// (#3112 review) Record this executable as the process starts from it. The
+/// darkmux binary calls this first thing; a process that never did records it
+/// at its first Seatbelt dispatch instead.
+pub fn note_executable_at_start() {
+    EXECUTABLE_AT_START.get_or_init(|| executable_at_start(std::env::current_exe()));
+}
+
 /// (#3112) The runtime a Seatbelt dispatch runs: the standalone build
 /// `override_program` names ([`SANDBOX_RUNTIME_ENV`]), else this executable
-/// (`exe`), whose `runtime` subcommand is the runtime itself, so nothing is
-/// built or downloaded. The executable is named by its real path: an
-/// install's link (Homebrew's `bin/darkmux` into its Cellar) or a relative
-/// invocation is not a path the sandbox's profile allows it to run from.
-fn host_runtime(override_program: Option<std::ffi::OsString>, exe: std::io::Result<PathBuf>) -> Result<HostRuntime> {
-    if let Some(program) = override_program.filter(|v| !v.is_empty()).map(PathBuf::from) {
-        if !program.is_file() {
-            bail!(
-                "{SANDBOX_RUNTIME_ENV}={}: no such file. It names a standalone runtime for development \
+/// as the process started from it, whose `runtime` subcommand is the runtime
+/// itself, so nothing is built or downloaded. Each is named by its real path:
+/// an install's link (Homebrew's `bin/darkmux` into its Cellar) or a relative
+/// path is not a path the sandbox's profile allows it to run from.
+fn host_runtime(override_program: Option<std::ffi::OsString>, at_start: &ExecutableAtStart) -> Result<HostRuntime> {
+    if let Some(named) = override_program.filter(|v| !v.is_empty()).map(PathBuf::from) {
+        let program = named.canonicalize().ok().filter(|p| is_executable_file(p)).ok_or_else(|| {
+            anyhow!(
+                "{SANDBOX_RUNTIME_ENV}={}: not an executable file. It names a standalone runtime for development \
                  (`cargo build --release --manifest-path runtime/Cargo.toml` writes \
                  runtime/target/release/darkmux-runtime); unset it to run this darkmux's own runtime",
-                program.display()
-            );
-        }
+                named.display()
+            )
+        })?;
         return Ok(HostRuntime { program, leading_args: Vec::new() });
     }
-    let exe = exe.context("finding this darkmux executable, whose `runtime` subcommand the Seatbelt sandbox runs")?;
-    let program = exe.canonicalize().with_context(|| format!("resolving this darkmux executable's path ({})", exe.display()))?;
-    Ok(HostRuntime { program, leading_args: vec![RUNTIME_SUBCOMMAND.to_string()] })
+    let (path, started) = at_start.0.as_ref().map_err(|why| anyhow!("{why}"))?;
+    if file_identity(path).ok().as_ref() != Some(started) {
+        bail!(
+            "darkmux was replaced since this process started: {} is no longer the file it started from \
+             (an upgrade, a reinstall or `brew cleanup`), so its runtime would not match this process. \
+             Restart this darkmux process (a running `darkmux serve` included) and dispatch again",
+            path.display()
+        );
+    }
+    Ok(HostRuntime { program: path.clone(), leading_args: vec![RUNTIME_SUBCOMMAND.to_string()] })
+}
+
+/// A regular file someone may execute.
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
 /// (#3112) The runtime program a dispatch's sandbox runs, and the arguments
@@ -7110,7 +7170,8 @@ fn host_runtime_image(image_arg: Option<&str>) -> Result<RuntimeImage> {
     if let Some(image) = image_arg {
         bail!("--image {image}: the Seatbelt sandbox ({}=seatbelt) runs this host's own programs, not an image", darkmux_sandbox::SANDBOX_ENV);
     }
-    let runtime = host_runtime(std::env::var_os(SANDBOX_RUNTIME_ENV), std::env::current_exe())?;
+    let at_start = EXECUTABLE_AT_START.get_or_init(|| executable_at_start(std::env::current_exe()));
+    let runtime = host_runtime(std::env::var_os(SANDBOX_RUNTIME_ENV), at_start)?;
     let shown = std::iter::once(runtime.program.display().to_string()).chain(runtime.leading_args.iter().cloned()).collect::<Vec<_>>().join(" ");
     darkmux_types::diag_eprintln!("darkmux dispatch: runtime=internal, sandbox=seatbelt, runtime: {shown}");
     Ok(RuntimeImage {

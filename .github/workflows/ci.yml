@@ -276,6 +276,13 @@ jobs:
         # workspace does not carry. `--all-targets` would compile them here.
         run: cargo clippy --workspace --exclude darkmux-runtime-linked --all-targets -- -D warnings
 
+      # (#3112) The linked runtime's library (runtime/src) as darkmux builds
+      # it, with this workspace's lockfile and unified features: the lint the
+      # step above leaves out, minus the test code it cannot compile here.
+      - name: Clippy (the runtime as darkmux links it, library only)
+        if: steps.gate.outputs.tests == 'true'
+        run: cargo clippy -p darkmux-runtime-linked -- -D warnings
+
       # (#3137) The records, last, so each exists only when every step before
       # it passed. Fork PR runs upload them too; the lookup ignores those.
       - name: Record that this tree passed
