@@ -13,9 +13,15 @@
 //!   supply one.
 //! - **Limit memory or processes, or switch user.** `limits` and `user` are
 //!   unused; the process runs as the caller's user.
-//! - **Publish one port.** The default network may bind any port on the
-//!   loopback and no other address; [`Network::None`] reaches only the
-//!   loopback.
+//! - **Publish one port, or hold a bind to the loopback (#3559).** The
+//!   default network may bind any port on ANY local address: `0.0.0.0` and
+//!   this host's LAN address included, so a server that binds every address
+//!   is reachable from the LAN. SBPL's address filter (`local ip`) takes only
+//!   `*` or `localhost`, and for a bind `localhost` matches every local
+//!   address (measured on macOS 26.6), so the profile can allow binding or
+//!   deny it, never tell loopback from the rest. A caller that needs
+//!   loopback-only listeners watches them itself (client previews do).
+//!   [`Network::None`] allows no network at all, the loopback included.
 //! - **Reach every descendant.** A sandbox is the process group its launcher
 //!   leads; a descendant that leaves the group (`setsid`) outlives a kill,
 //!   though still inside the sandbox.
@@ -93,7 +99,10 @@ mkdir -m 700 "$d/tmp" && printf '%s' "$2" > "$d/profile.sb" && printf '%s' "$3" 
 /// Runs the sandbox attached: `$d` set, `$1` the working directory (empty
 /// for none), then the program and its arguments. Records its own pid (the
 /// group's), survives the group's SIGTERM long enough to see the sandbox
-/// out, and removes the directory when it exits.
+/// out, and removes the directory when it exits. The sandbox ends with its
+/// program, as a container ends with its init's child: whatever the program
+/// left running in the group is killed then (#3112), so a background
+/// process never outlives it holding a port or writing to a mount.
 const LAUNCH: &str = r#"wd=$1; shift
 echo $$ > "$d/pid" && ps -o lstart= -p $$ > "$d/started" || exit 125
 trap : TERM INT HUP
@@ -101,6 +110,7 @@ trap : TERM INT HUP
 [ -n "$1" ] || { echo "seatbelt: no program to run (a policy needs an entrypoint)" >&2; rm -rf "$d"; exit 125; }
 /usr/bin/sandbox-exec -f "$d/profile.sb" "$@"
 rc=$?
+for p in $(/usr/bin/pgrep -g $$ 2>/dev/null); do [ "$p" = "$$" ] || kill -KILL "$p" 2>/dev/null; done
 rm -rf "$d"
 exit $rc
 "#;
@@ -175,9 +185,11 @@ impl SeatbeltBackend {
             }
         }
         match policy.network {
-            // Any address, binding only on the loopback; no unix socket but
-            // the resolver's, so never the Docker daemon's or another
-            // service's (#3553 review).
+            // Any address. The bind rule names `localhost`, but Seatbelt
+            // matches it against every local address, so `0.0.0.0` and the
+            // LAN address bind too (#3559): it holds no bind to the
+            // loopback. No unix socket but the resolver's, so never the
+            // Docker daemon's or another service's (#3553 review).
             Network::Default => p.push_str(concat!(
                 "(allow network*)\n(deny network-bind)\n(allow network-bind (local ip \"localhost:*\"))\n",
                 "(deny network-outbound (remote unix-socket))\n",
@@ -353,6 +365,13 @@ impl SandboxBackend for SeatbeltBackend {
         canonical(&mount.host).to_string_lossy().into_owned()
     }
 
+    /// Under [`SYSTEM_READ`] and outside [`DENIED_READ`], where its links
+    /// lead.
+    fn host_reads(&self, path: &Path) -> bool {
+        let real = canonical(path);
+        SYSTEM_READ.iter().any(|s| real.starts_with(s)) && !DENIED_READ.iter().any(|s| real.starts_with(s))
+    }
+
     fn run(&self, policy: &SandboxPolicy) -> (Command, SandboxHandle) {
         let handle = SandboxHandle { backend: BackendKind::Seatbelt, id: policy.name.clone() };
         let Some(dir) = dir_of(&policy.name) else { return (refused(&policy.name), handle) };
@@ -484,9 +503,12 @@ mod tests {
     }
 
     /// A read-only mount after a read-write one denies writes beneath it,
-    /// in order, and the default network may bind only the loopback.
+    /// in order, and the default network's bind rule is the one written
+    /// (which, #3559, Seatbelt applies to every local address: the
+    /// conformance suite's `a_server_on_every_address_reaches_only_what_the_backend_allows`
+    /// records what it really allows).
     #[test]
-    fn the_profile_layers_mounts_in_order_and_binds_only_loopback() {
+    fn the_profile_layers_mounts_in_order_and_writes_the_bind_rule() {
         let p = SeatbeltBackend::profile(
             &policy(vec![mount("/nonexistent-ws", Access::ReadWrite), mount("/nonexistent-ws/.git", Access::ReadOnly)], Network::Default),
             Path::new("/nonexistent-state/s"),
@@ -542,6 +564,24 @@ mod tests {
         let _ = other.wait();
         assert!(!kill.success(), "a kill claimed a process it did not start");
         assert!(survived, "a kill signaled a process that reused the pid");
+    }
+
+    /// (#3112) What a sandbox reads with no mount: the OS and the system
+    /// toolchain (Homebrew's programs), never a home, never Homebrew's or
+    /// `/usr/local`'s data; a path is judged where its links lead.
+    #[test]
+    fn it_reads_the_system_and_never_a_home() {
+        for yes in ["/usr/bin/env", "/bin/sh", "/opt/homebrew/bin", "/opt/homebrew/Cellar/node", "/usr/local/bin"] {
+            assert!(SeatbeltBackend.host_reads(Path::new(yes)), "{yes}");
+        }
+        for no in ["/Users/someone/.nvm/versions/node/v24/bin", "/opt/homebrew/var", "/opt/homebrew", "/usr/local/var/db", "/usr/local/etc", "/opt/local/bin", "/"] {
+            assert!(!SeatbeltBackend.host_reads(Path::new(no)), "{no}");
+        }
+        let home = tempfile::TempDir::new().unwrap();
+        let link = home.path().join("to-usr");
+        std::os::unix::fs::symlink("/usr/bin", &link).unwrap();
+        assert!(SeatbeltBackend.host_reads(&link), "a link into the system reads where it leads");
+        assert!(!crate::DockerBackend.host_reads(Path::new("/usr/bin")), "a container reads only its image and mounts");
     }
 
     /// A quote or backslash in a path cannot end the SBPL string.

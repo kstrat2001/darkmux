@@ -80,8 +80,10 @@ pub struct SandboxPolicy {
     pub labels: Vec<(String, String)>,
     /// In order: a later mount at a nested path is layered over an earlier.
     pub mounts: Vec<Mount>,
-    /// Ports the host reaches on its loopback, at the same number, and on
-    /// no other address.
+    /// Ports the host reaches on its loopback, at the same number. A
+    /// container publishes them there and on no other address; a sandbox on
+    /// the host ([`BackendKind::on_host`]) publishes nothing and its servers
+    /// bind host ports directly, on whatever address they ask for (#3559).
     pub ports: Vec<u16>,
     /// Whether the sandbox reads the caller's stdin (a secret piped in);
     /// otherwise it gets none.
@@ -380,6 +382,16 @@ pub trait SandboxBackend: Send + Sync {
     /// caller builds every in-sandbox path into a mount from this, never
     /// from `at` (#3112 step 2).
     fn place(&self, mount: &Mount) -> String;
+
+    /// (#3112) Whether a sandbox of this backend reads host path `path`
+    /// with no mount: the OS and its system toolchain, for a sandbox on the
+    /// host. A container sees only its image and mounts: `false`. A caller
+    /// that grants a host program read-only (a preview's toolchain) grants
+    /// only what this says is not already readable.
+    fn host_reads(&self, path: &std::path::Path) -> bool {
+        let _ = path;
+        false
+    }
 
     /// The command that runs `policy` attached until it exits, and the
     /// handle naming the sandbox. Killing that command's process need not
