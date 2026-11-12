@@ -305,6 +305,9 @@ mod tests {
         assert_eq!(renamed("/workspace2/workspace"), "/workspace2/workspace");
     }
 
+    /// (#3112 review) Line 3 of `templates/builtin/roles/tool-bench.md`.
+    pub(crate) const TOOL_BENCH_WORKSPACE_SENTENCE: &str = "You are an assistant operating inside a container. A working directory is mounted at `/workspace` and you have tools to read files, search file contents, run shell commands, and write or edit files.";
+
     /// (#3112 review) A shipped role whose frozen prompt says the working
     /// directory is mounted at `/workspace` (`tool-bench`) reaches the model
     /// naming the host-seen root under a sandbox on the host: the runtime
@@ -312,8 +315,12 @@ mod tests {
     /// never changes. Byte-identical under the default root.
     #[test]
     fn a_shipped_role_prompt_naming_workspace_is_renamed_to_the_root() {
-        let role = include_str!("../../../templates/builtin/roles/tool-bench.md");
-        assert!(role.contains("`/workspace`"), "the role still names the container path");
+        // The shipped sentence, verbatim. It is held here rather than read
+        // from `templates/`, which is outside this crate: the PR-diff mutation
+        // job copies only `runtime/`. `darkmux-crew`'s
+        // `the_tool_bench_role_still_names_the_workspace_the_runtime_renames`
+        // keeps the two in step.
+        let role = TOOL_BENCH_WORKSPACE_SENTENCE;
         assert_eq!(naming(role, Path::new(DEFAULT_WORKSPACE)), role);
         let renamed = naming(role, Path::new("/Users/op/ws"));
         assert!(!renamed.contains("/workspace") && renamed.contains("`/Users/op/ws`"), "{renamed}");
