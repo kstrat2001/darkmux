@@ -106,7 +106,11 @@ pub trait Platform: Send + Sync {
     /// `None` when it cannot be read (no such process, or the platform has
     /// no reader). Compare it only for EQUALITY against a stamp this same
     /// method produced for the same pid on this same machine: two equal
-    /// stamps mean the pid was not reused in between.
+    /// stamps mean the pid was not reused in between. (#3112) Two stamps of
+    /// different pids on one machine since its last boot also order their
+    /// starts (microseconds since the epoch on macOS, clock ticks since boot
+    /// on Linux): the preview sweep kills only a process started no earlier
+    /// than its sandbox.
     fn process_start_stamp(&self, pid: u32) -> Option<u64>;
     /// (#3448) How much memory process `pid` holds, in bytes: macOS's
     /// physical footprint (what Activity Monitor's Memory column shows, which
