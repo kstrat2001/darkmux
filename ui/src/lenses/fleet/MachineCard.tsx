@@ -251,6 +251,8 @@ function CountLine({
     shown,
     engineServers: atLiveEdge ? card.engineServers : [],
     residents: atLiveEdge ? card.residents : null,
+    // As the servers line reads a server's state: right to the presence poll.
+    nowMs: Date.now(),
   });
   if (!runsHash) {
     return (

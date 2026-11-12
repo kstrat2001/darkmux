@@ -51,6 +51,7 @@ import type { CardResidents } from "../../lib/machineEngine";
 import { parseEndpointRoute, routeKindLabel, type EndpointRoute } from "../../lib/endpointRoute";
 import { shortModel } from "../../lib/format";
 import { modelShortName } from "../../lib/modelName";
+import { serverStateWord } from "../../lib/engineServers";
 
 /** A machine's runs in flight as of `t`: its run- and execution-grain runs
  *  (`runRef.ts`) whose lifecycle (`lifecycle.ts`) is open or waiting. One
@@ -942,6 +943,20 @@ function residentsLine(count: string, residents: CardResidents | null): { text: 
   return { text, title: text };
 }
 
+type CardServer = Pick<EngineServer, "engine" | "port" | "answering" | "started_at_ms">;
+
+/** (#3554) The servers that hold no model yet, in the servers line's own
+ *  words ("1 server starting the model"), for the idle line's title: they
+ *  add nothing to "N loaded". Empty when every server answers. */
+function pendingServers(servers: readonly CardServer[], nowMs: number): string {
+  const counts = new Map<string, number>();
+  for (const s of servers) {
+    const word = serverStateWord(s, nowMs);
+    if (word !== "resident") counts.set(word, (counts.get(word) ?? 0) + 1);
+  }
+  return [...counts].map(([word, n]) => `${n} ${n === 1 ? "server" : "servers"} ${word}`).join(" · ");
+}
+
 /** The idle line when the engine's list is not known: the servers as a lower
  *  bound when there are any. */
 function unknownResidentsLine(count: string, r: { why: string; servers: number }): { text: string; title: string } {
@@ -949,6 +964,11 @@ function unknownResidentsLine(count: string, r: { why: string; servers: number }
   const text = `${count} · ${r.servers}+ loaded`;
   const servers = `${r.servers} ${r.servers === 1 ? "server" : "servers"} darkmux started`;
   return { text, title: `${text}: ${servers}; the rest is unknown: ${r.why}` };
+}
+
+/** A line with the servers that hold nothing yet named in its title. */
+function withPending(line: { text: string; title: string }, pending: string): { text: string; title: string } {
+  return pending ? { text: line.text, title: `${line.title} · ${pending}` } : line;
 }
 
 /** (#3554) The count line's words and its tooltip. While something runs it
@@ -961,11 +981,13 @@ export function countLine(f: {
   executions: number;
   position: number;
   shown: Pick<ExecutionTokenReading, "model" | "endpoint"> | null;
-  engineServers: readonly Pick<EngineServer, "engine" | "port">[];
+  engineServers: readonly CardServer[];
   residents: CardResidents | null;
+  /** The clock a server's start age is read against (its state word). */
+  nowMs: number;
 }): { text: string; title: string } {
   const count = executionCountText(f);
-  if (f.runsCount === 0) return residentsLine(count, f.residents);
+  if (f.runsCount === 0) return withPending(residentsLine(count, f.residents), pendingServers(f.engineServers, f.nowMs));
   const route = f.shown ? routeWords(f.shown, f.engineServers) : null;
   return route ? { text: `${count} · ${route.text}`, title: `${count} · ${route.title}` } : { text: count, title: count };
 }

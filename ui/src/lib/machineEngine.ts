@@ -6,6 +6,7 @@
 
 import type { MachineEngine } from "../types/generated/MachineEngine";
 import type { MachineSpecsResponse } from "../types/generated/MachineSpecsResponse";
+import { serverIsResident } from "./engineServers";
 
 const LMSTUDIO = "lmstudio";
 
@@ -61,14 +62,15 @@ type ResidentsInput = ResidentSpecs & Pick<MachineSpecsResponse, "loaded_models"
 /** (#3554) How many models the machine holds for darkmux: the engine's
  *  residents in darkmux's namespace (never a model another app loaded: the
  *  fleet card is a darkmux card, not an LM Studio one) plus the servers
- *  darkmux started (#3450), a server the engine's list also names counted
- *  once. When the engine's list is not known, why, and the servers alone, so
+ *  darkmux started (#3450) that answer (`serverIsResident`; one still starting
+ *  holds nothing yet), a server the engine's list also names counted once. When the engine's list is not known, why, and the servers alone, so
  *  a card never says "0 loaded" about a list nobody read. `null` with no
  *  specs: no card was read, so nothing is claimed. */
 export function darkmuxResidents(specs: ResidentsInput | null): CardResidents | null {
   if (!specs) return null;
-  // A card from a darkmux before 5.10 lists no servers.
-  const servers = Array.isArray(specs.engine_servers) ? specs.engine_servers : [];
+  // A card from a darkmux before 5.10 lists no servers. A server still
+  // starting its model holds nothing yet.
+  const servers = (Array.isArray(specs.engine_servers) ? specs.engine_servers : []).filter(serverIsResident);
   const why = residentsUnknownNote(specs);
   if (why !== null) return { known: false, why, servers: servers.length };
   // A peer's card is read off the wire: one that leaves the list out claims

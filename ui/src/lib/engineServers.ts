@@ -15,12 +15,19 @@ export const ENGINE_START_BOUND_MS = 15 * 60 * 1000;
 
 type StateWord = "starting the model" | "not answering" | "resident";
 
+/** (#3554) Whether a server holds its model: it answered under its served
+ *  name when listed, as the daemon decided it (`answering`). The one test
+ *  behind "resident" here and a fleet card's "N loaded". */
+export function serverIsResident(s: Pick<EngineServer, "answering">): boolean {
+  return s.answering;
+}
+
 /** What a server is doing, in the words every surface uses: "resident" when
  * it answers; "starting the model" when it does not and its start is still
  * inside the start bound; otherwise "not answering" (a resident too busy to
  * answer within the listing's bound, or one that stopped answering). */
 export function serverStateWord(s: Pick<EngineServer, "answering" | "started_at_ms">, nowMs: number): StateWord {
-  if (s.answering) return "resident";
+  if (serverIsResident(s)) return "resident";
   return nowMs - s.started_at_ms < ENGINE_START_BOUND_MS ? "starting the model" : "not answering";
 }
 

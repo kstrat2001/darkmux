@@ -3805,6 +3805,14 @@ describe("FleetLens: the count line names the model and what is loaded (#3554)",
     await waitFor(() => expect(countEl()?.textContent).toBe("0 running · 1 loaded"));
   });
 
+  it("a server still starting its model adds nothing, and the title says it is starting", async () => {
+    const tf = { endpoint: "local-tf", engine: "tensorfold", model: "Qwen3.8-27B", served_name: "darkmux:Qwen3.8-27B", n_ctx: 4096, port: 8093, pid: 2, started_at_ms: Date.now() - 30_000, answering: false };
+    mockFleetFetch({ runs: [], specs: { ...SELF, loaded_models: [], engine_servers: [tf] } });
+    renderFleetLens();
+    await waitFor(() => expect(countEl()?.textContent).toBe("0 running · 0 loaded"));
+    expect(countEl().getAttribute("title")).toBe("0 running · 0 loaded · 1 server starting the model");
+  });
+
   it("a machine whose engine could not say what it holds never reads 0 loaded: the title says why", async () => {
     mockFleetFetch({ runs: [], specs: { ...SELF, lms_unreachable: true } });
     renderFleetLens();

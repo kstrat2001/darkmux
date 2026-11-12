@@ -1365,8 +1365,9 @@ describe("the count line with several executions (W3)", () => {
 // (#3554) The count line names what the shown execution runs on, and what an
 // idle machine holds.
 describe("the count line's model, engine and residents (#3554)", () => {
-  const one = { runsCount: 1, executions: 1, position: 1, engineServers: [], residents: null };
-  const flint = { engine: "flint", port: 8123 };
+  const NOW = Date.parse("2026-11-12T10:00:00Z");
+  const one = { runsCount: 1, executions: 1, position: 1, engineServers: [], residents: null, nowMs: NOW };
+  const flint = { engine: "flint", port: 8123, answering: true, started_at_ms: NOW - 60_000 };
 
   it("names a managed LM Studio run by its model alone, without darkmux's namespace", () => {
     expect(countLine({ ...one, shown: { model: "darkmux:qwen3.6-35b-a3b" } })).toEqual({
@@ -1424,7 +1425,7 @@ describe("the count line's model, engine and residents (#3554)", () => {
   // the wire model ("flint", `Target::wire_model`); the endpoint's tail is the
   // profile model id on every path that writes an endpoint, so it wins.
   it("prefers the endpoint's model over the start record's wire model (an agentic Flint dispatch)", () => {
-    const flint8092 = { engine: "flint", port: 8092 };
+    const flint8092 = { ...flint, port: 8092 };
     expect(countLine({ ...one, engineServers: [flint8092], shown: { model: "flint", endpoint: "openai:127.0.0.1:8092/flint-int4" } })).toEqual({
       text: "1 running · flint",
       title: "1 running · flint-int4 · flint on 127.0.0.1:8092",
@@ -1467,6 +1468,36 @@ describe("the count line's model, engine and residents (#3554)", () => {
       title: `0 running · 1+ loaded: 1 server darkmux started; the rest is unknown: ${why}`,
     });
     expect(countLine({ ...one, runsCount: 0, executions: 0, position: 0, shown: null, residents: { known: false, why, servers: 2 } }).title).toMatch(/: 2 servers darkmux started;/);
+  });
+
+  // (#3554, operator) A server still starting its model adds nothing to N;
+  // the title says it is starting, in the servers line's own words.
+  describe("a server still starting its model", () => {
+    const idle = { ...one, runsCount: 0, executions: 0, position: 0, shown: null };
+    const starting = { engine: "tensorfold", port: 8093, answering: false, started_at_ms: NOW - 30_000 };
+    it("a starting server alone: 0 loaded, and the title says it is starting", () => {
+      expect(countLine({ ...idle, engineServers: [starting], residents: { known: true, count: 0 } })).toEqual({
+        text: "0 running · 0 loaded",
+        title: "0 running · 0 loaded · 1 server starting the model",
+      });
+    });
+    it("an answering server alone: no note", () => {
+      expect(countLine({ ...idle, engineServers: [flint], residents: { known: true, count: 1 } })).toEqual({ text: "0 running · 1 loaded", title: "0 running · 1 loaded" });
+    });
+    it("one of each: the answering one counted, the starting one named", () => {
+      expect(countLine({ ...idle, engineServers: [flint, starting], residents: { known: true, count: 1 } })).toEqual({
+        text: "0 running · 1 loaded",
+        title: "0 running · 1 loaded · 1 server starting the model",
+      });
+    });
+    it("with the engine's list unknown, the lower bound counts answering servers only", () => {
+      const why = "LM Studio could not be asked (`lms ps` failed); what it holds is unknown.";
+      expect(countLine({ ...idle, engineServers: [flint, starting], residents: { known: false, why, servers: 1 } })).toEqual({
+        text: "0 running · 1+ loaded",
+        title: `0 running · 1+ loaded: 1 server darkmux started; the rest is unknown: ${why} · 1 server starting the model`,
+      });
+      expect(countLine({ ...idle, engineServers: [starting], residents: { known: false, why, servers: 0 } }).text).toBe("0 running");
+    });
   });
 
   it("claims nothing about residents with no card read", () => {

@@ -57,7 +57,7 @@ describe("machineEngine (#316 stage 4.5)", () => {
 
     // (#3554, operator) The servers darkmux started are darkmux's own
     // residents too (#3450): "N loaded" counts them.
-    const server = (served_name: string, port: number) => ({ endpoint: "local", engine: "flint", model: served_name, served_name, n_ctx: 4096, port, pid: 1, started_at_ms: 0, answering: true });
+    const server = (served_name: string, port: number, answering = true) => ({ endpoint: "local", engine: "flint", model: served_name, served_name, n_ctx: 4096, port, pid: 1, started_at_ms: 0, answering });
     it("counts the servers darkmux started: a Flint-only machine holds one", () => {
       expect(darkmuxResidents({ engine: lms, lms_unreachable: false, loaded_models: [model("user-loaded")], engine_servers: [server("flint", 8092)] })).toEqual({ known: true, count: 1 });
     });
@@ -75,6 +75,16 @@ describe("machineEngine (#316 stage 4.5)", () => {
         servers: 1,
       });
     });
+    // (#3554, operator) Only a server that answers holds its model; one still
+    // starting adds nothing, known list or not.
+    it("counts an answering server and never one still starting its model", () => {
+      const lmsKnown = { engine: lms, lms_unreachable: false, loaded_models: [] };
+      expect(darkmuxResidents({ ...lmsKnown, engine_servers: [server("flint", 8092, false)] })).toEqual({ known: true, count: 0 });
+      expect(darkmuxResidents({ ...lmsKnown, engine_servers: [server("flint", 8092, true)] })).toEqual({ known: true, count: 1 });
+      expect(darkmuxResidents({ ...lmsKnown, engine_servers: [server("flint", 8092, true), server("tf", 8093, false)] })).toEqual({ known: true, count: 1 });
+      expect(darkmuxResidents({ ...lmsKnown, lms_unreachable: true, engine_servers: [server("flint", 8092, false)] })).toMatchObject({ known: false, servers: 0 });
+    });
+
     it("reads a card from a darkmux before 5.10, which lists no servers, as none", () => {
       expect(darkmuxResidents({ engine: lms, lms_unreachable: false, loaded_models: [model("darkmux:qwen")] } as never)).toEqual({ known: true, count: 1 });
     });
