@@ -102,7 +102,7 @@ Functions at 0% coverage on the path are the exception: small enough to test dir
 
 | Function | CRAP | Complexity | Coverage | Role in the facade |
 |---|---:|---:|---:|---|
-| `runtime/src/main.rs::run_dispatch` (:146-1183, 1,037 lines) | 2298 | 132 | 50% | the container's whole run: argument parsing, client setup, the loop; where per-backend request behavior will live |
+| `runtime/src/lib.rs::run_dispatch` (:146-1183, 1,037 lines) | 2298 | 132 | 50% | the container's whole run: argument parsing, client setup, the loop; where per-backend request behavior will live |
 | `crates/darkmux-crew/src/dispatch_internal.rs::run_telemetry_sampler` | 202 | 37 | 51% | calls LM Studio directly; becomes "observe this seat" |
 | `crates/darkmux-crew/src/dispatch_internal.rs::dispatch` | 166 | 78 | 76% | seat resolution and residency: the facade's front door |
 | `src/mission_launch.rs::launch` | 167 | 101 | 81% | profile and utility staffing |

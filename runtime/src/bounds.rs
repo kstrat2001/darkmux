@@ -20,12 +20,12 @@
 //! resolves the tier and forwards it alongside each value — a companion
 //! `--<flag>-source <tier>` CLI arg for the CLI-flag-carried knobs, and a
 //! companion `DARKMUX_INACTIVITY_TIMEOUT_SECONDS_SOURCE` env var for the one
-//! knob that already travels as an env var. `main.rs` parses those and calls
+//! knob that already travels as an env var. `lib.rs` parses those and calls
 //! [`set_bound_sources`] once, before the loop runs; every emission site in
 //! `loop_runner.rs` reads them back via [`bound_sources`].
 //!
 //! Every runtime test that calls `loop_runner::run`/`run_with_sleeper`
-//! directly (35+ call sites, none of which go through `main.rs`) never calls
+//! directly (35+ call sites, none of which go through `lib.rs`) never calls
 //! [`set_bound_sources`] — [`bound_sources`] then returns the all-`BuiltIn`
 //! default, which is the CORRECT provenance for a test that supplied no CLI
 //! source flag. This is why sources are process-global state instead of a
@@ -171,8 +171,8 @@ impl BoundRef {
 
 /// The resolved source tier for the two per-call-region knobs
 /// (`per_call_cap`'s two possible origins — see `loop_runner.rs`'s
-/// cap-selection block), set ONCE (from `main.rs`, before the loop runs) via
-/// [`set_bound_sources`]. Unset (every non-`main.rs` test caller) reads back
+/// cap-selection block), set ONCE (from `lib.rs`, before the loop runs) via
+/// [`set_bound_sources`]. Unset (every non-`lib.rs` test caller) reads back
 /// as all-`BuiltIn` via `Default`. The inactivity-timeout source travels
 /// separately (a companion `DARKMUX_INACTIVITY_TIMEOUT_SECONDS_SOURCE` env
 /// var read directly at that knob's own definition site in
@@ -189,7 +189,7 @@ pub struct BoundSources {
 
 static BOUND_SOURCES: OnceLock<BoundSources> = OnceLock::new();
 
-/// Called once from `main.rs` after parsing the host's
+/// Called once from `lib.rs` after parsing the host's
 /// `--max-tokens-per-call-source`/`--reasoning-checkpoint-interval-source`
 /// args, before the loop starts. A second call (there should never be one
 /// in production) is a silent no-op — `OnceLock::set` — rather than a

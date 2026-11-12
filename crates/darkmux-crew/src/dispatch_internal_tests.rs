@@ -6058,6 +6058,7 @@ S(("127.0.0.1", port), H).serve_forever()
             runtime_binary: Some(PathBuf::from(
                 "/home/op/.darkmux/runtime/darkmux-runtime",
             )),
+            runtime_leading_args: Vec::new(),
             image: "rust:slim".to_string(),
             role_id: "test-role".to_string(),
             execution: darkmux_types::execution_id::ExecutionId::parse("exec-test").unwrap(),
@@ -6272,6 +6273,7 @@ S(("127.0.0.1", port), H).serve_forever()
             mod_attachment_mounts: Vec::new(),
             inject: false,
             runtime_binary: None,
+            runtime_leading_args: Vec::new(),
             image: "darkmux-runtime:latest".to_string(),
             role_id: "test-role".to_string(),
             execution: darkmux_types::execution_id::ExecutionId::parse("exec-test").unwrap(),
@@ -6342,6 +6344,95 @@ S(("127.0.0.1", port), H).serve_forever()
         assert_eq!(env(&docker, "CARGO_HOME"), Some("/darkmux-cache/cargo".to_string()));
         assert_eq!(docker.entrypoint.as_deref(), Some("/darkmux-runtime"));
         assert_eq!(prompt(&docker).as_deref(), Some("/darkmux-out/.prompt.txt"));
+    }
+
+    /// (#3112) With no override, a Seatbelt dispatch runs THIS executable's
+    /// `runtime` subcommand, by its real path: a link into an install (how
+    /// Homebrew puts `bin/darkmux` on PATH, pointing into its Cellar) is
+    /// followed, so the program the sandbox runs is the file its profile
+    /// allows. An empty override is no override.
+    #[test]
+    fn a_seatbelt_dispatch_runs_this_executables_runtime_subcommand_by_its_real_path() {
+        let root = tempfile::TempDir::new().unwrap();
+        let cellar = root.path().join("Cellar/darkmux/9.9.9/bin");
+        std::fs::create_dir_all(&cellar).unwrap();
+        std::fs::write(cellar.join("darkmux"), "").unwrap();
+        std::fs::create_dir(root.path().join("bin")).unwrap();
+        let link = root.path().join("bin/darkmux");
+        std::os::unix::fs::symlink(cellar.join("darkmux"), &link).unwrap();
+        let real = cellar.join("darkmux").canonicalize().unwrap();
+
+        for named in [None, Some(std::ffi::OsString::new())] {
+            let got = host_runtime(named, Ok(link.clone())).unwrap();
+            assert_eq!(got, HostRuntime { program: real.clone(), leading_args: vec!["runtime".to_string()] });
+        }
+        let err = host_runtime(None, Err(std::io::Error::other("no exe"))).unwrap_err();
+        assert!(format!("{err:#}").contains("finding this darkmux executable"), "{err:#}");
+    }
+
+    /// (#3112) `DARKMUX_SANDBOX_RUNTIME`, for development, runs a standalone
+    /// runtime instead, as given and with no subcommand; one that names no
+    /// file is refused, naming the variable, never silently replaced.
+    #[test]
+    fn the_sandbox_runtime_override_runs_a_standalone_runtime_or_is_refused() {
+        let root = tempfile::TempDir::new().unwrap();
+        let standalone = root.path().join("darkmux-runtime");
+        std::fs::write(&standalone, "").unwrap();
+        let exe = Ok(root.path().join("darkmux"));
+        let got = host_runtime(Some(standalone.clone().into_os_string()), exe).unwrap();
+        assert_eq!(got, HostRuntime { program: standalone, leading_args: Vec::new() });
+
+        let missing = root.path().join("nope");
+        let err = host_runtime(Some(missing.into_os_string()), Ok(root.path().join("darkmux"))).unwrap_err();
+        assert!(format!("{err:#}").contains("DARKMUX_SANDBOX_RUNTIME="), "{err:#}");
+    }
+
+    /// (#3112) The dispatch's config carries the host runtime's program AND
+    /// its leading arguments; a darkmux image runs its own baked-in runtime
+    /// with neither.
+    #[test]
+    fn a_host_runtime_reaches_the_config_with_its_leading_arguments() {
+        let image = |host_runtime: Option<HostRuntime>| RuntimeImage {
+            inject: host_runtime.is_some(),
+            darkmux_image: crate::runtime_image::ResolvedImage { reference: "r".into(), id: "r".into() },
+            image: "i".into(),
+            run_image: "i".into(),
+            host_runtime,
+        };
+        let host = HostRuntime { program: PathBuf::from("/real/darkmux"), leading_args: vec!["runtime".to_string()] };
+        assert_eq!(
+            runtime_program(&image(Some(host))).unwrap(),
+            (Some(PathBuf::from("/real/darkmux")), vec!["runtime".to_string()])
+        );
+        assert_eq!(runtime_program(&image(None)).unwrap(), (None, Vec::new()));
+    }
+
+    /// (#3112) The Seatbelt policy's entrypoint is the darkmux executable and
+    /// its command is `runtime run …`: the subcommand, then exactly the
+    /// arguments a standalone runtime gets. A runtime with no leading
+    /// arguments (Docker's injected binary, the override) is unchanged.
+    #[test]
+    fn the_seatbelt_policy_runs_the_runtime_subcommand_then_the_runtimes_own_arguments() {
+        use darkmux_sandbox::SeatbeltBackend;
+        let root = tempfile::TempDir::new().unwrap();
+        for d in ["ws", "out"] {
+            std::fs::create_dir(root.path().join(d)).unwrap();
+        }
+        std::fs::write(root.path().join("darkmux"), "").unwrap();
+        let mut cfg = argv_config_with_base_url(None);
+        cfg.workspace = root.path().join("ws");
+        cfg.host_out = root.path().join("out");
+        cfg.inject = true;
+        cfg.runtime_binary = Some(root.path().join("darkmux"));
+        let standalone = dispatch_policy_for(&cfg, &SeatbeltBackend);
+        assert_eq!(standalone.command.first().map(String::as_str), Some("run"));
+
+        cfg.runtime_leading_args = vec!["runtime".to_string()];
+        let linked = dispatch_policy_for(&cfg, &SeatbeltBackend);
+        let exe = root.path().join("darkmux").canonicalize().unwrap().display().to_string();
+        assert_eq!(linked.entrypoint, Some(exe));
+        assert_eq!(linked.command[0], "runtime");
+        assert_eq!(linked.command[1..], standalone.command[..], "after the subcommand, the standalone runtime's arguments");
     }
 
     /// (#3112 step 2) The dispatch spawns the backend's own command, its
@@ -6625,6 +6716,7 @@ S(("127.0.0.1", port), H).serve_forever()
             mod_attachment_mounts: Vec::new(),
             inject: false,
             runtime_binary: None,
+            runtime_leading_args: Vec::new(),
             image: "darkmux-runtime:latest".to_string(),
             role_id: "test-role".to_string(),
             execution: darkmux_types::execution_id::ExecutionId::parse("exec-test").unwrap(),
@@ -6771,6 +6863,7 @@ S(("127.0.0.1", port), H).serve_forever()
             mod_attachment_mounts: Vec::new(),
             inject: false,
             runtime_binary: None,
+            runtime_leading_args: Vec::new(),
             image: "darkmux-runtime:latest".to_string(),
             role_id: "test-role".to_string(),
             execution: darkmux_types::execution_id::ExecutionId::parse("exec-test").unwrap(),
@@ -6859,6 +6952,7 @@ S(("127.0.0.1", port), H).serve_forever()
             mod_attachment_mounts: vec![(PathBuf::from("/tmp/mods/m1"), "/darkmux-mods/m1".to_string())],
             inject: true,
             runtime_binary: Some(PathBuf::from("/tmp/rt/darkmux-runtime")),
+            runtime_leading_args: Vec::new(),
             cache_dir: Some(PathBuf::from("/tmp/cache")),
             max_pause_ms_env: Some(250),
             remote_needs_auth: true,
@@ -6956,6 +7050,7 @@ S(("127.0.0.1", port), H).serve_forever()
             mod_attachment_mounts: Vec::new(),
             inject: false,
             runtime_binary: None,
+            runtime_leading_args: Vec::new(),
             image: "darkmux-runtime:latest".to_string(),
             role_id: "test-role".to_string(),
             execution: darkmux_types::execution_id::ExecutionId::parse("exec-test").unwrap(),
@@ -8812,6 +8907,7 @@ S(("127.0.0.1", port), H).serve_forever()
             mod_attachment_mounts: Vec::new(),
             inject: false,
             runtime_binary: None,
+            runtime_leading_args: Vec::new(),
             image: "darkmux-runtime:latest".to_string(),
             role_id: "test-role".to_string(),
             execution: darkmux_types::execution_id::ExecutionId::parse("exec-test").unwrap(),
@@ -16246,6 +16342,7 @@ S(("127.0.0.1", port), H).serve_forever()
             mod_attachment_mounts: Vec::new(),
             inject: false,
             runtime_binary: None,
+            runtime_leading_args: Vec::new(),
             image: "darkmux-runtime:latest".to_string(),
             role_id: "test-role".to_string(),
             execution: darkmux_types::execution_id::ExecutionId::parse("exec-test").unwrap(),

@@ -191,7 +191,8 @@ pub fn canonical_args(tool_name: &str, raw_args: &str) -> String {
             filtered.insert(k.to_string(), v.clone());
         }
     }
-    serde_json::Value::Object(filtered).to_string()
+    // (#3112) Recorded on `dispatch.cycle.suspected`: the standalone build's order.
+    crate::key_order::sorted(serde_json::Value::Object(filtered)).to_string()
 }
 
 #[cfg(test)]

@@ -396,7 +396,7 @@ fn reply_room_from(n_ctx: u32, prompt_bytes: usize, workload_id: &str) -> Result
 
 /// Dispatch via darkmux's internal Docker-bounded runtime through the
 /// crew::dispatch substrate. The runtime emits a JSON envelope per
-/// `runtime/src/main.rs::build_json_envelope` which becomes the
+/// `runtime/src/lib.rs::build_json_envelope` which becomes the
 /// provider's stdout artifact.
 fn dispatch_via_internal(
     opts: darkmux_crew::dispatch::DispatchOpts,

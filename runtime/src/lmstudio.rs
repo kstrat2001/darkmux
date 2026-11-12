@@ -228,7 +228,8 @@ pub struct ToolCall {
     /// delta, stored opaquely, re-serialized unchanged. `None` (LMStudio,
     /// Azure/OpenAI, any endpoint that doesn't use it) skips the field
     /// entirely, so nothing else sees it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // (#3112) Sorted as read: the standalone build's key order in every copy.
+    #[serde(default, deserialize_with = "crate::key_order::sorted_option", skip_serializing_if = "Option::is_none")]
     pub extra_content: Option<serde_json::Value>,
 }
 
@@ -525,7 +526,8 @@ impl LmStudioClient {
         let request = self.apply_auth_header(
             self.agent.post(&url).set("content-type", "application/json"),
         );
-        let resp = send_capturing_error(request.send_json(body), "chat")?;
+        // (#3112) The key order the standalone build sends, in every build.
+        let resp = send_capturing_error(request.send_json(crate::key_order::sorted(body)), "chat")?;
 
         if self.speaks_messages() {
             let reply: serde_json::Value = resp.into_json().context("parsing the messages reply as JSON")?;
@@ -566,7 +568,8 @@ impl LmStudioClient {
                 .set("content-type", "application/json")
                 .set("accept", "text/event-stream"),
         );
-        send_capturing_error(request.send_json(body), "streaming")
+        // (#3112) The key order the standalone build sends, in every build.
+        send_capturing_error(request.send_json(crate::key_order::sorted(body)), "streaming")
     }
 
     /// (#2889) The streaming call behind a [`TickingStream`], holding a
@@ -775,7 +778,8 @@ pub struct ToolCallDelta {
     /// Vendor overflow (Google's `extra_content.google.thought_signature`).
     /// Carried on the first fragment of a call; the accumulator copies it to
     /// the slot so it round-trips. See [`ToolCall::extra_content`].
-    #[serde(default)]
+    // (#3112) Sorted as read, like `ToolCall::extra_content`.
+    #[serde(default, deserialize_with = "crate::key_order::sorted_option")]
     pub extra_content: Option<serde_json::Value>,
 }
 

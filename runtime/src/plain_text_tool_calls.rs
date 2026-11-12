@@ -254,7 +254,8 @@ fn apply_promotion(
             kind: "function".to_string(),
             function: FunctionCall {
                 name: block.name,
-                arguments: serde_json::Value::Object(block.arguments).to_string(),
+                // (#3112) The key order the standalone build records and sends back.
+                arguments: crate::key_order::sorted(serde_json::Value::Object(block.arguments)).to_string(),
             },
             // A promoted plain-text call has no vendor signature — the model
             // emitted it as text precisely because it bypassed the structured

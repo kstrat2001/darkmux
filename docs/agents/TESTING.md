@@ -34,6 +34,7 @@ loop. Install it: `cargo install cargo-nextest --locked`.
 | `cargo t-fleet` | roster + cross-machine routing | |
 | `cargo t-gestalt` | residency arbiter, hardware/heuristics providers | |
 | `cargo t-runtime` | the agent runtime — **not a workspace member, so `t-all` misses it** | ~418 |
+| `cargo t-runtime-linked` | the same suite with the `serde_json` feature the darkmux build turns on, for the copy linked into `darkmux runtime` (#3112); `cargo nextest run -p darkmux --test runtime_parity` compares the two programs' bytes | 1035 / 17s |
 | `cargo t-all` | the same scope CI gates on (CI runs it as `cargo nextest run --workspace --profile ci`) | ~75s |
 
 Narrower still is better when you know the name: `cargo nextest run -p

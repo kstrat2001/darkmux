@@ -2355,6 +2355,10 @@ pub struct DockerRunConfig {
     pub inject: bool,
     /// Path to the cached runtime binary (only used when `inject` is true).
     pub runtime_binary: Option<PathBuf>,
+    /// (#3112) The arguments `runtime_binary` takes before the runtime's own
+    /// (`run …`): `["runtime"]` when it is the darkmux executable, whose
+    /// `runtime` subcommand is the runtime; empty for a standalone runtime.
+    pub runtime_leading_args: Vec<String>,
     /// The Docker image to run (operator-supplied or resolved darkmux image).
     pub image: String,
     /// (Security audit, #2114 resume follow-up) The role id this dispatch
@@ -2658,7 +2662,9 @@ pub(crate) fn dispatch_policy_for(config: &DockerRunConfig, backend: &dyn darkmu
         env,
         workdir: None,
         entrypoint,
-        command: runtime_args(config, &out_at),
+        // (#3112) The runtime's own arguments after any its program takes
+        // first (`darkmux runtime run …`).
+        command: config.runtime_leading_args.iter().cloned().chain(runtime_args(config, &out_at)).collect(),
     }
 }
 
@@ -7039,40 +7045,80 @@ struct RuntimeImage {
     image: String,
     /// What `docker run` is given.
     run_image: String,
-    /// (#3112 step 2) The host-built runtime a Seatbelt sandbox runs; `None`
-    /// under Docker.
-    host_runtime: Option<PathBuf>,
+    /// (#3112 step 2) The runtime a Seatbelt sandbox runs; `None` under
+    /// Docker.
+    host_runtime: Option<HostRuntime>,
 }
 
-/// (#3112 step 2, spike) The env var naming the host-built runtime a
-/// Seatbelt dispatch runs: `cargo build --release --manifest-path
-/// runtime/Cargo.toml` writes it to `runtime/target/release/darkmux-runtime`.
+/// (#3112) The runtime a Seatbelt sandbox runs: a host program, and the
+/// arguments it takes before the runtime's own (`run …`).
+#[derive(Debug, Clone, PartialEq)]
+struct HostRuntime {
+    program: PathBuf,
+    leading_args: Vec<String>,
+}
+
+/// (#3112) The subcommand of the darkmux binary that IS the agent runtime
+/// (`src/runtime_cmd.rs` at the repo root hands it to the runtime's entry).
+pub const RUNTIME_SUBCOMMAND: &str = "runtime";
+
+/// (#3112 step 2) For development: a standalone `darkmux-runtime` (built with
+/// `cargo build --release --manifest-path runtime/Cargo.toml`, at
+/// `runtime/target/release/darkmux-runtime`) a Seatbelt dispatch runs in
+/// place of this executable's own runtime.
 pub const SANDBOX_RUNTIME_ENV: &str = "DARKMUX_SANDBOX_RUNTIME";
 
+/// (#3112) The runtime a Seatbelt dispatch runs: the standalone build
+/// `override_program` names ([`SANDBOX_RUNTIME_ENV`]), else this executable
+/// (`exe`), whose `runtime` subcommand is the runtime itself, so nothing is
+/// built or downloaded. The executable is named by its real path: an
+/// install's link (Homebrew's `bin/darkmux` into its Cellar) or a relative
+/// invocation is not a path the sandbox's profile allows it to run from.
+fn host_runtime(override_program: Option<std::ffi::OsString>, exe: std::io::Result<PathBuf>) -> Result<HostRuntime> {
+    if let Some(program) = override_program.filter(|v| !v.is_empty()).map(PathBuf::from) {
+        if !program.is_file() {
+            bail!(
+                "{SANDBOX_RUNTIME_ENV}={}: no such file. It names a standalone runtime for development \
+                 (`cargo build --release --manifest-path runtime/Cargo.toml` writes \
+                 runtime/target/release/darkmux-runtime); unset it to run this darkmux's own runtime",
+                program.display()
+            );
+        }
+        return Ok(HostRuntime { program, leading_args: Vec::new() });
+    }
+    let exe = exe.context("finding this darkmux executable, whose `runtime` subcommand the Seatbelt sandbox runs")?;
+    let program = exe.canonicalize().with_context(|| format!("resolving this darkmux executable's path ({})", exe.display()))?;
+    Ok(HostRuntime { program, leading_args: vec![RUNTIME_SUBCOMMAND.to_string()] })
+}
+
+/// (#3112) The runtime program a dispatch's sandbox runs, and the arguments
+/// it takes before the runtime's own: a Seatbelt dispatch's host runtime; the
+/// cached static binary injected into an operator's image; none for a
+/// darkmux image, which has its runtime baked in.
+fn runtime_program(image: &RuntimeImage) -> Result<(Option<PathBuf>, Vec<String>)> {
+    match &image.host_runtime {
+        Some(host) => Ok((Some(host.program.clone()), host.leading_args.clone())),
+        None if image.inject => Ok((Some(ensure_runtime_binary_cached(&image.darkmux_image.id)?), Vec::new())),
+        None => Ok((None, Vec::new())),
+    }
+}
+
 /// (#3112 step 2) What a Seatbelt dispatch runs in place of an image: the
-/// host-built runtime [`SANDBOX_RUNTIME_ENV`] names, else a `darkmux-runtime`
-/// beside this executable. No image is checked or pulled, and `--image` is
+/// [`host_runtime`]. No image is checked or pulled, and `--image` is
 /// refused: there is no image to name.
 fn host_runtime_image(image_arg: Option<&str>) -> Result<RuntimeImage> {
     if let Some(image) = image_arg {
         bail!("--image {image}: the Seatbelt sandbox ({}=seatbelt) runs this host's own programs, not an image", darkmux_sandbox::SANDBOX_ENV);
     }
-    let named = std::env::var_os(SANDBOX_RUNTIME_ENV).filter(|v| !v.is_empty()).map(PathBuf::from);
-    let beside = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|d| d.join("darkmux-runtime")));
-    let Some(binary) = named.or(beside).filter(|p| p.is_file()) else {
-        bail!(
-            "the Seatbelt sandbox needs a host-built runtime: run `cargo build --release --manifest-path runtime/Cargo.toml` \
-             and set {SANDBOX_RUNTIME_ENV} to runtime/target/release/darkmux-runtime"
-        );
-    };
-    let shown = binary.display().to_string();
-    darkmux_types::diag_eprintln!("darkmux dispatch: runtime=internal, sandbox=seatbelt, runtime binary: {shown}");
+    let runtime = host_runtime(std::env::var_os(SANDBOX_RUNTIME_ENV), std::env::current_exe())?;
+    let shown = std::iter::once(runtime.program.display().to_string()).chain(runtime.leading_args.iter().cloned()).collect::<Vec<_>>().join(" ");
+    darkmux_types::diag_eprintln!("darkmux dispatch: runtime=internal, sandbox=seatbelt, runtime: {shown}");
     Ok(RuntimeImage {
         inject: true,
         darkmux_image: crate::runtime_image::ResolvedImage { reference: shown.clone(), id: shown.clone() },
         image: format!("host:{shown}"),
         run_image: "host".to_string(),
-        host_runtime: Some(binary),
+        host_runtime: Some(runtime),
     })
 }
 
@@ -8307,24 +8353,21 @@ fn container_run_config(
     let feedback_json = feedback_templates_json(&run.role);
     // (#2902) The container's hosted-brain flags, from the resolved target.
     let agentic_brain = agentic_brain_flags(agentic_pm);
+    // (#2295) The attachment directories the briefed mods want readable
+    // inside the container. Resolved off the SAME ref list the brief was
+    // rendered from, so the paths the block names are the paths mounted.
+    // Resolved before the runtime program, as it always was.
+    let mod_attachment_mounts = crate::brief_refs::mod_attachment_mounts(&opts.brief_refs, &crate::mods::mods_dir())?;
+    let (runtime_binary, runtime_leading_args) = runtime_program(&run.image)?;
     Ok(DockerRunConfig {
         container_name: container_name.to_string(),
         host_identity: crate::orphan_reaper::HostIdentity::this_process(),
         workspace: run.workspace.clone(),
         host_out: run.host_out.clone(),
-        // (#2295) The attachment directories the briefed mods want readable
-        // inside the container. Resolved off the SAME ref list the brief was
-        // rendered from, so the paths the block names are the paths mounted.
-        mod_attachment_mounts: crate::brief_refs::mod_attachment_mounts(
-            &opts.brief_refs,
-            &crate::mods::mods_dir(),
-        )?,
+        mod_attachment_mounts,
         inject: run.image.inject,
-        runtime_binary: match &run.image.host_runtime {
-            Some(host) => Some(host.clone()),
-            None if run.image.inject => Some(ensure_runtime_binary_cached(&run.image.darkmux_image.id)?),
-            None => None,
-        },
+        runtime_binary,
+        runtime_leading_args,
         image: run.image.run_image.clone(),
         role_id: opts.role_id.clone(),
         // (#2386) The SAME id `materialize_finding` keys stored findings by.
