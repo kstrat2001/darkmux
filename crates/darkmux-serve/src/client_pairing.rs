@@ -68,11 +68,13 @@
 //! another run works in the same copy, and no run starts there while an
 //! Undo reverts.
 //!
-//! **Previews run in a container** ([`crate::client_preview`]): one per
-//! running preview, from the darkmux runtime image, the workspace its only
-//! mount, its two ports published on 127.0.0.1 only, and no host
-//! environment beyond the recipe's `env`. Stop, the idle check and
-//! `client serve`'s own shutdown remove it.
+//! **Previews run in a sandbox** ([`crate::client_preview`]), the one
+//! `runtime.sandbox` selects at each start: a container from the darkmux
+//! runtime image, its two ports published on 127.0.0.1 only, or Seatbelt on
+//! a Mac, this machine's toolchain read-only and its listeners watched; the
+//! workspace its only writable path, and no host environment beyond the
+//! recipe's `env`. Stop, the idle check and `client serve`'s own shutdown
+//! remove it.
 //!
 //! **Previews trust only the user's own checkout.** A preview's recipe
 //! (`.darkmux/preview.json`) is a command darkmux runs, so it is read only
@@ -3703,8 +3705,8 @@ fn previews_allowed(state: &ClientServerState) -> Result<(), Refused> {
             StatusCode::FORBIDDEN, ClientCode::PreviewDisabled,
             "previews are off on this machine: a preview runs the workspace's own code (its \
              package.json scripts and whatever they call, which a model may have written) in a \
-             container with network access, the workspace mounted read-write and its ports \
-             published on 127.0.0.1. To allow it: \
+             sandbox with network access (a container, or Seatbelt on this Mac, `runtime.sandbox`), \
+             the workspace writable and its dev server on 127.0.0.1. To allow it: \
              `darkmux config set clients.preview.enabled true`",
         )),
         Err(e) => Err(refuse(StatusCode::SERVICE_UNAVAILABLE, ClientCode::Unavailable, e)),
@@ -3712,30 +3714,39 @@ fn previews_allowed(state: &ClientServerState) -> Result<(), Refused> {
 }
 
 /// (#3112) Why a preview cannot start under `selected` (the configured
-/// sandbox), or `None` under Docker. A preview runs in a Docker container
-/// (`client_preview`) and has no other backend yet, so any other sandbox
-/// refuses it, naming the setting that would allow it.
+/// sandbox), or `None`: a preview runs in every sandbox darkmux has
+/// (Docker's container; Seatbelt on this Mac, its listeners watched,
+/// `client_preview`), so only a refused setting refuses it. A backend that
+/// cannot run one yet answers here, naming the fix.
 pub(crate) fn preview_sandbox_refusal(selected: &Result<darkmux_sandbox::BackendKind, String>) -> Option<String> {
-    let docker = darkmux_sandbox::setting_value(darkmux_sandbox::BackendKind::Docker);
     match selected {
-        Ok(darkmux_sandbox::BackendKind::Docker) => None,
-        Ok(kind) => Some(format!(
-            "previews need `{key}` `{docker}` for now: a preview runs in a Docker container, and this \
-             machine's sandbox is `{}`. To run previews here: `darkmux config set {key} {docker}` \
-             (Docker installed and running)",
-            darkmux_sandbox::setting_value(*kind),
-            key = darkmux_sandbox::SANDBOX_KEY,
-        )),
+        Ok(darkmux_sandbox::BackendKind::Docker | darkmux_sandbox::BackendKind::Seatbelt) => None,
         Err(why) => Some(format!("no preview can start: {why}")),
     }
 }
 
-/// (#3112) [`preview_sandbox_refusal`] for this machine's sandbox as
-/// `config.json` says now, as a 403 `forbidden`.
-fn previews_run_here(state: &ClientServerState) -> Result<(), Refused> {
-    match preview_sandbox_refusal(&(state.preview_sandbox)()) {
-        None => Ok(()),
-        Some(why) => Err(refuse(StatusCode::FORBIDDEN, ClientCode::Forbidden, why)),
+/// Whether `client` may start workspace `name`'s preview now: previews on,
+/// the workspace its own, and a sandbox to run it in. Returns the sandbox,
+/// the workspace and where its recipe comes from.
+fn preview_may_start(
+    state: &ClientServerState,
+    client: &ApprovedClient,
+    name: &str,
+) -> Result<(darkmux_sandbox::BackendKind, PathBuf, crate::client_preview::RecipeSource), Refused> {
+    let kind = previews_allowed(state)
+        .and_then(|()| owned_workspace(state, client, name).map(|_| ()))
+        .and_then(|()| previews_run_here(state))?;
+    let (dir, source) = workspace_and_recipe_source(state, name)?;
+    Ok((kind, dir, source))
+}
+
+/// (#3112) The sandbox a preview starts in: this machine's as `config.json`
+/// says now, or a 403 `forbidden` saying why none can.
+fn previews_run_here(state: &ClientServerState) -> Result<darkmux_sandbox::BackendKind, Refused> {
+    let selected = (state.preview_sandbox)();
+    match (preview_sandbox_refusal(&selected), selected) {
+        (None, Ok(kind)) => Ok(kind),
+        (Some(why), _) | (None, Err(why)) => Err(refuse(StatusCode::FORBIDDEN, ClientCode::Forbidden, why)),
     }
 }
 
@@ -3759,13 +3770,7 @@ async fn preview_start_body(body: Body) -> Result<PreviewStartBody, Response> {
 /// Starts workspace `name`'s preview from its trusted recipe; with `clean`,
 /// first stops it and clears its install ([`crate::client_preview::Previews::clean`]).
 fn start_preview(state: &ClientServerState, client: &ApprovedClient, name: &str, clean: bool) -> Response {
-    let allowed = previews_allowed(state)
-        .and_then(|()| owned_workspace(state, client, name).map(|_| ()))
-        .and_then(|()| previews_run_here(state));
-    if let Err(r) = allowed {
-        return *r;
-    }
-    let (dir, source) = match workspace_and_recipe_source(state, name) {
+    let (kind, dir, source) = match preview_may_start(state, client, name) {
         Ok(found) => found,
         Err(r) => return *r,
     };
@@ -3774,7 +3779,7 @@ fn start_preview(state: &ClientServerState, client: &ApprovedClient, name: &str,
         Err(r) => return *r,
     };
     let started = if clean { state.previews.clean(name, &dir, &source) } else { Ok(()) }
-        .and_then(|()| state.previews.start_holding(name, &dir, &source, held));
+        .and_then(|()| state.previews.start_holding(kind, name, &dir, &source, held));
     match started {
         Ok((v, true)) => Json(v).into_response(),
         Ok((v, false)) => (StatusCode::ACCEPTED, Json(v)).into_response(),

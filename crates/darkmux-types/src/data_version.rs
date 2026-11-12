@@ -53,8 +53,12 @@ pub const LAB_FIXTURE_SCHEMA_VERSION: &str = "1.2";
 pub const LAB_FIXTURE_EVAL_ROLES_SINCE: &str = "1.2";
 /// A repo's `.darkmux/preview.json` (the preview recipe `darkmux client
 /// serve` runs, read only from the user's own checkout). Required, not
-/// lenient: the format was born with its marker.
-pub const PREVIEW_RECIPE_SCHEMA_VERSION: &str = "1.0";
+/// lenient: the format was born with its marker. 1.1 (#3112) gives `{host}`
+/// in `env` a meaning (the address the dev server binds: `0.0.0.0` in a
+/// container, `127.0.0.1` in a sandbox on the host); a 1.0 recipe keeps
+/// `{host}` as text, and a darkmux that reads only 1.0 refuses a 1.1 one as
+/// newer.
+pub const PREVIEW_RECIPE_SCHEMA_VERSION: &str = "1.1";
 /// `mission.json`.
 pub const MISSION_SCHEMA_VERSION: &str = "1.0";
 /// A phase JSON.

@@ -193,6 +193,28 @@ impl Platform for LinuxPlatform {
         Some(pids)
     }
 
+    /// (#3112) The LISTEN sockets on `port` in `/proc/net/tcp` and `tcp6`
+    /// (the kernel's table), each with the process holding it when this user
+    /// can read that process's fds.
+    fn tcp_port_listeners(&self, port: u16) -> Option<Vec<crate::PortListener>> {
+        let mut listening = listening_sockets(&read_to_string("/proc/net/tcp")?);
+        listening.extend(listening_sockets(&read_to_string("/proc/net/tcp6").unwrap_or_default()));
+        listening.retain(|(at, _)| at.port() == port);
+        let owner = |inode: u64| {
+            list_dir("/proc").into_iter().filter_map(|name| name.parse::<u32>().ok()).find(|pid| {
+                list_dir(&format!("/proc/{pid}/fd"))
+                    .iter()
+                    .any(|fd| read_link(&format!("/proc/{pid}/fd/{fd}")).and_then(|l| socket_inode(&l)) == Some(inode))
+            })
+        };
+        Some(
+            listening
+                .into_iter()
+                .map(|(at, inode)| crate::PortListener { addr: Some(at.ip()), text: at.ip().to_string(), scope: None, pid: owner(inode) })
+                .collect(),
+        )
+    }
+
     /// The ESTABLISHED sockets in `/proc/net/tcp` and `tcp6` (where a
     /// dual-stack client's socket shows its v4-mapped address) whose other
     /// end is `local`, matched in one pass over every process's fds to the
@@ -376,6 +398,19 @@ pub(crate) fn listening_inodes(table: &str, port: u16) -> Vec<u64> {
             let f: Vec<&str> = line.split_whitespace().collect();
             let local_port = f.get(1)?.rsplit_once(':').and_then(|(_, p)| u16::from_str_radix(p, 16).ok())?;
             (local_port == port && *f.get(3)? == "0A").then(|| f.get(9)?.parse().ok())?
+        })
+        .collect()
+}
+
+/// (#3112) Every LISTEN (`0A`) socket in a `/proc/net/tcp{,6}` table: its
+/// address and its inode.
+pub(crate) fn listening_sockets(table: &str) -> Vec<(std::net::SocketAddr, u64)> {
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            (*f.get(3)? == "0A").then(|| Some((proc_net_addr(f.get(1)?)?, f.get(9)?.parse().ok()?)))?
         })
         .collect()
 }

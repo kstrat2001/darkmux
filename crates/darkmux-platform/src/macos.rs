@@ -188,6 +188,12 @@ impl Platform for MacPlatform {
         lsof_established(local.port()).map(|out| crate::peers_from_lsof_fpn(&out, local))
     }
 
+    /// (#3112) One `netstat -anv -p tcp` (the kernel's `pcblist`, no walk
+    /// over processes), bounded to 5 s: about 5 ms measured on an M5 Max.
+    fn tcp_port_listeners(&self, port: u16) -> Option<Vec<crate::PortListener>> {
+        netstat_tcp().and_then(|out| crate::port_listeners_from_netstat(&out, port))
+    }
+
     fn process_group(&self, pid: u32) -> Option<u32> {
         crate::unix_process_group(pid)
     }
@@ -637,6 +643,32 @@ fn lsof_listen_pids(port: u16) -> Option<String> {
 #[cfg(not(target_os = "macos"))]
 fn lsof_listen_pids(_port: u16) -> Option<String> {
     None
+}
+
+/// How long one `netstat` may take before it is no answer.
+const NETSTAT_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// `netstat -anv -p tcp`'s answer, when it ran to success within
+/// [`NETSTAT_BOUND`].
+#[cfg(target_os = "macos")]
+fn netstat_tcp() -> Option<String> {
+    let mut cmd = std::process::Command::new("/usr/sbin/netstat");
+    cmd.args(["-anv", "-p", "tcp"]).current_dir("/");
+    let out = crate::output_within(cmd, NETSTAT_BOUND)?;
+    netstat_answer(out.status.code(), &String::from_utf8_lossy(&out.stdout))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn netstat_tcp() -> Option<String> {
+    let _ = NETSTAT_BOUND;
+    None
+}
+
+/// A netstat's output is an answer only when it exited 0. (Compiled on
+/// every OS for its test; only macOS runs netstat.)
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn netstat_answer(code: Option<i32>, stdout: &str) -> Option<String> {
+    (code == Some(0)).then(|| stdout.to_string())
 }
 
 /// `lsof`'s `-Fpn` answer for the established TCP connections on `port`
