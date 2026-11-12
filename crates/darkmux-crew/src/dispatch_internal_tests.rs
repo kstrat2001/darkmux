@@ -6058,6 +6058,7 @@ S(("127.0.0.1", port), H).serve_forever()
             runtime_binary: Some(PathBuf::from(
                 "/home/op/.darkmux/runtime/darkmux-runtime",
             )),
+            runtime_leading_args: Vec::new(),
             image: "rust:slim".to_string(),
             role_id: "test-role".to_string(),
             execution: darkmux_types::execution_id::ExecutionId::parse("exec-test").unwrap(),
@@ -6272,6 +6273,7 @@ S(("127.0.0.1", port), H).serve_forever()
             mod_attachment_mounts: Vec::new(),
             inject: false,
             runtime_binary: None,
+            runtime_leading_args: Vec::new(),
             image: "darkmux-runtime:latest".to_string(),
             role_id: "test-role".to_string(),
             execution: darkmux_types::execution_id::ExecutionId::parse("exec-test").unwrap(),
@@ -6342,6 +6344,270 @@ S(("127.0.0.1", port), H).serve_forever()
         assert_eq!(env(&docker, "CARGO_HOME"), Some("/darkmux-cache/cargo".to_string()));
         assert_eq!(docker.entrypoint.as_deref(), Some("/darkmux-runtime"));
         assert_eq!(prompt(&docker).as_deref(), Some("/darkmux-out/.prompt.txt"));
+    }
+
+    /// An executable file (mode 755) at `path`, its directory created.
+    fn an_executable(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// (#3112) With no override, a Seatbelt dispatch runs THIS executable's
+    /// `runtime` subcommand, by the real path it had when the process
+    /// started: a link into an install (how Homebrew puts `bin/darkmux` on
+    /// PATH, pointing into its Cellar) is followed, so the program the
+    /// sandbox runs is the file its profile allows. An empty override is no
+    /// override.
+    #[test]
+    fn a_seatbelt_dispatch_runs_this_executables_runtime_subcommand_by_its_real_path() {
+        let root = tempfile::TempDir::new().unwrap();
+        let cellar = root.path().join("Cellar/darkmux/9.9.9/bin/darkmux");
+        an_executable(&cellar, "old");
+        let link = root.path().join("bin/darkmux");
+        std::fs::create_dir(root.path().join("bin")).unwrap();
+        std::os::unix::fs::symlink(&cellar, &link).unwrap();
+        let at_start = executable_at_start(Ok(link.clone()));
+        let real = cellar.canonicalize().unwrap();
+
+        for named in [None, Some(std::ffi::OsString::new())] {
+            let got = host_runtime(named, &at_start).unwrap();
+            assert_eq!((got.program, got.leading_args), (real.clone(), vec!["runtime".to_string()]));
+            assert!(got.started_as.is_some(), "this executable is checked again where the command is built");
+        }
+        let unknown = executable_at_start(Err(std::io::Error::other("no exe")));
+        let err = host_runtime(None, &unknown).unwrap_err();
+        assert!(format!("{err:#}").contains("finding this darkmux executable"), "{err:#}");
+    }
+
+    /// (#3112 review) A long-lived process (a `darkmux serve`) whose install
+    /// was upgraded keeps running the runtime it was built with while that
+    /// file is still there: a relink of `bin/darkmux` to a new Cellar does
+    /// not change what it runs.
+    #[test]
+    fn a_relinked_install_keeps_running_the_runtime_this_process_started_from() {
+        let root = tempfile::TempDir::new().unwrap();
+        let old = root.path().join("Cellar/darkmux/1.0.0/bin/darkmux");
+        let new = root.path().join("Cellar/darkmux/2.0.0/bin/darkmux");
+        an_executable(&old, "old");
+        an_executable(&new, "new build");
+        std::fs::create_dir(root.path().join("bin")).unwrap();
+        let link = root.path().join("bin/darkmux");
+        std::os::unix::fs::symlink(&old, &link).unwrap();
+        let at_start = executable_at_start(Ok(link.clone()));
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&new, &link).unwrap();
+
+        let got = host_runtime(None, &at_start).unwrap();
+        assert_eq!(got.program, old.canonicalize().unwrap(), "the file this process started from, not the new link target");
+    }
+
+    /// (#3112 review) Once the file this process started from is gone or is
+    /// another file (`cargo install` replaces by rename; `brew cleanup`
+    /// deletes the old Cellar), the dispatch is refused with the remedy,
+    /// never run against a runtime that does not match this process.
+    #[test]
+    fn a_replaced_or_removed_executable_is_refused_with_restart_as_the_remedy() {
+        let root = tempfile::TempDir::new().unwrap();
+        let exe = root.path().join("bin/darkmux");
+        an_executable(&exe, "old");
+        let at_start = executable_at_start(Ok(exe.clone()));
+
+        // Replaced by rename: same path, another file (same size, too).
+        let staged = root.path().join("bin/.darkmux.new");
+        an_executable(&staged, "new");
+        std::fs::rename(&staged, &exe).unwrap();
+        let err = format!("{:#}", host_runtime(None, &at_start).unwrap_err());
+        assert!(err.contains("was replaced since this process started") && err.contains("Restart this darkmux process"), "{err}");
+
+        std::fs::remove_file(&exe).unwrap();
+        let err = format!("{:#}", host_runtime(None, &at_start).unwrap_err());
+        assert!(err.contains("was replaced since this process started") && err.contains("Restart this darkmux process"), "{err}");
+    }
+
+    /// `path`'s (inode, size, mtime).
+    fn ino_len_mtime(path: &Path) -> (u64, u64, std::time::SystemTime) {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(path).unwrap();
+        (m.ino(), m.len(), m.modified().unwrap())
+    }
+
+    /// `path`'s modification time set to `when`.
+    fn set_mtime(path: &Path, when: std::time::SystemTime) {
+        std::fs::File::options().write(true).open(path).unwrap().set_modified(when).unwrap();
+    }
+
+    /// A refusal names what happened and the remedy.
+    fn assert_replaced(err: anyhow::Error) {
+        let err = format!("{err:#}");
+        assert!(err.contains("was replaced since this process started") && err.contains("Restart this darkmux process"), "{err}");
+    }
+
+    /// (#3112 re-review) Only the inode differs: a reinstall that renames a
+    /// same-size file with the same mtime over it (a Homebrew bottle's files
+    /// keep the bottle's build time).
+    #[test]
+    fn a_replacement_differing_only_in_inode_is_refused() {
+        let root = tempfile::TempDir::new().unwrap();
+        let exe = root.path().join("bin/darkmux");
+        an_executable(&exe, "old");
+        let at_start = executable_at_start(Ok(exe.clone()));
+        let (ino, len, mtime) = ino_len_mtime(&exe);
+        let staged = root.path().join("bin/.darkmux.new");
+        an_executable(&staged, "new");
+        set_mtime(&staged, mtime);
+        std::fs::rename(&staged, &exe).unwrap();
+        let (ino2, len2, mtime2) = ino_len_mtime(&exe);
+        assert!(ino2 != ino && len2 == len && mtime2 == mtime, "the fixture differs in the inode alone");
+        assert_replaced(host_runtime(None, &at_start).unwrap_err());
+    }
+
+    /// (#3112 re-review) Only the size differs: the same inode rewritten in
+    /// place (macOS `cp new dst` keeps the destination's inode), its mtime put
+    /// back.
+    #[test]
+    fn an_in_place_rewrite_differing_only_in_size_is_refused() {
+        let root = tempfile::TempDir::new().unwrap();
+        let exe = root.path().join("bin/darkmux");
+        an_executable(&exe, "old");
+        let at_start = executable_at_start(Ok(exe.clone()));
+        let (ino, len, mtime) = ino_len_mtime(&exe);
+        std::fs::write(&exe, "a longer build").unwrap();
+        set_mtime(&exe, mtime);
+        let (ino2, len2, mtime2) = ino_len_mtime(&exe);
+        assert!(ino2 == ino && len2 != len && mtime2 == mtime, "the fixture differs in the size alone");
+        assert_replaced(host_runtime(None, &at_start).unwrap_err());
+    }
+
+    /// (#3112 re-review) Only the mtime differs: the same inode rewritten in
+    /// place with content of the same length.
+    #[test]
+    fn an_in_place_rewrite_differing_only_in_mtime_is_refused() {
+        let root = tempfile::TempDir::new().unwrap();
+        let exe = root.path().join("bin/darkmux");
+        an_executable(&exe, "old");
+        let at_start = executable_at_start(Ok(exe.clone()));
+        let (ino, len, mtime) = ino_len_mtime(&exe);
+        std::fs::write(&exe, "new").unwrap();
+        set_mtime(&exe, mtime + std::time::Duration::from_secs(5));
+        let (ino2, len2, mtime2) = ino_len_mtime(&exe);
+        assert!(ino2 == ino && len2 == len && mtime2 != mtime, "the fixture differs in the mtime alone");
+        assert_replaced(host_runtime(None, &at_start).unwrap_err());
+    }
+
+    /// (#3112 re-review) The early check fails a dispatch fast; between it
+    /// and the exec come role load, a model load that can wait behind a
+    /// preflight hold, the lease and the workspace copy. A replacement in that
+    /// window is refused where the command is built.
+    #[test]
+    fn a_replacement_after_the_early_check_is_refused_where_the_command_is_built() {
+        let root = tempfile::TempDir::new().unwrap();
+        let exe = root.path().join("bin/darkmux");
+        an_executable(&exe, "old");
+        let at_start = executable_at_start(Ok(exe.clone()));
+        let host = host_runtime(None, &at_start).expect("the early check passes");
+        let image = RuntimeImage {
+            inject: true,
+            darkmux_image: crate::runtime_image::ResolvedImage { reference: "r".into(), id: "r".into() },
+            image: "i".into(),
+            run_image: "host".into(),
+            host_runtime: Some(host),
+        };
+        assert!(runtime_program(&image).is_ok(), "unchanged, the command is built");
+        let staged = root.path().join("bin/.darkmux.new");
+        an_executable(&staged, "new");
+        std::fs::rename(&staged, &exe).unwrap();
+        assert_replaced(runtime_program(&image).unwrap_err());
+    }
+
+    /// (#3112) `DARKMUX_SANDBOX_RUNTIME`, for development, runs a standalone
+    /// runtime instead, by its real path and with no subcommand. One that is
+    /// not an executable file (missing, a directory, not executable) is
+    /// refused, naming the variable, never silently replaced.
+    #[test]
+    fn the_sandbox_runtime_override_runs_a_standalone_runtime_or_is_refused() {
+        let root = tempfile::TempDir::new().unwrap();
+        let standalone = root.path().join("rt/darkmux-runtime");
+        an_executable(&standalone, "");
+        let at_start = executable_at_start(Ok(root.path().join("darkmux")));
+        // Relative to the working directory (`root/rt/../rt/…`): resolved.
+        let relative = standalone.strip_prefix(std::env::current_dir().unwrap()).map(Path::to_path_buf).unwrap_or_else(|_| {
+            pathdiff_to(&std::env::current_dir().unwrap(), &standalone)
+        });
+        assert!(relative.is_relative(), "{}", relative.display());
+        let got = host_runtime(Some(relative.into_os_string()), &at_start).unwrap();
+        assert_eq!(got, HostRuntime { program: standalone.canonicalize().unwrap(), leading_args: Vec::new(), started_as: None });
+
+        let plain = root.path().join("not-executable");
+        std::fs::write(&plain, "").unwrap();
+        for refused in [root.path().join("nope"), root.path().join("rt"), plain] {
+            let err = format!("{:#}", host_runtime(Some(refused.clone().into_os_string()), &at_start).unwrap_err());
+            assert!(err.contains("DARKMUX_SANDBOX_RUNTIME=") && err.contains("not an executable file"), "{}: {err}", refused.display());
+        }
+    }
+
+    /// `to` relative to `from`, by `..` up to their common ancestor.
+    fn pathdiff_to(from: &Path, to: &Path) -> PathBuf {
+        let from: Vec<_> = from.components().collect();
+        let to: Vec<_> = to.components().collect();
+        let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+        let mut rel = PathBuf::new();
+        for _ in common..from.len() {
+            rel.push("..");
+        }
+        for c in &to[common..] {
+            rel.push(c);
+        }
+        rel
+    }
+
+    /// (#3112) The dispatch's config carries the host runtime's program AND
+    /// its leading arguments; a darkmux image runs its own baked-in runtime
+    /// with neither.
+    #[test]
+    fn a_host_runtime_reaches_the_config_with_its_leading_arguments() {
+        let image = |host_runtime: Option<HostRuntime>| RuntimeImage {
+            inject: host_runtime.is_some(),
+            darkmux_image: crate::runtime_image::ResolvedImage { reference: "r".into(), id: "r".into() },
+            image: "i".into(),
+            run_image: "i".into(),
+            host_runtime,
+        };
+        let host = HostRuntime { program: PathBuf::from("/real/darkmux"), leading_args: vec!["runtime".to_string()], started_as: None };
+        assert_eq!(
+            runtime_program(&image(Some(host))).unwrap(),
+            (Some(PathBuf::from("/real/darkmux")), vec!["runtime".to_string()])
+        );
+        assert_eq!(runtime_program(&image(None)).unwrap(), (None, Vec::new()));
+    }
+
+    /// (#3112) The Seatbelt policy's entrypoint is the darkmux executable and
+    /// its command is `runtime run …`: the subcommand, then exactly the
+    /// arguments a standalone runtime gets. A runtime with no leading
+    /// arguments (Docker's injected binary, the override) is unchanged.
+    #[test]
+    fn the_seatbelt_policy_runs_the_runtime_subcommand_then_the_runtimes_own_arguments() {
+        use darkmux_sandbox::SeatbeltBackend;
+        let root = tempfile::TempDir::new().unwrap();
+        for d in ["ws", "out"] {
+            std::fs::create_dir(root.path().join(d)).unwrap();
+        }
+        std::fs::write(root.path().join("darkmux"), "").unwrap();
+        let mut cfg = argv_config_with_base_url(None);
+        cfg.workspace = root.path().join("ws");
+        cfg.host_out = root.path().join("out");
+        cfg.inject = true;
+        cfg.runtime_binary = Some(root.path().join("darkmux"));
+        let standalone = dispatch_policy_for(&cfg, &SeatbeltBackend);
+        assert_eq!(standalone.command.first().map(String::as_str), Some("run"));
+
+        cfg.runtime_leading_args = vec!["runtime".to_string()];
+        let linked = dispatch_policy_for(&cfg, &SeatbeltBackend);
+        let exe = root.path().join("darkmux").canonicalize().unwrap().display().to_string();
+        assert_eq!(linked.entrypoint, Some(exe));
+        assert_eq!(linked.command[0], "runtime");
+        assert_eq!(linked.command[1..], standalone.command[..], "after the subcommand, the standalone runtime's arguments");
     }
 
     /// (#3112 step 2) The dispatch spawns the backend's own command, its
@@ -6626,6 +6892,7 @@ S(("127.0.0.1", port), H).serve_forever()
             mod_attachment_mounts: Vec::new(),
             inject: false,
             runtime_binary: None,
+            runtime_leading_args: Vec::new(),
             image: "darkmux-runtime:latest".to_string(),
             role_id: "test-role".to_string(),
             execution: darkmux_types::execution_id::ExecutionId::parse("exec-test").unwrap(),
@@ -6772,6 +7039,7 @@ S(("127.0.0.1", port), H).serve_forever()
             mod_attachment_mounts: Vec::new(),
             inject: false,
             runtime_binary: None,
+            runtime_leading_args: Vec::new(),
             image: "darkmux-runtime:latest".to_string(),
             role_id: "test-role".to_string(),
             execution: darkmux_types::execution_id::ExecutionId::parse("exec-test").unwrap(),
@@ -6860,6 +7128,7 @@ S(("127.0.0.1", port), H).serve_forever()
             mod_attachment_mounts: vec![(PathBuf::from("/tmp/mods/m1"), "/darkmux-mods/m1".to_string())],
             inject: true,
             runtime_binary: Some(PathBuf::from("/tmp/rt/darkmux-runtime")),
+            runtime_leading_args: Vec::new(),
             cache_dir: Some(PathBuf::from("/tmp/cache")),
             max_pause_ms_env: Some(250),
             remote_needs_auth: true,
@@ -6957,6 +7226,7 @@ S(("127.0.0.1", port), H).serve_forever()
             mod_attachment_mounts: Vec::new(),
             inject: false,
             runtime_binary: None,
+            runtime_leading_args: Vec::new(),
             image: "darkmux-runtime:latest".to_string(),
             role_id: "test-role".to_string(),
             execution: darkmux_types::execution_id::ExecutionId::parse("exec-test").unwrap(),
@@ -8813,6 +9083,7 @@ S(("127.0.0.1", port), H).serve_forever()
             mod_attachment_mounts: Vec::new(),
             inject: false,
             runtime_binary: None,
+            runtime_leading_args: Vec::new(),
             image: "darkmux-runtime:latest".to_string(),
             role_id: "test-role".to_string(),
             execution: darkmux_types::execution_id::ExecutionId::parse("exec-test").unwrap(),
@@ -16247,6 +16518,7 @@ S(("127.0.0.1", port), H).serve_forever()
             mod_attachment_mounts: Vec::new(),
             inject: false,
             runtime_binary: None,
+            runtime_leading_args: Vec::new(),
             image: "darkmux-runtime:latest".to_string(),
             role_id: "test-role".to_string(),
             execution: darkmux_types::execution_id::ExecutionId::parse("exec-test").unwrap(),

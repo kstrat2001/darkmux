@@ -379,7 +379,7 @@ pub(crate) struct EnvelopeMeta {
     /// in `total_tokens` (and, downstream, in the persisted
     /// `ScoreRow::tokens_to_solution`). Same "`None`, not `Some(0)`: nothing
     /// was measured, not 'zero was measured'" discipline
-    /// `runtime/src/main.rs` documents beside its own hardcoded-zero arms.
+    /// `runtime/src/lib.rs` documents beside its own hardcoded-zero arms.
     pub infra_exit: bool,
     /// The envelope's own `result` was `error`: the runtime's loop returned
     /// an error (an endpoint that refused or dropped the call). Classified
@@ -436,8 +436,9 @@ pub fn envelope_candidate(stdout: &str) -> &str {
 /// # This is for dispatch STDOUT, and only for dispatch stdout
 ///
 /// The input must be what the internal runtime prints: `serde_json::to_string`
-/// (COMPACT) + `println!` (`runtime/src/main.rs:1110`, `:1216`), i.e. the
-/// envelope occupies exactly one line, possibly preceded by noise.
+/// (COMPACT) + `println!` (`print_success` and `print_failure` in
+/// `runtime/src/lib.rs`), i.e. the envelope occupies exactly one line,
+/// possibly preceded by noise.
 ///
 /// Do NOT route a stored, PRETTY-PRINTED artifact through this. The last line
 /// starting with `{` in a pretty-printed document is an inner array-element
@@ -948,7 +949,7 @@ mod tests {
     /// verdict out of", which is FALSE for this shape — so the condition is
     /// now the one the justification actually describes.
     ///
-    /// No live producer reaches it (`runtime/src/main.rs`'s
+    /// No live producer reaches it (`runtime/src/lib.rs`'s
     /// `build_json_envelope` always emits a `metrics` object carrying
     /// `model`), which makes this a CONTRACT defect rather than a
     /// misclassification. Pinned so it stays fixed.

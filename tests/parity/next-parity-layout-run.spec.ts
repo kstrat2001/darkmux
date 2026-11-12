@@ -416,7 +416,8 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
 // line reserved) is the operator's design call, so it is recorded, not decided.
 test.fixme("run page MODEL section: the same size live and finished with the thermal governor armed (owner: the operator's call on ACTIVE TIME's sub line)", async () => {});
 
-// (W3) Two executions: the tube pages them ("2 running · 1/2"), and there is no
+// (W3) Two executions: the tube pages them ("2 running · 1/2", then (#3554) the
+// shown execution's model), and there is no
 // pager row, so the card is the size of one running a single execution, on a
 // desktop as on a phone.
 async function pagerRows(browser, viewport) {
@@ -426,14 +427,14 @@ async function pagerRows(browser, viewport) {
     await expect(page.locator(CARD.card)).toHaveCount(1);
     await expect(page.locator(".mach-scope__pager"), `${state.id}: no pager row`).toHaveCount(0);
     if (state === MULTI) {
-      await expect(page.locator(".runs")).toHaveText("2 running · 1/2");
+      await expect(page.locator(".runs")).toHaveText("2 running · 1/2 · qwen-layout");
       const tube = page.locator('.mach-scope[role="button"]');
       await expect(tube).toHaveAttribute("aria-label", /^execution 1 of 2/);
       await tube.click();
-      await expect(page.locator(".runs")).toHaveText("2 running · 2/2");
+      await expect(page.locator(".runs")).toHaveText("2 running · 2/2 · qwen-layout");
       await expect(tube).toHaveAttribute("aria-label", /^execution 2 of 2/);
       await tube.press("Enter");
-      await expect(page.locator(".runs")).toHaveText("2 running · 1/2");
+      await expect(page.locator(".runs")).toHaveText("2 running · 1/2 · qwen-layout");
     }
     await page.waitForTimeout(400);
     rows.push({ state: state.id, ...(await measure(page, { card: CARD.card, cardScope: CARD.cardScope, stat: STAT, runs: ".mach .runs", serves: ".mach .serves" })) });

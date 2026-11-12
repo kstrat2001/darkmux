@@ -8,7 +8,7 @@
  * peer's own `detail` sentence: an outcome line is a fixed phrase per variant.
  */
 
-import { engineOf, engineSuffix, residentsKnown } from "../../lib/machineEngine";
+import { darkmuxResidents, engineOf, engineSuffix, residentsKnown, type CardResidents } from "../../lib/machineEngine";
 import type { CardOutcome } from "../../types/generated/CardOutcome";
 import type { EngineServer } from "../../types/generated/EngineServer";
 import type { FleetMachine } from "../../types/generated/FleetMachine";
@@ -228,6 +228,8 @@ export interface RowFacts {
   engineServers: EngineServer[];
   /** The row's card's own statement of its machine's utility model. */
   utility: UtilityReading;
+  /** (#3554) What the row's card says its machine holds for darkmux. */
+  residents: CardResidents | null;
 }
 
 /** Whether this viewer is receiving the row's machine. A view whose presence
@@ -285,6 +287,7 @@ export function rowFacts(
     servesProfiles: rowServesProfiles(row),
     engineServers: rowEngineServers(row),
     utility: rowUtility(row),
+    residents: darkmuxResidents(specs),
   };
 }
 

@@ -43,10 +43,10 @@
 //! launcher removes the directory when the sandbox exits.
 //!
 //! The confined process is started by a helper: this same executable, run
-//! with [`HELPER_ARG`] first. `darkmux`'s `main` hands those arguments to
-//! [`helper_if_asked`] before anything else; a test binary that starts
-//! sandboxes does the same before its `main`
-//! ([`darkmux_platform::confine_before_main`]).
+//! with [`HELPER_ARG`] first. In `darkmux` it is a row of the multi-call
+//! entry (`src/multicall.rs`), routed to [`helper`] before anything else; a
+//! test binary that starts sandboxes routes it with [`helper_if_asked`]
+//! before its `main` ([`darkmux_platform::confine_before_main`]).
 
 use crate::{Access, BackendKind, Listed, Mount, Network, Query, SandboxBackend, SandboxHandle, SandboxPolicy};
 use darkmux_platform::confine::{Bind, Confinement};
@@ -166,30 +166,8 @@ impl LandlockBackend {
     }
 
     fn rules_with(policy: &SandboxPolicy, dir: &Path, etc: &Path) -> Option<String> {
-        let mut lines = Vec::new();
-        for system in SYSTEM_READ.iter().map(Path::new) {
-            match std::fs::symlink_metadata(system) {
-                Ok(m) if m.file_type().is_symlink() => {
-                    let target = std::fs::read_link(system).ok()?;
-                    lines.push(format!("link {}\t{}", system.display(), target.display()));
-                }
-                Ok(_) => lines.push(format!("ro {}", system.display())),
-                Err(_) => {}
-            }
-        }
-        if let Ok(entries) = std::fs::read_dir(etc) {
-            let mut names: Vec<String> = entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
-            names.sort();
-            for name in names.iter().filter(|n| !DENIED_ETC.contains(&n.as_str())) {
-                // A link to nowhere (a stale `/etc/resolv.conf`) grants nothing,
-                // and one into the kernel's own trees (`/etc/mtab`, the host's
-                // mount table) is not followed there.
-                let into_kernel = etc.join(name).canonicalize().is_ok_and(|real| KERNEL_TREES.iter().any(|k| real.starts_with(k)));
-                if etc.join(name).exists() && !into_kernel {
-                    lines.push(format!("ro {}", Path::new("/etc").join(name).display()));
-                }
-            }
-        }
+        let mut lines = Self::system_lines()?;
+        lines.extend(Self::etc_lines(etc));
         lines.push(format!("rw {}", canonical(&dir.join("tmp")).display()));
         if let Some(program) = policy.entrypoint.as_deref().filter(|e| Path::new(e).is_absolute()) {
             lines.push(format!("ro {}", canonical(Path::new(program)).display()));
@@ -210,6 +188,38 @@ impl LandlockBackend {
             lines.push(format!("workdir {workdir}"));
         }
         lines.iter().all(|l| !l.contains('\n')).then(|| lines.iter().map(|l| format!("{l}\n")).collect())
+    }
+
+    /// The system's own trees, read-only; a symlink among them (`/bin` to
+    /// `usr/bin`) stays a link. `None` when a link cannot be read.
+    fn system_lines() -> Option<Vec<String>> {
+        let mut lines = Vec::new();
+        for system in SYSTEM_READ.iter().map(Path::new) {
+            match std::fs::symlink_metadata(system) {
+                Ok(m) if m.file_type().is_symlink() => {
+                    let target = std::fs::read_link(system).ok()?;
+                    lines.push(format!("link {}\t{}", system.display(), target.display()));
+                }
+                Ok(_) => lines.push(format!("ro {}", system.display())),
+                Err(_) => {}
+            }
+        }
+        Some(lines)
+    }
+
+    /// `etc`'s entries, read-only and sorted, but the denied ones. A link to
+    /// nowhere (a stale `/etc/resolv.conf`) grants nothing, and one into the
+    /// kernel's own trees (`/etc/mtab`, the host's mount table) is not
+    /// followed there.
+    fn etc_lines(etc: &Path) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(etc) else { return Vec::new() };
+        let mut names: Vec<String> = entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names.retain(|name| {
+            let into_kernel = etc.join(name).canonicalize().is_ok_and(|real| KERNEL_TREES.iter().any(|k| real.starts_with(k)));
+            !DENIED_ETC.contains(&name.as_str()) && etc.join(name).exists() && !into_kernel
+        });
+        names.iter().map(|name| format!("ro {}", Path::new("/etc").join(name).display())).collect()
     }
 
     /// `key=value`, one per line, newlines in a value dropped so one label
@@ -268,43 +278,58 @@ impl LandlockBackend {
 fn confinement(dir: &Path, rules: &str) -> Result<Confinement, String> {
     let mut c = Confinement { root: dir.join("root"), host_network: true, ..Default::default() };
     for line in rules.lines().filter(|l| !l.is_empty()) {
-        let (kind, rest) = line.split_once(' ').unwrap_or((line, ""));
-        match kind {
-            "ro" | "rw" => c.binds.push(Bind { path: PathBuf::from(rest), writable: kind == "rw" }),
-            "link" => {
-                let (path, target) = rest.split_once('\t').ok_or_else(|| format!("not a link: {line}"))?;
-                c.links.push((PathBuf::from(path), PathBuf::from(target)));
-            }
-            "dev" => c.devices.push(PathBuf::from(rest)),
-            "net" => c.host_network = rest == "host",
-            "port" => c.bind_ports.push(rest.parse().map_err(|_| format!("not a port: {line}"))?),
-            "workdir" => c.workdir = Some(PathBuf::from(rest)),
-            _ => return Err(format!("not a rule: {line}")),
-        }
+        add_rule(&mut c, line)?;
     }
     Ok(c)
 }
 
-/// The helper, when `args` (this process's own) ask for it: confine this
-/// process as the sandbox directory's rules say and exec the program. It
-/// never returns then, exiting 125 when it cannot start. Otherwise it
-/// returns at once. Call it first in `main`, before any thread starts.
-pub fn helper_if_asked(args: Vec<OsString>) {
-    if args.get(1).map(|a| a.as_os_str()) != Some(HELPER_ARG.as_ref()) {
-        return;
+/// One rule line added to `c`, or the line when it is not a rule.
+fn add_rule(c: &mut Confinement, line: &str) -> Result<(), String> {
+    let (kind, rest) = line.split_once(' ').unwrap_or((line, ""));
+    match kind {
+        "ro" | "rw" => c.binds.push(Bind { path: PathBuf::from(rest), writable: kind == "rw" }),
+        "link" => {
+            let (path, target) = rest.split_once('\t').ok_or_else(|| format!("not a link: {line}"))?;
+            c.links.push((PathBuf::from(path), PathBuf::from(target)));
+        }
+        "dev" => c.devices.push(PathBuf::from(rest)),
+        "net" => c.host_network = rest == "host",
+        "port" => c.bind_ports.push(rest.parse().map_err(|_| format!("not a port: {line}"))?),
+        "workdir" => c.workdir = Some(PathBuf::from(rest)),
+        _ => return Err(format!("not a rule: {line}")),
     }
-    let Some(dir) = args.get(2).map(PathBuf::from) else {
+    Ok(())
+}
+
+/// The helper, given its own arguments (the sandbox directory, the program
+/// and the program's arguments): confine this process as the directory's
+/// rules say and exec the program. It returns only when it cannot start,
+/// with exit code 125. Run it before any thread starts.
+pub fn helper(args: &[OsString]) -> std::process::ExitCode {
+    let Some(dir) = args.first().map(PathBuf::from) else {
         eprintln!("landlock: {HELPER_ARG} needs the sandbox's directory");
-        std::process::exit(125);
+        return std::process::ExitCode::from(125);
     };
     let rules = std::fs::read_to_string(dir.join("rules")).map_err(|e| e.to_string());
     match rules.and_then(|r| confinement(&dir, &r)) {
         Ok(c) => {
-            let e = darkmux_platform::confine::enter(&c, &args[3..]);
+            let e = darkmux_platform::confine::enter(&c, &args[1..]);
             eprintln!("landlock: could not start the sandbox: {e}");
         }
         Err(why) => eprintln!("landlock: {}: {why}", dir.join("rules").display()),
     }
+    std::process::ExitCode::from(125)
+}
+
+/// [`helper`], when `args` (this process's own) ask for it; it never
+/// returns then. Otherwise it returns at once. For a binary without the
+/// multi-call entry (a test binary, through
+/// [`darkmux_platform::confine_before_main`]).
+pub fn helper_if_asked(args: Vec<OsString>) {
+    if args.get(1).map(|a| a.as_os_str()) != Some(HELPER_ARG.as_ref()) {
+        return;
+    }
+    let _ = helper(&args[2..]);
     std::process::exit(125);
 }
 

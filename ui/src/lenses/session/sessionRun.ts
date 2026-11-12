@@ -52,6 +52,7 @@
  * golden moves — asserted directly in `lib/format.test.ts`.
  */
 
+import { routeKindLabel } from "../../lib/endpointRoute";
 import type { AbandonReason } from "../../types/generated/AbandonReason";
 import { computeTMax, type RunState } from "../../lib/flow";
 import { runStatusWord, type RunBadgeStatus } from "../../lib/runStatusWord";
@@ -812,8 +813,7 @@ function routeLabel(ep: string | undefined, on: { name: string; uid: string }, v
   const i = ep.indexOf(":");
   const kind = i >= 0 ? ep.slice(0, i) : "";
   const rest = i >= 0 ? ep.slice(i + 1) : ep;
-  const label = kind === "azure" ? "Azure OpenAI" : kind === "openai" ? "OpenAI" : kind || "endpoint";
-  return `${label} · ${rest}`;
+  return `${routeKindLabel(kind)} · ${rest}`;
 }
 
 /** (5.0 R3) The route row: stated by a dispatch start or a terminal naming the

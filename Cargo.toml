@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/darkmux-types", "crates/darkmux-flow", "crates/darkmux-profiles", "crates/darkmux-crew", "crates/darkmux-hardware", "crates/darkmux-platform", "crates/darkmux-sandbox", "crates/darkmux-heuristics", "crates/darkmux-eureka", "crates/darkmux-fleet", "crates/darkmux-lab", "crates/darkmux-doctor", "crates/darkmux-serve", "crates/darkmux-gestalt", "crates/darkmux-trajectory"]
+members = [".", "crates/darkmux-types", "crates/darkmux-flow", "crates/darkmux-profiles", "crates/darkmux-crew", "crates/darkmux-hardware", "crates/darkmux-platform", "crates/darkmux-sandbox", "crates/darkmux-heuristics", "crates/darkmux-eureka", "crates/darkmux-fleet", "crates/darkmux-lab", "crates/darkmux-doctor", "crates/darkmux-serve", "crates/darkmux-gestalt", "crates/darkmux-trajectory", "crates/darkmux-runtime-linked"]
 # runtime/ is a separate crate with its own Cargo.lock; it stays out of the
 # workspace per #463 ("stays as-is"). plugins/darkmux-bundler-rust is a
 # genuinely standalone Cargo project (its own [workspace] table, zero
@@ -23,6 +23,12 @@ members = [".", "crates/darkmux-types", "crates/darkmux-flow", "crates/darkmux-p
 # without also touching that script. `tools/darkmux-mock-model` is
 # deliberately left uncovered (dev/test infrastructure, not production code —
 # see the workflow's own comment for the reasoning).
+#
+# (#3112) Excluded, yet inside the darkmux binary: `crates/darkmux-runtime-linked`
+# compiles `runtime/src/lib.rs` in place as a member of this workspace (its
+# manifest says why a path dependency on `runtime/` cannot do it), and the
+# root binary runs it as the hidden `darkmux runtime` subcommand. `runtime/`
+# itself stays a standalone project with its own lockfile.
 exclude = ["runtime", "plugins/darkmux-bundler-rust", "tools/darkmux-mock-model"]
 
 [workspace.dependencies]
@@ -95,8 +101,16 @@ darkmux-serve = { path = "crates/darkmux-serve" }
 # previously wired as a DIRECT dependency of the binary itself.
 darkmux-gestalt = { path = "crates/darkmux-gestalt" }
 darkmux-trajectory = { path = "crates/darkmux-trajectory", features = ["schemars"] }
-# (#3112) `main` hands a Landlock sandbox's helper its arguments first.
+# (#3112) A Landlock sandbox's helper is a row of `src/multicall.rs`; and
+# `tests/runtime_parity.rs` runs `darkmux runtime` inside a real Seatbelt
+# sandbox (opt-in), through the backend dispatch uses.
 darkmux-sandbox = { path = "crates/darkmux-sandbox" }
+# (#3112) The agent runtime (`runtime/src/lib.rs`, linked by the package
+# below), run as the hidden `darkmux runtime` subcommand (src/multicall.rs):
+# what a Seatbelt sandbox runs, so no user builds or downloads a separate
+# runtime. Named `darkmux-runtime` here: its library is `darkmux_runtime`, as
+# the standalone one's is.
+darkmux-runtime = { package = "darkmux-runtime-linked", path = "crates/darkmux-runtime-linked" }
 anyhow = "1.0"
 axum = "0.7"
 clap = { version = "4.5", features = ["derive"] }

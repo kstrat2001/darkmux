@@ -154,6 +154,7 @@ macro_rules! confine_before_main {
 }
 
 /// An exit status as a shell reports it: the code, or 128 plus the signal.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn exit_code(exited: Option<i32>, signaled: Option<i32>) -> i32 {
     exited.or(signaled.map(|s| 128 + s)).unwrap_or(1)
 }
@@ -300,11 +301,13 @@ mod imp {
 
     extern "C" fn ignore(_: libc::c_int) {}
 
+    /// Reap children until `pid` exits, and the status to exit with as it
+    /// did. Any other child reaped on the way (as pid 1 must) is dropped.
     fn wait_code(pid: libc::pid_t) -> i32 {
         let mut status = 0;
         loop {
-            // SAFETY: waiting on our own child.
-            let r = unsafe { libc::waitpid(pid, &mut status, 0) };
+            // SAFETY: waiting on our own children.
+            let r = unsafe { libc::waitpid(-1, &mut status, 0) };
             if r == pid {
                 break;
             }
@@ -374,18 +377,7 @@ mod imp {
                 }
                 libc::_exit(as_program(c, abi, argv));
             }
-            loop {
-                let mut status = 0;
-                let r = libc::waitpid(-1, &mut status, 0);
-                if r == program {
-                    let exited = libc::WIFEXITED(status).then(|| libc::WEXITSTATUS(status));
-                    let signaled = libc::WIFSIGNALED(status).then(|| libc::WTERMSIG(status));
-                    return super::exit_code(exited, signaled);
-                }
-                if r < 0 && Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-                    return 1;
-                }
-            }
+            wait_code(program)
         }
     }
 
@@ -475,6 +467,15 @@ mod imp {
         let root = &c.root;
         mount(None, Path::new("/"), None, libc::MS_REC | libc::MS_PRIVATE, None)?;
         mount(None, root, Some("tmpfs"), libc::MS_NOSUID | libc::MS_NODEV, Some("mode=0755,size=4m"))?;
+        grant_paths(c)?;
+        kernel_trees(root)?;
+        set_attrs(root, libc::MOUNT_ATTR_RDONLY | libc::MOUNT_ATTR_NOSUID | libc::MOUNT_ATTR_NODEV, false)?;
+        pivot_into(root)
+    }
+
+    /// The granted links, paths and devices, each at its own path in `root`.
+    fn grant_paths(c: &Confinement) -> Result<(), Error> {
+        let root = &c.root;
         for (path, target) in &c.links {
             std::os::unix::fs::symlink(target, under(root, path))?;
         }
@@ -485,6 +486,11 @@ mod imp {
         for device in &c.devices {
             bind(device, &under(root, device), libc::MOUNT_ATTR_NOSUID)?;
         }
+        Ok(())
+    }
+
+    /// `/dev`'s standard links, an empty `/tmp` and a fresh `/proc`.
+    fn kernel_trees(root: &Path) -> Result<(), Error> {
         let dev = root.join("dev");
         std::fs::create_dir_all(&dev)?;
         for (name, target) in [("fd", "/proc/self/fd"), ("stdin", "/proc/self/fd/0"), ("stdout", "/proc/self/fd/1"), ("stderr", "/proc/self/fd/2")] {
@@ -493,8 +499,11 @@ mod imp {
         std::fs::create_dir_all(root.join("tmp"))?;
         let proc = root.join("proc");
         std::fs::create_dir_all(&proc)?;
-        mount(Some(Path::new("proc")), &proc, Some("proc"), libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, None)?;
-        set_attrs(root, libc::MOUNT_ATTR_RDONLY | libc::MOUNT_ATTR_NOSUID | libc::MOUNT_ATTR_NODEV, false)?;
+        mount(Some(Path::new("proc")), &proc, Some("proc"), libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, None)
+    }
+
+    /// Make `root` this process's `/`, the old root detached.
+    fn pivot_into(root: &Path) -> Result<(), Error> {
         std::env::set_current_dir(root)?;
         let dot = c".";
         // SAFETY: pivot_root(".", ".") stacks the old root over the new one,

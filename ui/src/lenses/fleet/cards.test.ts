@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { machActive, specOf, busiestExecution, isStrictlyBusier, specUnknownLabel, cardFace, notStreamedNames, servesLine, servesParts, executionCountText, shownExecution } from "./cards";
+import { machActive, specOf, busiestExecution, isStrictlyBusier, specUnknownLabel, cardFace, notStreamedNames, servesLine, servesParts, executionCountText, countLine, shownExecution } from "./cards";
 import { CardStatus, STATUS_WORD, lampOf, secondLineOf, statusReason } from "./cardStatus";
 import { buildFleetCard, faceOf } from "../../testing/fleetCard";
 import { LampForm } from "../../lib/lamp";
@@ -36,7 +36,7 @@ function beat(overrides: Partial<PresenceBeat>): PresenceBeat {
 
 /** A fleet-view row's facts, as `viewRows.ts::rowFacts` would hand them to a card. */
 function rowFactsFor(overrides: Partial<RowFacts> = {}): RowFacts {
-  return { uid: "u1", known: true, name: null, names: [], spec: "", note: null, standing: "online", liveness: "live", isSelf: false, hub: false, servesRadio: false, servesProfiles: 0, engineServers: [], utility: utilityReading(false, null), ...overrides };
+  return { uid: "u1", known: true, name: null, names: [], spec: "", note: null, standing: "online", liveness: "live", isSelf: false, hub: false, servesRadio: false, servesProfiles: 0, engineServers: [], utility: utilityReading(false, null), residents: null, ...overrides };
 }
 
 function machineSpecs(overrides: Partial<MachineSpecsResponse> & Pick<MachineSpecsResponse, "machine_id">): MachineSpecsResponse {
@@ -1359,6 +1359,188 @@ describe("the count line with several executions (W3)", () => {
   });
   it("a single execution is the plain count", () => {
     expect(executionCountText({ runsCount: 1, executions: 1, position: 1 })).toBe("1 running");
+  });
+});
+
+// (#3554) The count line names what the shown execution runs on, and what an
+// idle machine holds.
+describe("the count line's model, engine and residents (#3554)", () => {
+  const NOW = Date.parse("2026-11-12T10:00:00Z");
+  const one = { runsCount: 1, executions: 1, position: 1, engineServers: [], residents: null, nowMs: NOW, executionModels: [] as string[] };
+  const flint = { engine: "flint", port: 8123, answering: true, started_at_ms: NOW - 60_000 };
+
+  it("names a managed LM Studio run by its model alone, without darkmux's namespace", () => {
+    expect(countLine({ ...one, shown: { model: "darkmux:qwen3.6-35b-a3b" } })).toEqual({
+      text: "1 running · qwen3.6-35b-a3b",
+      title: "1 running · qwen3.6-35b-a3b",
+    });
+  });
+
+  it("shows only the model's name on the card (modelShortName); the title has the whole id", () => {
+    expect(countLine({ ...one, shown: { model: "darkmux:mlx-community/Qwen3.6-35B-A3B-4bit" } })).toEqual({
+      text: "1 running · Qwen3.6-35B-A3B",
+      title: "1 running · mlx-community/Qwen3.6-35B-A3B-4bit",
+    });
+    expect(countLine({ ...one, shown: { model: "darkmux:qwen/qwen3.6-35b-a3b-mlx-4bit" } }).text).toBe("1 running · qwen3.6-35b-a3b");
+  });
+
+  it("names the engine once when the model's name already is it", () => {
+    expect(countLine({ ...one, engineServers: [flint], shown: { model: "flint-int4", endpoint: "openai:127.0.0.1:8123/flint-int4" } })).toEqual({
+      text: "1 running · flint",
+      title: "1 running · flint-int4 · flint on 127.0.0.1:8123",
+    });
+  });
+
+  it("names a hosted run's engine: Azure by name, the host in the title", () => {
+    expect(countLine({ ...one, shown: { model: "gpt-4o", endpoint: "azure:myorg.openai.azure.com/gpt-4o" } })).toEqual({
+      text: "1 running · gpt-4o · Azure OpenAI",
+      title: "1 running · gpt-4o · Azure OpenAI on myorg.openai.azure.com",
+    });
+  });
+
+  // (#3554 re-review) Only Azure OpenAI's own hosts read "Azure OpenAI"
+  // (`darkmux_types::provider`'s registry); Azure AI Foundry and any other
+  // host with "azure" in it read by address.
+  it("names Azure OpenAI only on its own hosts", () => {
+    expect(countLine({ ...one, shown: { model: "gpt-4o", endpoint: "azure:myres.cognitiveservices.azure.com/gpt-4o" } }).text).toBe("1 running · gpt-4o · Azure OpenAI");
+    expect(countLine({ ...one, shown: { model: "phi-4", endpoint: "azure:myres.services.ai.azure.com/phi-4" } })).toEqual({
+      text: "1 running · phi-4 · myres.services.ai.azure.com",
+      title: "1 running · phi-4 · myres.services.ai.azure.com",
+    });
+    expect(countLine({ ...one, shown: { model: "m", endpoint: "azure:a.b.openai.azure.com/m" } }).text).toBe("1 running · m · a.b.openai.azure.com");
+  });
+
+  it("names any other endpoint by its address, never as having left the machine", () => {
+    expect(countLine({ ...one, shown: { model: "llama-3", endpoint: "openai:127.0.0.1:8080/llama-3" } })).toEqual({
+      text: "1 running · llama-3 · 127.0.0.1:8080",
+      title: "1 running · llama-3 · 127.0.0.1:8080",
+    });
+  });
+
+  it("names a server darkmux started by its engine, matched on the machine's own port", () => {
+    expect(countLine({ ...one, engineServers: [flint], shown: { model: "TensorFold/Qwen3.8-27B", endpoint: "openai:127.0.0.1:8123/TensorFold/Qwen3.8-27B" } })).toEqual({
+      text: "1 running · Qwen3.8-27B · flint",
+      title: "1 running · TensorFold/Qwen3.8-27B · flint on 127.0.0.1:8123",
+    });
+    // Another port on loopback is not that server.
+    expect(countLine({ ...one, engineServers: [flint], shown: { model: "m", endpoint: "openai:127.0.0.1:9000/m" } }).text).toBe("1 running · m · 127.0.0.1:9000");
+    // The same port on another host is not that server either.
+    expect(countLine({ ...one, engineServers: [flint], shown: { model: "m", endpoint: "openai:gpu-box:8123/m" } }).text).toBe("1 running · m · gpu-box:8123");
+  });
+
+  it("matches a started server on every loopback spelling", () => {
+    expect(countLine({ ...one, engineServers: [flint], shown: { model: "m", endpoint: "openai:localhost:8123/m" } }).text).toBe("1 running · m · flint");
+    expect(countLine({ ...one, engineServers: [flint], shown: { model: "m", endpoint: "openai:[::1]:8123/m" } }).text).toBe("1 running · m · flint");
+  });
+
+  // (#3554 review) On the container path a Flint dispatch's start record names
+  // the wire model ("flint", `Target::wire_model`); the endpoint's tail is the
+  // profile model id on every path that writes an endpoint, so it wins.
+  it("prefers the endpoint's model over the start record's wire model (an agentic Flint dispatch)", () => {
+    const flint8092 = { ...flint, port: 8092 };
+    expect(countLine({ ...one, engineServers: [flint8092], shown: { model: "flint", endpoint: "openai:127.0.0.1:8092/flint-int4" } })).toEqual({
+      text: "1 running · flint",
+      title: "1 running · flint-int4 · flint on 127.0.0.1:8092",
+    });
+  });
+
+  it("reads the model from the endpoint's tail when the start record names none", () => {
+    expect(countLine({ ...one, shown: { endpoint: "azure:myorg.openai.azure.com/gpt-4o" } }).text).toBe("1 running · gpt-4o · Azure OpenAI");
+  });
+
+  it("compares the model's name and the engine without case", () => {
+    expect(countLine({ ...one, engineServers: [flint], shown: { model: "x", endpoint: "openai:127.0.0.1:8123/Flint" } }).text).toBe("1 running · Flint");
+    expect(countLine({ ...one, engineServers: [{ ...flint, engine: "FLINT" }], shown: { model: "x", endpoint: "openai:127.0.0.1:8123/flint" } }).text).toBe("1 running · flint");
+  });
+
+  // (#3554 re-review) Two executions on one card whose ids shorten alike
+  // (the A/B runs darkmux makes) keep what tells them apart.
+  it("keeps what tells two executions on the card apart", () => {
+    const ab = ["darkmux:qwen3.6-35b-a3b-turboquant-mlx", "darkmux:qwen3.6-35b-a3b-mlx"];
+    expect(countLine({ ...one, runsCount: 2, executions: 2, position: 1, shown: { model: ab[0] }, executionModels: ab }).text).toBe("2 running · 1/2 · qwen3.6-35b-a3b-turboquant-mlx");
+    expect(countLine({ ...one, runsCount: 2, executions: 2, position: 2, shown: { model: ab[1] }, executionModels: ab }).text).toBe("2 running · 2/2 · qwen3.6-35b-a3b-mlx");
+    // Different models shorten apart: each its short name.
+    expect(countLine({ ...one, runsCount: 2, executions: 2, position: 1, shown: { model: ab[0] }, executionModels: [ab[0], "darkmux:gpt-oss-120b"] }).text).toBe("2 running · 1/2 · qwen3.6-35b-a3b");
+  });
+
+  it("follows the shown execution, after its position", () => {
+    expect(countLine({ ...one, runsCount: 2, executions: 2, position: 2, shown: { model: "darkmux:reviewer-7b" } }).text).toBe("2 running · 2/2 · reviewer-7b");
+  });
+
+  it("is the plain count while nothing names a model (a lab run between dispatches, a start not yet landed)", () => {
+    expect(countLine({ ...one, shown: null }).text).toBe("1 running");
+    expect(countLine({ ...one, shown: {} }).text).toBe("1 running");
+  });
+
+  it("says how many models an idle machine holds, when its engine said", () => {
+    expect(countLine({ ...one, runsCount: 0, executions: 0, position: 0, shown: null, residents: { known: true, count: 2 } })).toEqual({
+      text: "0 running · 2 loaded",
+      title: "0 running · 2 loaded",
+    });
+    expect(countLine({ ...one, runsCount: 0, executions: 0, position: 0, shown: null, residents: { known: true, count: 0 } }).text).toBe("0 running · 0 loaded");
+  });
+
+  it("never says 0 loaded when the list is not known: the reason is in the title", () => {
+    const line = countLine({ ...one, runsCount: 0, executions: 0, position: 0, shown: null, residents: { known: false, why: "LM Studio could not be asked (`lms ps` failed); what it holds is unknown." } });
+    expect(line.text).toBe("0 running");
+    expect(line.title).toBe("0 running · loaded models unknown: LM Studio could not be asked (`lms ps` failed); what it holds is unknown.");
+  });
+
+  // (#3554, operator) The servers darkmux started are the count's other half:
+  // an answering one counts; one still starting (inside its start bound) adds
+  // nothing; one past its start bound that does not answer may be a resident
+  // too busy to answer, so the total becomes a lower bound. The servers
+  // line's own state word (`serverStateWord`) decides each.
+  describe("the servers darkmux started", () => {
+    const idle = { ...one, runsCount: 0, executions: 0, position: 0, shown: null };
+    const why = "LM Studio could not be asked (`lms ps` failed); what it holds is unknown.";
+    const starting = { engine: "tensorfold", port: 8093, answering: false, started_at_ms: NOW - 30_000 };
+    const silent = { engine: "tensorfold", port: 8094, answering: false, started_at_ms: NOW - 60 * 60_000 };
+    it("a Flint-only machine: the answering server is its one loaded model", () => {
+      expect(countLine({ ...idle, engineServers: [flint], residents: { known: true, count: 0 } })).toEqual({ text: "0 running · 1 loaded", title: "0 running · 1 loaded" });
+    });
+    it("adds the servers to LM Studio's residents, never deduplicated against them (two copies in memory)", () => {
+      expect(countLine({ ...idle, engineServers: [flint], residents: { known: true, count: 1 } }).text).toBe("0 running · 2 loaded");
+    });
+    it("a starting server alone: 0 loaded, and the title says it is starting", () => {
+      expect(countLine({ ...idle, engineServers: [starting], residents: { known: true, count: 0 } })).toEqual({
+        text: "0 running · 0 loaded",
+        title: "0 running · 0 loaded · 1 server starting the model",
+      });
+    });
+    it("one answering, one starting: the answering one counted, the starting one named", () => {
+      expect(countLine({ ...idle, engineServers: [flint, starting], residents: { known: true, count: 1 } })).toEqual({
+        text: "0 running · 2 loaded",
+        title: "0 running · 2 loaded · 1 server starting the model",
+      });
+    });
+    it("a server past its start bound that does not answer makes the total a lower bound", () => {
+      expect(countLine({ ...idle, engineServers: [flint, silent], residents: { known: true, count: 0 } })).toEqual({
+        text: "0 running · 1+ loaded",
+        title: "0 running · 1+ loaded · 1 server not answering",
+      });
+      // Nothing known to count: no "0+", the plain count and the reason.
+      expect(countLine({ ...idle, engineServers: [silent], residents: { known: true, count: 0 } })).toEqual({
+        text: "0 running",
+        title: "0 running · 1 server not answering",
+      });
+    });
+    it("with the engine's list unknown, the answering servers are a lower bound", () => {
+      expect(countLine({ ...idle, engineServers: [flint, starting], residents: { known: false, why } })).toEqual({
+        text: "0 running · 1+ loaded",
+        title: `0 running · 1+ loaded · 1 server darkmux started; the rest is unknown: ${why} · 1 server starting the model`,
+      });
+      expect(countLine({ ...idle, engineServers: [flint, { ...flint, port: 9 }], residents: { known: false, why } }).title).toMatch(/· 2 servers darkmux started;/);
+      expect(countLine({ ...idle, engineServers: [starting], residents: { known: false, why } }).text).toBe("0 running");
+    });
+  });
+
+  it("claims nothing about residents with no card read", () => {
+    expect(countLine({ ...one, runsCount: 0, executions: 0, position: 0, shown: null, residents: null })).toEqual({ text: "0 running", title: "0 running" });
+  });
+
+  it("names no residents while something runs: the line is the running execution's", () => {
+    expect(countLine({ ...one, shown: { model: "darkmux:q" }, residents: { known: true, count: 3 } }).text).toBe("1 running · q");
   });
 });
 

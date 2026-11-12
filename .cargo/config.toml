@@ -89,3 +89,10 @@ t-all = "nextest run --workspace"
 # hang protection that justifies nextest elsewhere (#3142). Run from the
 # repo root, as every alias here is.
 t-runtime = "nextest run --manifest-path runtime/Cargo.toml --config-file .config/nextest.toml"
+
+# (#3112) The same suite with the feature the darkmux binary's build turns on
+# for `serde_json` (`preserve_order`): the runtime linked into darkmux
+# (`darkmux runtime`) must emit what the standalone one does. CI runs both.
+# `cargo nextest run -p darkmux --test runtime_parity` compares the two
+# programs' bytes on shared fixtures.
+t-runtime-linked = "nextest run --manifest-path runtime/Cargo.toml --config-file .config/nextest.toml --locked --features serde_json/preserve_order"

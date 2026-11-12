@@ -96,7 +96,7 @@ fn cap_chars(s: &str, max: usize) -> String {
 }
 
 /// The runtime's bookkeeping directory: `<RUNTIME_OUT_BASE>/.darkmux-runtime`.
-/// Every runtime write site (the trajectory in `main.rs`, structured
+/// Every runtime write site (the trajectory in `lib.rs`, structured
 /// compaction output in `loop_runner.rs`, findings and mods in `tools`)
 /// consumes this so they can't drift to different paths.
 pub fn runtime_dir() -> std::path::PathBuf {
@@ -523,7 +523,7 @@ impl Trajectory {
     /// context, stopped producing calls" is answerable from this one line
     /// instead of joining `telemetry.lms` (model) and `telemetry.context`
     /// (token count) by hand — same shape as #2188's model/locality stamp.
-    /// `reason` is the exact same snake_case string `main.rs` emits as the
+    /// `reason` is the exact same snake_case string `lib.rs` emits as the
     /// JSON envelope's `result` field for this escalation (e.g.
     /// `"escalation_empty_tool_calls"`) — see [`escalation_reason_str`],
     /// the single source of truth both call sites read from, so the
@@ -1104,7 +1104,8 @@ impl Trajectory {
             // and its 1-based ordinal in this dispatch. `null` for every
             // other tool and every rejected report. The crawl's product
             // never rides the preview above.
-            emitted: emitted.cloned(),
+            // (#3112) The standalone build's key order, in every build.
+            emitted: emitted.cloned().map(crate::key_order::sorted),
             emit_seq: emit_seq.map(|n| n as u64),
             result_chars: result_chars as u64,
             result: result.to_string(),
@@ -1472,7 +1473,8 @@ pub(crate) fn unix_ms() -> u64 {
 
 /// The bound a record names, as the opaque value the host forwards.
 fn bound_value(bound: crate::bounds::BoundRef) -> serde_json::Value {
-    serde_json::to_value(bound).unwrap_or_default()
+    // (#3112) A struct turned into a `Value`: the standalone build's key order.
+    crate::key_order::sorted(serde_json::to_value(bound).unwrap_or_default())
 }
 
 /// The two stall-recovery events share one shape.

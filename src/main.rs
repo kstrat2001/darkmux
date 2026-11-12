@@ -115,6 +115,8 @@ mod client_cli;
 pub use darkmux_serve as serve;
 mod skills;
 mod phase_review;
+// (#3112) Hidden helper subcommands (`darkmux runtime …`), routed first.
+mod multicall;
 // #463 workspace split (PR2) — profiles/ownership extracted to the
 // darkmux-profiles crate. These re-exports keep crate::{profiles,
 // ownership}::* paths resolving. (2.0, #1405: the `runtime` module — the
@@ -143,10 +145,22 @@ pub(crate) fn test_run() -> darkmux_types::session_id::RunId {
     darkmux_types::session_id::RunId::mission("m-test").expect("a literal run id is never empty")
 }
 
-fn main() -> Result<()> {
-    // (#3112) A Landlock sandbox's helper is this executable: hand it its
-    // arguments first, while this process is still single-threaded.
-    darkmux_sandbox::landlock::helper_if_asked(std::env::args_os().collect());
+fn main() -> multicall::Exit {
+    // (#3112) A hidden helper (`darkmux runtime …`) is handed over before
+    // anything else runs (`multicall`'s module doc says why).
+    match multicall::hand_over() {
+        Some(code) => multicall::Exit::Helper(code),
+        None => {
+            // (#3112 review) Which file this process started from, before
+            // anything can replace it: a Seatbelt dispatch runs only that.
+            darkmux_crew::dispatch_internal::note_executable_at_start();
+            multicall::Exit::Darkmux(darkmux_main())
+        }
+    }
+}
+
+/// Every darkmux command but the runtime.
+fn darkmux_main() -> Result<()> {
     providers::register_builtins()?;
     let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
     let cli = Cli::parse_from(argv);

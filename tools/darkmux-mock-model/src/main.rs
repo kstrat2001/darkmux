@@ -205,7 +205,7 @@ fn load_turns(script: Option<&PathBuf>) -> Result<Vec<ScriptedTurn>> {
 /// chat-completions body (`choices[0].message.{content,tool_calls}`,
 /// `choices[0].finish_reason`) — into an SSE-framed streaming response body.
 ///
-/// `runtime`'s agent loop streams by default (`runtime/src/main.rs`'s
+/// `runtime`'s agent loop streams by default (`runtime/src/lib.rs`'s
 /// `streaming` flag defaults to `true`; `--no-stream` is the opt-out darkmux
 /// dispatch never passes), so it calls `LmStudioClient::chat_streaming`, not
 /// `chat` — a plain `200 application/json` body (this module's first

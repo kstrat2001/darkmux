@@ -111,7 +111,7 @@ impl<'a> AgentLoop<'a> {
         resume_seed: Option<&checkpoint::RunCheckpoint>,
     ) -> Self {
         // (#2114) A resumed dispatch replaces the fresh `initial_messages` (the
-        // system prompt + first user turn main.rs built) with the checkpoint's
+        // system prompt + first user turn lib.rs built) with the checkpoint's
         // own history — the checkpoint already carries whatever system/user
         // messages opened the ORIGINAL dispatch, so re-seeding from scratch
         // would duplicate them.
@@ -278,7 +278,7 @@ impl<'a> AgentLoop<'a> {
             // model-facing context, not just operator-stderr noise.
             // Operator-disable via `DARKMUX_FEEDBACK_INJECTION=0`.
             // (#457 Step 2) Per-role template overrides come in from the
-            // dispatcher via `--feedback-templates-json`; main.rs parses
+            // dispatcher via `--feedback-templates-json`; lib.rs parses
             // into a BTreeMap and passes here. Empty map = all defaults.
             feedback_injector: FeedbackInjector::with_templates(w.feedback_templates),
             // (#2793) Consecutive compactions that installed and still left occupancy
@@ -1124,7 +1124,7 @@ impl<'a> AgentLoop<'a> {
             // turn's accumulation goes — AND the prefill message that carried
             // it, which is the half this used to forget. Clearing the index
             // alone orphaned a raw `<think>` block in history that nothing
-            // could reconstruct an answer from, so `main.rs` handed that markup
+            // could reconstruct an answer from, so `lib.rs` handed that markup
             // over as the deliverable. `begin` does both or neither.
             self.turn.begin(&mut self.messages);
             // (#2171) A fresh turn gets a fresh generation-continuation
@@ -1561,7 +1561,7 @@ impl<'a> AgentLoop<'a> {
         // SUFFIX — a prefill continuation carries just the new text, never the
         // prefix it continues. Pushing that suffix as a fresh message left the
         // accumulated body orphaned in the stale prefill one slot earlier, and
-        // `main.rs` takes "the last assistant message" as the deliverable — so
+        // `lib.rs` takes "the last assistant message" as the deliverable — so
         // the envelope, the JSON `content` and the operator-visible preview all
         // got the tail and nothing else.
         //
@@ -1861,7 +1861,7 @@ impl<'a> AgentLoop<'a> {
 
     fn escalate_empty_tool_calls(&mut self) -> LoopOutcome {
         // (#1221) Drop the empty message before handing off.
-        // `main.rs` takes the LAST assistant message as the
+        // `lib.rs` takes the LAST assistant message as the
         // deliverable, and this arm pushes a wholly empty one
         // every time it fires — so escalating with it still in
         // place buries the turn's real work behind a blank
@@ -2582,7 +2582,7 @@ impl<'a> AgentLoop<'a> {
         // the safe reading of "cannot tell" at a `length` finish is a
         // CAP HIT, not a context overflow. `is_some_and` returned false
         // for unknown, which routed straight into the hard `Err` below
-        // — and that `Err` kills the whole dispatch, so `main.rs` emits
+        // — and that `Err` kills the whole dispatch, so `lib.rs` emits
         // `result: "error"` with no deliverable. Every banked checkpoint goes with it.
         //
         // This matters far more on this branch than before it: the
