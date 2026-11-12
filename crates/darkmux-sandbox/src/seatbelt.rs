@@ -99,10 +99,11 @@ mkdir -m 700 "$d/tmp" && printf '%s' "$2" > "$d/profile.sb" && printf '%s' "$3" 
 /// Runs the sandbox attached: `$d` set, `$1` the working directory (empty
 /// for none), then the program and its arguments. Records its own pid (the
 /// group's), survives the group's SIGTERM long enough to see the sandbox
-/// out, and removes the directory when it exits. The sandbox ends with its
-/// program, as a container ends with its init's child: whatever the program
-/// left running in the group is killed then (#3112), so a background
-/// process never outlives it holding a port or writing to a mount.
+/// out, and removes the directory when it exits (with [`DRAIN`] and
+/// [`LAUNCHED`]: [`launcher`]). When its program ends, whatever the program
+/// left running in its process group is killed, until none is left (#3112).
+/// A process that moved to a group of its own (`setsid`, `setpgid`) is not
+/// reached: unlike a container's, this sandbox does not end everything in it.
 const LAUNCH: &str = r#"wd=$1; shift
 echo $$ > "$d/pid" && ps -o lstart= -p $$ > "$d/started" || exit 125
 trap : TERM INT HUP
@@ -110,10 +111,37 @@ trap : TERM INT HUP
 [ -n "$1" ] || { echo "seatbelt: no program to run (a policy needs an entrypoint)" >&2; rm -rf "$d"; exit 125; }
 /usr/bin/sandbox-exec -f "$d/profile.sb" "$@"
 rc=$?
-for p in $(/usr/bin/pgrep -g $$ 2>/dev/null); do [ "$p" = "$$" ] || kill -KILL "$p" 2>/dev/null; done
-rm -rf "$d"
+g=$$
+"#;
+
+/// Kills every process in group `$g` but `$$`, over and over until none is
+/// left (a fork-hopper's new pid appears after any one look), at most 200
+/// rounds. The look's own processes (the command substitution, itself in
+/// the group when `$g` is `$$`) have ended by the time each pid is checked,
+/// so they never count. A process that moved to a group of its own is not
+/// in it.
+const DRAIN: &str = r#"i=0
+while [ "$i" -lt 200 ]; do
+  live=
+  for m in $(/usr/bin/pgrep -g "$g" 2>/dev/null); do
+    [ "$m" = "$$" ] || ! kill -0 "$m" 2>/dev/null || live="$live $m"
+  done
+  [ -n "$live" ] || break
+  kill -KILL $live 2>/dev/null
+  i=$((i + 1))
+done
+"#;
+
+/// The launcher's end: the group drained, the directory removed, the
+/// program's exit status its own.
+const LAUNCHED: &str = r#"rm -rf "$d"
 exit $rc
 "#;
+
+/// The whole launcher script.
+fn launcher() -> String {
+    format!("{LAUNCH}{DRAIN}{LAUNCHED}")
+}
 
 /// Whether `$d` is a sandbox's directory at all: only a directory holding
 /// the profile this backend wrote is ever listed, stopped or deleted.
@@ -190,16 +218,30 @@ impl SeatbeltBackend {
             // LAN address bind too (#3559): it holds no bind to the
             // loopback. No unix socket but the resolver's, so never the
             // Docker daemon's or another service's (#3553 review).
-            Network::Default => p.push_str(concat!(
-                "(allow network*)\n(deny network-bind)\n(allow network-bind (local ip \"localhost:*\"))\n",
-                "(deny network-outbound (remote unix-socket))\n",
-                "(allow network-outbound (remote unix-socket (path-literal \"/private/var/run/mDNSResponder\")))\n",
-            )),
+            Network::Default => {
+                p.push_str("(allow network*)\n(deny network-bind)\n");
+                p.push_str(&Self::bind_rule(&policy.ports));
+                p.push_str(concat!(
+                    "(deny network-outbound (remote unix-socket))\n",
+                    "(allow network-outbound (remote unix-socket (path-literal \"/private/var/run/mDNSResponder\")))\n",
+                ));
+            }
             // Nothing: a sandbox has no loopback of its own, and the host's
             // runs its databases and model servers (#3553 review).
             Network::None => {}
         }
         p
+    }
+
+    /// What the default network may bind: with `ports` named, only those
+    /// port numbers (on any local address: SBPL's `localhost` matches every
+    /// one, #3559), every other bind refused by the kernel; with none named,
+    /// any port.
+    fn bind_rule(ports: &[u16]) -> String {
+        if ports.is_empty() {
+            return "(allow network-bind (local ip \"localhost:*\"))\n".to_string();
+        }
+        format!("(allow network-bind {})\n", join(ports.iter().map(|p| format!("(local ip \"localhost:{p}\")"))))
     }
 
     /// The directories above every path the sandbox may reach, and the
@@ -290,7 +332,7 @@ impl SeatbeltBackend {
 /// Removes `$d`'s sandbox, killing it first if it runs; leaves alone a
 /// directory this backend did not write ([`OURS`]).
 fn remove_script() -> String {
-    format!("{OURS} || exit 0\nif {ALIVE}; then kill -KILL -- \"-$pid\" 2>/dev/null; fi\nrm -rf \"$d\"; exit 0")
+    format!("{OURS} || exit 0\nif {ALIVE}; then kill -KILL -- \"-$pid\" 2>/dev/null; g=$pid\n{DRAIN}fi\nrm -rf \"$d\"; exit 0")
 }
 
 /// Lists the sandboxes under `$1`, skipping any directory this backend did
@@ -383,7 +425,7 @@ impl SandboxBackend for SeatbeltBackend {
             policy.workdir.clone().unwrap_or_default(),
         ];
         args.extend(Self::program(policy));
-        let mut cmd = Self::script(&format!("{PREPARE}shift 3\n{LAUNCH}"), &args, &Self::environment(policy, &dir));
+        let mut cmd = Self::script(&format!("{PREPARE}shift 3\n{}", launcher()), &args, &Self::environment(policy, &dir));
         if !policy.stdin {
             cmd.stdin(Stdio::null());
         }
@@ -402,7 +444,7 @@ impl SandboxBackend for SeatbeltBackend {
         let start = format!(
             "exec /usr/bin/env -i {} {SH} -c {} sh {}\n",
             join(env.iter().map(|(k, v)| sh_quote(&format!("{k}={v}")))),
-            sh_quote(&format!("d=$1; shift\n{LAUNCH}")),
+            sh_quote(&format!("d=$1; shift\n{}", launcher())),
             join(launch_args.iter().map(|a| sh_quote(a))),
         );
         let args = vec![dir.to_string_lossy().into_owned(), Self::profile(policy, &dir), Self::labels(policy), start];
@@ -424,14 +466,15 @@ if {ALIVE}; then
   kill -TERM -- "-$pid" 2>/dev/null
   i=0; while kill -0 "$pid" 2>/dev/null && [ "$i" -lt "$(($2 * 10))" ]; do sleep 0.1; i=$((i + 1)); done
   kill -KILL -- "-$pid" 2>/dev/null
-fi
+  g=$pid
+{DRAIN}fi
 rm -rf "$d"; exit 0"#
         );
         Self::on_dir(handle, &script, &[grace.as_secs().to_string()])
     }
 
     fn kill(&self, handle: &SandboxHandle) -> Command {
-        Self::on_dir(handle, &format!("{OURS} && {ALIVE} || exit 1\nkill -KILL -- \"-$pid\" && rm -rf \"$d\""), &[])
+        Self::on_dir(handle, &format!("{OURS} && {ALIVE} || exit 1\nkill -KILL -- \"-$pid\" || exit 1\ng=$pid\n{DRAIN}rm -rf \"$d\""), &[])
     }
 
     fn remove(&self, handle: &SandboxHandle) -> Command {
@@ -523,6 +566,19 @@ mod tests {
         assert!(p.contains("(deny file-read* file-write* (regex #\"^/dev/ttys\"))"), "no other terminal: {p}");
         assert!(!p.contains("(subpath \"/opt/homebrew\")"), "not all of Homebrew, its var included: {p}");
         assert!(!p.contains("/Users"), "no home is readable: {p}");
+    }
+
+    /// (#3112, #3559) A policy naming ports may bind only those numbers;
+    /// one naming none, any. The address cannot be held either way.
+    #[test]
+    fn named_ports_are_the_only_ones_the_profile_lets_bind() {
+        let mut p = policy(Vec::new(), Network::Default);
+        p.ports = vec![4100, 4200];
+        let named = SeatbeltBackend::profile(&p, Path::new("/s"));
+        assert!(named.contains("(deny network-bind)\n(allow network-bind (local ip \"localhost:4100\") (local ip \"localhost:4200\"))\n"), "{named}");
+        assert!(!named.contains("localhost:*"), "{named}");
+        let any = SeatbeltBackend::profile(&policy(Vec::new(), Network::Default), Path::new("/s"));
+        assert!(any.contains("(allow network-bind (local ip \"localhost:*\"))"), "{any}");
     }
 
     /// No network allows no network rule at all, the host's loopback
