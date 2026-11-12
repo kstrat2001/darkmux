@@ -114,6 +114,24 @@ fn a_commands_programs_are_the_first_word_of_each_simple_command() {
     assert!(on_host::programs_of("if true; then echo; fi").iter().all(|p| p == "true" || p == "echo"));
 }
 
+/// A program the sandbox reads where it really is (a home link to it) is
+/// granted only where the link is: its real folder's install folder is
+/// never granted, even when that folder would be wider than what the
+/// sandbox reads (Homebrew's root, its data with it).
+#[test]
+fn a_link_to_a_program_the_sandbox_reads_grants_only_the_links_folder() {
+    let host = a_fake_host();
+    let readable_bin = host.system.clone();
+    program(&readable_bin.join("tool"), "\x7fELF");
+    std::fs::create_dir_all(host.home.join("bin")).unwrap();
+    std::os::unix::fs::symlink(readable_bin.join("tool"), host.home.join("bin/tool")).unwrap();
+    let recipe = a_recipe(serde_json::json!({"schema_version": "1.0", "command": "tool"}));
+    let path = format!("{}:{}", host.home.join("bin").display(), host.path_var());
+    let only_bin = |p: &Path| p.starts_with(&readable_bin);
+    let got = on_host::resolve_toolchain(&recipe, BackendKind::Seatbelt, &path, Some(&host.home), &only_bin).unwrap();
+    assert_eq!(got.read_only, vec![host.home.join("bin")], "never {}", readable_bin.parent().unwrap().display());
+}
+
 /// A run in a sandbox on the host, as a start builds it.
 fn a_run_in(dir: &Path) -> RunIn {
     let ws = dir.join("ws/site");
@@ -275,7 +293,9 @@ fn a_preview_on_the_host_that_listens_beyond_the_loopback_is_stopped() {
     }
     let dir = tempfile::TempDir::new().unwrap();
     let (previews, _docker, seatbelt) = two_backends(dir.path());
-    let previews = previews.with_exposure_every(Duration::from_millis(200));
+    // Only the read as it first answers can catch it: the periodic one is
+    // a minute away.
+    let previews = previews.with_exposure_every(Duration::from_secs(60));
     let wt = a_workspace(dir.path(), serde_json::json!({"schema_version": "1.0", "command": serve_on("'0.0.0.0'"), "env": {"PORT": "{port}"}}));
     previews.start_in(BackendKind::Seatbelt, "w", &wt, &RecipeSource::Checkout(wt.clone())).unwrap();
     let v = until_status(&previews, "w", &["failed", "ready"], Duration::from_secs(20));
@@ -287,6 +307,11 @@ fn a_preview_on_the_host_that_listens_beyond_the_loopback_is_stopped() {
     previews.start_in(BackendKind::Seatbelt, "w", &wt, &RecipeSource::Checkout(wt.clone())).unwrap();
     let v = until_status(&previews, "w", &["failed", "ready"], Duration::from_secs(20));
     assert_eq!(v["status"], "ready", "{v}");
+    previews.stop("w");
+    // Watched every 0.2 s, a loopback server stays ready.
+    let previews = previews.with_exposure_every(Duration::from_millis(200));
+    previews.start_in(BackendKind::Seatbelt, "w", &wt, &RecipeSource::Checkout(wt.clone())).unwrap();
+    assert_eq!(until_status(&previews, "w", &["failed", "ready"], Duration::from_secs(20))["status"], "ready");
     std::thread::sleep(Duration::from_millis(1000));
     assert_eq!(until_status(&previews, "w", &[], Duration::ZERO)["status"], "ready", "still ready after several watches");
     previews.stop("w");

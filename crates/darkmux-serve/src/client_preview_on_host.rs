@@ -151,11 +151,13 @@ struct Found {
 }
 
 impl Found {
-    /// Grants `dir`'s install folder unless the sandbox already reads it;
+    /// Grants the install folder of `at` (a program, or what it links to)
+    /// unless the sandbox already reads `at` or an earlier grant covers it;
     /// refuses one that would be the home or a folder above it, or `/`.
-    fn grant(&mut self, program: &str, at: &Path, dir: &Path, home: Option<&Path>, reads: &dyn Fn(&Path) -> bool) -> Result<(), Unresolved> {
+    fn grant(&mut self, program: &str, at: &Path, home: Option<&Path>, reads: &dyn Fn(&Path) -> bool) -> Result<(), Unresolved> {
+        let dir = at.parent().unwrap_or(Path::new("/"));
         let prefix = install_prefix(dir, home);
-        if reads(&prefix) || self.read_only.iter().any(|g| prefix.starts_with(g)) {
+        if reads(at) || self.read_only.iter().any(|g| prefix.starts_with(g)) {
             return Ok(());
         }
         if prefix.parent().is_none() || home.is_some_and(|h| h.starts_with(&prefix)) {
@@ -186,18 +188,13 @@ fn resolve_one(program: &str, dirs: &[PathBuf], home: Option<&Path>, reads: &dyn
         return Ok(());
     }
     found.identity.push(line);
-    if !(reads(&at) && reads(&real)) {
-        found.grant(program, &at, at.parent().unwrap_or(Path::new("/")), home, reads)?;
-        if real != at {
-            found.grant(program, &real, real.parent().unwrap_or(Path::new("/")), home, reads)?;
-        }
+    found.grant(program, &at, home, reads)?;
+    if real != at {
+        found.grant(program, &real, home, reads)?;
     }
     match (interpreter_of(&real), depth) {
         (Some(Interpreter::OnPath(name)), d) if d < SHEBANG_DEPTH => resolve_one(&name, dirs, home, reads, found, d + 1),
-        (Some(Interpreter::At(path)), _) if !reads(&path) => {
-            let real = path.canonicalize().unwrap_or(path);
-            found.grant(program, &real, real.parent().unwrap_or(Path::new("/")), home, reads)
-        }
+        (Some(Interpreter::At(path)), _) => found.grant(program, &path.canonicalize().unwrap_or(path), home, reads),
         _ => Ok(()),
     }
 }
