@@ -270,7 +270,18 @@ jobs:
 
       - name: Clippy (whole workspace, all targets, no warnings allowed)
         if: steps.gate.outputs.tests == 'true'
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        # (#3112) `darkmux-runtime-linked` has no sources of its own: its
+        # library is `runtime/src`, whose tests run and are linted in the
+        # runtime job against runtime/'s own dev-dependencies, which this
+        # workspace does not carry. `--all-targets` would compile them here.
+        run: cargo clippy --workspace --exclude darkmux-runtime-linked --all-targets -- -D warnings
+
+      # (#3112) The linked runtime's library (runtime/src) as darkmux builds
+      # it, with this workspace's lockfile and unified features: the lint the
+      # step above leaves out, minus the test code it cannot compile here.
+      - name: Clippy (the runtime as darkmux links it, library only)
+        if: steps.gate.outputs.tests == 'true'
+        run: cargo clippy -p darkmux-runtime-linked -- -D warnings
 
       # (#3137) The records, last, so each exists only when every step before
       # it passed. Fork PR runs upload them too; the lookup ignores those.
@@ -565,6 +576,16 @@ jobs:
       - name: Test (runtime crate)
         if: steps.filter.outputs.runtime == 'true'
         run: cargo nextest run --manifest-path runtime/Cargo.toml --config-file .config/nextest.toml --profile ci
+
+      # (#3112) The runtime also ships inside the darkmux binary
+      # (`darkmux runtime`, crates/darkmux-runtime-linked), where cargo turns
+      # on `serde_json`'s `preserve_order` for the whole build. The same
+      # suite under that feature catches a JSON value whose key order would
+      # then change what the runtime emits (`runtime/src/key_order.rs`); the
+      # root's `tests/runtime_parity.rs` compares the two programs' bytes.
+      - name: Test (runtime crate, as darkmux links it)
+        if: steps.filter.outputs.runtime == 'true'
+        run: cargo nextest run --manifest-path runtime/Cargo.toml --config-file .config/nextest.toml --profile ci --locked --features serde_json/preserve_order
 
       - name: Clippy (runtime crate, all targets, no warnings allowed)
         if: steps.filter.outputs.runtime == 'true'

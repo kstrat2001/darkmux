@@ -80,7 +80,11 @@ jobs:
 
       - name: Build release (whole workspace, no warnings allowed)
         if: steps.tree.outputs.hit != 'true'
-        run: cargo build --workspace --release --all-targets
+        # (#3112) `darkmux-runtime-linked` has no sources of its own: its
+        # library is `runtime/src`, whose tests run and are linted in the
+        # runtime job against runtime/'s own dev-dependencies, which this
+        # workspace does not carry. `--all-targets` would compile them here.
+        run: cargo build --workspace --exclude darkmux-runtime-linked --release --all-targets
 
       # nextest under the `ci` profile, as `ci.yml` runs the same suite
       # (#2896): each test in its own process, no retries. Plain `cargo test`
@@ -106,7 +110,8 @@ jobs:
 
       - name: Clippy release (whole workspace, all targets, no warnings allowed)
         if: steps.tree.outputs.hit != 'true'
-        run: cargo clippy --workspace --release --all-targets -- -D warnings
+        # (#3112) Why the linked runtime is excluded: the build step above.
+        run: cargo clippy --workspace --exclude darkmux-runtime-linked --release --all-targets -- -D warnings
 
       - name: Record that this tree passed
         id: rec

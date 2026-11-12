@@ -34,11 +34,20 @@ loop. Install it: `cargo install cargo-nextest --locked`.
 | `cargo t-fleet` | roster + cross-machine routing | |
 | `cargo t-gestalt` | residency arbiter, hardware/heuristics providers | |
 | `cargo t-runtime` | the agent runtime — **not a workspace member, so `t-all` misses it** | ~418 |
+| `cargo t-runtime-linked` | the same suite with the `serde_json` feature the darkmux build turns on, for the copy linked into `darkmux runtime` (#3112); `cargo nextest run -p darkmux --test runtime_parity` compares the two programs' bytes | 1035 / 17s |
 | `cargo t-all` | the same scope CI gates on (CI runs it as `cargo nextest run --workspace --profile ci`) | ~75s |
 
 Narrower still is better when you know the name: `cargo nextest run -p
 darkmux-flow integrity_exit_code` runs one function's tests in under a second.
 A filter is almost always the right first move after an edit.
+
+**`--workspace --all-targets` needs `--exclude darkmux-runtime-linked` (#3112).**
+That package's library is `runtime/src`, and `--all-targets` compiles a
+library's test code even with `test = false`; those tests need runtime/'s own
+dev-dependencies, which this workspace does not carry. They run from
+`runtime/` (`cargo t-runtime`, `cargo t-runtime-linked`), and CI lints the
+library alone as darkmux builds it (`cargo clippy -p darkmux-runtime-linked`).
+`nextest run --workspace` is unaffected.
 
 **Why nextest rather than `cargo test`** — and it is NOT mainly speed. On a
 single area the two are equivalent (measured 4.6s vs 4.5s); the gap only opens

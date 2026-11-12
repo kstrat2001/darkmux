@@ -401,7 +401,7 @@ impl CompactionConfig {
     /// Resolve a CompactionConfig from optional explicit overrides.
     /// `None` for any field uses the corresponding default (or
     /// disables the optional trigger). Production callers
-    /// (`runtime/src/main.rs`) construct via
+    /// (`runtime/src/lib.rs`) construct via
     /// `from_overrides_with_bail_and_custom` directly so they can
     /// thread the (#377) bail bound and (#383) custom instructions;
     /// this shorter form is kept for test ergonomics where those
@@ -590,7 +590,7 @@ impl CompactionConfig {
 /// last-resort pre-send bound (#2792) between it and overflow, silently: no
 /// soft trim since #3202, and nothing else in the runtime to catch it.
 ///
-/// Pure so `main.rs`'s actual `eprintln!` is testable without capturing
+/// Pure so `lib.rs`'s actual `eprintln!` is testable without capturing
 /// stderr — call sites just print whatever this returns. `None` only when
 /// compaction IS configured (`compactor_model` is `Some`, nothing to warn
 /// about) — by the time production code reaches this function,
@@ -1523,6 +1523,9 @@ pub(crate) fn parse_compactor_response_content(content: &str) -> Result<Structur
         );
     }
 
+    // (#3112) Sorted first: which invalid field the error names follows the
+    // object's order, which is the standalone build's in every build.
+    let patched_value = crate::key_order::sorted(patched_value);
     let mut out = serde_json::from_value::<StructuredCompactionOutput>(patched_value).map_err(|e| {
         anyhow!(
             "parsing compactor JSON failed (even after repair + schema patch): {e} \

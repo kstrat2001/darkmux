@@ -15,6 +15,16 @@ rust-version = "1.86"
 description = "Container-bounded in-house agent runtime for darkmux — see README.md"
 publish = false
 
+# (#3112) The runtime is a library with one entry (`main_with`), run two
+# ways: this binary (the Docker image's entrypoint, built from this manifest
+# and its own Cargo.lock), and the hidden `darkmux runtime` subcommand of the
+# darkmux binary, which links this library as a path dependency so a Seatbelt
+# sandbox needs no separate build. `tests/runtime_parity.rs` at the repo root
+# runs both on the same fixtures and requires the same bytes.
+[lib]
+name = "darkmux_runtime"
+path = "src/lib.rs"
+
 [[bin]]
 name = "darkmux-runtime"
 path = "src/main.rs"

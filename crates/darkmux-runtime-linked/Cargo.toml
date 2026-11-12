@@ -1,0 +1,59 @@
+# (#3112) The agent runtime as darkmux links it: `runtime/src/lib.rs`,
+# compiled in place as a member of THIS workspace, so the darkmux binary runs
+# it as the hidden `darkmux runtime` subcommand and a Seatbelt sandbox needs no
+# separate build or download.
+#
+# Why a package with no sources of its own, and not a path dependency on
+# `runtime/`: cargo makes every path dependency a workspace member, `exclude`
+# notwithstanding (verified on cargo 1.97: the root then lists
+# `darkmux-runtime` as a member and refuses its `[workspace]` table, "multiple
+# workspace roots"). Membership would merge `runtime/Cargo.lock` into this one
+# and break what the exclusion protects: the Docker image's build from
+# `runtime/` alone, its own MSRV check, `cargo t-runtime`, and its own
+# mutation job. This package leaves `runtime/` exactly as it was and compiles
+# the same files a second time, under this workspace's lockfile.
+#
+# Two things must stay equal to `runtime/Cargo.toml`, and a test holds each:
+#   - `version`: the runtime prints `CARGO_PKG_VERSION` for `--version`
+#     (`tests/runtime_parity.rs`, the version case);
+#   - `[dependencies]`, names and features (`tests/runtime_parity.rs`,
+#     `the_linked_runtime_declares_the_standalone_runtimes_dependencies`).
+# Everything this build adds is the workspace's feature unification
+# (`serde_json`'s `preserve_order`, which `agent-client-protocol` turns on);
+# `tests/runtime_parity.rs` runs both programs on the same fixtures and
+# requires the same bytes.
+[package]
+name = "darkmux-runtime-linked"
+version = "0.1.0"
+edition = "2021"
+# This workspace's floor: the copy is built against this workspace's lockfile,
+# whose dependencies need it (`runtime/` itself declares its own).
+rust-version = "1.89"
+description = "The darkmux agent runtime (runtime/), compiled into the darkmux binary"
+license = "MIT"
+publish = false
+
+[lib]
+# The standalone runtime's library name, so `module_path!` and every path
+# the runtime names are the same in both builds.
+name = "darkmux_runtime"
+path = "../../runtime/src/lib.rs"
+# The runtime's own tests run from `runtime/` (`cargo t-runtime`), against
+# its own lockfile and dev-dependencies; compiling them here would run them a
+# second time under this workspace's features.
+test = false
+doctest = false
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1.5"
+darkmux-trajectory = { path = "../darkmux-trajectory" }
+libc = "0.2"
+ureq = { version = "2", default-features = false, features = ["json", "tls"] }
+
+[package.metadata.cargo-machete]
+# The sources live in `runtime/src`, outside this directory, where
+# cargo-machete does not look; every one of these is used there.
+ignored = ["anyhow", "serde", "serde_json", "blake3", "darkmux-trajectory", "libc", "ureq"]
