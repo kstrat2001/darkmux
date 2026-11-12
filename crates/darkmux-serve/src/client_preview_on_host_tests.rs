@@ -432,7 +432,7 @@ fn what_lingers_on_a_stopped_previews_ports_is_reported() {
     let fake = darkmux_platform::FakePlatform { port_listeners: vec![(4200, vec![holder])], ..Default::default() };
     let lines = on_host::lingering(&fake, "darkmux-preview-w", [4100, 4200]);
     assert_eq!(lines.len(), 1, "{lines:?}");
-    assert!(lines[0].contains("* still listens on its port 4200 (pid 7)") && lines[0].contains("left running"), "{lines:?}");
+    assert!(lines[0].contains("* still listens on its port 4200 (pid 7): left running (a process"), "{lines:?}");
     assert!(on_host::lingering(&darkmux_platform::FakePlatform::default(), "w", [4100, 4200]).is_empty());
 }
 

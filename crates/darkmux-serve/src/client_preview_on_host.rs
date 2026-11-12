@@ -183,7 +183,7 @@ pub(crate) fn lingering(platform: &dyn darkmux_platform::Platform, name: &str, p
         .flat_map(|&port| platform.tcp_port_listeners(port).unwrap_or_default().into_iter().map(move |l| (port, l)))
         .map(|(port, l)| {
             format!(
-                "darkmux client serve: preview sandbox {name} stopped, but {} still listens on its port {port}{}:                  left running (a process that left the sandbox's process group, or another program on that port)",
+                "darkmux client serve: preview sandbox {name} stopped, but {} still listens on its port {port}{}: left running (a process that left the sandbox's process group, or another program on that port)",
                 l.text,
                 l.pid.map(|p| format!(" (pid {p})")).unwrap_or_default()
             )
