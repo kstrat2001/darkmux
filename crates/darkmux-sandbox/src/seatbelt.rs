@@ -21,15 +21,18 @@
 //!   address (measured on macOS 26.6), so the profile can allow binding or
 //!   deny it, never tell loopback from the rest. It can hold a sandbox to
 //!   PORTS: a policy naming `ports` binds and takes in traffic only on those
-//!   numbers (a bind to another port, and a `listen` with no bind, are
-//!   refused; a UDP socket bound implicitly by a send receives nothing back;
-//!   outbound connections are open). A caller that needs loopback-only
+//!   numbers: a bind to another port, and a `listen` with no bind, are
+//!   refused, and no socket on another port accepts connections or
+//!   unsolicited datagrams; replies on connections it opened (TCP, connected
+//!   UDP) arrive. An unconnected UDP socket's `recvfrom` is refused, even for
+//!   a reply. A caller that needs loopback-only
 //!   listeners watches the address itself (client previews do).
 //!   [`Network::None`] allows no network at all, the loopback included.
 //! - **Reach every descendant.** A sandbox is the process group its launcher
 //!   leads, killed over and over until it is empty (a process that keeps
 //!   forking is caught). A descendant that leaves the group (`setsid`, or
-//!   `setpgid` to a group of its own, which job control does by itself)
+//!   `setpgid` to a group of its own or to another existing group in its
+//!   session; job control does it by itself)
 //!   outlives every kill, still inside the sandbox: it keeps its file and
 //!   network rules (binds and inbound only on the named ports) and nothing
 //!   ends it: nothing marks it as the sandbox's, so nothing else is killed.
@@ -252,9 +255,11 @@ impl SeatbeltBackend {
     /// only those port numbers (on any local address: SBPL's `localhost`
     /// matches every one, #3559). Every other bind is refused, and so is
     /// inbound traffic to any other local port: a `listen` with no bind (an
-    /// ephemeral port the bind rule never sees) is refused, and a UDP socket
-    /// bound implicitly by a send receives nothing back. Outbound
-    /// connections are untouched. With none named, any port, as before.
+    /// ephemeral port the bind rule never sees) is refused, and no socket on
+    /// another port accepts connections or unsolicited datagrams. Replies on
+    /// connections the sandbox opened (TCP, connected UDP) arrive; an
+    /// unconnected UDP socket's `recvfrom` is refused, even for a reply.
+    /// With none named, any port, as before.
     fn bind_rule(ports: &[u16]) -> String {
         if ports.is_empty() {
             return "(allow network-bind (local ip \"localhost:*\"))\n".to_string();

@@ -88,9 +88,10 @@
 //! - **Two ports, enforced; their address, watched (#3559).** The kernel
 //!   holds the preview to its app and HMR ports: it binds and takes in
 //!   traffic only on them. A bind to any other port is refused, so is a
-//!   `listen` with no bind (which would get an ephemeral port), and a UDP
-//!   socket bound implicitly by a send receives nothing back; outbound
-//!   connections are open. So a dev server that opens internal listeners on
+//!   `listen` with no bind (which would get an ephemeral port), and no socket
+//!   on another port accepts connections or unsolicited datagrams; replies on
+//!   connections it opened (TCP, connected UDP) arrive, and an unconnected
+//!   UDP socket's `recvfrom` is refused, even for a reply. So a dev server that opens internal listeners on
 //!   ephemeral ports (Next.js-style workers) fails under Seatbelt: run it with
 //!   `runtime.sandbox docker`. Seatbelt cannot hold those two to the
 //!   loopback (its address filter knows only `*` and `localhost`, and
@@ -121,8 +122,9 @@
 //!   server too. One left by a killed `client serve` is found by its labels
 //!   in the sandbox's state folder and removed at the next start, like a
 //!   container. **Unlike a container**, a process that moves to a process
-//!   group of its own (`setsid`, `setpgid`; job control does it by itself)
-//!   is not ended with the sandbox. A stop kills only what darkmux can prove
+//!   group of its own, or to another existing group in its session
+//!   (`setsid`, `setpgid`; job control does it by itself), is not ended with
+//!   the sandbox. A stop kills only what darkmux can prove
 //!   is the sandbox's, its process group; nothing marks a process that left
 //!   the group as the sandbox's (the two ports come from the ephemeral range,
 //!   so another program may hold one by chance), so nothing else is killed.

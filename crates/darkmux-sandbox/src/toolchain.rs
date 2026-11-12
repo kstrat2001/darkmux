@@ -308,6 +308,13 @@ enum Interpreter {
 
 fn interpreter_of(script: &Path) -> Option<Interpreter> {
     use std::io::Read;
+    // (#3112 review) Only a regular file (where its links lead) is opened: a
+    // FIFO or a device in its place would hold the open forever. A run that
+    // swaps one in between this look and the open can still stall this one
+    // preview's start; it gains nothing else.
+    if !std::fs::metadata(script).is_ok_and(|m| m.is_file()) {
+        return None;
+    }
     let mut head = [0u8; 256];
     let n = std::fs::File::open(script).and_then(|mut f| f.read(&mut head)).ok()?;
     let text = String::from_utf8_lossy(&head[..n]);

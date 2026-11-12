@@ -325,7 +325,11 @@ pub(crate) fn answer_from_button(label: &str) -> AllowAnswer {
 /// so a wedged one never holds its caller forever. (#3112 review) Its
 /// output is read while it runs, so one that prints more than a pipe holds
 /// (netstat's table on a busy machine) finishes instead of blocking on a
-/// full pipe until the bound kills it.
+/// full pipe until the bound kills it. The bound covers the command only:
+/// when it exits leaving a process that still holds its output open, the
+/// read waits for that process too (as it did before the output was
+/// drained), and a command killed at the bound leaves its readers to end
+/// when that process does.
 pub(crate) fn output_within(mut cmd: std::process::Command, deadline: std::time::Duration) -> Option<std::process::Output> {
     use std::process::Stdio;
     let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().ok()?;

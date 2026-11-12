@@ -244,6 +244,7 @@ fn a_workspace_shebang_never_grants_the_path_it_names() {
         assert!(got.read_only.iter().all(|g| g == &host.nvm), "{script} granted beyond the PATH's node: {:?}", got.read_only);
     }
     assert_eq!(host.resolve(&["./a.sh"], Some(&ws)).unwrap().read_only, vec![host.nvm.clone()], "`<ws>/evil/node` is the PATH's node");
+    assert_eq!(host.resolve(&["./c.sh"], Some(&ws)).unwrap().read_only, vec![host.nvm.clone()], "`env <ws>/evil/node` is the PATH's node");
     assert!(host.resolve(&["./b.sh"], Some(&ws)).unwrap().read_only.is_empty(), "hosts.yml is no runtime");
 }
 
@@ -256,4 +257,46 @@ fn a_version_shaped_home_is_never_granted_as_a_version_folder() {
     let home = dir.path().canonicalize().unwrap().join("versions/me");
     program(&home.join("bin/tool"), "\x7fELF");
     assert_eq!(grant_for(&home.join("bin/tool"), Some(&home)), Ok(home.join("bin")));
+}
+
+/// (#3112 review) A recipe word that is an absolute path to a file that is
+/// not a program (gh's `hosts.yml`) grants nothing.
+#[test]
+fn an_absolute_recipe_word_that_is_no_program_grants_nothing() {
+    let host = a_fake_host();
+    std::fs::create_dir_all(host.home.join(".config/gh")).unwrap();
+    std::fs::write(host.home.join(".config/gh/hosts.yml"), "token: secret").unwrap();
+    let word = host.home.join(".config/gh/hosts.yml").display().to_string();
+    let got = host.resolve(&[word.as_str()], None).unwrap();
+    assert!(got.read_only.is_empty(), "{:?}", got.read_only);
+}
+
+/// (#3112 review) A workspace script that is a FIFO (or any file that is
+/// not a regular one) is never opened to read its `#!`: resolving returns at
+/// once, granting nothing for it, where opening it would wait forever for a
+/// writer.
+#[test]
+fn a_workspace_script_that_is_a_fifo_never_hangs_the_resolution() {
+    let host = a_fake_host();
+    let ws = tempfile::TempDir::new().unwrap();
+    let ws = ws.path().canonicalize().unwrap();
+    std::fs::create_dir_all(ws.join("node_modules/.bin")).unwrap();
+    let fifo = ws.join("node_modules/.bin/vite");
+    let made = std::process::Command::new("/usr/bin/mkfifo").arg(&fifo).status().unwrap();
+    assert!(made.success());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = host.path_var();
+    let (home, system, ws2) = (host.home.clone(), host.system.clone(), ws.clone());
+    std::thread::spawn(move || {
+        let reads = move |p: &Path| p.starts_with(&system);
+        let got = resolve(&Ask { commands: vec!["./node_modules/.bin/vite"], workdir: Some(&ws2), path_var: &path, home: Some(&home), reads: &reads, placed: "x".into(), runs_with: "y" });
+        let _ = tx.send(got);
+    });
+    let got = rx.recv_timeout(std::time::Duration::from_secs(3));
+    if got.is_err() {
+        // Unblock the stuck open so the thread ends with the test.
+        let _ = std::fs::OpenOptions::new().write(true).open(&fifo).map(|mut f| std::io::Write::write_all(&mut f, b"#!/bin/sh\n"));
+    }
+    let got = got.expect("resolving a FIFO script hung").unwrap();
+    assert!(got.read_only.is_empty(), "{:?}", got.read_only);
 }

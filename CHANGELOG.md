@@ -43,8 +43,9 @@ darkmux release.
   runs unchanged (`{host}` is preview recipe schema 1.1; a 1.0 recipe keeps `{host}` as text, and
   an older darkmux refuses a 1.1 recipe as newer). The kernel holds the preview to its app and HMR
   ports: it binds only on them and takes in traffic only on them (a bind to any other port, and a
-  `listen` with no bind, are refused; a UDP socket bound implicitly by a send receives nothing
-  back; outbound connections are open). It cannot hold them to the loopback (#3559), so darkmux
+  `listen` with no bind, are refused; no socket on another port accepts connections or
+  unsolicited datagrams; replies on connections it opened, TCP or connected UDP, arrive, and an
+  unconnected UDP socket's `recvfrom` is refused, even for a reply). It cannot hold them to the loopback (#3559), so darkmux
   reads those two TCP ports from the kernel's socket table before it reports the preview ready and
   every 2 s after, and stops one listening beyond the loopback, naming the socket: on those two
   ports, detection with a short window, not a kernel boundary (UDP on them is not watched). A
@@ -56,11 +57,12 @@ darkmux release.
   and reinstalled, saying so in the logs. Previews stay off by default.
 - **Seatbelt: a sandbox's process group ends with its program (#3112).** Whatever the program
   left running in its process group is killed when it exits, over and over until none is left.
-  Unlike a container's init, it does not reach a process that moved to a group of its own
-  (`setsid`, `setpgid`).
+  Unlike a container's init, it does not reach a process that moved to a group of its own, or to
+  another existing group in its session (`setsid`, `setpgid`).
 - **Seatbelt can hold a sandbox to named ports (#3112).** A policy naming ports binds and takes in
-  traffic only on those: a bind to any other port and a `listen` with no bind are refused, and an
-  implicitly bound UDP socket receives nothing back; outbound connections are open.
+  traffic only on those: a bind to any other port and a `listen` with no bind are refused, and no
+  socket on another port accepts connections or unsolicited datagrams; replies on connections it
+  opened (TCP, connected UDP) arrive.
 - **Seatbelt does not hold a bind to the loopback (#3559).** The docs no longer claim it: a
   dispatch under Seatbelt can listen on every address. Recorded by a conformance case; dispatches
   are not watched yet.
