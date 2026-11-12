@@ -24,4 +24,6 @@ What every backend must do is one suite, `crates/darkmux-crew/src/sandbox_confor
 
 ## Migration (step 1 of #3112): done
 
-Every caller is on the seam: contained runs and the mods gate (#3548), the reapers and client previews (#3551), the dispatch container, its kills and the watchdog's probe, and Docker's image and engine commands. Next is step 2, a Seatbelt backend that passes the conformance suite; its first question is how a backend that cannot remap paths honors `Mount.at` (`/workspace`).
+Every caller is on the seam: contained runs and the mods gate (#3548), the reapers and client previews (#3551), the dispatch container, its kills and the watchdog's probe, and Docker's image and engine commands. Step 2, the Seatbelt backend, passes the conformance suite; a caller builds every in-sandbox path from `place`, and grants a host program read-only only where `host_reads` says the sandbox cannot already read it. Client previews run in it too (#3112).
+
+**What Seatbelt cannot do (#3559):** hold a bind to the loopback. SBPL's `local ip` filter knows only `*` and `localhost`, and `localhost` matches every local address, so the default network may listen on `0.0.0.0` and the LAN address. The conformance case `a_server_on_every_address_reaches_only_what_the_backend_allows` records it. A caller that needs loopback-only listeners watches them itself (client previews read `Platform::tcp_group_listeners`).

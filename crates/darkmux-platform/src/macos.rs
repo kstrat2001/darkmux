@@ -645,8 +645,9 @@ fn lsof_listen_pids(_port: u16) -> Option<String> {
     None
 }
 
-/// `lsof`'s `-Fptn` answer for the TCP listeners in process group `pgid`
-/// (exit 1 with no output is "none").
+/// `lsof`'s `-Fptn` answer for the TCP listeners in process group `pgid`.
+/// It exits 1 when nothing matched, and also when a process it was reading
+/// ended meanwhile, keeping what it printed: both are an answer.
 #[cfg(target_os = "macos")]
 fn lsof_group_listeners(pgid: u32) -> Option<String> {
     let out = std::process::Command::new("/usr/sbin/lsof")
@@ -654,10 +655,8 @@ fn lsof_group_listeners(pgid: u32) -> Option<String> {
         .current_dir("/")
         .output()
         .ok()?;
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     match out.status.code() {
-        Some(0) => Some(stdout),
-        Some(1) if stdout.trim().is_empty() => Some(String::new()),
+        Some(0 | 1) => Some(String::from_utf8_lossy(&out.stdout).into_owned()),
         _ => None,
     }
 }

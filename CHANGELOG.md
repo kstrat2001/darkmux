@@ -30,9 +30,26 @@ darkmux release.
   keeps its own until it restarts, the processes it starts read the setting fresh), and answers
   `docker_on_path` only when either is Docker; doctor's `daemon sandbox` row warns when the two
   differ. `init`'s next steps, the guide
-  and the README ask for Docker only under Docker. Client previews (`darkmux client serve`) still
-  need Docker: under Seatbelt a preview start is refused (403 `forbidden`), naming
-  `darkmux config set runtime.sandbox docker`.
+  and the README ask for Docker only under Docker.
+
+- **Client previews run in the selected sandbox: Seatbelt previews, no Docker needed (#3112).**
+  A preview starts in the sandbox `runtime.sandbox` names at that request, and is stopped in the
+  one it started in. Under Seatbelt its dev server runs this Mac's own toolchain: each program the
+  recipe runs (and the interpreter a script asks `env` for, npm's node) is found on the PATH
+  `client serve` runs with, and only its install folder is readable (nvm's version folder, never
+  your home); a program not on PATH is refused, naming it and where darkmux looked. darkmux gives
+  the dev server the loopback: a recipe's new `{host}` is `127.0.0.1` there (`0.0.0.0` in a
+  container), and a `HOST` of `0.0.0.0` is given as `127.0.0.1`, so a recipe written for Docker
+  runs unchanged. Seatbelt cannot hold that bind (#3559), so darkmux reads the preview's listeners
+  before it reports it ready and every 2 s after, and stops one that listens beyond the loopback,
+  naming the socket: detection with a short window, not a kernel boundary. A workspace installed
+  in the other sandbox has its `install.unless_exists` path (Linux-built `node_modules`) deleted in
+  darkmux's workspace copy and reinstalled, saying so in the logs. Previews stay off by default.
+- **Seatbelt: a sandbox ends with its program (#3112).** Whatever the program left running in its
+  process group is killed when it exits, as a container's init does.
+- **Seatbelt does not hold a bind to the loopback (#3559).** The docs no longer claim it: a
+  dispatch under Seatbelt can listen on every address. Recorded by a conformance case; dispatches
+  are not watched yet.
 
   Under a sandbox on the host every model-facing path names where that sandbox sees it: the lab
   prompt, crawl unit briefs, split-gitdir notes, mod attachments, and the shipped `review` and

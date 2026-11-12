@@ -34,6 +34,9 @@ pub struct FakePlatform {
     /// `(pgid, listeners)` [`Platform::tcp_group_listeners`] answers; any
     /// other group has none.
     pub group_listeners: Vec<(u32, Vec<crate::GroupListener>)>,
+    /// How many [`Platform::tcp_group_listeners`] reads cannot say (`None`)
+    /// before the reads answer; each read counts one down.
+    pub group_listeners_unreadable_reads: std::sync::atomic::AtomicU32,
     /// `(pid, group)` pairs [`Platform::process_group`] answers.
     pub process_groups: Vec<(u32, u32)>,
     /// `(pid, app)` pairs [`Platform::signed_app`] names; any other pid is unsigned.
@@ -67,6 +70,7 @@ impl Default for FakePlatform {
             tcp_listeners_unreadable_reads: std::sync::atomic::AtomicU32::new(0),
             tcp_peers: Vec::new(),
             group_listeners: Vec::new(),
+            group_listeners_unreadable_reads: std::sync::atomic::AtomicU32::new(0),
             process_groups: Vec::new(),
             signed_apps: Vec::new(),
             allow_answer: crate::AllowAnswer::NoDialog("a fake platform shows no dialog".to_string()),
@@ -186,6 +190,10 @@ impl Platform for FakePlatform {
     }
 
     fn tcp_group_listeners(&self, pgid: u32) -> Option<Vec<crate::GroupListener>> {
+        use std::sync::atomic::Ordering;
+        if self.group_listeners_unreadable_reads.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
+            return None;
+        }
         Some(self.group_listeners.iter().find(|(g, _)| *g == pgid).map(|(_, l)| l.clone()).unwrap_or_default())
     }
 
