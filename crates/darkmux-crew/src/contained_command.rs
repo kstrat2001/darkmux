@@ -127,11 +127,21 @@ pub fn policy_for(image: &str, name: &str, run: &Run, backend: &dyn SandboxBacke
         command: vec![
             "-c".to_string(),
             format!(
-                "test -f {sentinel_at}/{SENTINEL} || {{ echo 'the tree was not mounted: the Docker daemon cannot see the host path' >&2; exit {DOCKER_RUN_FAILED}; }}\n\
+                "test -f {sentinel_at}/{SENTINEL} || {{ echo '{}' >&2; exit {DOCKER_RUN_FAILED}; }}\n\
                  echo '{STARTED_LINE}'\n{}",
+                mount_check_failure(backend.kind()),
                 run.command
             ),
         ],
+    }
+}
+
+/// (#3112) What a failed mount check says inside the sandbox: Docker's likely
+/// cause only under Docker.
+fn mount_check_failure(kind: darkmux_sandbox::BackendKind) -> &'static str {
+    match kind {
+        darkmux_sandbox::BackendKind::Docker => "the tree was not mounted: the Docker daemon cannot see the host path",
+        _ => "the tree is not readable in the sandbox",
     }
 }
 
@@ -326,6 +336,8 @@ mod tests {
         assert_eq!(p.workdir, Some(real.join("tree/pkg").display().to_string()));
         let check = real.join(format!("{SENTINEL}-darkmux-test-1")).display().to_string();
         assert!(p.command[1].starts_with(&format!("test -f {check}/{SENTINEL} ||")), "{}", p.command[1]);
+        // (#3112) A Seatbelt sandbox's failed mount check names no Docker.
+        assert!(!p.command[1].contains("Docker") && p.command[1].contains("the tree is not readable in the sandbox"), "{}", p.command[1]);
         let at_root = Run { workdir: "", ..run.clone() };
         let p = policy_for("unused", "darkmux-test-1", &at_root, &darkmux_sandbox::SeatbeltBackend);
         assert_eq!(p.workdir, Some(real.join("tree").display().to_string()), "an empty workdir is the tree itself");
