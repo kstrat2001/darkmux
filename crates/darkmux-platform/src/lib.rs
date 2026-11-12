@@ -322,22 +322,37 @@ pub(crate) fn answer_from_button(label: &str) -> AllowAnswer {
 
 /// Runs `cmd` to its end, or kills it at `deadline`: `None` when it could
 /// not start or was killed. For a tool that waits on a person (a dialog),
-/// so a wedged one never holds its caller forever.
+/// so a wedged one never holds its caller forever. (#3112 review) Its
+/// output is read while it runs, so one that prints more than a pipe holds
+/// (netstat's table on a busy machine) finishes instead of blocking on a
+/// full pipe until the bound kills it.
 pub(crate) fn output_within(mut cmd: std::process::Command, deadline: std::time::Duration) -> Option<std::process::Output> {
     use std::process::Stdio;
     let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().ok()?;
+    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>));
+    let stderr = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>));
     let until = std::time::Instant::now() + deadline;
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().ok(),
-            Ok(None) if std::time::Instant::now() < until => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < until => std::thread::sleep(std::time::Duration::from_millis(20)),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
                 return None;
             }
         }
-    }
+    };
+    Some(std::process::Output { status, stdout: stdout.join().ok()?, stderr: stderr.join().ok()? })
 }
 
 /// Starts `cmd` and lets it finish on its own (reaped on a thread), for a

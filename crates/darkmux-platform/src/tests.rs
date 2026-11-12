@@ -1789,3 +1789,18 @@ fn proc_net_listen_rows_read_with_their_address() {
         vec![("127.0.0.1:8080".parse().unwrap(), 41231), ("0.0.0.0:8081".parse().unwrap(), 41232)]
     );
 }
+
+/// (#3112 review) A bounded command's output is drained while it runs: one
+/// that prints more than a pipe holds (netstat's table on a busy machine)
+/// finishes, whole, instead of blocking on a full pipe until the bound
+/// kills it.
+#[test]
+fn a_bounded_command_with_more_output_than_a_pipe_holds_finishes() {
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.args(["-c", "head -c 300000 /dev/zero; echo done >&2"]);
+    let started = std::time::Instant::now();
+    let out = crate::output_within(cmd, std::time::Duration::from_secs(3)).expect("it finished within its bound");
+    assert_eq!(out.stdout.len(), 300_000);
+    assert_eq!(String::from_utf8_lossy(&out.stderr).trim(), "done");
+    assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+}
