@@ -199,6 +199,21 @@ fn resolve_one(program: &str, dirs: &[PathBuf], home: Option<&Path>, reads: &dyn
     }
 }
 
+/// The folders darkmux manages programs in for previews, searched before
+/// the host's PATH. None yet: #3561 puts a darkmux-verified Node.js under
+/// `~/.darkmux/toolchains/` and names its `bin` here, and it is then found,
+/// granted read-only and put first on the preview's PATH by the same
+/// [`resolve_toolchain`] that grants a host-installed one (one seam).
+fn managed_toolchain_bins() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+/// The PATH a preview's programs are looked up on: darkmux's managed
+/// toolchain folders first, then `host_path` (`client serve`'s own).
+pub(crate) fn search_path(managed: &[PathBuf], host_path: &str) -> String {
+    managed.iter().map(|d| d.display().to_string()).chain(std::iter::once(host_path.to_string())).filter(|p| !p.is_empty()).collect::<Vec<_>>().join(":")
+}
+
 /// (#3112) The host toolchain a recipe runs under `kind`: each program its
 /// `command` and `install.command` run (and the interpreter a script asks
 /// `env` for: npm's node), found on `path_var` (the PATH `client serve`
@@ -329,7 +344,7 @@ impl PreviewContainers for OnHost {
 
     fn toolchain(&self, recipe: &Recipe) -> Result<Toolchain, String> {
         let backend = darkmux_sandbox::backend_of(self.kind);
-        let path = std::env::var("PATH").unwrap_or_default();
+        let path = search_path(&managed_toolchain_bins(), &std::env::var("PATH").unwrap_or_default());
         let home = std::env::var_os("HOME").map(PathBuf::from).map(|h| h.canonicalize().unwrap_or(h));
         resolve_toolchain(recipe, self.kind, &path, home.as_deref(), &|p| backend.host_reads(p))
     }

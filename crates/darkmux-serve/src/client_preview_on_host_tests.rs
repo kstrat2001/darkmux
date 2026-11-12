@@ -69,6 +69,25 @@ fn a_host_toolchain_is_found_on_path_and_only_its_install_prefix_is_granted() {
     assert!(got.identity.contains("npm-cli.js"), "{}", got.identity);
 }
 
+/// (#3561's seam) A toolchain folder darkmux manages, searched before the
+/// host's PATH, wins over the host's node: it is granted read-only (its
+/// version folder only) and first on the preview's PATH, by the same
+/// resolution a host-installed one goes through.
+#[test]
+fn a_managed_toolchain_folder_is_searched_first_and_granted_the_same_way() {
+    let host = a_fake_host();
+    let managed = host.home.join(".darkmux/toolchains/node-v24.11.0");
+    program(&managed.join("bin/node"), "\x7fELF");
+    program(&managed.join("lib/node_modules/npm/bin/npm-cli.js"), "#!/usr/bin/env node\n");
+    std::os::unix::fs::symlink("../lib/node_modules/npm/bin/npm-cli.js", managed.join("bin/npm")).unwrap();
+    let recipe = a_recipe(serde_json::json!({"schema_version": "1.0", "command": "npm run dev"}));
+    let path = on_host::search_path(&[managed.join("bin")], &host.path_var());
+    let got = on_host::resolve_toolchain(&recipe, BackendKind::Seatbelt, &path, Some(&host.home), &host.reads()).unwrap();
+    assert_eq!(got.read_only, vec![managed.clone()]);
+    assert!(got.path.as_deref().unwrap().starts_with(&managed.join("bin").display().to_string()), "{:?}", got.path);
+    assert!(got.identity.contains(&managed.join("bin/node").display().to_string()) && !got.identity.contains(".nvm"), "{}", got.identity);
+}
+
 /// (#3112) A program the recipe runs that is not on PATH is refused,
 /// naming it, where darkmux looked, and how to fix it.
 #[test]
