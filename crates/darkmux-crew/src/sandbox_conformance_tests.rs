@@ -38,6 +38,12 @@ pub struct Host {
     /// Serves one line, `served`, on `port` on the sandbox's loopback, over
     /// and over.
     pub serve: fn(u16) -> String,
+    /// Prints `connected` when a TCP connection to the sandbox's own
+    /// `127.0.0.1:port` succeeds.
+    pub tcp_probe: fn(u16) -> String,
+    /// Prints `connected` when a connection to the unix socket at the path
+    /// succeeds.
+    pub unix_probe: fn(&str) -> String,
 }
 
 /// Where the sandbox sees `tree` when it is mounted at `/workspace`.
@@ -181,6 +187,55 @@ fn network_none_has_no_network(backend: &dyn SandboxBackend, host: &Host) {
     assert_eq!(none.trim(), "", "a sandbox with no network has a route");
     let default = run_ok(backend, &SandboxPolicy { network: Network::Default, ..policy(backend, image, tree.path(), probe) });
     assert!(!default.trim().is_empty(), "the probe cannot see a route on the default network");
+}
+
+/// Nothing of the caller's environment reaches the sandbox: the test
+/// process's own cargo variables are not there.
+fn the_hosts_environment_does_not_leak_in(backend: &dyn SandboxBackend, host: &Host) {
+    let tree = tempfile::TempDir::new().unwrap();
+    assert!(std::env::var_os("CARGO_PKG_NAME").is_some(), "the probe needs a variable the caller has");
+    let env = run_ok(backend, &policy(backend, host.image, tree.path(), "env"));
+    assert!(!env.contains("CARGO_PKG_NAME="), "the caller's environment leaked in: {env}");
+}
+
+/// With no network, the host's own loopback services are out of reach: a
+/// listener on this host's `127.0.0.1` gets no connection.
+fn network_none_cannot_reach_the_hosts_loopback(backend: &dyn SandboxBackend, host: &Host) {
+    let tree = tempfile::TempDir::new().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let said = run_ok(backend, &policy(backend, host.image, tree.path(), &(host.tcp_probe)(port)));
+    assert!(!said.contains("connected"), "a sandbox with no network reached the host's loopback: {said}");
+    assert!(listener.accept().is_err(), "the host's listener took a connection from a sandbox with no network");
+}
+
+/// On the default network, a unix socket outside the sandbox's mounts (the
+/// Docker daemon's, a database's) is out of reach.
+fn the_default_network_reaches_no_outside_unix_socket(backend: &dyn SandboxBackend, host: &Host) {
+    let tree = tempfile::TempDir::new().unwrap();
+    let outside = tempfile::TempDir::new().unwrap();
+    let path = outside.path().join("s.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let p = SandboxPolicy { network: Network::Default, ..policy(backend, host.image, tree.path(), &(host.unix_probe)(&path.display().to_string())) };
+    let said = run_ok(backend, &p);
+    assert!(!said.contains("connected"), "a sandbox reached a unix socket outside its mounts: {said}");
+    assert!(listener.accept().is_err(), "the outside socket took a connection from a sandbox");
+}
+
+/// A read-only mount nested two levels into a read-write one stays read
+/// only even when the sandbox renames the directory above it.
+fn a_deep_read_only_mount_survives_renaming_its_parent(backend: &dyn SandboxBackend, host: &Host) {
+    let tree = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(tree.path().join("sub/.git")).unwrap();
+    std::fs::write(tree.path().join("sub/.git/config"), "kept\n").unwrap();
+    let git = Mount { host: tree.path().join("sub/.git"), at: "/workspace/sub/.git".to_string(), access: Access::ReadOnly };
+    let script = "mv sub sub2 2>/dev/null; echo pwn >> sub2/.git/config 2>/dev/null; echo pwn >> sub/.git/config 2>/dev/null; mv sub2 sub 2>/dev/null; true";
+    let mut p = policy(backend, host.image, tree.path(), script);
+    p.mounts.push(git);
+    run_ok(backend, &p);
+    assert_eq!(std::fs::read_to_string(tree.path().join("sub/.git/config")).unwrap(), "kept\n", "a read-only mount took a write");
 }
 
 /// A run past its deadline is cut short, and removing its sandbox ends the
@@ -470,6 +525,26 @@ macro_rules! conformance {
             }
             #[test]
             #[ignore = $needs]
+            fn the_hosts_environment_does_not_leak_in() {
+                super::the_hosts_environment_does_not_leak_in(&$make, &$host)
+            }
+            #[test]
+            #[ignore = $needs]
+            fn network_none_cannot_reach_the_hosts_loopback() {
+                super::network_none_cannot_reach_the_hosts_loopback(&$make, &$host)
+            }
+            #[test]
+            #[ignore = $needs]
+            fn the_default_network_reaches_no_outside_unix_socket() {
+                super::the_default_network_reaches_no_outside_unix_socket(&$make, &$host)
+            }
+            #[test]
+            #[ignore = $needs]
+            fn a_deep_read_only_mount_survives_renaming_its_parent() {
+                super::a_deep_read_only_mount_survives_renaming_its_parent(&$make, &$host)
+            }
+            #[test]
+            #[ignore = $needs]
             fn a_listing_by_name_matches_the_name_literally() {
                 super::a_listing_by_name_matches_the_name_literally(&$make, &$host)
             }
@@ -484,6 +559,8 @@ conformance!(
         image: "alpine:3.22",
         route_probe: "tail -n +2 /proc/net/route",
         serve: |port| format!("while :; do echo served | nc -l -p {port}; done"),
+        tcp_probe: |port| format!("nc -w 2 127.0.0.1 {port} </dev/null >/dev/null 2>&1 && echo connected; true"),
+        unix_probe: |path| format!("nc -U '{path}' </dev/null >/dev/null 2>&1 && echo connected; true"),
     },
     "needs Docker and alpine:3.22"
 );
@@ -497,6 +574,8 @@ conformance!(
         image: "unused",
         route_probe: "nc -z -G 2 1.1.1.1 53 2>/dev/null && echo route; true",
         serve: |port| format!("while :; do echo served | nc -l 127.0.0.1 {port}; done"),
+        tcp_probe: |port| format!("nc -z -G 2 127.0.0.1 {port} >/dev/null 2>&1 && echo connected; true"),
+        unix_probe: |path| format!("nc -U '{path}' </dev/null >/dev/null 2>&1 && echo connected; true"),
     },
     "needs macOS sandbox-exec"
 );

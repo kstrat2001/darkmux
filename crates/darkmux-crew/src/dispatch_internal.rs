@@ -2582,9 +2582,8 @@ impl DockerRunConfig {
 /// runtime's arguments, as the sandbox backend renders [`dispatch_policy`].
 /// Pure function — no I/O, no side effects.
 ///
-/// Turn this into the executable `Command` via [`docker_command_from_argv`]
-/// (program = `[0]`, args = `[1..]`). Do NOT push the whole vector as arguments
-/// — that runs `docker docker run …` and docker exits 125 (the #975 regression).
+/// The argv is a rendering for tests and records; the dispatch spawns the
+/// backend's own `Command` (`container_command`), never one rebuilt from it.
 pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     let (cmd, _) = darkmux_sandbox::backend().run(&dispatch_policy(config));
     std::iter::once(cmd.get_program())
@@ -8406,6 +8405,14 @@ fn container_run_config(
     })
 }
 
+/// (#3112 step 2) The backend's own `Command` for the dispatch, as it
+/// planned it: its environment, process group and stdin are part of the
+/// sandbox (a Seatbelt sandbox clears the host's environment), so it is
+/// never flattened to an argv and rebuilt, which would drop them.
+fn container_command(config: &DockerRunConfig, backend: &dyn darkmux_sandbox::SandboxBackend) -> Command {
+    backend.run(&dispatch_policy_for(config, backend)).0
+}
+
 /// Check the run config, build the `docker run` command from it, and spawn
 /// it with its output piped (and its stdin, when a secret rides it).
 fn spawn_container(argv_config: &DockerRunConfig, max_turns_override: Option<u32>) -> Result<std::process::Child> {
@@ -8414,11 +8421,7 @@ fn spawn_container(argv_config: &DockerRunConfig, max_turns_override: Option<u32
     // interpretation; this rejects malformed refs (leading `-`, whitespace,
     // control chars) so the contract is explicit, not just fence-dependent.
     preflight_docker_config(argv_config)?;
-    // (#3112 step 2) The backend's own `Command`, as it planned it: its
-    // environment, process group and stdin are part of the sandbox (a
-    // Seatbelt sandbox clears the host's environment), so it is never
-    // flattened to an argv and rebuilt, which would drop them.
-    let (mut cmd, _) = darkmux_sandbox::backend().run(&dispatch_policy(argv_config));
+    let mut cmd = container_command(argv_config, darkmux_sandbox::backend());
 
     // TODO (#839): Network hardening — the runtime must reach host LMStudio
     // via `host.docker.internal`. Constraining networking (e.g. `--network none`

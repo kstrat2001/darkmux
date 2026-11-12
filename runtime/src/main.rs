@@ -171,7 +171,9 @@ struct Dispatch {
 fn prepare_dispatch(argv: &[String]) -> Result<Dispatch, Refusal> {
     let mut args = parse_run_args(argv, std::env::var("DARKMUX_RESUME_CHECKPOINT").ok())?;
     let (model, prompt) = required_model_and_prompt(args.model.take(), args.prompt.take())?;
-    let system_prompt = args.system.take().unwrap_or_else(|| tools::workspace::naming_root(&default_system_prompt()));
+    // (#3112 step 2) A role's prompt names `/workspace` too (`--system`), so
+    // it is renamed the same way as the default; byte-identical under it.
+    let system_prompt = tools::workspace::naming_root(&args.system.take().unwrap_or_else(default_system_prompt));
 
     // (#2386) The finding-key identity this dispatch mints under, plus the
     // brief it was given. `create_finding` returns the real key

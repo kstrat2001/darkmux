@@ -58,13 +58,29 @@ const SYSTEM_READ: &[&str] = &[
     "/private/var/db/xcode_select_link",
     "/private/var/select",
     "/dev",
-    "/opt/homebrew",
+    // Homebrew's programs and libraries, never its `var` (databases' data)
+    // or the rest of its `etc` (#3553 review).
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/opt/homebrew/lib",
+    "/opt/homebrew/opt",
+    "/opt/homebrew/Cellar",
+    "/opt/homebrew/Frameworks",
+    "/opt/homebrew/include",
+    "/opt/homebrew/share",
+    "/opt/homebrew/etc/openssl@3",
+    "/opt/homebrew/etc/ca-certificates",
     "/Applications/Xcode.app",
 ];
 
-/// Mach services a sandbox may not look up: the keychain's. Everything else
+/// Paths under [`SYSTEM_READ`] that hold data, not programs: never readable.
+const DENIED_READ: &[&str] = &["/usr/local/var", "/usr/local/etc"];
+
+/// Mach services a sandbox may not look up: the keychain's and the
+/// clipboard's (#3553 review). Everything else
 /// a program needs (name resolution, certificate trust) stays reachable.
-const DENIED_SERVICES: &[&str] = &["com.apple.SecurityServer", "com.apple.securityd.xpc", "com.apple.secd"];
+const DENIED_SERVICES: &[&str] =
+    &["com.apple.SecurityServer", "com.apple.securityd.xpc", "com.apple.secd", "com.apple.pasteboard.1"];
 
 /// Writes the sandbox's directory: `$1` the directory, `$2` the profile,
 /// `$3` the labels. Fails (125, Docker's own "could not make it") when the
@@ -79,7 +95,7 @@ mkdir -m 700 "$d/tmp" && printf '%s' "$2" > "$d/profile.sb" && printf '%s' "$3" 
 /// group's), survives the group's SIGTERM long enough to see the sandbox
 /// out, and removes the directory when it exits.
 const LAUNCH: &str = r#"wd=$1; shift
-echo $$ > "$d/pid" || exit 125
+echo $$ > "$d/pid" && ps -o lstart= -p $$ > "$d/started" || exit 125
 trap : TERM INT HUP
 [ -z "$wd" ] || cd "$wd" || { rm -rf "$d"; exit 125; }
 [ -n "$1" ] || { echo "seatbelt: no program to run (a policy needs an entrypoint)" >&2; rm -rf "$d"; exit 125; }
@@ -94,8 +110,9 @@ exit $rc
 const OURS: &str = r#"[ -f "$d/profile.sb" ]"#;
 
 /// Whether `$d`'s sandbox is running: its launcher's pid is alive and is
-/// still that launcher (a reused pid is not), leaving `$pid` set.
-const ALIVE: &str = r#"pid=$(cat "$d/pid" 2>/dev/null) && kill -0 "$pid" 2>/dev/null && ps -ww -p "$pid" -o command= | grep -qF -- "$d""#;
+/// still that launcher, started when the launcher recorded (a reused pid,
+/// or another sandbox's launcher, is not), leaving `$pid` set.
+const ALIVE: &str = r#"pid=$(cat "$d/pid" 2>/dev/null) && kill -0 "$pid" 2>/dev/null && started=$(cat "$d/started" 2>/dev/null) && [ -n "$started" ] && [ "$(ps -o lstart= -p "$pid" 2>/dev/null)" = "$started" ]"#;
 
 /// The directory sandboxes live under: [`STATE_DIR_ENV`], else
 /// `~/.darkmux/seatbelt` (not `~/.darkmux/sandboxes`, which holds the lab's
@@ -132,7 +149,11 @@ impl SeatbeltBackend {
         p.push_str(&format!("(allow file-read-metadata {})\n", join(Self::ancestors(policy, dir).iter().map(|a| format!("(literal {})", quote(&a.to_string_lossy()))))));
         let system = std::iter::once("(literal \"/\")".to_string()).chain(SYSTEM_READ.iter().map(|s| subpath(Path::new(s))));
         p.push_str(&format!("(allow file-read* {})\n", join(system)));
-        p.push_str("(allow file-write* (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/tty\") (regex #\"^/dev/fd/\") (regex #\"^/dev/ttys[0-9]+$\"))\n");
+        p.push_str(&format!("(deny file-read* {})\n", join(DENIED_READ.iter().map(|s| subpath(Path::new(s))))));
+        // Its own controlling terminal only: never another of the user's
+        // terminals, to read keystrokes from or forge output on.
+        p.push_str("(deny file-read* file-write* (regex #\"^/dev/ttys\"))\n");
+        p.push_str("(allow file-write* (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/tty\") (regex #\"^/dev/fd/\"))\n");
         p.push_str(&format!("(allow file-read* file-write* {})\n", subpath(&canonical(&dir.join("tmp")))));
         for mount in &policy.mounts {
             let at = subpath(&canonical(&mount.host));
@@ -141,14 +162,30 @@ impl SeatbeltBackend {
                 Access::ReadOnly => p.push_str(&format!("(allow file-read* {at})\n(deny file-write* {at})\n")),
             }
         }
+        // Seatbelt matches paths, not mounts: a read-only mount nested deep in
+        // a read-write one could be moved out from under its rule by renaming
+        // a directory above it. Each directory between them is fixed in place
+        // (its contents stay writable).
+        for pinned in Self::pinned_ancestors(policy) {
+            p.push_str(&format!("(deny file-write* (literal {}))\n", quote(&pinned.to_string_lossy())));
+        }
         if let Some(program) = &policy.entrypoint {
             if Path::new(program).is_absolute() {
                 p.push_str(&format!("(allow file-read* (literal {}))\n", quote(&canonical(Path::new(program)).to_string_lossy())));
             }
         }
         match policy.network {
-            Network::Default => p.push_str("(allow network*)\n(deny network-bind)\n(allow network-bind (local ip \"localhost:*\"))\n"),
-            Network::None => p.push_str("(allow network* (remote ip \"localhost:*\"))\n(allow network-bind (local ip \"localhost:*\"))\n"),
+            // Any address, binding only on the loopback; no unix socket but
+            // the resolver's, so never the Docker daemon's or another
+            // service's (#3553 review).
+            Network::Default => p.push_str(concat!(
+                "(allow network*)\n(deny network-bind)\n(allow network-bind (local ip \"localhost:*\"))\n",
+                "(deny network-outbound (remote unix-socket))\n",
+                "(allow network-outbound (remote unix-socket (path-literal \"/private/var/run/mDNSResponder\")))\n",
+            )),
+            // Nothing: a sandbox has no loopback of its own, and the host's
+            // runs its databases and model servers (#3553 review).
+            Network::None => {}
         }
         p
     }
@@ -172,6 +209,21 @@ impl SeatbeltBackend {
         all.sort();
         all.dedup();
         all
+    }
+
+    /// The directories strictly between a read-only mount and the
+    /// read-write mount it is nested in.
+    fn pinned_ancestors(policy: &SandboxPolicy) -> Vec<PathBuf> {
+        let rw: Vec<PathBuf> = policy.mounts.iter().filter(|m| m.access == Access::ReadWrite).map(|m| canonical(&m.host)).collect();
+        let mut pinned = Vec::new();
+        for ro in policy.mounts.iter().filter(|m| m.access == Access::ReadOnly).map(|m| canonical(&m.host)) {
+            for outer in rw.iter().filter(|outer| ro.starts_with(outer) && ro != **outer) {
+                pinned.extend(ro.ancestors().skip(1).take_while(|a| a != outer).map(Path::to_path_buf));
+            }
+        }
+        pinned.sort();
+        pinned.dedup();
+        pinned
     }
 
     /// `key=value`, one per line, newlines in a value dropped so one label
@@ -445,15 +497,51 @@ mod tests {
         assert!(p.starts_with("(version 1)\n(deny default)\n"), "{p}");
         assert!(p.contains("(deny network-bind)\n(allow network-bind (local ip \"localhost:*\"))"), "{p}");
         assert!(p.contains("(deny mach-lookup (global-name \"com.apple.SecurityServer\")"), "{p}");
+        assert!(p.contains("(global-name \"com.apple.pasteboard.1\")"), "the clipboard is out of reach: {p}");
+        assert!(p.contains("(deny file-read* file-write* (regex #\"^/dev/ttys\"))"), "no other terminal: {p}");
+        assert!(!p.contains("(subpath \"/opt/homebrew\")"), "not all of Homebrew, its var included: {p}");
         assert!(!p.contains("/Users"), "no home is readable: {p}");
     }
 
-    /// No network reaches only the loopback.
+    /// No network allows no network rule at all, the host's loopback
+    /// included; the default network reaches no unix socket but the
+    /// resolver's.
     #[test]
-    fn no_network_reaches_only_loopback() {
-        let p = SeatbeltBackend::profile(&policy(Vec::new(), Network::None), Path::new("/s"));
-        assert!(p.contains("(allow network* (remote ip \"localhost:*\"))"), "{p}");
-        assert!(!p.contains("(allow network*)\n"), "{p}");
+    fn no_network_allows_nothing_and_the_default_no_unix_socket() {
+        let none = SeatbeltBackend::profile(&policy(Vec::new(), Network::None), Path::new("/s"));
+        assert!(!none.contains("network"), "{none}");
+        let default = SeatbeltBackend::profile(&policy(Vec::new(), Network::Default), Path::new("/s"));
+        assert!(default.contains("(deny network-outbound (remote unix-socket))\n(allow network-outbound (remote unix-socket (path-literal \"/private/var/run/mDNSResponder\")))"), "{default}");
+    }
+
+    /// The directories between a read-only mount and the read-write one
+    /// it is nested in are fixed in place; none above the read-write one.
+    #[test]
+    fn a_deep_read_only_mount_pins_the_directories_above_it() {
+        let p = policy(vec![mount("/nx/ws", Access::ReadWrite), mount("/nx/ws/a/b/.git", Access::ReadOnly)], Network::None);
+        assert_eq!(SeatbeltBackend::pinned_ancestors(&p), [PathBuf::from("/nx/ws/a"), PathBuf::from("/nx/ws/a/b")]);
+        let shallow = policy(vec![mount("/nx/ws", Access::ReadWrite), mount("/nx/ws/.git", Access::ReadOnly)], Network::None);
+        assert!(SeatbeltBackend::pinned_ancestors(&shallow).is_empty());
+    }
+
+    /// A kill finds a sandbox only by its launcher's own pid and start
+    /// time: a recorded pid now held by another process (reused, or another
+    /// sandbox's launcher) is not killed.
+    #[test]
+    fn a_kill_never_signals_a_process_that_reused_the_pid() {
+        let root = tempfile::TempDir::new().unwrap();
+        let d = root.path().join("darkmux-pr-1");
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(d.join("profile.sb"), "(version 1)").unwrap();
+        let mut other = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        std::fs::write(d.join("pid"), other.id().to_string()).unwrap();
+        std::fs::write(d.join("started"), "Thu Jan  1 00:00:00 1970\n").unwrap();
+        let kill = Command::new(SH).arg("-c").arg(format!("d=$1\n{OURS} && {ALIVE} || exit 1\nkill -KILL -- \"$pid\"")).arg("sh").arg(&d).status().unwrap();
+        let survived = other.try_wait().unwrap().is_none();
+        let _ = other.kill();
+        let _ = other.wait();
+        assert!(!kill.success(), "a kill claimed a process it did not start");
+        assert!(survived, "a kill signaled a process that reused the pid");
     }
 
     /// A quote or backslash in a path cannot end the SBPL string.

@@ -6344,6 +6344,28 @@ S(("127.0.0.1", port), H).serve_forever()
         assert_eq!(prompt(&docker).as_deref(), Some("/darkmux-out/.prompt.txt"));
     }
 
+    /// (#3112 step 2) The dispatch spawns the backend's own command, its
+    /// environment included: a Seatbelt sandbox's runtime is told its
+    /// workspace there, and nothing of the host's comes with it.
+    #[test]
+    fn the_dispatch_spawns_the_backends_own_command() {
+        let root = tempfile::TempDir::new().unwrap();
+        for d in ["ws", "out"] {
+            std::fs::create_dir(root.path().join(d)).unwrap();
+        }
+        let mut cfg = argv_config_with_base_url(None);
+        cfg.workspace = root.path().join("ws");
+        cfg.host_out = root.path().join("out");
+        let cmd = container_command(&cfg, &darkmux_sandbox::SeatbeltBackend);
+        let envs: Vec<(String, Option<String>)> = cmd
+            .get_envs()
+            .map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned())))
+            .collect();
+        let ws = root.path().join("ws").canonicalize().unwrap().display().to_string();
+        assert!(envs.contains(&("DARKMUX_RUNTIME_WORKSPACE".to_string(), Some(ws))), "{envs:?}");
+        assert!(!envs.iter().any(|(k, _)| k == "CARGO_PKG_NAME"), "the host's environment rode along: {envs:?}");
+    }
+
     /// (#3112 step 2) Only a sandbox with its own loopback (a container)
     /// needs "this machine" rewritten; a Seatbelt sandbox is on the host.
     #[test]
