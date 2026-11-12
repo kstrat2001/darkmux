@@ -7059,7 +7059,7 @@ struct HostRuntime {
 }
 
 /// (#3112) The subcommand of the darkmux binary that IS the agent runtime
-/// (`src/runtime_cmd.rs` at the repo root hands it to the runtime's entry).
+/// (`src/multicall.rs` at the repo root hands it to the runtime's entry).
 pub const RUNTIME_SUBCOMMAND: &str = "runtime";
 
 /// (#3112 step 2) For development: a standalone `darkmux-runtime` (built with

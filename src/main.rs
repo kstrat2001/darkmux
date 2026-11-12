@@ -115,8 +115,8 @@ mod client_cli;
 pub use darkmux_serve as serve;
 mod skills;
 mod phase_review;
-// (#3112) The hidden `darkmux runtime …`: the agent runtime in this binary.
-mod runtime_cmd;
+// (#3112) Hidden helper subcommands (`darkmux runtime …`), routed first.
+mod multicall;
 // #463 workspace split (PR2) — profiles/ownership extracted to the
 // darkmux-profiles crate. These re-exports keep crate::{profiles,
 // ownership}::* paths resolving. (2.0, #1405: the `runtime` module — the
@@ -145,16 +145,16 @@ pub(crate) fn test_run() -> darkmux_types::session_id::RunId {
     darkmux_types::session_id::RunId::mission("m-test").expect("a literal run id is never empty")
 }
 
-fn main() -> runtime_cmd::Exit {
-    // (#3112) `darkmux runtime …` is the agent runtime: handed over before
-    // anything else runs (`runtime_cmd`'s module doc says why).
-    match runtime_cmd::run_if_invoked() {
-        Some(code) => runtime_cmd::Exit::Runtime(code),
+fn main() -> multicall::Exit {
+    // (#3112) A hidden helper (`darkmux runtime …`) is handed over before
+    // anything else runs (`multicall`'s module doc says why).
+    match multicall::hand_over() {
+        Some(code) => multicall::Exit::Helper(code),
         None => {
             // (#3112 review) Which file this process started from, before
             // anything can replace it: a Seatbelt dispatch runs only that.
             darkmux_crew::dispatch_internal::note_executable_at_start();
-            runtime_cmd::Exit::Darkmux(darkmux_main())
+            multicall::Exit::Darkmux(darkmux_main())
         }
     }
 }

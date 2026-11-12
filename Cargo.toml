@@ -102,7 +102,7 @@ darkmux-serve = { path = "crates/darkmux-serve" }
 darkmux-gestalt = { path = "crates/darkmux-gestalt" }
 darkmux-trajectory = { path = "crates/darkmux-trajectory", features = ["schemars"] }
 # (#3112) The agent runtime (`runtime/src/lib.rs`, linked by the package
-# below), run as the hidden `darkmux runtime` subcommand (src/runtime_cmd.rs):
+# below), run as the hidden `darkmux runtime` subcommand (src/multicall.rs):
 # what a Seatbelt sandbox runs, so no user builds or downloads a separate
 # runtime. Named `darkmux-runtime` here: its library is `darkmux_runtime`, as
 # the standalone one's is.
