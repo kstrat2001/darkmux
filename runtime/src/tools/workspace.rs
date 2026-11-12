@@ -29,6 +29,35 @@ use std::path::{Path, PathBuf};
 /// Default workspace root inside the dispatch container.
 pub const DEFAULT_WORKSPACE: &str = "/workspace";
 
+/// (#3112 step 2) Env override of [`DEFAULT_WORKSPACE`]: the host sets it
+/// when its sandbox cannot place the workspace at `/workspace` (Seatbelt
+/// sees it at its own host path). Never set for a container.
+pub const WORKSPACE_ENV: &str = "DARKMUX_RUNTIME_WORKSPACE";
+
+/// This run's workspace root: [`WORKSPACE_ENV`] when set and non-empty,
+/// otherwise [`DEFAULT_WORKSPACE`].
+pub fn root() -> PathBuf {
+    match std::env::var_os(WORKSPACE_ENV) {
+        Some(dir) if !dir.is_empty() => dir.into(),
+        _ => DEFAULT_WORKSPACE.into(),
+    }
+}
+
+/// Model-facing text with [`DEFAULT_WORKSPACE`] named as this run's
+/// [`root`]: byte-identical when the root is the default (contract 6), so
+/// a container's tool definitions never change.
+pub fn naming_root(text: &str) -> String {
+    naming(text, &root())
+}
+
+/// `text` with [`DEFAULT_WORKSPACE`] named as `root`.
+fn naming(text: &str, root: &Path) -> String {
+    if root.as_os_str() == DEFAULT_WORKSPACE {
+        return text.to_string();
+    }
+    text.replace(DEFAULT_WORKSPACE, &root.to_string_lossy())
+}
+
 /// Resolve and validate a path that the agent wants to **read**. The
 /// path must already exist on disk so that `canonicalize` can resolve
 /// it; the canonical resolution is then checked against the workspace
@@ -182,6 +211,39 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::symlink;
+
+    /// (#3112 step 2) Under the default root, model-facing text is byte
+    /// for byte what it was (contract 6); under another, every mention of
+    /// `/workspace` names that root.
+    #[test]
+    fn model_facing_text_names_the_root_only_when_it_moved() {
+        let text = "runs with cwd=/workspace; paths inside /workspace/...";
+        assert_eq!(naming(text, Path::new(DEFAULT_WORKSPACE)), text);
+        assert_eq!(
+            naming(text, Path::new("/Users/op/ws")),
+            "runs with cwd=/Users/op/ws; paths inside /Users/op/ws/..."
+        );
+    }
+
+    /// (#3112 step 2) The root is the env override when set and non-empty,
+    /// else `/workspace`; the tool definitions the model sees follow it.
+    #[test]
+    #[serial_test::serial(runtime_workspace_env)]
+    fn the_root_and_the_tool_definitions_follow_the_env_override() {
+        std::env::remove_var(WORKSPACE_ENV);
+        assert_eq!(root(), Path::new(DEFAULT_WORKSPACE));
+        let read = serde_json::to_string(&crate::tools::Tool::Read.to_tool_def()).unwrap();
+        assert!(read.contains("/workspace/"), "{read}");
+        std::env::set_var(WORKSPACE_ENV, "");
+        assert_eq!(root(), Path::new(DEFAULT_WORKSPACE), "empty is unset");
+        std::env::set_var(WORKSPACE_ENV, "/Users/op/ws");
+        assert_eq!(root(), Path::new("/Users/op/ws"));
+        let read = serde_json::to_string(&crate::tools::Tool::Read.to_tool_def()).unwrap();
+        let bash = serde_json::to_string(&crate::tools::Tool::Bash.to_tool_def()).unwrap();
+        std::env::remove_var(WORKSPACE_ENV);
+        assert!(read.contains("/Users/op/ws/") && !read.contains("/workspace"), "{read}");
+        assert!(bash.contains("cwd=/Users/op/ws") && !bash.contains("/workspace"), "{bash}");
+    }
 
     /// Create a fresh tempdir to serve as the workspace root for one
     /// test. Returns the dir; drop = cleanup.

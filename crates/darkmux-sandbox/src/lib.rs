@@ -18,6 +18,8 @@ use std::process::Command;
 
 pub mod docker;
 pub use docker::DockerBackend;
+pub mod seatbelt;
+pub use seatbelt::SeatbeltBackend;
 
 #[cfg(test)]
 mod docker_calls;
@@ -103,6 +105,8 @@ pub struct SandboxPolicy {
 #[serde(rename_all = "snake_case")]
 pub enum BackendKind {
     Docker,
+    /// (#3112 step 2, spike) macOS `sandbox-exec`.
+    Seatbelt,
 }
 
 /// A running (or once-running) sandbox, as a record can store it: which
@@ -151,15 +155,47 @@ pub struct Listed {
     pub labels: Vec<Option<String>>,
 }
 
-/// The backend darkmux runs sandboxes through. Docker is the only one.
+/// (#3112 step 2, spike) The env var that picks the backend: `docker` (the
+/// default) or `seatbelt`. A spike's switch, not yet a `config.json` key.
+pub const SANDBOX_ENV: &str = "DARKMUX_SANDBOX";
+
+/// The backend [`SANDBOX_ENV`] names, or why it names none this host can
+/// use. Unset or empty is Docker; any other unknown value is refused, never
+/// defaulted, and `seatbelt` is refused where `sandbox-exec` is missing.
+pub fn selected() -> Result<BackendKind, String> {
+    selected_from(std::env::var(SANDBOX_ENV).ok().as_deref(), SeatbeltBackend::available())
+}
+
+fn selected_from(value: Option<&str>, seatbelt_available: bool) -> Result<BackendKind, String> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(BackendKind::Docker),
+        Some(v) if v == docker::SETTING => Ok(BackendKind::Docker),
+        Some("seatbelt") if seatbelt_available => Ok(BackendKind::Seatbelt),
+        Some("seatbelt") => Err(format!("{SANDBOX_ENV}=seatbelt: this host has no {}", seatbelt::SANDBOX_EXEC)),
+        Some(other) => Err(format!("{SANDBOX_ENV}={other:?} is not a sandbox backend; use `docker` or `seatbelt`")),
+    }
+}
+
+/// The backend darkmux runs sandboxes through: the one [`selected`] names.
+/// A refused selection falls back to Docker here; every entry point that
+/// starts a sandbox calls [`selected`] first and refuses it there.
 pub fn backend() -> &'static dyn SandboxBackend {
-    &DockerBackend
+    match selected() {
+        Ok(BackendKind::Seatbelt) => &SeatbeltBackend,
+        _ => &DockerBackend,
+    }
 }
 
 /// A way to run a policy. Each method plans a process for the caller to
 /// spawn and bound; none runs anything itself.
 pub trait SandboxBackend: Send + Sync {
     fn kind(&self) -> BackendKind;
+
+    /// Where the sandbox sees `mount`: its `at` for a backend that places
+    /// mounts (Docker), its host path for one that cannot (Seatbelt). A
+    /// caller builds every in-sandbox path into a mount from this, never
+    /// from `at` (#3112 step 2).
+    fn place(&self, mount: &Mount) -> String;
 
     /// The command that runs `policy` attached until it exits, and the
     /// handle naming the sandbox. Killing that command's process need not
@@ -215,6 +251,18 @@ mod tests {
 
     /// A handle is stored by a reaper or a resume record and read back as
     /// the same handle; its backend is spelled in snake case.
+    /// Unset, empty or `docker` is Docker; `seatbelt` is Seatbelt where it
+    /// is installed and refused where not; anything else is refused.
+    #[test]
+    fn the_backend_setting_refuses_what_it_does_not_know() {
+        assert_eq!(selected_from(None, true), Ok(BackendKind::Docker));
+        assert_eq!(selected_from(Some(""), true), Ok(BackendKind::Docker));
+        assert_eq!(selected_from(Some(docker::SETTING), false), Ok(BackendKind::Docker));
+        assert_eq!(selected_from(Some("seatbelt"), true), Ok(BackendKind::Seatbelt));
+        assert!(selected_from(Some("seatbelt"), false).is_err());
+        assert!(selected_from(Some("podman"), true).unwrap_err().contains("podman"));
+    }
+
     #[test]
     fn a_handle_round_trips_through_a_record() {
         let handle = SandboxHandle { backend: BackendKind::Docker, id: "darkmux-gate-1-0".into() };

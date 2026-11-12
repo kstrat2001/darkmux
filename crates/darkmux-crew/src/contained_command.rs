@@ -10,7 +10,7 @@
 //! should ever select.
 
 use crate::bounded_command::{run_bounded, Bounded};
-use darkmux_sandbox::{backend, Access, DockerBackend, Limits, Mount, Network, Query, SandboxHandle, SandboxPolicy};
+use darkmux_sandbox::{backend, Access, DockerBackend, Limits, Mount, Network, Query, SandboxBackend, SandboxHandle, SandboxPolicy};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -83,16 +83,27 @@ pub struct Run<'a> {
 /// network, the coder container's limits, the owner's pid as a label, and
 /// `sh` running the command behind the mount check.
 pub fn policy(image: &str, name: &str, run: &Run) -> SandboxPolicy {
+    policy_for(image, name, run, backend())
+}
+
+/// [`policy`] for `backend`: the working directory and the mount check are
+/// where it places the tree and the check's directory (#3112 step 2).
+pub fn policy_for(image: &str, name: &str, run: &Run, backend: &dyn SandboxBackend) -> SandboxPolicy {
     use crate::dispatch_internal::{DOCKER_MEMORY, DOCKER_PIDS_LIMIT};
     let read_write = |host: &Path, at: &str| Mount { host: host.to_path_buf(), at: at.to_string(), access: Access::ReadWrite };
-    let mut mounts = vec![read_write(run.tree, "/workspace")];
+    let tree = read_write(run.tree, "/workspace");
+    let tree_at = backend.place(&tree);
+    let mut mounts = vec![tree];
+    let mut sentinel_at = SENTINEL_AT.to_string();
     if let Some(sentinel_dir) = sentinel_dir_for(name, run.tree) {
-        mounts.push(Mount { host: sentinel_dir, at: SENTINEL_AT.to_string(), access: Access::ReadOnly });
+        let check = Mount { host: sentinel_dir, at: SENTINEL_AT.to_string(), access: Access::ReadOnly };
+        sentinel_at = backend.place(&check);
+        mounts.push(check);
     }
     mounts.extend(run.mounts.iter().map(|(host, at)| read_write(host, at)));
     let workdir = match run.workdir.trim_matches('/') {
-        "" => "/workspace".to_string(),
-        rel => format!("/workspace/{rel}"),
+        "" => tree_at,
+        rel => format!("{tree_at}/{rel}"),
     };
     SandboxPolicy {
         name: name.to_string(),
@@ -116,7 +127,7 @@ pub fn policy(image: &str, name: &str, run: &Run) -> SandboxPolicy {
         command: vec![
             "-c".to_string(),
             format!(
-                "test -f {SENTINEL_AT}/{SENTINEL} || {{ echo 'the tree was not mounted: the Docker daemon cannot see the host path' >&2; exit {DOCKER_RUN_FAILED}; }}\n\
+                "test -f {sentinel_at}/{SENTINEL} || {{ echo 'the tree was not mounted: the Docker daemon cannot see the host path' >&2; exit {DOCKER_RUN_FAILED}; }}\n\
                  echo '{STARTED_LINE}'\n{}",
                 run.command
             ),
@@ -239,6 +250,11 @@ pub fn remove_container(name: &str) {
 /// not reachable, naming the opt-out.
 pub fn lab_test_image(workload_image: Option<&str>) -> anyhow::Result<String> {
     use anyhow::Context;
+    // (#3112 step 2) A Seatbelt sandbox runs this host's own toolchain: there
+    // is no image to name, resolve or pull.
+    if darkmux_sandbox::selected().map_err(|why| anyhow::anyhow!(why))? == darkmux_sandbox::BackendKind::Seatbelt {
+        return Ok("host".to_string());
+    }
     if let Some(image) = workload_image {
         crate::dispatch_internal::validate_image_ref(image)?;
         return Ok(image.to_string());
@@ -254,6 +270,10 @@ pub fn lab_test_image(workload_image: Option<&str>) -> anyhow::Result<String> {
 /// the platform's), so files the tests write into a bind-mounted tree belong
 /// to whoever owns the tree.
 pub fn lab_test_user() -> anyhow::Result<Option<String>> {
+    // (#3112 step 2) A Seatbelt sandbox runs as the caller.
+    if darkmux_sandbox::backend().kind() == darkmux_sandbox::BackendKind::Seatbelt {
+        return Ok(None);
+    }
     crate::dispatch_internal::runtime_container_user()
 }
 
@@ -284,6 +304,28 @@ mod tests {
         assert!(script.starts_with(&format!("test -f {SENTINEL_AT}/{SENTINEL} || {{")), "{script}");
         assert!(script.ends_with(&format!("\necho '{STARTED_LINE}'\nnpm test")), "{script}");
         assert!(!container_args("node:22", "n", &a_run(&[], None)).join(" ").contains("--user"));
+    }
+
+    /// (#3112 step 2) Under a backend that sees each mount at its host path,
+    /// the command runs in the tree's own directory and checks the mount
+    /// check where it is; Docker's paths are unchanged.
+    #[test]
+    fn a_backend_that_cannot_place_mounts_runs_in_the_trees_own_path() {
+        let root = tempfile::TempDir::new().unwrap();
+        let tree = root.path().join("tree");
+        std::fs::create_dir_all(tree.join("pkg")).unwrap();
+        let real = root.path().canonicalize().unwrap();
+        let run = Run { command: "npm test", tree: &tree, workdir: "pkg", mounts: &[], user: None, name_prefix: "darkmux-test" };
+        let p = policy_for("unused", "darkmux-test-1", &run, &darkmux_sandbox::SeatbeltBackend);
+        assert_eq!(p.workdir, Some(real.join("tree/pkg").display().to_string()));
+        let check = real.join(format!("{SENTINEL}-darkmux-test-1")).display().to_string();
+        assert!(p.command[1].starts_with(&format!("test -f {check}/{SENTINEL} ||")), "{}", p.command[1]);
+        let at_root = Run { workdir: "", ..run.clone() };
+        let p = policy_for("unused", "darkmux-test-1", &at_root, &darkmux_sandbox::SeatbeltBackend);
+        assert_eq!(p.workdir, Some(real.join("tree").display().to_string()), "an empty workdir is the tree itself");
+        let docker = policy_for("node:22", "darkmux-test-1", &run, &DockerBackend);
+        assert_eq!(docker.workdir.as_deref(), Some("/workspace/pkg"));
+        assert!(docker.command[1].starts_with(&format!("test -f {SENTINEL_AT}/{SENTINEL} ||")));
     }
 
     fn strings(args: &[&str]) -> Vec<String> {
