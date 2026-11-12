@@ -50,6 +50,7 @@ pub mod mission_graph;
 /// scoped work through `darkmux dispatch` (local prototype).
 pub mod client_edit;
 pub mod client_image;
+pub mod client_image_ref;
 pub mod client_git;
 mod client_changes;
 pub mod client_pairing;

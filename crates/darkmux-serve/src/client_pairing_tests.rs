@@ -8575,7 +8575,7 @@ async fn an_image_body_waits_for_a_turn_and_is_refused_when_none_frees() {
     let token = paired(&h).await;
     let _wt = image_workspace(&h);
     let turns = h.state.body_limits.image_reads.clone();
-    let held = turns.clone().try_acquire_many_owned(IMAGE_READS as u32).expect("every turn is free");
+    let held = turns.clone().try_acquire_many_owned(2).expect("two turns, both free");
     let body = serde_json::json!({"name": "a.png", "data": b64(PNG)});
     let started = std::time::Instant::now();
     let (code, v) = add_image(&h, &token, body.clone()).await;
@@ -8967,6 +8967,93 @@ async fn an_image_reference_in_the_pages_text_is_not_one_it_uses() {
     let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "hero.jpg"})).await;
     assert_eq!((code, &v["matches"]), (200, &Value::from(0)), "{v}");
     assert_eq!(std::fs::read_to_string(wt.join("page.html")).unwrap(), text);
+}
+
+/// (review) A repository's README is not one of the site's pages: a
+/// reference it names, in a code span or anywhere, is never edited, and
+/// the page that does use one (front matter, unquoted) is.
+#[tokio::test]
+async fn an_image_reference_in_a_readme_is_never_edited_and_front_matter_is() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = image_workspace(&h);
+    let readme = "# Site\n\nThe hero picture is `/hero.jpg`.\n\n![hero](/hero.jpg)\n";
+    std::fs::write(wt.join("page.html"), "<p>Hi</p>\n").unwrap();
+    std::fs::write(wt.join("README.md"), readme).unwrap();
+    run_git(Some(&wt), &["add", "page.html", "README.md"]);
+    run_git(Some(&wt), &["commit", "--quiet", "-m", "readme"]);
+    let head = run_git(Some(&wt), &["rev-parse", "HEAD"]);
+    let body = serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "/hero.jpg"});
+    let (code, v) = add_image(&h, &token, body.clone()).await;
+    assert_eq!((code, &v["matches"]), (200, &Value::from(0)), "{v}");
+    assert_eq!(run_git(Some(&wt), &["rev-parse", "HEAD"]), head);
+    assert_eq!(std::fs::read_to_string(wt.join("README.md")).unwrap(), readme);
+    std::fs::write(wt.join("post.md"), "---\ntitle: Hello\nimage: /hero.jpg\n---\n\nWords.\n").unwrap();
+    run_git(Some(&wt), &["add", "post.md"]);
+    run_git(Some(&wt), &["commit", "--quiet", "-m", "post"]);
+    let (code, v) = add_image(&h, &token, body).await;
+    assert_eq!((code, &v["matches"]), (200, &Value::from(1)), "{v}");
+    let url = v["url"].as_str().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(wt.join("post.md")).unwrap(),
+        format!("---\ntitle: Hello\nimage: {url}\n---\n\nWords.\n")
+    );
+    assert_eq!(std::fs::read_to_string(wt.join("README.md")).unwrap(), readme);
+}
+
+/// (review) A rollback that itself fails is never reported as one that
+/// worked: with the index locked under it, the reply says the work copy
+/// needs attention and names what is left.
+#[tokio::test]
+async fn an_image_whose_rollback_fails_says_the_work_copy_needs_attention() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = image_workspace(&h);
+    let lock = crate::client_git::clone_git_dir(&h.base, "site").join("index.lock");
+    let at = lock.clone();
+    on_edit_commit(&wt, move || std::fs::write(&at, "").unwrap());
+    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "/hero.jpg"})).await;
+    on_edit_commit(&wt, || {});
+    std::fs::remove_file(&lock).unwrap();
+    assert_eq!(code, 409, "{v}");
+    let error = v["error"].as_str().unwrap();
+    assert!(error.contains("couldn't commit the image"), "{error}");
+    assert!(error.contains("needs attention"), "the failed rollback is said: {error}");
+    assert!(error.contains("public/images/a-") && error.contains("page.html"), "what is left is named: {error}");
+}
+
+/// (review) The documented limits, worked out here rather than read from
+/// the constants: two image bodies at once, 30 seconds for a body.
+#[test]
+fn the_documented_body_limits_hold() {
+    let limits = BodyLimits::default();
+    assert_eq!(limits.image_reads.available_permits(), 2);
+    assert_eq!(limits.read_timeout, std::time::Duration::from_secs(30));
+}
+
+/// (review) On a disk that tells case apart, the same image may already be
+/// tracked under `PUBLIC/images/`. darkmux's copy under `public/images/` is
+/// staged as its own entry, and the commit names that one, not the other.
+#[tokio::test]
+async fn an_image_already_tracked_in_another_case_commits_its_own_entry() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = image_workspace(&h);
+    if case_insensitive(&wt) {
+        eprintln!("skipped: this filesystem ignores case (run with TMPDIR on a case-sensitive volume)");
+        return;
+    }
+    let name = crate::client_image::file_name("a.png", PNG, "png");
+    let theirs = format!("PUBLIC/images/{name}");
+    std::fs::create_dir_all(wt.join("PUBLIC/images")).unwrap();
+    std::fs::write(wt.join(&theirs), PNG).unwrap();
+    run_git(Some(&wt), &["add", &theirs]);
+    run_git(Some(&wt), &["commit", "--quiet", "-m", "theirs"]);
+    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG)})).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["path"], format!("public/images/{name}"), "{v}");
+    let tracked = run_git(Some(&wt), &["ls-files"]);
+    assert!(tracked.lines().any(|l| l == theirs) && tracked.lines().any(|l| l == format!("public/images/{name}")), "{tracked}");
 }
 
 // ─── (#3544) Pairing with no code: verified apps, and the Allow dialog ───

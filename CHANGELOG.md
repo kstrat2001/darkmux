@@ -23,8 +23,8 @@ darkmux release.
   paired app (its token checked before the body is read) reads a body past 64 KiB, up to 27.6 MiB,
   enough for a 10 MiB image however the app's JSON escapes its base64 (`\/`, line breaks); any other
   request, an image with no token or an unknown one included, is refused at 64 KiB without the rest
-  being read. At most two image bodies are read at once (a third waits for a turn, then gets 429),
-  and every request's body must arrive within 30 seconds (408). darkmux picks the file's name
+  being read. At most two image bodies are read at once (a third waits for a turn, then gets 429).
+  darkmux picks the file's name
   itself, a slug of `name` plus a short content hash, under `public/images/`, and never writes
   through a symlink. Where git ignores case (as on a Mac) it commits the image under the name git
   staged it as, which may spell the folders as the repository already does (`Public/images/`), and
@@ -32,15 +32,24 @@ darkmux release.
   and would stage the image somewhere darkmux did not write it, the image is refused. It commits the
   image as a work record with no model, like a hand edit, so `/client/work/{id}/undo` takes it out
   again. A write or commit that fails puts back the work copy, the index's entries for the files it
-  touched and HEAD as they were, with no half-written file or folder it made. With `replace` (an
-  `<img>`'s `src` as the source has it), the one place in the tracked files that uses that reference
-  (after a quote, `(` or a srcset's comma, ending at a quote, `)`, `>`, a space, `?`, `#` or a comma;
-  never part of a longer URL such as `/assets/hero.jpg` for `hero.jpg`, and never words in a page's
-  text) points at the new image in the same commit. Found zero times or more than once, nothing
-  changes and the reply gives `matches`. Sending the same image again with no `replace` commits
+  touched and HEAD as they were, with no half-written file or folder it made; if putting something
+  back fails too, the reply (409) and the serve log say the work copy needs attention and name what
+  is left. With `replace` (an `<img>`'s `src` as the source has it), the one place in the site's
+  files that uses that whole URL points at the new image in the same commit: the value of a URL
+  attribute (`src`, `href`, `srcset`, `poster`, `content`, ...), `url(...)` in CSS, a Markdown image,
+  link or reference definition, a front matter, YAML, TOML or JSON value, or a JavaScript string
+  literal. Never words in a page's text, a Markdown code span, alt text or another text key, part of
+  a longer URL (`/assets/hero.jpg` for `hero.jpg`), or a repository's own documents (a README, a
+  changelog, anything under `.github/`). Found zero times or more than once, nothing changes and
+  the reply gives `matches`. Sending the same image again with no `replace` commits
   nothing and replies with its `path` and `url`. New reply type `ImageReply`.
 
 ### Changed
+
+- **Every `darkmux client serve` route refuses a request whose body takes more than 30 seconds to
+  arrive (#3545).** It answers 408 with code `bad_request`; before, a client could hold a request,
+  and what it had sent, open for as long as it liked. A client that sends its body at once sees no
+  change.
 
 - **On a Mac, darkmux needs no Docker: the sandbox is a setting, and macOS's own is the default
   (#3112).** New setting `runtime.sandbox` (env `DARKMUX_SANDBOX`, `config.json` schema 2.9):

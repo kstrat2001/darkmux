@@ -4679,10 +4679,15 @@ struct EditDone {
 /// One place `old` was found: the file, the span, and the file's text.
 type EditHit = (String, (usize, usize), String);
 
-/// The places `find` finds `old` at in a file's text, at most `limit` of them
-/// ([`crate::client_edit::find`] for a hand edit's words,
-/// [`crate::client_edit::find_reference`] for an image's reference).
-type Finder = fn(&str, &str, usize) -> Vec<(usize, usize)>;
+/// The places `find` finds `old` at in the text of the tracked file named
+/// first, at most `limit` of them ([`hand_edit_words`] for a hand edit,
+/// [`crate::client_image_ref::find_reference`] for an image's reference).
+type Finder = fn(&str, &str, &str, usize) -> Vec<(usize, usize)>;
+
+/// A hand edit's words, in any file ([`crate::client_edit::find`]).
+fn hand_edit_words(_file: &str, text: &str, old: &str, limit: usize) -> Vec<(usize, usize)> {
+    crate::client_edit::find(text, old, limit)
+}
 
 /// Where `old` is in the work copy's tracked regular text files, as `find`
 /// finds it, counted up to two (more than one is already too many).
@@ -4698,7 +4703,7 @@ fn find_in_tracked(wc: &WorkCopy, old: &str, find: Finder) -> Result<Vec<EditHit
         let Some(text) = tracked_text(wc, path) else {
             continue;
         };
-        for span in find(&text, old, 2 - hits.len()) {
+        for span in find(path, &text, old, 2 - hits.len()) {
             hits.push((path.to_string(), span, text.clone()));
         }
         if hits.len() >= 2 {
@@ -4732,7 +4737,7 @@ fn edit_in(
     new: &str,
     work_id: &str,
 ) -> Result<EditDone, Refused> {
-    let mut hits = find_in_tracked(wc, old, crate::client_edit::find)?;
+    let mut hits = find_in_tracked(wc, old, hand_edit_words)?;
     if hits.len() != 1 {
         return Err(Box::new(
             Json(EditReply {
@@ -5046,11 +5051,22 @@ fn image_in(
     let before = snapshot_tree(wc)
         .map_err(|e| Box::new(internal(anyhow!("reading the work copy failed: {e}"))))?;
     let mut placed = Placed::default();
-    let done = place_and_commit(wc, image, already, hit.as_ref(), &mut placed, before.tree, work_id);
-    if done.is_err() {
-        put_image_back(wc, image, &placed);
+    place_and_commit(wc, image, already, hit.as_ref(), &mut placed, before.tree, work_id)
+        .map_err(|why| not_added(why, &put_image_back(wc, image, &placed), &image.path))
+}
+
+/// The refusal of an image that was not added (`why`), once its changes were
+/// put back. When some could not be (`left`), it says so, naming what is
+/// left, in the reply and in the serve log: the work copy needs attention.
+fn not_added(why: String, left: &[String], path: &str) -> Refused {
+    if left.is_empty() {
+        return conflict(why);
     }
-    done
+    let left = left.join("; ");
+    eprintln!("darkmux client serve: adding {path} failed ({why}), and its changes could not all be put back: {left}");
+    conflict(format!(
+        "{why}; darkmux could not put the work copy back as it was, so it needs attention: {left}"
+    ))
 }
 
 /// The reply for an image already there with nothing to point at it: its
@@ -5062,7 +5078,7 @@ fn already_added(wc: &WorkCopy, image: &Image) -> Refused {
             let path = entries.into_iter().next().map_or_else(|| image.path.clone(), |e| e.path);
             image_not_committed(None, Some(path))
         }
-        Err(refused) => refused,
+        Err(e) => Box::new(internal(anyhow!(e))),
     }
 }
 
@@ -5083,6 +5099,7 @@ struct Placed {
 /// Writes the image (unless `already` there), stages it and reads back the
 /// name git filed it under ([`stage_image`]), points `hit` at that name's
 /// URL, and commits the image and the file; `placed` records each step.
+/// A failure is why, in words, for [`not_added`].
 fn place_and_commit(
     wc: &WorkCopy,
     image: &Image,
@@ -5091,11 +5108,11 @@ fn place_and_commit(
     placed: &mut Placed,
     baseline: String,
     work_id: &str,
-) -> Result<EditDone, Refused> {
+) -> Result<EditDone, String> {
     use crate::client_preview::at;
     if !already {
         placed.made = at::write_new_making_folders(&wc.work_tree, &image.path, &image.bytes, 0o644)
-            .map_err(|e| conflict(format!("darkmux didn't add {}: {e}", image.path)))?;
+            .map_err(|e| format!("darkmux didn't add {}: {e}", image.path))?;
         placed.wrote = true;
     }
     let path = stage_image(wc, image, placed)?;
@@ -5104,7 +5121,7 @@ fn place_and_commit(
     if let Some((file, (start, end), text)) = hit {
         let edited = format!("{}{}{}", &text[..*start], url, &text[*end..]);
         at::replace_regular(&wc.work_tree, file, text.as_bytes(), edited.as_bytes())
-            .map_err(|e| conflict(format!("darkmux didn't edit {file}: {e}")))?;
+            .map_err(|e| format!("darkmux didn't edit {file}: {e}"))?;
         placed.edited = Some(file.clone());
         files.push(file.clone());
     }
@@ -5116,7 +5133,7 @@ fn place_and_commit(
     #[cfg(test)]
     before_edit_commit(wc);
     let (commit, branch) =
-        commit_run(wc, &files, &message).map_err(|e| conflict(format!("couldn't commit the image: {e}")))?;
+        commit_run(wc, &files, &message).map_err(|e| format!("couldn't commit the image: {e}"))?;
     Ok(EditDone {
         result: serde_json::json!({"image": {"path": path, "url": url}}),
         files,
@@ -5134,24 +5151,24 @@ fn place_and_commit(
 /// guesses. Refused when that name is not the file darkmux wrote: git set
 /// to ignore case on a disk that tells case apart would commit a path
 /// nothing is at, and a `public/` site would never serve it.
-fn stage_image(wc: &WorkCopy, image: &Image, placed: &mut Placed) -> Result<String, Refused> {
+fn stage_image(wc: &WorkCopy, image: &Image, placed: &mut Placed) -> Result<String, String> {
     let prior = index_entries(wc, &image.path)?;
     placed.prior = Some(prior.clone());
     git_quiet(wc, &["--literal-pathspecs", "add", "-A", "--", &image.path])
-        .map_err(|e| conflict(format!("couldn't stage the image: {e}")))?;
+        .map_err(|e| format!("couldn't stage the image: {e}"))?;
     let after = index_entries(wc, &image.path)?;
     let staged = after
         .iter()
         .find(|e| !prior.contains(e))
         .or(after.first())
         .map(|e| e.path.clone())
-        .ok_or_else(|| conflict(format!("git did not stage {}", image.path)))?;
+        .ok_or_else(|| format!("git did not stage {}", image.path))?;
     if staged != image.path && !same_file(wc, &staged, &image.path) {
-        return Err(conflict(format!(
+        return Err(format!(
             "git files the image as {staged}, which on this disk is not {}, where darkmux wrote it: \
              the repository sets core.ignorecase on a disk that tells case apart",
             image.path
-        )));
+        ));
     }
     Ok(staged)
 }
@@ -5166,10 +5183,10 @@ struct IndexEntry {
 
 /// The index's entries for `path` in any case (`:(literal,icase)`), so one
 /// git filed under another case is found too.
-fn index_entries(wc: &WorkCopy, path: &str) -> Result<Vec<IndexEntry>, Refused> {
+fn index_entries(wc: &WorkCopy, path: &str) -> Result<Vec<IndexEntry>, String> {
     let spec = format!(":(literal,icase){path}");
     let out = crate::client_git::run_or_why(wc, None, &["ls-files", "--stage", "-z", "--", &spec])
-        .map_err(|e| Box::new(internal(anyhow!("reading the index failed: {e}"))))?;
+        .map_err(|e| format!("reading the index failed: {e}"))?;
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     Ok(text
         .split('\0')
@@ -5195,11 +5212,11 @@ fn same_file(wc: &WorkCopy, a: &str, b: &str) -> bool {
 }
 
 /// The one place `old` is in the tracked files as a whole reference
-/// ([`crate::client_edit::find_reference`]: never part of a longer URL, never
-/// words in a page's text), in a file with no uncommitted change; else the
-/// reply naming how many places hold it.
+/// ([`crate::client_image_ref::find_reference`]: only where a site uses a URL,
+/// never part of a longer one, never words in a page's text), in a file with
+/// no uncommitted change; else the reply naming how many places hold it.
 fn one_reference(wc: &WorkCopy, old: &str) -> Result<EditHit, Refused> {
-    let mut hits = find_in_tracked(wc, old, crate::client_edit::find_reference)?;
+    let mut hits = find_in_tracked(wc, old, crate::client_image_ref::find_reference)?;
     if hits.len() != 1 {
         return Err(image_not_committed(Some(hits.len() as u32), None));
     }
@@ -5229,36 +5246,58 @@ fn image_already_there(wc: &WorkCopy, image: &Image) -> Result<bool, Refused> {
 /// Puts back everything a failed [`place_and_commit`] changed: the index's
 /// entries for the image as they were ([`restore_index`]), the image if
 /// darkmux wrote it (never one that was already there), the folders it made
-/// (innermost first; one that now holds anything stays), and the edited
-/// file as committed.
-fn put_image_back(wc: &WorkCopy, image: &Image, placed: &Placed) {
+/// (innermost first; one that still holds anything stays), and the edited
+/// file as committed. Returns what it could not put back, in words (empty
+/// when everything is as it was).
+fn put_image_back(wc: &WorkCopy, image: &Image, placed: &Placed) -> Vec<String> {
     use crate::client_preview::at;
+    let mut left = Vec::new();
     if let Some(prior) = &placed.prior {
-        restore_index(wc, &image.path, prior);
+        left.extend(restore_index(wc, &image.path, prior));
     }
     if placed.wrote {
-        let _ = at::remove(&wc.work_tree, &image.path);
+        if let Err(e) = at::remove(&wc.work_tree, &image.path) {
+            left.push(format!("{} is still in the work copy ({e})", image.path));
+        }
     }
     for folder in placed.made.iter().rev() {
-        let _ = at::remove_empty_folder(&wc.work_tree, folder);
+        match at::remove_empty_folder(&wc.work_tree, folder) {
+            Err(e) if !matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty) => {
+                left.push(format!("the folder {folder} is still there ({e})"));
+            }
+            _ => {}
+        }
     }
     if let Some(f) = &placed.edited {
-        let _ = git_quiet(wc, &["--literal-pathspecs", "checkout", "HEAD", "--", f]);
+        if let Err(e) = git_quiet(wc, &["--literal-pathspecs", "checkout", "HEAD", "--", f]) {
+            left.push(format!("{f} still points at the image, not as committed ({e})"));
+        }
     }
+    left
 }
 
 /// Makes the index's entries for `path` (in any case) `prior` again: an
 /// entry staged since is dropped, one that was there is put back as it was
-/// (an identical image the person had staged stays staged).
-fn restore_index(wc: &WorkCopy, path: &str, prior: &[IndexEntry]) {
-    let now = index_entries(wc, path).unwrap_or_default();
+/// (an identical image the person had staged stays staged). Returns what it
+/// could not put back, in words.
+fn restore_index(wc: &WorkCopy, path: &str, prior: &[IndexEntry]) -> Vec<String> {
+    let now = match index_entries(wc, path) {
+        Ok(now) => now,
+        Err(e) => return vec![format!("the index's entry for {path} may not be as it was ({e})")],
+    };
+    let mut left = Vec::new();
     for e in now.iter().filter(|e| !prior.contains(e)) {
-        let _ = git_quiet(wc, &["update-index", "--force-remove", "--", &e.path]);
+        if let Err(why) = git_quiet(wc, &["update-index", "--force-remove", "--", &e.path]) {
+            left.push(format!("the index still stages {} ({why})", e.path));
+        }
     }
     for e in prior.iter().filter(|e| !now.contains(e)) {
         let info = format!("{},{},{}", e.mode, e.sha, e.path);
-        let _ = git_quiet(wc, &["update-index", "--add", "--cacheinfo", &info]);
+        if let Err(why) = git_quiet(wc, &["update-index", "--add", "--cacheinfo", &info]) {
+            left.push(format!("the index no longer stages {} as it did ({why})", e.path));
+        }
     }
+    left
 }
 
 // ─── Commits and Undo ────────────────────────────────────────────────────
