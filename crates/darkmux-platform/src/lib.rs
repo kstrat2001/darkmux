@@ -602,27 +602,43 @@ pub(crate) fn port_listeners_from_netstat(out: &str, port: u16) -> Option<Vec<Po
     lines.find(|l| l.starts_with("Proto") && l.contains("Local Address") && l.contains("process:pid"))?;
     let mut found = Vec::new();
     for line in lines {
-        let f: Vec<&str> = line.split_whitespace().collect();
-        if !f.first().is_some_and(|p| p.starts_with("tcp")) || f.get(5) != Some(&"LISTEN") {
-            continue;
+        if let Some(listener) = netstat_listener(line, port)? {
+            found.push(listener);
         }
-        let (host, at) = f.get(3)?.rsplit_once('.')?;
-        if at.parse::<u16>().ok()? != port {
-            continue;
-        }
-        let (host, scope) = match host.split_once('%') {
-            Some((h, s)) => (h, Some(s.to_string())),
-            None => (host, None),
-        };
-        let addr = match host {
-            "*" if f[0] == "tcp4" => std::net::IpAddr::from(std::net::Ipv4Addr::UNSPECIFIED),
-            "*" => std::net::IpAddr::from(std::net::Ipv6Addr::UNSPECIFIED),
-            h => h.parse().ok()?,
-        };
-        let pid = f.len().checked_sub(9).and_then(|i| f.get(i)).and_then(|w| w.rsplit_once(':')).and_then(|(_, p)| p.parse().ok());
-        found.push(PortListener { addr, scope, pid });
     }
     Some(found)
+}
+
+/// One netstat row: a listener on `port` (`Some(Some(_))`), another row
+/// (`Some(None)`), or a LISTEN row whose local address does not read
+/// (`None`).
+fn netstat_listener(line: &str, port: u16) -> Option<Option<PortListener>> {
+    let f: Vec<&str> = line.split_whitespace().collect();
+    if !f.first().is_some_and(|p| p.starts_with("tcp")) || f.get(5) != Some(&"LISTEN") {
+        return Some(None);
+    }
+    let (host, at) = f.get(3)?.rsplit_once('.')?;
+    if at.parse::<u16>().ok()? != port {
+        return Some(None);
+    }
+    let (addr, scope) = netstat_address(f[0], host)?;
+    let pid = f.len().checked_sub(9).and_then(|i| f.get(i)).and_then(|w| w.rsplit_once(':')).and_then(|(_, p)| p.parse().ok());
+    Some(Some(PortListener { addr, scope, pid }))
+}
+
+/// A netstat local address without its port: `*` is every address of
+/// `proto`'s family (`tcp4`, else IPv6), a `%` names its scope.
+fn netstat_address(proto: &str, host: &str) -> Option<(std::net::IpAddr, Option<String>)> {
+    let (host, scope) = match host.split_once('%') {
+        Some((h, s)) => (h, Some(s.to_string())),
+        None => (host, None),
+    };
+    let addr = match host {
+        "*" if proto == "tcp4" => std::net::IpAddr::from(std::net::Ipv4Addr::UNSPECIFIED),
+        "*" => std::net::IpAddr::from(std::net::Ipv6Addr::UNSPECIFIED),
+        h => h.parse().ok()?,
+    };
+    Some((addr, scope))
 }
 
 /// The pids in `lsof -Fp`'s answer: one `p<pid>` line per process; every

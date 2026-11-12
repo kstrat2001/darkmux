@@ -98,10 +98,24 @@ struct Lexer {
 
 impl Lexer {
     fn take(&mut self, c: char, rest: &mut std::str::Chars) {
+        match self.quote {
+            Some(q) => self.take_quoted(q, c, rest),
+            None => self.take_plain(c, rest),
+        }
+    }
+
+    /// Inside quotes `q`: only the closing quote (and, in double quotes, a
+    /// backslash) is special.
+    fn take_quoted(&mut self, q: char, c: char, rest: &mut std::str::Chars) {
+        match c {
+            c if c == q => self.quote = None,
+            '\\' if q == '"' => self.word.extend(rest.next()),
+            c => self.word.push(c),
+        }
+    }
+
+    fn take_plain(&mut self, c: char, rest: &mut std::str::Chars) {
         match (self.quote, c) {
-            (Some(q), c) if c == q => self.quote = None,
-            (Some('"'), '\\') => self.word.extend(rest.next()),
-            (Some(_), c) => self.word.push(c),
             (None, '\'' | '"') => {
                 self.quote = Some(c);
                 self.started = true;
@@ -116,7 +130,7 @@ impl Lexer {
                 self.end_command();
             }
             (None, c) if c.is_whitespace() => self.end_word(),
-            (None, c) => {
+            (_, c) => {
                 self.word.push(c);
                 self.started = true;
             }
@@ -247,12 +261,12 @@ fn version_folder(bin: &Path) -> Option<PathBuf> {
     let ver = bin.parent()?;
     let up1 = ver.parent()?;
     let up2 = up1.parent();
-    let known = match (name(ver).as_deref(), name(up1).as_deref(), up2.and_then(name).as_deref()) {
-        (Some("installation"), _, Some("node-versions")) => true,
-        (_, Some("versions"), _) => true,
-        (_, _, Some("versions" | "installs" | "image" | "Cellar" | "toolchains")) => true,
-        _ => false,
-    };
+    let known = matches!(
+        (name(ver).as_deref(), name(up1).as_deref(), up2.and_then(name).as_deref()),
+        (Some("installation"), _, Some("node-versions"))
+            | (_, Some("versions"), _)
+            | (_, _, Some("versions" | "installs" | "image" | "Cellar" | "toolchains"))
+    );
     known.then(|| ver.to_path_buf())
 }
 

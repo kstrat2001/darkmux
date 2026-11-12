@@ -2195,6 +2195,7 @@ fn check_exposure(containers: &dyn PreviewContainers, at: &RunIn) -> Result<(), 
 
 /// Why the container ended, from what it printed: Docker never started it,
 /// the install step failed, or the dev server exited.
+#[cfg(test)]
 fn exit_reason(
     recipe: &Recipe,
     log: &Path,
