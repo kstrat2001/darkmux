@@ -664,7 +664,9 @@ fn netstat_tcp() -> Option<String> {
     None
 }
 
-/// A netstat's output is an answer only when it exited 0.
+/// A netstat's output is an answer only when it exited 0. (Compiled on
+/// every OS for its test; only macOS runs netstat.)
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn netstat_answer(code: Option<i32>, stdout: &str) -> Option<String> {
     (code == Some(0)).then(|| stdout.to_string())
 }
