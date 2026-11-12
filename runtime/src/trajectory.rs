@@ -42,9 +42,9 @@ pub struct CallTokens<'a> {
 /// MUST match the mount point in darkmux-crew's dispatch_internal.rs.
 pub const RUNTIME_OUT_BASE: &str = "/darkmux-out";
 
-/// (#316) Env override of [`RUNTIME_OUT_BASE`]. The host never sets it; it
-/// exists so a test can drive the real binary on a host that cannot create
-/// `/darkmux-out` and still read what the run recorded there.
+/// (#316) Env override of [`RUNTIME_OUT_BASE`]: set by a test driving the
+/// real binary on a host that cannot create `/darkmux-out`, and (#3112 step
+/// 2) by the host when its sandbox sees the out-dir at its own host path.
 pub const OUT_DIR_ENV: &str = "DARKMUX_RUNTIME_OUT_DIR";
 
 /// The out-dir this run writes its bookkeeping to: [`OUT_DIR_ENV`] when set
@@ -100,7 +100,7 @@ fn cap_chars(s: &str, max: usize) -> String {
 /// compaction output in `loop_runner.rs`, findings and mods in `tools`)
 /// consumes this so they can't drift to different paths.
 pub fn runtime_dir() -> std::path::PathBuf {
-    std::path::Path::new(RUNTIME_OUT_BASE).join(dt::TRAJECTORY_SUBDIR)
+    out_base().join(dt::TRAJECTORY_SUBDIR)
 }
 
 /// What a compaction installed: the summary's length, and whether the
@@ -1502,6 +1502,17 @@ pub(crate) fn recorded(base_dir: &Path) -> dt::TrajectoryFold {
 
 #[cfg(test)]
 mod tests {
+    /// (#3112 step 2) Findings, mods and compaction output land under the
+    /// out-dir the run was told, not always `/darkmux-out`.
+    #[test]
+    #[serial_test::serial(runtime_out_dir_env)]
+    fn the_runtime_dir_follows_the_out_dir_override() {
+        std::env::set_var(super::OUT_DIR_ENV, "/Users/op/out");
+        let moved = super::runtime_dir();
+        std::env::remove_var(super::OUT_DIR_ENV);
+        assert!(moved.starts_with("/Users/op/out"), "{moved:?}");
+        assert!(super::runtime_dir().starts_with(super::RUNTIME_OUT_BASE));
+    }
     use super::*;
     use crate::failure_rate::ToolOutcome;
     use darkmux_trajectory::{TRAJECTORY_FILE, TRAJECTORY_SUBDIR};

@@ -103,17 +103,19 @@ fn run_check() -> ExitCode {
     println!("darkmux-runtime {VERSION} — container environment check");
     println!();
 
-    let workspace = Path::new("/workspace");
+    let root = tools::workspace::root();
+    let workspace = root.as_path();
+    let shown = workspace.display();
     if workspace.is_dir() {
         let writable = test_workspace_writable(workspace);
         if writable {
-            println!("[ok]  /workspace exists and is writable");
+            println!("[ok]  {shown} exists and is writable");
         } else {
-            println!("[!!]  /workspace exists but is NOT writable by this user");
+            println!("[!!]  {shown} exists but is NOT writable by this user");
             all_ok = false;
         }
     } else {
-        println!("[!!]  /workspace does NOT exist (was the volume mounted?)");
+        println!("[!!]  {shown} does NOT exist (was the volume mounted?)");
         all_ok = false;
     }
 
@@ -169,7 +171,9 @@ struct Dispatch {
 fn prepare_dispatch(argv: &[String]) -> Result<Dispatch, Refusal> {
     let mut args = parse_run_args(argv, std::env::var("DARKMUX_RESUME_CHECKPOINT").ok())?;
     let (model, prompt) = required_model_and_prompt(args.model.take(), args.prompt.take())?;
-    let system_prompt = args.system.take().unwrap_or_else(default_system_prompt);
+    // (#3112 step 2) A role's prompt names `/workspace` too (`--system`), so
+    // it is renamed the same way as the default; byte-identical under it.
+    let system_prompt = tools::workspace::naming_root(&args.system.take().unwrap_or_else(default_system_prompt));
 
     // (#2386) The finding-key identity this dispatch mints under, plus the
     // brief it was given. `create_finding` returns the real key

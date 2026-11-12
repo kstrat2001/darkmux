@@ -11,6 +11,10 @@ use std::process::Command;
 /// Asking whether it is installed is [`DockerBackend::on_path`].
 const PROGRAM: &str = "docker";
 
+/// This backend's value of `DARKMUX_SANDBOX` ([`crate::SANDBOX_ENV`]). It
+/// happens to spell the program, so it lives here, behind the ratchet.
+pub(crate) const SETTING: &str = "docker";
+
 /// `--cap-drop`: every Linux capability. A sandbox's code needs none.
 pub const CAP_DROP: &str = "ALL";
 
@@ -228,6 +232,11 @@ fn volume(mount: &Mount) -> [String; 2] {
 impl SandboxBackend for DockerBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::Docker
+    }
+
+    /// A mount is seen at its `at`.
+    fn place(&self, mount: &Mount) -> String {
+        mount.at.clone()
     }
 
     fn run(&self, policy: &SandboxPolicy) -> (Command, SandboxHandle) {

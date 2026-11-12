@@ -6304,6 +6304,78 @@ S(("127.0.0.1", port), H).serve_forever()
         }
     }
 
+    /// (#3112 step 2) Under a backend that sees each mount at its host path
+    /// (Seatbelt), the dispatch tells the runtime where its workspace and
+    /// out-dir are, reads its prompt and runs the injected runtime from
+    /// there, and points the caches there. Under Docker none of it changes.
+    #[test]
+    fn a_backend_that_cannot_place_mounts_gets_host_paths_everywhere() {
+        use darkmux_sandbox::{DockerBackend, SeatbeltBackend};
+        let root = tempfile::TempDir::new().unwrap();
+        let real = root.path().canonicalize().unwrap();
+        for d in ["ws", "out", "cache"] {
+            std::fs::create_dir(root.path().join(d)).unwrap();
+        }
+        std::fs::write(root.path().join("darkmux-runtime"), "").unwrap();
+        let mut cfg = argv_config_with_base_url(None);
+        cfg.workspace = root.path().join("ws");
+        cfg.host_out = root.path().join("out");
+        cfg.cache_dir = Some(root.path().join("cache"));
+        cfg.inject = true;
+        cfg.runtime_binary = Some(root.path().join("darkmux-runtime"));
+        let env = |p: &darkmux_sandbox::SandboxPolicy, k: &str| p.env.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+        let prompt = |p: &darkmux_sandbox::SandboxPolicy| {
+            p.command.iter().skip_while(|a| *a != "--prompt-file").nth(1).cloned()
+        };
+        let at = |sub: &str| real.join(sub).display().to_string();
+
+        let seatbelt = dispatch_policy_for(&cfg, &SeatbeltBackend);
+        assert_eq!(env(&seatbelt, "DARKMUX_RUNTIME_WORKSPACE"), Some(at("ws")));
+        assert_eq!(env(&seatbelt, "DARKMUX_RUNTIME_OUT_DIR"), Some(at("out")));
+        assert_eq!(env(&seatbelt, "CARGO_HOME"), Some(at("cache/cargo")));
+        assert_eq!(seatbelt.entrypoint, Some(at("darkmux-runtime")));
+        assert_eq!(prompt(&seatbelt), Some(at("out/.prompt.txt")));
+
+        let docker = dispatch_policy_for(&cfg, &DockerBackend);
+        assert_eq!(env(&docker, "DARKMUX_RUNTIME_WORKSPACE"), None);
+        assert_eq!(env(&docker, "DARKMUX_RUNTIME_OUT_DIR"), None);
+        assert_eq!(env(&docker, "CARGO_HOME"), Some("/darkmux-cache/cargo".to_string()));
+        assert_eq!(docker.entrypoint.as_deref(), Some("/darkmux-runtime"));
+        assert_eq!(prompt(&docker).as_deref(), Some("/darkmux-out/.prompt.txt"));
+    }
+
+    /// (#3112 step 2) The dispatch spawns the backend's own command, its
+    /// environment included: a Seatbelt sandbox's runtime is told its
+    /// workspace there, and nothing of the host's comes with it.
+    #[test]
+    fn the_dispatch_spawns_the_backends_own_command() {
+        let root = tempfile::TempDir::new().unwrap();
+        for d in ["ws", "out"] {
+            std::fs::create_dir(root.path().join(d)).unwrap();
+        }
+        let mut cfg = argv_config_with_base_url(None);
+        cfg.workspace = root.path().join("ws");
+        cfg.host_out = root.path().join("out");
+        let cmd = container_command(&cfg, &darkmux_sandbox::SeatbeltBackend);
+        let envs: Vec<(String, Option<String>)> = cmd
+            .get_envs()
+            .map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned())))
+            .collect();
+        let ws = root.path().join("ws").canonicalize().unwrap().display().to_string();
+        assert!(envs.contains(&("DARKMUX_RUNTIME_WORKSPACE".to_string(), Some(ws))), "{envs:?}");
+        assert!(!envs.iter().any(|(k, _)| k == "CARGO_PKG_NAME"), "the host's environment rode along: {envs:?}");
+    }
+
+    /// (#3112 step 2) Only a sandbox with its own loopback (a container)
+    /// needs "this machine" rewritten; a Seatbelt sandbox is on the host.
+    #[test]
+    fn only_a_sandbox_with_its_own_loopback_rewrites_this_machine() {
+        use darkmux_sandbox::BackendKind;
+        let url = "http://127.0.0.1:1234/v1";
+        assert_eq!(url_for(url, BackendKind::Seatbelt), url);
+        assert_eq!(url_for(url, BackendKind::Docker), "http://host.docker.internal:1234/v1");
+    }
+
     /// (#2916 review M2) A job another machine submitted never mounts this
     /// machine's shared, writable toolchain cache; local work still does.
     #[test]

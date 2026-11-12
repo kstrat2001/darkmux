@@ -563,6 +563,10 @@ pub(crate) fn mod_attachment_mounts(mounts: &[(PathBuf, String)]) -> Vec<Mount> 
 pub(crate) const PROMPT_FILE_NAME: &str = ".prompt.txt";
 const PROMPT_FILE_CONTAINER_PATH: &str = "/darkmux-out/.prompt.txt";
 
+/// Where a container sees the out-dir ([`volume_mounts`]); the in-sandbox
+/// paths under it are rebased on where the backend places it.
+const OUT_DIR_CONTAINER_PATH: &str = "/darkmux-out";
+
 /// (#2114 finding 3) Container-relative path to a resumed dispatch's
 /// checkpoint. `runtime/src/checkpoint.rs` writes checkpoints ONLY at
 /// `<out_dir>/checkpoint.json` — the `/darkmux-out` mount, NEVER
@@ -1629,10 +1633,17 @@ pub(crate) fn shared_cache_dir_for(remote_origin: Option<&str>) -> Option<std::p
 /// concurrent dispatches don't contend on build artifacts. Returns the mount
 /// and the environment pointing the package managers at it. Unit-testable
 /// without docker.
+#[cfg(test)]
 fn cache_mount(cache: &Path) -> (Mount, Vec<(String, String)>) {
+    cache_mount_placed(cache, &darkmux_sandbox::DockerBackend)
+}
+
+/// [`cache_mount`], its environment naming where `backend` places the cache.
+fn cache_mount_placed(cache: &Path, backend: &dyn darkmux_sandbox::SandboxBackend) -> (Mount, Vec<(String, String)>) {
     let mount = Mount { host: cache.to_path_buf(), at: "/darkmux-cache".to_string(), access: Access::ReadWrite };
-    let env = ["CARGO_HOME=/darkmux-cache/cargo", "npm_config_cache=/darkmux-cache/npm", "PIP_CACHE_DIR=/darkmux-cache/pip"];
-    (mount, env.iter().map(|kv| split_kv(kv)).collect())
+    let at = backend.place(&mount);
+    let env = [("CARGO_HOME", "cargo"), ("npm_config_cache", "npm"), ("PIP_CACHE_DIR", "pip")];
+    (mount, env.iter().map(|(k, sub)| (k.to_string(), format!("{at}/{sub}"))).collect())
 }
 
 /// (#703) Ensure the static `darkmux-runtime` binary is extracted to the
@@ -2571,9 +2582,8 @@ impl DockerRunConfig {
 /// runtime's arguments, as the sandbox backend renders [`dispatch_policy`].
 /// Pure function — no I/O, no side effects.
 ///
-/// Turn this into the executable `Command` via [`docker_command_from_argv`]
-/// (program = `[0]`, args = `[1..]`). Do NOT push the whole vector as arguments
-/// — that runs `docker docker run …` and docker exits 125 (the #975 regression).
+/// The argv is a rendering for tests and records; the dispatch spawns the
+/// backend's own `Command` (`container_command`), never one rebuilt from it.
 pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     let (cmd, _) = darkmux_sandbox::backend().run(&dispatch_policy(config));
     std::iter::once(cmd.get_program())
@@ -2602,18 +2612,34 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
 /// - `host.docker.internal` where the platform says the engine lacks it,
 ///   and the resolved container user (#3275).
 pub fn dispatch_policy(config: &DockerRunConfig) -> SandboxPolicy {
+    dispatch_policy_for(config, darkmux_sandbox::backend())
+}
+
+/// [`dispatch_policy`] for `backend`: every in-sandbox path is where it
+/// places the mount (#3112 step 2).
+pub(crate) fn dispatch_policy_for(config: &DockerRunConfig, backend: &dyn darkmux_sandbox::SandboxBackend) -> SandboxPolicy {
     let mut mounts = volume_mounts(&config.workspace, &config.host_out, config.workspace_read_only).to_vec();
+    // (#3112 step 2) Where the sandbox sees the workspace and the out-dir.
+    let (ws_at, out_at) = (backend.place(&mounts[0]), backend.place(&mounts[1]));
     mounts.extend(workdir_git_read_only_mount(config.workdir_git_read_only.as_deref()));
     mounts.extend(mod_attachment_mounts(&config.mod_attachment_mounts));
     let mut env = Vec::new();
     if let Some(cache) = &config.cache_dir {
-        let (mount, cache_env) = cache_mount(cache);
+        let (mount, cache_env) = cache_mount_placed(cache, backend);
         mounts.push(mount);
         env.extend(cache_env);
     }
     env.extend(forwarded_env(config));
-    let injected = config.runtime_binary.as_deref().filter(|_| config.inject);
-    mounts.extend(injected.map(runtime_injection_mount));
+    // (#3112 step 2) A runtime that cannot assume its container paths is told them.
+    if ws_at != mounts[0].at {
+        env.push(("DARKMUX_RUNTIME_WORKSPACE".to_string(), ws_at));
+    }
+    if out_at != mounts[1].at {
+        env.push(("DARKMUX_RUNTIME_OUT_DIR".to_string(), out_at.clone()));
+    }
+    let injected = config.runtime_binary.as_deref().filter(|_| config.inject).map(runtime_injection_mount);
+    let entrypoint = injected.as_ref().map(|m| backend.place(m));
+    mounts.extend(injected);
     let user = config.container_user.docker_user();
     // The image's home belongs to the image's own user.
     env.extend(user.iter().map(|_| ("HOME".to_string(), "/tmp".to_string())));
@@ -2631,8 +2657,8 @@ pub fn dispatch_policy(config: &DockerRunConfig) -> SandboxPolicy {
         user,
         env,
         workdir: None,
-        entrypoint: injected.map(|_| RUNTIME_INJECTION_PATH.to_string()),
-        command: runtime_args(config),
+        entrypoint,
+        command: runtime_args(config, &out_at),
     }
 }
 
@@ -2705,7 +2731,8 @@ fn forwarded_env(config: &DockerRunConfig) -> Vec<(String, String)> {
 }
 
 /// The runtime's own arguments: everything after the image.
-fn runtime_args(config: &DockerRunConfig) -> Vec<String> {
+/// `out_at` is where the sandbox sees the out-dir.
+fn runtime_args(config: &DockerRunConfig, out_at: &str) -> Vec<String> {
     let mut args = vec!["run".to_string(), "--model".to_string(), config.model.clone()];
     // (Security audit, #2114 resume follow-up) Unconditional — every
     // dispatch, resumed or not, stamps its role id into every
@@ -2732,7 +2759,7 @@ fn runtime_args(config: &DockerRunConfig) -> Vec<String> {
     // so a substantial brief can't hit ARG_MAX or show up in `ps`. The host
     // wrote it to `<host_out>/.prompt.txt` before this runs.
     args.push("--prompt-file".to_string());
-    args.push(PROMPT_FILE_CONTAINER_PATH.to_string());
+    args.push(PROMPT_FILE_CONTAINER_PATH.replacen(OUT_DIR_CONTAINER_PATH, out_at, 1));
 
     // (#2114) Resume: the checkpoint lives inside `config.workspace` itself
     // (see `RESUME_CHECKPOINT_CONTAINER_PATH`'s doc), already visible at
@@ -2740,7 +2767,7 @@ fn runtime_args(config: &DockerRunConfig) -> Vec<String> {
     // no extra mount needed.
     if config.resume_checkpoint {
         args.push("--resume".to_string());
-        args.push(RESUME_CHECKPOINT_CONTAINER_PATH.to_string());
+        args.push(RESUME_CHECKPOINT_CONTAINER_PATH.replacen(OUT_DIR_CONTAINER_PATH, out_at, 1));
     }
 
     // The container's local-brain base URL (#2904: the configured
@@ -2844,7 +2871,7 @@ pub(crate) fn container_lmstudio_base_url(override_url: Option<&str>) -> Option<
         return None;
     }
     let base = darkmux_types::endpoint::lmstudio_v1_base(&configured);
-    Some(loopback_to_docker_host(&base))
+    Some(url_for_sandbox(&base))
 }
 
 /// (#2902) The `--dialect` the container gets for a target: only a declared
@@ -2868,8 +2895,22 @@ pub(crate) fn agentic_brain_flags(
     agentic: Option<&crate::target::Target>,
 ) -> (Option<String>, Option<darkmux_types::Dialect>) {
     match agentic {
-        Some(t) => (Some(loopback_to_docker_host(&t.chat_url)), container_dialect_flag(t)),
+        Some(t) => (Some(url_for_sandbox(&t.chat_url)), container_dialect_flag(t)),
         None => (None, None),
+    }
+}
+
+/// (#3112 step 2) `url` as the sandbox dials it: unchanged under a backend
+/// whose sandbox shares this host's loopback (Seatbelt runs on the host
+/// itself), else [`loopback_to_docker_host`].
+fn url_for_sandbox(url: &str) -> String {
+    url_for(url, darkmux_sandbox::backend().kind())
+}
+
+fn url_for(url: &str, kind: darkmux_sandbox::BackendKind) -> String {
+    match kind {
+        darkmux_sandbox::BackendKind::Seatbelt => url.to_string(),
+        darkmux_sandbox::BackendKind::Docker => loopback_to_docker_host(url),
     }
 }
 
@@ -2925,6 +2966,7 @@ fn host_means_this_machine(host: &str) -> bool {
 /// it ran `docker docker run …`, which docker rejects with exit 125, killing
 /// every internal-runtime dispatch. `build_docker_run_argv` always emits at
 /// least the program and `run`, so `argv[0]` is guaranteed present.
+#[cfg(test)]
 fn docker_command_from_argv(argv: &[String]) -> Command {
     debug_assert!(
         !argv.is_empty(),
@@ -6997,10 +7039,49 @@ struct RuntimeImage {
     image: String,
     /// What `docker run` is given.
     run_image: String,
+    /// (#3112 step 2) The host-built runtime a Seatbelt sandbox runs; `None`
+    /// under Docker.
+    host_runtime: Option<PathBuf>,
+}
+
+/// (#3112 step 2, spike) The env var naming the host-built runtime a
+/// Seatbelt dispatch runs: `cargo build --release --manifest-path
+/// runtime/Cargo.toml` writes it to `runtime/target/release/darkmux-runtime`.
+pub const SANDBOX_RUNTIME_ENV: &str = "DARKMUX_SANDBOX_RUNTIME";
+
+/// (#3112 step 2) What a Seatbelt dispatch runs in place of an image: the
+/// host-built runtime [`SANDBOX_RUNTIME_ENV`] names, else a `darkmux-runtime`
+/// beside this executable. No image is checked or pulled, and `--image` is
+/// refused: there is no image to name.
+fn host_runtime_image(image_arg: Option<&str>) -> Result<RuntimeImage> {
+    if let Some(image) = image_arg {
+        bail!("--image {image}: the Seatbelt sandbox ({}=seatbelt) runs this host's own programs, not an image", darkmux_sandbox::SANDBOX_ENV);
+    }
+    let named = std::env::var_os(SANDBOX_RUNTIME_ENV).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let beside = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|d| d.join("darkmux-runtime")));
+    let Some(binary) = named.or(beside).filter(|p| p.is_file()) else {
+        bail!(
+            "the Seatbelt sandbox needs a host-built runtime: run `cargo build --release --manifest-path runtime/Cargo.toml` \
+             and set {SANDBOX_RUNTIME_ENV} to runtime/target/release/darkmux-runtime"
+        );
+    };
+    let shown = binary.display().to_string();
+    darkmux_types::diag_eprintln!("darkmux dispatch: runtime=internal, sandbox=seatbelt, runtime binary: {shown}");
+    Ok(RuntimeImage {
+        inject: true,
+        darkmux_image: crate::runtime_image::ResolvedImage { reference: shown.clone(), id: shown.clone() },
+        image: format!("host:{shown}"),
+        run_image: "host".to_string(),
+        host_runtime: Some(binary),
+    })
 }
 
 /// Resolve and check the runtime image, then say which one runs.
 fn resolve_runtime_image(image_arg: Option<&str>, skip_preflight: bool) -> Result<RuntimeImage> {
+    // (#3112 step 2) A refused backend setting refuses the dispatch (contract 9).
+    if darkmux_sandbox::selected().map_err(|why| anyhow!(why))? == darkmux_sandbox::BackendKind::Seatbelt {
+        return host_runtime_image(image_arg);
+    }
     // (#703) `inject` is true only when the operator named a NON-darkmux image
     // (e.g. `rust:slim`) — then darkmux's static runtime binary is injected
     // into it (bind-mount + entrypoint override) so the coder runs in the
@@ -7054,7 +7135,7 @@ fn resolve_runtime_image(image_arg: Option<&str>, skip_preflight: bool) -> Resul
             format!(" ({})", short_image_id(&darkmux_image.id))
         }
     );
-    Ok(RuntimeImage { inject, darkmux_image, image, run_image })
+    Ok(RuntimeImage { inject, darkmux_image, image, run_image, host_runtime: None })
 }
 
 /// Step 1, load the role manifest + .md prompt: the role, its assembled
@@ -8239,10 +8320,10 @@ fn container_run_config(
             &crate::mods::mods_dir(),
         )?,
         inject: run.image.inject,
-        runtime_binary: if run.image.inject {
-            Some(ensure_runtime_binary_cached(&run.image.darkmux_image.id)?)
-        } else {
-            None
+        runtime_binary: match &run.image.host_runtime {
+            Some(host) => Some(host.clone()),
+            None if run.image.inject => Some(ensure_runtime_binary_cached(&run.image.darkmux_image.id)?),
+            None => None,
         },
         image: run.image.run_image.clone(),
         role_id: opts.role_id.clone(),
@@ -8295,10 +8376,15 @@ fn container_run_config(
         // this just tells the container to reload it.
         resume_checkpoint: opts.resume_from.is_some(),
         container_host_access: darkmux_platform::current().container_host_access(),
-        container_user: resolve_container_user(
-            darkmux_types::config_access::container_user_override().as_deref(),
-            darkmux_platform::current(),
-        )?,
+        container_user: if run.image.host_runtime.is_some() {
+            // (#3112 step 2) Seatbelt runs as the caller; there is no user to switch to.
+            darkmux_platform::ContainerUser::Image
+        } else {
+            resolve_container_user(
+                darkmux_types::config_access::container_user_override().as_deref(),
+                darkmux_platform::current(),
+            )?
+        },
         remote_chat_url: agentic_brain.0,
         // (#2902) Only a declared dialect that differs from what the runtime
         // already assumes for this kind reaches argv, so every existing
@@ -8319,6 +8405,14 @@ fn container_run_config(
     })
 }
 
+/// (#3112 step 2) The backend's own `Command` for the dispatch, as it
+/// planned it: its environment, process group and stdin are part of the
+/// sandbox (a Seatbelt sandbox clears the host's environment), so it is
+/// never flattened to an argv and rebuilt, which would drop them.
+fn container_command(config: &DockerRunConfig, backend: &dyn darkmux_sandbox::SandboxBackend) -> Command {
+    backend.run(&dispatch_policy_for(config, backend)).0
+}
+
 /// Check the run config, build the `docker run` command from it, and spawn
 /// it with its output piped (and its stdin, when a secret rides it).
 fn spawn_container(argv_config: &DockerRunConfig, max_turns_override: Option<u32>) -> Result<std::process::Child> {
@@ -8327,14 +8421,7 @@ fn spawn_container(argv_config: &DockerRunConfig, max_turns_override: Option<u32
     // interpretation; this rejects malformed refs (leading `-`, whitespace,
     // control chars) so the contract is explicit, not just fence-dependent.
     preflight_docker_config(argv_config)?;
-    let argv = build_docker_run_argv(argv_config);
-
-    // `build_docker_run_argv` returns a FULL command — the program (`docker`)
-    // at [0], then `run` + the #839 hardening OPTIONS + the `--` image fence +
-    // runtime args. Split it: program from [0], args from [1..]. Pushing the
-    // whole vector (incl. [0]) ran `docker docker run …` → docker exit 125, the
-    // #975 regression. (Caps/limits/newpriv all live inside build_docker_run_argv.)
-    let mut cmd = docker_command_from_argv(&argv);
+    let mut cmd = container_command(argv_config, darkmux_sandbox::backend());
 
     // TODO (#839): Network hardening — the runtime must reach host LMStudio
     // via `host.docker.internal`. Constraining networking (e.g. `--network none`
@@ -14754,7 +14841,7 @@ fn prepare_unmanaged_compactor(
     utility: &crate::target::UtilityTarget,
 ) -> Result<Option<(String, String)>> {
     let compactor_id = compaction.compactor_model.clone().unwrap_or_default();
-    let chat_url = loopback_to_docker_host(&utility.chat_url);
+    let chat_url = url_for_sandbox(&utility.chat_url);
     match apply_unmanaged_compactor(compaction, &compactor_id, utility, chat_url) {
         Some(_refused) => Ok(None),
         None => remote_auth_header(&utility.endpoint),

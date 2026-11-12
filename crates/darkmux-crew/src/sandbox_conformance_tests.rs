@@ -27,9 +27,34 @@ fn a_name() -> String {
     format!("darkmux-conformance-{}-{n}", std::process::id())
 }
 
+/// What a case needs to know about a backend's host beyond the trait: the
+/// image it runs, and the shell lines that probe its network, which differ
+/// between a Linux image and a macOS host.
+pub struct Host {
+    pub image: &'static str,
+    /// Prints something when the sandbox has a route off this machine, and
+    /// nothing when it has none.
+    pub route_probe: &'static str,
+    /// Serves one line, `served`, on `port` on the sandbox's loopback, over
+    /// and over.
+    pub serve: fn(u16) -> String,
+    /// Prints `connected` when a TCP connection to the sandbox's own
+    /// `127.0.0.1:port` succeeds.
+    pub tcp_probe: fn(u16) -> String,
+    /// Prints `connected` when a connection to the unix socket at the path
+    /// succeeds.
+    pub unix_probe: fn(&str) -> String,
+}
+
+/// Where the sandbox sees `tree` when it is mounted at `/workspace`.
+fn ws(backend: &dyn SandboxBackend, tree: &Path) -> String {
+    backend.place(&Mount { host: tree.to_path_buf(), at: "/workspace".to_string(), access: Access::ReadWrite })
+}
+
 /// `sh -c script` in `image`, no network, the tree read-write at
-/// `/workspace`, labeled for this suite.
-fn policy(image: &str, tree: &Path, script: &str) -> SandboxPolicy {
+/// `/workspace` (wherever the backend places it, its working directory),
+/// labeled for this suite.
+fn policy(backend: &dyn SandboxBackend, image: &str, tree: &Path, script: &str) -> SandboxPolicy {
     let name = a_name();
     SandboxPolicy {
         labels: vec![(LABEL.to_string(), name.clone())],
@@ -43,7 +68,7 @@ fn policy(image: &str, tree: &Path, script: &str) -> SandboxPolicy {
         host_alias: None,
         user: None,
         env: Vec::new(),
-        workdir: Some("/workspace".to_string()),
+        workdir: Some(ws(backend, tree)),
         entrypoint: Some("sh".to_string()),
         command: vec!["-c".to_string(), script.to_string()],
     }
@@ -113,36 +138,39 @@ fn len(path: &Path) -> u64 {
 
 /// The mounted tree is there, and the host path beside it, and the tree's
 /// own host path, are not.
-fn sees_the_mounted_tree_and_nothing_else(backend: &dyn SandboxBackend, image: &str) {
+fn sees_the_mounted_tree_and_nothing_else(backend: &dyn SandboxBackend, host: &Host) {
+    let image = host.image;
     let root = tempfile::TempDir::new().unwrap();
     let tree = root.path().join("tree");
     std::fs::create_dir(&tree).unwrap();
     std::fs::write(tree.join("a.txt"), "hello").unwrap();
     std::fs::write(root.path().join("secret.txt"), "keep out").unwrap();
-    let script = format!(
-        "cat /workspace/a.txt && test ! -e '{}' && test ! -e '{}'",
-        root.path().join("secret.txt").display(),
-        tree.join("a.txt").display()
-    );
-    assert_eq!(run_ok(backend, &policy(image, &tree, &script)), "hello");
+    let at = ws(backend, &tree);
+    let mut script = format!("cat '{at}/a.txt' && test ! -e '{}'", root.path().join("secret.txt").display());
+    // A backend that cannot place a mount sees the tree at its own path.
+    if Path::new(&at) != tree.canonicalize().unwrap() {
+        script.push_str(&format!(" && test ! -e '{}'", tree.join("a.txt").display()));
+    }
+    assert_eq!(run_ok(backend, &policy(backend, image, &tree, &script)), "hello");
 }
 
 /// A read-only mount refuses a write, alone or layered over a read-write
 /// one (a checkout's `.git` over its tree), and the read-write tree beneath
 /// still takes one.
-fn read_only_mounts_refuse_writes(backend: &dyn SandboxBackend, image: &str) {
+fn read_only_mounts_refuse_writes(backend: &dyn SandboxBackend, host: &Host) {
+    let image = host.image;
     let root = tempfile::TempDir::new().unwrap();
     let tree = root.path().join("tree");
     let ro = root.path().join("ro");
     std::fs::create_dir_all(tree.join(".git")).unwrap();
     std::fs::create_dir(&ro).unwrap();
-    let mut p = policy(
-        image,
-        &tree,
-        "touch /workspace/written && ! touch /workspace/.git/x 2>/dev/null && ! touch /ro/x 2>/dev/null && echo refused",
-    );
-    p.mounts.push(Mount { host: tree.join(".git"), at: "/workspace/.git".to_string(), access: Access::ReadOnly });
-    p.mounts.push(Mount { host: ro.clone(), at: "/ro".to_string(), access: Access::ReadOnly });
+    let git = Mount { host: tree.join(".git"), at: "/workspace/.git".to_string(), access: Access::ReadOnly };
+    let ro_mount = Mount { host: ro.clone(), at: "/ro".to_string(), access: Access::ReadOnly };
+    let (at_git, at_ro) = (backend.place(&git), backend.place(&ro_mount));
+    let script = format!("touch written && ! touch '{at_git}/x' 2>/dev/null && ! touch '{at_ro}/x' 2>/dev/null && echo refused");
+    let mut p = policy(backend, image, &tree, &script);
+    p.mounts.push(git);
+    p.mounts.push(ro_mount);
     assert_eq!(run_ok(backend, &p).trim(), "refused");
     assert!(tree.join("written").is_file(), "the read-write tree took the write");
     assert!(!tree.join(".git/x").exists() && !ro.join("x").exists(), "a read-only mount took a write");
@@ -151,13 +179,63 @@ fn read_only_mounts_refuse_writes(backend: &dyn SandboxBackend, image: &str) {
 /// No network means no route anywhere: the routing table is empty (the
 /// loopback's routes are not in it). The same probe on the default network
 /// finds a route, so it can tell the two apart.
-fn network_none_has_no_network(backend: &dyn SandboxBackend, image: &str) {
+fn network_none_has_no_network(backend: &dyn SandboxBackend, host: &Host) {
+    let image = host.image;
     let tree = tempfile::TempDir::new().unwrap();
-    let probe = "tail -n +2 /proc/net/route";
-    let none = run_ok(backend, &policy(image, tree.path(), probe));
+    let probe = host.route_probe;
+    let none = run_ok(backend, &policy(backend, image, tree.path(), probe));
     assert_eq!(none.trim(), "", "a sandbox with no network has a route");
-    let default = run_ok(backend, &SandboxPolicy { network: Network::Default, ..policy(image, tree.path(), probe) });
+    let default = run_ok(backend, &SandboxPolicy { network: Network::Default, ..policy(backend, image, tree.path(), probe) });
     assert!(!default.trim().is_empty(), "the probe cannot see a route on the default network");
+}
+
+/// Nothing of the caller's environment reaches the sandbox: the test
+/// process's own cargo variables are not there.
+fn the_hosts_environment_does_not_leak_in(backend: &dyn SandboxBackend, host: &Host) {
+    let tree = tempfile::TempDir::new().unwrap();
+    assert!(std::env::var_os("CARGO_PKG_NAME").is_some(), "the probe needs a variable the caller has");
+    let env = run_ok(backend, &policy(backend, host.image, tree.path(), "env"));
+    assert!(!env.contains("CARGO_PKG_NAME="), "the caller's environment leaked in: {env}");
+}
+
+/// With no network, the host's own loopback services are out of reach: a
+/// listener on this host's `127.0.0.1` gets no connection.
+fn network_none_cannot_reach_the_hosts_loopback(backend: &dyn SandboxBackend, host: &Host) {
+    let tree = tempfile::TempDir::new().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let said = run_ok(backend, &policy(backend, host.image, tree.path(), &(host.tcp_probe)(port)));
+    assert!(!said.contains("connected"), "a sandbox with no network reached the host's loopback: {said}");
+    assert!(listener.accept().is_err(), "the host's listener took a connection from a sandbox with no network");
+}
+
+/// On the default network, a unix socket outside the sandbox's mounts (the
+/// Docker daemon's, a database's) is out of reach.
+fn the_default_network_reaches_no_outside_unix_socket(backend: &dyn SandboxBackend, host: &Host) {
+    let tree = tempfile::TempDir::new().unwrap();
+    let outside = tempfile::TempDir::new().unwrap();
+    let path = outside.path().join("s.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let p = SandboxPolicy { network: Network::Default, ..policy(backend, host.image, tree.path(), &(host.unix_probe)(&path.display().to_string())) };
+    let said = run_ok(backend, &p);
+    assert!(!said.contains("connected"), "a sandbox reached a unix socket outside its mounts: {said}");
+    assert!(listener.accept().is_err(), "the outside socket took a connection from a sandbox");
+}
+
+/// A read-only mount nested two levels into a read-write one stays read
+/// only even when the sandbox renames the directory above it.
+fn a_deep_read_only_mount_survives_renaming_its_parent(backend: &dyn SandboxBackend, host: &Host) {
+    let tree = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(tree.path().join("sub/.git")).unwrap();
+    std::fs::write(tree.path().join("sub/.git/config"), "kept\n").unwrap();
+    let git = Mount { host: tree.path().join("sub/.git"), at: "/workspace/sub/.git".to_string(), access: Access::ReadOnly };
+    let script = "mv sub sub2 2>/dev/null; echo pwn >> sub2/.git/config 2>/dev/null; echo pwn >> sub/.git/config 2>/dev/null; mv sub2 sub 2>/dev/null; true";
+    let mut p = policy(backend, host.image, tree.path(), script);
+    p.mounts.push(git);
+    run_ok(backend, &p);
+    assert_eq!(std::fs::read_to_string(tree.path().join("sub/.git/config")).unwrap(), "kept\n", "a read-only mount took a write");
 }
 
 /// A run past its deadline is cut short, and removing its sandbox ends the
@@ -165,10 +243,11 @@ fn network_none_has_no_network(backend: &dyn SandboxBackend, image: &str) {
 /// appending, and nothing is left listed. It is listed while it runs, so
 /// "not listed" is not a listing that sees nothing, and the child was seen
 /// appending, so "stopped" is not a child that never ran.
-fn a_deadline_kills_the_whole_tree(backend: &dyn SandboxBackend, image: &str) {
+fn a_deadline_kills_the_whole_tree(backend: &dyn SandboxBackend, host: &Host) {
+    let image = host.image;
     let tree = tempfile::TempDir::new().unwrap();
     let beat = tree.path().join("beat");
-    let p = policy(image, tree.path(), "(while :; do echo x >> /workspace/beat; sleep 0.2; done) & sleep 300 & wait");
+    let p = policy(backend, image, tree.path(), "(while :; do echo x >> beat; sleep 0.2; done) & sleep 300 & wait");
     let (cmd, handle) = backend.run(&p);
     let removed = Removed(backend, handle);
     let bounded = std::thread::spawn(move || run_bounded(cmd, Duration::from_secs(8)));
@@ -187,15 +266,16 @@ fn a_deadline_kills_the_whole_tree(backend: &dyn SandboxBackend, image: &str) {
 /// label, so a reaper can remove it, after which it is gone. A running
 /// neighbor under another label is not in that listing, so a backend that
 /// lists everything fails.
-fn a_reaper_finds_an_orphan_by_its_label(backend: &dyn SandboxBackend, image: &str) {
+fn a_reaper_finds_an_orphan_by_its_label(backend: &dyn SandboxBackend, host: &Host) {
+    let image = host.image;
     let tree = tempfile::TempDir::new().unwrap();
-    let neighbor = policy(image, tree.path(), "sleep 300");
+    let neighbor = policy(backend, image, tree.path(), "sleep 300");
     let neighbor = SandboxPolicy { labels: vec![(OTHER.to_string(), neighbor.name.clone())], ..neighbor };
     let (mut cmd, handle) = backend.run(&neighbor);
     let _neighbor = Removed(backend, handle);
     let mut neighbor_client = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
     assert!(until_listed_by(backend, OTHER, &neighbor.name, true), "{} never listed", neighbor.name);
-    let p = policy(image, tree.path(), "sleep 300");
+    let p = policy(backend, image, tree.path(), "sleep 300");
     let (mut cmd, handle) = backend.run(&p);
     let removed = Removed(backend, handle);
     let mut client = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
@@ -212,9 +292,10 @@ fn a_reaper_finds_an_orphan_by_its_label(backend: &dyn SandboxBackend, image: &s
 
 /// A created sandbox is listed before it starts, so a stop from then on
 /// finds it; starting it runs the policy attached, its output the client's.
-fn a_created_sandbox_is_listed_then_runs_when_started(backend: &dyn SandboxBackend, image: &str) {
+fn a_created_sandbox_is_listed_then_runs_when_started(backend: &dyn SandboxBackend, host: &Host) {
+    let image = host.image;
     let tree = tempfile::TempDir::new().unwrap();
-    let p = policy(image, tree.path(), "echo started");
+    let p = policy(backend, image, tree.path(), "echo started");
     let (create, handle) = backend.create(&p);
     let _removed = Removed(backend, handle.clone());
     let made = run_bounded(create, Duration::from_secs(60));
@@ -228,12 +309,14 @@ fn a_created_sandbox_is_listed_then_runs_when_started(backend: &dyn SandboxBacke
 
 /// A stop asks first: the sandbox's own SIGTERM handler runs within the
 /// grace, and the sandbox is gone after.
-fn a_stop_lets_the_sandbox_end_itself(backend: &dyn SandboxBackend, image: &str) {
+fn a_stop_lets_the_sandbox_end_itself(backend: &dyn SandboxBackend, host: &Host) {
+    let image = host.image;
     let tree = tempfile::TempDir::new().unwrap();
     let p = policy(
+        backend,
         image,
         tree.path(),
-        "trap 'echo bye > /workspace/bye; exit 0' TERM; echo up > /workspace/up; while :; do sleep 0.1; done",
+        "trap 'echo bye > bye; exit 0' TERM; echo up > up; while :; do sleep 0.1; done",
     );
     let (create, handle) = backend.create(&p);
     let _removed = Removed(backend, handle.clone());
@@ -256,12 +339,13 @@ fn a_stop_lets_the_sandbox_end_itself(backend: &dyn SandboxBackend, image: &str)
 /// not on the host's outward address. The sandbox serves one line on it;
 /// the host reads that line back, so an accepting proxy with nothing behind
 /// it does not pass.
-fn a_published_port_answers_on_loopback(backend: &dyn SandboxBackend, image: &str) {
+fn a_published_port_answers_on_loopback(backend: &dyn SandboxBackend, host: &Host) {
+    let image = host.image;
     use std::io::Read;
     let tree = tempfile::TempDir::new().unwrap();
     let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    let script = format!("while :; do echo served | nc -l -p {port}; done");
-    let p = SandboxPolicy { network: Network::Default, ports: vec![port], ..policy(image, tree.path(), &script) };
+    let script = (host.serve)(port);
+    let p = SandboxPolicy { network: Network::Default, ports: vec![port], ..policy(backend, image, tree.path(), &script) };
     let (mut cmd, handle) = backend.run(&p);
     let _removed = Removed(backend, handle);
     let mut client = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
@@ -299,12 +383,13 @@ fn this_hosts_lan_address() -> Option<std::net::IpAddr> {
 
 /// A kill's success is proof the sandbox was running: it fails for one that
 /// was never made, succeeds for a running one, and that one is gone after.
-fn a_kill_succeeds_only_against_a_running_sandbox(backend: &dyn SandboxBackend, image: &str) {
+fn a_kill_succeeds_only_against_a_running_sandbox(backend: &dyn SandboxBackend, host: &Host) {
+    let image = host.image;
     let tree = tempfile::TempDir::new().unwrap();
     let never = SandboxHandle { backend: backend.kind(), id: a_name() };
     let ghost = run_bounded(backend.kill(&never), Duration::from_secs(30));
     assert!(!matches!(ghost, Bounded::Finished { success: true, .. }), "killing a sandbox never made succeeded");
-    let p = policy(image, tree.path(), "sleep 300");
+    let p = policy(backend, image, tree.path(), "sleep 300");
     let (mut cmd, handle) = backend.run(&p);
     let _removed = Removed(backend, handle.clone());
     let mut client = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
@@ -317,9 +402,10 @@ fn a_kill_succeeds_only_against_a_running_sandbox(backend: &dyn SandboxBackend, 
 
 /// A stop ends a sandbox that ignores SIGTERM once the grace is up: it is
 /// gone well before the sleep it was running would have ended.
-fn a_stop_ends_a_sandbox_that_ignores_it_after_the_grace(backend: &dyn SandboxBackend, image: &str) {
+fn a_stop_ends_a_sandbox_that_ignores_it_after_the_grace(backend: &dyn SandboxBackend, host: &Host) {
+    let image = host.image;
     let tree = tempfile::TempDir::new().unwrap();
-    let p = policy(image, tree.path(), "trap '' TERM; echo up > /workspace/up; while :; do sleep 0.1; done");
+    let p = policy(backend, image, tree.path(), "trap '' TERM; echo up > up; while :; do sleep 0.1; done");
     let (mut cmd, handle) = backend.run(&p);
     let _removed = Removed(backend, handle.clone());
     let mut client = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
@@ -337,9 +423,10 @@ fn a_stop_ends_a_sandbox_that_ignores_it_after_the_grace(backend: &dyn SandboxBa
 
 /// A created sandbox that is removed before it starts never runs: a later
 /// start fails, and nothing it would have written appears.
-fn a_sandbox_removed_before_it_starts_never_runs(backend: &dyn SandboxBackend, image: &str) {
+fn a_sandbox_removed_before_it_starts_never_runs(backend: &dyn SandboxBackend, host: &Host) {
+    let image = host.image;
     let tree = tempfile::TempDir::new().unwrap();
-    let p = policy(image, tree.path(), "echo ran > /workspace/ran");
+    let p = policy(backend, image, tree.path(), "echo ran > ran");
     let (create, handle) = backend.create(&p);
     let _removed = Removed(backend, handle.clone());
     assert!(matches!(run_bounded(create, Duration::from_secs(60)), Bounded::Finished { success: true, .. }));
@@ -354,12 +441,13 @@ fn a_sandbox_removed_before_it_starts_never_runs(backend: &dyn SandboxBackend, i
 /// neighbor `<base>Xa`, by exact name and by prefix alike (Docker's name
 /// filter is a regular expression, where `.` is any character; #3552
 /// review). The watchdog's probe and the reapers list this way.
-fn a_listing_by_name_matches_the_name_literally(backend: &dyn SandboxBackend, image: &str) {
+fn a_listing_by_name_matches_the_name_literally(backend: &dyn SandboxBackend, host: &Host) {
+    let image = host.image;
     let tree = tempfile::TempDir::new().unwrap();
     let base = a_name();
     let mut created = Vec::new();
     for name in [format!("{base}.a"), format!("{base}Xa")] {
-        let mut p = policy(image, tree.path(), "true");
+        let mut p = policy(backend, image, tree.path(), "true");
         p.name = name;
         let (create, handle) = backend.create(&p);
         created.push(Removed(backend, handle));
@@ -378,70 +466,116 @@ fn a_listing_by_name_matches_the_name_literally(backend: &dyn SandboxBackend, im
 }
 
 macro_rules! conformance {
-    ($backend:ident, $make:expr, $image:literal, $needs:literal) => {
+    ($backend:ident, $make:expr, $host:expr, $needs:literal) => {
         mod $backend {
             #[test]
             #[ignore = $needs]
             fn sees_the_mounted_tree_and_nothing_else() {
-                super::sees_the_mounted_tree_and_nothing_else(&$make, $image)
+                super::sees_the_mounted_tree_and_nothing_else(&$make, &$host)
             }
             #[test]
             #[ignore = $needs]
             fn read_only_mounts_refuse_writes() {
-                super::read_only_mounts_refuse_writes(&$make, $image)
+                super::read_only_mounts_refuse_writes(&$make, &$host)
             }
             #[test]
             #[ignore = $needs]
             fn network_none_has_no_network() {
-                super::network_none_has_no_network(&$make, $image)
+                super::network_none_has_no_network(&$make, &$host)
             }
             #[test]
             #[ignore = $needs]
             fn a_deadline_kills_the_whole_tree() {
-                super::a_deadline_kills_the_whole_tree(&$make, $image)
+                super::a_deadline_kills_the_whole_tree(&$make, &$host)
             }
             #[test]
             #[ignore = $needs]
             fn a_reaper_finds_an_orphan_by_its_label() {
-                super::a_reaper_finds_an_orphan_by_its_label(&$make, $image)
+                super::a_reaper_finds_an_orphan_by_its_label(&$make, &$host)
             }
             #[test]
             #[ignore = $needs]
             fn a_kill_succeeds_only_against_a_running_sandbox() {
-                super::a_kill_succeeds_only_against_a_running_sandbox(&$make, $image)
+                super::a_kill_succeeds_only_against_a_running_sandbox(&$make, &$host)
             }
             #[test]
             #[ignore = $needs]
             fn a_stop_ends_a_sandbox_that_ignores_it_after_the_grace() {
-                super::a_stop_ends_a_sandbox_that_ignores_it_after_the_grace(&$make, $image)
+                super::a_stop_ends_a_sandbox_that_ignores_it_after_the_grace(&$make, &$host)
             }
             #[test]
             #[ignore = $needs]
             fn a_sandbox_removed_before_it_starts_never_runs() {
-                super::a_sandbox_removed_before_it_starts_never_runs(&$make, $image)
+                super::a_sandbox_removed_before_it_starts_never_runs(&$make, &$host)
             }
             #[test]
             #[ignore = $needs]
             fn a_created_sandbox_is_listed_then_runs_when_started() {
-                super::a_created_sandbox_is_listed_then_runs_when_started(&$make, $image)
+                super::a_created_sandbox_is_listed_then_runs_when_started(&$make, &$host)
             }
             #[test]
             #[ignore = $needs]
             fn a_stop_lets_the_sandbox_end_itself() {
-                super::a_stop_lets_the_sandbox_end_itself(&$make, $image)
+                super::a_stop_lets_the_sandbox_end_itself(&$make, &$host)
             }
             #[test]
             #[ignore = $needs]
             fn a_published_port_answers_on_loopback() {
-                super::a_published_port_answers_on_loopback(&$make, $image)
+                super::a_published_port_answers_on_loopback(&$make, &$host)
+            }
+            #[test]
+            #[ignore = $needs]
+            fn the_hosts_environment_does_not_leak_in() {
+                super::the_hosts_environment_does_not_leak_in(&$make, &$host)
+            }
+            #[test]
+            #[ignore = $needs]
+            fn network_none_cannot_reach_the_hosts_loopback() {
+                super::network_none_cannot_reach_the_hosts_loopback(&$make, &$host)
+            }
+            #[test]
+            #[ignore = $needs]
+            fn the_default_network_reaches_no_outside_unix_socket() {
+                super::the_default_network_reaches_no_outside_unix_socket(&$make, &$host)
+            }
+            #[test]
+            #[ignore = $needs]
+            fn a_deep_read_only_mount_survives_renaming_its_parent() {
+                super::a_deep_read_only_mount_survives_renaming_its_parent(&$make, &$host)
             }
             #[test]
             #[ignore = $needs]
             fn a_listing_by_name_matches_the_name_literally() {
-                super::a_listing_by_name_matches_the_name_literally(&$make, $image)
+                super::a_listing_by_name_matches_the_name_literally(&$make, &$host)
             }
         }
     };
 }
 
-conformance!(docker, darkmux_sandbox::DockerBackend, "alpine:3.22", "needs Docker and alpine:3.22");
+conformance!(
+    docker,
+    darkmux_sandbox::DockerBackend,
+    super::Host {
+        image: "alpine:3.22",
+        route_probe: "tail -n +2 /proc/net/route",
+        serve: |port| format!("while :; do echo served | nc -l -p {port}; done"),
+        tcp_probe: |port| format!("nc -w 2 127.0.0.1 {port} </dev/null >/dev/null 2>&1 && echo connected; true"),
+        unix_probe: |path| format!("nc -U '{path}' </dev/null >/dev/null 2>&1 && echo connected; true"),
+    },
+    "needs Docker and alpine:3.22"
+);
+
+// (#3112 step 2, spike) macOS only: there is no image, and the probes are
+// the host's. A route off the machine is a connection to a public resolver.
+conformance!(
+    seatbelt,
+    darkmux_sandbox::SeatbeltBackend,
+    super::Host {
+        image: "unused",
+        route_probe: "nc -z -G 2 1.1.1.1 53 2>/dev/null && echo route; true",
+        serve: |port| format!("while :; do echo served | nc -l 127.0.0.1 {port}; done"),
+        tcp_probe: |port| format!("nc -z -G 2 127.0.0.1 {port} >/dev/null 2>&1 && echo connected; true"),
+        unix_probe: |path| format!("nc -U '{path}' </dev/null >/dev/null 2>&1 && echo connected; true"),
+    },
+    "needs macOS sandbox-exec"
+);
