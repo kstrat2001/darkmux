@@ -2568,6 +2568,32 @@
         assert!(proxied["docker_on_path"].is_null(), "{proxied}");
         assert_eq!(missing["docker_on_path"], false, "{missing}");
         assert!(!found.to_string().contains(&dir.path().display().to_string()), "the path never appears");
+        // (#3112) The sandbox the daemon runs isolated work in, to this
+        // machine only (a test build's default is Docker on every host).
+        assert_eq!(found["sandbox"], "docker", "{found}");
+        assert!(proxied["sandbox"].is_null(), "{proxied}");
+    }
+
+    /// (#3112) A daemon whose sandbox is Seatbelt needs no docker: `/health`
+    /// says which sandbox it runs, and does not answer `docker_on_path`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn health_under_seatbelt_names_it_and_asks_nothing_of_docker() {
+        darkmux_types::run_in_own_process!();
+        if !darkmux_sandbox::SeatbeltBackend::available() {
+            return; // Seatbelt is refused off macOS; nothing to show here.
+        }
+        let prev = std::env::var_os("DARKMUX_SANDBOX");
+        unsafe { std::env::set_var("DARKMUX_SANDBOX", "seatbelt") };
+        let health = loopback_health(&[]).await;
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_SANDBOX", v),
+                None => std::env::remove_var("DARKMUX_SANDBOX"),
+            }
+        }
+        assert_eq!(health["sandbox"], "seatbelt", "{health}");
+        assert!(health["docker_on_path"].is_null(), "{health}");
     }
 
     /// `/health` tells this machine whether the daemon can publish to the

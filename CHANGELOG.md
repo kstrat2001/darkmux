@@ -14,6 +14,28 @@ darkmux release.
 
 ## [Unreleased]
 
+### Changed
+
+- **On a Mac, darkmux needs no Docker: the sandbox is a setting, and macOS's own is the default
+  (#3112).** New setting `runtime.sandbox` (env `DARKMUX_SANDBOX`, `config.json` schema 2.9):
+  `docker` or `seatbelt`, the sandbox every isolated run uses (a dispatch, a lab run's verify
+  command and grader suites, the mods gate). Unset, the platform decides: `seatbelt` (macOS's
+  `sandbox-exec`) on a Mac that has it, `docker` on Linux and everywhere else. Any other value is
+  refused by every entry point, naming the key, and `darkmux doctor` fails it; `seatbelt` on a host
+  without `sandbox-exec` is refused too. `darkmux doctor` gains a `sandbox` row (the sandbox in
+  effect, where the value came from, and whether it can run here) and asks Docker's rows
+  (`docker runtime`, `daemon docker`, `runtime image freshness`, `runtime binary cache`,
+  `container user`) only under Docker; under Seatbelt each says Docker is not needed. `/health`
+  gains `sandbox`, and answers `docker_on_path` only under Docker. `init`'s next steps, the guide
+  and the README ask for Docker only under Docker. Client previews (`darkmux client serve`) still
+  need Docker: under Seatbelt a preview start is refused (403 `forbidden`), naming
+  `darkmux config set runtime.sandbox docker`.
+
+  **Upgrading:** on a Mac whose `config.json` names no sandbox, dispatches, lab runs and the mods
+  gate move from Docker to Seatbelt. To keep Docker, `darkmux config set runtime.sandbox docker`
+  (and upgrade every darkmux that reads the same `~/.darkmux` first: an older binary refuses the
+  new key). Linux is unchanged.
+
 ## [5.10.0] - 2026-11-11
 
 The Mux Bot release: darkmux starts the Tensorfold and Flint servers it dispatches to, and a paired

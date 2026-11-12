@@ -170,6 +170,7 @@ pub const CONFIG_SHOWN: &[&str] = &[
     "runtime.host_sampler_interval_ms",
     "runtime.live_sample_ms",
     "runtime.memory.pressure_gate",
+    "runtime.sandbox",
     "runtime.thermal.enabled",
     "runtime.thermal.pause_at",
     "runtime.thermal.resume_at",

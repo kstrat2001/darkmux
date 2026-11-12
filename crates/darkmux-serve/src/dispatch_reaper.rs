@@ -32,13 +32,10 @@ pub(crate) fn tick_lines(
     docker_warned: &mut bool,
 ) -> Vec<String> {
     match reap_tick(local, liveness) {
-        ReapTick::DockerUnavailable if *docker_warned => Vec::new(),
-        ReapTick::DockerUnavailable => {
+        ReapTick::ListingUnavailable if *docker_warned => Vec::new(),
+        ReapTick::ListingUnavailable => {
             *docker_warned = true;
-            vec![
-                "darkmux serve: dispatch-container reaper idle: `docker ps` did not answer"
-                    .to_string(),
-            ]
+            vec![idle_line(darkmux_sandbox::backend().kind())]
         }
         ReapTick::Listed { reaped } => {
             *docker_warned = false;
@@ -54,6 +51,16 @@ pub(crate) fn tick_lines(
                 .collect()
         }
     }
+}
+
+/// (#3112) The line for a listing that did not answer, naming the sandbox
+/// it asked (`kind`, the configured one).
+fn idle_line(kind: darkmux_sandbox::BackendKind) -> String {
+    let what = match kind {
+        darkmux_sandbox::BackendKind::Docker => "`docker ps` did not answer (`runtime.sandbox` is `docker`)".to_string(),
+        other => format!("the listing of {} did not answer", darkmux_sandbox::placed_in(other)),
+    };
+    format!("darkmux serve: dispatch reaper idle: {what}")
 }
 
 /// One production tick: this host's own machine and pid namespace, and this
@@ -242,5 +249,16 @@ mod tests {
         }
         assert_eq!(first.len(), 1, "{first:?}");
         assert!(second.is_empty(), "{second:?}");
+        // (#3112) The line names the sandbox whose listing did not answer.
+        assert!(first[0].contains("(`runtime.sandbox` is `docker`)"), "{first:?}");
+    }
+
+    /// (#3112) Under Seatbelt the idle line names Seatbelt, not docker.
+    #[test]
+    fn the_idle_line_names_the_configured_sandbox() {
+        let seatbelt = idle_line(darkmux_sandbox::BackendKind::Seatbelt);
+        assert!(seatbelt.contains("the `seatbelt` sandbox (`runtime.sandbox`)") && !seatbelt.contains("docker"), "{seatbelt}");
+        let docker = idle_line(darkmux_sandbox::BackendKind::Docker);
+        assert!(docker.contains("`docker ps` did not answer"), "{docker}");
     }
 }

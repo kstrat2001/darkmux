@@ -205,7 +205,7 @@ fn started(ran: Bounded) -> Result<Bounded, NotRun> {
             None => {
                 let said = String::from_utf8_lossy(&stderr).trim().to_string();
                 let code = code.map_or("a signal".to_string(), |c| format!("exit {c}"));
-                Err(NotRun(if said.is_empty() { format!("docker run ended ({code}) before the command started") } else { said }))
+                Err(NotRun(if said.is_empty() { format!("{} ended ({code}) before the command started", darkmux_sandbox::placed_in_configured()) } else { said }))
             }
         },
         other => Ok(other),
@@ -259,10 +259,16 @@ pub fn lab_test_image(workload_image: Option<&str>) -> anyhow::Result<String> {
         crate::dispatch_internal::validate_image_ref(image)?;
         return Ok(image.to_string());
     }
-    crate::dispatch_internal::test_runtime_image().context(
-        "model-written tests run in a container, so they need Docker; \
-         to run them on this machine as your user instead, `darkmux config set runtime.tests_on_host true`",
-    )
+    // (#3112) Docker is asked for only here, under `runtime.sandbox docker`:
+    // the message says so, and how to need no Docker where that can run.
+    let remedy = darkmux_sandbox::docker_remedy().unwrap_or_else(|| "Docker must be installed and running".to_string());
+    crate::dispatch_internal::test_runtime_image().with_context(|| {
+        format!(
+            "model-written tests run in {}: {remedy}; \
+             to run them on this machine as your user instead, `darkmux config set runtime.tests_on_host true`",
+            darkmux_sandbox::placed_in(darkmux_sandbox::BackendKind::Docker),
+        )
+    })
 }
 
 /// (#906) The user a lab run's test container runs as: the same answer the
@@ -508,6 +514,8 @@ mod tests {
         assert_eq!(started(finished("", "Unable to find image")).unwrap_err(), NotRun("Unable to find image".into()));
         let silent = started(finished("", "")).unwrap_err().0;
         assert!(silent.contains("exit 125") && silent.contains("before the command started"), "{silent}");
+        // (#3112) It names the configured sandbox (a test build's is Docker).
+        assert!(silent.contains("a Docker container (`runtime.sandbox` is `docker`) ended"), "{silent}");
         assert!(started(Bounded::TimedOut { seconds: 3 }).is_ok());
     }
 

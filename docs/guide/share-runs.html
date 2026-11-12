@@ -53,7 +53,7 @@
 <section>
   <div class="wrap">
     <h2>Set up on macOS</h2>
-    <p>You need <a href="https://lmstudio.ai">LM Studio</a> with the model you want to measure downloaded, and Docker running (each lab run works in a small container). Then:</p>
+    <p>You need <a href="https://lmstudio.ai">LM Studio</a> with the model you want to measure downloaded. Each lab run works in macOS’s own sandbox (Seatbelt), so there is no Docker to install; with <code>runtime.sandbox docker</code> it works in a small container instead, and Docker must be running. Then:</p>
     <pre><code>brew install kstrat2001/tap/darkmux
 darkmux --version     <span class="comment"># a release, not a development build</span>
 darkmux init          <span class="comment"># writes your config and profiles</span>
@@ -158,8 +158,8 @@ Rules for a run that counts:
   get a pass. A failed run is a result, and it can be shared.
 
 Steps:
-1. Check darkmux --version, that Docker is running, and that LM Studio is
-   installed. Run darkmux init if darkmux has no config yet, then darkmux doctor.
+1. Check darkmux --version, that LM Studio is installed, and that doctor's
+   sandbox row passes (Docker matters only if runtime.sandbox is docker). Run darkmux init if darkmux has no config yet, then darkmux doctor.
 2. If I don't have upload access on darkmux evals yet, ask me to request it now
    on the Tokens tab of https://evals.darkmux.com/account. The maintainer grants
    it, and I get an email either way. The run can go ahead while I wait.

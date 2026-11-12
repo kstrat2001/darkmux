@@ -2105,11 +2105,27 @@ fn cmd_init(opts: init::InitOptions) -> Result<i32> {
                 .unwrap_or_else(|| "the profile registry".to_string());
             step(&format!("Edit {path} to point at a downloaded model (`lms ls` lists them)"));
         }
-        step("First answer, no Docker needed: `darkmux radio \"do you have a brain?\"`");
-        step("Check the setup: `darkmux doctor`");
-        step("With Docker running, a first dispatch: `darkmux dispatch code-reviewer \"What do you do?\"` (the runtime image is pulled on first use)");
+        first_steps(darkmux_types::config_access::sandbox().ok()).into_iter().for_each(&mut step);
     }
     Ok(0)
+}
+
+/// (#3112) `init`'s last three next steps. The first dispatch runs in the
+/// configured sandbox (`sandbox`, `None` when the setting is refused): Docker
+/// is named only when that is Docker.
+fn first_steps(sandbox: Option<darkmux_types::config::SandboxKind>) -> [&'static str; 3] {
+    match sandbox {
+        Some(darkmux_types::config::SandboxKind::Seatbelt) => [
+            "First answer: `darkmux radio \"do you have a brain?\"`",
+            "Check the setup: `darkmux doctor`",
+            "A first dispatch, in macOS's own sandbox (no Docker needed): `darkmux dispatch code-reviewer \"What do you do?\"`",
+        ],
+        _ => [
+            "First answer, no Docker needed: `darkmux radio \"do you have a brain?\"`",
+            "Check the setup: `darkmux doctor`",
+            "With Docker running, a first dispatch: `darkmux dispatch code-reviewer \"What do you do?\"` (the runtime image is pulled on first use; `runtime.sandbox` is `docker`)",
+        ],
+    }
 }
 
 fn profile_matches(

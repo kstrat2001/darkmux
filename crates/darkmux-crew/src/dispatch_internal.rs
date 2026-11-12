@@ -13910,19 +13910,29 @@ pub fn runtime_container_user() -> Result<Option<String>> {
     Ok(user.docker_user())
 }
 
+/// (#3112) `\n<why Docker, and the way to need none>`, or nothing when the
+/// configured sandbox is not Docker.
+fn docker_remedy_line() -> String {
+    darkmux_sandbox::docker_remedy().map(|r| format!("\n{r}.")).unwrap_or_default()
+}
+
 /// Map a probe result to the dispatch-time bail (pure — unit-testable
 /// without Docker on the host).
 fn preflight_result_for(status: DockerRuntimeStatus) -> Result<()> {
     match status {
         DockerRuntimeStatus::Ready => Ok(()),
+        // (#3112) Each names why Docker was asked for (the sandbox setting)
+        // and, where Seatbelt can run, how to need no Docker.
         DockerRuntimeStatus::DaemonUnreachable(stderr) => bail!(
             "darkmux's runtime requires Docker, but `docker version` failed:\n  {}\n\
-             Start Docker Desktop and retry.",
-            stderr
+             Start Docker Desktop and retry.{}",
+            stderr,
+            docker_remedy_line()
         ),
         DockerRuntimeStatus::BinaryMissing => bail!(
             "darkmux's runtime requires Docker, but the `docker` binary isn't on PATH.\n\
-             Install Docker Desktop (https://www.docker.com/products/docker-desktop) and retry."
+             Install Docker Desktop (https://www.docker.com/products/docker-desktop) and retry.{}",
+            docker_remedy_line()
         ),
         DockerRuntimeStatus::ImageMissing => bail!(
             "no darkmux runtime image for darkmux {version} found locally. darkmux pulls the \

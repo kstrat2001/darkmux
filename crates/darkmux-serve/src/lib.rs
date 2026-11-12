@@ -1833,6 +1833,9 @@ async fn health(
     // loopback request that did not come through a reverse proxy and names
     // this daemon in its Host.
     let loopback_caller = is_local_request(peer.map(|c| c.0), &headers);
+    // (#3112) The sandbox this daemon runs isolated work in; `None` when the
+    // setting is refused (every launch through the daemon refuses it too).
+    let daemon_sandbox = darkmux_sandbox::selected().ok();
     axum::Json(wire::HealthResponse {
         darkmux_version: env!("CARGO_PKG_VERSION").to_string(),
         build: darkmux_types::build_version(),
@@ -1850,7 +1853,13 @@ async fn health(
         fleet_token_set: loopback_caller.then(darkmux_flow::serve_token_present),
         // (#3423) Whether THIS process's PATH finds `docker`, for the same
         // reason: `darkmux doctor` runs from a shell whose PATH may differ.
-        docker_on_path: loopback_caller.then(darkmux_sandbox::DockerBackend::on_path),
+        // (#3112) Not asked when this daemon's sandbox is another one: it
+        // then needs no docker, and `sandbox` says which it runs.
+        docker_on_path: (loopback_caller && daemon_sandbox != Some(darkmux_sandbox::BackendKind::Seatbelt))
+            .then(darkmux_sandbox::DockerBackend::on_path),
+        sandbox: daemon_sandbox
+            .filter(|_| loopback_caller)
+            .map(|kind| darkmux_sandbox::setting_value(kind).to_string()),
         // Whether this daemon can publish to the fleet hub's flow stream
         // (`null` when no hub is configured), for this machine only: an
         // outage's reason is operator detail, not something a peer needs.

@@ -257,8 +257,9 @@ pub enum ReapTick {
     /// The listing answered; each orphan found, with whether its kill
     /// succeeded.
     Listed { reaped: Vec<(Orphan, bool)> },
-    /// The listing did not answer (no docker, a stopped daemon, a timeout).
-    DockerUnavailable,
+    /// The configured sandbox's listing did not answer (under Docker: no
+    /// docker, a stopped daemon; any backend: a timeout).
+    ListingUnavailable,
 }
 
 /// List the dispatch containers, decide, and kill each orphan.
@@ -281,7 +282,7 @@ pub fn reap_tick_named(
             stdout,
             ..
         } => stdout,
-        _ => return ReapTick::DockerUnavailable,
+        _ => return ReapTick::ListingUnavailable,
     };
     let listed = listed_containers(backend.parse_list(&query, &String::from_utf8_lossy(&stdout)));
     let reaped = orphaned_containers_named(&listed, prefix, local, liveness)

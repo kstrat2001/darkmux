@@ -311,7 +311,7 @@ fn a_tick_without_docker_does_nothing() {
     unsafe { std::env::set_var("PATH", empty.path()) };
     let tick = reap_tick(Some(&local()), liveness);
     restore_path(prev);
-    assert!(matches!(tick, ReapTick::DockerUnavailable), "{tick:?}");
+    assert!(matches!(tick, ReapTick::ListingUnavailable), "{tick:?}");
 }
 
 /// (#3200 review) `kill(pid, 0)` answers `EPERM` for a live process owned by

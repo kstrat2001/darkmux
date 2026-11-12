@@ -1012,7 +1012,7 @@ impl PreviewContainers for Docker {
             host_liveness,
         ) {
             ReapTick::Listed { reaped } => reaped.into_iter().map(|(o, _)| o.name).collect(),
-            ReapTick::DockerUnavailable => Vec::new(),
+            ReapTick::ListingUnavailable => Vec::new(),
         }
     }
 }

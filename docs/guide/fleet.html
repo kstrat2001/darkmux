@@ -62,7 +62,7 @@
 <section id="part-1">
   <div class="wrap">
     <h2>Part 1: Join as an observability peer</h2>
-    <p>On the new machine: install <a href="https://brew.sh">Homebrew</a> and join your <a href="https://tailscale.com">Tailscale</a> tailnet (<code>tailscale up</code>). If you'll run dispatches on the peer, also do the base <a href="getting-started.html">getting-started</a> setup (<a href="https://lmstudio.ai/">LMStudio</a> + <a href="https://www.docker.com/products/docker-desktop">Docker</a>). Then, confirming it can reach the hub:</p>
+    <p>On the new machine: install <a href="https://brew.sh">Homebrew</a> and join your <a href="https://tailscale.com">Tailscale</a> tailnet (<code>tailscale up</code>). If you'll run dispatches on the peer, also do the base <a href="getting-started.html">getting-started</a> setup (<a href="https://lmstudio.ai/">LMStudio</a>, plus <a href="https://www.docker.com/products/docker-desktop">Docker</a> only if the peer's <code>runtime.sandbox</code> is <code>docker</code>). Then, confirming it can reach the hub:</p>
     <pre><code><span class="comment"># 0. Sanity: can this machine reach the hub over the tailnet?</span>
 <span class="comment">#    HUB_IP is the hub's Tailscale address. Run `tailscale ip -4` ON THE HUB.</span>
 HUB_IP=&lt;hub-tailnet-addr&gt;

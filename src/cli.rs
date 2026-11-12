@@ -83,9 +83,10 @@ pub(crate) enum Cmd {
     },
     /// Dispatch a single turn to the named role: the task-grain execution
     /// entry point. Loads the role manifest + `.md` system prompt and
-    /// runs the role through the in-house container-bounded runtime (a
-    /// per-dispatch `darkmux-runtime` Docker container) with the assembled
-    /// message.
+    /// runs the role through the in-house runtime, isolated in the sandbox
+    /// `runtime.sandbox` names (macOS's own Seatbelt by default on a Mac, a
+    /// per-dispatch `darkmux-runtime` Docker container elsewhere or when set
+    /// to `docker`), with the assembled message.
     ///
     /// The MESSAGE is positional. When it is omitted, darkmux reads the
     /// message from stdin, so a diff pipes straight in:
@@ -262,7 +263,9 @@ pub(crate) enum Cmd {
         /// local dispatches (always synchronous).
         #[arg(long)]
         no_wait: bool,
-        /// Dispatch into a specific Docker image. Default: the
+        /// Dispatch into a specific Docker image (`runtime.sandbox docker`
+        /// only: a Seatbelt sandbox runs this host's own programs and
+        /// refuses it). Default: the
         /// darkmux runtime image built for this version (slim: python +
         /// node): a local `darkmux-runtime:latest` whose version label
         /// matches, else `ghcr.io/kstrat2001/darkmux-runtime:<version>`,

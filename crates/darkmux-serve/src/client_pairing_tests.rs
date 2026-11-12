@@ -5707,6 +5707,50 @@ async fn previews_are_refused_while_clients_preview_enabled_is_off() {
     assert_eq!(code, 503, "{v}");
 }
 
+/// (#3112) A preview runs in a Docker container, and only there for now:
+/// under any other sandbox a start is refused, naming the setting that
+/// would allow it, and nothing starts. Docker allows it.
+#[test]
+fn a_preview_needs_the_docker_sandbox_for_now() {
+    use darkmux_sandbox::BackendKind;
+    assert!(crate::client_pairing::preview_sandbox_refusal(&Ok(BackendKind::Docker)).is_none());
+    let refused = crate::client_pairing::preview_sandbox_refusal(&Ok(BackendKind::Seatbelt)).expect("refused");
+    for part in ["previews need `runtime.sandbox` `docker` for now", "this machine's sandbox is `seatbelt`", "darkmux config set runtime.sandbox docker"] {
+        assert!(refused.contains(part), "missing `{part}` in: {refused}");
+    }
+    let bad = crate::client_pairing::preview_sandbox_refusal(&Err("`x` is not a valid sandbox".into())).expect("refused");
+    assert!(bad.contains("`x` is not a valid sandbox"), "{bad}");
+}
+
+/// (#3112) The route: under Seatbelt (macOS only), a start is a 403 naming
+/// the sandbox, and nothing runs.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_preview_start_under_seatbelt_is_refused_and_runs_nothing() {
+    darkmux_types::run_in_own_process!();
+    if !darkmux_sandbox::SeatbeltBackend::available() {
+        return;
+    }
+    let h = harness();
+    let token = paired(&h).await;
+    let (mine, name, ws) = served_workspace(&h, &token).await;
+    recipe(&mine, serde_json::json!({"command": format!("touch ran; {}", serve()), "env": {"PORT": "{port}"}}));
+    let prev = std::env::var_os("DARKMUX_SANDBOX");
+    unsafe { std::env::set_var("DARKMUX_SANDBOX", "seatbelt") };
+    let (code, v) = start_preview(&h, &token, &name).await;
+    unsafe {
+        match prev {
+            Some(p) => std::env::set_var("DARKMUX_SANDBOX", p),
+            None => std::env::remove_var("DARKMUX_SANDBOX"),
+        }
+    }
+    assert_eq!(code, 403, "{v}");
+    assert_eq!(v["code"], "forbidden", "{v}");
+    assert!(v["error"].as_str().unwrap().contains("darkmux config set runtime.sandbox docker"), "{v}");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(!ws.join("ran").exists(), "nothing started");
+}
+
 /// The switch reads `clients.preview.enabled` fresh, through the config
 /// gate: absent is off, and a misspelling refuses rather than reading as off
 /// or on.

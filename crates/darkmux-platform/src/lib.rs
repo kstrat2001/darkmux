@@ -37,6 +37,11 @@ pub trait Platform: Send + Sync {
     /// host directories bind-mounted into it.
     fn container_user(&self) -> ContainerUser;
 
+    /// (#3112) Which sandbox darkmux runs isolated work in on this host when
+    /// the operator names none (`runtime.sandbox` unset): the one that needs
+    /// nothing installed here. The operator's setting always wins over it.
+    fn default_sandbox(&self) -> DefaultSandbox;
+
     /// This install's stable identity (#640: the identity, distinct from the
     /// operator's display name). `None` when the platform has none to read:
     /// callers treat that as unknown identity and never fall back to a name.
@@ -460,6 +465,21 @@ impl MemorySnapshot {
         let used = self.capacity_bytes.saturating_sub(available);
         Some((used * 100 + self.capacity_bytes / 2) / self.capacity_bytes)
     }
+}
+
+/// (#3112) Where macOS keeps the Seatbelt launcher. Its presence is what
+/// makes Seatbelt this host's default sandbox, and the Seatbelt backend
+/// runs it.
+pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+
+/// (#3112) The sandbox a host runs isolated work in by default
+/// ([`Platform::default_sandbox`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultSandbox {
+    /// A Docker container: needs Docker installed and its daemon running.
+    Docker,
+    /// macOS Seatbelt (`sandbox-exec`): part of the OS, nothing to install.
+    Seatbelt,
 }
 
 /// Which user a dispatch container runs as.

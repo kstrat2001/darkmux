@@ -9,7 +9,9 @@
 //! count is lowered, so the list records the migration and only shrinks.
 //!
 //! Test code is not counted: `tests/` directories, `tests.rs` and
-//! `*_tests.rs` files, and every `#[cfg(test)]` item. It reads text, so a
+//! `*_tests.rs` files, and every `#[cfg(test)]` item. Nor is a
+//! `config_enum!` row, which names a setting's value (`runtime.sandbox`'s
+//! `docker`, #3112), not the program. It reads text, so a
 //! comment spelling the literal counts too.
 
 use std::collections::BTreeMap;
@@ -125,12 +127,26 @@ fn docker_calls(root: &Path) -> BTreeMap<String, usize> {
             continue;
         }
         let text = std::fs::read_to_string(&file).unwrap_or_default();
-        let n = production_lines(&text).iter().filter(|l| l.contains(LITERAL)).count();
+        let n = production_lines(&text).iter().filter(|l| spells_the_program(l)).count();
         if n > 0 {
             calls.insert(rel, n);
         }
     }
     calls
+}
+
+/// Whether `line` spells the program: it holds the literal, and is not a
+/// `config_enum!` row (`Variant = <the literal> => "<meaning>",`), which
+/// declares a setting's value (#3112: `runtime.sandbox`), with the literal
+/// once.
+fn spells_the_program(line: &str) -> bool {
+    if !line.contains(LITERAL) {
+        return false;
+    }
+    let token_row = line.trim_start().split_once(&format!(" = {LITERAL} => \"")).is_some_and(|(variant, meaning)| {
+        variant.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !meaning.contains(LITERAL)
+    });
+    !token_row
 }
 
 fn allowed() -> BTreeMap<String, usize> {
@@ -261,6 +277,18 @@ fn test_items_are_skipped_and_production_around_them_counts() {
             "    _ => Command::new(\"docker\"),",
         ]
     );
+}
+
+/// (#3112) A `config_enum!` row is a setting's value (`runtime.sandbox`'s
+/// `docker`), not the program: it does not count. Anything else on such a
+/// line, or the literal anywhere else, still does.
+#[test]
+fn a_settings_token_row_is_not_a_program_spelling() {
+    assert!(!spells_the_program("    Docker = \"docker\" => \"a Docker container\","));
+    assert!(spells_the_program("    Docker = \"docker\","));
+    assert!(spells_the_program("    let docker = \"docker\";"));
+    assert!(spells_the_program("    Command::new(\"docker\")"));
+    assert!(spells_the_program("    X = \"docker\" => Command::new(\"docker\"),"));
 }
 
 /// The walk sees production files only, in every Rust tree the repo builds

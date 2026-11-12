@@ -39,13 +39,13 @@
 <section>
   <div class="wrap">
     <h2>Prerequisites</h2>
-    <p>Two things, and a third only for dispatch.</p>
+    <p>Two things. Docker is optional on a Mac.</p>
     <table>
       <thead><tr><th>Required</th><th>Why</th></tr></thead>
       <tbody>
         <tr><td><a href="https://brew.sh">Homebrew</a></td><td>How darkmux installs.</td></tr>
         <tr><td><a href="https://lmstudio.ai">LM Studio</a>, with at least one model downloaded and its command-line tool enabled (<code>~/.lmstudio/bin/lms bootstrap</code>)</td><td>darkmux loads and unloads models through <code>lms</code>. <code>init</code> picks your first worker model from what you have downloaded.</td></tr>
-        <tr><td>Docker, running</td><td>Only for <code>dispatch</code>, <code>lab run</code>, and missions: each dispatch runs in a small <code>darkmux-runtime</code> container, pulled on first use. <code>radio</code>, <code>doctor</code>, and the viewer need no Docker.</td></tr>
+        <tr><td>Docker: optional on macOS</td><td>On a Mac, <code>dispatch</code>, <code>lab run</code>, and missions run in macOS’s own sandbox (Seatbelt), which needs nothing installed. Docker is the opt-in: <code>darkmux config set runtime.sandbox docker</code> runs each dispatch in a small <code>darkmux-runtime</code> container, pulled on first use, with Docker running. It is the default on Linux, and client previews need it for now. <code>radio</code>, <code>doctor</code>, and the viewer need no sandbox at all.</td></tr>
       </tbody>
     </table>
     <p>darkmux is developed and tested on Apple Silicon. Everything below was run on one.</p>
@@ -67,11 +67,11 @@ skills targets: ~/.claude/skills
   installed (15): darkmux-bootstrap, darkmux-mission-debrief, darkmux-enable-audit, darkmux-add-machine, darkmux-status, darkmux-list-stacks, darkmux-list-workloads, darkmux-lab-run, darkmux-list-runs, darkmux-analyze-run, darkmux-compare-runs, darkmux-design-profile, darkmux-scan-and-suggest, darkmux-qa-review, darkmux-escalation-handler
 
 Next steps:
-  1. First answer, no Docker needed: <code>darkmux radio "do you have a brain?"</code>
+  1. First answer: <code>darkmux radio "do you have a brain?"</code>
   2. Check the setup: <code>darkmux doctor</code>
-  3. With Docker running, a first dispatch: <code>darkmux dispatch code-reviewer "What do you do?"</code> (the runtime image is pulled on first use)</div>
+  3. A first dispatch, in macOS's own sandbox (no Docker needed): <code>darkmux dispatch code-reviewer "What do you do?"</code></div>
     </div>
-    <p class="session-caption">Verbatim, captured 2026-08-28 on an M5 Max from a home directory with no <code>~/.darkmux</code>, LM Studio installed with a few models downloaded.</p>
+    <p class="session-caption">Captured 2026-08-28 on an M5 Max from a home directory with no <code>~/.darkmux</code>, LM Studio installed with a few models downloaded; the next steps are this release’s wording on a Mac. Under <code>runtime.sandbox docker</code> the third step asks for Docker running.</p>
     <p>If Homebrew refuses the tap as untrusted, run <code>brew trust kstrat2001/tap</code> once and install again. Update later with <code>brew upgrade darkmux</code>. <code>init</code> is safe to re-run: it refreshes a skill it can prove it wrote itself, leaves an edited one alone, and never overwrites a registry or config you have edited. A skill installed by an older darkmux carries no such proof, so the first re-run after upgrading reports every skill as kept rather than refreshed — <code>darkmux init --force</code> takes the new versions and discards any edits.</p>
   </div>
 </section>
@@ -146,7 +146,7 @@ matches no registered profile</div>
 <section>
   <div class="wrap">
     <h2>First dispatch</h2>
-    <p>A dispatch hands one role one message and lets it work with real tools. This is what Docker is for: each dispatch runs in a fresh <code>darkmux-runtime</code> container with only its workspace mounted, so the model can read, write, and run things in that directory and reach nothing else on your Mac, and the container is gone when the dispatch ends. The workspace itself is the model’s to change, which is why coding missions stop at a sign-off gate before anything ships. The first dispatch pulls the image; after that it is seconds. <code>darkmux lab run quick-q</code> runs the same path as a recorded, timed run.</p>
+    <p>A dispatch hands one role one message and lets it work with real tools, isolated in the sandbox <code>runtime.sandbox</code> names. On a Mac that is macOS’s own Seatbelt sandbox: the model can read, write, and run things in its workspace and write nothing else on your Mac. Under <code>runtime.sandbox docker</code> (the default on Linux), each dispatch runs in a fresh <code>darkmux-runtime</code> container with only its workspace mounted, gone when the dispatch ends; the first such dispatch pulls the image, and after that it is seconds. The workspace itself is the model’s to change, which is why coding missions stop at a sign-off gate before anything ships. <code>darkmux lab run quick-q</code> runs the same path as a recorded, timed run.</p>
     <div class="session">
       <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux dispatch code-reviewer "In two sentences, what do you do and what do you never do?"</span><button class="copy-btn" data-copy="darkmux dispatch code-reviewer &quot;In two sentences, what do you do and what do you never do?&quot;" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
       <div class="cmd-out">dispatching to model: qwen3.6-35b-a3b-turboquant-mlx

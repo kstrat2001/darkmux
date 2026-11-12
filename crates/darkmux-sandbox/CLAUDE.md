@@ -12,11 +12,11 @@ Claude Code loads this file when it works in this directory.
 - **Some things are not in the policy because no caller may turn them off:** every sandbox is removed when it exits, has an init as its first process, drops every capability and cannot gain privileges.
 - **A backend plans processes; it runs nothing.** Bounding a run (deadline, interrupt, process-group kill) stays with the caller's runner (`darkmux-crew`'s `bounded_command`). A run cut short is followed by `remove(handle)`, because killing the client need not stop the sandbox.
 - **A `SandboxHandle` is what a record stores** (a reaper's, a resume's): the backend and the sandbox's id there.
-- **Which backend runs on which host is a `darkmux-platform` question, later.** Today every caller uses `DockerBackend`.
+- **Which backend runs is the `runtime.sandbox` setting** (#3112), resolved by `darkmux_types::config_access::sandbox` (env `DARKMUX_SANDBOX` > `config.json` > the platform's answer, `Platform::default_sandbox`: Seatbelt on a Mac with `sandbox-exec`, Docker elsewhere). `selected()` reads it and refuses what cannot run here; `backend()` is what every caller spawns through. This crate parses no config itself. A test build (`test-support`) and every CLI test spawn resolve Docker on every host, so no outcome depends on the machine. Messages name the sandbox with `placed_in`, and a Docker remedy comes only from `docker_remedy`, which is `None` under any other sandbox.
 
 ## The ratchet (`docker-calls.allow`, `src/docker_calls.rs`)
 
-Outside `src/docker.rs`, no production line spells the `docker` program (`"docker"` as a string literal): the allow list is empty since step 1 of #3112. The walk covers every Rust package the repo builds (the workspace, `runtime/`, `plugins/`, `tools/`) and every `build.rs`. Test code is not counted (`tests/`, `tests.rs`, `*_tests.rs`, `#[cfg(test)]` items). The test fails if a file gains one (the fix is the seam) and if a file loses one until its count is lowered, so the list only shrinks.
+Outside `src/docker.rs`, no production line spells the `docker` program (`"docker"` as a string literal): the allow list is empty since step 1 of #3112. The walk covers every Rust package the repo builds (the workspace, `runtime/`, `plugins/`, `tools/`) and every `build.rs`. Test code is not counted (`tests/`, `tests.rs`, `*_tests.rs`, `#[cfg(test)]` items), nor is a `config_enum!` row (`runtime.sandbox`'s `docker` token, a setting's value, not the program). The test fails if a file gains one (the fix is the seam) and if a file loses one until its count is lowered, so the list only shrinks.
 
 ## Conformance
 

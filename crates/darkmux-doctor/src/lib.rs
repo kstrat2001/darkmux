@@ -25,6 +25,8 @@ mod checks_power;
 mod checks_hooks;
 mod checks_engines;
 mod checks_clients;
+// (#3112) The configured sandbox, and the Docker rows that apply only under it.
+mod checks_sandbox;
 use checks_hooks::check_hooks;
 mod fleet_submission;
 pub use fleet_submission::{
@@ -137,6 +139,17 @@ fn check_build_info() -> Check {
 }
 
 pub fn run() -> DoctorReport {
+    // (#3112) The sandbox every isolated run uses. Docker's rows are asked
+    // only under Docker; the `sandbox` row says whether the one configured
+    // can run here, from the `docker runtime` row's one probe under Docker.
+    let (sandbox, sandbox_source) = checks_sandbox::configured();
+    let docker_runtime = checks_sandbox::docker_only(&sandbox, "docker runtime", check_docker_runtime);
+    let sandbox_row = checks_sandbox::sandbox_row(
+        &sandbox,
+        sandbox_source,
+        Some(&docker_runtime),
+        darkmux_sandbox::SeatbeltBackend::available(),
+    );
     let mut checks = vec![
         check_build_info(),
         check_profile_registry(),
@@ -147,7 +160,8 @@ pub fn run() -> DoctorReport {
         checks_engines::check_tensorfold_engine(),
         // (#3453) Only asks rec when an endpoint declares Flint.
         checks_engines::check_flint_engine(),
-        check_docker_runtime(),
+        sandbox_row,
+        docker_runtime,
         check_models_loaded(),
         check_profile_loaded_match(),
         check_darkmux_version_vs_latest_release(),
@@ -160,10 +174,10 @@ pub fn run() -> DoctorReport {
         // (#1461) Staleness: what is RUNNING vs what is INSTALLED vs the source.
         check_daemon_freshness(),
         // (#3423) Does the RUNNING daemon find `docker` on its own PATH?
-        check_daemon_docker(),
+        checks_sandbox::docker_only(&sandbox, DAEMON_DOCKER_CHECK_NAME, check_daemon_docker),
         check_binary_vs_source(),
-        check_runtime_image_freshness(),
-        check_runtime_binary_cache(),
+        checks_sandbox::docker_only(&sandbox, RUNTIME_IMAGE_CHECK_NAME, check_runtime_image_freshness),
+        checks_sandbox::docker_only(&sandbox, RUNTIME_BINARY_CACHE_CHECK_NAME, check_runtime_binary_cache),
         check_ram_headroom(),
         check_load_projection(),
         check_power_state(),
@@ -200,7 +214,8 @@ pub fn run() -> DoctorReport {
         check_host_probe(),
         check_quarantined_mirrors(),
         checks_power::check_power_posture(),
-        checks_container::check_container_user(),
+        // (#3112) Read only by a Docker sandbox: Seatbelt runs as you.
+        checks_sandbox::docker_only(&sandbox, checks_container::NAME, checks_container::check_container_user),
         checks_container::check_lab_tests_placement(),
         check_unmanaged_endpoint_credentials(),
         check_endpoints(),
@@ -2230,6 +2245,9 @@ fn enum_setting_pass_row(s: &darkmux_types::config_enum::EnumSetting) -> Check {
     let from = match (source, s.env) {
         (darkmux_types::config_access::Source::Env, Some(var)) => format!("from {var}"),
         (darkmux_types::config_access::Source::Config, _) => "from config.json".to_string(),
+        // (#3112) A default the platform answers is this machine's, not
+        // darkmux's everywhere.
+        _ if s.shipped_by_host() => "this machine's default".to_string(),
         _ => "default".to_string(),
     };
     Check { name: s.key.into(), status: Status::Pass, message: format!("`{token}` ({from}): {meaning}"), hint: None }
@@ -5378,7 +5396,7 @@ const RUNTIME_IMAGE_CHECK_NAME: &str = "runtime image freshness";
 /// Brew users must never see a source-tree warning, and the vast majority of
 /// users never run a daemon — a warning whose fix_hint cannot fix anything is
 /// noise, so those cases resolve to a silent Pass carrying the reason.
-fn not_applicable(name: &str, reason: &str) -> Check {
+pub(crate) fn not_applicable(name: &str, reason: &str) -> Check {
     Check {
         name: name.into(),
         status: Status::Pass,
@@ -5546,9 +5564,24 @@ fn check_daemon_docker() -> Check {
     let addr = darkmux_types::config_access::serve_client_addr();
     let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or("127.0.0.1").to_string();
     let health = loopback_http_body(&host, darkmux_types::config_access::serve_client_port(), "/health");
+    // (#3112) A daemon started with another sandbox (its own env) needs no
+    // docker, whatever this shell's setting says.
+    if let Some(other) = health.as_deref().and_then(daemon_sandbox_other_than_docker) {
+        return not_applicable(
+            DAEMON_DOCKER_CHECK_NAME,
+            &format!("the running darkmux serve daemon's sandbox is `{other}`, so it needs no docker"),
+        );
+    }
     let (daemon, listener_on) = health.as_deref().map(parse_daemon_docker).unwrap_or((None, false));
     let in_panel = env::var_os("DARKMUX_PANEL").is_some();
     classify_daemon_docker(daemon, darkmux_sandbox::DockerBackend::on_path(), listener_on, in_panel)
+}
+
+/// (#3112) `/health`'s `sandbox` when it names one other than Docker.
+fn daemon_sandbox_other_than_docker(health_body: &str) -> Option<String> {
+    let v = serde_json::from_str::<serde_json::Value>(health_body).ok()?;
+    let sandbox = v.get("sandbox")?.as_str()?;
+    (sandbox != darkmux_types::config::SandboxKind::Docker.as_str()).then(|| sandbox.to_string())
 }
 
 /// `/health`'s `docker_on_path` (`None` when absent: no daemon, one older than
@@ -6884,11 +6917,12 @@ fn docker_status_to_check(status: darkmux_crew::dispatch_internal::DockerRuntime
         S::BinaryMissing => Check {
             name,
             status: Status::Warn,
-            message: "`docker` not on PATH — darkmux's default internal runtime can't dispatch"
+            message: "`docker` not on PATH: `runtime.sandbox` is `docker`, so no dispatch can run"
                 .into(),
             hint: Some(
-                "Install Docker Desktop (https://www.docker.com/products/docker-desktop) to use \
-                 darkmux's default container-bounded runtime."
+                "Install Docker Desktop (https://www.docker.com/products/docker-desktop) to run \
+                 isolated work in Docker containers, or choose another sandbox (`darkmux doctor`'s \
+                 `sandbox` row names one this machine can run)."
                     .into(),
             ),
         },
@@ -6896,8 +6930,8 @@ fn docker_status_to_check(status: darkmux_crew::dispatch_internal::DockerRuntime
             name,
             status: Status::Warn,
             message:
-                "Docker is installed but the daemon isn't reachable — the default internal runtime \
-                 can't dispatch"
+                "Docker is installed but the daemon isn't reachable: `runtime.sandbox` is `docker`, \
+                 so no dispatch can run"
                     .into(),
             hint: Some("Start Docker Desktop, then re-run `darkmux doctor`.".into()),
         },
@@ -9634,6 +9668,26 @@ mod tests {
                 None => std::env::remove_var("DARKMUX_SERVE_PORT"),
             }
         }
+    }
+
+    #[test]
+    fn a_host_default_enum_row_says_it_is_this_machines() {
+        // (#3112) `runtime.sandbox`'s default is the platform's answer, so
+        // its Pass row says so rather than "default".
+        let s = darkmux_types::config_enum::setting("runtime.sandbox").unwrap();
+        let row = enum_setting_pass_row(s);
+        assert!(row.message.contains("(this machine's default)"), "{}", row.message);
+        let fixed = darkmux_types::config_enum::setting("fleet.mode").unwrap();
+        assert!(enum_setting_pass_row(fixed).message.contains("(default)"));
+    }
+
+    #[test]
+    fn a_daemon_whose_sandbox_is_not_docker_needs_no_docker() {
+        // (#3112) The daemon's own sandbox, from `/health`.
+        assert_eq!(daemon_sandbox_other_than_docker(r#"{"docker_on_path":null,"sandbox":"seatbelt"}"#), Some("seatbelt".into()));
+        assert_eq!(daemon_sandbox_other_than_docker(r#"{"docker_on_path":true,"sandbox":"docker"}"#), None);
+        assert_eq!(daemon_sandbox_other_than_docker(r#"{"docker_on_path":true}"#), None);
+        assert_eq!(daemon_sandbox_other_than_docker("not json"), None);
     }
 
     #[test]
@@ -12753,8 +12807,12 @@ mod tests {
         //
         // (#3544) 78: two more `clients.*` rows, `clients.pairing.verified_teams`
         // and `clients.pairing.dialog`.
+        //
+        // (#3112) 79: `checks_sandbox::sandbox_row` joined before the
+        // `docker runtime` row (the `runtime.sandbox` enum row is counted by
+        // `ENUM_SETTINGS.len()`).
         let expected =
-            78 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            79 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

@@ -1248,6 +1248,8 @@
             .to_string();
         assert!(msg.contains("isn't on PATH"), "{msg}");
         assert!(msg.contains("Install Docker Desktop"), "{msg}");
+        // (#3112) It says why Docker was asked for: the sandbox setting.
+        assert!(msg.contains("`runtime.sandbox` is `docker`"), "{msg}");
     }
 
     #[test]
@@ -1260,6 +1262,7 @@
         assert!(msg.contains("`docker version` failed"), "{msg}");
         assert!(msg.contains("Start Docker Desktop"), "{msg}");
         assert!(msg.contains("Cannot connect to the Docker daemon"), "{msg}");
+        assert!(msg.contains("`runtime.sandbox` is `docker`"), "{msg}");
     }
 
     #[test]

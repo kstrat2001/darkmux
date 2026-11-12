@@ -468,6 +468,19 @@ fn run_gate_command(placement: &GatePlacement, command: &str, scratch_checkout: 
     gate_result(command, scratch_checkout, ran)
 }
 
+/// (#3112) Why the gate never ran test_command, naming the sandbox it was to
+/// run in (`kind`, the configured one); Docker's likely causes only under
+/// Docker.
+fn not_run_reason(why: &str, kind: darkmux_sandbox::BackendKind) -> String {
+    let causes = match kind {
+        darkmux_sandbox::BackendKind::Docker => {
+            ": the `gate_image` may be missing, Docker may be down, or the scratch copy was not mounted (a remote Docker daemon)"
+        }
+        _ => "",
+    };
+    format!("the gate did not run test_command in {} ({why}){causes}", darkmux_sandbox::placed_in(kind))
+}
+
 /// What one gate run means. (#2973 review) A container that never ran the
 /// command (a missing image, a stopped daemon, or the mount check finding
 /// the scratch copy unmounted) is a named skip, never a kit that "applied
@@ -481,15 +494,7 @@ fn gate_result(
     use crate::bounded_command::Bounded;
     let ran = match ran {
         Ok(ran) => ran,
-        Err(why) => {
-            return (
-                None,
-                Some(format!(
-                    "the gate container did not run test_command ({why}): the `gate_image` may be missing, \
-                     Docker may be down, or the scratch copy was not mounted (a remote Docker daemon)"
-                )),
-            )
-        }
+        Err(why) => return (None, Some(not_run_reason(&why.to_string(), darkmux_sandbox::backend().kind()))),
     };
     match ran {
         Bounded::Finished { success, code, .. } => (
@@ -873,6 +878,20 @@ mod tests {
         let (own, _) = gate_result("true", Path::new("/w"),
             Ok(crate::bounded_command::Bounded::Finished { success: false, code: Some(125), stdout: Vec::new(), stderr: Vec::new() }));
         assert!(own.is_some_and(|o| !o.passed && o.exit_code == Some(125)), "the command's own exit 125 fails the kit");
+    }
+
+    /// (#3112) A gate that never ran names the configured sandbox; Docker's
+    /// causes are named only under Docker.
+    #[test]
+    fn a_gate_that_never_ran_names_the_configured_sandbox() {
+        use darkmux_sandbox::BackendKind;
+        let docker = not_run_reason("no image", BackendKind::Docker);
+        assert!(docker.contains("a Docker container (`runtime.sandbox` is `docker`)"), "{docker}");
+        assert!(docker.contains("Docker may be down"), "{docker}");
+        let seatbelt = not_run_reason("sandbox-exec: no such file", BackendKind::Seatbelt);
+        assert!(seatbelt.contains("the `seatbelt` sandbox (`runtime.sandbox`)"), "{seatbelt}");
+        assert!(!seatbelt.contains("Docker") && !seatbelt.contains("gate_image"), "{seatbelt}");
+        assert!(seatbelt.contains("sandbox-exec: no such file"), "{seatbelt}");
     }
 
     /// (#2973 review) An orphan is a gate container whose owner process is

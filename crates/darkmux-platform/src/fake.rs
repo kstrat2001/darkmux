@@ -1,10 +1,11 @@
 //! A platform whose every answer is set by the test using it.
 
-use crate::{ContainerHostAccess, ContainerUser, Platform};
+use crate::{ContainerHostAccess, ContainerUser, DefaultSandbox, Platform};
 
 pub struct FakePlatform {
     pub container_host_access: ContainerHostAccess,
     pub container_user: ContainerUser,
+    pub default_sandbox: DefaultSandbox,
     pub machine_uid: Option<String>,
     pub reclaimable_memory_bytes: Option<u64>,
     pub memory_pressure: Option<crate::MemoryPressure>,
@@ -46,6 +47,7 @@ impl Default for FakePlatform {
         FakePlatform {
             container_host_access: ContainerHostAccess::Builtin,
             container_user: ContainerUser::Image,
+            default_sandbox: DefaultSandbox::Docker,
             machine_uid: None,
             reclaimable_memory_bytes: None,
             memory_pressure: None,
@@ -79,6 +81,10 @@ impl Platform for FakePlatform {
 
     fn container_user(&self) -> ContainerUser {
         self.container_user
+    }
+
+    fn default_sandbox(&self) -> DefaultSandbox {
+        self.default_sandbox
     }
 
     fn machine_uid(&self) -> Option<String> {

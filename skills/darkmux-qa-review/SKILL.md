@@ -7,7 +7,7 @@ allowed-tools: "Bash(darkmux:*),Bash(git:*),Bash(jq:*)"
 
 # Darkmux QA review
 
-Dispatches the **code-reviewer** role against the current branch's diff via `darkmux dispatch` (default internal runtime, container-bounded). The dispatch reads the role manifest at `templates/builtin/roles/code-reviewer.json` + the bundled `.md` system prompt, runs in a fresh per-dispatch Docker container, and returns a structured JSON envelope via `--json`.
+Dispatches the **code-reviewer** role against the current branch's diff via `darkmux dispatch` (default internal runtime, sandboxed). The dispatch reads the role manifest at `templates/builtin/roles/code-reviewer.json` + the bundled `.md` system prompt, runs in the sandbox `runtime.sandbox` names (macOS Seatbelt by default on a Mac, a fresh per-dispatch Docker container under `docker`), and returns a structured JSON envelope via `--json`.
 
 ## Step 1 — Determine review scope
 
@@ -104,6 +104,6 @@ Show the user the reply. Ask: "Want to address any of these findings, or move on
 
 - **No Discord delivery.** Unlike the engagement-side `qa-review` skill (which posts to a team chat channel), the darkmux variant returns findings inline only.
 - **No multi-auditor dispatch.** For code review, darkmux ships the `code-reviewer` role (this skill dispatches it). But a dedicated multi-specialist *diff auditor* crew (e.g. a `devops` auditor; `devops` is genuinely not in the schema) isn't wired up yet. Those would be added when the team is staffed for those concerns.
-- **The runtime is internal (Docker container) — the only dispatch path.** This skill uses darkmux's in-house container-bounded runtime; the parser below assumes the `--json` envelope shape it emits.
+- **The runtime is internal (sandboxed per `runtime.sandbox`) — the only dispatch path.** This skill uses darkmux's in-house sandboxed runtime; the parser below assumes the `--json` envelope shape it emits.
 - **No agent-registry sync step needed.** The internal runtime reads role manifests directly each dispatch — no separate registry to reconcile.
 - **Why this skill instead of `qa-review`:** the engagement-side skill is scoped to that engagement's own infrastructure (a team chat channel, qa/devops/legal agents). This darkmux variant routes through the namespace-managed agent and respects the operator-sovereignty contract.

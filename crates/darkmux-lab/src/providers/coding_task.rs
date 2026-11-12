@@ -1195,6 +1195,21 @@ fn verify_workdir(cwd: Option<&str>, view: &str) -> Result<String> {
     Ok(parts.join("/"))
 }
 
+/// (#3112) Why a verify command never ran, naming the sandbox it was to run
+/// in (`kind`, the configured one) and, under Docker alone, why Docker.
+fn not_run_details(why: &str, kind: darkmux_sandbox::BackendKind) -> String {
+    let docker = match (kind, darkmux_sandbox::docker_remedy()) {
+        (darkmux_sandbox::BackendKind::Docker, Some(remedy)) => format!("; {remedy}"),
+        (darkmux_sandbox::BackendKind::Docker, None) => "; Docker must be installed and running".to_string(),
+        _ => String::new(),
+    };
+    format!(
+        "the verify command did not run in {}: {why} (model-written tests run in that sandbox{docker}; \
+         to run them on this machine as your user instead, `darkmux config set runtime.tests_on_host true`)",
+        darkmux_sandbox::placed_in(kind),
+    )
+}
+
 /// A verify run's (passed, details, captured output). A container that never
 /// ran the command, or a command that could not start, is a failed verify
 /// that says so, so the run is still recorded (#3355 review); an interrupt
@@ -1203,11 +1218,7 @@ fn verify_result(ran: Result<Bounded, contained_command::NotRun>, cmd: &str) -> 
     let ran = match ran {
         Ok(ran) => ran,
         Err(why) => {
-            let details = format!(
-                "the verify command did not run in its container: {why} \
-                 (model-written tests run in a container, so they need Docker; to run them on this machine \
-                 as your user instead, `darkmux config set runtime.tests_on_host true`)"
-            );
+            let details = not_run_details(&why.to_string(), darkmux_sandbox::backend().kind());
             return Ok((false, details.clone(), format!("{details}\n")));
         }
     };
@@ -2787,6 +2798,12 @@ mod tests {
         let never = contained_command::NotRun("Unable to find image".into());
         let (passed, details, output) = verify_result(Err(never), "npm test").unwrap();
         assert!(!passed && details.contains("Unable to find image") && details.contains("runtime.tests_on_host"), "{details}");
+        // (#3112) It names the configured sandbox, and Docker only under it.
+        let docker = not_run_details("x", darkmux_sandbox::BackendKind::Docker);
+        assert!(docker.contains("a Docker container (`runtime.sandbox` is `docker`)") && docker.contains("Docker must be installed"), "{docker}");
+        let seatbelt = not_run_details("x", darkmux_sandbox::BackendKind::Seatbelt);
+        assert!(seatbelt.contains("the `seatbelt` sandbox (`runtime.sandbox`)") && !seatbelt.contains("Docker"), "{seatbelt}");
+        assert!(seatbelt.contains("runtime.tests_on_host"), "{seatbelt}");
         assert!(output.contains("Unable to find image"));
         let own_125 = Bounded::Finished { success: false, code: Some(125), stdout: vec![], stderr: vec![] };
         let (passed, details, _) = verify_result(Ok(own_125), "x").unwrap();

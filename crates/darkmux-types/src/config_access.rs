@@ -1957,6 +1957,39 @@ pub fn memory_pressure_gate() -> Result<crate::config::PressureGate, crate::conf
     resolve_enum("runtime.memory.pressure_gate").map(|(v, _)| v)
 }
 
+// ── Sandbox (#3112) ──
+/// The sandbox every isolated run uses (a dispatch, a lab run's tests, the
+/// mods gate): `env(DARKMUX_SANDBOX) > config.runtime.sandbox > this host's
+/// default` ([`sandbox_default`]). An unregistered value is an error naming
+/// the key, never a fallback: every entry point refuses it at preflight.
+pub fn sandbox() -> Result<crate::config::SandboxKind, crate::config_enum::BadEnumValue> {
+    sandbox_with_source().map(|(v, _)| v)
+}
+
+/// [`sandbox`] plus WHICH tier resolved it.
+pub fn sandbox_with_source(
+) -> Result<(crate::config::SandboxKind, Source), crate::config_enum::BadEnumValue> {
+    resolve_enum("runtime.sandbox")
+}
+
+/// The sandbox an absent `runtime.sandbox` resolves to on this host: the
+/// platform's answer ([`sandbox_default_on`]). A test build (the
+/// `test-support` feature, the same switch that hands it an empty config)
+/// gets Docker on every host, so no test's outcome depends on the machine
+/// it runs on; the platform's answer is tested through
+/// [`sandbox_default_on`].
+pub fn sandbox_default() -> &'static str {
+    if cfg!(feature = "test-support") {
+        return crate::config::SandboxKind::Docker.as_str();
+    }
+    sandbox_default_on(darkmux_platform::current())
+}
+
+/// The default sandbox `platform` names, as its `runtime.sandbox` token.
+fn sandbox_default_on(platform: &dyn darkmux_platform::Platform) -> &'static str {
+    crate::config::SandboxKind::from(platform.default_sandbox()).as_str()
+}
+
 /// OS thermal state at or above which the governor pauses. Default
 /// `serious`. (#2947) An unrecognized state is an error: it used to pass
 /// through, and the governor disarmed its soft tiers on it, so a typo
@@ -2808,6 +2841,9 @@ mod location_guard {
         ("detection_degeneracy_policy", "an enum value"),
         ("thermal_pause_at", "an enum value"),
         ("memory_pressure_gate", "an enum value"),
+        ("sandbox", "an enum value"),
+        ("sandbox_with_source", "an enum value and its tier"),
+        ("sandbox_default", "an enum token"),
         ("MEMORY_PRESSURE_GATE_DEFAULT", "the default memory pressure gate token, public in the source"),
         ("thermal_resume_at", "an enum value"),
         ("resolved_locations", "the union of LOCATION_ACCESSORS itself"),
@@ -3064,6 +3100,38 @@ mod location_guard {
     }
 }
 
+
+#[cfg(test)]
+mod sandbox_setting {
+    use super::*;
+    use darkmux_platform::{DefaultSandbox, FakePlatform};
+
+    /// (#3112) Absent `runtime.sandbox`, a host runs the sandbox its
+    /// platform names: Seatbelt on a Mac with `sandbox-exec`, Docker else.
+    #[test]
+    fn the_default_sandbox_is_the_platforms_answer() {
+        let on = |d| sandbox_default_on(&FakePlatform { default_sandbox: d, ..FakePlatform::default() });
+        assert_eq!(on(DefaultSandbox::Seatbelt), "seatbelt");
+        assert_eq!(on(DefaultSandbox::Docker), "docker");
+    }
+
+    /// `env > config.json > the host's default`, each tier named.
+    #[test]
+    fn the_sandbox_resolves_env_over_config_over_the_default() {
+        let s = crate::config_enum::setting("runtime.sandbox").unwrap();
+        let cfg: crate::config::DarkmuxConfig =
+            serde_json::from_value(serde_json::json!({"runtime": {"sandbox": "seatbelt"}})).unwrap();
+        let none = |_: &str| None;
+        let env_docker = |v: &str| (v == "DARKMUX_SANDBOX").then(|| "docker".to_string());
+        assert_eq!(crate::config_enum::resolve_in(s, &cfg, none), Ok(("seatbelt", Source::Config)));
+        assert_eq!(crate::config_enum::resolve_in(s, &cfg, env_docker), Ok(("docker", Source::Env)));
+        assert_eq!(
+            crate::config_enum::resolve_in(s, &crate::config::DarkmuxConfig::default(), none),
+            Ok(("docker", Source::BuiltIn))
+        );
+        assert_eq!(sandbox(), Ok(crate::config::SandboxKind::Docker));
+    }
+}
 
 #[cfg(test)]
 mod detection_policy_regression {
