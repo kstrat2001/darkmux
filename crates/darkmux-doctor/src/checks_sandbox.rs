@@ -132,6 +132,12 @@ pub(crate) fn managed_runtime_rows(
     }
 }
 
+/// [`managed_runtime_rows`] read from `platform`: its runtimes' statuses
+/// and its C library.
+pub(crate) fn managed_runtimes_on(selected: &Result<BackendKind, String>, platform: &dyn darkmux_platform::Platform) -> Vec<Check> {
+    managed_runtime_rows(selected, || darkmux_crew::managed_toolchain::statuses_on(platform), platform.c_library())
+}
+
 /// One managed runtime's row under the sandbox on the host `kind`.
 /// `c_library`: this machine's, which names why no build is pinned when it
 /// is musl.

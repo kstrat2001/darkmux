@@ -612,28 +612,117 @@ pub enum CLibrary {
     Musl,
 }
 
-/// The C library a Linux machine whose library folders hold these entries
-/// uses: glibc wherever a glibc dynamic loader (`ld-linux-*`) is (musl's
-/// `ld-musl-*` can sit beside it: Debian's `musl` package installs it next
-/// to glibc); musl only where its loader is the only one; glibc when
-/// neither is found.
-pub(crate) fn c_library_from(lib_entries: &[String]) -> CLibrary {
-    let has = |prefix: &str| lib_entries.iter().any(|n| n.starts_with(prefix));
-    if has("ld-musl-") && !has("ld-linux") {
+/// The C library a program with ELF interpreter `interp` uses: musl when
+/// the interpreter's file name starts with `ld-musl` (Alpine's
+/// `/lib/ld-musl-<arch>.so.1`), glibc for any other, and glibc when it has
+/// none (a static program, a file darkmux could not read or that is not
+/// ELF): the default, as nearly every distribution.
+pub(crate) fn c_library_of_interpreter(interp: Option<&str>) -> CLibrary {
+    let name = interp.map(|p| p.rsplit('/').next().unwrap_or(p));
+    if name.is_some_and(|n| n.starts_with("ld-musl")) {
         CLibrary::Musl
     } else {
         CLibrary::Glibc
     }
 }
 
-/// [`c_library_from`] over the entries of `dirs` (a missing one has none).
-pub(crate) fn c_library_in(dirs: &[std::path::PathBuf]) -> CLibrary {
-    let entries: Vec<String> = dirs
-        .iter()
-        .filter_map(|d| std::fs::read_dir(d).ok())
-        .flat_map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()))
-        .collect();
-    c_library_from(&entries)
+/// How much of a program [`c_library_of_program`] reads: its header,
+/// program headers and interpreter path sit at its start.
+const ELF_READ_BOUND: u64 = 64 * 1024;
+
+/// The C library the program at `path` (a machine's `/bin/sh`) uses, from
+/// its ELF interpreter ([`c_library_of_interpreter`]), reading at most
+/// [`ELF_READ_BOUND`] bytes.
+pub(crate) fn c_library_of_program(path: &std::path::Path) -> CLibrary {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(path).and_then(|f| f.take(ELF_READ_BOUND).read_to_end(&mut bytes));
+    c_library_of_interpreter(read.ok().and_then(|_| elf_interpreter(&bytes)).as_deref())
+}
+
+/// The interpreter (`PT_INTERP`) an ELF file names, from its bytes: 64- or
+/// 32-bit, either byte order. `None` for a file with none (static), cut
+/// short, or not ELF. Every offset is checked against `bytes`.
+pub(crate) fn elf_interpreter(bytes: &[u8]) -> Option<String> {
+    let elf = Elf::read(bytes)?;
+    let raw = elf.interpreter_bytes(elf.interpreter_header()?)?;
+    let path = raw.split(|b| *b == 0).next()?;
+    (!path.is_empty()).then(|| String::from_utf8_lossy(path).into_owned())
+}
+
+/// An ELF file's bytes, its class and its byte order.
+struct Elf<'a> {
+    bytes: &'a [u8],
+    is64: bool,
+    big: bool,
+}
+
+/// A program header's type for the interpreter's path.
+const PT_INTERP: u64 = 3;
+
+impl<'a> Elf<'a> {
+    /// `bytes` as ELF: the magic, then a known class and byte order.
+    fn read(bytes: &'a [u8]) -> Option<Self> {
+        if bytes.get(..4)? != b"\x7fELF" {
+            return None;
+        }
+        let is64 = Self::one_of(*bytes.get(4)?)?;
+        let big = Self::one_of(*bytes.get(5)?)?;
+        Some(Elf { bytes, is64, big })
+    }
+
+    /// An identification byte that is 1 (`false`: 32-bit, little-endian)
+    /// or 2 (`true`: 64-bit, big-endian).
+    fn one_of(b: u8) -> Option<bool> {
+        match b {
+            1 => Some(false),
+            2 => Some(true),
+            _ => None,
+        }
+    }
+
+    /// The `width`-byte unsigned field at `at`, in the file's byte order.
+    fn field(&self, at: usize, width: usize) -> Option<u64> {
+        let raw = self.bytes.get(at..at.checked_add(width)?)?;
+        Some(raw.iter().enumerate().fold(0u64, |acc, (i, b)| {
+            let shift = if self.big { 8 * (width - 1 - i) } else { 8 * i };
+            acc | (u64::from(*b) << shift)
+        }))
+    }
+
+    /// The program header table: its offset, entry size and count, refused
+    /// when an entry is too small for its class or the table runs past the
+    /// bytes.
+    fn program_headers(&self) -> Option<(usize, usize, usize)> {
+        let (phoff, phentsize, phnum) = self.table_fields()?;
+        let fits = phoff.checked_add(phentsize.checked_mul(phnum)?)? <= self.bytes.len();
+        let entry_min = if self.is64 { 56 } else { 32 };
+        (phentsize >= entry_min && fits).then_some((phoff, phentsize, phnum))
+    }
+
+    /// The header's program header table fields: offset, entry size, count.
+    fn table_fields(&self) -> Option<(usize, usize, usize)> {
+        let ((off, off_w), size_at, num_at) = if self.is64 { ((0x20, 8), 0x36, 0x38) } else { ((0x1C, 4), 0x2A, 0x2C) };
+        let phoff = usize::try_from(self.field(off, off_w)?).ok()?;
+        Some((phoff, self.field(size_at, 2)? as usize, self.field(num_at, 2)? as usize))
+    }
+
+    /// Where the `PT_INTERP` program header is, when there is one.
+    fn interpreter_header(&self) -> Option<usize> {
+        let (phoff, phentsize, phnum) = self.program_headers()?;
+        (0..phnum).map(|n| phoff + n * phentsize).find(|ph| self.field(*ph, 4) == Some(PT_INTERP))
+    }
+
+    /// The bytes program header `ph` points at (its file offset and size).
+    fn interpreter_bytes(&self, ph: usize) -> Option<&'a [u8]> {
+        let (offset, size) = if self.is64 {
+            (self.field(ph + 8, 8)?, self.field(ph + 32, 8)?)
+        } else {
+            (self.field(ph + 4, 4)?, self.field(ph + 16, 4)?)
+        };
+        let (offset, size) = (usize::try_from(offset).ok()?, usize::try_from(size).ok()?);
+        self.bytes.get(offset..offset.checked_add(size)?)
+    }
 }
 
 /// The Node.js archive platform for a Linux machine on CPU `arch` with C

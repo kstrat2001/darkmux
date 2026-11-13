@@ -167,11 +167,11 @@ impl Platform for LinuxPlatform {
         crate::linux_node_release_platform(std::env::consts::ARCH, self.c_library()?)
     }
 
-    /// From the dynamic loaders in `/lib` and `/lib64`: glibc wherever a
-    /// glibc loader is, musl only where musl's (Alpine's
-    /// `ld-musl-<arch>.so.1`) is the only one.
+    /// From `/bin/sh`'s ELF interpreter: musl where it is `ld-musl-*`
+    /// (Alpine's busybox, `gcompat` installed or not), glibc otherwise and
+    /// when it cannot be read ([`crate::c_library_of_program`]).
     fn c_library(&self) -> Option<crate::CLibrary> {
-        Some(crate::c_library_in(&lib_dirs()))
+        Some(crate::c_library_of_program(&shell()))
     }
 
     /// The CPU tiers [`Platform::cpu_clusters`] reads, one core per online
@@ -1038,28 +1038,28 @@ fn read_hwmon() -> Vec<HwmonInput> {
     Vec::new()
 }
 
-/// The folders a Linux machine's dynamic loaders are in.
-const LIB_DIRS: [&str; 2] = ["/lib", "/lib64"];
+/// The program whose ELF interpreter names a Linux machine's C library.
+const SHELL: &str = "/bin/sh";
 
 #[cfg(test)]
 thread_local! {
-    static LIB_DIRS_FOR_TEST: std::cell::RefCell<Option<Vec<std::path::PathBuf>>> = const { std::cell::RefCell::new(None) };
+    static SHELL_FOR_TEST: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
-/// [`LIB_DIRS`], or a test's own folders standing in for them.
-fn lib_dirs() -> Vec<std::path::PathBuf> {
+/// [`SHELL`], or a test's own file standing in for it.
+fn shell() -> std::path::PathBuf {
     #[cfg(test)]
-    if let Some(dirs) = LIB_DIRS_FOR_TEST.with(|d| d.borrow().clone()) {
-        return dirs;
+    if let Some(path) = SHELL_FOR_TEST.with(|p| p.borrow().clone()) {
+        return path;
     }
-    LIB_DIRS.iter().map(std::path::PathBuf::from).collect()
+    std::path::PathBuf::from(SHELL)
 }
 
-/// Run `f` with `dirs` as this thread's library folders.
+/// Run `f` with `path` as this thread's shell.
 #[cfg(test)]
-pub(crate) fn with_lib_dirs<T>(dirs: Vec<std::path::PathBuf>, f: impl FnOnce() -> T) -> T {
-    LIB_DIRS_FOR_TEST.with(|d| *d.borrow_mut() = Some(dirs));
+pub(crate) fn with_shell<T>(path: std::path::PathBuf, f: impl FnOnce() -> T) -> T {
+    SHELL_FOR_TEST.with(|p| *p.borrow_mut() = Some(path));
     let out = f();
-    LIB_DIRS_FOR_TEST.with(|d| *d.borrow_mut() = None);
+    SHELL_FOR_TEST.with(|p| *p.borrow_mut() = None);
     out
 }

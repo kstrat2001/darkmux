@@ -29,9 +29,11 @@
 //!   `darkmux_sandbox::toolchain`). No other part of `~/.darkmux` is added to
 //!   what a sandbox reads.
 //! - **Required only when declared** (Kain's decision): a runtime the
-//!   project declares (for Node an `.nvmrc` or `.node-version`, even one
-//!   darkmux cannot read, or a readable `package.json`'s `engines.node`;
-//!   a `package.json` darkmux cannot read declares nothing) must be had, or the sandbox
+//!   project declares (for Node an `.nvmrc` or `.node-version` naming a
+//!   version, even one darkmux cannot read or use (a link, `latest`), but
+//!   not an empty or comment-only one; or a readable `package.json`'s
+//!   `engines.node`; a `package.json` darkmux cannot read declares
+//!   nothing) must be had, or the sandbox
 //!   is refused. One it does not declare is best effort: its default build,
 //!   or, when that cannot be had (a download or verify failure, no build
 //!   pinned for this machine), the sandbox runs without it, with a warning
@@ -90,8 +92,9 @@ pub struct Runtime {
     /// folders asks for, or why none answers it.
     pub pick: for<'p> fn(&[&Path], &'p [Pin]) -> Result<&'p Pin, String>,
     /// Whether a project in these folders declares a version of it, by the
-    /// runtime's own rules (Node: an `.nvmrc` or `.node-version`, even one
-    /// darkmux cannot read, or a readable `package.json`'s `engines.node`).
+    /// runtime's own rules (Node: an `.nvmrc` or `.node-version` naming a
+    /// version, even one darkmux cannot read or use, but not an empty or
+    /// comment-only one; or a readable `package.json`'s `engines.node`).
     /// A declared runtime is required; an undeclared one is best effort.
     pub declares: fn(&[&Path]) -> bool,
     /// What the caller should say about the project's files before any
@@ -436,11 +439,16 @@ pub enum Status {
 /// Each runtime's default build for this host, as `darkmux doctor` shows
 /// it.
 pub fn statuses() -> Vec<(&'static Runtime, Status)> {
+    statuses_on(darkmux_platform::current())
+}
+
+/// [`statuses`] on `platform` (a test's fake one).
+pub fn statuses_on(platform: &dyn darkmux_platform::Platform) -> Vec<(&'static Runtime, Status)> {
     let root = darkmux_types::config_access::toolchains_dir();
-    let platform = darkmux_platform::current().node_release_platform();
+    let build = platform.node_release_platform();
     RUNTIMES
         .iter()
-        .map(|r| (*r, status_in(r, platform, &root, &Source::configured(r))))
+        .map(|r| (*r, status_in(r, build, &root, &Source::configured(r))))
         .collect()
 }
 

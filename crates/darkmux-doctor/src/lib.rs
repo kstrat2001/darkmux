@@ -145,6 +145,15 @@ pub fn run() -> DoctorReport {
 /// [`run`] under `configured`, the sandbox selection and its tier (a test
 /// runs the whole doctor under Seatbelt this way).
 fn run_with(configured: (Result<darkmux_sandbox::BackendKind, String>, darkmux_types::config_access::Source)) -> DoctorReport {
+    run_on(configured, darkmux_platform::current())
+}
+
+/// [`run_with`] on `platform`, whose answers the platform-reading rows use
+/// (a test runs the doctor on a fake one).
+fn run_on(
+    configured: (Result<darkmux_sandbox::BackendKind, String>, darkmux_types::config_access::Source),
+    platform: &dyn darkmux_platform::Platform,
+) -> DoctorReport {
     // (#3112) The sandbox every isolated run uses. Docker's rows are asked
     // only under Docker; the `sandbox` row says whether the one configured
     // can run here, from the `docker runtime` row's one probe under Docker.
@@ -224,11 +233,7 @@ fn run_with(configured: (Result<darkmux_sandbox::BackendKind, String>, darkmux_t
     // (#3561) A row per runtime darkmux supplies to every sandbox on the
     // host, beside the sandbox row.
     let after_sandbox = checks.iter().position(|c| c.name == checks_sandbox::SANDBOX_CHECK_NAME).map_or(checks.len(), |i| i + 1);
-    let runtimes: Vec<Check> = checks_sandbox::managed_runtime_rows(
-        &sandbox,
-        darkmux_crew::managed_toolchain::statuses,
-        darkmux_platform::current().c_library(),
-    );
+    let runtimes: Vec<Check> = checks_sandbox::managed_runtimes_on(&sandbox, platform);
     checks.splice(after_sandbox..after_sandbox, runtimes);
     // (#2947) `None` when a thermal threshold is bad config; that value's
     // own enum-settings row reports it.
@@ -9792,6 +9797,23 @@ mod tests {
         assert!(differs.hint.as_deref().unwrap_or("").contains("restart"), "{:?}", differs.hint);
         assert_eq!(row(Some("seatbelt"), Some("seatbelt")).status, Status::Pass);
         assert_eq!(row(None, None).status, Status::Pass);
+    }
+
+    /// (#3561 re-review) The whole doctor reads the managed runtimes'
+    /// rows from the platform it runs on: a Linux machine using musl, with
+    /// no pinned build, warns naming its C library.
+    #[test]
+    fn the_whole_doctor_names_a_musl_machines_c_library() {
+        use darkmux_sandbox::BackendKind;
+        let musl = darkmux_platform::FakePlatform {
+            c_library: Some(darkmux_platform::CLibrary::Musl),
+            node_release_platform: None,
+            ..Default::default()
+        };
+        let r = with_isolated_darkmux_home(|| run_on((Ok(BackendKind::Landlock), darkmux_types::config_access::Source::Config), &musl));
+        let row = r.checks.iter().find(|c| c.name == "managed node").expect("a managed node row");
+        assert_eq!(row.status, Status::Warn, "{}", row.message);
+        assert!(row.message.contains("C library (musl"), "{}", row.message);
     }
 
     /// (#3112 review) The whole doctor under Seatbelt: the `sandbox` row

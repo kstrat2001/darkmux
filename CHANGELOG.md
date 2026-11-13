@@ -38,8 +38,9 @@ darkmux release.
     and 22.23.5 for macOS on Apple Silicon and Intel, and glibc Linux on x64 and arm64), each archive
     checked against its pinned SHA-256 (never a checksum fetched at run time) and installed atomically
     under `~/.darkmux/toolchains/node-<version>-<platform>/` on first use. A Linux machine using musl
-    (Alpine) has no pinned build: a project that declares Node is refused there, one that declares
-    none runs without it. A build this binary no longer pins is removed by a later install only once
+    (Alpine, also with `gcompat`), told by `/bin/sh`'s ELF interpreter (`ld-musl-*`), has no pinned
+    build: a project that declares Node is refused there, one that declares none runs without it. A
+    glibc machine with the `musl` package installed is still glibc. A build this binary no longer pins is removed by a later install only once
     nobody has used it for 7 days, so a daemon still running an older darkmux keeps its Node.
   - **Visible:** a first use writes `toolchain.fetch` and then `toolchain.ready` or `toolchain.error`
     to the flow; a starting preview shows it as `stage` (`{"code": "getting_node", "detail": "getting

@@ -2174,22 +2174,96 @@ fn another_users_open_files_are_no_answer() {
     }
 }
 
-/// (#3561 re-review) Which C library a Linux machine's programs use, from
-/// the dynamic loaders in its library folders: glibc wherever a glibc
-/// loader (`ld-linux-*`) is, even beside musl's (Debian's `musl` package
-/// installs `ld-musl-*` next to glibc); musl only where its loader
-/// (`ld-musl-<arch>.so.1`, Alpine) is the only one; glibc when neither is
-/// found, as nearly every distribution. A musl machine has no official Node
-/// build darkmux pins (they link glibc), so it names none; a Mac has no
-/// such question.
+/// A minimal ELF file shaped like a real one: a header, then program
+/// headers in a real binary's order (`PT_PHDR`, `PT_INTERP` naming `interp`
+/// when given, then a `PT_LOAD` covering the whole file), in 64- or 32-bit
+/// form and either byte order. Only `PT_INTERP` names an interpreter: a
+/// reader that took another header for it would read the table or the ELF
+/// header as a path.
+fn an_elf(is64: bool, big: bool, interp: Option<&str>) -> Vec<u8> {
+    let (ehsize, phentsize) = if is64 { (64usize, 56usize) } else { (52, 32) };
+    let phnum = 2 + usize::from(interp.is_some());
+    let interp_at = ehsize + phentsize * phnum;
+    let mut b = vec![0u8; interp_at];
+    b[..4].copy_from_slice(b"\x7fELF");
+    b[4] = if is64 { 2 } else { 1 };
+    b[5] = if big { 2 } else { 1 };
+    b[6] = 1;
+    let put = |b: &mut Vec<u8>, at: usize, v: u64, width: usize| {
+        let bytes = if big { v.to_be_bytes() } else { v.to_le_bytes() };
+        let part = if big { &bytes[8 - width..] } else { &bytes[..width] };
+        b[at..at + width].copy_from_slice(part);
+    };
+    if is64 {
+        put(&mut b, 0x20, ehsize as u64, 8);
+        put(&mut b, 0x36, phentsize as u64, 2);
+        put(&mut b, 0x38, phnum as u64, 2);
+    } else {
+        put(&mut b, 0x1C, ehsize as u64, 4);
+        put(&mut b, 0x2A, phentsize as u64, 2);
+        put(&mut b, 0x2C, phnum as u64, 2);
+    }
+    // One program header: type, file offset, file size.
+    let header = |b: &mut Vec<u8>, n: usize, kind: u64, offset: u64, size: u64| {
+        let ph = ehsize + n * phentsize;
+        put(b, ph, kind, 4);
+        if is64 {
+            put(b, ph + 8, offset, 8);
+            put(b, ph + 32, size, 8);
+        } else {
+            put(b, ph + 4, offset, 4);
+            put(b, ph + 16, size, 4);
+        }
+    };
+    header(&mut b, 0, 6, ehsize as u64, (phentsize * phnum) as u64);
+    if let Some(path) = interp {
+        header(&mut b, 1, 3, interp_at as u64, path.len() as u64 + 1);
+        b.extend_from_slice(path.as_bytes());
+        b.push(0);
+    }
+    let len = b.len() as u64;
+    header(&mut b, phnum - 1, 1, 0, len);
+    b
+}
+
+/// (#3561 re-review) A Linux machine's C library is its `/bin/sh`'s ELF
+/// interpreter: musl where it is `ld-musl-*` (Alpine's busybox, also with
+/// `gcompat` installed beside it), glibc for any other (Debian with the
+/// `musl` package, NixOS's store path). Read from 64- and 32-bit files in
+/// either byte order; a file with no interpreter, cut short or not ELF
+/// reads as having none, which is glibc. A musl machine has no official
+/// Node build darkmux pins (they link glibc), so it names none; a Mac has
+/// no such question.
 #[test]
-fn a_musl_linux_names_no_node_build() {
-    let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-    assert_eq!(c_library_from(&names(&["ld-musl-x86_64.so.1", "libz.so.1"])), CLibrary::Musl);
-    assert_eq!(c_library_from(&names(&["ld-linux-x86-64.so.2", "libc.so.6"])), CLibrary::Glibc);
-    assert_eq!(c_library_from(&names(&["ld-musl-x86_64.so.1", "ld-linux-x86-64.so.2"])), CLibrary::Glibc, "musl installed beside glibc");
-    assert_eq!(c_library_from(&names(&["ld-linux-aarch64.so.1", "ld-musl-aarch64.so.1"])), CLibrary::Glibc);
-    assert_eq!(c_library_from(&names(&[])), CLibrary::Glibc, "no loader found: glibc, as nearly every distribution");
+fn a_linux_c_library_is_its_shells_elf_interpreter() {
+    let busybox = an_elf(true, false, Some("/lib/ld-musl-x86_64.so.1"));
+    assert_eq!(elf_interpreter(&busybox).as_deref(), Some("/lib/ld-musl-x86_64.so.1"));
+    assert_eq!(c_library_of_interpreter(elf_interpreter(&busybox).as_deref()), CLibrary::Musl);
+    for (elf, want) in [
+        (an_elf(true, false, Some("/lib/ld-musl-aarch64.so.1")), CLibrary::Musl),
+        (an_elf(true, false, Some("/lib64/ld-linux-x86-64.so.2")), CLibrary::Glibc),
+        (an_elf(true, false, Some("/nix/store/0abc-glibc-2.39-52/lib/ld-linux-x86-64.so.2")), CLibrary::Glibc),
+        (an_elf(false, true, Some("/lib/ld-musl-mips.so.1")), CLibrary::Musl),
+        (an_elf(false, false, Some("/lib/ld-linux-armhf.so.3")), CLibrary::Glibc),
+        (an_elf(true, true, Some("/lib64/ld64.so.2")), CLibrary::Glibc),
+    ] {
+        assert_eq!(c_library_of_interpreter(elf_interpreter(&elf).as_deref()), want, "{:?}", elf_interpreter(&elf));
+    }
+    let static_sh = an_elf(true, false, None);
+    assert_eq!(elf_interpreter(&static_sh), None, "a static shell has no interpreter");
+    let cut = &busybox[..busybox.len() - 10];
+    assert_eq!(elf_interpreter(cut), None, "an interpreter cut short is not read");
+    assert_eq!(elf_interpreter(&busybox[..40]), None, "a header cut short is not read");
+    assert_eq!(elf_interpreter(b"#!/bin/busybox sh\n"), None, "not ELF");
+    let mut no_magic = busybox.clone();
+    no_magic[1] = b'X';
+    assert_eq!(elf_interpreter(&no_magic), None, "a file without the ELF magic is not ELF, whatever follows");
+    assert_eq!(elf_interpreter(&[]), None);
+    let mut lying = busybox.clone();
+    lying[0x38] = 0xff;
+    lying[0x39] = 0xff;
+    assert_eq!(elf_interpreter(&lying), None, "a program header table past the file is not read");
+    assert_eq!(c_library_of_interpreter(None), CLibrary::Glibc, "no interpreter: glibc, the default");
     assert_eq!(linux_node_release_platform("x86_64", CLibrary::Musl), None);
     assert_eq!(linux_node_release_platform("aarch64", CLibrary::Musl), None);
     assert_eq!(linux_node_release_platform("x86_64", CLibrary::Glibc), Some("linux-x64"));
@@ -2200,30 +2274,31 @@ fn a_musl_linux_names_no_node_build() {
     assert_eq!(FakePlatform::default().c_library(), None);
 }
 
-/// (#3561 re-review) `LinuxPlatform` itself reads its library folders
-/// (`/lib`, `/lib64`; here temp folders with fake loaders standing in): a
-/// glibc loader in either, musl's beside it or not, is glibc and names the
-/// glibc build; musl's alone names no build.
+/// (#3561 re-review) `LinuxPlatform` itself reads its shell (here a temp
+/// file standing in for `/bin/sh`): Alpine's busybox, `gcompat` or not,
+/// is musl and names no build; a glibc shell names the glibc build; a shell
+/// it cannot read is glibc.
 #[test]
-fn the_linux_platform_reads_its_own_library_folders() {
-    let lib = tempfile::TempDir::new().unwrap();
-    let lib64 = tempfile::TempDir::new().unwrap();
-    let with = |files: &[(&tempfile::TempDir, &str)]| {
-        for d in [&lib, &lib64] {
-            for e in std::fs::read_dir(d.path()).unwrap().flatten() {
-                std::fs::remove_file(e.path()).unwrap();
-            }
+fn the_linux_platform_reads_its_own_shell() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let sh = dir.path().join("sh");
+    let read = |bytes: Option<Vec<u8>>| {
+        let _ = std::fs::remove_file(&sh);
+        if let Some(b) = bytes {
+            std::fs::write(&sh, b).unwrap();
         }
-        for (d, f) in files {
-            std::fs::write(d.path().join(f), "").unwrap();
-        }
-        crate::linux::with_lib_dirs(vec![lib.path().to_path_buf(), lib64.path().to_path_buf()], || {
-            (LinuxPlatform.c_library(), LinuxPlatform.node_release_platform())
-        })
+        crate::linux::with_shell(sh.clone(), || (LinuxPlatform.c_library(), LinuxPlatform.node_release_platform()))
     };
     let glibc_build = node_release_platform_for(NodeOs::Linux, std::env::consts::ARCH);
-    assert_eq!(with(&[(&lib, "ld-musl-x86_64.so.1")]), (Some(CLibrary::Musl), None));
-    assert_eq!(with(&[(&lib, "ld-musl-x86_64.so.1"), (&lib64, "ld-linux-x86-64.so.2")]), (Some(CLibrary::Glibc), glibc_build));
-    assert_eq!(with(&[(&lib, "ld-linux-aarch64.so.1")]), (Some(CLibrary::Glibc), glibc_build));
-    assert_eq!(with(&[]), (Some(CLibrary::Glibc), glibc_build));
+    assert_eq!(read(Some(an_elf(true, false, Some("/lib/ld-musl-x86_64.so.1")))), (Some(CLibrary::Musl), None));
+    assert_eq!(read(Some(an_elf(true, false, Some("/lib64/ld-linux-x86-64.so.2")))), (Some(CLibrary::Glibc), glibc_build));
+    assert_eq!(read(None), (Some(CLibrary::Glibc), glibc_build), "no shell to read: glibc");
+}
+
+/// (#3561 re-review) This CI host's real `/bin/sh` (Arch on the Omarchy
+/// runner, glibc) reads as glibc.
+#[cfg(target_os = "linux")]
+#[test]
+fn this_linux_hosts_shell_reads_as_glibc() {
+    assert_eq!(LinuxPlatform.c_library(), Some(CLibrary::Glibc));
 }

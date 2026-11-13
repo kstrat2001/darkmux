@@ -1580,3 +1580,23 @@ fn the_package_json_notice_follows_the_declaration_search() {
         "the search goes on to the far one"
     );
 }
+
+/// (#3561 re-review) With two unreadable `package.json` files on the
+/// search, the notice names the nearer one, the first the search reached.
+#[test]
+fn the_package_json_notice_names_the_nearest_unreadable_one() {
+    let (_d, root) = a_dir();
+    let (near, far) = (root.join("ws/pkg"), root.join("ws"));
+    std::fs::create_dir_all(&near).unwrap();
+    std::fs::write(near.join("package.json"), "{ near").unwrap();
+    std::fs::write(far.join("package.json"), "{ far").unwrap();
+    let said = unread_package_json(&[&near, &far]).unwrap();
+    assert!(
+        said.contains(&near.join("package.json").display().to_string()),
+        "{said}"
+    );
+    assert!(
+        !said.contains(&far.join("package.json").display().to_string()),
+        "{said}"
+    );
+}
