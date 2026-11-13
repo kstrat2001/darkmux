@@ -38,7 +38,12 @@ fn a_listener_beyond_the_loopback_stops_the_sandbox_naming_it() {
     let fake = FakePlatform { held_listeners: vec![(100, vec![(4100, at("127.0.0.1", 7)), (4321, at("0.0.0.0", 8))])], ..Default::default() };
     let stops = watched(fake, Duration::from_secs(5));
     assert_eq!(stops.len(), 1, "{stops:?}");
-    for part in ["0.0.0.0:4321 (pid 8)", "A dispatch in the `seatbelt` sandbox", "#3559", "127.0.0.1"] {
+    for part in [
+        "the program listened on 0.0.0.0:4321 (pid 8)",
+        "a server in a dispatch must listen on 127.0.0.1 (or localhost)",
+        "A dispatch in the `seatbelt` sandbox",
+        "#3559",
+    ] {
         assert!(stops[0].contains(part), "{part} not in {}", stops[0]);
     }
     assert!(!stops[0].contains(":4100"), "a loopback listener named: {}", stops[0]);
@@ -60,16 +65,21 @@ fn another_leaders_listener_does_not_stop_this_sandbox() {
     assert_eq!(watched(fake, Duration::from_millis(200)), Vec::<String>::new());
 }
 
+/// A fake whose listing reads follow `reads` (`false`: cannot say).
+fn reading(reads: &[bool]) -> FakePlatform {
+    let fake = FakePlatform::default();
+    *fake.held_listeners_reads.lock().unwrap() = reads.iter().copied().collect();
+    fake
+}
+
 /// (#3559) A listing that cannot be read twice running stops the sandbox
 /// (it cannot be vouched for), saying why and the way back to Docker; one
-/// miss alone does not.
+/// miss alone does not, and neither do misses a good read separates.
 #[test]
 fn an_unreadable_listing_twice_running_stops_the_sandbox() {
-    let once = FakePlatform::default();
-    once.held_listeners_unreadable_reads.store(1, Ordering::SeqCst);
-    assert_eq!(watched(once, Duration::from_millis(200)), Vec::<String>::new());
-    let twice = FakePlatform::default();
-    twice.held_listeners_unreadable_reads.store(2, Ordering::SeqCst);
+    assert_eq!(watched(reading(&[false]), Duration::from_millis(200)), Vec::<String>::new());
+    assert_eq!(watched(reading(&[false, true, false, true, false]), Duration::from_millis(200)), Vec::<String>::new(), "misses a read separates");
+    let twice = reading(&[false, false]);
     let stops = watched(twice, Duration::from_secs(5));
     assert_eq!(stops.len(), 1, "{stops:?}");
     for part in ["cannot read", "seatbelt", "#3559", "docker"] {

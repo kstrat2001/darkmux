@@ -31,14 +31,16 @@
 //!   (`darkmux-crew`'s `sandbox_listeners`), a client preview watches its
 //!   two ports. Both are detection with a window, not a boundary.
 //!   [`Network::None`] allows no network at all, the loopback included.
-//! - **Reach every descendant.** A sandbox is the process group its launcher
-//!   leads, killed over and over until it is empty (a process that keeps
-//!   forking is caught). A descendant that leaves the group (`setsid`, or
-//!   `setpgid` to a group of its own or to another existing group in its
-//!   session; job control does it by itself)
-//!   outlives every kill, still inside the sandbox: it keeps its file and
-//!   network rules (binds and inbound only on the named ports) and nothing
-//!   ends it: nothing marks it as the sandbox's, so nothing else is killed.
+//! - **Reach every descendant.** A sandbox is the session its launcher leads
+//!   (#3559): its process group is killed over and over until it is empty (a
+//!   process that keeps forking is caught), then every other process in the
+//!   session is (one that moved to a group of its own, as a runtime's tool
+//!   command or job control does). Nothing in it can move into another
+//!   sandbox's group, or darkmux's, and it has no controlling terminal. A
+//!   descendant that starts a session of its own (`setsid`) outlives every
+//!   kill, still inside the sandbox: it keeps its file and network rules
+//!   (binds and inbound only on the named ports) and nothing ends it:
+//!   nothing marks it as the sandbox's, so nothing else is killed.
 //!
 //! Each sandbox has a directory under [`state_root`] while it exists: its
 //! profile, its labels, its launcher's pid once started, its own `tmp`
@@ -122,8 +124,11 @@ mkdir -m 700 "$d/tmp" && printf '%s' "$2" > "$d/profile.sb" && printf '%s' "$3" 
 /// launcher's whole group again and again until it is empty (#3112): one
 /// kill of a group reaches every member at that instant, a fork-hopper's
 /// newest pid included, where a list of pids is always a step behind.
-/// A process that moved to a group of its own (`setsid`, `setpgid`) is not
-/// reached: unlike a container's, this sandbox does not end everything in it.
+/// Then (#3559) it ends every other process in the launcher's session
+/// ([`sweep!`]), so one that moved to a group of its own (`setpgid`, as a
+/// runtime's tool command does) ends too. Only one that started a session of
+/// its own (`setsid`) is not reached: unlike a container's, this sandbox
+/// does not end everything in it.
 const LAUNCH: &str = r#"wd=$1; shift
 echo $$ > "$d/pid" && ps -o lstart= -p $$ > "$d/started" || exit 125
 {GUARD} "$$" </dev/null >/dev/null 2>&1 &
@@ -135,19 +140,38 @@ rc=$?
 g=$$
 "#;
 
+/// (#3559) Perl that kills every process in session `$ARGV[0]` but itself
+/// and zombies, listing them again until none is left (at most 200 times).
+/// A Seatbelt launcher leads a session of its own, so its session is the
+/// whole sandbox but what started a session of its own (`setsid`). macOS's
+/// `ps` does not print a session id, so each listed pid's is asked of the
+/// kernel: `getsid` is system call 310 (`<sys/syscall.h>`), which perl
+/// reaches without headers; a pid gone since it was listed answers -1 and is
+/// skipped. No single quote: it runs inside one.
+macro_rules! sweep {
+    () => {
+        "my $s = $ARGV[0] + 0; for (1 .. 200) { my @p = map { $_->[0] } grep { $_->[0] != $$ && $_->[1] !~ /^Z/ && syscall(310, $_->[0] + 0) == $s } map { [split] } `/bin/ps -A -o pid=,stat=`; last unless @p; kill(\"KILL\", @p); select(undef, undef, undef, 0.01); }"
+    };
+}
+
 /// Ends every process in group `$g` from outside it (stop, remove and kill
 /// run in a group of their own): the whole group is killed at once, again
 /// and again until no process is left in it, at most 1000 times. One kill
 /// of a group reaches every member at that instant, so a process that keeps
 /// forking a new pid (a fork-hopper) is caught where a list of pids, always
-/// a step behind, is not. A process that moved to a group of its own is
-/// not in it.
-const DRAIN: &str = r#"n=0
+/// a step behind, is not. Then (#3559) every process left in the session
+/// `$g` leads ([`sweep!`]): one that moved to a group of its own in it.
+const DRAIN: &str = concat!(
+    r#"n=0
 while [ "$n" -lt 1000 ] && kill -0 -- "-$g" 2>/dev/null; do
   kill -KILL -- "-$g" 2>/dev/null
   n=$((n + 1))
 done
-"#;
+/usr/bin/perl -e '"#,
+    sweep!(),
+    r#"' "$g"
+"#
+);
 
 /// The launcher's end: the directory removed, the program's status its
 /// own. What the program left running in the group is ended by the
@@ -161,8 +185,13 @@ fn launcher() -> String {
     format!("{}{LAUNCHED}", LAUNCH.replacen("{GUARD}", GUARD, 1))
 }
 
-/// The launcher's guard ([`LAUNCH`]), its launcher's pid its argument.
-const GUARD: &str = r#"/usr/bin/perl -e 'setpgrp(0, 0); my $l = $ARGV[0]; select(undef, undef, undef, 0.05) while getppid() == $l; for (1 .. 1000) { last unless kill(0, -$l); kill("KILL", -$l); }'"#;
+/// The launcher's guard ([`LAUNCH`]), its launcher's pid its argument: the
+/// group drained, then the session swept ([`sweep!`]).
+const GUARD: &str = concat!(
+    r#"/usr/bin/perl -e 'setpgrp(0, 0); my $l = $ARGV[0]; select(undef, undef, undef, 0.05) while getppid() == $l; for (1 .. 1000) { last unless kill(0, -$l); kill("KILL", -$l); } "#,
+    sweep!(),
+    "'"
+);
 
 /// Whether `$d` is a sandbox's directory at all: only a directory holding
 /// the profile this backend wrote is ever listed, stopped or deleted.
@@ -182,6 +211,10 @@ pub fn state_root() -> PathBuf {
         _ => PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".darkmux/seatbelt"),
     }
 }
+
+/// How a planned shell command is built: `script` with its arguments and
+/// environment ([`SeatbeltBackend::script`] or its launcher twin).
+type BuildScript = fn(&str, &[String], &[(String, String)]) -> Command;
 
 /// Sandboxes as `sandbox-exec` processes on this host.
 #[derive(Debug, Clone, Copy, Default)]
@@ -343,13 +376,35 @@ impl SeatbeltBackend {
         cmd
     }
 
+    /// (#3559) [`Self::script`] for a command that becomes a sandbox's
+    /// launcher: it leads a session of its own rather than only a group, so
+    /// nothing in the sandbox can move into another sandbox's process group
+    /// (or darkmux's: `setpgid` across sessions is refused), and it has no
+    /// controlling terminal. Its group is still its own pid, which every
+    /// stop, kill and its guard signal. A caller must not set a process
+    /// group on it as well: the spawn would fail.
+    fn launcher_script(script: &str, args: &[String], env: &[(String, String)]) -> Command {
+        let mut cmd = Command::new(SH);
+        cmd.arg("-c").arg(script).arg("sh").args(args);
+        cmd.env_clear().envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        darkmux_platform::in_a_session_of_its_own(&mut cmd);
+        cmd
+    }
+
     /// A lifecycle command for `handle`'s directory, or one that fails
     /// naming why when its id is no sandbox name.
     fn on_dir(handle: &SandboxHandle, script: &str, extra: &[String]) -> Command {
+        Self::on_dir_as(handle, script, extra, Self::script)
+    }
+
+    /// [`Self::on_dir`], its command built by `build` ([`Self::script`], or
+    /// [`Self::launcher_script`] for `start`, whose command becomes the
+    /// launcher).
+    fn on_dir_as(handle: &SandboxHandle, script: &str, extra: &[String], build: BuildScript) -> Command {
         match dir_of(&handle.id) {
             Some(dir) => {
                 let args: Vec<String> = std::iter::once(dir.to_string_lossy().into_owned()).chain(extra.iter().cloned()).collect();
-                Self::script(&format!("d=$1\n{script}"), &args, &[("PATH".into(), DEFAULT_PATH.into())])
+                build(&format!("d=$1\n{script}"), &args, &[("PATH".into(), DEFAULT_PATH.into())])
             }
             None => refused(&handle.id),
         }
@@ -452,7 +507,7 @@ impl SandboxBackend for SeatbeltBackend {
             policy.workdir.clone().unwrap_or_default(),
         ];
         args.extend(Self::program(policy));
-        let mut cmd = Self::script(&format!("{PREPARE}shift 3\n{}", launcher()), &args, &Self::environment(policy, &dir));
+        let mut cmd = Self::launcher_script(&format!("{PREPARE}shift 3\n{}", launcher()), &args, &Self::environment(policy, &dir));
         if !policy.stdin {
             cmd.stdin(Stdio::null());
         }
@@ -480,8 +535,8 @@ impl SandboxBackend for SeatbeltBackend {
     }
 
     fn start(&self, handle: &SandboxHandle) -> Command {
-        let mut cmd = Self::on_dir(handle, r#"[ -f "$d/start.sh" ] || { echo "seatbelt: no created sandbox $d" >&2; exit 125; }
-exec /bin/sh "$d/start.sh""#, &[]);
+        let mut cmd = Self::on_dir_as(handle, r#"[ -f "$d/start.sh" ] || { echo "seatbelt: no created sandbox $d" >&2; exit 125; }
+exec /bin/sh "$d/start.sh""#, &[], Self::launcher_script);
         cmd.stdin(Stdio::null());
         cmd
     }

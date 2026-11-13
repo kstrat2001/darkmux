@@ -62,7 +62,8 @@ pub struct Host {
     /// loopback bind from any other.
     pub every_address_reaches_the_lan: bool,
     /// (#3559) With the default network and no ports named (a dispatch's
-    /// shape): makes a socket listen on every address, binding `port` where
+    /// shape): from a process group of its own (as a runtime's tool command
+    /// runs), makes a socket listen on every address, binding `port` where
     /// the backend allows it and otherwise by a `listen` with no bind (the
     /// kernel then binds every address, on a port of its choosing), writes
     /// `listening <port>` to `said` in its working directory (or `refused`
@@ -74,13 +75,18 @@ pub struct Host {
     /// what a backend refuses shows. Today every backend does (a container
     /// on its own network; a sandbox on the host on this machine's).
     pub listens_beyond: bool,
+    /// (#3559) Writes `joined` to `said` when it could move itself into
+    /// host process group `group` (another sandbox's), else `refused`.
+    /// `None` for a container: its processes cannot name a host group.
+    pub join_group: Option<fn(u32) -> String>,
     /// Runs `script` in a process group of its own (`setsid` in a Linux
     /// image, `setpgrp` on macOS), in the background of the caller's shell.
     pub new_group: fn(&str) -> String,
     /// Whether a process that moved to a group of its own outlives the
     /// sandbox's program: never in a container (its init's exit ends every
-    /// process in it); in a sandbox on the host, it does (the launcher can
-    /// end only its own group), recorded, not wanted.
+    /// process in it), nor under Landlock (its pid namespace's init), nor
+    /// under Seatbelt since #3559 (the sandbox is its launcher's session,
+    /// swept on the way out). Recorded, so a change shows.
     pub a_new_group_outlives_the_program: bool,
     /// The host process group a running sandbox's processes are in, when
     /// they are host processes (a sandbox on the host): `None` for a
@@ -564,8 +570,59 @@ fn a_listener_beyond_the_loopback_is_refused_or_stopped(backend: &dyn SandboxBac
         let _ = client.wait();
     }
     assert!(why.contains(&format!(":{listening} (pid")), "the watch named no listener on port {listening}: {why:?}");
+    // The stop ends the listener itself, not only the sandbox's program: the
+    // script listens from a process group of its own, as a runtime's tool
+    // command does.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut still = std::net::TcpStream::connect(("127.0.0.1", listening)).is_ok();
+    while still && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        still = std::net::TcpStream::connect(("127.0.0.1", listening)).is_ok();
+    }
+    assert!(!still, "port {listening} still listened after the sandbox was stopped");
     assert!(!why.contains(&format!(":{} ", foreign.local_addr().unwrap().port())), "another process's listener named: {why}");
     assert!(ended, "the sandbox ran on after the watch stopped it");
+}
+
+/// (#3559) A process in one sandbox cannot move into another's process
+/// group: had it, the other sandbox's listener watch would count its
+/// listener (and stop the wrong sandbox), and the other's guard would kill
+/// it. Each sandbox on the host is a session of its own, and a group in
+/// another session cannot be joined.
+fn a_sandbox_cannot_join_another_sandboxs_group(backend: &dyn SandboxBackend, host: &Host) {
+    let Some(join) = host.join_group else { return };
+    // A group can be joined only from inside its own session, so either side
+    // being a session of its own refuses it: each launcher path (`run`, and
+    // `create` then `start`) is tried on both sides at once.
+    let (one, two) = (tempfile::TempDir::new().unwrap(), tempfile::TempDir::new().unwrap());
+    let (mut cmd, ran) = backend.run(&policy(backend, host.image, one.path(), "sleep 30"));
+    let _ran = Removed(backend, ran);
+    let mut a = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let (create, made) = backend.create(&policy(backend, host.image, two.path(), "sleep 30"));
+    let _made = Removed(backend, made.clone());
+    assert!(matches!(run_bounded(create, Duration::from_secs(60)), Bounded::Finished { success: true, .. }));
+    let mut b = backend.start(&made).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let from_a_run = |group: u32| {
+        let tree = tempfile::TempDir::new().unwrap();
+        run_ok(backend, &policy(backend, host.image, tree.path(), &format!("{} ; cat said", join(group)))).trim().to_string()
+    };
+    let from_a_start = |group: u32| {
+        let tree = tempfile::TempDir::new().unwrap();
+        let (create, made) = backend.create(&policy(backend, host.image, tree.path(), &join(group)));
+        let _made = Removed(backend, made.clone());
+        assert!(matches!(run_bounded(create, Duration::from_secs(60)), Bounded::Finished { success: true, .. }));
+        let started = run_bounded(backend.start(&made), Duration::from_secs(60));
+        assert!(matches!(started, Bounded::Finished { success: true, .. }), "{}", describe(&started));
+        std::fs::read_to_string(tree.path().join("said")).unwrap_or_default().trim().to_string()
+    };
+    let (into_ran, into_started) = (from_a_run(a.id()), from_a_start(b.id()));
+    for c in [&mut a, &mut b] {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    assert_eq!(into_ran, "refused", "a sandbox joined a run sandbox's process group");
+    assert_eq!(into_started, "refused", "a sandbox joined a started sandbox's process group");
 }
 
 /// (#3559) The inverse: a server on the sandbox's own loopback (a test
@@ -633,7 +690,7 @@ fn a_sandbox_ends_with_its_program(backend: &dyn SandboxBackend, host: &Host) {
     std::thread::sleep(Duration::from_secs(3));
     let (left, hops, group) = (tree.path().join("left").exists(), grew("hops"), grew("group"));
     if let Ok(pid) = std::fs::read_to_string(tree.path().join("group.pid")) {
-        if host.a_new_group_outlives_the_program {
+        if group {
             let _ = std::process::Command::new("kill").args(["-KILL", pid.trim()]).status();
         }
     }
@@ -933,6 +990,11 @@ macro_rules! conformance {
             }
             #[test]
             #[ignore = $needs]
+            fn a_sandbox_cannot_join_another_sandboxs_group() {
+                super::a_sandbox_cannot_join_another_sandboxs_group(&$make, &$host)
+            }
+            #[test]
+            #[ignore = $needs]
             fn a_loopback_listener_is_never_stopped() {
                 super::a_loopback_listener_is_never_stopped(&$make, &$host)
             }
@@ -979,7 +1041,16 @@ conformance!(
         serve_any: |port| format!("while :; do echo served | nc -l -p {port} || sleep 1; done"),
         every_address_reaches_the_lan: false,
         listens_beyond: true,
-        listen_beyond: |port| format!("echo listening {port} > said; while :; do echo served | nc -l -p {port} || sleep 1; done"),
+        join_group: None,
+        // `listening` only once the kernel's own table shows the socket in
+        // LISTEN on every address (all-zero address, either family: busybox
+        // `nc` listens on `::`; state `0A`), so "not reachable" is never read
+        // off a port nothing listens on.
+        listen_beyond: |port| format!(
+            "(while :; do echo served | nc -l -p {port} || sleep 1; done) & \
+             i=0; until cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | grep -Eq '^ *[0-9]+: 0+:{port:04X} 0+:0000 0A' || [ $i -ge 100 ]; do sleep 0.1; i=$((i + 1)); done; \
+             cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | grep -Eq '^ *[0-9]+: 0+:{port:04X} 0+:0000 0A' && echo listening {port} > said || echo refused > said; wait"
+        ),
         new_group: |script| format!("setsid sh -c '{script}' &"),
         a_new_group_outlives_the_program: false,
         host_group: |_| None,
@@ -1002,17 +1073,20 @@ conformance!(
         // #3559: recorded, not wanted.
         every_address_reaches_the_lan: true,
         listens_beyond: true,
+        join_group: Some(|group| format!("/usr/bin/perl -e 'print(setpgrp(0, {group}) ? \"joined\" : \"refused\")' > said")),
         // The system's perl (no Python is assumed on a Mac). With no ports
         // named, Seatbelt lets it bind any port on every address.
         listen_beyond: |port| format!(
-            "/usr/bin/perl -MSocket -e 'socket(S, PF_INET, SOCK_STREAM, 0) or die; setsockopt(S, SOL_SOCKET, SO_REUSEADDR, 1); \
+            "/usr/bin/perl -MSocket -e 'setpgrp(0, 0); socket(S, PF_INET, SOCK_STREAM, 0) or die; setsockopt(S, SOL_SOCKET, SO_REUSEADDR, 1); \
              bind(S, sockaddr_in({port}, INADDR_ANY)); $ok = listen(S, 5); $at = $ok ? (sockaddr_in(getsockname(S)))[0] : 0; \
              open(F, \">said\"); print F ($ok ? \"listening $at\" : \"refused\"); close(F); \
              while ($ok && accept(C, S)) {{ print C \"served\\n\"; close(C); }}'"
         ),
         new_group: |script| format!("/usr/bin/perl -e 'setpgrp(0, 0); exec @ARGV' sh -c '{script}' &"),
-        // Recorded, not wanted: the launcher ends only its own group.
-        a_new_group_outlives_the_program: true,
+        // (#3559) The sandbox is its session: every group in it is ended,
+        // one that moved to a group of its own included (only `setsid`
+        // leaves it).
+        a_new_group_outlives_the_program: false,
         host_group: |name| {
             let pid = std::fs::read_to_string(darkmux_sandbox::seatbelt::state_root().join(name).join("pid")).ok()?;
             pid.trim().parse().ok()
@@ -1045,10 +1119,13 @@ conformance!(
         // Landlock holds a bind to the named ports but not to an address.
         every_address_reaches_the_lan: true,
         listens_beyond: true,
+        join_group: Some(|group| format!(
+            "python3 -c \"import os\ntry:\n    os.setpgid(0, {group}); print('joined')\nexcept OSError:\n    print('refused')\" > said"
+        )),
         // With no ports named Landlock refuses the bind, but a `listen` with
         // no bind is not a bind it sees: the kernel binds every address.
         listen_beyond: |port| format!(
-            "python3 -c \"import socket\ns = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ntry:\n    s.bind(('0.0.0.0', {port}))\nexcept OSError:\n    pass\ntry:\n    s.listen(5); said = 'listening %d' % s.getsockname()[1]\nexcept OSError:\n    said = 'refused'\nopen('said', 'w').write(said)\nwhile said != 'refused':\n    c, _ = s.accept(); c.sendall(b'served\\n'); c.close()\""
+            "python3 -c \"import os, socket\nos.setpgid(0, 0)\ns = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ntry:\n    s.bind(('0.0.0.0', {port}))\nexcept OSError:\n    pass\ntry:\n    s.listen(5); said = 'listening %d' % s.getsockname()[1]\nexcept OSError:\n    said = 'refused'\nopen('said', 'w').write(said)\nwhile said != 'refused':\n    c, _ = s.accept(); c.sendall(b'served\\n'); c.close()\""
         ),
         new_group: |script| format!("setsid sh -c '{script}' &"),
         // A pid namespace of its own: its init's exit ends every process in

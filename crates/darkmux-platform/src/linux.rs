@@ -423,25 +423,28 @@ pub(crate) fn pid_namespace_from_link(link: &str) -> Option<String> {
     (!inode.is_empty() && inode.bytes().all(|b| b.is_ascii_digit())).then(|| format!("pid:{inode}"))
 }
 
-/// (#3559) `/proc/<pid>/stat`'s pid, parent and process group. The name
+/// (#3559) `/proc/<pid>/stat`'s pid, parent, process group and session. The name
 /// field is in parentheses and may hold either, so the fields are read
 /// after its last `)`.
-pub(crate) fn stat_ids(stat: &str) -> Option<(u32, u32, u32)> {
+pub(crate) fn stat_ids(stat: &str) -> Option<(u32, u32, u32, u32)> {
     let pid = stat.split_whitespace().next()?.parse().ok()?;
     let mut after = stat.get(stat.rfind(')')? + 1..)?.split_whitespace().skip(1);
-    Some((pid, after.next()?.parse().ok()?, after.next()?.parse().ok()?))
+    let mut next = || after.next()?.parse().ok();
+    Some((pid, next()?, next()?, next()?))
 }
 
 /// (#3559) Whether `/proc/<pid>/stat` says the process has exited: a
-/// zombie (`Z`) or dead (`X`), which holds no open files.
+/// zombie (`Z`) or dead (`X`), which holds no open files. (Compiled on
+/// every OS for its test; only Linux reads `/proc`.)
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn stat_says_exited(stat: &str) -> bool {
     stat.rfind(')').and_then(|end| stat.get(end + 1..)).and_then(|rest| rest.split_whitespace().next()).is_some_and(|state| matches!(state, "Z" | "X"))
 }
 
-/// (#3559) `(pid, ppid, pgid)` of every process in `/proc`; `None` when
+/// (#3559) `(pid, ppid, pgid, sid)` of every process in `/proc`; `None` when
 /// `/proc` lists none. A process that exited between the listing and the
 /// read is left out.
-fn proc_table() -> Option<Vec<(u32, u32, u32)>> {
+fn proc_table() -> Option<Vec<(u32, u32, u32, u32)>> {
     let pids: Vec<u32> = list_dir("/proc").into_iter().filter_map(|name| name.parse().ok()).collect();
     if pids.is_empty() {
         return None;
@@ -449,25 +452,33 @@ fn proc_table() -> Option<Vec<(u32, u32, u32)>> {
     Some(pids.into_iter().filter_map(|pid| stat_ids(&read_to_string(&format!("/proc/{pid}/stat"))?)).collect())
 }
 
-/// (#3559) The socket inodes `pid`'s open files name: none when it has
-/// exited (gone, or a zombie, whose `fd` directory the kernel gives to root
-/// and so cannot be read), `None` when its `fd` directory cannot be read
-/// otherwise (another user's process, or one this user may not inspect).
+/// (#3559) The socket inodes `pid`'s open files name, from reading its
+/// `fd` directory (`links`, or the error kind it failed with) and its
+/// `stat` (read only on a refusal): none when it has exited (gone, or a
+/// zombie, whose `fd` directory the kernel gives to root and so cannot be
+/// read), `None` when its `fd` directory was refused otherwise (another
+/// user's process, or one this user may not inspect). Compiled on every OS
+/// for its test; only Linux reads `/proc`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn socket_inodes_in(links: Result<Vec<String>, std::io::ErrorKind>, stat: impl FnOnce() -> Option<String>) -> Option<Vec<u64>> {
+    match links {
+        Ok(links) => Some(links.iter().filter_map(|l| socket_inode(l)).collect()),
+        Err(std::io::ErrorKind::NotFound) => Some(Vec::new()),
+        Err(_) => stat().is_none_or(|stat| stat_says_exited(&stat)).then(Vec::new),
+    }
+}
+
+/// [`socket_inodes_in`] for `pid`, from `/proc`.
 #[cfg(target_os = "linux")]
-fn socket_inodes_held_by(pid: u32) -> Option<Vec<u64>> {
-    let dir = match std::fs::read_dir(format!("/proc/{pid}/fd")) {
-        Ok(dir) => dir,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
-        Err(_) => {
-            let exited = read_to_string(&format!("/proc/{pid}/stat")).is_none_or(|stat| stat_says_exited(&stat));
-            return exited.then(Vec::new);
-        }
-    };
-    Some(dir.flatten().filter_map(|fd| std::fs::read_link(fd.path()).ok()).filter_map(|l| socket_inode(&l.to_string_lossy())).collect())
+pub(crate) fn socket_inodes_held_by(pid: u32) -> Option<Vec<u64>> {
+    let links = std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .map(|dir| dir.flatten().filter_map(|fd| std::fs::read_link(fd.path()).ok()).map(|l| l.to_string_lossy().into_owned()).collect())
+        .map_err(|e| e.kind());
+    socket_inodes_in(links, || read_to_string(&format!("/proc/{pid}/stat")))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn socket_inodes_held_by(_pid: u32) -> Option<Vec<u64>> {
+pub(crate) fn socket_inodes_held_by(_pid: u32) -> Option<Vec<u64>> {
     None
 }
 

@@ -1809,41 +1809,43 @@ fn a_bounded_command_with_more_output_than_a_pipe_holds_finishes() {
     assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
 }
 
-/// (#3559) A sandbox's processes in a process table: its leader, every
-/// process in the leader's group (an orphan the leader left behind among
-/// them), and every descendant of any of those (one that moved to a group
-/// of its own included). Nothing else: not another group's, not the
-/// leader's own parent.
+/// (#3559) A sandbox's processes in a process table of (pid, ppid, pgid,
+/// sid): its leader, every process in the leader's group or session (an
+/// orphan the leader left behind among them, one in a group of its own
+/// included), and every descendant of any of those (one that moved to a
+/// session of its own included). Nothing else: not another session's, not
+/// the leader's own parent.
 #[test]
 fn a_sandboxs_processes_are_its_group_and_their_descendants() {
     let table = [
-        (1, 0, 1),       // launchd / init
-        (50, 1, 50),     // the leader's parent (darkmux)
-        (100, 50, 100),  // the leader
-        (101, 100, 100), // its child, in its group
-        (102, 101, 102), // a grandchild that moved to a group of its own
-        (105, 102, 105), // and its child
-        (103, 1, 100),   // an orphan still in the group
-        (104, 103, 104), // the orphan's child, in a group of its own
-        (200, 1, 200),   // another program
-        (201, 200, 200), // and its child
+        (1, 0, 1, 1),         // launchd / init
+        (50, 1, 50, 40),      // the leader's parent (darkmux)
+        (100, 50, 100, 100),  // the leader
+        (101, 100, 100, 100), // its child, in its group
+        (102, 101, 102, 102), // a grandchild that started a session of its own
+        (105, 102, 105, 102), // and its child
+        (103, 1, 100, 100),   // an orphan still in the group
+        (104, 103, 104, 100), // the orphan's child, in a group of its own
+        (106, 1, 106, 100),   // an orphan in a group of its own, still in the session
+        (200, 1, 200, 200),   // another program
+        (201, 200, 200, 200), // and its child
     ];
-    assert_eq!(crate::sandbox_members(100, &table), vec![100, 101, 102, 103, 104, 105]);
+    assert_eq!(crate::sandbox_members(100, &table), vec![100, 101, 102, 103, 104, 105, 106]);
     // A leader that has exited still has its group and what descends from it.
-    let gone: Vec<_> = table.iter().copied().filter(|(p, _, _)| *p != 100).collect();
-    assert_eq!(crate::sandbox_members(100, &gone), vec![100, 101, 102, 103, 104, 105]);
+    let gone: Vec<_> = table.iter().copied().filter(|(p, _, _, _)| *p != 100).collect();
+    assert_eq!(crate::sandbox_members(100, &gone), vec![100, 101, 102, 103, 104, 105, 106]);
     // launchd or init is never a sandbox's leader: nothing would be outside it.
     assert_eq!(crate::sandbox_members(1, &table), Vec::<u32>::new());
     assert_eq!(crate::sandbox_members(0, &table), Vec::<u32>::new());
 }
 
-/// (#3559) `/proc/<pid>/stat` as (pid, ppid, pgrp): the name, in
+/// (#3559) `/proc/<pid>/stat` as (pid, ppid, pgrp, session): the name, in
 /// parentheses, may hold spaces and parentheses itself.
 #[test]
 fn a_proc_stat_line_reads_as_its_pid_parent_and_group() {
-    assert_eq!(crate::linux::stat_ids("1234 (my (odd) prog) S 1200 1234 1234 0 -1 4194560"), Some((1234, 1200, 1234)));
-    assert_eq!(crate::linux::stat_ids("7 (sh) R 1 7 7"), Some((7, 1, 7)));
-    assert_eq!(crate::linux::stat_ids("7 (sh) R"), None);
+    assert_eq!(crate::linux::stat_ids("1234 (my (odd) prog) S 1200 1234 1230 0 -1 4194560"), Some((1234, 1200, 1234, 1230)));
+    assert_eq!(crate::linux::stat_ids("7 (sh) R 1 7 7"), Some((7, 1, 7, 7)));
+    assert_eq!(crate::linux::stat_ids("7 (sh) R 1 7"), None);
     assert_eq!(crate::linux::stat_ids(""), None);
     // A zombie holds no files (its `fd` directory is root's, so unreadable).
     assert!(crate::linux::stat_says_exited("9 (a (Z) b) Z 1 9 9"));
@@ -2004,8 +2006,9 @@ time.sleep(30)
     let one = PortListener { addr: Some(any4), text: "0.0.0.0".into(), scope: None, pid: Some(7) };
     let fake = FakePlatform { held_listeners: vec![(5, vec![(80, one.clone())])], ..Default::default() };
     assert_eq!((fake.tcp_listeners_held_by(5), fake.tcp_listeners_held_by(6)), (Some(vec![(80, one)]), Some(vec![])));
-    fake.held_listeners_unreadable_reads.store(1, std::sync::atomic::Ordering::SeqCst);
-    assert_eq!((fake.tcp_listeners_held_by(5).is_none(), fake.tcp_listeners_held_by(6)), (true, Some(vec![])));
+    *fake.held_listeners_reads.lock().unwrap() = [false, true, false].into();
+    let reads: Vec<bool> = (0..4).map(|_| fake.tcp_listeners_held_by(6).is_some()).collect();
+    assert_eq!(reads, [false, true, false, true], "the scripted reads, then answers");
 }
 
 /// (#3559) Whether a listener is on the loopback, and how a message names
@@ -2044,9 +2047,110 @@ fn a_libproc_read_is_whole_gone_or_no_answer() {
     assert_eq!(libproc_read(0, None, 0), LibprocRead::Read);
     assert_eq!(libproc_read(0, Some(792), 3), LibprocRead::Gone);
     assert_eq!(libproc_read(0, Some(792), 9), LibprocRead::Gone);
+    assert_eq!(libproc_read(0, Some(792), 38), LibprocRead::Gone, "ENOTSOCK: the descriptor reused for a file");
     assert_eq!(libproc_read(0, None, 3), LibprocRead::Gone);
     assert_eq!(libproc_read(400, Some(792), 0), LibprocRead::Unreadable);
     assert_eq!(libproc_read(0, Some(792), 0), LibprocRead::Unreadable);
     assert_eq!(libproc_read(0, Some(792), 1), LibprocRead::Unreadable);
     assert_eq!(libproc_read(-1, None, 1), LibprocRead::Unreadable);
+}
+
+/// (#3559) A command started in a session of its own leads it (its
+/// session and group are its own pid), and what it runs cannot move into a
+/// process group of another session (this test's). Set together with
+/// `process_group(0)`, the spawn fails rather than quietly staying in the
+/// caller's session.
+#[cfg(unix)]
+#[test]
+fn a_command_in_a_session_of_its_own_cannot_join_another_sessions_group() {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: plain queries of this process.
+    let ours = unsafe { libc::getpgrp() };
+    let mut cmd = std::process::Command::new("/usr/bin/perl");
+    cmd.args(["-e", &format!("$| = 1; print(setpgrp(0, {ours}) ? 'joined' : 'refused'); sleep 5")]);
+    cmd.stdout(std::process::Stdio::piped());
+    crate::in_a_session_of_its_own(&mut cmd);
+    let mut child = cmd.spawn().unwrap();
+    let pid = child.id() as i32;
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    // SAFETY: queries of the child this test started.
+    let (sid, group) = unsafe { (libc::getsid(pid), libc::getpgid(pid)) };
+    let _ = child.kill();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!((sid, group), (pid, pid), "it leads a session and a group of its own");
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("refused"), "{:?}", String::from_utf8_lossy(&out.stdout));
+    let mut both = std::process::Command::new("/usr/bin/true");
+    crate::in_a_session_of_its_own(&mut both);
+    both.process_group(0);
+    assert!(both.spawn().is_err(), "a group leader cannot start a session: the spawn must fail");
+}
+
+/// (#3559) At the call sites, a refused read is no answer, never "none":
+/// macOS's per-socket reads (`proc_pidfdinfo`) and its descriptor list
+/// (`PROC_PIDLISTFDS`), and Linux's `fd` directory. A descriptor or process
+/// that is gone since it was listed (closed, reused for a file, exited, a
+/// zombie) holds nothing.
+#[test]
+fn a_refused_read_at_the_call_site_is_no_answer() {
+    use crate::macos::libproc::{listeners_in_records, socket_fds_in, SOCKET_FDINFO_SIZE};
+    let full = SOCKET_FDINFO_SIZE as i32;
+    let names = |_: u32| None;
+    // A listener record: TCP, LISTEN, IPv4 every address, port 80.
+    let listener = |info: &mut [u8]| {
+        info[256..260].copy_from_slice(&2i32.to_ne_bytes());
+        info[344..348].copy_from_slice(&1i32.to_ne_bytes());
+        info[288] = 1;
+        info[268..270].copy_from_slice(&80u16.to_be_bytes());
+    };
+    let read = |answers: Vec<(i32, i32)>| {
+        let mut answers = answers.into_iter();
+        move |_fd: i32, info: &mut [u8]| {
+            let (got, errno) = answers.next().unwrap();
+            if got == SOCKET_FDINFO_SIZE as i32 {
+                listener(info);
+            }
+            (got, errno)
+        }
+    };
+    let ports = |held: Option<Vec<(u16, PortListener)>>| held.map(|h| h.into_iter().map(|(p, _)| p).collect::<Vec<_>>());
+    assert_eq!(ports(listeners_in_records(7, &[3, 4], read(vec![(full, 0), (full, 0)]), names)), Some(vec![80, 80]));
+    for gone in [9, 38, 3] {
+        assert_eq!(ports(listeners_in_records(7, &[3, 4], read(vec![(0, gone), (full, 0)]), names)), Some(vec![80]), "errno {gone}");
+    }
+    for refused in [1, 12, 0] {
+        assert_eq!(ports(listeners_in_records(7, &[3, 4], read(vec![(full, 0), (0, refused)]), names)), None, "errno {refused}");
+    }
+    assert_eq!(ports(listeners_in_records(7, &[3], read(vec![(400, 0)]), names)), None, "a short record");
+    let entries = [(3, 2), (4, 1), (5, 2), (6, 2)];
+    assert_eq!(socket_fds_in(24, 0, &entries), Some(vec![3, 5]), "only the listed entries, only sockets");
+    assert_eq!(socket_fds_in(0, 0, &entries), Some(vec![]));
+    assert_eq!(socket_fds_in(0, 3, &entries), Some(vec![]), "an exited process");
+    assert_eq!(socket_fds_in(0, 1, &entries), None, "a refused list");
+
+    use crate::linux::socket_inodes_in;
+    let live = || Some("9 (sh) S 1 9 9".to_string());
+    let zombie = || Some("9 (sh) Z 1 9 9".to_string());
+    assert_eq!(socket_inodes_in(Ok(vec!["socket:[41]".into(), "/dev/null".into()]), live), Some(vec![41]));
+    assert_eq!(socket_inodes_in(Err(std::io::ErrorKind::NotFound), live), Some(vec![]));
+    assert_eq!(socket_inodes_in(Err(std::io::ErrorKind::PermissionDenied), live), None);
+    assert_eq!(socket_inodes_in(Err(std::io::ErrorKind::PermissionDenied), zombie), Some(vec![]));
+    assert_eq!(socket_inodes_in(Err(std::io::ErrorKind::PermissionDenied), || None), Some(vec![]), "gone by the time its stat is read");
+}
+
+/// (#3559) Live, at the call site: another user's process (launchd's or
+/// init's, pid 1) cannot have its open files read by this one, and that is
+/// no answer. Skipped when the tests run as root.
+#[cfg(unix)]
+#[test]
+fn another_users_open_files_are_no_answer() {
+    // SAFETY: a plain query of this process.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    if cfg!(target_os = "macos") {
+        assert_eq!(crate::macos::listeners_held_by_pid(1), None);
+    }
+    if cfg!(target_os = "linux") {
+        assert_eq!(crate::linux::socket_inodes_held_by(1), None);
+    }
 }

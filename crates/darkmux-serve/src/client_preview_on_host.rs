@@ -210,11 +210,10 @@ impl PreviewContainers for OnHost {
         let handle = self.handle(name);
         let mut cmd = darkmux_sandbox::for_handle(&handle).start(&handle);
         cmd.stdin(std::process::Stdio::null()).stdout(out).stderr(err);
-        // Its own process group, which the backend's launcher leads: a
-        // Ctrl-C at `client serve` reaches darkmux, which removes every
-        // preview itself.
-        #[cfg(unix)]
-        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        // The backend's launcher leads a process group of its own (under
+        // Seatbelt, a session of its own, #3559, so no group is set here: a
+        // group leader cannot start a session): a Ctrl-C at `client serve`
+        // reaches darkmux, which removes every preview itself.
         cmd.spawn().map_err(|e| format!("starting the preview's sandbox: {e}"))
     }
 

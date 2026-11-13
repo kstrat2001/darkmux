@@ -41,9 +41,10 @@ pub struct FakePlatform {
     /// `(leader, listeners)` [`Platform::tcp_listeners_held_by`] answers;
     /// any other leader's sandbox holds none.
     pub held_listeners: Vec<(u32, Vec<(u16, crate::PortListener)>)>,
-    /// How many [`Platform::tcp_listeners_held_by`] reads cannot say
-    /// (`None`) before the reads answer; each read counts one down.
-    pub held_listeners_unreadable_reads: std::sync::atomic::AtomicU32,
+    /// The next [`Platform::tcp_listeners_held_by`] reads, in order: `false`
+    /// cannot say (`None`), `true` answers. Each read takes one; once it is
+    /// empty every read answers.
+    pub held_listeners_reads: std::sync::Mutex<std::collections::VecDeque<bool>>,
     /// `(pid, group)` pairs [`Platform::process_group`] answers.
     pub process_groups: Vec<(u32, u32)>,
     /// `(pid, app)` pairs [`Platform::signed_app`] names; any other pid is unsigned.
@@ -80,7 +81,7 @@ impl Default for FakePlatform {
             port_listeners: Vec::new(),
             port_listeners_unreadable_reads: std::sync::atomic::AtomicU32::new(0),
             held_listeners: Vec::new(),
-            held_listeners_unreadable_reads: std::sync::atomic::AtomicU32::new(0),
+            held_listeners_reads: Default::default(),
             process_groups: Vec::new(),
             signed_apps: Vec::new(),
             allow_answer: crate::AllowAnswer::NoDialog("a fake platform shows no dialog".to_string()),
@@ -212,8 +213,7 @@ impl Platform for FakePlatform {
     }
 
     fn tcp_listeners_held_by(&self, leader: u32) -> Option<Vec<(u16, crate::PortListener)>> {
-        use std::sync::atomic::Ordering;
-        if self.held_listeners_unreadable_reads.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
+        if self.held_listeners_reads.lock().unwrap_or_else(|p| p.into_inner()).pop_front() == Some(false) {
             return None;
         }
         Some(self.held_listeners.iter().find(|(l, _)| *l == leader).map(|(_, held)| held.clone()).unwrap_or_default())

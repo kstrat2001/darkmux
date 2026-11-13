@@ -16,6 +16,12 @@
 //! when the listing cannot be read twice running (it cannot be vouched for).
 //!
 //! What this is, and is not:
+//! - **It catches mistakes, not code trying to get past it.** A server that
+//!   binds every address by default is stopped; a program that means to
+//!   evade the watch can. A plain double-fork daemon under Seatbelt (fork,
+//!   `setsid`, fork again, the middle process exits) leaves the sandbox's
+//!   process group with no parent back to it: no look sees its listener,
+//!   and it outlives the dispatch (measured in review).
 //! - **Detection with a window, not a kernel boundary.** A listener beyond
 //!   the loopback is reachable from the LAN until the next look finds it and
 //!   the sandbox is stopped: up to one interval plus the stop.
@@ -23,10 +29,12 @@
 //!   socket (a resolver's query) is bound to every address by the kernel, so
 //!   a UDP listener cannot be told from ordinary outbound traffic.
 //! - **The sandbox's processes only.** Another program's listener never
-//!   stops it. A process that left the sandbox's process group and whose
-//!   parents back to it have all exited (Seatbelt: `setsid` then the parent
-//!   exits) is not found; on Landlock every process descends from the
-//!   sandbox's init, so none is lost that way.
+//!   stops it, another sandbox's included: a Seatbelt sandbox is a session of
+//!   its own, so nothing in one can move into another's process group. A
+//!   process that started a session of its own and whose parents back to the
+//!   sandbox have all exited (Seatbelt: `setsid` then the parent exits) is
+//!   not found; on Landlock every process descends from the sandbox's init,
+//!   so none is lost that way.
 //! - **One listing, its holders as they are now.** A listener whose holder
 //!   keeps forking a new pid and exiting the old can be missed by a look.
 //!
@@ -45,9 +53,9 @@ use std::time::Duration;
 /// How often a running sandbox on the host has its listeners read, and so
 /// the most a listener beyond the loopback is reachable before the stop
 /// begins. One look reads the process table and each member's open files
-/// in-process (no command spawned): about 0.5 ms of CPU on a Mac with 1,300
-/// processes (a debug build, 50 looks), so a look a second is about 0.05%
-/// of one core per running sandbox.
+/// in-process (no command spawned): 0.52 ms of CPU on a Mac with 1,276
+/// processes (a release build, 50 looks; 0.64 ms in a debug build), so a
+/// look a second is about 0.05% of one core per running sandbox.
 pub const CHECK_EVERY: Duration = Duration::from_secs(1);
 
 /// One look at a sandbox's listeners: nothing beyond the loopback, a
@@ -98,9 +106,9 @@ pub fn exposure_reason(kind: BackendKind, what: &str, held: &[(u16, PortListener
         })
         .collect();
     Some(format!(
-        "it listened beyond this machine's loopback, on {}. {} in {} runs on this machine, whose sandbox cannot \
-         hold a listener to the loopback (#3559), so darkmux stops one that listens past it: bind servers to \
-         127.0.0.1 or ::1",
+        "the program listened on {}, beyond this machine's loopback: a server in {what} must listen on 127.0.0.1 \
+         (or localhost). {} in {} runs on this machine, whose sandbox cannot hold a listener to the loopback \
+         (#3559), so darkmux stops one that listens past it",
         listed.join(", "),
         capitalized(what),
         darkmux_sandbox::placed_in(kind),

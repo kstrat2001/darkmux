@@ -180,8 +180,9 @@ pub trait Platform: Send + Sync {
 
     /// (#3559) Every TCP socket listening that a sandbox on the host holds,
     /// each with its port: the sandbox being `leader` (its launcher, which
-    /// leads its process group), every process in that group, and every
-    /// descendant of any of those (`sandbox_members`). Each listener's
+    /// leads its process group, and under Seatbelt its session), every
+    /// process in that group or session, and every descendant of any of
+    /// those (`sandbox_members`). Each listener's
     /// `pid` is a process holding it, read from that process's own open
     /// files, never the socket table's last user (netstat's pid, which still
     /// names an opener that handed the socket to its child and exited).
@@ -665,24 +666,26 @@ impl PortListener {
     }
 }
 
-/// (#3559) A sandbox's processes in a process table of `(pid, ppid, pgid)`
-/// rows: `leader`, every process in its group (an orphan the leader left
-/// among them), and every descendant of any of those (one that moved to a
-/// group or session of its own included), ascending. A process that left the
-/// group and whose parents back to one of them have all exited is not found:
+/// (#3559) A sandbox's processes in a process table of `(pid, ppid, pgid,
+/// sid)` rows: `leader`, every process in its group or its session (an
+/// orphan the leader left among them, one in a group of its own included),
+/// and every descendant of any of those (one that started a session of its
+/// own included), ascending. A process that started a session of its own
+/// and whose parents back to one of them have all exited is not found:
 /// nothing marks it as the sandbox's. Empty for pid 0 or 1, which lead
 /// everything.
-pub(crate) fn sandbox_members(leader: u32, table: &[(u32, u32, u32)]) -> Vec<u32> {
+pub(crate) fn sandbox_members(leader: u32, table: &[(u32, u32, u32, u32)]) -> Vec<u32> {
     if leader <= 1 {
         return Vec::new();
     }
-    let mut members: std::collections::BTreeSet<u32> = table.iter().filter(|(_, _, group)| *group == leader).map(|(pid, _, _)| *pid).collect();
+    let mut members: std::collections::BTreeSet<u32> =
+        table.iter().filter(|(_, _, group, session)| *group == leader || *session == leader).map(|(pid, ..)| *pid).collect();
     members.insert(leader);
     // Each pass adds the children of what is already in; a table is finite,
     // so it settles.
     loop {
         let before = members.len();
-        let children: Vec<u32> = table.iter().filter(|(_, parent, _)| members.contains(parent)).map(|(pid, _, _)| *pid).collect();
+        let children: Vec<u32> = table.iter().filter(|(_, parent, ..)| members.contains(parent)).map(|(pid, ..)| *pid).collect();
         members.extend(children);
         if members.len() == before {
             return members.into_iter().collect();
@@ -776,6 +779,26 @@ pub(crate) fn peers_from_lsof_fpn(out: &str, local: std::net::SocketAddr) -> Vec
         }
     }
     peers
+}
+
+/// (#3559) Starts `cmd` as the leader of a session of its own (`setsid`):
+/// its process group is its own pid, as `process_group(0)` would give, it
+/// has no controlling terminal, and no process it starts can move into a
+/// process group outside that session (`setpgid` across sessions is
+/// refused). Do not also set `process_group`: a group leader cannot start
+/// a session, so the spawn fails.
+pub fn in_a_session_of_its_own(cmd: &mut std::process::Command) {
+    #[cfg(unix)]
+    // SAFETY: the hook runs in the forked child before exec and calls only
+    // `setsid`, which is async-signal-safe.
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(cmd, || match libc::setsid() {
+            -1 => Err(std::io::Error::last_os_error()),
+            _ => Ok(()),
+        });
+    }
+    #[cfg(not(unix))]
+    let _ = cmd;
 }
 
 /// `getpgid(pid)`, shared by the Unix strategies.
