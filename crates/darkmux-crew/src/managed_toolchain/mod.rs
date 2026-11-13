@@ -436,13 +436,8 @@ pub enum Status {
     Unsupported,
 }
 
-/// Each runtime's default build for this host, as `darkmux doctor` shows
-/// it.
-pub fn statuses() -> Vec<(&'static Runtime, Status)> {
-    statuses_on(darkmux_platform::current())
-}
-
-/// [`statuses`] on `platform` (a test's fake one).
+/// Each runtime's default build on `platform` (this host's, or a test's
+/// fake one), as `darkmux doctor` shows it.
 pub fn statuses_on(platform: &dyn darkmux_platform::Platform) -> Vec<(&'static Runtime, Status)> {
     let root = darkmux_types::config_access::toolchains_dir();
     let build = platform.node_release_platform();
@@ -452,7 +447,8 @@ pub fn statuses_on(platform: &dyn darkmux_platform::Platform) -> Vec<(&'static R
         .collect()
 }
 
-/// [`statuses`]' answer for `runtime` on `platform`, `root` and `source`.
+/// [`statuses_on`]'s answer for `runtime` on `platform`, `root` and
+/// `source`.
 /// It reads; it writes nothing.
 pub fn status_in(
     runtime: &Runtime,

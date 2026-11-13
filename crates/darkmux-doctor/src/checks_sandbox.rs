@@ -113,7 +113,7 @@ fn host_row(named: &str, what: &str, kind: BackendKind, host_runtime: Option<&Re
 
 /// (#3561) Each runtime darkmux supplies to every sandbox it starts on the
 /// host (Node), one row each, named `managed <runtime>`, as `statuses`
-/// (from [`darkmux_crew::managed_toolchain::statuses`]) reads it: the
+/// (from [`darkmux_crew::managed_toolchain::statuses_on`]) reads it: the
 /// default build for a project that declares no version, installed and
 /// verified (its version and path), or fetched on first use. A machine with
 /// no pinned build warns: a sandbox for a project that declares the

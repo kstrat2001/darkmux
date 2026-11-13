@@ -2274,6 +2274,93 @@ fn a_linux_c_library_is_its_shells_elf_interpreter() {
     assert_eq!(FakePlatform::default().c_library(), None);
 }
 
+/// `an_elf`, its interpreter's path moved to file offset `at` (past the
+/// program headers, the gap zero-filled), as Fedora's bash has its
+/// `PT_INTERP` about 968 KiB in.
+fn an_elf_with_interpreter_at(interp: &str, at: usize) -> Vec<u8> {
+    let mut b = an_elf(true, false, Some(interp));
+    let (ehsize, phentsize) = (64usize, 56usize);
+    let start = ehsize + 3 * phentsize;
+    b.truncate(start);
+    b.resize(at, 0);
+    b.extend_from_slice(interp.as_bytes());
+    b.push(0);
+    let ph = ehsize + phentsize;
+    b[ph + 8..ph + 16].copy_from_slice(&(at as u64).to_le_bytes());
+    b
+}
+
+/// (#3561 re-review) A program is read where its ELF says, not from a
+/// fixed prefix: the header, then the program header table at `e_phoff`,
+/// then the interpreter's path at its `p_offset`, however far into the
+/// file. A musl shell whose path lies past the first 64 KiB is musl.
+#[test]
+fn a_shells_interpreter_is_read_wherever_the_file_puts_it() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let sh = dir.path().join("sh");
+    let far = an_elf_with_interpreter_at("/lib/ld-musl-x86_64.so.1", 0xf2000);
+    assert_eq!(elf_interpreter(&far).as_deref(), Some("/lib/ld-musl-x86_64.so.1"));
+    std::fs::write(&sh, &far).unwrap();
+    assert_eq!(c_library_of_program(&sh), CLibrary::Musl, "an interpreter 968 KiB in");
+    std::fs::write(&sh, &far[..far.len() - 5]).unwrap();
+    assert_eq!(c_library_of_program(&sh), CLibrary::Glibc, "a path cut short is not read");
+    std::fs::write(&sh, an_elf(true, false, Some("/lib/ld-musl-x86_64.so.1"))).unwrap();
+    assert_eq!(c_library_of_program(&sh), CLibrary::Musl, "and one near the start");
+    assert_eq!(c_library_of_program(&dir.path().join("none")), CLibrary::Glibc, "no file: glibc");
+}
+
+/// (#3561 re-review) Whatever a header claims, no read asks for more than
+/// its bound: a table of 65535 entries of 65535 bytes (4 GiB) is refused
+/// unread, and an interpreter claiming 4 GiB of path is read only to 4 KiB.
+#[test]
+fn a_header_cannot_make_the_reader_ask_for_more_than_its_bounds() {
+    let asks = |bytes: Vec<u8>| {
+        let mut asked = Vec::new();
+        let got = elf_interpreter_at(&mut |at, len| {
+            asked.push(len);
+            let at = usize::try_from(at).ok()?;
+            Some(bytes.get(at..).unwrap_or_default().iter().take(len).copied().collect())
+        });
+        (got, asked)
+    };
+    let mut huge_table = an_elf(true, false, Some("/lib/ld-musl-x86_64.so.1"));
+    huge_table[0x36..0x38].copy_from_slice(&u16::MAX.to_le_bytes());
+    huge_table[0x38..0x3A].copy_from_slice(&u16::MAX.to_le_bytes());
+    let (got, asked) = asks(huge_table);
+    assert_eq!(got, None);
+    assert!(asked.iter().all(|n| *n <= 64 * 1024), "{asked:?}");
+    let mut long_path = an_elf(true, false, Some("/lib/ld-musl-x86_64.so.1"));
+    let ph = 64 + 56;
+    long_path[ph + 32..ph + 40].copy_from_slice(&u64::from(u32::MAX).to_le_bytes());
+    long_path.resize(long_path.len() + 8192, b'a');
+    let (got, asked) = asks(long_path);
+    assert!(asked.iter().all(|n| *n <= 64 * 1024) && asked.last() == Some(&4096), "{asked:?}");
+    assert_eq!(got.as_deref(), Some("/lib/ld-musl-x86_64.so.1"), "the path ends at its NUL within the bound");
+}
+
+/// (#3561 re-review) Two malformed tables name no interpreter: program
+/// header entries smaller than their class's (entries that would overlap,
+/// one's fields read from the next), and a `PT_INTERP` whose path is empty.
+#[test]
+fn a_malformed_program_header_table_names_no_interpreter() {
+    // An ELF64 file whose entries claim 8 bytes: the second "entry" has the
+    // interpreter type, and the bytes 8 and 32 past it point at a path.
+    let mut small = an_elf(true, false, Some("/lib/ld-musl-x86_64.so.1"));
+    let (ehsize, real) = (64usize, 56usize);
+    let path_at = (ehsize + 3 * real) as u64;
+    small[0x36..0x38].copy_from_slice(&8u16.to_le_bytes());
+    // Six 8-byte entries: a 48-byte table, which holds the second entry's
+    // offset and size fields (8 and 32 bytes past it).
+    small[0x38..0x3A].copy_from_slice(&6u16.to_le_bytes());
+    let second = ehsize + 8;
+    small[second..second + 4].copy_from_slice(&3u32.to_le_bytes());
+    small[second + 8..second + 16].copy_from_slice(&path_at.to_le_bytes());
+    small[second + 32..second + 40].copy_from_slice(&25u64.to_le_bytes());
+    assert_eq!(elf_interpreter(&small), None, "an entry smaller than its class is not read");
+    let empty = an_elf(true, false, Some(""));
+    assert_eq!(elf_interpreter(&empty), None, "an empty interpreter path is none");
+}
+
 /// (#3561 re-review) `LinuxPlatform` itself reads its shell (here a temp
 /// file standing in for `/bin/sh`): Alpine's busybox, `gcompat` or not,
 /// is musl and names no build; a glibc shell names the glibc build; a shell

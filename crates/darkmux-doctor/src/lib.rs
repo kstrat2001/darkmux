@@ -148,8 +148,10 @@ fn run_with(configured: (Result<darkmux_sandbox::BackendKind, String>, darkmux_t
     run_on(configured, darkmux_platform::current())
 }
 
-/// [`run_with`] on `platform`, whose answers the platform-reading rows use
-/// (a test runs the doctor on a fake one).
+/// [`run_with`] with `platform` for the managed-runtime rows (their
+/// builds and this machine's C library), so a test can run the doctor with
+/// a fake one there. Every other row still asks the platform it always
+/// did.
 fn run_on(
     configured: (Result<darkmux_sandbox::BackendKind, String>, darkmux_types::config_access::Source),
     platform: &dyn darkmux_platform::Platform,

@@ -626,31 +626,93 @@ pub(crate) fn c_library_of_interpreter(interp: Option<&str>) -> CLibrary {
     }
 }
 
-/// How much of a program [`c_library_of_program`] reads: its header,
-/// program headers and interpreter path sit at its start.
-const ELF_READ_BOUND: u64 = 64 * 1024;
+/// The most [`c_library_of_program`] reads of each part of a program: its
+/// ELF header, its program header table (wherever `e_phoff` puts it), and
+/// its interpreter's path (wherever `p_offset` puts it). A table or path
+/// larger than its bound names no interpreter.
+const ELF_HEADER_BOUND: usize = 64;
+const PROGRAM_HEADERS_BOUND: usize = 64 * 1024;
+const INTERPRETER_BOUND: usize = 4096;
 
 /// The C library the program at `path` (a machine's `/bin/sh`) uses, from
-/// its ELF interpreter ([`c_library_of_interpreter`]), reading at most
-/// [`ELF_READ_BOUND`] bytes.
+/// its ELF interpreter ([`c_library_of_interpreter`]): the header, then the
+/// program header table and the interpreter's path where the header says,
+/// each a bounded read, so its layout does not matter (Fedora's bash has
+/// its interpreter about 968 KiB in). A file that cannot be read whole
+/// where it says reads as having none: glibc.
 pub(crate) fn c_library_of_program(path: &std::path::Path) -> CLibrary {
-    use std::io::Read;
-    let mut bytes = Vec::new();
-    let read = std::fs::File::open(path).and_then(|f| f.take(ELF_READ_BOUND).read_to_end(&mut bytes));
-    c_library_of_interpreter(read.ok().and_then(|_| elf_interpreter(&bytes)).as_deref())
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else { return CLibrary::Glibc };
+    let mut read_at = |at: u64, len: usize| -> Option<Vec<u8>> {
+        file.seek(SeekFrom::Start(at)).ok()?;
+        let mut out = Vec::with_capacity(len);
+        (&mut file).take(len as u64).read_to_end(&mut out).ok()?;
+        Some(out)
+    };
+    c_library_of_interpreter(elf_interpreter_at(&mut read_at).as_deref())
 }
 
-/// The interpreter (`PT_INTERP`) an ELF file names, from its bytes: 64- or
-/// 32-bit, either byte order. `None` for a file with none (static), cut
-/// short, or not ELF. Every offset is checked against `bytes`.
+/// The interpreter (`PT_INTERP`) an ELF file in memory names
+/// ([`elf_interpreter_at`] over `bytes`).
+#[cfg(test)]
 pub(crate) fn elf_interpreter(bytes: &[u8]) -> Option<String> {
-    let elf = Elf::read(bytes)?;
-    let raw = elf.interpreter_bytes(elf.interpreter_header()?)?;
+    elf_interpreter_at(&mut |at, len| {
+        let at = usize::try_from(at).ok()?;
+        Some(bytes.get(at..).unwrap_or_default().iter().take(len).copied().collect())
+    })
+}
+
+/// The interpreter (`PT_INTERP`) an ELF file names, 64- or 32-bit, either
+/// byte order, read through `read_at(offset, len)` (at most `len` bytes,
+/// fewer at the file's end). `None` for a file with none (static), one cut
+/// short where its header points, one whose table or path is past its
+/// bound, or one that is not ELF. All arithmetic is checked.
+fn elf_interpreter_at(read_at: &mut ReadAt) -> Option<String> {
+    let found = program_header_table(read_at)?;
+    let table = Elf { bytes: &found.bytes, is64: found.is64, big: found.big };
+    let ph = (0..found.count).map(|n| n * found.entry).find(|ph| table.field(*ph, 4) == Some(PT_INTERP))?;
+    let (offset, size) = table.interpreter_fields(ph)?;
+    let raw = read_whole(read_at, offset, usize::try_from(size).ok()?.min(INTERPRETER_BOUND))?;
     let path = raw.split(|b| *b == 0).next()?;
     (!path.is_empty()).then(|| String::from_utf8_lossy(path).into_owned())
 }
 
-/// An ELF file's bytes, its class and its byte order.
+/// The program header table (read at `e_phoff`), the file's class and
+/// byte order, and the table's entry size and count; `None` for a file
+/// that is not ELF, or whose entries are smaller than its class's, or
+/// whose table is past [`PROGRAM_HEADERS_BOUND`] or cut short.
+fn program_header_table(read_at: &mut ReadAt) -> Option<Table> {
+    let header = read_at(0, ELF_HEADER_BOUND)?;
+    let head = Elf::read(&header)?;
+    let (phoff, phentsize, phnum) = head.table_fields()?;
+    let table_len = phentsize.checked_mul(phnum)?;
+    if phentsize < head.entry_min() || table_len > PROGRAM_HEADERS_BOUND {
+        return None;
+    }
+    Some(Table { bytes: read_whole(read_at, phoff, table_len)?, is64: head.is64, big: head.big, entry: phentsize, count: phnum })
+}
+
+/// A file's program header table, its class and byte order, and its
+/// entry size and count.
+struct Table {
+    bytes: Vec<u8>,
+    is64: bool,
+    big: bool,
+    entry: usize,
+    count: usize,
+}
+
+/// A read of a file at an offset: at most `len` bytes, fewer at its end.
+type ReadAt<'r> = dyn FnMut(u64, usize) -> Option<Vec<u8>> + 'r;
+
+/// Exactly `len` bytes at `at`, or `None` when the file has fewer there.
+fn read_whole(read_at: &mut ReadAt, at: u64, len: usize) -> Option<Vec<u8>> {
+    read_at(at, len).filter(|b| b.len() == len)
+}
+
+/// Bytes of an ELF file (its header, or its program header table), its
+/// class and its byte order.
+#[derive(Clone, Copy)]
 struct Elf<'a> {
     bytes: &'a [u8],
     is64: bool,
@@ -661,7 +723,8 @@ struct Elf<'a> {
 const PT_INTERP: u64 = 3;
 
 impl<'a> Elf<'a> {
-    /// `bytes` as ELF: the magic, then a known class and byte order.
+    /// `bytes` as an ELF header: the magic, then a known class and byte
+    /// order.
     fn read(bytes: &'a [u8]) -> Option<Self> {
         if bytes.get(..4)? != b"\x7fELF" {
             return None;
@@ -681,6 +744,15 @@ impl<'a> Elf<'a> {
         }
     }
 
+    /// The smallest program header entry of this class.
+    fn entry_min(&self) -> usize {
+        if self.is64 {
+            56
+        } else {
+            32
+        }
+    }
+
     /// The `width`-byte unsigned field at `at`, in the file's byte order.
     fn field(&self, at: usize, width: usize) -> Option<u64> {
         let raw = self.bytes.get(at..at.checked_add(width)?)?;
@@ -690,38 +762,20 @@ impl<'a> Elf<'a> {
         }))
     }
 
-    /// The program header table: its offset, entry size and count, refused
-    /// when an entry is too small for its class or the table runs past the
-    /// bytes.
-    fn program_headers(&self) -> Option<(usize, usize, usize)> {
-        let (phoff, phentsize, phnum) = self.table_fields()?;
-        let fits = phoff.checked_add(phentsize.checked_mul(phnum)?)? <= self.bytes.len();
-        let entry_min = if self.is64 { 56 } else { 32 };
-        (phentsize >= entry_min && fits).then_some((phoff, phentsize, phnum))
-    }
-
-    /// The header's program header table fields: offset, entry size, count.
-    fn table_fields(&self) -> Option<(usize, usize, usize)> {
+    /// The header's program header table fields: file offset, entry size,
+    /// count.
+    fn table_fields(&self) -> Option<(u64, usize, usize)> {
         let ((off, off_w), size_at, num_at) = if self.is64 { ((0x20, 8), 0x36, 0x38) } else { ((0x1C, 4), 0x2A, 0x2C) };
-        let phoff = usize::try_from(self.field(off, off_w)?).ok()?;
-        Some((phoff, self.field(size_at, 2)? as usize, self.field(num_at, 2)? as usize))
+        Some((self.field(off, off_w)?, self.field(size_at, 2)? as usize, self.field(num_at, 2)? as usize))
     }
 
-    /// Where the `PT_INTERP` program header is, when there is one.
-    fn interpreter_header(&self) -> Option<usize> {
-        let (phoff, phentsize, phnum) = self.program_headers()?;
-        (0..phnum).map(|n| phoff + n * phentsize).find(|ph| self.field(*ph, 4) == Some(PT_INTERP))
-    }
-
-    /// The bytes program header `ph` points at (its file offset and size).
-    fn interpreter_bytes(&self, ph: usize) -> Option<&'a [u8]> {
-        let (offset, size) = if self.is64 {
-            (self.field(ph + 8, 8)?, self.field(ph + 32, 8)?)
+    /// Program header `ph`'s file offset and size.
+    fn interpreter_fields(&self, ph: usize) -> Option<(u64, u64)> {
+        if self.is64 {
+            Some((self.field(ph.checked_add(8)?, 8)?, self.field(ph.checked_add(32)?, 8)?))
         } else {
-            (self.field(ph + 4, 4)?, self.field(ph + 16, 4)?)
-        };
-        let (offset, size) = (usize::try_from(offset).ok()?, usize::try_from(size).ok()?);
-        self.bytes.get(offset..offset.checked_add(size)?)
+            Some((self.field(ph.checked_add(4)?, 4)?, self.field(ph.checked_add(16)?, 4)?))
+        }
     }
 }
 

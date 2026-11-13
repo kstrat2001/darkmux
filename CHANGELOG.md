@@ -40,8 +40,9 @@ darkmux release.
     under `~/.darkmux/toolchains/node-<version>-<platform>/` on first use. A Linux machine using musl
     (Alpine, also with `gcompat`), told by `/bin/sh`'s ELF interpreter (`ld-musl-*`), has no pinned
     build: a project that declares Node is refused there, one that declares none runs without it. A
-    glibc machine with the `musl` package installed is still glibc. A build this binary no longer pins is removed by a later install only once
-    nobody has used it for 7 days, so a daemon still running an older darkmux keeps its Node.
+    glibc machine with the `musl` package installed is still glibc. A build this binary no longer pins
+    is removed by a later install only once nobody has used it for 7 days, so a daemon still running
+    an older darkmux keeps its Node.
   - **Visible:** a first use writes `toolchain.fetch` and then `toolchain.ready` or `toolchain.error`
     to the flow; a starting preview shows it as `stage` (`{"code": "getting_node", "detail": "getting
     Node 26.13.1, first use only"}`), an additive field of `PreviewState`. `darkmux doctor` has a row per
