@@ -1122,10 +1122,13 @@ conformance!(
         join_group: Some(|group| format!(
             "python3 -c \"import os\ntry:\n    os.setpgid(0, {group}); print('joined')\nexcept OSError:\n    print('refused')\" > said"
         )),
+        // The program leads a session of its own here, and `sh -c` may exec
+        // python as it, so moving to a group of its own can be refused
+        // (EPERM for a session leader): that is not the listen's answer.
         // With no ports named Landlock refuses the bind, but a `listen` with
         // no bind is not a bind it sees: the kernel binds every address.
         listen_beyond: |port| format!(
-            "python3 -c \"import os, socket\nos.setpgid(0, 0)\ns = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ntry:\n    s.bind(('0.0.0.0', {port}))\nexcept OSError:\n    pass\ntry:\n    s.listen(5); said = 'listening %d' % s.getsockname()[1]\nexcept OSError:\n    said = 'refused'\nopen('said', 'w').write(said)\nwhile said != 'refused':\n    c, _ = s.accept(); c.sendall(b'served\\n'); c.close()\""
+            "python3 -c \"import os, socket\ntry:\n    os.setpgid(0, 0)\nexcept OSError:\n    pass\ns = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ntry:\n    s.bind(('0.0.0.0', {port}))\nexcept OSError:\n    pass\ntry:\n    s.listen(5); said = 'listening %d' % s.getsockname()[1]\nexcept OSError:\n    said = 'refused'\nopen('said', 'w').write(said)\nwhile said != 'refused':\n    c, _ = s.accept(); c.sendall(b'served\\n'); c.close()\""
         ),
         new_group: |script| format!("setsid sh -c '{script}' &"),
         // A pid namespace of its own: its init's exit ends every process in

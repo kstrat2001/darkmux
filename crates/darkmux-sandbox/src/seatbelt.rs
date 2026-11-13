@@ -140,8 +140,12 @@ rc=$?
 g=$$
 "#;
 
-/// (#3559) Perl that kills every process in session `$ARGV[0]` but itself
-/// and zombies, listing them again until none is left (at most 200 times).
+/// (#3559) Perl that kills every process in session `$ARGV[0]` but itself,
+/// zombies and pids 0 and 1, listing them again until none is left (at most
+/// 200 times), or until a listing finds exactly the processes the last kill
+/// was sent to (one it cannot kill, a setuid program's, would otherwise keep
+/// it going for all 200: several seconds). Pid 0 is skipped because `ps`
+/// lists it under root and `getsid(0)` is the caller's own session.
 /// A Seatbelt launcher leads a session of its own, so its session is the
 /// whole sandbox but what started a session of its own (`setsid`). macOS's
 /// `ps` does not print a session id, so each listed pid's is asked of the
@@ -150,7 +154,7 @@ g=$$
 /// skipped. No single quote: it runs inside one.
 macro_rules! sweep {
     () => {
-        "my $s = $ARGV[0] + 0; for (1 .. 200) { my @p = map { $_->[0] } grep { $_->[0] != $$ && $_->[1] !~ /^Z/ && syscall(310, $_->[0] + 0) == $s } map { [split] } `/bin/ps -A -o pid=,stat=`; last unless @p; kill(\"KILL\", @p); select(undef, undef, undef, 0.01); }"
+        "my $s = $ARGV[0] + 0; my $last = \"\"; for (1 .. 200) { my @p = map { $_->[0] } grep { $_->[0] > 1 && $_->[0] != $$ && $_->[1] !~ /^Z/ && syscall(310, $_->[0] + 0) == $s } map { [split] } `/bin/ps -A -o pid=,stat=`; last unless @p; my $now = join(\",\", @p); last if $now eq $last; $last = $now; kill(\"KILL\", @p); select(undef, undef, undef, 0.01); }"
     };
 }
 
@@ -782,6 +786,77 @@ mod tests {
             let _ = Command::new("/bin/kill").args(["-KILL", pid]).status();
         }
         assert!(pids.is_empty(), "guards left behind: {pids:?}");
+    }
+
+    /// (#3559 re-review) Remove, stop and kill sweep a whole session, so
+    /// each is gated on the sandbox being alive and its launcher still the
+    /// pid it recorded. A stale sandbox directory whose `pid` now names an
+    /// unrelated session's leader (with a child in a process group of its
+    /// own), and whose start time is not that process's, is removed by each
+    /// without touching that session.
+    #[test]
+    #[serial_test::serial]
+    fn a_stale_sandbox_never_ends_an_unrelated_session() {
+        use std::io::BufRead;
+        if !SeatbeltBackend::available() {
+            return;
+        }
+        struct Session {
+            leader: std::process::Child,
+            child: String,
+        }
+        impl Drop for Session {
+            fn drop(&mut self) {
+                // The leader's group (its `sleep`), then the child that left it.
+                for pid in [format!("-{}", self.leader.id()), self.child.clone()] {
+                    let _ = Command::new("/bin/kill").args(["-KILL", "--", &pid]).status();
+                }
+                let _ = self.leader.wait();
+            }
+        }
+        // An unrelated session: a leader, and a child in a group of its own.
+        let session = || {
+            let mut leader = Command::new(SH);
+            leader.args(["-c", "/usr/bin/perl -e 'setpgrp(0, 0); sleep 60' & echo $!; sleep 60"]).stdout(Stdio::piped());
+            darkmux_platform::in_a_session_of_its_own(&mut leader);
+            let mut leader = leader.spawn().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(leader.stdout.take().unwrap()).read_line(&mut line).unwrap();
+            Session { leader, child: line.trim().to_string() }
+        };
+        let alive = |pid: &str| Command::new("/bin/kill").args(["-0", pid]).status().is_ok_and(|s| s.success());
+        let root = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var_os(STATE_DIR_ENV);
+        unsafe { std::env::set_var(STATE_DIR_ENV, root.path()) };
+        let handle = SandboxHandle { backend: BackendKind::Seatbelt, id: "darkmux-stale-b3559".into() };
+        let stale = |lead: u32| {
+            let d = canonical(root.path()).join(&handle.id);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("profile.sb"), "(version 1)").unwrap();
+            std::fs::write(d.join("pid"), lead.to_string()).unwrap();
+            std::fs::write(d.join("started"), "Thu Jan  1 00:00:00 1970\n").unwrap();
+        };
+        let lifecycle: [(&str, &dyn Fn() -> Command); 3] = [
+            ("remove", &|| SeatbeltBackend.remove(&handle)),
+            ("stop", &|| SeatbeltBackend.stop(&handle, Duration::from_secs(1))),
+            ("kill", &|| SeatbeltBackend.kill(&handle)),
+        ];
+        let mut ended = Vec::new();
+        for (what, command) in lifecycle {
+            let s = session();
+            stale(s.leader.id());
+            let _ = command().output().unwrap();
+            if !alive(&s.leader.id().to_string()) || !alive(&s.child) {
+                ended.push(what);
+            }
+        }
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(STATE_DIR_ENV, v),
+                None => std::env::remove_var(STATE_DIR_ENV),
+            }
+        }
+        assert_eq!(ended, Vec::<&str>::new(), "an unrelated session was ended");
     }
 
     /// A quote or backslash in a path cannot end the SBPL string.
