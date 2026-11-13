@@ -2,8 +2,8 @@
 // host listens on the loopback.
 //
 // darkmux writes this file into its managed Node install and loads it with
-// `NODE_OPTIONS=--require <this file>` in every sandbox on the host that
-// runs that Node (dispatch, contained commands, client previews). Such a
+// `NODE_OPTIONS=--require <this file>` in every sandbox on the host that has
+// that Node (dispatch, contained commands, client previews). Such a
 // sandbox shares this machine's network, and Node's own default for a
 // listen with no host is every address (`::`), which darkmux stops (#3559).
 //

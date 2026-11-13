@@ -162,8 +162,18 @@ impl Platform for LinuxPlatform {
         read_to_string("/proc/device-tree/compatible").and_then(|c| apple_chip_from_compatible(&c)).map(|_| "Vulkan")
     }
 
+    /// Only for glibc: an official Node build does not run on musl.
     fn node_release_platform(&self) -> Option<&'static str> {
-        crate::node_release_platform_for(crate::NodeOs::Linux, std::env::consts::ARCH)
+        crate::linux_node_release_platform(std::env::consts::ARCH, self.c_library()?)
+    }
+
+    /// Musl when its dynamic loader is in `/lib` (Alpine's
+    /// `ld-musl-<arch>.so.1`), else glibc.
+    fn c_library(&self) -> Option<crate::CLibrary> {
+        let entries: Vec<String> = std::fs::read_dir("/lib")
+            .map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+            .unwrap_or_default();
+        Some(crate::c_library_from(&entries))
     }
 
     /// The CPU tiers [`Platform::cpu_clusters`] reads, one core per online

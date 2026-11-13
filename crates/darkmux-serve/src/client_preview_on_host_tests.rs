@@ -813,7 +813,7 @@ fn a_preview_stage_ends_however_the_fetch_ends() {
     for ended in [
         Note::Ready { runtime: &NODE, pin: &pin, elapsed: at },
         Note::Failed { runtime: &NODE, pin: &pin, elapsed: at, reason: "x" },
-        Note::Skipped { runtime: &NODE, pin: None, platform: "darwin-arm64", reason: "x" },
+        Note::Unavailable { runtime: &NODE, pin: None, platform: "darwin-arm64", reason: "x", required: false },
     ] {
         assert_eq!(on_host::preview_stage(&ended), None, "{ended:?}");
     }

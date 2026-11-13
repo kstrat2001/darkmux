@@ -22,8 +22,10 @@
 //! is read only from a regular file in the folder itself (a link is refused,
 //! never followed), at most 4 KiB for a version file and 1 MiB for
 //! `package.json`. A `package.json` that does not parse as JSON declares
-//! nothing here (npm itself refuses it); one whose `engines.node` is not a
-//! string is refused.
+//! nothing here; neither does one that is a link or too large (#3561
+//! re-review: a project's tools read it for much else, and the reason is
+//! said instead). One whose `engines.node` is there but not a string is
+//! refused: the project did name its Node there.
 
 use super::node::DEFAULT_LINE;
 use super::pins::{Pin, Version};
@@ -137,12 +139,27 @@ fn version_file(dir: &Path, from: Declared) -> Result<Option<String>, String> {
         .map(str::to_string))
 }
 
-/// `package.json`'s `engines.node`, when it has one.
-fn engines_node(dir: &Path) -> Result<Option<String>, String> {
+/// `dir`'s `package.json` as JSON: `Ok(None)` when there is none, `Err`
+/// with why when darkmux cannot read it (a link, over 1 MiB, not text, not
+/// JSON).
+fn package_json(dir: &Path) -> Result<Option<serde_json::Value>, String> {
     let Some(text) = read_declaration(dir, Declared::Engines, MAX_PACKAGE_JSON)? else {
         return Ok(None);
     };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+    serde_json::from_str(&text).map(Some).map_err(|e| {
+        format!(
+            "{} does not parse as JSON ({e})",
+            dir.join("package.json").display()
+        )
+    })
+}
+
+/// `package.json`'s `engines.node`, when it has one. (#3561 re-review) A
+/// `package.json` darkmux cannot read declares nothing (a project's tools
+/// read it for much else); one whose `engines.node` is there but not a
+/// string is refused, since the project did name its Node there.
+fn engines_node(dir: &Path) -> Result<Option<String>, String> {
+    let Ok(Some(json)) = package_json(dir) else {
         return Ok(None);
     };
     match json.get("engines").and_then(|e| e.get("node")) {
@@ -153,6 +170,33 @@ fn engines_node(dir: &Path) -> Result<Option<String>, String> {
             dir.join("package.json").display()
         )),
     }
+}
+
+/// (#3561 re-review) Why a `package.json` darkmux could not read was
+/// passed over, for the caller to say: the first one in `dirs` before any
+/// declaration, or `None`.
+pub fn unread_package_json(dirs: &[&Path]) -> Option<String> {
+    for dir in dirs {
+        let version_file = [Declared::Nvmrc, Declared::NodeVersion]
+            .iter()
+            .any(|d| std::fs::symlink_metadata(dir.join(d.file())).is_ok());
+        if version_file {
+            return None;
+        }
+        match package_json(dir) {
+            Err(why) => return Some(format!("{why}, so it declares no Node version here")),
+            Ok(Some(json))
+                if json
+                    .get("engines")
+                    .and_then(|e| e.get("node"))
+                    .is_some_and(|n| !n.is_null()) =>
+            {
+                return None
+            }
+            Ok(_) => {}
+        }
+    }
+    None
 }
 
 /// A version with any part left open (`22`, `22.x`, `*`): `None` is a

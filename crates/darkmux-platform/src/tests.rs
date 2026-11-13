@@ -2173,3 +2173,24 @@ fn another_users_open_files_are_no_answer() {
         assert_eq!(crate::linux::socket_inodes_held_by(1), None);
     }
 }
+
+/// (#3561 re-review) Which C library a Linux machine's programs use, from
+/// the dynamic loaders in `/lib`: musl's `ld-musl-<arch>.so.1` (Alpine),
+/// else glibc. A musl machine has no official Node build darkmux pins (they
+/// link glibc), so it names none; a Mac has no such question.
+#[test]
+fn a_musl_linux_names_no_node_build() {
+    let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert_eq!(c_library_from(&names(&["ld-musl-x86_64.so.1", "libz.so.1"])), CLibrary::Musl);
+    assert_eq!(c_library_from(&names(&["ld-linux-x86-64.so.2", "libc.so.6"])), CLibrary::Glibc);
+    assert_eq!(c_library_from(&names(&[])), CLibrary::Glibc, "no musl loader: glibc, as nearly every distribution");
+    assert_eq!(linux_node_release_platform("x86_64", CLibrary::Musl), None);
+    assert_eq!(linux_node_release_platform("aarch64", CLibrary::Musl), None);
+    assert_eq!(linux_node_release_platform("x86_64", CLibrary::Glibc), Some("linux-x64"));
+    assert_eq!(MacPlatform.c_library(), None);
+    assert_eq!(OtherPlatform.c_library(), None);
+    assert!(LinuxPlatform.c_library().is_some());
+    let fake = FakePlatform { c_library: Some(CLibrary::Musl), ..Default::default() };
+    assert_eq!(fake.c_library(), Some(CLibrary::Musl));
+    assert_eq!(FakePlatform::default().c_library(), None);
+}

@@ -53,7 +53,7 @@ pub(crate) fn resolve_toolchain(
 fn managed_runtimes(workdir: &Path, stage: &dyn Fn(Option<PreviewStage>)) -> Result<Vec<darkmux_crew::managed_toolchain::Installed>, String> {
     use darkmux_crew::managed_toolchain::{for_sandbox, Note};
     for_sandbox(&[workdir], darkmux_flow::payload::ToolchainUse::Preview, None, &mut |n| {
-        if let (Some(line), Note::Skipped { .. }) = (darkmux_crew::managed_toolchain::said(n), n) {
+        if let (Some(line), Note::Unavailable { .. } | Note::Notice { .. }) = (darkmux_crew::managed_toolchain::said(n), n) {
             eprintln!("darkmux client serve: preview of {}: {line}", workdir.display());
         }
         stage(preview_stage(n));
@@ -68,7 +68,7 @@ pub(crate) fn preview_stage(n: &darkmux_crew::managed_toolchain::Note) -> Option
     use darkmux_crew::managed_toolchain::Note;
     match n {
         Note::Fetching { runtime, pin } => Some(PreviewStage::getting(runtime.name, runtime.display, &pin.version.to_string())),
-        Note::Ready { .. } | Note::Failed { .. } | Note::Skipped { .. } => None,
+        Note::Ready { .. } | Note::Failed { .. } | Note::Unavailable { .. } | Note::Notice { .. } => None,
     }
 }
 

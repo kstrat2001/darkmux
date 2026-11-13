@@ -40,7 +40,8 @@ darkmux release.
   then `toolchain.ready` or `toolchain.error` to the flow; a starting preview shows it as `stage`
   (`{"code": "getting_node", "detail": "getting Node 26.13.1, first use only"}`), an additive field of
   `PreviewState`. `darkmux doctor` has a row per managed runtime (`managed node`: the verified
-  install, or that it is fetched on first use). An install no longer pinned is removed by the next one.
+  install, or that it is fetched on first use). A build this binary no longer pins is removed by a later install once
+  nobody has used it for 7 days.
   **A server that names no host listens on the loopback:** the managed Node loads a preload darkmux
   writes into its install (`NODE_OPTIONS=--require "<install>/darkmux/listen-loopback.cjs"`, appended
   to any `NODE_OPTIONS` already set), so `listen(port)`, `listen(0)`, `listen(cb)` and an options

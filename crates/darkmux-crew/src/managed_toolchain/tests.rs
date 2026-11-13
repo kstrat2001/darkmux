@@ -54,7 +54,8 @@ fn note_word(n: &Note) -> String {
         Note::Fetching { pin, .. } => format!("fetching {}", pin.version),
         Note::Ready { pin, .. } => format!("ready {}", pin.version),
         Note::Failed { pin, .. } => format!("failed {}", pin.version),
-        Note::Skipped { .. } => "skipped".to_string(),
+        Note::Unavailable { .. } => "skipped".to_string(),
+        Note::Notice { text, .. } => format!("notice {text}"),
     }
 }
 
@@ -833,7 +834,8 @@ fn a_fetch_writes_one_record_per_step() {
         ToolchainUse::Dispatch,
         Some(&session),
         true,
-    );
+    )
+    .unwrap();
     assert_eq!(fetching.action, darkmux_flow::FlowAction::ToolchainFetch);
     assert_eq!(fetching.session_id, Some(session.wire()));
     assert_eq!(fetching.execution_id, None);
@@ -859,7 +861,8 @@ fn a_fetch_writes_one_record_per_step() {
         ToolchainUse::Preview,
         None,
         true,
-    );
+    )
+    .unwrap();
     assert_eq!(
         (ready.action.clone(), ready.session_id.clone()),
         (darkmux_flow::FlowAction::ToolchainReady, None)
@@ -875,7 +878,8 @@ fn a_fetch_writes_one_record_per_step() {
         ToolchainUse::Command,
         None,
         true,
-    );
+    )
+    .unwrap();
     assert_eq!(failed.action, darkmux_flow::FlowAction::ToolchainError);
     assert!(matches!(failed.level, darkmux_flow::Level::Error));
     assert_eq!(failed.payload_json()["error"], "hash mismatch");
@@ -887,7 +891,9 @@ fn a_fetch_writes_one_record_per_step() {
     };
     assert!(
         matches!(
-            record(&fail, ToolchainUse::Command, None, false).level,
+            record(&fail, ToolchainUse::Command, None, false)
+                .unwrap()
+                .level,
             darkmux_flow::Level::Warn
         ),
         "a failure the sandbox goes on without is a warning"
@@ -1300,28 +1306,48 @@ fn a_declared_node_that_cannot_be_had_refuses_the_sandbox() {
     );
     assert_eq!(
         shapes(&records),
-        ["toolchain.fetch info", "toolchain.error error"]
+        ["toolchain.fetch info", "toolchain.error error"],
+        "a refusal after a fetch keeps the fetch's own record"
     );
-    for (platform, text) in [
-        (None, "22"),
-        (Some(PLATFORM), "latest"),
-        (Some(PLATFORM), "21.0.0"),
-    ] {
-        std::fs::write(ws.join(".nvmrc"), format!("{text}\n")).unwrap();
-        assert!(
-            supplied(&[&ws], platform, &toolchains, &source).0.is_err(),
-            "{platform:?} `{text}` was not refused"
+    // Each refusal before any fetch writes exactly one error-level record.
+    let refused_before_a_fetch = |platform: Option<&str>, toolchains: &Path, want: &str| {
+        let (got, records, notes) = supplied(&[&ws], platform, toolchains, &source);
+        let why = got.unwrap_err();
+        assert!(why.contains(want), "{why}");
+        assert_eq!(shapes(&records), ["toolchain.error error"], "{why}");
+        assert_eq!(
+            records[0].payload_json()["error"],
+            why.lines().next().unwrap(),
+            "the record carries the reason"
         );
-    }
+        assert!(
+            notes.is_empty(),
+            "a refused runtime is not reported as skipped: {notes:?}"
+        );
+    };
+    refused_before_a_fetch(None, &toolchains, "pins no Node build for this machine");
+    std::fs::write(ws.join(".nvmrc"), "latest\n").unwrap();
+    refused_before_a_fetch(Some(PLATFORM), &toolchains, "cannot read");
+    std::fs::write(ws.join(".nvmrc"), "21.0.0\n").unwrap();
+    refused_before_a_fetch(
+        Some(PLATFORM),
+        &toolchains,
+        "no version darkmux pins satisfies",
+    );
+    std::fs::write(ws.join(".nvmrc"), "26\n").unwrap();
+    let theirs = root.join("theirs");
+    fixture::release_tree(&theirs, &pin_of(&source, 26).dir_name(), "node", "6.6.6");
+    refused_before_a_fetch(
+        Some(PLATFORM),
+        &theirs,
+        "not a Node install darkmux verified",
+    );
     // A declaration darkmux will not read at all (a link) still says the
     // project asked for Node: refused, never skipped.
     std::fs::remove_file(ws.join(".nvmrc")).unwrap();
     std::fs::write(root.join("elsewhere"), "22\n").unwrap();
     std::os::unix::fs::symlink(root.join("elsewhere"), ws.join(".nvmrc")).unwrap();
-    let why = supplied(&[&ws], Some(PLATFORM), &toolchains, &source)
-        .0
-        .unwrap_err();
-    assert!(why.contains("never reads through a link"), "{why}");
+    refused_before_a_fetch(Some(PLATFORM), &toolchains, "never reads through a link");
 }
 
 /// (#3561) Undeclared and failed: a project that names no Node version runs
@@ -1375,4 +1401,134 @@ fn an_undeclared_node_gets_the_default_pin() {
         shapes(&records),
         ["toolchain.fetch info", "toolchain.ready info"]
     );
+}
+
+/// (#3561 re-review) The download is held to https, redirects included,
+/// for every URL that is not a test build's `file:` fixture; it gives up on
+/// a host that does not connect within [`install::CONNECT_BOUND`] (tried
+/// twice) and on a transfer that stalls, so a failed best-effort fetch
+/// costs a sandbox start seconds, not minutes.
+#[test]
+fn the_download_is_https_only_and_gives_up_on_a_dead_host() {
+    let args = |url: &str| -> Vec<String> {
+        let cmd = install::download_command(url, Path::new("/tmp/n3561.tar.gz"));
+        assert_eq!(cmd.get_program(), "curl");
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    };
+    let after = |a: &[String], flag: &str| {
+        a.iter()
+            .position(|x| x == flag)
+            .and_then(|i| a.get(i + 1))
+            .cloned()
+    };
+    let https = args("https://nodejs.org/dist/v26.13.1/node-v26.13.1-darwin-arm64.tar.gz");
+    assert_eq!(https[0], "-q", "no ~/.curlrc");
+    assert_eq!(after(&https, "--proto").as_deref(), Some("=https"));
+    assert_eq!(after(&https, "--proto-redir").as_deref(), Some("=https"));
+    assert_eq!(
+        after(&https, "--connect-timeout"),
+        Some(install::CONNECT_BOUND.as_secs().to_string())
+    );
+    assert_eq!(after(&https, "--retry").as_deref(), Some("1"));
+    assert!(
+        after(&https, "--speed-time").is_some() && after(&https, "--speed-limit").is_some(),
+        "{https:?}"
+    );
+    let plain = args("http://nodejs.org/x.tar.gz");
+    assert_eq!(
+        after(&plain, "--proto").as_deref(),
+        Some("=https"),
+        "an http URL is still held to https"
+    );
+    assert_eq!(
+        after(&args("file:///tmp/x.tar.gz"), "--proto").as_deref(),
+        Some("=file")
+    );
+}
+
+/// (#3561 re-review) A link at the install's path is never a verified
+/// install, even to a verified one elsewhere: it is refused, not followed.
+#[test]
+fn a_link_at_the_install_path_is_not_an_install() {
+    let (_d, root) = a_dir();
+    let (source, toolchains) = a_source(&root);
+    let pin = pin_of(&source, 26);
+    let real = install(&pin, &root.join("elsewhere"), &source).unwrap();
+    std::fs::create_dir_all(&toolchains).unwrap();
+    std::os::unix::fs::symlink(&real.dir, toolchains.join(pin.dir_name())).unwrap();
+    assert_eq!(installed(&NODE, &pin, &toolchains), Ok(None));
+    let why = install(&pin, &toolchains, &source).unwrap_err();
+    assert!(why.contains("not a Node install darkmux verified"), "{why}");
+}
+
+/// (#3561 re-review) A `package.json` declares Node only through a readable
+/// `engines.node`. One darkmux cannot read (a link, over 1 MiB, not JSON)
+/// declares nothing: the sandbox gets the default pin and the reason is
+/// said; a readable one whose `engines.node` is unusable (not a string)
+/// still declares it and is refused.
+#[test]
+fn an_unreadable_package_json_declares_nothing_and_says_why() {
+    let (_d, root) = a_dir();
+    let (source, toolchains) = a_source(&root);
+    std::fs::write(root.join("their-package.json"), r#"{"name": "x"}"#).unwrap();
+    type Make = Box<dyn Fn(&Path)>;
+    let cases: [(&str, Make, &str); 3] = [
+        (
+            "linked",
+            Box::new(|ws: &Path| {
+                std::os::unix::fs::symlink(
+                    ws.parent()
+                        .unwrap()
+                        .parent()
+                        .unwrap()
+                        .join("their-package.json"),
+                    ws.join("package.json"),
+                )
+                .unwrap()
+            }),
+            "never reads through a link",
+        ),
+        (
+            "oversized",
+            Box::new(|ws: &Path| {
+                std::fs::write(
+                    ws.join("package.json"),
+                    format!("{{\"pad\": \"{}\"}}", "x".repeat(1_100_000)),
+                )
+                .unwrap()
+            }),
+            "larger than",
+        ),
+        (
+            "unparseable",
+            Box::new(|ws: &Path| std::fs::write(ws.join("package.json"), "{ not json").unwrap()),
+            "does not parse",
+        ),
+    ];
+    for (name, make, said) in cases {
+        let ws = root.join("cases").join(name);
+        std::fs::create_dir_all(&ws).unwrap();
+        make(&ws);
+        assert_eq!(declared_in(&[&ws]), Ok(None), "{name}");
+        let (got, records, notes) = supplied(&[&ws], Some(PLATFORM), &toolchains, &source);
+        assert_eq!(got.unwrap().len(), 1, "{name}: the default pin");
+        assert!(
+            shapes(&records).iter().all(|r| !r.contains("error")),
+            "{name}: {records:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.starts_with("notice") && n.contains(said)),
+            "{name}: {notes:?}"
+        );
+    }
+    let ws = root.join("cases/non-string");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(ws.join("package.json"), r#"{"engines": {"node": 22}}"#).unwrap();
+    let (got, records, _) = supplied(&[&ws], Some(PLATFORM), &toolchains, &source);
+    assert!(got.unwrap_err().contains("not a string"));
+    assert_eq!(shapes(&records), ["toolchain.error error"]);
 }

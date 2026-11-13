@@ -2462,6 +2462,10 @@ pub(crate) struct HostEmulator {
     /// reporting its stage for this long, then failing with the reason
     /// when one is given.
     pub fetch: Mutex<Option<(Duration, Option<String>)>>,
+    /// (#3561 re-review) Set: the played fetch never clears its own stage,
+    /// as a toolchain whose last step is not a stage-ending one would not,
+    /// so only the preview's own reset can.
+    pub fetch_leaves_stage: Mutex<bool>,
     created: Mutex<HashMap<String, ContainerSpec>>,
     groups: Mutex<HashMap<String, i32>>,
 }
@@ -2472,7 +2476,9 @@ impl PreviewContainers for HostEmulator {
         let Some((takes, fails)) = self.fetch.lock().unwrap().clone() else { return Ok(Toolchain::default()) };
         stage(Some(PreviewStage::getting("node", "Node", "26.13.1")));
         std::thread::sleep(takes);
-        stage(None);
+        if !*self.fetch_leaves_stage.lock().unwrap() {
+            stage(None);
+        }
         fails.map_or(Ok(Toolchain::default()), Err)
     }
 
@@ -3799,6 +3805,29 @@ mod tests {
         assert!(v["error"].as_str().unwrap().contains("does not match the SHA-256"), "{v}");
         assert!(v.get("stage").is_none(), "{v}");
         assert!(emu.specs.lock().unwrap().is_empty(), "a preview whose Node failed still started");
+    }
+
+    /// (#3561 re-review) The preview itself clears its stage once its
+    /// toolchain is resolved, whatever the toolchain reported last: a stage
+    /// left set by it is gone while the dev server starts.
+    #[test]
+    fn a_preview_clears_a_stage_its_toolchain_left_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = a_workspace(dir.path(), "sleep 30");
+        let (previews, emu) = emulated(dir.path());
+        *emu.fetch.lock().unwrap() = Some((Duration::from_millis(100), None));
+        *emu.fetch_leaves_stage.lock().unwrap() = true;
+        previews.start("w", &wt, &RecipeSource::Checkout(wt.clone())).unwrap();
+        for _ in 0..200 {
+            if !emu.specs.lock().unwrap().is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!emu.specs.lock().unwrap().is_empty(), "the preview never got past its toolchain");
+        let v = serde_json::to_value(previews.status("w").unwrap()).unwrap();
+        assert!(v.get("stage").is_none(), "the stage stuck: {v}");
+        previews.stop("w");
     }
 
     /// (#3456) Stopping a preview, and `client serve` shutting down, remove

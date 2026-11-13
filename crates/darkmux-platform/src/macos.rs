@@ -158,6 +158,10 @@ impl Platform for MacPlatform {
         self.cpu_brand().filter(|b| b.starts_with("Apple M")).map(|_| "Metal")
     }
 
+    fn c_library(&self) -> Option<crate::CLibrary> {
+        None
+    }
+
     fn node_release_platform(&self) -> Option<&'static str> {
         crate::node_release_platform_for(crate::NodeOs::Darwin, std::env::consts::ARCH)
     }

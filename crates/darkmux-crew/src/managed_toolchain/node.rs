@@ -13,9 +13,10 @@
 //! supports (github.com/nodejs/Release's `schedule.json`), for the four
 //! platforms below, `.tar.gz` archives (GNU tar on Linux unpacks them with
 //! no `xz`). A version dropped from here is removed from
-//! `~/.darkmux/toolchains/` by the next install.
+//! `~/.darkmux/toolchains/` by a later install once nobody has used it for
+//! 7 days.
 //!
-//! **The listen preload.** Every sandbox on the host that runs this Node
+//! **The listen preload.** Every sandbox on the host that has this Node
 //! gets `NODE_OPTIONS=--require "<install>/darkmux/listen-loopback.cjs"`,
 //! appended to any `NODE_OPTIONS` the sandbox already carries. It makes a
 //! listen that names no host (`listen(port)`, `listen(0)`, `listen(cb)`,
@@ -163,6 +164,7 @@ pub const NODE: Runtime = Runtime {
     // A declaration darkmux cannot read (a link, `latest`) still says the
     // project asked for Node: it is refused, never skipped.
     declares: |dirs| !matches!(super::node_version::declared_in(dirs), Ok(None)),
+    notice: super::node_version::unread_package_json,
     extras: &[Extra {
         path: "darkmux/listen-loopback.cjs",
         content: LISTEN_PRELOAD,

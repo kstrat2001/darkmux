@@ -1,7 +1,10 @@
 //! (#3561) The runtimes darkmux fetches and verifies itself for a sandbox
 //! on the host (a pinned Node.js): `toolchain.fetch`, `toolchain.ready` and
-//! `toolchain.error`. They are records of this machine's state, written once
-//! per install (the first sandbox that needs it), never per use.
+//! `toolchain.error`. A successful fetch is written once per install (the
+//! first sandbox that needs it), never per use. A failed one is written on
+//! every sandbox start that tries it: a project declaring no Node retries
+//! the default build at each start (each `toolchain.error` at warn level),
+//! and a machine with no pinned build warns at each start.
 
 use super::Attribution;
 use serde::{Deserialize, Serialize};

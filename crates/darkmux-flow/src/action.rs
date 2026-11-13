@@ -381,8 +381,11 @@ flow_actions! {
     /// (#3561) The fetched archive matched its pinned SHA-256 and is
     /// installed; every later sandbox uses it with no fetch.
     ToolchainReady => Toolchain, "toolchain.ready";
-    /// (#3561) The fetch failed (download, hash mismatch, unpack): nothing
-    /// was installed and the sandbox was refused.
+    /// (#3561) A runtime could not be had (a download, hash or unpack
+    /// failure, no pinned build, a declaration darkmux will not read):
+    /// nothing was installed. At error level the project declared it and
+    /// the sandbox was refused; at warn level it declared none and the
+    /// sandbox ran without it.
     ToolchainError => Toolchain, "toolchain.error";
     UtilityStart => Utility, "utility.start";
     UtilityError => Utility, "utility.error";

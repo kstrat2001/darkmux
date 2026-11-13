@@ -42,6 +42,11 @@ pub const MARKER: &str = ".darkmux-verified";
 /// How long one download may take (about 50 MB).
 pub const DOWNLOAD_BOUND: Duration = Duration::from_secs(900);
 
+/// (#3561 re-review) How long connecting (DNS, TCP, TLS) may take, tried
+/// twice: a dead or blackholed host costs a sandbox start about 21 s, where
+/// it cost 93 s (30 s, three times) before.
+pub const CONNECT_BOUND: Duration = Duration::from_secs(10);
+
 /// How long unpacking may take.
 const UNPACK_BOUND: Duration = Duration::from_secs(300);
 
@@ -107,15 +112,20 @@ pub enum Note<'a> {
         elapsed: Duration,
         reason: &'a str,
     },
-    /// (#3561) The project declares no version of `runtime` and it could not
-    /// be had here (`reason`): the sandbox runs without it. `pin` is the
-    /// build that was tried, when one was.
-    Skipped {
+    /// (#3561) `runtime` could not be had here (`reason`). `required`: the
+    /// project declares it, and the sandbox is refused; otherwise the
+    /// sandbox runs without it. `pin` is the build that was tried, when one
+    /// was chosen.
+    Unavailable {
         runtime: &'a Runtime,
         pin: Option<&'a Pin>,
         platform: &'a str,
         reason: &'a str,
+        required: bool,
     },
+    /// (#3561 re-review) Something about the project the caller should say
+    /// (a `package.json` darkmux could not read, which declares nothing).
+    Notice { runtime: &'a Runtime, text: &'a str },
 }
 
 /// The marker's line for `pin`.
@@ -361,8 +371,9 @@ pub(super) fn land(pin: &Pin, inner: &Path, dir: &Path) -> Result<(), String> {
 
 /// `curl`'s fetch of `url` into `to`: no `~/.curlrc` (`-q`), failing on an
 /// HTTP error, only over https (redirects included), or `file:` for a test
-/// build's fixture.
-fn download(url: &str, to: &Path) -> Result<(), String> {
+/// build's fixture; giving up on a host that does not connect within
+/// [`CONNECT_BOUND`] (one retry) or a transfer that stalls.
+pub(super) fn download_command(url: &str, to: &Path) -> Command {
     // https always; a test build's local fixture is a `file:` URL.
     let scheme = if url.starts_with("file:") {
         "file"
@@ -380,15 +391,22 @@ fn download(url: &str, to: &Path) -> Result<(), String> {
         ])
         .args([
             "--connect-timeout",
-            "30",
+            &CONNECT_BOUND.as_secs().to_string(),
             "--retry",
-            "2",
-            "--max-time",
-            &DOWNLOAD_BOUND.as_secs().to_string(),
-            "-o",
+            "1",
         ])
+        // A transfer that stalls (under 1 KiB/s for 30 s) gives up rather
+        // than holding a sandbox start for the whole bound.
+        .args(["--speed-limit", "1024", "--speed-time", "30"])
+        .args(["--max-time", &DOWNLOAD_BOUND.as_secs().to_string(), "-o"])
         .arg(to)
         .arg(url);
+    cmd
+}
+
+/// Fetch `url` into `to` ([`download_command`]).
+fn download(url: &str, to: &Path) -> Result<(), String> {
+    let cmd = download_command(url, to);
     let fix = "Nothing was installed. Check that this machine reaches the download's host (behind a proxy, set \
                `https_proxy`) and run again";
     match run_bounded(cmd, DOWNLOAD_BOUND + Duration::from_secs(30)) {

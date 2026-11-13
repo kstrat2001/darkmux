@@ -1,6 +1,7 @@
-//! (#3561) The runtimes darkmux supplies to every sandbox it starts on the
+//! (#3561) The runtimes darkmux supplies to the sandboxes it starts on the
 //! host for a workspace (Seatbelt on macOS, Landlock on Linux): dispatch,
-//! contained commands and client previews. Node.js is the one it ships
+//! contained commands and client previews. Required where the project
+//! declares one, best effort where it does not (see below). Node.js is the one it ships
 //! ([`node`]). A container keeps its image's own runtimes and never comes
 //! here.
 //!
@@ -91,6 +92,9 @@ pub struct Runtime {
     /// declaration darkmux cannot read counts: the project asked). A
     /// declared runtime is required; an undeclared one is best effort.
     pub declares: fn(&[&Path]) -> bool,
+    /// What the caller should say about the project's files before any
+    /// fetch (Node: a `package.json` darkmux could not read).
+    pub notice: fn(&[&Path]) -> Option<String>,
     pub extras: &'static [Extra],
 }
 
@@ -164,7 +168,7 @@ pub fn provide(
         return Err(format!(
             "darkmux pins no {} build for this machine ({}), and a sandbox on the host runs {} from darkmux",
             runtime.display,
-            platform.unwrap_or("a CPU no pinned build runs on"),
+            platform.unwrap_or("a CPU or C library, such as musl, that no pinned build runs on"),
             runtime.display,
         ));
     }
@@ -188,7 +192,7 @@ pub struct Supply<'a> {
 /// refuses the sandbox (its `toolchain.error` at error level). One it does
 /// not declare is best effort: its default build, or, when that cannot be
 /// had, nothing (its `toolchain.error` at warn level, once, and a
-/// [`Note::Skipped`]), and the sandbox runs without it. Each step goes to
+/// [`Note::Unavailable`]), and the sandbox runs without it. Each step goes to
 /// `stage` and its record to `sink`.
 pub fn supply(
     ask: &Supply,
@@ -203,7 +207,10 @@ pub fn supply(
     Ok(got)
 }
 
-/// [`supply`] for one runtime: `Ok(None)` when it is skipped.
+/// [`supply`] for one runtime: `Ok(None)` when it is skipped. Every
+/// failure is recorded once: by the fetch's own `toolchain.error` when a
+/// fetch failed, else by an [`Note::Unavailable`] record (error level when
+/// the project declared the runtime, warn level when it did not).
 fn supply_one(
     ask: &Supply,
     runtime: &Runtime,
@@ -212,28 +219,38 @@ fn supply_one(
     sink: &mut dyn FnMut(darkmux_flow::FlowRecord),
 ) -> Result<Option<Installed>, String> {
     let required = (runtime.declares)(dirs);
+    if let Some(text) = (runtime.notice)(dirs) {
+        stage(&Note::Notice {
+            runtime,
+            text: &text,
+        });
+    }
     let mut recorded = false;
     let source = (ask.source)(runtime);
     let got = provide(runtime, ask.platform, ask.root, &source, dirs, &mut |n| {
         recorded |= matches!(n, Note::Failed { .. });
-        sink(record(n, ask.needed_by, ask.session, required));
+        if let Some(r) = record(n, ask.needed_by, ask.session, required) {
+            sink(r);
+        }
         stage(n);
     });
-    let why = match got {
-        Ok(installed) => return Ok(Some(installed)),
-        Err(why) if required => return Err(format!("{why}\n{}", way_out())),
-        Err(why) => why,
-    };
-    let skipped = Note::Skipped {
+    let Err(why) = got else { return got.map(Some) };
+    let unavailable = Note::Unavailable {
         runtime,
         pin: None,
         platform: ask.platform.unwrap_or("unknown"),
         reason: &why,
+        required,
     };
     if !recorded {
-        sink(record(&skipped, ask.needed_by, ask.session, required));
+        if let Some(r) = record(&unavailable, ask.needed_by, ask.session, required) {
+            sink(r);
+        }
     }
-    stage(&skipped);
+    if required {
+        return Err(format!("{why}\n{}", way_out()));
+    }
+    stage(&unavailable);
     Ok(None)
 }
 
@@ -266,12 +283,13 @@ pub fn said(note: &Note) -> Option<String> {
         Note::Fetching { runtime, pin } => {
             Some(format!("getting {} {} for sandboxes on this machine (first use only)", runtime.display, pin.version))
         }
-        Note::Skipped { runtime, reason, .. } => Some(format!(
+        Note::Unavailable { runtime, reason, required: false, .. } => Some(format!(
             "running this sandbox without darkmux's {0} (or its listen preload): the project declares no {0} \
              version, and darkmux's default {0} could not be had here: {reason}",
             runtime.display
         )),
-        Note::Ready { .. } | Note::Failed { .. } => None,
+        Note::Notice { text, .. } => Some(text.to_string()),
+        Note::Ready { .. } | Note::Failed { .. } | Note::Unavailable { .. } => None,
     }
 }
 
@@ -282,9 +300,11 @@ pub fn managed(installed: &[Installed]) -> Vec<darkmux_sandbox::toolchain::Manag
 }
 
 /// A step's payload: the build (empty fields where none was chosen, as on
-/// a machine with no pinned build), and its time and reason when it ended.
-fn toolchain_payload(note: &Note, needed_by: ToolchainUse) -> ToolchainPayload {
+/// a machine with no pinned build), and its time and reason when it ended;
+/// `None` for a step that is not a fetch's (a notice).
+fn toolchain_payload(note: &Note, needed_by: ToolchainUse) -> Option<ToolchainPayload> {
     let (runtime, pin, platform, elapsed, error) = match note {
+        Note::Notice { .. } => return None,
         Note::Fetching { runtime, pin } => (runtime.name, Some(*pin), pin.platform, None, None),
         Note::Ready {
             runtime,
@@ -303,11 +323,12 @@ fn toolchain_payload(note: &Note, needed_by: ToolchainUse) -> ToolchainPayload {
             Some(*elapsed),
             Some(reason.to_string()),
         ),
-        Note::Skipped {
+        Note::Unavailable {
             runtime,
             pin,
             platform,
             reason,
+            ..
         } => (
             runtime.name,
             *pin,
@@ -316,7 +337,7 @@ fn toolchain_payload(note: &Note, needed_by: ToolchainUse) -> ToolchainPayload {
             Some(reason.to_string()),
         ),
     };
-    ToolchainPayload {
+    Some(ToolchainPayload {
         tool: runtime.to_string(),
         version: pin.map(|p| p.version.to_string()).unwrap_or_default(),
         platform: platform.to_string(),
@@ -324,20 +345,21 @@ fn toolchain_payload(note: &Note, needed_by: ToolchainUse) -> ToolchainPayload {
         needed_by,
         elapsed_ms: elapsed.map(|d| d.as_millis() as u64),
         error,
-    }
+    })
 }
 
 /// A step as its flow record, on `session` when there is one:
 /// `toolchain.fetch`, `.ready`, or `.error` (at error level when the
-/// runtime is `required`, else at warn level, as for a [`Note::Skipped`]).
+/// runtime is `required` and the sandbox is refused, else at warn level);
+/// `None` for a notice, which is said, not recorded.
 pub fn record(
     note: &Note,
     needed_by: ToolchainUse,
     session: Option<&darkmux_types::session_id::SessionId>,
     required: bool,
-) -> darkmux_flow::FlowRecord {
+) -> Option<darkmux_flow::FlowRecord> {
     use darkmux_flow::{Level, Payload};
-    let payload = toolchain_payload(note, needed_by);
+    let payload = toolchain_payload(note, needed_by)?;
     // A failure is an error where it refuses the sandbox (the project
     // declared the runtime) and a warning where the sandbox goes on without
     // it, as `utility.error` is a warning: the work continues.
@@ -346,14 +368,16 @@ pub fn record(
         Note::Fetching { .. } => (Level::Info, Payload::ToolchainFetch(payload)),
         Note::Ready { .. } => (Level::Info, Payload::ToolchainReady(payload)),
         Note::Failed { .. } => (failed, Payload::ToolchainError(payload)),
-        Note::Skipped { .. } => (Level::Warn, Payload::ToolchainError(payload)),
+        Note::Unavailable { .. } | Note::Notice { .. } => {
+            (failed, Payload::ToolchainError(payload))
+        }
     };
     let (category, stage, handle) = (
         darkmux_flow::Category::Machinery,
         darkmux_flow::Stage::Dispatch,
         "darkmux",
     );
-    match session {
+    Some(match session {
         Some(s) => {
             darkmux_flow::FlowRecord::for_session_with(s, level, category, stage, payload, handle)
         }
@@ -378,7 +402,7 @@ pub fn record(
             hash: None,
             payload: Some(payload),
         },
-    }
+    })
 }
 
 /// What `darkmux doctor` says of one managed runtime.

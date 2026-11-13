@@ -143,6 +143,12 @@ pub trait Platform: Send + Sync {
     /// build darkmux has a pin for.
     fn node_release_platform(&self) -> Option<&'static str>;
 
+    /// (#3561 re-review) Which C library this machine's programs link
+    /// against, where that is a question (Linux): glibc, or musl (Alpine),
+    /// whose machines no official glibc-linked build (Node's) runs on.
+    /// `None` where the platform has no such choice.
+    fn c_library(&self) -> Option<CLibrary>;
+
     /// What this machine was bought with beyond its chip and RAM: the CPU
     /// and GPU core counts and the model, the choices a buyer makes. What
     /// the OS does not say is left empty, never guessed.
@@ -597,6 +603,32 @@ pub enum ContainerHostAccess {
     /// The name has to be mapped to the engine's host gateway when the
     /// container starts (Docker Engine on Linux).
     HostGateway,
+}
+
+/// (#3561 re-review) A Linux machine's C library.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CLibrary {
+    Glibc,
+    Musl,
+}
+
+/// The C library a Linux machine with these entries in `/lib` uses: musl
+/// when its dynamic loader (`ld-musl-<arch>.so.1`) is there, else glibc.
+pub(crate) fn c_library_from(lib_entries: &[String]) -> CLibrary {
+    if lib_entries.iter().any(|n| n.starts_with("ld-musl-")) {
+        CLibrary::Musl
+    } else {
+        CLibrary::Glibc
+    }
+}
+
+/// The Node.js archive platform for a Linux machine on CPU `arch` with C
+/// library `libc`: none on musl (the official builds link glibc).
+pub(crate) fn linux_node_release_platform(arch: &str, libc: CLibrary) -> Option<&'static str> {
+    match libc {
+        CLibrary::Musl => None,
+        CLibrary::Glibc => node_release_platform_for(NodeOs::Linux, arch),
+    }
 }
 
 /// (#3561) The two kernels Node.js publishes builds for that darkmux pins.
