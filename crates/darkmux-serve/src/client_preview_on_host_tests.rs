@@ -800,3 +800,21 @@ fn a_preview_appends_the_listen_preload_to_the_recipes_node_options() {
     let options: Vec<&String> = docker.env.iter().filter(|(k, _)| k == "NODE_OPTIONS").map(|(_, v)| v).collect();
     assert_eq!(options, ["--max-old-space-size=4096"]);
 }
+
+/// (#3561) A preview shows `getting_node` only while a fetch runs: once it
+/// ends, installed, failed or skipped (a project that declares no Node
+/// version runs without it), the stage is gone, so a preview never sticks.
+#[test]
+fn a_preview_stage_ends_however_the_fetch_ends() {
+    use darkmux_crew::managed_toolchain::{Note, NODE};
+    let pin = NODE.pins[0];
+    let at = std::time::Duration::ZERO;
+    assert_eq!(on_host::preview_stage(&Note::Fetching { runtime: &NODE, pin: &pin }), Some(PreviewStage::getting("node", "Node", "26.13.1")));
+    for ended in [
+        Note::Ready { runtime: &NODE, pin: &pin, elapsed: at },
+        Note::Failed { runtime: &NODE, pin: &pin, elapsed: at, reason: "x" },
+        Note::Skipped { runtime: &NODE, pin: None, platform: "darwin-arm64", reason: "x" },
+    ] {
+        assert_eq!(on_host::preview_stage(&ended), None, "{ended:?}");
+    }
+}

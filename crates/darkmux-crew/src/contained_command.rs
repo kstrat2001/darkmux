@@ -169,8 +169,8 @@ fn toolchain_for(backend: &dyn SandboxBackend, run: &Run) -> Result<darkmux_sand
     }
     let workdir = run.tree.join(run.workdir.trim_matches('/'));
     let installed = crate::managed_toolchain::for_sandbox(&[&workdir, run.tree], darkmux_flow::payload::ToolchainUse::Command, None, &mut |n| {
-        if let crate::managed_toolchain::Note::Fetching { runtime, pin } = n {
-            eprintln!("darkmux: getting {} {} for sandboxes on this machine (first use only)", runtime.display, pin.version);
+        if let Some(line) = crate::managed_toolchain::said(n) {
+            eprintln!("darkmux: {line}");
         }
     })
     .map_err(NotRun)?;

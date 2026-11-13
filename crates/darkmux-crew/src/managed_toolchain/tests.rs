@@ -54,6 +54,7 @@ fn note_word(n: &Note) -> String {
         Note::Fetching { pin, .. } => format!("fetching {}", pin.version),
         Note::Ready { pin, .. } => format!("ready {}", pin.version),
         Note::Failed { pin, .. } => format!("failed {}", pin.version),
+        Note::Skipped { .. } => "skipped".to_string(),
     }
 }
 
@@ -831,6 +832,7 @@ fn a_fetch_writes_one_record_per_step() {
         },
         ToolchainUse::Dispatch,
         Some(&session),
+        true,
     );
     assert_eq!(fetching.action, darkmux_flow::FlowAction::ToolchainFetch);
     assert_eq!(fetching.session_id, Some(session.wire()));
@@ -856,6 +858,7 @@ fn a_fetch_writes_one_record_per_step() {
         },
         ToolchainUse::Preview,
         None,
+        true,
     );
     assert_eq!(
         (ready.action.clone(), ready.session_id.clone()),
@@ -871,10 +874,24 @@ fn a_fetch_writes_one_record_per_step() {
         },
         ToolchainUse::Command,
         None,
+        true,
     );
     assert_eq!(failed.action, darkmux_flow::FlowAction::ToolchainError);
     assert!(matches!(failed.level, darkmux_flow::Level::Error));
     assert_eq!(failed.payload_json()["error"], "hash mismatch");
+    let fail = Note::Failed {
+        runtime: &NODE,
+        pin: &pin,
+        elapsed: Duration::ZERO,
+        reason: "hash mismatch",
+    };
+    assert!(
+        matches!(
+            record(&fail, ToolchainUse::Command, None, false).level,
+            darkmux_flow::Level::Warn
+        ),
+        "a failure the sandbox goes on without is a warning"
+    );
 }
 
 /// (#3561) `darkmux doctor`'s reading: fetched on first use until it is
@@ -1204,4 +1221,158 @@ mod live {
         assert_eq!(lines[1], installed.bin().join("node").display().to_string());
         assert_eq!(lines[2], format!("v{} 127.0.0.1 ok", installed.pin.version));
     }
+}
+
+/// (#3561, Kain's decision) A runtime is required only when the project
+/// declares it. What a sandbox start got, and the records it wrote.
+fn supplied(
+    dirs: &[&Path],
+    platform: Option<&str>,
+    root: &Path,
+    source: &Source,
+) -> (
+    Result<Vec<Installed>, String>,
+    Vec<darkmux_flow::FlowRecord>,
+    Vec<String>,
+) {
+    let (mut records, mut notes) = (Vec::new(), Vec::new());
+    let source_for = |_: &Runtime| source.clone();
+    let ask = Supply {
+        platform,
+        root,
+        source: &source_for,
+        needed_by: ToolchainUse::Command,
+        session: None,
+    };
+    let got = supply(&ask, dirs, &mut |n| notes.push(note_kind(n)), &mut |r| {
+        records.push(r)
+    });
+    (got, records, notes)
+}
+
+fn note_kind(n: &Note) -> String {
+    note_word(n)
+}
+
+/// The action and level of each record, as words.
+fn shapes(records: &[darkmux_flow::FlowRecord]) -> Vec<String> {
+    records
+        .iter()
+        .map(|r| format!("{} {:?}", r.action, r.level).to_lowercase())
+        .collect()
+}
+
+/// A source whose every archive is missing (a failed download).
+fn unreachable(source: &Source, root: &Path) -> Source {
+    let nowhere = fixture::leak(format!(
+        "file://{}",
+        root.join("nowhere/x.tar.gz").display()
+    ));
+    Source {
+        pins: source
+            .pins
+            .iter()
+            .map(|p| Pin { url: nowhere, ..*p })
+            .collect(),
+    }
+}
+
+/// (#3561) Declared and failed: a project that names its Node version gets
+/// that Node or the sandbox is refused, with `toolchain.error` at error
+/// level and the remedy.
+#[test]
+fn a_declared_node_that_cannot_be_had_refuses_the_sandbox() {
+    let (_d, root) = a_dir();
+    let (source, toolchains) = a_source(&root);
+    let ws = root.join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(ws.join(".nvmrc"), "22\n").unwrap();
+    let (got, records, _) = supplied(
+        &[&ws],
+        Some(PLATFORM),
+        &toolchains,
+        &unreachable(&source, &root),
+    );
+    let why = got.unwrap_err();
+    assert!(
+        why.contains("could not download") && why.contains("runtime.sandbox docker"),
+        "{why}"
+    );
+    assert_eq!(
+        shapes(&records),
+        ["toolchain.fetch info", "toolchain.error error"]
+    );
+    for (platform, text) in [
+        (None, "22"),
+        (Some(PLATFORM), "latest"),
+        (Some(PLATFORM), "21.0.0"),
+    ] {
+        std::fs::write(ws.join(".nvmrc"), format!("{text}\n")).unwrap();
+        assert!(
+            supplied(&[&ws], platform, &toolchains, &source).0.is_err(),
+            "{platform:?} `{text}` was not refused"
+        );
+    }
+    // A declaration darkmux will not read at all (a link) still says the
+    // project asked for Node: refused, never skipped.
+    std::fs::remove_file(ws.join(".nvmrc")).unwrap();
+    std::fs::write(root.join("elsewhere"), "22\n").unwrap();
+    std::os::unix::fs::symlink(root.join("elsewhere"), ws.join(".nvmrc")).unwrap();
+    let why = supplied(&[&ws], Some(PLATFORM), &toolchains, &source)
+        .0
+        .unwrap_err();
+    assert!(why.contains("never reads through a link"), "{why}");
+}
+
+/// (#3561) Undeclared and failed: a project that names no Node version runs
+/// without managed Node when the default build cannot be had, warning
+/// (`toolchain.error` at warn level, once) and saying so to its caller; no
+/// toolchain, so no `NODE_OPTIONS` preload either.
+#[test]
+fn an_undeclared_node_that_cannot_be_had_is_skipped_with_a_warning() {
+    let (_d, root) = a_dir();
+    let (source, toolchains) = a_source(&root);
+    let ws = root.join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(ws.join("package.json"), r#"{"name": "no engines"}"#).unwrap();
+    let (got, records, notes) = supplied(
+        &[&ws],
+        Some(PLATFORM),
+        &toolchains,
+        &unreachable(&source, &root),
+    );
+    assert_eq!(got.unwrap(), Vec::<Installed>::new());
+    assert_eq!(
+        shapes(&records),
+        ["toolchain.fetch info", "toolchain.error warn"]
+    );
+    assert_eq!(notes, ["fetching 26.13.1", "failed 26.13.1", "skipped"]);
+    let (got, records, notes) = supplied(&[&ws], None, &toolchains, &source);
+    assert_eq!(
+        got.unwrap(),
+        Vec::<Installed>::new(),
+        "no build pinned for this machine"
+    );
+    assert_eq!(shapes(&records), ["toolchain.error warn"]);
+    assert_eq!(notes, ["skipped"]);
+    assert_eq!(records[0].payload_json()["tool"], "node");
+}
+
+/// (#3561) Undeclared and available: the default pin, installed and used.
+#[test]
+fn an_undeclared_node_gets_the_default_pin() {
+    let (_d, root) = a_dir();
+    let (source, toolchains) = a_source(&root);
+    let ws = root.join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let (got, records, _) = supplied(&[&ws], Some(PLATFORM), &toolchains, &source);
+    let got = got.unwrap();
+    assert_eq!(
+        got.iter().map(|i| i.pin.version).collect::<Vec<_>>(),
+        [Version::new(26, 13, 1)]
+    );
+    assert_eq!(
+        shapes(&records),
+        ["toolchain.fetch info", "toolchain.ready info"]
+    );
 }

@@ -107,6 +107,15 @@ pub enum Note<'a> {
         elapsed: Duration,
         reason: &'a str,
     },
+    /// (#3561) The project declares no version of `runtime` and it could not
+    /// be had here (`reason`): the sandbox runs without it. `pin` is the
+    /// build that was tried, when one was.
+    Skipped {
+        runtime: &'a Runtime,
+        pin: Option<&'a Pin>,
+        platform: &'a str,
+        reason: &'a str,
+    },
 }
 
 /// The marker's line for `pin`.

@@ -160,6 +160,9 @@ pub const NODE: Runtime = Runtime {
         let request = super::node_version::declared_in(dirs)?;
         super::node_version::choose(request.as_ref(), pins)
     },
+    // A declaration darkmux cannot read (a link, `latest`) still says the
+    // project asked for Node: it is refused, never skipped.
+    declares: |dirs| !matches!(super::node_version::declared_in(dirs), Ok(None)),
     extras: &[Extra {
         path: "darkmux/listen-loopback.cjs",
         content: LISTEN_PRELOAD,

@@ -34,7 +34,9 @@ darkmux release.
   removed only once nobody has used it for 7 days, so a daemon still running an older darkmux keeps its
   Node. A version no pin satisfies is refused
   naming the nearest pinned one; a failed download or a hash mismatch refuses the sandbox with the
-  reason and the fix, never falling back to the host's Node. A first use writes `toolchain.fetch` and
+  reason and the fix, never falling back to the host's Node. That holds for a project that declares
+  its Node; one that declares none gets the default build when it can be had and otherwise runs
+  without darkmux's Node (and its listen preload), with a warning (`toolchain.error` at warn level). A first use writes `toolchain.fetch` and
   then `toolchain.ready` or `toolchain.error` to the flow; a starting preview shows it as `stage`
   (`{"code": "getting_node", "detail": "getting Node 26.13.1, first use only"}`), an additive field of
   `PreviewState`. `darkmux doctor` has a row per managed runtime (`managed node`: the verified

@@ -33,8 +33,11 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.8.0";
 //           `elapsed_ms` on ready and error, `error` on error), written when
 //           darkmux fetches a pinned Node.js for a sandbox on the host: on
 //           the dispatch's session for a dispatch, with no session
-//           otherwise; never an execution's record. ADDITIVE: a reader that
-//           does not know them keeps them as unknown records.
+//           otherwise; never an execution's record. `toolchain.error` is at
+//           error level when the project declared the runtime (the sandbox
+//           is refused) and warn level when it declared none (the sandbox
+//           runs without it). ADDITIVE: a reader that does not know them
+//           keeps them as unknown records.
 //   2.7.0 (#3448): three actions, `dispatch.model.start`, `.loading` and
 //           `.ready` (payload `DispatchModelPayload`: `engine`, `endpoint`,
 //           `model`, and `replacing`, `evicted` on start, `elapsed_ms` on

@@ -116,7 +116,8 @@ fn host_row(named: &str, what: &str, kind: BackendKind, host_runtime: Option<&Re
 /// (from [`darkmux_crew::managed_toolchain::statuses`]) reads it: the
 /// default build for a project that declares no version, installed and
 /// verified (its version and path), or fetched on first use. A machine with
-/// no pinned build fails: every sandbox on the host is refused there. Under
+/// no pinned build warns: a sandbox for a project that declares the
+/// runtime is refused there, one that declares none runs without it. Under
 /// Docker the rows are not asked (the image carries its own runtimes).
 pub(crate) fn managed_runtime_rows(
     selected: &Result<BackendKind, String>,
@@ -135,13 +136,14 @@ fn runtime_row(kind: BackendKind, runtime: &darkmux_crew::managed_toolchain::Run
     use darkmux_crew::managed_toolchain::Status as Rt;
     let check = |status, message: String, hint: Option<String>| Check { name: format!("managed {}", runtime.name), status, message, hint };
     let display = runtime.display;
-    let others = "a project's own declaration (for Node `.nvmrc`, `.node-version` or `engines.node`) picks another pinned \
-                  version, fetched on its first use";
+    let others = "a project's own declaration (for Node `.nvmrc`, `.node-version` or `engines.node`) picks a pinned version \
+                  and requires it (the sandbox is refused when it cannot be had); a project that declares no version gets \
+                  this build when it can be had and otherwise runs without it";
     match status {
         Rt::Installed(i) => check(
             Status::Pass,
             format!(
-                "{display} {} at {} (verified against its pinned SHA-256 when installed): first on the PATH of every \
+                "{display} {} at {} (verified against its pinned SHA-256 when installed): first on the PATH of a \
                  sandbox darkmux starts here for a project that declares no version; {others}",
                 i.pin.version,
                 i.dir.display()
@@ -152,16 +154,18 @@ fn runtime_row(kind: BackendKind, runtime: &darkmux_crew::managed_toolchain::Run
             Status::Pass,
             format!(
                 "{display} {} is fetched from {} and verified against its pinned SHA-256 on first use, then first on \
-                 the PATH of every sandbox darkmux starts here for a project that declares no version; {others}",
+                 the PATH of a sandbox darkmux starts here for a project that declares no version; {others}",
                 pin.version,
                 pin.url
             ),
             None,
         ),
         Rt::Unsupported => check(
-            Status::Fail,
+            Status::Warn,
             format!(
-                "darkmux pins no {display} build for this machine's CPU, so `{}` refuses every sandbox it would start here",
+                "darkmux pins no {display} build for this machine's CPU: under `{}` a sandbox for a project that \
+                 declares a {display} version is refused here, and one for a project that declares none runs without \
+                 darkmux's {display}",
                 darkmux_sandbox::setting_value(kind)
             ),
             Some(format!(
@@ -373,7 +377,7 @@ mod tests {
 
     /// (#3561) A row per managed runtime: under a sandbox on the host, the
     /// default build darkmux verified (version, path), or that it is
-    /// fetched on first use; a machine with no pinned build fails, naming
+    /// fetched on first use; a machine with no pinned build warns (only a declared runtime is refused there), naming
     /// the way to a container; under Docker it is not applicable (the image
     /// has its own runtimes) and the runtimes are never read.
     #[test]
@@ -389,8 +393,10 @@ mod tests {
         let rows = managed_runtime_rows(&seatbelt, || vec![(&NODE, Rt::WillFetch(pin))]);
         assert_eq!(rows[0].status, Status::Pass);
         assert!(rows[0].message.contains("Node 26.13.1") && rows[0].message.contains("first use") && rows[0].message.contains("nodejs.org"), "{}", rows[0].message);
+        assert!(rows[0].message.contains("declares no version") && rows[0].message.contains("runs without it"), "{}", rows[0].message);
         let rows = managed_runtime_rows(&Ok(BackendKind::Landlock), || vec![(&NODE, Rt::Unsupported)]);
-        assert_eq!(rows[0].status, Status::Fail);
+        assert_eq!(rows[0].status, Status::Warn, "only a project that declares Node is refused here");
+        assert!(rows[0].message.contains("declares a Node version is refused") && rows[0].message.contains("declares none runs without"), "{}", rows[0].message);
         assert!(rows[0].hint.as_deref().unwrap_or("").contains("runtime.sandbox docker"), "{:?}", rows[0].hint);
         let asked = std::cell::Cell::new(false);
         let rows = managed_runtime_rows(&Ok(BackendKind::Docker), || {

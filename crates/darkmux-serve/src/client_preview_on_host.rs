@@ -47,13 +47,29 @@ pub(crate) fn resolve_toolchain(
 }
 
 /// (#3561) The verified runtimes (Node) a preview of `workdir` runs, each
-/// fetched on first use with `getting_<runtime>` as its stage meanwhile.
+/// fetched on first use with `getting_<runtime>` as its stage meanwhile;
+/// one the project does not declare and that cannot be had is skipped,
+/// said on the serve log.
 fn managed_runtimes(workdir: &Path, stage: &dyn Fn(Option<PreviewStage>)) -> Result<Vec<darkmux_crew::managed_toolchain::Installed>, String> {
     use darkmux_crew::managed_toolchain::{for_sandbox, Note};
-    for_sandbox(&[workdir], darkmux_flow::payload::ToolchainUse::Preview, None, &mut |n| match n {
-        Note::Fetching { runtime, pin } => stage(Some(PreviewStage::getting(runtime.name, runtime.display, &pin.version.to_string()))),
-        Note::Ready { .. } | Note::Failed { .. } => stage(None),
+    for_sandbox(&[workdir], darkmux_flow::payload::ToolchainUse::Preview, None, &mut |n| {
+        if let (Some(line), Note::Skipped { .. }) = (darkmux_crew::managed_toolchain::said(n), n) {
+            eprintln!("darkmux client serve: preview of {}: {line}", workdir.display());
+        }
+        stage(preview_stage(n));
     })
+}
+
+/// (#3561) The stage a preview shows for a step: `getting_<runtime>` while
+/// a fetch runs, and none once it ended, however it ended (installed,
+/// failed, or skipped for a project that declares no version), so a
+/// preview never sticks at it.
+pub(crate) fn preview_stage(n: &darkmux_crew::managed_toolchain::Note) -> Option<PreviewStage> {
+    use darkmux_crew::managed_toolchain::Note;
+    match n {
+        Note::Fetching { runtime, pin } => Some(PreviewStage::getting(runtime.name, runtime.display, &pin.version.to_string())),
+        Note::Ready { .. } | Note::Failed { .. } | Note::Skipped { .. } => None,
+    }
 }
 
 /// The listeners bound beyond the loopback: every address (`0.0.0.0`,

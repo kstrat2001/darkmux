@@ -7304,8 +7304,8 @@ pub(crate) fn dispatch_toolchain(
         return Ok(darkmux_sandbox::toolchain::Toolchain::default());
     }
     let installed = crate::managed_toolchain::for_sandbox(&[workspace], darkmux_flow::payload::ToolchainUse::Dispatch, Some(session), &mut |n| {
-        if let crate::managed_toolchain::Note::Fetching { runtime, pin } = n {
-            eprintln!("darkmux dispatch: getting {} {} for sandboxes on this machine (first use only)", runtime.display, pin.version);
+        if let Some(line) = crate::managed_toolchain::said(n) {
+            eprintln!("darkmux dispatch: {line}");
         }
     })
     .map_err(|why| anyhow!("darkmux dispatch: {why}"))?;

@@ -29,7 +29,10 @@ pub enum ToolchainUse {
 
 /// One fetch of a managed toolchain: when it began (`toolchain.fetch`), when
 /// its archive matched the pinned SHA-256 and was installed
-/// (`toolchain.ready`), or why nothing was installed (`toolchain.error`).
+/// (`toolchain.ready`), or why nothing was installed (`toolchain.error`: at
+/// error level when the project declared the runtime and the sandbox was
+/// refused, at warn level when it declared none and the sandbox went on
+/// without it).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(
@@ -39,11 +42,12 @@ pub enum ToolchainUse {
 pub struct ToolchainPayload {
     /// The runtime (`node`).
     pub tool: String,
-    /// Its version (`26.13.1`).
+    /// Its version (`26.13.1`). Empty on a `toolchain.error` written when no
+    /// build could be chosen (a machine with no pinned build).
     pub version: String,
     /// The build's platform (`darwin-arm64`).
     pub platform: String,
-    /// Where the archive is fetched from.
+    /// Where the archive is fetched from (empty when no build was chosen).
     pub url: String,
     /// What needed it.
     pub needed_by: ToolchainUse,
