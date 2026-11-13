@@ -25,8 +25,11 @@
 //!   refused, and no socket on another port accepts connections or
 //!   unsolicited datagrams; replies on connections it opened (TCP, connected
 //!   UDP) arrive. An unconnected UDP socket's `recvfrom` is refused, even for
-//!   a reply. A caller that needs loopback-only
-//!   listeners watches the address itself (client previews do).
+//!   a reply. A caller that needs loopback-only listeners watches the
+//!   address itself: a dispatch has the TCP listeners its processes hold
+//!   read every second and is stopped on one beyond the loopback
+//!   (`darkmux-crew`'s `sandbox_listeners`), a client preview watches its
+//!   two ports. Both are detection with a window, not a boundary.
 //!   [`Network::None`] allows no network at all, the loopback included.
 //! - **Reach every descendant.** A sandbox is the process group its launcher
 //!   leads, killed over and over until it is empty (a process that keeps

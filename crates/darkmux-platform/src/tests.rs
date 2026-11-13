@@ -1808,3 +1808,245 @@ fn a_bounded_command_with_more_output_than_a_pipe_holds_finishes() {
     assert_eq!(String::from_utf8_lossy(&out.stderr).trim(), "done");
     assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
 }
+
+/// (#3559) A sandbox's processes in a process table: its leader, every
+/// process in the leader's group (an orphan the leader left behind among
+/// them), and every descendant of any of those (one that moved to a group
+/// of its own included). Nothing else: not another group's, not the
+/// leader's own parent.
+#[test]
+fn a_sandboxs_processes_are_its_group_and_their_descendants() {
+    let table = [
+        (1, 0, 1),       // launchd / init
+        (50, 1, 50),     // the leader's parent (darkmux)
+        (100, 50, 100),  // the leader
+        (101, 100, 100), // its child, in its group
+        (102, 101, 102), // a grandchild that moved to a group of its own
+        (105, 102, 105), // and its child
+        (103, 1, 100),   // an orphan still in the group
+        (104, 103, 104), // the orphan's child, in a group of its own
+        (200, 1, 200),   // another program
+        (201, 200, 200), // and its child
+    ];
+    assert_eq!(crate::sandbox_members(100, &table), vec![100, 101, 102, 103, 104, 105]);
+    // A leader that has exited still has its group and what descends from it.
+    let gone: Vec<_> = table.iter().copied().filter(|(p, _, _)| *p != 100).collect();
+    assert_eq!(crate::sandbox_members(100, &gone), vec![100, 101, 102, 103, 104, 105]);
+    // launchd or init is never a sandbox's leader: nothing would be outside it.
+    assert_eq!(crate::sandbox_members(1, &table), Vec::<u32>::new());
+    assert_eq!(crate::sandbox_members(0, &table), Vec::<u32>::new());
+}
+
+/// (#3559) `/proc/<pid>/stat` as (pid, ppid, pgrp): the name, in
+/// parentheses, may hold spaces and parentheses itself.
+#[test]
+fn a_proc_stat_line_reads_as_its_pid_parent_and_group() {
+    assert_eq!(crate::linux::stat_ids("1234 (my (odd) prog) S 1200 1234 1234 0 -1 4194560"), Some((1234, 1200, 1234)));
+    assert_eq!(crate::linux::stat_ids("7 (sh) R 1 7 7"), Some((7, 1, 7)));
+    assert_eq!(crate::linux::stat_ids("7 (sh) R"), None);
+    assert_eq!(crate::linux::stat_ids(""), None);
+    // A zombie holds no files (its `fd` directory is root's, so unreadable).
+    assert!(crate::linux::stat_says_exited("9 (a (Z) b) Z 1 9 9"));
+    assert!(crate::linux::stat_says_exited("9 (sh) X 1 9 9"));
+    assert!(!crate::linux::stat_says_exited("9 (Z) S 1 9 9"));
+    assert!(!crate::linux::stat_says_exited(""));
+}
+
+/// (#3559) One socket's `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)` record (a
+/// `struct socket_fdinfo`, read at the offsets `<sys/proc_info.h>` gives
+/// on macOS 26) as a TCP listener: its port (network order), its address
+/// (IPv4 or IPv6, a dual-stack `*` as `::`), a link-local address's scope
+/// (embedded in the address, KAME style, or given as the interface index)
+/// by name. A socket in another TCP state, or not TCP, is no listener.
+#[test]
+fn a_socket_fdinfo_record_reads_as_a_listener() {
+    use crate::macos::libproc::{listener_in_fdinfo, SOCKET_FDINFO_SIZE};
+    let record = |kind: i32, state: i32, vflag: u8, port: u16, addr: &[u8], at: usize, ifindex: u16| {
+        let mut b = vec![0u8; SOCKET_FDINFO_SIZE];
+        b[256..260].copy_from_slice(&kind.to_ne_bytes());
+        b[344..348].copy_from_slice(&state.to_ne_bytes());
+        b[288] = vflag;
+        b[268..270].copy_from_slice(&port.to_be_bytes());
+        b[at..at + addr.len()].copy_from_slice(addr);
+        b[340..342].copy_from_slice(&ifindex.to_ne_bytes());
+        b
+    };
+    let names = |i: u32| (i == 1).then(|| "lo0".to_string());
+    let read = |b: &[u8]| listener_in_fdinfo(b, 42, names).map(|(port, l)| (port, l.addr, l.scope, l.pid));
+    let v4 = |a: [u8; 4]| record(2, 1, 1, 8080, &a, 324, 0);
+    assert_eq!(read(&v4([0, 0, 0, 0])), Some((8080, Some("0.0.0.0".parse().unwrap()), None, Some(42))));
+    assert_eq!(read(&v4([127, 0, 0, 1])), Some((8080, Some("127.0.0.1".parse().unwrap()), None, Some(42))));
+    let v6 = |a: std::net::Ipv6Addr, vflag: u8, ifindex: u16| record(2, 1, vflag, 4100, &a.octets(), 312, ifindex);
+    assert_eq!(read(&v6("::".parse().unwrap(), 3, 0)), Some((4100, Some("::".parse().unwrap()), None, Some(42))));
+    assert_eq!(read(&v6("::1".parse().unwrap(), 2, 0)), Some((4100, Some("::1".parse().unwrap()), None, Some(42))));
+    let lo0 = Some("lo0".to_string());
+    assert_eq!(read(&v6("fe80:1::1".parse().unwrap(), 2, 0)), Some((4100, Some("fe80::1".parse().unwrap()), lo0.clone(), Some(42))));
+    assert_eq!(read(&v6("fe80::1".parse().unwrap(), 2, 1)), Some((4100, Some("fe80::1".parse().unwrap()), lo0, Some(42))));
+    // A scope with no name stays unnamed (never read as the loopback's).
+    assert_eq!(read(&v6("fe80:9::1".parse().unwrap(), 2, 0)), Some((4100, Some("fe80::1".parse().unwrap()), None, Some(42))));
+    // ESTABLISHED (4), not TCP (SOCKINFO_IN, 1), no address family flag.
+    assert_eq!(read(&record(2, 4, 1, 8080, &[0; 4], 324, 0)), None);
+    assert_eq!(read(&record(1, 1, 1, 8080, &[0; 4], 324, 0)), None);
+    assert_eq!(read(&record(2, 1, 0, 8080, &[0; 4], 324, 0)), None);
+    assert_eq!(read(&[0u8; 100]), None);
+}
+
+/// Kills a fixture's process group and any process that left it, when the
+/// test ends (a panic included), so no listener outlives its test.
+#[cfg(unix)]
+struct Fixture {
+    group: u32,
+    others: Vec<u32>,
+    child: std::process::Child,
+}
+
+#[cfg(unix)]
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        for pid in &self.others {
+            // SAFETY: a signal to a pid this test started.
+            unsafe { libc::kill(*pid as i32, libc::SIGKILL) };
+        }
+        // SAFETY: a signal to the process group this test started.
+        unsafe { libc::kill(-(self.group as i32), libc::SIGKILL) };
+        let _ = self.child.wait();
+    }
+}
+
+/// (#3559) The TCP listeners a sandbox's processes hold, asked of this
+/// host's strategy, against a real process tree in a group of its own: its
+/// leader's on every address, on the loopback and on IPv6's every address;
+/// one a descendant opened after moving to a session of its own; one whose
+/// opener handed it to its own child and exited (the socket table still
+/// names the dead opener; the holder is what is read). The test's own
+/// listener on every address is another process's and never one of them.
+/// A group holding nothing reads empty. An OS with no strategy cannot say;
+/// the fake answers what was set.
+#[cfg(unix)]
+#[test]
+fn the_host_lists_the_listeners_a_sandboxs_processes_hold() {
+    use std::io::BufRead;
+    use std::os::unix::process::CommandExt;
+    let host = current();
+    let foreign = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    let foreign_port = foreign.local_addr().unwrap().port();
+    let script = r#"import os, socket, sys, time
+def listen(family, host):
+    s = socket.socket(family); s.bind((host, 0)); s.listen(); return s
+a = listen(socket.AF_INET, '0.0.0.0'); b = listen(socket.AF_INET, '127.0.0.1')
+own = [a, b]
+try:
+    c = listen(socket.AF_INET6, '::'); cp = c.getsockname()[1]; own.append(c)
+except OSError:
+    cp = 0
+r, w = os.pipe()
+if os.fork() == 0:
+    [o.close() for o in own]
+    os.setsid(); s = listen(socket.AF_INET, '0.0.0.0')
+    os.write(w, b'left %d %d\n' % (s.getsockname()[1], os.getpid())); time.sleep(30); os._exit(0)
+if os.fork() == 0:
+    [o.close() for o in own]
+    h = listen(socket.AF_INET, '0.0.0.0')
+    if os.fork() == 0:
+        os.write(w, b'kept %d %d\n' % (h.getsockname()[1], os.getpid())); time.sleep(30); os._exit(0)
+    os._exit(0)
+got = b''
+while got.count(b'\n') < 2:
+    got += os.read(r, 100)
+sys.stdout.write('own %d %d %d %d\n' % (a.getsockname()[1], b.getsockname()[1], cp, os.getpid()) + got.decode()); sys.stdout.flush()
+time.sleep(30)
+"#;
+    let mut child = std::process::Command::new("/usr/bin/python3")
+        .args(["-c", script])
+        .stdout(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let out = child.stdout.take().unwrap();
+    let leader = child.id();
+    let mut fixture = Fixture { group: leader, others: Vec::new(), child };
+    let mut lines = std::io::BufReader::new(out).lines();
+    let mut said = std::collections::HashMap::new();
+    while said.len() < 3 {
+        let line = lines.next().expect("the fixture said what it listens on").unwrap();
+        let words: Vec<u32> = line.split_whitespace().skip(1).map(|w| w.parse().unwrap()).collect();
+        said.insert(line.split_whitespace().next().unwrap().to_string(), words);
+    }
+    let (own, left, kept) = (&said["own"], &said["left"], &said["kept"]);
+    fixture.others.push(left[1]);
+    let any4: std::net::IpAddr = "0.0.0.0".parse().unwrap();
+    let mut want = vec![
+        (own[0] as u16, any4, leader),
+        (own[1] as u16, "127.0.0.1".parse().unwrap(), leader),
+        (left[0] as u16, any4, left[1]),
+        (kept[0] as u16, any4, kept[1]),
+    ];
+    if own[2] != 0 {
+        want.push((own[2] as u16, "::".parse().unwrap(), leader));
+    }
+    want.sort();
+    if host.id() == OtherPlatform.id() {
+        return; // no strategy reads sockets here
+    }
+    let held = host.tcp_listeners_held_by(leader).expect("the host reads its own user's processes");
+    let mut held: Vec<_> = held.into_iter().map(|(p, l)| (p, l.addr.unwrap(), l.pid.unwrap())).collect();
+    held.sort();
+    assert_eq!(held, want);
+    assert!(!held.iter().any(|(p, _, _)| *p == foreign_port), "another process's listener counted");
+    let mut idle = std::process::Command::new("/bin/sleep").arg("30").process_group(0).spawn().unwrap();
+    let nothing = host.tcp_listeners_held_by(idle.id());
+    let _ = idle.kill();
+    let _ = idle.wait();
+    assert_eq!(nothing, Some(Vec::new()));
+    drop(fixture);
+    drop(foreign);
+    assert_eq!(OtherPlatform.tcp_listeners_held_by(1), None);
+    let one = PortListener { addr: Some(any4), text: "0.0.0.0".into(), scope: None, pid: Some(7) };
+    let fake = FakePlatform { held_listeners: vec![(5, vec![(80, one.clone())])], ..Default::default() };
+    assert_eq!((fake.tcp_listeners_held_by(5), fake.tcp_listeners_held_by(6)), (Some(vec![(80, one)]), Some(vec![])));
+    fake.held_listeners_unreadable_reads.store(1, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!((fake.tcp_listeners_held_by(5).is_none(), fake.tcp_listeners_held_by(6)), (true, Some(vec![])));
+}
+
+/// (#3559) Whether a listener is on the loopback, and how a message names
+/// it: `127.x`, `::1`, a v4-mapped loopback and an address scoped to the
+/// loopback interface are; every address, a LAN address, and an address
+/// the platform could not read whole are not.
+#[test]
+fn a_listener_on_the_loopback_is_told_from_one_beyond_it() {
+    let at = |addr: &str, scope: Option<&str>| PortListener {
+        addr: Some(addr.parse().unwrap()),
+        text: addr.to_string(),
+        scope: scope.map(str::to_string),
+        pid: None,
+    };
+    for near in [at("127.0.0.1", None), at("127.8.9.1", None), at("::1", None), at("::ffff:127.0.0.1", None), at("fe80::1", Some("lo0")), at("fe80::1", Some("lo"))] {
+        assert!(near.on_loopback(), "{near:?}");
+    }
+    let cut = PortListener { addr: None, text: "::1:2:3:4:5:6:7".into(), scope: None, pid: None };
+    for far in [at("0.0.0.0", None), at("::", None), at("192.168.1.5", None), at("fe80::1", Some("en0")), at("fe80::1", None), cut.clone()] {
+        assert!(!far.on_loopback(), "{far:?}");
+    }
+    assert_eq!(at("0.0.0.0", None).named_at(4100), "0.0.0.0:4100");
+    assert_eq!(at("::", None).named_at(4100), "[::]:4100");
+    assert_eq!(cut.named_at(4100), "[::1:2:3:4:5:6:7…]:4100 (an IPv6 address netstat cut short; not a loopback one)");
+}
+
+/// (#3559) A libproc read is the whole record (or, sized by the kernel, any
+/// bytes, or none with no error), nothing because what it read is gone
+/// (`ESRCH`, `EBADF`), or no answer: a short record, or any other error
+/// (`EPERM`), never "none".
+#[test]
+fn a_libproc_read_is_whole_gone_or_no_answer() {
+    use crate::macos::libproc::{libproc_read, LibprocRead};
+    assert_eq!(libproc_read(792, Some(792), 0), LibprocRead::Read);
+    assert_eq!(libproc_read(64, None, 0), LibprocRead::Read);
+    assert_eq!(libproc_read(0, None, 0), LibprocRead::Read);
+    assert_eq!(libproc_read(0, Some(792), 3), LibprocRead::Gone);
+    assert_eq!(libproc_read(0, Some(792), 9), LibprocRead::Gone);
+    assert_eq!(libproc_read(0, None, 3), LibprocRead::Gone);
+    assert_eq!(libproc_read(400, Some(792), 0), LibprocRead::Unreadable);
+    assert_eq!(libproc_read(0, Some(792), 0), LibprocRead::Unreadable);
+    assert_eq!(libproc_read(0, Some(792), 1), LibprocRead::Unreadable);
+    assert_eq!(libproc_read(-1, None, 1), LibprocRead::Unreadable);
+}

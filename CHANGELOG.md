@@ -116,8 +116,20 @@ darkmux release.
   socket on another port accepts connections or unsolicited datagrams; replies on connections it
   opened (TCP, connected UDP) arrive.
 - **Seatbelt does not hold a bind to the loopback (#3559).** The docs no longer claim it: a
-  dispatch under Seatbelt can listen on every address. Recorded by a conformance case; dispatches
-  are not watched yet.
+  dispatch under Seatbelt can listen on every address. Recorded by a conformance case.
+- **A dispatch in a sandbox on the host that listens beyond the loopback is stopped (#3559).**
+  Neither Seatbelt nor Landlock can hold a listener to the loopback (Landlock filters a bind by
+  port, and a `listen` with no bind binds every address without asking it). While a dispatch runs
+  under `seatbelt` or `landlock`, darkmux reads the TCP listeners its processes hold every second
+  (in-process, about half a millisecond of CPU a look) and stops it on one beyond the loopback
+  (`0.0.0.0`, `::`, a LAN address), or when that listing cannot be read twice running. The run
+  ends with a `dispatch.error` naming the address, port and pid, and the fix: bind servers to
+  `127.0.0.1` or `::1`. Servers on the loopback (a test server, a dev server a browser test
+  drives) run as before. This is detection with a window of about a second, not a kernel
+  boundary; UDP sockets are not watched; under Seatbelt a process that left the sandbox's process
+  group and whose parents back to it have exited is not seen. Docker dispatches, client previews
+  (which watch their two ports) and runs with no network (a lab run's verify, the mods gate) are
+  unchanged.
 
   Under a sandbox on the host every model-facing path names where that sandbox sees it: the lab
   prompt, crawl unit briefs, split-gitdir notes, mod attachments, and the shipped `review` and

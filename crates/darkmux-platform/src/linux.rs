@@ -241,6 +241,24 @@ impl Platform for LinuxPlatform {
         Some(peers)
     }
 
+    /// (#3559) The LISTEN sockets of `/proc/net/tcp` and `tcp6` (this
+    /// process's network namespace, which a sandbox on the default network
+    /// shares) whose inode one of the members' `/proc/<pid>/fd` links names;
+    /// the process table from every `/proc/<pid>/stat`.
+    fn tcp_listeners_held_by(&self, leader: u32) -> Option<Vec<(u16, crate::PortListener)>> {
+        let mut listening = listening_sockets(&read_to_string("/proc/net/tcp")?);
+        listening.extend(listening_sockets(&read_to_string("/proc/net/tcp6").unwrap_or_default()));
+        let mut held = Vec::new();
+        for pid in crate::sandbox_members(leader, &proc_table()?) {
+            for inode in socket_inodes_held_by(pid)? {
+                held.extend(listening.iter().filter(|(_, i)| *i == inode).map(|(at, _)| {
+                    (at.port(), crate::PortListener { addr: Some(at.ip()), text: at.ip().to_string(), scope: None, pid: Some(pid) })
+                }));
+            }
+        }
+        Some(held)
+    }
+
     fn process_group(&self, pid: u32) -> Option<u32> {
         crate::unix_process_group(pid)
     }
@@ -403,6 +421,54 @@ pub(crate) fn start_ticks_from_proc_stat(stat: &str) -> Option<u64> {
 pub(crate) fn pid_namespace_from_link(link: &str) -> Option<String> {
     let inode = link.trim().strip_prefix("pid:[")?.strip_suffix(']')?;
     (!inode.is_empty() && inode.bytes().all(|b| b.is_ascii_digit())).then(|| format!("pid:{inode}"))
+}
+
+/// (#3559) `/proc/<pid>/stat`'s pid, parent and process group. The name
+/// field is in parentheses and may hold either, so the fields are read
+/// after its last `)`.
+pub(crate) fn stat_ids(stat: &str) -> Option<(u32, u32, u32)> {
+    let pid = stat.split_whitespace().next()?.parse().ok()?;
+    let mut after = stat.get(stat.rfind(')')? + 1..)?.split_whitespace().skip(1);
+    Some((pid, after.next()?.parse().ok()?, after.next()?.parse().ok()?))
+}
+
+/// (#3559) Whether `/proc/<pid>/stat` says the process has exited: a
+/// zombie (`Z`) or dead (`X`), which holds no open files.
+pub(crate) fn stat_says_exited(stat: &str) -> bool {
+    stat.rfind(')').and_then(|end| stat.get(end + 1..)).and_then(|rest| rest.split_whitespace().next()).is_some_and(|state| matches!(state, "Z" | "X"))
+}
+
+/// (#3559) `(pid, ppid, pgid)` of every process in `/proc`; `None` when
+/// `/proc` lists none. A process that exited between the listing and the
+/// read is left out.
+fn proc_table() -> Option<Vec<(u32, u32, u32)>> {
+    let pids: Vec<u32> = list_dir("/proc").into_iter().filter_map(|name| name.parse().ok()).collect();
+    if pids.is_empty() {
+        return None;
+    }
+    Some(pids.into_iter().filter_map(|pid| stat_ids(&read_to_string(&format!("/proc/{pid}/stat"))?)).collect())
+}
+
+/// (#3559) The socket inodes `pid`'s open files name: none when it has
+/// exited (gone, or a zombie, whose `fd` directory the kernel gives to root
+/// and so cannot be read), `None` when its `fd` directory cannot be read
+/// otherwise (another user's process, or one this user may not inspect).
+#[cfg(target_os = "linux")]
+fn socket_inodes_held_by(pid: u32) -> Option<Vec<u64>> {
+    let dir = match std::fs::read_dir(format!("/proc/{pid}/fd")) {
+        Ok(dir) => dir,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
+        Err(_) => {
+            let exited = read_to_string(&format!("/proc/{pid}/stat")).is_none_or(|stat| stat_says_exited(&stat));
+            return exited.then(Vec::new);
+        }
+    };
+    Some(dir.flatten().filter_map(|fd| std::fs::read_link(fd.path()).ok()).filter_map(|l| socket_inode(&l.to_string_lossy())).collect())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn socket_inodes_held_by(_pid: u32) -> Option<Vec<u64>> {
+    None
 }
 
 /// (#3453 review) The inodes of `/proc/net/tcp{,6}`'s sockets in LISTEN
