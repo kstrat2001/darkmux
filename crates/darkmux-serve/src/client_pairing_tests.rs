@@ -383,6 +383,7 @@ fn harness() -> Harness {
         ask_allow: Arc::new(|_, _, _| darkmux_platform::AllowAnswer::NoAnswer),
         notify: Arc::new(|_| {}),
         dialogs: Arc::new(crate::client_trust::DialogSlots::default()),
+        body_limits: BodyLimits::default(),
     };
     let trust = TrustSeams::new();
     let mut state = state;
@@ -8165,6 +8166,906 @@ fn a_file_whose_status_git_cannot_read_is_not_edited() {
     let not_a_repo = WorkCopy { work_tree: dir.path().to_path_buf(), git_dir: dir.path().join("no-such-git-dir") };
     let refused = refuse_unless_clean(&not_a_repo, "page.html").expect_err("an unreadable status is not clean");
     assert_eq!(refused.status(), StatusCode::CONFLICT);
+}
+
+// ─── Added images (#3545) ────────────────────────────────────────────────
+
+/// A tiny PNG's bytes (the signature is what darkmux checks), and as base64.
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+
+fn b64(bytes: &[u8]) -> String {
+    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for c in bytes.chunks(3) {
+        let n = (c[0] as u32) << 16
+            | (*c.get(1).unwrap_or(&0) as u32) << 8
+            | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            if i <= c.len() {
+                out.push(A[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// A workspace with a page that shows one image, committed.
+fn image_workspace(h: &Harness) -> PathBuf {
+    let wt = git_workspace(h, "site");
+    std::fs::write(
+        wt.join("page.html"),
+        "<img src=\"/hero.jpg\" alt=\"\">\n<img src=\"/two.jpg\"><img src=\"/two.jpg\">\n",
+    )
+    .unwrap();
+    run_git(Some(&wt), &["add", "page.html"]);
+    run_git(Some(&wt), &["commit", "--quiet", "-m", "page"]);
+    wt
+}
+
+async fn add_image(h: &Harness, token: &str, body: Value) -> (u16, Value) {
+    let req = post("/client/workspaces/site/image", Some(token), body);
+    match tokio::time::timeout(EDIT_BOUND, call(h, req)).await {
+        Ok(reply) => reply,
+        Err(_) => {
+            eprintln!("adding an image did not end within {EDIT_BOUND:?}");
+            std::process::abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_image_sent_as_bytes_is_added_pointed_at_and_undone_like_a_run() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = image_workspace(&h);
+    let (code, v) = add_image(
+        &h,
+        &token,
+        serde_json::json!({"name": "../My Logo.png", "data": b64(PNG), "replace": "/hero.jpg"}),
+    )
+    .await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["matches"], 1);
+    let path = v["path"].as_str().unwrap().to_string();
+    let url = v["url"].as_str().unwrap().to_string();
+    assert!(
+        path.starts_with("public/images/my-logo-") && path.ends_with(".png"),
+        "{path}"
+    );
+    assert_eq!(url, path.trim_start_matches("public"));
+    assert_eq!(std::fs::read(wt.join(&path)).unwrap(), PNG);
+    assert_eq!(
+        std::fs::read_to_string(wt.join("page.html")).unwrap(),
+        format!("<img src=\"{url}\" alt=\"\">\n<img src=\"/two.jpg\"><img src=\"/two.jpg\">\n")
+    );
+    assert_eq!(
+        run_git(Some(&wt), &["status", "--porcelain"]),
+        "?? notes.txt",
+        "both committed, the owner's file stays out"
+    );
+    let id = v["work_id"].as_str().unwrap().to_string();
+    let done = status(&h, &token, &id).await;
+    assert_eq!(done["status"], "done", "{done}");
+    let (code, v) = call(
+        &h,
+        post(
+            &format!("/client/work/{id}/undo"),
+            Some(&token),
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(code, 200, "{v}");
+    assert!(!wt.join(&path).exists(), "Undo takes the image out");
+    assert!(std::fs::read_to_string(wt.join("page.html"))
+        .unwrap()
+        .contains("/hero.jpg"));
+}
+
+#[tokio::test]
+async fn an_image_without_replace_is_only_added_and_the_same_image_twice_is_kept() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = image_workspace(&h);
+    let body = serde_json::json!({"name": "photo.png", "data": b64(PNG)});
+    let (code, v) = add_image(&h, &token, body.clone()).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["matches"], Value::Null);
+    assert!(v["work_id"].is_string(), "{v}");
+    let head = run_git(Some(&wt), &["rev-parse", "HEAD"]);
+    let (code, again) = add_image(&h, &token, body).await;
+    assert_eq!(code, 200, "{again}");
+    assert_eq!(again["path"], v["path"]);
+    assert_eq!(again["work_id"], Value::Null, "nothing new to commit");
+    assert_eq!(run_git(Some(&wt), &["rev-parse", "HEAD"]), head);
+}
+
+#[tokio::test]
+async fn an_image_whose_reference_is_found_zero_or_several_times_changes_nothing() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = image_workspace(&h);
+    let head = run_git(Some(&wt), &["rev-parse", "HEAD"]);
+    for (replace, n) in [("/two.jpg", 2), ("/nowhere.jpg", 0)] {
+        let (code, v) = add_image(
+            &h,
+            &token,
+            serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": replace}),
+        )
+        .await;
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(v["matches"], n, "{replace}: {v}");
+        assert_eq!(v["work_id"], Value::Null);
+    }
+    assert_eq!(run_git(Some(&wt), &["rev-parse", "HEAD"]), head);
+    assert!(!wt.join("public").exists(), "no image left behind");
+}
+
+#[tokio::test]
+async fn an_image_refuses_what_is_not_one_and_never_writes_through_a_link() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = image_workspace(&h);
+    let svg = b64(b"<svg xmlns='http://www.w3.org/2000/svg'><script>x()</script></svg>");
+    let (code, v) = add_image(
+        &h,
+        &token,
+        serde_json::json!({"name": "a.svg", "data": svg}),
+    )
+    .await;
+    assert_eq!(code, 415, "{v}");
+    let (code, _) = add_image(
+        &h,
+        &token,
+        serde_json::json!({"name": "a.png", "data": "not base64!"}),
+    )
+    .await;
+    assert_eq!(code, 400);
+    let (code, _) = add_image(
+        &h,
+        &token,
+        serde_json::json!({"name": "a.png", "data": b64(PNG), "path": "x"}),
+    )
+    .await;
+    assert_eq!(code, 400, "unknown keys are refused");
+    let big = b64(&[PNG, &vec![0u8; crate::client_image::MAX_IMAGE_BYTES]].concat());
+    let (code, _) = add_image(
+        &h,
+        &token,
+        serde_json::json!({"name": "a.png", "data": big}),
+    )
+    .await;
+    assert_eq!(code, 413);
+    // A link where the folder should be: refused, nothing written outside.
+    let outside = h.base.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::create_dir_all(wt.join("public")).unwrap();
+    std::os::unix::fs::symlink(&outside, wt.join("public/images")).unwrap();
+    let (code, v) = add_image(
+        &h,
+        &token,
+        serde_json::json!({"name": "a.png", "data": b64(PNG)}),
+    )
+    .await;
+    assert_eq!(code, 409, "{v}");
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+}
+
+/// `body` POSTed exactly as given (not re-serialized), as an app sends it.
+fn post_raw(path: &str, token: &str, body: String) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// An image body sent exactly as given, failed within [`EDIT_BOUND`].
+async fn add_image_raw(h: &Harness, token: &str, body: String) -> (u16, Value) {
+    let req = post_raw("/client/workspaces/site/image", token, body);
+    match tokio::time::timeout(EDIT_BOUND, call(h, req)).await {
+        Ok(reply) => reply,
+        Err(_) => {
+            eprintln!("adding an image did not end within {EDIT_BOUND:?}");
+            std::process::abort();
+        }
+    }
+}
+
+/// `len` bytes of a JPEG as a camera writes one: the signature, then bytes
+/// with no pattern (a fixed LCG), so its base64 holds `/` about as often as
+/// a photo's does.
+fn photo(len: usize) -> Vec<u8> {
+    let mut out = vec![0xFF, 0xD8, 0xFF, 0xE0];
+    let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+    while out.len() < len {
+        x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        out.push((x >> 56) as u8);
+    }
+    out.truncate(len);
+    out
+}
+
+/// `bytes` as base64 the way a Swift app's JSON can carry it: broken into
+/// 64-character lines (`.lineLength64Characters`, CR LF) and escaped as
+/// `JSONEncoder` writes a string, every `/` as `\/` and each line break as
+/// `\r\n`. Returned as the JSON string's contents, quotes not included.
+fn swift_json_base64(bytes: &[u8]) -> String {
+    let plain = b64(bytes);
+    let mut out = String::with_capacity(plain.len() * 2);
+    for (i, line) in plain.as_bytes().chunks(64).enumerate() {
+        if i > 0 {
+            out.push_str("\\r\\n");
+        }
+        for c in line {
+            if *c == b'/' {
+                out.push_str("\\/");
+            } else {
+                out.push(*c as char);
+            }
+        }
+    }
+    out
+}
+
+/// (review) An image of several megabytes reaches the image route through
+/// the whole router: the gate in front of every route reads only 64 KB of
+/// any other route's body, never this one's.
+#[tokio::test]
+async fn an_image_of_several_megabytes_is_added_through_the_whole_router() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = image_workspace(&h);
+    let jpeg = photo(3 * 1024 * 1024);
+    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "beach.jpg", "data": b64(&jpeg)})).await;
+    assert_eq!(code, 200, "{v}");
+    let path = v["path"].as_str().unwrap();
+    assert_eq!(std::fs::read(wt.join(path)).unwrap(), jpeg);
+    assert!(run_git(Some(&wt), &["ls-files", "--", path]).contains(path), "committed");
+}
+
+/// (review) The image route's cap is exactly [`MAX_IMAGE_BODY_BYTES`]: a
+/// body of that size is read (padded with the whitespace JSON allows after
+/// a value), one byte more is refused with the image route's own reason,
+/// not the 64 KB one every other route gives.
+#[tokio::test]
+async fn an_image_body_past_the_image_cap_gets_the_image_routes_own_refusal() {
+    let h = harness();
+    let token = paired(&h).await;
+    let _wt = image_workspace(&h);
+    // Worked out here, not read from the constant: 10 MiB as base64 is
+    // 13,981,016 characters; every one escaped (two bytes), CR LF written
+    // `\r\n` (four bytes) for each of its 218,454 64-character lines, and
+    // 64 KiB for the other fields.
+    let cap = 13_981_016 * 2 + 218_454 * 4 + 65_536;
+    assert_eq!(cap, 28_901_384);
+    let at_cap = |extra: usize| {
+        let json = format!("{{\"name\":\"a.png\",\"data\":\"{}\"}}", b64(PNG));
+        let pad = cap + extra - json.len();
+        format!("{json}{}", " ".repeat(pad))
+    };
+    let (code, v) = add_image_raw(&h, &token, at_cap(0)).await;
+    assert_eq!(code, 200, "a body of exactly the cap is read: {v}");
+    let (code, v) = add_image_raw(&h, &token, at_cap(1)).await;
+    assert_eq!(code, 413, "{v}");
+    assert_eq!(v["code"], "payload_too_large", "{v}");
+    assert_eq!(v["error"], "an image is at most 10 MiB", "{v}");
+}
+
+/// (review) Every route that takes a body, the image route included,
+/// refuses past [`MAX_BODY_BYTES`] in the gate, before its handler: asked
+/// with no token, each answers 413, never the 401 its handler would give.
+#[tokio::test]
+async fn every_route_refuses_a_body_past_64_kb_before_its_handler() {
+    let h = harness();
+    let _token = paired(&h).await;
+    let _wt = image_workspace(&h);
+    let mut checked = 0;
+    for r in crate::routes::client_table() {
+        if matches!(r.method, "get" | "head") {
+            continue;
+        }
+        let path = r.path.replace(":name", "site").replace(":work_id", "w-0").replace(":request_id", "r-0");
+        let (code, v) = call(&h, raw(r.method, &path, None, Body::from(vec![b' '; MAX_BODY_BYTES + 1]))).await;
+        assert_eq!(code, 413, "{} {}: {v}", r.method, r.path);
+        assert_eq!(v["error"], format!("body larger than {MAX_BODY_BYTES} bytes"), "{} {}", r.method, r.path);
+        checked += 1;
+    }
+    assert!(checked >= 9, "every route that takes a body was asked ({checked})");
+}
+
+/// (review) A paired app's token raises the cap on the image route alone:
+/// every other route refuses its body past 64 KB too.
+#[tokio::test]
+async fn a_paired_apps_token_raises_the_cap_on_no_other_route() {
+    let h = harness();
+    let token = paired(&h).await;
+    let _wt = image_workspace(&h);
+    for r in crate::routes::client_table() {
+        if matches!(r.method, "get" | "head") || r.path == IMAGE_ROUTE {
+            continue;
+        }
+        let path = r.path.replace(":name", "site").replace(":work_id", "w-0").replace(":request_id", "r-0");
+        let (code, v) = call(&h, raw(r.method, &path, Some(&token), Body::from(vec![b' '; MAX_BODY_BYTES + 1]))).await;
+        assert_eq!(code, 413, "{} {}: {v}", r.method, r.path);
+    }
+}
+
+/// (review) An image keeps its turn until it has been added, not only
+/// while its body arrives: the bytes it read stay held until then.
+#[tokio::test]
+async fn an_image_keeps_its_turn_until_it_has_been_added() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = image_workspace(&h);
+    let seen = Arc::new(Mutex::new(None));
+    let (turns, s) = (h.state.body_limits.image_reads.clone(), seen.clone());
+    on_edit_commit(&wt, move || *s.lock().unwrap() = Some(turns.available_permits()));
+    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG)})).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(*seen.lock().unwrap(), Some(IMAGE_READS - 1), "its turn is held while it commits");
+    assert_eq!(h.state.body_limits.image_reads.available_permits(), IMAGE_READS, "and given back after");
+}
+
+/// A request with `method`, a JSON content type, the bearer `token` when
+/// given, and `body`.
+fn raw(method: &str, path: &str, token: Option<&str>, body: Body) -> Request<Body> {
+    let mut b = Request::builder()
+        .method(method.to_ascii_uppercase().as_str())
+        .uri(path)
+        .header("content-type", "application/json");
+    if let Some(t) = token {
+        b = b.header("authorization", format!("Bearer {t}"));
+    }
+    b.body(body).unwrap()
+}
+
+/// A body sent in 8 KB chunks, `total` bytes in all, counting what the
+/// server has taken; with `stall`, it stops sending after the first chunk
+/// and never ends.
+fn counted_body(total: usize, stall: bool) -> (Body, Arc<AtomicU64>) {
+    let taken = Arc::new(AtomicU64::new(0));
+    let chunk = 8 * 1024;
+    let n = if stall { 1 } else { total.div_ceil(chunk) };
+    let counter = taken.clone();
+    let chunks = futures::stream::iter((0..n).map(move |_| {
+        counter.fetch_add(chunk as u64, Ordering::SeqCst);
+        Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![b' '; chunk]))
+    }));
+    let body = if stall {
+        Body::from_stream(futures::StreamExt::chain(chunks, futures::stream::pending()))
+    } else {
+        Body::from_stream(chunks)
+    };
+    (body, taken)
+}
+
+/// (review) The image route reads a large body only for a paired app: one
+/// with no token, or a token no app holds, is refused once 64 KB has
+/// arrived, and the rest is never read.
+#[tokio::test]
+async fn an_image_without_a_paired_token_is_refused_before_more_than_64_kb_is_read() {
+    let h = harness();
+    let _token = paired(&h).await;
+    let _wt = image_workspace(&h);
+    for token in [None, Some("not-a-token")] {
+        let (body, taken) = counted_body(4 * 1024 * 1024, false);
+        let (code, v) = call(&h, raw("post", "/client/workspaces/site/image", token, body)).await;
+        assert_eq!(code, 413, "{token:?}: refused at 64 KB, not read and then refused 401: {v}");
+        assert_eq!(v["error"], format!("body larger than {MAX_BODY_BYTES} bytes"), "{token:?}");
+        let read = taken.load(Ordering::SeqCst) as usize;
+        assert!(read <= MAX_BODY_BYTES + 16 * 1024, "{token:?}: {read} bytes were read");
+    }
+}
+
+/// (review) Only a POST reads the image route's cap: any other method on
+/// its path (each answered 405 by its handler) is refused past 64 KB.
+#[tokio::test]
+async fn only_a_post_to_the_image_route_reads_past_64_kb() {
+    let h = harness();
+    let token = paired(&h).await;
+    let _wt = image_workspace(&h);
+    for method in ["put", "patch", "delete", "options"] {
+        let body = Body::from(vec![b' '; 1024 * 1024]);
+        let (code, v) = call(&h, raw(method, "/client/workspaces/site/image", Some(&token), body)).await;
+        assert_eq!(code, 413, "{method}: {v}");
+        assert_eq!(v["error"], format!("body larger than {MAX_BODY_BYTES} bytes"), "{method}");
+    }
+}
+
+/// (review) At most [`IMAGE_READS`] large image bodies are read at once: a
+/// further one waits for a turn as long as a body may take to arrive, then
+/// is refused with `too_many_requests`; once a turn frees, it is read.
+#[tokio::test]
+async fn an_image_body_waits_for_a_turn_and_is_refused_when_none_frees() {
+    let mut h = harness();
+    h.state.body_limits = BodyLimits::new(std::time::Duration::from_millis(300));
+    let token = paired(&h).await;
+    let _wt = image_workspace(&h);
+    let turns = h.state.body_limits.image_reads.clone();
+    let held = turns.clone().try_acquire_many_owned(2).expect("two turns, both free");
+    let body = serde_json::json!({"name": "a.png", "data": b64(PNG)});
+    let started = std::time::Instant::now();
+    let (code, v) = add_image(&h, &token, body.clone()).await;
+    assert_eq!(code, 429, "{v}");
+    assert_eq!(v["code"], "too_many_requests", "{v}");
+    assert!(started.elapsed() >= std::time::Duration::from_millis(300), "it waited for a turn first");
+    drop(held);
+    let (code, v) = add_image(&h, &token, body).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(turns.available_permits(), IMAGE_READS, "its turn is given back");
+}
+
+/// (review) A body that stops arriving is refused once the read time is
+/// up, on the image route and on any other, so a client cannot hold a
+/// request (and what was read of it) open.
+#[tokio::test]
+async fn a_body_that_stops_arriving_is_refused_when_the_read_time_is_up() {
+    let mut h = harness();
+    h.state.body_limits = BodyLimits::new(std::time::Duration::from_millis(300));
+    let token = paired(&h).await;
+    let _wt = image_workspace(&h);
+    for path in ["/client/workspaces/site/image", "/client/workspaces/site/edit", "/client/pair"] {
+        let (body, taken) = counted_body(0, true);
+        let started = std::time::Instant::now();
+        let (code, v) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            call(&h, raw("post", path, Some(&token), body)),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{path}: a stalled body was waited on for good"));
+        assert_eq!(code, 408, "{path}: {v}");
+        assert!(taken.load(Ordering::SeqCst) > 0, "{path}: the first chunk was read");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{path}");
+    }
+    assert_eq!(h.state.body_limits.image_reads.available_permits(), IMAGE_READS, "no turn is kept");
+}
+
+/// (review) The decoded size is the real limit: a 10 MB image is taken
+/// however a Swift app's JSON encodes it, every `/` escaped (an image of
+/// `0xFF` bytes, whose base64 is all `/`, is the worst case) and its lines
+/// broken with CR LF.
+#[tokio::test]
+async fn a_ten_megabyte_image_as_a_swift_app_encodes_it_is_accepted() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = image_workspace(&h);
+    let mut jpeg = vec![0xFF; crate::client_image::MAX_IMAGE_BYTES];
+    jpeg[1] = 0xD8;
+    let body = format!("{{\"name\":\"big.jpg\",\"data\":\"{}\"}}", swift_json_base64(&jpeg));
+    assert!(body.len() > 2 * jpeg.len(), "the worst case is being sent: {}", body.len());
+    let (code, v) = add_image_raw(&h, &token, body).await;
+    assert_eq!(code, 200, "{v}");
+    let path = v["path"].as_str().unwrap();
+    assert!(std::fs::read(wt.join(path)).unwrap() == jpeg, "the bytes as sent");
+    // A photo's bytes, encoded the same way, the way it most often is.
+    let (code, v) = add_image_raw(
+        &h,
+        &token,
+        format!("{{\"name\":\"photo.jpg\",\"data\":\"{}\"}}", swift_json_base64(&photo(crate::client_image::MAX_IMAGE_BYTES))),
+    )
+    .await;
+    assert_eq!(code, 200, "{v}");
+}
+
+/// (review) One byte past 10 MB, decoded, is refused, though its body fits
+/// what the route reads: nothing is written or committed.
+#[tokio::test]
+async fn an_image_one_byte_past_ten_megabytes_decoded_is_refused() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = image_workspace(&h);
+    let head = run_git(Some(&wt), &["rev-parse", "HEAD"]);
+    let too_big = photo(crate::client_image::MAX_IMAGE_BYTES + 1);
+    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.jpg", "data": b64(&too_big)})).await;
+    assert_eq!(code, 413, "{v}");
+    assert_eq!(v["error"], "an image is at most 10 MiB", "{v}");
+    assert_eq!(run_git(Some(&wt), &["rev-parse", "HEAD"]), head);
+    assert!(!wt.join("public").exists(), "nothing written");
+}
+
+/// The work copy as git and the disk hold it: HEAD, the index (every
+/// entry), the status, and the page.
+fn work_copy_state(wt: &Path) -> (String, String, String, String) {
+    (
+        run_git(Some(wt), &["rev-parse", "HEAD"]),
+        run_git(Some(wt), &["ls-files", "--stage"]),
+        run_git(Some(wt), &["status", "--porcelain", "--untracked-files=all"]),
+        std::fs::read_to_string(wt.join("page.html")).unwrap(),
+    )
+}
+
+/// Makes the next commit on the work copy's branch fail: git cannot lock
+/// the branch's ref while another `.lock` holds it.
+fn lock_branch(h: &Harness, wt: &Path) -> PathBuf {
+    let branch = run_git(Some(wt), &["branch", "--show-current"]);
+    let lock = crate::client_git::clone_git_dir(&h.base, "site").join(format!("refs/heads/{branch}.lock"));
+    std::fs::write(&lock, "").unwrap();
+    lock
+}
+
+/// (review) An image whose commit fails leaves the work copy exactly as it
+/// was: HEAD, the index, the page it pointed, and no image or folder it
+/// made; a folder that was already there stays.
+#[tokio::test]
+async fn an_image_whose_commit_fails_leaves_the_work_copy_as_it_was() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = image_workspace(&h);
+    let before = work_copy_state(&wt);
+    let lock = lock_branch(&h, &wt);
+    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "/hero.jpg"})).await;
+    assert_eq!(code, 409, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("couldn't commit the image"), "{v}");
+    assert_eq!(work_copy_state(&wt), before, "HEAD, index, status and page as they were");
+    assert!(!wt.join("public").exists(), "the folders it made are gone");
+    // A `public/` that was there (with a file of the site's) stays.
+    std::fs::remove_file(&lock).unwrap();
+    std::fs::create_dir_all(wt.join("public")).unwrap();
+    std::fs::write(wt.join("public/robots.txt"), "User-agent: *\n").unwrap();
+    run_git(Some(&wt), &["add", "public/robots.txt"]);
+    run_git(Some(&wt), &["commit", "--quiet", "-m", "robots"]);
+    let before = work_copy_state(&wt);
+    let lock = lock_branch(&h, &wt);
+    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG)})).await;
+    assert_eq!(code, 409, "{v}");
+    assert_eq!(work_copy_state(&wt), before);
+    assert!(wt.join("public/robots.txt").exists(), "the site's folder stays");
+    assert!(!wt.join("public/images").exists(), "the folder it made is gone");
+    // Once git can commit, the same image is added: nothing was left to refuse it.
+    std::fs::remove_file(&lock).unwrap();
+    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG)})).await;
+    assert_eq!(code, 200, "{v}");
+    assert!(v["work_id"].is_string(), "{v}");
+}
+
+/// Whether `dir`'s filesystem tells names apart only by case (a Mac's
+/// default APFS volume).
+fn case_insensitive(dir: &Path) -> bool {
+    let probe = dir.join("case-probe");
+    std::fs::write(&probe, "").unwrap();
+    let insensitive = dir.join("CASE-PROBE").exists();
+    std::fs::remove_file(probe).unwrap();
+    insensitive
+}
+
+/// (review) In a repository that tracks `Public/` (another case) on a
+/// case-insensitive disk, git files the image under the index's spelling;
+/// darkmux names it that way, so it commits, and a failed commit still
+/// leaves the index as it was.
+#[tokio::test]
+async fn an_image_where_public_is_tracked_in_another_case_commits_where_git_files_it() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = image_workspace(&h);
+    if !case_insensitive(&wt) || run_git(Some(&wt), &["config", "--type=bool", "core.ignorecase"]) != "true" {
+        eprintln!("skipped: this filesystem tells names apart by case, so git files no path under another case");
+        return;
+    }
+    std::fs::create_dir_all(wt.join("Public")).unwrap();
+    std::fs::write(wt.join("Public/x.txt"), "x\n").unwrap();
+    run_git(Some(&wt), &["add", "Public/x.txt"]);
+    run_git(Some(&wt), &["commit", "--quiet", "-m", "Public"]);
+    let before = work_copy_state(&wt);
+    let lock = lock_branch(&h, &wt);
+    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG)})).await;
+    assert_eq!(code, 409, "{v}");
+    assert_eq!(work_copy_state(&wt), before, "the index as it was");
+    assert!(!wt.join("Public/images").exists(), "the folder it made is gone");
+    std::fs::remove_file(&lock).unwrap();
+    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG)})).await;
+    assert_eq!(code, 200, "{v}");
+    let path = v["path"].as_str().unwrap();
+    assert!(path.starts_with("Public/images/a-"), "{path}");
+    assert!(run_git(Some(&wt), &["ls-files"]).lines().any(|l| l == path), "committed as {path}");
+    assert_eq!(run_git(Some(&wt), &["status", "--porcelain"]), "?? notes.txt");
+}
+
+/// (review) `replace` is a whole reference: `hero.jpg` is not found inside
+/// `/assets/hero.jpg`, and `/hero.jpg` is not found inside
+/// `/thumbs/hero.jpg`.
+#[tokio::test]
+async fn an_image_reference_is_a_whole_path_never_the_tail_of_a_longer_one() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = image_workspace(&h);
+    let page = |text: &str| {
+        std::fs::write(wt.join("page.html"), text).unwrap();
+        run_git(Some(&wt), &["commit", "--quiet", "-am", "page"]);
+    };
+    page("<img src=\"/assets/hero.jpg\">\n");
+    let head = run_git(Some(&wt), &["rev-parse", "HEAD"]);
+    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "hero.jpg"})).await;
+    assert_eq!((code, &v["matches"]), (200, &Value::from(0)), "{v}");
+    assert_eq!(run_git(Some(&wt), &["rev-parse", "HEAD"]), head);
+    assert_eq!(std::fs::read_to_string(wt.join("page.html")).unwrap(), "<img src=\"/assets/hero.jpg\">\n");
+    page("<img src=\"/hero.jpg\"><img src=\"/thumbs/hero.jpg\"><img src=\"/hero.jpg.bak\">\n");
+    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "/hero.jpg"})).await;
+    assert_eq!((code, &v["matches"]), (200, &Value::from(1)), "{v}");
+    let url = v["url"].as_str().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(wt.join("page.html")).unwrap(),
+        format!("<img src=\"{url}\"><img src=\"/thumbs/hero.jpg\"><img src=\"/hero.jpg.bak\">\n")
+    );
+}
+
+/// (review) The file holding the reference must have no uncommitted change:
+/// one that does is refused and nothing is written or committed.
+#[tokio::test]
+async fn an_image_is_refused_onto_a_referenced_file_with_uncommitted_changes() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = image_workspace(&h);
+    let head = run_git(Some(&wt), &["rev-parse", "HEAD"]);
+    let edited = "<img src=\"/hero.jpg\" alt=\"\">\n<p>edited by hand</p>\n";
+    std::fs::write(wt.join("page.html"), edited).unwrap();
+    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "/hero.jpg"})).await;
+    assert_eq!(code, 409, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("aren't committed"), "{v}");
+    assert_eq!(std::fs::read_to_string(wt.join("page.html")).unwrap(), edited);
+    assert_eq!(run_git(Some(&wt), &["rev-parse", "HEAD"]), head);
+    assert!(!wt.join("public").exists(), "no image written");
+}
+
+/// (review) A work copy a run is busy in is refused, as `/edit` refuses it;
+/// so is a different file already where the image would go.
+#[tokio::test]
+async fn an_image_is_refused_in_a_busy_work_copy_or_over_a_different_file() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = image_workspace(&h);
+    let head = run_git(Some(&wt), &["rev-parse", "HEAD"]);
+    let id = start_in(&h, &token, "site", "wait").await;
+    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG)})).await;
+    assert_eq!(code, 409, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("already working in this work copy"), "{v}");
+    assert!(!wt.join("public").exists(), "nothing written while busy");
+    let _ = cancel(&h, Some(&token), &id).await;
+    let _ = wait_done(&h, &token, &id).await;
+    let at = wt.join(crate::client_image::IMAGE_FOLDER).join(crate::client_image::file_name("a.png", PNG, "png"));
+    std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+    std::fs::write(&at, b"another file").unwrap();
+    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG)})).await;
+    assert_eq!(code, 409, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("already holds a different file"), "{v}");
+    assert_eq!(std::fs::read(&at).unwrap(), b"another file");
+    assert_eq!(run_git(Some(&wt), &["rev-parse", "HEAD"]), head);
+}
+
+/// Adds `path` to the index as a blob holding `text`, and the file to the
+/// disk (where a case-insensitive disk may file it under another case).
+fn index_only(wt: &Path, path: &str, text: &str) {
+    let file = wt.join(path);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, text).unwrap();
+    let sha = run_git(Some(wt), &["hash-object", "-w", path]);
+    run_git(Some(wt), &["update-index", "--add", "--cacheinfo", &format!("100644,{sha},{path}")]);
+}
+
+/// The URL a page reaches `path` at: `path` without its first folder.
+fn url_for(path: &str) -> String {
+    format!("/{}", path.split_once('/').unwrap().1)
+}
+
+/// (review) A repository made on Linux can hold `public/` in two cases.
+/// darkmux does not guess which one git files the image under: it reads
+/// back the name git staged and commits that, and a failed commit leaves
+/// the index exactly as it was.
+#[tokio::test]
+async fn an_image_where_the_index_holds_public_in_two_cases_commits_what_git_staged() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = image_workspace(&h);
+    if !case_insensitive(&wt) || run_git(Some(&wt), &["config", "--type=bool", "core.ignorecase"]) != "true" {
+        eprintln!("skipped: this filesystem tells names apart by case, so git files no path under another case");
+        return;
+    }
+    index_only(&wt, "PUBLIC/a.txt", "a\n");
+    index_only(&wt, "public/b.txt", "b\n");
+    run_git(Some(&wt), &["commit", "--quiet", "-m", "two cases"]);
+    let before = work_copy_state(&wt);
+    let lock = lock_branch(&h, &wt);
+    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG)})).await;
+    assert_eq!(code, 409, "{v}");
+    assert_eq!(work_copy_state(&wt), before, "the index as it was");
+    std::fs::remove_file(&lock).unwrap();
+    for _ in 0..2 {
+        let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "/hero.jpg"})).await;
+        assert_eq!(code, 200, "{v}");
+        if v["work_id"].is_null() {
+            continue;
+        }
+        let path = v["path"].as_str().unwrap();
+        assert!(run_git(Some(&wt), &["ls-files"]).lines().any(|l| l == path), "committed as {path}");
+        assert_eq!(v["url"], url_for(path), "{v}");
+        assert_eq!(run_git(Some(&wt), &["status", "--porcelain"]), "?? notes.txt");
+    }
+}
+
+/// (review) The reply's `url`, and the reference `replace` writes, follow
+/// the folders the image was filed under: a site that keeps its images in
+/// `public/IMAGES/` gets `/IMAGES/...`, which a case-sensitive server
+/// serves.
+#[tokio::test]
+async fn an_images_url_follows_the_folder_it_was_filed_under() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = image_workspace(&h);
+    index_only(&wt, "public/IMAGES/old.png", "old\n");
+    run_git(Some(&wt), &["commit", "--quiet", "-m", "old image"]);
+    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "/hero.jpg"})).await;
+    assert_eq!(code, 200, "{v}");
+    let path = v["path"].as_str().unwrap();
+    assert_eq!(v["url"], url_for(path), "{v}");
+    if case_insensitive(&wt) {
+        assert!(path.starts_with("public/IMAGES/a-"), "{path}");
+    }
+    let page = std::fs::read_to_string(wt.join("page.html")).unwrap();
+    assert!(page.contains(&format!("src=\"{}\"", url_for(path))), "{page}");
+}
+
+/// (review) On a disk that tells case apart, a repository whose config
+/// still says `core.ignorecase` makes git file the image under the tracked
+/// `Public/`, where darkmux did not write it and a `public/` site never
+/// serves it. darkmux refuses that, saying why, and leaves nothing behind.
+#[tokio::test]
+async fn an_image_git_would_file_elsewhere_on_a_case_sensitive_disk_is_refused() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = image_workspace(&h);
+    if case_insensitive(&wt) {
+        eprintln!("skipped: this filesystem ignores case (run with TMPDIR on a case-sensitive volume)");
+        return;
+    }
+    run_git(Some(&wt), &["config", "core.ignorecase", "true"]);
+    index_only(&wt, "Public/x.txt", "x\n");
+    run_git(Some(&wt), &["commit", "--quiet", "-m", "Public"]);
+    let before = work_copy_state(&wt);
+    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "/hero.jpg"})).await;
+    assert_eq!(code, 409, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("core.ignorecase"), "{v}");
+    assert_eq!(work_copy_state(&wt), before, "HEAD, index, status and page as they were");
+    assert!(!wt.join("public").exists(), "nothing written");
+}
+
+/// (review) A failed commit restores the index entry that was there: an
+/// identical image the person had already staged at darkmux's name stays
+/// staged.
+#[tokio::test]
+async fn an_image_whose_commit_fails_keeps_an_identical_image_already_staged() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = image_workspace(&h);
+    let name = crate::client_image::file_name("a.png", PNG, "png");
+    let at = format!("{}/{name}", crate::client_image::IMAGE_FOLDER);
+    std::fs::create_dir_all(wt.join(crate::client_image::IMAGE_FOLDER)).unwrap();
+    std::fs::write(wt.join(&at), PNG).unwrap();
+    run_git(Some(&wt), &["add", &at]);
+    let before = work_copy_state(&wt);
+    let lock = lock_branch(&h, &wt);
+    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "/hero.jpg"})).await;
+    assert_eq!(code, 409, "{v}");
+    assert_eq!(work_copy_state(&wt), before, "still staged, as the person left it");
+    assert_eq!(std::fs::read(wt.join(&at)).unwrap(), PNG, "their file stays");
+    // Other bytes staged at that name, the file since deleted: darkmux
+    // writes and stages its image there, and a failed commit puts the
+    // person's entry back as it was.
+    run_git(Some(&wt), &["rm", "--cached", "--quiet", &at]);
+    std::fs::remove_file(wt.join(&at)).unwrap();
+    index_only(&wt, &at, "theirs\n");
+    std::fs::remove_file(wt.join(&at)).unwrap();
+    let before = work_copy_state(&wt);
+    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "/hero.jpg"})).await;
+    assert_eq!(code, 409, "{v}");
+    assert_eq!(work_copy_state(&wt), before, "their staged entry as it was");
+    assert!(!wt.join(&at).exists(), "the image darkmux wrote is gone");
+    std::fs::remove_file(lock).unwrap();
+}
+
+/// (review) A reference is found only where a page uses one (in quotes, in
+/// `url(...)`, in a srcset), never as words in the page's text.
+#[tokio::test]
+async fn an_image_reference_in_the_pages_text_is_not_one_it_uses() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = image_workspace(&h);
+    let text = "<img src=\"/hero.jpg\"> See hero.jpg, the hero.jpg.\n";
+    std::fs::write(wt.join("page.html"), text).unwrap();
+    run_git(Some(&wt), &["commit", "--quiet", "-am", "page"]);
+    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "hero.jpg"})).await;
+    assert_eq!((code, &v["matches"]), (200, &Value::from(0)), "{v}");
+    assert_eq!(std::fs::read_to_string(wt.join("page.html")).unwrap(), text);
+}
+
+/// (review) A repository's README is not one of the site's pages: a
+/// reference it names, in a code span or anywhere, is never edited, and
+/// the page that does use one (front matter, unquoted) is.
+#[tokio::test]
+async fn an_image_reference_in_a_readme_is_never_edited_and_front_matter_is() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = image_workspace(&h);
+    let readme = "# Site\n\nThe hero picture is `/hero.jpg`.\n\n![hero](/hero.jpg)\n";
+    std::fs::write(wt.join("page.html"), "<p>Hi</p>\n").unwrap();
+    std::fs::write(wt.join("README.md"), readme).unwrap();
+    run_git(Some(&wt), &["add", "page.html", "README.md"]);
+    run_git(Some(&wt), &["commit", "--quiet", "-m", "readme"]);
+    let head = run_git(Some(&wt), &["rev-parse", "HEAD"]);
+    let body = serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "/hero.jpg"});
+    let (code, v) = add_image(&h, &token, body.clone()).await;
+    assert_eq!((code, &v["matches"]), (200, &Value::from(0)), "{v}");
+    assert_eq!(run_git(Some(&wt), &["rev-parse", "HEAD"]), head);
+    assert_eq!(std::fs::read_to_string(wt.join("README.md")).unwrap(), readme);
+    std::fs::write(wt.join("post.md"), "---\ntitle: Hello\nimage: /hero.jpg\n---\n\nWords.\n").unwrap();
+    run_git(Some(&wt), &["add", "post.md"]);
+    run_git(Some(&wt), &["commit", "--quiet", "-m", "post"]);
+    let (code, v) = add_image(&h, &token, body).await;
+    assert_eq!((code, &v["matches"]), (200, &Value::from(1)), "{v}");
+    let url = v["url"].as_str().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(wt.join("post.md")).unwrap(),
+        format!("---\ntitle: Hello\nimage: {url}\n---\n\nWords.\n")
+    );
+    assert_eq!(std::fs::read_to_string(wt.join("README.md")).unwrap(), readme);
+}
+
+/// (review) A rollback that itself fails is never reported as one that
+/// worked: with the index locked under it, the reply says the work copy
+/// needs attention and names what is left.
+#[tokio::test]
+async fn an_image_whose_rollback_fails_says_the_work_copy_needs_attention() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = image_workspace(&h);
+    let lock = crate::client_git::clone_git_dir(&h.base, "site").join("index.lock");
+    let at = lock.clone();
+    on_edit_commit(&wt, move || std::fs::write(&at, "").unwrap());
+    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "/hero.jpg"})).await;
+    on_edit_commit(&wt, || {});
+    std::fs::remove_file(&lock).unwrap();
+    assert_eq!(code, 409, "{v}");
+    let error = v["error"].as_str().unwrap();
+    assert!(error.contains("couldn't commit the image"), "{error}");
+    assert!(error.contains("needs attention"), "the failed rollback is said: {error}");
+    assert!(error.contains("public/images/a-") && error.contains("page.html"), "what is left is named: {error}");
+}
+
+/// (review) The documented limits, worked out here rather than read from
+/// the constants: two image bodies at once, 30 seconds for a body.
+#[test]
+fn the_documented_body_limits_hold() {
+    let limits = BodyLimits::default();
+    assert_eq!(limits.image_reads.available_permits(), 2);
+    assert_eq!(limits.read_timeout, std::time::Duration::from_secs(30));
+}
+
+/// (review) On a disk that tells case apart, the same image may already be
+/// tracked under `PUBLIC/images/`. darkmux's copy under `public/images/` is
+/// staged as its own entry, and the commit names that one, not the other.
+#[tokio::test]
+async fn an_image_already_tracked_in_another_case_commits_its_own_entry() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = image_workspace(&h);
+    if case_insensitive(&wt) {
+        eprintln!("skipped: this filesystem ignores case (run with TMPDIR on a case-sensitive volume)");
+        return;
+    }
+    let name = crate::client_image::file_name("a.png", PNG, "png");
+    let theirs = format!("PUBLIC/images/{name}");
+    std::fs::create_dir_all(wt.join("PUBLIC/images")).unwrap();
+    std::fs::write(wt.join(&theirs), PNG).unwrap();
+    run_git(Some(&wt), &["add", &theirs]);
+    run_git(Some(&wt), &["commit", "--quiet", "-m", "theirs"]);
+    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG)})).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["path"], format!("public/images/{name}"), "{v}");
+    let tracked = run_git(Some(&wt), &["ls-files"]);
+    assert!(tracked.lines().any(|l| l == theirs) && tracked.lines().any(|l| l == format!("public/images/{name}")), "{tracked}");
 }
 
 // ─── (#3544) Pairing with no code: verified apps, and the Allow dialog ───

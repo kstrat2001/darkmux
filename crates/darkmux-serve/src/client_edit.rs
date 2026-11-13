@@ -96,9 +96,36 @@ fn push_shown(out: &mut Vec<(char, usize, usize)>, c: char, start: usize, end: u
 }
 
 /// The byte spans in `source` whose rendered text is `wanted` (already
-/// [`normalize`]d), without overlap, at most `limit` of them. Each place
-/// is looked at once, so it always ends.
+/// [`normalize`]d), without overlap, at most `limit` of them, as whole
+/// words: "more" is not found inside "furthermore". Each place is looked at
+/// once, so it always ends.
 pub fn find(source: &str, wanted: &str, limit: usize) -> Vec<(usize, usize)> {
+    find_where(source, wanted, limit, &whole_words)
+}
+
+/// The spans in `source` whose rendered text is `wanted` (already
+/// [`normalize`]d) and that `used` accepts, given each match's source span:
+/// [`crate::client_image_ref::find_reference`] asks whether a site uses a
+/// URL there.
+pub(crate) fn spans_of(source: &str, wanted: &str, limit: usize, used: impl Fn(usize, usize) -> bool) -> Vec<(usize, usize)> {
+    find_where(source, wanted, limit, &|page: &[Shown], _: &[char], at: usize, end: usize| used(page[at].1, page[end - 1].2))
+}
+
+/// One rendered char of a page, with the source bytes it came from.
+type Shown = (char, usize, usize);
+
+/// Whether a match, at `at..end` of the page, of the wanted chars stands on
+/// its own.
+type Whole<'a> = dyn Fn(&[Shown], &[char], usize, usize) -> bool + 'a;
+
+/// The spans where `wanted` is the rendered text and `whole` says the match
+/// at `at..end` stands on its own.
+fn find_where(
+    source: &str,
+    wanted: &str,
+    limit: usize,
+    whole: &Whole,
+) -> Vec<(usize, usize)> {
     let want: Vec<char> = wanted.chars().collect();
     let page = rendered(source);
     let mut found = Vec::new();
@@ -111,25 +138,22 @@ pub fn find(source: &str, wanted: &str, limit: usize) -> Vec<(usize, usize)> {
         if found.len() >= limit {
             break;
         }
-        if at >= free && matches_at(&page, &want, at) {
-            found.push((page[at].1, page[at + want.len() - 1].2));
-            free = at + want.len();
+        let end = at + want.len();
+        if at >= free && page[at..end].iter().map(|(c, _, _)| *c).eq(want.iter().copied()) && whole(&page, &want, at, end) {
+            found.push((page[at].1, page[end - 1].2));
+            free = end;
         }
     }
     found
 }
 
-/// Whether `want` is the rendered text at `at` in `page`, as whole words:
-/// "more" is not found inside "furthermore".
-fn matches_at(page: &[(char, usize, usize)], want: &[char], at: usize) -> bool {
-    let end = at + want.len();
-    let alnum = |i: Option<usize>| {
-        i.and_then(|i| page.get(i))
-            .is_some_and(|(c, _, _)| c.is_alphanumeric())
-    };
+/// Whether `want`, found at `at..end`, is whole words: a letter or digit
+/// on either side of one it starts or ends with cuts it.
+fn whole_words(page: &[Shown], want: &[char], at: usize, end: usize) -> bool {
+    let alnum = |i: Option<usize>| i.and_then(|i| page.get(i)).is_some_and(|(c, _, _)| c.is_alphanumeric());
     let cut_word = (want[0].is_alphanumeric() && alnum(at.checked_sub(1)))
         || (want[want.len() - 1].is_alphanumeric() && alnum(Some(end)));
-    !cut_word && page[at..end].iter().map(|(c, _, _)| *c).eq(want.iter().copied())
+    !cut_word
 }
 
 #[cfg(test)]
@@ -139,6 +163,13 @@ mod tests {
     fn one(source: &str, wanted: &str) -> Option<String> {
         let hits = find(source, &normalize(wanted), 2);
         (hits.len() == 1).then(|| source[hits[0].0..hits[0].1].to_string())
+    }
+
+    /// A hand edit's words still end at a slash or a dot, as prose does.
+    #[test]
+    fn a_hand_edits_words_end_at_a_slash_or_a_dot() {
+        assert_eq!(one("<p>tea/coffee</p>", "coffee").as_deref(), Some("coffee"));
+        assert_eq!(one("<p>See hero.jpg.</p>", "hero.jpg").as_deref(), Some("hero.jpg"));
     }
 
     #[test]

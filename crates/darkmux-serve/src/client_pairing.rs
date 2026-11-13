@@ -1100,6 +1100,37 @@ pub struct ClientServerState {
     pub notify: crate::client_trust::Notify,
     /// (#3544) The Allow dialogs open now.
     pub dialogs: Arc<crate::client_trust::DialogSlots>,
+    /// (#3545) How long a body may take to arrive, and the turns for
+    /// reading an image's large body.
+    pub body_limits: BodyLimits,
+}
+
+/// How many large image bodies the listener reads at once (#3545). Each may
+/// hold up to [`MAX_IMAGE_BODY_BYTES`] until its image is committed.
+pub const IMAGE_READS: usize = 2;
+
+/// The longest a request's body may take to arrive, on every route.
+pub const BODY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The listener's limits on reading bodies (#3545): how long one may take
+/// to arrive, and the [`IMAGE_READS`] turns for reading an image's body.
+#[derive(Clone)]
+pub struct BodyLimits {
+    pub image_reads: Arc<tokio::sync::Semaphore>,
+    pub read_timeout: std::time::Duration,
+}
+
+impl BodyLimits {
+    /// [`IMAGE_READS`] free turns, and `read_timeout` for a body to arrive.
+    pub fn new(read_timeout: std::time::Duration) -> Self {
+        BodyLimits { image_reads: Arc::new(tokio::sync::Semaphore::new(IMAGE_READS)), read_timeout }
+    }
+}
+
+impl Default for BodyLimits {
+    fn default() -> Self {
+        BodyLimits::new(BODY_READ_TIMEOUT)
+    }
 }
 
 impl ClientServerState {
@@ -1144,6 +1175,7 @@ impl ClientServerState {
             ask_allow: Arc::new(|message, icon, timeout| darkmux_platform::current().ask_allow(message, icon, timeout)),
             notify: Arc::new(|message| darkmux_platform::current().notify(message)),
             dialogs: Arc::new(crate::client_trust::DialogSlots::default()),
+            body_limits: BodyLimits::default(),
         })
     }
 }
@@ -1683,36 +1715,102 @@ pub(crate) async fn only_this_machines_apps(
         return err(status, code, why);
     }
     match refused_while_stopping(&state, req).await {
-        Ok(req) => next.run(req).await,
+        Ok((req, turn)) => {
+            let response = next.run(req).await;
+            // An image's turn is held until its image has been added.
+            drop(turn);
+            response
+        }
         Err(refused) => refused,
     }
 }
 
 /// Once `client serve` has begun to stop, a request that could start or
 /// change something (every method but GET and HEAD) is refused with
-/// `unavailable`. Its body is read first (the limit every handler applies),
-/// so the check lands when the whole request has arrived: one whose body
-/// was still coming when the stop began is refused too, never acted on
-/// after the previews were stopped.
+/// `unavailable`. Its body is read first (the limit its route applies,
+/// [`body_cap`], within [`BodyLimits::read_timeout`]), so the check lands
+/// when the whole request has arrived: one whose body was still coming when
+/// the stop began is refused too, never acted on after the previews were
+/// stopped. An image's body is read only in one of the [`IMAGE_READS`]
+/// turns, handed back with the request.
 async fn refused_while_stopping(
     state: &ClientServerState,
     req: axum::extract::Request,
-) -> Result<axum::extract::Request, Response> {
+) -> Result<(axum::extract::Request, Option<tokio::sync::OwnedSemaphorePermit>), Response> {
     use axum::http::Method;
     if matches!(*req.method(), Method::GET | Method::HEAD) {
-        return Ok(req);
+        return Ok((req, None));
     }
+    let limits = &state.body_limits;
+    let (limit, too_large, turn) = match body_cap(state, &req) {
+        Some(image) => (image, image_too_large as fn() -> Response, Some(image_turn(limits).await?)),
+        None => (MAX_BODY_BYTES, body_too_large as fn() -> Response, None),
+    };
     let (parts, body) = req.into_parts();
-    let bytes = axum::body::to_bytes(body, MAX_BODY_BYTES).await.map_err(|_| {
-        err(
-            StatusCode::PAYLOAD_TOO_LARGE, ClientCode::PayloadTooLarge,
-            format!("body larger than {MAX_BODY_BYTES} bytes"),
-        )
-    })?;
+    let bytes = match tokio::time::timeout(limits.read_timeout, axum::body::to_bytes(body, limit)).await {
+        Ok(read) => read.map_err(|_| too_large())?,
+        Err(_) => return Err(body_too_slow(limits.read_timeout)),
+    };
     if state.previews.stopping() {
         return Err(stopping_refusal());
     }
-    Ok(axum::extract::Request::from_parts(parts, Body::from(bytes)))
+    Ok((axum::extract::Request::from_parts(parts, Body::from(bytes)), turn))
+}
+
+/// The larger cap a request's body may have, `None` for [`MAX_BODY_BYTES`]:
+/// only a POST to the image route ([`IMAGE_ROUTE`], matched by the router
+/// before this gate runs) from a paired app (its bearer token checked here,
+/// from the headers alone) reads up to [`MAX_IMAGE_BODY_BYTES`]. Anything
+/// else, an image with no token or an unknown one included, is refused past
+/// 64 KB without the rest being read.
+fn body_cap(state: &ClientServerState, req: &axum::extract::Request) -> Option<usize> {
+    let route = req.extensions().get::<axum::extract::MatchedPath>();
+    let image = req.method() == axum::http::Method::POST && route.is_some_and(|r| r.as_str() == IMAGE_ROUTE);
+    (image && authenticate(state, req.headers()).is_ok()).then_some(MAX_IMAGE_BODY_BYTES)
+}
+
+/// One of the [`IMAGE_READS`] turns for reading an image's body, waited for
+/// as long as a body may take to arrive; refused `too_many_requests` when
+/// none frees in that time.
+async fn image_turn(limits: &BodyLimits) -> Result<tokio::sync::OwnedSemaphorePermit, Response> {
+    let busy = || {
+        err(
+            StatusCode::TOO_MANY_REQUESTS,
+            ClientCode::TooManyRequests,
+            format!("darkmux is already receiving {IMAGE_READS} images; send this one again once one has been added"),
+        )
+    };
+    match tokio::time::timeout(limits.read_timeout, limits.image_reads.clone().acquire_owned()).await {
+        Ok(Ok(turn)) => Ok(turn),
+        _ => Err(busy()),
+    }
+}
+
+/// The refusal of a body that did not arrive within `limit`.
+fn body_too_slow(limit: std::time::Duration) -> Response {
+    err(
+        StatusCode::REQUEST_TIMEOUT,
+        ClientCode::BadRequest,
+        format!("the request's body did not arrive within {} seconds", limit.as_secs_f64()),
+    )
+}
+
+/// The refusal of a body past [`MAX_BODY_BYTES`].
+fn body_too_large() -> Response {
+    err(
+        StatusCode::PAYLOAD_TOO_LARGE, ClientCode::PayloadTooLarge,
+        format!("body larger than {MAX_BODY_BYTES} bytes"),
+    )
+}
+
+/// The refusal of an image past [`crate::client_image::MAX_IMAGE_BYTES`]
+/// (decoded), or of a body past what the image route reads.
+fn image_too_large() -> Response {
+    err(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        ClientCode::PayloadTooLarge,
+        format!("an image is at most {} MiB", crate::client_image::MAX_IMAGE_BYTES / (1024 * 1024)),
+    )
 }
 
 /// The refusal of a request that could start something once `client serve`
@@ -1833,14 +1931,7 @@ fn internal(e: anyhow::Error) -> Response {
 
 /// Read and parse a capped JSON body; every refusal is JSON.
 async fn json_body<T: serde::de::DeserializeOwned>(body: Body) -> Result<T, Response> {
-    let bytes = axum::body::to_bytes(body, MAX_BODY_BYTES)
-        .await
-        .map_err(|_| {
-            err(
-                StatusCode::PAYLOAD_TOO_LARGE, ClientCode::PayloadTooLarge,
-                format!("body larger than {MAX_BODY_BYTES} bytes"),
-            )
-        })?;
+    let bytes = axum::body::to_bytes(body, MAX_BODY_BYTES).await.map_err(|_| body_too_large())?;
     serde_json::from_slice(&bytes)
         .map_err(|e| err(StatusCode::BAD_REQUEST, ClientCode::BadRequest, format!("bad JSON body: {e}")))
 }
@@ -4157,12 +4248,7 @@ fn status_of_code(code: ClientCode) -> StatusCode {
 /// A body that may be absent (or empty): its default then; anything else
 /// is parsed strictly, an unknown key refused with `bad_request`.
 async fn optional_json_body<T: serde::de::DeserializeOwned + Default>(body: Body) -> Result<T, Response> {
-    let bytes = axum::body::to_bytes(body, MAX_BODY_BYTES).await.map_err(|_| {
-        err(
-            StatusCode::PAYLOAD_TOO_LARGE, ClientCode::PayloadTooLarge,
-            format!("body larger than {MAX_BODY_BYTES} bytes"),
-        )
-    })?;
+    let bytes = axum::body::to_bytes(body, MAX_BODY_BYTES).await.map_err(|_| body_too_large())?;
     if bytes.iter().all(u8::is_ascii_whitespace) {
         return Ok(T::default());
     }
@@ -4432,7 +4518,23 @@ fn edit_checked(
     let work_id = format!("w-{}", random_hex(8).map_err(|e| Box::new(internal(e)))?);
     let held = hold_for_edit(st, client, &dir, &wc, &work_id, edit_title(&old, &req.new))?;
     let outcome = edit_in(st, &wc, &old, &req.new, &work_id);
-    held.finish(outcome)
+    let landed = held.finish(outcome)?;
+    Ok(EditReply {
+        matches: 1,
+        work_id: Some(landed.work_id),
+        file: landed.files.into_iter().next(),
+        commit: Some(landed.commit),
+        branch: Some(landed.branch),
+    })
+}
+
+/// What a hand edit or an added image committed: its work record, the files
+/// (the first is the one it was for), the short commit, the branch.
+struct Landed {
+    work_id: String,
+    files: Vec<String>,
+    commit: String,
+    branch: String,
 }
 
 /// A hand edit registered as running in its work copy ([`busy_copy`]), so
@@ -4450,7 +4552,7 @@ struct EditHold {
 impl EditHold {
     /// The edit's work record once [`edit_in`] ended: done with its commit,
     /// or gone when nothing was edited.
-    fn finish(mut self, outcome: Result<EditDone, Refused>) -> Result<EditReply, Refused> {
+    fn finish(mut self, outcome: Result<EditDone, Refused>) -> Result<Landed, Refused> {
         let now = (self.now)();
         let mut works = self.works.lock().unwrap();
         self.ended = true;
@@ -4461,12 +4563,11 @@ impl EditHold {
                 return Err(r);
             }
         };
-        let reply = EditReply {
-            matches: 1,
-            work_id: Some(self.id.clone()),
-            file: Some(done.file.clone()),
-            commit: Some(short(&done.commit)),
-            branch: Some(done.branch.clone()),
+        let reply = Landed {
+            work_id: self.id.clone(),
+            files: done.files.clone(),
+            commit: short(&done.commit),
+            branch: done.branch.clone(),
         };
         if let Some(e) = works.get_mut(&self.id) {
             record_edit(e, done, now);
@@ -4557,20 +4658,22 @@ fn hold_for_edit(
 /// The edit's work record once it landed: done, with its commit.
 fn record_edit(e: &mut WorkEntry, done: EditDone, now: u64) {
     e.status = WorkStatus::Done {
-        result: serde_json::json!({"hand_edit": {"file": done.file}}),
+        result: done.result,
         changes: done.changes,
         changes_error: done.changes_error,
     };
     e.finished = Some(now);
     e.baseline = Some(done.baseline);
-    e.files = vec![done.file];
+    e.files = done.files;
     e.commit = Some(done.commit);
     e.branch = Some(done.branch);
 }
 
 /// What a hand edit that landed did.
 struct EditDone {
-    file: String,
+    /// The work record's `result`.
+    result: serde_json::Value,
+    files: Vec<String>,
     commit: String,
     branch: String,
     baseline: String,
@@ -4581,9 +4684,19 @@ struct EditDone {
 /// One place `old` was found: the file, the span, and the file's text.
 type EditHit = (String, (usize, usize), String);
 
-/// Where `old` is in the work copy's tracked regular text files, counted up
-/// to two (more than one is already too many).
-fn find_in_tracked(wc: &WorkCopy, old: &str) -> Result<Vec<EditHit>, Refused> {
+/// The places `find` finds `old` at in the text of the tracked file named
+/// first, at most `limit` of them ([`hand_edit_words`] for a hand edit,
+/// [`crate::client_image_ref::find_reference`] for an image's reference).
+type Finder = fn(&str, &str, &str, usize) -> Vec<(usize, usize)>;
+
+/// A hand edit's words, in any file ([`crate::client_edit::find`]).
+fn hand_edit_words(_file: &str, text: &str, old: &str, limit: usize) -> Vec<(usize, usize)> {
+    crate::client_edit::find(text, old, limit)
+}
+
+/// Where `old` is in the work copy's tracked regular text files, as `find`
+/// finds it, counted up to two (more than one is already too many).
+fn find_in_tracked(wc: &WorkCopy, old: &str, find: Finder) -> Result<Vec<EditHit>, Refused> {
     let listing = crate::client_git::run_or_why(wc, None, &["ls-files", "-z"]).map_err(|e| {
         Box::new(internal(anyhow!(
             "listing the workspace's files failed: {e}"
@@ -4595,7 +4708,7 @@ fn find_in_tracked(wc: &WorkCopy, old: &str) -> Result<Vec<EditHit>, Refused> {
         let Some(text) = tracked_text(wc, path) else {
             continue;
         };
-        for span in crate::client_edit::find(&text, old, 2 - hits.len()) {
+        for span in find(path, &text, old, 2 - hits.len()) {
             hits.push((path.to_string(), span, text.clone()));
         }
         if hits.len() >= 2 {
@@ -4629,7 +4742,7 @@ fn edit_in(
     new: &str,
     work_id: &str,
 ) -> Result<EditDone, Refused> {
-    let mut hits = find_in_tracked(wc, old)?;
+    let mut hits = find_in_tracked(wc, old, hand_edit_words)?;
     if hits.len() != 1 {
         return Err(Box::new(
             Json(EditReply {
@@ -4695,7 +4808,8 @@ fn write_and_commit(
         )
     })?;
     Ok(EditDone {
-        file,
+        result: serde_json::json!({"hand_edit": {"file": file}}),
+        files: vec![file],
         commit,
         branch,
         baseline: before.tree,
@@ -4732,6 +4846,463 @@ fn edit_title(old: &str, new: &str) -> String {
         }
     };
     format!("\"{}\" to \"{}\"", cut(old), cut(new))
+}
+
+// ─── Added images (#3545) ────────────────────────────────────────────────
+
+/// The image route's path, as the client table declares it.
+pub(crate) const IMAGE_ROUTE: &str = "/client/workspaces/:name/image";
+
+/// The largest body the image route reads; only this route reads more than
+/// [`MAX_BODY_BYTES`] ([`body_cap`]). The real limit is the image decoded
+/// ([`crate::client_image::MAX_IMAGE_BYTES`], checked once decoded); this
+/// only has to fit the largest image however a client's JSON encodes it:
+/// base64 whose every character may be a `/` that Swift's `JSONEncoder`
+/// writes as `\/` (two bytes each; an image of `0xFF` bytes is all `/`),
+/// broken into lines as short as 64 characters whose CR LF is written
+/// `\r\n` (four bytes a line), and room for the other fields.
+const MAX_IMAGE_BODY_BYTES: usize = {
+    let base64 = crate::client_image::MAX_IMAGE_BYTES.div_ceil(3) * 4;
+    base64 * 2 + base64.div_ceil(64) * 4 + 64 * 1024
+};
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImageBody {
+    /// The picked file's name: only a hint for the name darkmux gives it.
+    name: String,
+    /// The image's bytes, base64.
+    data: String,
+    /// The image reference as the page reads it (an `<img>`'s `src`
+    /// attribute): its one place in the tracked files is pointed at the new
+    /// image, in the same commit.
+    #[serde(default)]
+    replace: Option<String>,
+}
+
+/// `POST /client/workspaces/{name}/image` (#3545): an image a person picked
+/// on the device the app runs on, sent as bytes (never a path: darkmux
+/// never reads a file a client names). darkmux checks what it is (PNG,
+/// JPEG, GIF, WebP; [`crate::client_image::sniff`]), names it itself under
+/// [`crate::client_image::IMAGE_FOLDER`], and commits it as a work record
+/// with no model, like a hand edit, so `/client/work/{id}/undo` reverts it.
+/// With `replace`, the one place that holds that reference now points at
+/// the image; found zero times or more than once, nothing changes and the
+/// reply says how many.
+pub(crate) async fn workspace_image_handler(
+    State(state): State<ClientServerState>,
+    ClientPath(name): ClientPath<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let client = match authenticate(&state, &headers) {
+        Ok(c) => c,
+        Err(r) => return *r,
+    };
+    let bytes = match axum::body::to_bytes(body, MAX_IMAGE_BODY_BYTES).await {
+        Ok(b) => b,
+        Err(_) => return image_too_large(),
+    };
+    let req: ImageBody = match serde_json::from_slice(&bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                ClientCode::BadRequest,
+                format!("bad JSON body: {e}"),
+            )
+        }
+    };
+    let st = state.clone();
+    tokio::task::spawn_blocking(move || match image_checked(&st, &client, &name, &req) {
+        Ok(reply) => Json(reply).into_response(),
+        Err(r) => *r,
+    })
+    .await
+    .unwrap_or_else(|e| internal(anyhow!("adding an image panicked: {e}")))
+}
+
+/// The image's bytes and kind, and the reference to point at it, once the
+/// body is checked.
+fn image_input(req: &ImageBody) -> Result<(Vec<u8>, &'static str, Option<String>), Refused> {
+    use crate::client_image::{decode_base64, sniff, MAX_IMAGE_BYTES};
+    clean_text(&req.name, "name", 0, 255)?;
+    let bytes = decode_base64(&req.data).ok_or_else(|| {
+        refuse(
+            StatusCode::BAD_REQUEST,
+            ClientCode::BadRequest,
+            "`data` must be base64",
+        )
+    })?;
+    if bytes.len() > MAX_IMAGE_BYTES {
+        return Err(Box::new(image_too_large()));
+    }
+    let kind = sniff(&bytes).ok_or_else(|| {
+        refuse(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ClientCode::UnsupportedMediaType,
+            "`data` must be a PNG, JPEG, GIF or WebP image",
+        )
+    })?;
+    let replace = match &req.replace {
+        None => None,
+        Some(r) => {
+            let r = crate::client_edit::normalize(r);
+            if r.is_empty() || r.chars().count() > MAX_EDIT_OLD_CHARS {
+                return Err(refuse(
+                    StatusCode::BAD_REQUEST,
+                    ClientCode::BadRequest,
+                    format!("`replace` must hold text, at most {MAX_EDIT_OLD_CHARS} characters"),
+                ));
+            }
+            Some(r)
+        }
+    };
+    Ok((bytes, kind, replace))
+}
+
+/// [`workspace_image_handler`], blocking, with every refusal an `Err`.
+fn image_checked(
+    st: &ClientServerState,
+    client: &ApprovedClient,
+    name: &str,
+    req: &ImageBody,
+) -> Result<ImageReply, Refused> {
+    let (bytes, kind, replace) = image_input(req)?;
+    let dir = owned_workspace(st, client, name)?;
+    let wc = work_copy_for(st, &dir).ok_or_else(|| {
+        refuse(
+            StatusCode::CONFLICT,
+            ClientCode::Conflict,
+            "darkmux holds no repository for this workspace",
+        )
+    })?;
+    let _in_use = held_work_copy(st, Some(&wc))?;
+    let file_name = crate::client_image::file_name(&req.name, &bytes, kind);
+    let image = Image { path: format!("{}/{file_name}", crate::client_image::IMAGE_FOLDER), bytes };
+    let work_id = format!("w-{}", random_hex(8).map_err(|e| Box::new(internal(e)))?);
+    let held = hold_for_edit(
+        st,
+        client,
+        &dir,
+        &wc,
+        &work_id,
+        format!("image {file_name}"),
+    )?;
+    let outcome = image_in(st, &wc, &image, replace.as_deref(), &work_id);
+    let landed = held.finish(outcome)?;
+    // The name git filed the image under, which the commit holds.
+    let path = landed.files.into_iter().next().unwrap_or(image.path);
+    Ok(ImageReply {
+        matches: replace.map(|_| 1),
+        url: Some(image_url(&path)),
+        path: Some(path),
+        work_id: Some(landed.work_id),
+        commit: Some(landed.commit),
+        branch: Some(landed.branch),
+    })
+}
+
+/// An image to add: where darkmux writes it, and its bytes.
+struct Image {
+    path: String,
+    bytes: Vec<u8>,
+}
+
+/// The URL a page reaches the image at `path` by: `path` without its first
+/// folder (a static site serves `public/` at `/`), so it keeps the case of
+/// the folders the image was filed under (`public/IMAGES/x.png` is
+/// `/IMAGES/x.png`).
+fn image_url(path: &str) -> String {
+    format!("/{}", path.split_once('/').map_or(path, |(_, rest)| rest))
+}
+
+/// A reply sent with nothing committed: a `replace` found `matches` times
+/// (not once), or the same image already at `path` and nothing to point at it.
+fn image_not_committed(matches: Option<u32>, path: Option<String>) -> Refused {
+    Box::new(
+        Json(ImageReply {
+            matches,
+            url: path.as_deref().map(image_url),
+            path,
+            work_id: None,
+            commit: None,
+            branch: None,
+        })
+        .into_response(),
+    )
+}
+
+fn conflict(why: String) -> Refused {
+    refuse(StatusCode::CONFLICT, ClientCode::Conflict, why)
+}
+
+/// Writes the image (kept when the same bytes are already there), points
+/// the one place holding `replace` at it, and commits both; a failed step
+/// puts back everything it changed ([`put_image_back`]).
+fn image_in(
+    st: &ClientServerState,
+    wc: &WorkCopy,
+    image: &Image,
+    replace: Option<&str>,
+    work_id: &str,
+) -> Result<EditDone, Refused> {
+    let hit = replace.map(|old| one_reference(wc, old)).transpose()?;
+    onto_own_branch(st, Some(wc))?;
+    let already = image_already_there(wc, image)?;
+    if already && hit.is_none() {
+        return Err(already_added(wc, image));
+    }
+    let before = snapshot_tree(wc)
+        .map_err(|e| Box::new(internal(anyhow!("reading the work copy failed: {e}"))))?;
+    let mut placed = Placed::default();
+    place_and_commit(wc, image, already, hit.as_ref(), &mut placed, before.tree, work_id)
+        .map_err(|why| not_added(why, &put_image_back(wc, image, &placed), &image.path))
+}
+
+/// The refusal of an image that was not added (`why`), once its changes were
+/// put back. When some could not be (`left`), it says so, naming what is
+/// left, in the reply and in the serve log: the work copy needs attention.
+fn not_added(why: String, left: &[String], path: &str) -> Refused {
+    if left.is_empty() {
+        return conflict(why);
+    }
+    let left = left.join("; ");
+    eprintln!("darkmux client serve: adding {path} failed ({why}), and its changes could not all be put back: {left}");
+    conflict(format!(
+        "{why}; darkmux could not put the work copy back as it was, so it needs attention: {left}"
+    ))
+}
+
+/// The reply for an image already there with nothing to point at it: its
+/// path as the index files it (else as darkmux would write it), with
+/// nothing committed.
+fn already_added(wc: &WorkCopy, image: &Image) -> Refused {
+    match index_entries(wc, &image.path) {
+        Ok(entries) => {
+            let path = entries.into_iter().next().map_or_else(|| image.path.clone(), |e| e.path);
+            image_not_committed(None, Some(path))
+        }
+        Err(e) => Box::new(internal(anyhow!(e))),
+    }
+}
+
+/// What [`place_and_commit`] changed so far, for [`put_image_back`].
+#[derive(Default)]
+struct Placed {
+    /// darkmux wrote the image (it was not already there).
+    wrote: bool,
+    /// The folders it made for the image, outermost first.
+    made: Vec<String>,
+    /// The index's entries for the image's path (in any case) before it
+    /// was staged; `None` until then.
+    prior: Option<Vec<IndexEntry>>,
+    /// The file pointed at the image.
+    edited: Option<String>,
+}
+
+/// Writes the image (unless `already` there), stages it and reads back the
+/// name git filed it under ([`stage_image`]), points `hit` at that name's
+/// URL, and commits the image and the file; `placed` records each step.
+/// A failure is why, in words, for [`not_added`].
+fn place_and_commit(
+    wc: &WorkCopy,
+    image: &Image,
+    already: bool,
+    hit: Option<&EditHit>,
+    placed: &mut Placed,
+    baseline: String,
+    work_id: &str,
+) -> Result<EditDone, String> {
+    use crate::client_preview::at;
+    if !already {
+        placed.made = at::write_new_making_folders(&wc.work_tree, &image.path, &image.bytes, 0o644)
+            .map_err(|e| format!("darkmux didn't add {}: {e}", image.path))?;
+        placed.wrote = true;
+    }
+    let path = stage_image(wc, image, placed)?;
+    let url = image_url(&path);
+    let mut files = vec![path.clone()];
+    if let Some((file, (start, end), text)) = hit {
+        let edited = format!("{}{}{}", &text[..*start], url, &text[*end..]);
+        at::replace_regular(&wc.work_tree, file, text.as_bytes(), edited.as_bytes())
+            .map_err(|e| format!("darkmux didn't edit {file}: {e}"))?;
+        placed.edited = Some(file.clone());
+        files.push(file.clone());
+    }
+    let (changes, changes_error) = match changes_since(wc, &baseline) {
+        Ok(c) => (Some(c), None),
+        Err(e) => (None, Some(format!("reading the image's changes failed: {e}"))),
+    };
+    let message = format!("image: {path} (work {work_id})");
+    #[cfg(test)]
+    before_edit_commit(wc);
+    let (commit, branch) =
+        commit_run(wc, &files, &message).map_err(|e| format!("couldn't commit the image: {e}"))?;
+    Ok(EditDone {
+        result: serde_json::json!({"image": {"path": path, "url": url}}),
+        files,
+        commit,
+        branch,
+        baseline,
+        changes,
+        changes_error,
+    })
+}
+
+/// Stages the image and reads back the name git filed it under: under
+/// `core.ignorecase` (a Mac's default) git spells its folders the way the
+/// index already spells them, whichever case that is, so darkmux never
+/// guesses. Refused when that name is not the file darkmux wrote: git set
+/// to ignore case on a disk that tells case apart would commit a path
+/// nothing is at, and a `public/` site would never serve it.
+fn stage_image(wc: &WorkCopy, image: &Image, placed: &mut Placed) -> Result<String, String> {
+    let prior = index_entries(wc, &image.path)?;
+    placed.prior = Some(prior.clone());
+    git_quiet(wc, &["--literal-pathspecs", "add", "-A", "--", &image.path])
+        .map_err(|e| format!("couldn't stage the image: {e}"))?;
+    let after = index_entries(wc, &image.path)?;
+    let staged = after
+        .iter()
+        .find(|e| !prior.contains(e))
+        .or(after.first())
+        .map(|e| e.path.clone())
+        .ok_or_else(|| format!("git did not stage {}", image.path))?;
+    if staged != image.path && !same_file(wc, &staged, &image.path) {
+        return Err(format!(
+            "git files the image as {staged}, which on this disk is not {}, where darkmux wrote it: \
+             the repository sets core.ignorecase on a disk that tells case apart",
+            image.path
+        ));
+    }
+    Ok(staged)
+}
+
+/// One stage-0 entry of the index: its mode, blob and path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IndexEntry {
+    mode: String,
+    sha: String,
+    path: String,
+}
+
+/// The index's entries for `path` in any case (`:(literal,icase)`), so one
+/// git filed under another case is found too.
+fn index_entries(wc: &WorkCopy, path: &str) -> Result<Vec<IndexEntry>, String> {
+    let spec = format!(":(literal,icase){path}");
+    let out = crate::client_git::run_or_why(wc, None, &["ls-files", "--stage", "-z", "--", &spec])
+        .map_err(|e| format!("reading the index failed: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    Ok(text
+        .split('\0')
+        .filter_map(|line| {
+            let (meta, path) = line.split_once('\t')?;
+            let mut meta = meta.split(' ');
+            let (mode, sha, stage) = (meta.next()?, meta.next()?, meta.next()?);
+            (stage == "0").then(|| IndexEntry { mode: mode.into(), sha: sha.into(), path: path.into() })
+        })
+        .collect())
+}
+
+/// Whether `a` and `b` name the same regular file in the work copy (on a
+/// disk that ignores case, two spellings of one name do).
+fn same_file(wc: &WorkCopy, a: &str, b: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let id = |p: &str| {
+        let (file, _) = crate::client_preview::at::open_regular(&wc.work_tree, p).ok()?;
+        let meta = file.metadata().ok()?;
+        Some((meta.dev(), meta.ino()))
+    };
+    id(a).is_some_and(|x| id(b) == Some(x))
+}
+
+/// The one place `old` is in the tracked files as a whole reference
+/// ([`crate::client_image_ref::find_reference`]: only where a site uses a URL,
+/// never part of a longer one, never words in a page's text), in a file with
+/// no uncommitted change; else the reply naming how many places hold it.
+fn one_reference(wc: &WorkCopy, old: &str) -> Result<EditHit, Refused> {
+    let mut hits = find_in_tracked(wc, old, crate::client_image_ref::find_reference)?;
+    if hits.len() != 1 {
+        return Err(image_not_committed(Some(hits.len() as u32), None));
+    }
+    let hit = hits.remove(0);
+    refuse_unless_clean(wc, &hit.0)?;
+    Ok(hit)
+}
+
+/// Whether the image is already at its path (the same bytes); refused when
+/// a different file, or anything darkmux won't read, is there.
+fn image_already_there(wc: &WorkCopy, image: &Image) -> Result<bool, Refused> {
+    use std::io::Read;
+    let didnt = |e: std::io::Error| conflict(format!("darkmux didn't add {}: {e}", image.path));
+    let file = match crate::client_preview::at::open_regular(&wc.work_tree, &image.path) {
+        Ok((file, _)) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(didnt(e)),
+    };
+    let mut held = Vec::new();
+    file.take(image.bytes.len() as u64 + 1).read_to_end(&mut held).map_err(didnt)?;
+    if held != image.bytes {
+        return Err(conflict(format!("{} already holds a different file", image.path)));
+    }
+    Ok(true)
+}
+
+/// Puts back everything a failed [`place_and_commit`] changed: the index's
+/// entries for the image as they were ([`restore_index`]), the image if
+/// darkmux wrote it (never one that was already there), the folders it made
+/// (innermost first; one that still holds anything stays), and the edited
+/// file as committed. Returns what it could not put back, in words (empty
+/// when everything is as it was).
+fn put_image_back(wc: &WorkCopy, image: &Image, placed: &Placed) -> Vec<String> {
+    use crate::client_preview::at;
+    let mut left = Vec::new();
+    if let Some(prior) = &placed.prior {
+        left.extend(restore_index(wc, &image.path, prior));
+    }
+    if placed.wrote {
+        if let Err(e) = at::remove(&wc.work_tree, &image.path) {
+            left.push(format!("{} is still in the work copy ({e})", image.path));
+        }
+    }
+    for folder in placed.made.iter().rev() {
+        match at::remove_empty_folder(&wc.work_tree, folder) {
+            Err(e) if !matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty) => {
+                left.push(format!("the folder {folder} is still there ({e})"));
+            }
+            _ => {}
+        }
+    }
+    if let Some(f) = &placed.edited {
+        if let Err(e) = git_quiet(wc, &["--literal-pathspecs", "checkout", "HEAD", "--", f]) {
+            left.push(format!("{f} still points at the image, not as committed ({e})"));
+        }
+    }
+    left
+}
+
+/// Makes the index's entries for `path` (in any case) `prior` again: an
+/// entry staged since is dropped, one that was there is put back as it was
+/// (an identical image the person had staged stays staged). Returns what it
+/// could not put back, in words.
+fn restore_index(wc: &WorkCopy, path: &str, prior: &[IndexEntry]) -> Vec<String> {
+    let now = match index_entries(wc, path) {
+        Ok(now) => now,
+        Err(e) => return vec![format!("the index's entry for {path} may not be as it was ({e})")],
+    };
+    let mut left = Vec::new();
+    for e in now.iter().filter(|e| !prior.contains(e)) {
+        if let Err(why) = git_quiet(wc, &["update-index", "--force-remove", "--", &e.path]) {
+            left.push(format!("the index still stages {} ({why})", e.path));
+        }
+    }
+    for e in prior.iter().filter(|e| !now.contains(e)) {
+        let info = format!("{},{},{}", e.mode, e.sha, e.path);
+        if let Err(why) = git_quiet(wc, &["update-index", "--add", "--cacheinfo", &info]) {
+            left.push(format!("the index no longer stages {} as it did ({why})", e.path));
+        }
+    }
+    left
 }
 
 // ─── Commits and Undo ────────────────────────────────────────────────────

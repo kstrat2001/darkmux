@@ -224,6 +224,23 @@ pub struct EditReply {
     pub branch: Option<String>,
 }
 
+/// `POST /client/workspaces/{name}/image` (#3545): an image added to the
+/// workspace. `matches` is set only when `replace` was sent: how many places
+/// held that reference (counted up to 2). Committed (`work_id` set): the
+/// image is at `path` (repo-relative), the page reaches it at `url`, and
+/// `/undo` reverts it. Not committed: a `replace` found other than once
+/// (every other field `null`), or the same image already there with nothing
+/// to point at it (`path` and `url` set, no `work_id`).
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ImageReply {
+    pub matches: Option<u32>,
+    pub path: Option<String>,
+    pub url: Option<String>,
+    pub work_id: Option<String>,
+    pub commit: Option<String>,
+    pub branch: Option<String>,
+}
+
 /// `POST /client/work/{id}/keep` (older apps): the run's commit.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct KeepReply {

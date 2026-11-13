@@ -219,6 +219,142 @@ pub(crate) fn create_new(root: &Path, rel: &str, mode: u32) -> io::Result<File> 
     Ok(File::from(fd))
 }
 
+/// Writes `bytes` as the new file `rel` inside `root` with permission bits
+/// `mode`, making each missing folder on the way (`0o755`). No link is
+/// followed at any name; refused when anything is already at `rel`. Returns
+/// the folders it made, outermost first, so a later failure can take them
+/// out again ([`remove_empty_folder`]). A write that fails part way leaves
+/// nothing behind: the file is unlinked and the folders it made removed.
+pub(crate) fn write_new_making_folders(root: &Path, rel: &str, bytes: &[u8], mode: u32) -> io::Result<Vec<String>> {
+    use io::Write;
+    write_new_making_folders_with(root, rel, mode, |out| out.write_all(bytes))
+}
+
+/// [`write_new_making_folders`], the file's bytes written by `write` (a test
+/// fails it part way).
+fn write_new_making_folders_with(
+    root: &Path,
+    rel: &str,
+    mode: u32,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+) -> io::Result<Vec<String>> {
+    let parts = plain_parts(rel)?;
+    let (last, folders) = parts.split_last().ok_or_else(|| invalid("an empty path"))?;
+    let mut chain = vec![open_root(root)?];
+    let first_made = make_folders(&mut chain, folders)?;
+    let dir = chain.last().expect("the root").as_raw_fd();
+    let out = match open_at(dir, last, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, mode) {
+        Ok(fd) => File::from(fd),
+        // Whatever is at `rel` is not this call's: it stays.
+        Err(e) => return Err(unmade(&chain, folders, first_made, e)),
+    };
+    if let Err(e) = fill(out, mode, write) {
+        let _ = unlink_at(dir, last, 0);
+        return Err(unmade(&chain, folders, first_made, e));
+    }
+    Ok(first_made.map_or_else(Vec::new, |first| made_paths(folders, first)))
+}
+
+/// Makes and opens each of `folders` in turn under the last of `chain`
+/// (the root), pushing each onto `chain`: the index of the first one it
+/// made (every one after it is new too). A failure removes those it made.
+fn make_folders(chain: &mut Vec<OwnedFd>, folders: &[&OsStr]) -> io::Result<Option<usize>> {
+    let mut first_made = None;
+    for (i, folder) in folders.iter().enumerate() {
+        match make_and_open(chain.last().expect("the root"), folder) {
+            Ok((fd, made)) => {
+                if made && first_made.is_none() {
+                    first_made = Some(i);
+                }
+                chain.push(fd);
+            }
+            Err(e) => return Err(unmade(chain, folders, first_made, e)),
+        }
+    }
+    Ok(first_made)
+}
+
+/// Writes the new file `out` with `write`, sets its bits to `mode` (the
+/// umask may have narrowed what `O_CREAT` set), and syncs it.
+fn fill(mut out: File, mode: u32, write: impl FnOnce(&mut File) -> io::Result<()>) -> io::Result<()> {
+    write(&mut out)?;
+    out.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    out.sync_all()
+}
+
+/// Removes the folders a failed [`write_new_making_folders`] made (from
+/// `first_made` down, each through its parent's descriptor in `chain`),
+/// innermost first, and hands back `e`.
+fn unmade(chain: &[OwnedFd], folders: &[&OsStr], first_made: Option<usize>, e: io::Error) -> io::Error {
+    if let Some(first) = first_made {
+        for i in (first..chain.len() - 1).rev() {
+            let _ = unlink_at(chain[i].as_raw_fd(), folders[i], libc::AT_REMOVEDIR);
+        }
+    }
+    e
+}
+
+/// The folders `folders[first..]` as paths from the root, outermost first.
+fn made_paths(folders: &[&OsStr], first: usize) -> Vec<String> {
+    (first..folders.len())
+        .map(|i| folders[..=i].iter().map(|f| f.to_string_lossy()).collect::<Vec<_>>().join("/"))
+        .collect()
+}
+
+/// Removes the empty folder `rel` inside `root`; one that holds anything,
+/// or is absent, is left (an error says which).
+pub(crate) fn remove_empty_folder(root: &Path, rel: &str) -> io::Result<()> {
+    let (dir, name) = parent_of(root, rel)?;
+    unlink_at(dir.as_raw_fd(), &name, libc::AT_REMOVEDIR)
+}
+
+/// `rel`'s names, refused unless every one is a plain name.
+fn plain_parts(rel: &str) -> io::Result<Vec<&OsStr>> {
+    Path::new(rel)
+        .components()
+        .map(|c| match c {
+            Component::Normal(n) => Ok(n),
+            _ => Err(invalid("not a plain relative path")),
+        })
+        .collect()
+}
+
+/// The folder `root`, opened.
+fn open_root(root: &Path) -> io::Result<OwnedFd> {
+    let root = cstr(root.as_os_str())?;
+    // SAFETY: a valid NUL-terminated path; the fd is checked before use.
+    let fd = unsafe { libc::open(root.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `open` just returned this fd.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// The folder `name` in `dir`, made when missing, opened without following
+/// a link; and whether this call made it. One it made but could not open is
+/// removed again.
+fn make_and_open(dir: &OwnedFd, name: &OsStr) -> io::Result<(OwnedFd, bool)> {
+    let c = cstr(name)?;
+    // SAFETY: a valid NUL-terminated name and an fd we own.
+    let made = unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o755) } == 0;
+    if !made {
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::AlreadyExists {
+            return Err(e);
+        }
+    }
+    match open_at(dir.as_raw_fd(), name, libc::O_RDONLY | libc::O_DIRECTORY, 0) {
+        Ok(fd) => Ok((fd, made)),
+        Err(e) => {
+            if made {
+                let _ = unlink_at(dir.as_raw_fd(), name, libc::AT_REMOVEDIR);
+            }
+            Err(e)
+        }
+    }
+}
+
 /// Opens the regular file `rel` inside `root` for reading, with its
 /// permission bits. Opened `O_NONBLOCK`, so a FIFO (or a device) there
 /// never waits for a writer before it is refused; blocking reads again once
@@ -331,6 +467,36 @@ mod tests {
             assert!(outside.join("a/b/c").exists(), "{at}: deleted outside");
             assert!(!outside.join("a/b/new").exists(), "{at}: created outside");
         }
+    }
+
+    /// (review) A write that fails part way (a full disk, an I/O error)
+    /// leaves no truncated file and no folder it made, so the same write
+    /// can be tried again; a folder that was there stays.
+    #[test]
+    fn a_write_that_fails_part_way_leaves_no_file_and_no_folder_it_made() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("public")).unwrap();
+        let half = |out: &mut File| {
+            out.write_all(b"half")?;
+            Err(io::Error::other("no space left on the device"))
+        };
+        let err = write_new_making_folders_with(root, "public/images/deep/a.png", 0o644, half).unwrap_err();
+        assert!(err.to_string().contains("no space"), "{err}");
+        assert!(!root.join("public/images").exists(), "no folder it made is left");
+        assert!(root.join("public").is_dir(), "the folder that was there stays");
+        let made = write_new_making_folders(root, "public/images/deep/a.png", b"whole", 0o644).unwrap();
+        assert_eq!(made, ["public/images", "public/images/deep"]);
+        assert_eq!(std::fs::read(root.join("public/images/deep/a.png")).unwrap(), b"whole");
+        // Made folders come out again once empty; one holding a file stays.
+        std::fs::remove_file(root.join("public/images/deep/a.png")).unwrap();
+        std::fs::write(root.join("public/keep"), "").unwrap();
+        for f in made.iter().rev() {
+            remove_empty_folder(root, f).unwrap();
+        }
+        assert!(remove_empty_folder(root, "public").is_err(), "a folder holding a file is left");
+        assert!(root.join("public/keep").exists());
     }
 
     #[test]
