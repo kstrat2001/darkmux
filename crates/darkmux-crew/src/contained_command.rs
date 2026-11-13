@@ -84,6 +84,19 @@ pub struct Run<'a> {
 /// [`policy`] for `backend`: the working directory and the mount check are
 /// where it places the tree and the check's directory (#3112 step 2).
 pub fn policy_for(image: &str, name: &str, run: &Run, backend: &dyn SandboxBackend) -> SandboxPolicy {
+    policy_with(image, name, run, backend, &darkmux_sandbox::toolchain::Toolchain::default())
+}
+
+/// (#3561) [`policy_for`] with `toolchain` (a sandbox on the host's
+/// managed runtimes): its PATH, its environment additions, and its folders
+/// read-only where they are.
+pub fn policy_with(
+    image: &str,
+    name: &str,
+    run: &Run,
+    backend: &dyn SandboxBackend,
+    toolchain: &darkmux_sandbox::toolchain::Toolchain,
+) -> SandboxPolicy {
     use crate::dispatch_internal::{DOCKER_MEMORY, DOCKER_PIDS_LIMIT};
     let read_write = |host: &Path, at: &str| Mount { host: host.to_path_buf(), at: at.to_string(), access: Access::ReadWrite };
     let tree = read_write(run.tree, "/workspace");
@@ -96,6 +109,15 @@ pub fn policy_for(image: &str, name: &str, run: &Run, backend: &dyn SandboxBacke
         mounts.push(check);
     }
     mounts.extend(run.mounts.iter().map(|(host, at)| read_write(host, at)));
+    mounts.extend(toolchain_mounts(toolchain));
+    let mut env: Vec<(String, String)> = toolchain
+        .path
+        .iter()
+        .map(|p| ("PATH".to_string(), p.clone()))
+        .chain(run.user.iter().map(|_| ("HOME".to_string(), "/tmp".to_string())))
+        .collect();
+    // (#3561) A managed runtime's additions (Node's listen preload).
+    toolchain.append_env(&mut env);
     let workdir = match run.workdir.trim_matches('/') {
         "" => tree_at,
         rel => format!("{tree_at}/{rel}"),
@@ -114,7 +136,7 @@ pub fn policy_for(image: &str, name: &str, run: &Run, backend: &dyn SandboxBacke
         host_alias: None,
         user: run.user.clone(),
         // The image's home belongs to the image's own user.
-        env: run.user.iter().map(|_| ("HOME".to_string(), "/tmp".to_string())).collect(),
+        env,
         workdir: Some(workdir),
         // The image's own entrypoint never wraps the command (the darkmux
         // runtime image's would take `sh -c` as its arguments).
@@ -129,6 +151,31 @@ pub fn policy_for(image: &str, name: &str, run: &Run, backend: &dyn SandboxBacke
             ),
         ],
     }
+}
+
+/// (#3561) A toolchain's folders, each read-only where it is on the host
+/// (only a sandbox on the host has one).
+pub fn toolchain_mounts(toolchain: &darkmux_sandbox::toolchain::Toolchain) -> impl Iterator<Item = Mount> + '_ {
+    toolchain.read_only.iter().map(|p| Mount { host: p.clone(), at: p.display().to_string(), access: Access::ReadOnly })
+}
+
+/// (#3561) The toolchain a contained run in `backend` gets: on the host,
+/// darkmux's verified runtimes (Node) for the tree (its working directory's
+/// declaration, then the tree's), over the backend's own PATH, fetched on
+/// first use and said so on stderr; a container keeps its image's.
+fn toolchain_for(backend: &dyn SandboxBackend, run: &Run) -> Result<darkmux_sandbox::toolchain::Toolchain, NotRun> {
+    if !backend.kind().on_host() {
+        return Ok(darkmux_sandbox::toolchain::Toolchain::default());
+    }
+    let workdir = run.tree.join(run.workdir.trim_matches('/'));
+    let installed = crate::managed_toolchain::for_sandbox(&[&workdir, run.tree], darkmux_flow::payload::ToolchainUse::Command, None, &mut |n| {
+        if let Some(line) = crate::managed_toolchain::said(n) {
+            eprintln!("darkmux: {line}");
+        }
+    })
+    .map_err(NotRun)?;
+    let managed = crate::managed_toolchain::managed(&installed);
+    Ok(darkmux_sandbox::toolchain::with_managed(&managed, backend.default_path().unwrap_or_default()))
 }
 
 /// (#3112) What a failed mount check says inside the sandbox: Docker's likely
@@ -160,7 +207,8 @@ pub fn command(placement: &Placement, run: &Run) -> Result<(Command, Option<Sand
             static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let name = format!("{}-{}-{n}", run.name_prefix, std::process::id());
-            let (cmd, handle) = backend.run(&policy_for(image, &name, run, backend));
+            let toolchain = toolchain_for(backend, run)?;
+            let (cmd, handle) = backend.run(&policy_with(image, &name, run, backend, &toolchain));
             Ok((cmd, Some(handle)))
         }
     }
@@ -590,6 +638,60 @@ mod tests {
         }
         assert!(matches!(ran, Ok(Bounded::Finished { success: true, .. })), "{ran:?}");
         assert!(!calls.exists(), "docker was called: {}", std::fs::read_to_string(&calls).unwrap_or_default());
+    }
+
+    /// (#3561) A contained run in a sandbox on the host runs darkmux's
+    /// verified Node (here the test build's local fixture of it): the
+    /// version the tree's `.nvmrc` names, first on the sandbox's PATH, its
+    /// listen preload in `NODE_OPTIONS` and readable, and nothing else of
+    /// darkmux's state beside it.
+    #[test]
+    #[serial_test::serial]
+    fn a_seatbelt_contained_run_runs_the_managed_node_the_tree_declares() {
+        darkmux_types::run_in_own_process!();
+        if !darkmux_sandbox::SeatbeltBackend::available() {
+            return;
+        }
+        let home = tempfile::TempDir::new().unwrap();
+        let home_path = home.path().canonicalize().unwrap();
+        std::fs::create_dir_all(&home_path).unwrap();
+        std::fs::write(home_path.join("config-secret"), "secret").unwrap();
+        let root = tempfile::TempDir::new().unwrap();
+        let tree = root.path().join("tree");
+        std::fs::create_dir_all(tree.join("pkg")).unwrap();
+        std::fs::write(tree.join(".nvmrc"), "22\n").unwrap();
+        let state = tempfile::TempDir::new().unwrap();
+        let saved: Vec<_> = ["DARKMUX_SANDBOX", "DARKMUX_HOME", darkmux_sandbox::seatbelt::STATE_DIR_ENV].iter().map(|k| (*k, std::env::var_os(k))).collect();
+        unsafe {
+            std::env::set_var("DARKMUX_SANDBOX", "seatbelt");
+            std::env::set_var("DARKMUX_HOME", &home_path);
+            std::env::set_var(darkmux_sandbox::seatbelt::STATE_DIR_ENV, state.path());
+        }
+        let secret = home_path.join("config-secret");
+        let platform = darkmux_platform::current().node_release_platform().unwrap();
+        let preload = home_path.join(format!("toolchains/node-22.23.5-{platform}/darkmux/listen-loopback.cjs"));
+        let command = format!(
+            "node; echo \"$PATH\"; cat {} && echo READ; test -r {} && echo 'PRELOAD READABLE'",
+            secret.display(),
+            preload.display()
+        );
+        let r = Run { command: &command, tree: &tree, workdir: "pkg", mounts: &[], user: None, name_prefix: "darkmux-test" };
+        let ran = run(&Placement::Container("host".into()), &r, Duration::from_secs(60));
+        unsafe {
+            for (k, v) in saved {
+                match v { Some(v) => std::env::set_var(k, v), None => std::env::remove_var(k) }
+            }
+        }
+        let Ok(Bounded::Finished { stdout, .. }) = ran else { panic!("{ran:?}") };
+        let out = String::from_utf8_lossy(&stdout).into_owned();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.first(), Some(&"v22.23.5"), "{out}");
+        let install = home_path.join(format!("toolchains/node-22.23.5-{platform}"));
+        let preload = install.join("darkmux/listen-loopback.cjs");
+        assert_eq!(lines[1], format!("--require \"{}\"", preload.display()), "the fixture node prints its NODE_OPTIONS: {out}");
+        assert_eq!(lines[2].split(':').next(), install.join("bin").to_str(), "{out}");
+        assert!(lines.contains(&"PRELOAD READABLE"), "the sandbox cannot read the preload: {out}");
+        assert!(!lines.contains(&"READ"), "the sandbox read darkmux state beside the toolchain: {out}");
     }
 
     /// On the host the command runs in the tree's working directory.

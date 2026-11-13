@@ -344,4 +344,27 @@ pub struct PreviewState {
     /// The end of its log, when it failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log_tail: Option<String>,
+    /// (#3561) What a starting preview is doing that an app may show;
+    /// absent the rest of the time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<PreviewStage>,
+}
+
+/// (#3561) A step of a preview's start that an app may show.
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq)]
+pub struct PreviewStage {
+    /// Which step, for an app to branch on: `getting_node` (darkmux is
+    /// fetching and verifying the project's Node.js for a sandbox on this
+    /// machine, first use of that version only).
+    pub code: String,
+    /// The same for a person: `getting Node 26.13.1, first use only`.
+    pub detail: String,
+}
+
+impl PreviewStage {
+    /// The stage of a first use's fetch of a runtime darkmux manages
+    /// (`name` `node`, shown as `display` `Node`): `getting_node`.
+    pub fn getting(name: &str, display: &str, version: &str) -> Self {
+        PreviewStage { code: format!("getting_{name}"), detail: format!("getting {display} {version}, first use only") }
+    }
 }

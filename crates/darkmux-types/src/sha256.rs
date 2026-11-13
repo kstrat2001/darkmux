@@ -1,7 +1,8 @@
-//! SHA-256 (FIPS 180-4), inline: the weights hash a shared result names must
-//! be the one the darkmux evals site computes, and the workspace has no
-//! SHA-256 crate (BLAKE3 hashes sandboxes). Checked against the standard's
-//! test vectors below.
+//! SHA-256 (FIPS 180-4), inline and streaming: the weights hash a shared
+//! lab result names must be the one the darkmux evals site computes, and a
+//! managed Node.js archive must match the hash pinned in the binary (#3561).
+//! The workspace has no SHA-256 crate (BLAKE3 hashes sandboxes). Checked
+//! against the standard's test vectors below.
 
 use std::io::Read;
 

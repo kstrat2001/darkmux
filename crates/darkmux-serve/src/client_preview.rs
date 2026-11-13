@@ -221,7 +221,7 @@
 //! that same checkout into the workspace, never overwriting and never
 //! through a symlink at either end.
 
-use crate::client_wire::PreviewState;
+use crate::client_wire::{PreviewStage, PreviewState};
 
 /// Delete, create, read and replace inside a run-written folder without
 /// crossing a link (a hand edit's reads and write go through it too).
@@ -692,6 +692,8 @@ struct Entry {
     /// When an app last asked about it (a start or a status), in the
     /// [`Previews`] clock's seconds.
     last_asked: u64,
+    /// (#3561) The step of its start an app may show, while there is one.
+    stage: Option<PreviewStage>,
 }
 
 /// Seconds on a wall clock: Unix seconds in production. A wall clock, not
@@ -1093,12 +1095,12 @@ pub trait PreviewContainers: Send + Sync {
     fn kind(&self) -> BackendKind {
         BackendKind::Docker
     }
-    /// (#3112) The host toolchain `recipe` runs with; a container's is its
-    /// image's ([`Toolchain::default`]).
     /// (#3112) The host toolchain `recipe` runs with in `workdir`; a
-    /// container's is its image's ([`Toolchain::default`]).
-    fn toolchain(&self, recipe: &Recipe, workdir: &Path) -> Result<Toolchain, String> {
-        let _ = (recipe, workdir);
+    /// container's is its image's ([`Toolchain::default`]). (#3561) A step
+    /// an app may show while it is resolved (a first use's Node fetch) goes
+    /// to `stage`, then `None` once it is done.
+    fn toolchain(&self, recipe: &Recipe, workdir: &Path, stage: &dyn Fn(Option<PreviewStage>)) -> Result<Toolchain, String> {
+        let _ = (recipe, workdir, stage);
         Ok(Toolchain::default())
     }
     /// The image and `--user` a preview container runs with, resolved as a
@@ -1349,6 +1351,7 @@ impl Previews {
             hmr_port: e.hmr_port,
             log_tail: failed.as_ref().map(|_| tail(&e.log, 20)),
             error: failed,
+            stage: e.stage.clone().filter(|_| e.status.live()),
         }
     }
 
@@ -1423,6 +1426,7 @@ impl Previews {
             heartbeat: None,
             log: log.clone(),
             last_asked: (self.clock)(),
+            stage: None,
         }));
         let snap = Self::snapshot(name, &entry.lock().unwrap());
         entries.insert(name.to_string(), entry.clone());
@@ -2002,7 +2006,13 @@ fn spec_in(
         ports: [at.port, at.hmr_port],
         user: user.filter(|_| !on_host),
         labels,
-        env: container_env_for(recipe, at.port, at.hmr_port, kind, toolchain.path.as_deref()),
+        env: {
+            // (#3561) A managed runtime's additions (Node's listen preload),
+            // appended to the recipe's own.
+            let mut env = container_env_for(recipe, at.port, at.hmr_port, kind, toolchain.path.as_deref());
+            toolchain.append_env(&mut env);
+            env
+        },
         script: container_script(recipe, install_due, &Watch::production_at(&beat_at)).replacen(STARTED_LINE, started_line(kind), 1),
         read_only: if on_host { toolchain.read_only.iter().cloned().chain([at.log.clone()]).collect() } else { Vec::new() },
     }
@@ -2089,7 +2099,9 @@ fn planned_spec(
     let resolved = containers
         .image_and_user()
         .map_err(|e| if kind.on_host() { format!("a preview runs in {}: {e}", darkmux_sandbox::placed_in(kind)) } else { format!("a preview runs in a container: {e}") })?;
-    let toolchain = containers.toolchain(recipe, &at.workdir)?;
+    let toolchain = containers.toolchain(recipe, &at.workdir, &|stage| entry.lock().unwrap().stage = stage);
+    entry.lock().unwrap().stage = None;
+    let toolchain = toolchain?;
     // On the host the toolchain stands in for the image an install counts.
     let image = if kind.on_host() { format!("{}|{}", resolved.0, toolchain.identity) } else { resolved.0.clone() };
     let plan = install_plan_in(kind, recipe, at, &image);
@@ -2446,12 +2458,30 @@ pub(crate) struct HostEmulator {
     /// its listener watch and not-ready reason read this host's real
     /// sockets for the emulated process group.
     pub on_host: Mutex<bool>,
+    /// (#3561) Set: resolving the toolchain plays a first use's Node fetch,
+    /// reporting its stage for this long, then failing with the reason
+    /// when one is given.
+    pub fetch: Mutex<Option<(Duration, Option<String>)>>,
+    /// (#3561 re-review) Set: the played fetch never clears its own stage,
+    /// as a toolchain whose last step is not a stage-ending one would not,
+    /// so only the preview's own reset can.
+    pub fetch_leaves_stage: Mutex<bool>,
     created: Mutex<HashMap<String, ContainerSpec>>,
     groups: Mutex<HashMap<String, i32>>,
 }
 
 #[cfg(test)]
 impl PreviewContainers for HostEmulator {
+    fn toolchain(&self, _recipe: &Recipe, _workdir: &Path, stage: &dyn Fn(Option<PreviewStage>)) -> Result<Toolchain, String> {
+        let Some((takes, fails)) = self.fetch.lock().unwrap().clone() else { return Ok(Toolchain::default()) };
+        stage(Some(PreviewStage::getting("node", "Node", "26.13.1")));
+        std::thread::sleep(takes);
+        if !*self.fetch_leaves_stage.lock().unwrap() {
+            stage(None);
+        }
+        fails.map_or(Ok(Toolchain::default()), Err)
+    }
+
     fn kind(&self) -> BackendKind {
         if *self.on_host.lock().unwrap() {
             BackendKind::Seatbelt
@@ -3731,6 +3761,73 @@ mod tests {
             "{v}"
         );
         assert!(emu.specs.lock().unwrap().is_empty() && !wt.join("ran").exists());
+    }
+
+    /// (#3561) While a sandbox on the host gets its Node (first use only),
+    /// the starting preview says so in `stage`, which an app can show; the
+    /// stage is gone once the toolchain is there. A fetch that fails fails
+    /// the preview with its reason.
+    #[test]
+    fn a_preview_shows_getting_node_as_its_stage_until_node_is_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = a_workspace(dir.path(), "sleep 30");
+        let (previews, emu) = emulated(dir.path());
+        *emu.fetch.lock().unwrap() = Some((Duration::from_millis(600), None));
+        previews.start("w", &wt, &RecipeSource::Checkout(wt.clone())).unwrap();
+        let mut seen = None;
+        for _ in 0..100 {
+            let v = serde_json::to_value(previews.status("w").unwrap()).unwrap();
+            if v.get("stage").is_some() {
+                seen = Some(v);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let v = seen.expect("the preview never showed its stage");
+        assert_eq!(v["status"], "starting", "{v}");
+        assert_eq!(v["stage"]["code"], "getting_node", "{v}");
+        assert_eq!(v["stage"]["detail"], "getting Node 26.13.1, first use only", "{v}");
+        let mut after = serde_json::Value::Null;
+        for _ in 0..200 {
+            after = serde_json::to_value(previews.status("w").unwrap()).unwrap();
+            if after.get("stage").is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(after.get("stage").is_none(), "{after}");
+        previews.stop("w");
+
+        let (previews, emu) = emulated(dir.path());
+        *emu.fetch.lock().unwrap() = Some((Duration::ZERO, Some("does not match the SHA-256 darkmux pins".into())));
+        previews.start("w", &wt, &RecipeSource::Checkout(wt.clone())).unwrap();
+        let v = until_failed(&previews, "w");
+        assert!(v["error"].as_str().unwrap().contains("does not match the SHA-256"), "{v}");
+        assert!(v.get("stage").is_none(), "{v}");
+        assert!(emu.specs.lock().unwrap().is_empty(), "a preview whose Node failed still started");
+    }
+
+    /// (#3561 re-review) The preview itself clears its stage once its
+    /// toolchain is resolved, whatever the toolchain reported last: a stage
+    /// left set by it is gone while the dev server starts.
+    #[test]
+    fn a_preview_clears_a_stage_its_toolchain_left_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = a_workspace(dir.path(), "sleep 30");
+        let (previews, emu) = emulated(dir.path());
+        *emu.fetch.lock().unwrap() = Some((Duration::from_millis(100), None));
+        *emu.fetch_leaves_stage.lock().unwrap() = true;
+        previews.start("w", &wt, &RecipeSource::Checkout(wt.clone())).unwrap();
+        for _ in 0..200 {
+            if !emu.specs.lock().unwrap().is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!emu.specs.lock().unwrap().is_empty(), "the preview never got past its toolchain");
+        let v = serde_json::to_value(previews.status("w").unwrap()).unwrap();
+        assert!(v.get("stage").is_none(), "the stage stuck: {v}");
+        previews.stop("w");
     }
 
     /// (#3456) Stopping a preview, and `client serve` shutting down, remove

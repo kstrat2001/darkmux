@@ -11,7 +11,8 @@
 //! guessed, and [`Built::notes`] says why. The pure readings are here and
 //! tested; [`gather`] probes the machine (the platform, the engine, git).
 
-pub mod sha256;
+/// SHA-256, shared with the managed Node's archive check (#3561).
+pub use darkmux_types::sha256;
 pub mod upload;
 
 use anyhow::{anyhow, bail, Context, Result};

@@ -44,6 +44,7 @@ import type { TelemetryRuntimePayload } from "./TelemetryRuntimePayload";
 import type { ThermalStopUnresolvedPayload } from "./ThermalStopUnresolvedPayload";
 import type { ThermalTier5EjectFailedPayload } from "./ThermalTier5EjectFailedPayload";
 import type { ThermalTier5EjectPayload } from "./ThermalTier5EjectPayload";
+import type { ToolchainPayload } from "./ToolchainPayload";
 import type { UsagePayload } from "./UsagePayload";
 import type { UtilityErrorPayload } from "./UtilityErrorPayload";
 import type { UtilityStartPayload } from "./UtilityStartPayload";
@@ -112,6 +113,9 @@ export type FlowPayloads = {
   "thermal.stop_unresolved": ThermalStopUnresolvedPayload,
   "thermal.tier5_eject": ThermalTier5EjectPayload,
   "thermal.tier5_eject_failed": ThermalTier5EjectFailedPayload,
+  "toolchain.fetch": ToolchainPayload,
+  "toolchain.ready": ToolchainPayload,
+  "toolchain.error": ToolchainPayload,
   "utility.start": UtilityStartPayload,
   "utility.error": UtilityErrorPayload,
 };

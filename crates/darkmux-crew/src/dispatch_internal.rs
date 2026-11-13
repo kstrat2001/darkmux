@@ -2621,6 +2621,11 @@ pub struct DockerRunConfig {
     /// `-e HOME=/tmp` (the image's home belongs to the image's own uid);
     /// `Image` adds nothing.
     pub container_user: darkmux_platform::ContainerUser,
+    /// (#3561) A sandbox on the host's managed runtimes
+    /// ([`dispatch_toolchain`]): its PATH, its environment additions (Node's
+    /// listen preload) and its folders, read-only. Empty in a container, which keeps
+    /// its image's.
+    pub toolchain: darkmux_sandbox::toolchain::Toolchain,
 }
 
 /// (#3275) Which user the dispatch container runs as: the operator's
@@ -2694,7 +2699,9 @@ pub(crate) fn dispatch_policy_for(config: &DockerRunConfig, backend: &dyn darkmu
     let (ws_at, out_at) = (backend.place(&mounts[0]), backend.place(&mounts[1]));
     mounts.extend(workdir_git_read_only_mount(config.workdir_git_read_only.as_deref()));
     mounts.extend(mod_attachment_mounts(&config.mod_attachment_mounts));
-    let mut env = Vec::new();
+    // (#3561) A sandbox on the host's managed Node, read-only where it is.
+    mounts.extend(crate::contained_command::toolchain_mounts(&config.toolchain));
+    let mut env: Vec<(String, String)> = config.toolchain.path.iter().map(|p| ("PATH".to_string(), p.clone())).collect();
     if let Some(cache) = &config.cache_dir {
         let (mount, cache_env) = cache_mount_placed(cache, backend);
         mounts.push(mount);
@@ -2714,6 +2721,8 @@ pub(crate) fn dispatch_policy_for(config: &DockerRunConfig, backend: &dyn darkmu
     let user = config.container_user.docker_user();
     // The image's home belongs to the image's own user.
     env.extend(user.iter().map(|_| ("HOME".to_string(), "/tmp".to_string())));
+    // (#3561) A managed runtime's additions (Node's listen preload).
+    config.toolchain.append_env(&mut env);
     SandboxPolicy {
         name: config.container_name.clone(),
         image: config.image.clone(),
@@ -6850,6 +6859,10 @@ struct ContainerRun {
     /// The job model the lease holds: an LM Studio load darkmux made for
     /// this dispatch, `None` on any other route.
     leased_job: Option<String>,
+    /// (#3561) The sandbox's managed Node, set once `dispatch.start` is
+    /// written (a first use fetches it, recorded on the run's session);
+    /// empty in a container.
+    toolchain: darkmux_sandbox::toolchain::Toolchain,
 }
 
 /// The container path up to its `dispatch.start`, in the order the steps
@@ -6920,6 +6933,7 @@ fn prepare_container_run(
         remote_auth,
         lease,
         leased_job,
+        toolchain: Default::default(),
     })
 }
 
@@ -7275,6 +7289,28 @@ fn runtime_program(image: &RuntimeImage) -> Result<(Option<PathBuf>, Vec<String>
         None if image.inject => Ok((Some(ensure_runtime_binary_cached(&image.darkmux_image.id)?), Vec::new())),
         None => Ok((None, Vec::new())),
     }
+}
+
+/// (#3561) The toolchain a dispatch in `kind` gets: in a sandbox on the
+/// host, the verified runtimes (Node, the version the workspace declares), over the backend's own
+/// PATH, fetched on first use (its `toolchain.*` records on `session`, and
+/// a line on stderr); in a container, none (the image's own).
+pub(crate) fn dispatch_toolchain(
+    kind: darkmux_sandbox::BackendKind,
+    workspace: &Path,
+    session: &darkmux_types::session_id::SessionId,
+) -> Result<darkmux_sandbox::toolchain::Toolchain> {
+    if !kind.on_host() {
+        return Ok(darkmux_sandbox::toolchain::Toolchain::default());
+    }
+    let installed = crate::managed_toolchain::for_sandbox(&[workspace], darkmux_flow::payload::ToolchainUse::Dispatch, Some(session), &mut |n| {
+        if let Some(line) = crate::managed_toolchain::said(n) {
+            eprintln!("darkmux dispatch: {line}");
+        }
+    })
+    .map_err(|why| anyhow!("darkmux dispatch: {why}"))?;
+    let base = darkmux_sandbox::backend_of(kind).default_path().unwrap_or_default();
+    Ok(darkmux_sandbox::toolchain::with_managed(&crate::managed_toolchain::managed(&installed), base))
 }
 
 /// (#3112 review) The runtime a dispatch on `kind`, a sandbox on the host
@@ -7896,6 +7932,53 @@ fn container_model_resident(
     })
 }
 
+/// (#3561) What a dispatch's toolchain is resolved for: the sandbox it
+/// runs in (or why none can run here), its workspace, and for its terminal
+/// record the model and the hosted brain's route label.
+struct ToolchainFor<'a> {
+    kind: std::result::Result<darkmux_sandbox::BackendKind, String>,
+    workspace: &'a Path,
+    model: &'a str,
+    endpoint: Option<&'a str>,
+}
+
+/// (#3561) The sandbox `run` starts in: the selected one for a sandbox on
+/// the host, Docker otherwise (which gets no managed toolchain).
+fn sandbox_of(run: &ContainerRun) -> std::result::Result<darkmux_sandbox::BackendKind, String> {
+    if run.image.host_runtime.is_some() {
+        darkmux_sandbox::selected()
+    } else {
+        Ok(darkmux_sandbox::BackendKind::Docker)
+    }
+}
+
+/// (#3561) The toolchain the dispatch's sandbox gets ([`dispatch_toolchain`]:
+/// on the host, the workspace's verified Node, fetched on first use), or
+/// `bookend` closed with the refusal's own reason (no sandbox can run, a
+/// fetch failed, a declaration darkmux will not read) and that refusal.
+fn container_toolchain(
+    opts: &DispatchOpts,
+    execution: &ExecutionId,
+    ask: ToolchainFor<'_>,
+    bookend: &mut DispatchBookendGuard<'_>,
+    started: std::time::Instant,
+) -> Result<darkmux_sandbox::toolchain::Toolchain> {
+    let refused = match ask.kind.map_err(|why| anyhow!(why)).and_then(|kind| dispatch_toolchain(kind, ask.workspace, &opts.session)) {
+        Ok(toolchain) => return Ok(toolchain),
+        Err(e) => e,
+    };
+    let (mut payload, level) = ended_mid_run_terminal(
+        &format!("{refused:#}"),
+        started.elapsed().as_millis() as u64,
+        &TrajectorySummary::default(),
+        ask.endpoint,
+        opts.resume_from.as_deref(),
+    );
+    merge_record_context(&mut payload, &opts.record_context);
+    bookend.close(crate::dispatch::build_dispatch_record(level, &opts.role_id, &opts.session, execution, Some(ask.model), opts.phase_id.as_deref(), payload));
+    Err(refused)
+}
+
 /// The container run, from its `dispatch.start` to its terminal record.
 /// It owns the bookend guard (contract 2): `dispatch.start` opens it, and
 /// every exit closes it exactly once, explicitly on the two mid-run exits
@@ -7956,6 +8039,10 @@ fn run_container(opts: &DispatchOpts, execution: &ExecutionId, mut run: Containe
         dispatch_start_payload,
     ));
     let dispatch_start_instant = std::time::Instant::now();
+    // (#3561) A sandbox on the host runs the workspace's verified Node,
+    // settled before its model is made resident.
+    let ask = ToolchainFor { kind: sandbox_of(&run), workspace: &run.workspace, model: &run.model, endpoint: run.unmanaged_endpoint_raw_label.as_deref() };
+    run.toolchain = container_toolchain(opts, execution, ask, &mut bookend, dispatch_start_instant)?;
     // (#3121) A run that ended mid-way closes with the error that ended it
     // and the turns it finished, never the guard's "early return or panic".
     let close_ended_mid_run =
@@ -8641,6 +8728,7 @@ fn container_run_config(
         // this just tells the container to reload it.
         resume_checkpoint: opts.resume_from.is_some(),
         container_host_access: darkmux_platform::current().container_host_access(),
+        toolchain: run.toolchain.clone(),
         container_user: if run.image.host_runtime.is_some() {
             // (#3112 step 2) A host-process sandbox runs as the caller; there is no user to switch to.
             darkmux_platform::ContainerUser::Image
