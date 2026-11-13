@@ -114,8 +114,9 @@ pub enum Note<'a> {
     },
     /// (#3561) `runtime` could not be had here (`reason`). `required`: the
     /// project declares it, and the sandbox is refused; otherwise the
-    /// sandbox runs without it. `pin` is the build that was tried, when one
-    /// was chosen.
+    /// sandbox runs without it. `pin` is the build that was chosen, when
+    /// one was (none on a machine with no pinned build, or when the
+    /// project's declaration was refused).
     Unavailable {
         runtime: &'a Runtime,
         pin: Option<&'a Pin>,

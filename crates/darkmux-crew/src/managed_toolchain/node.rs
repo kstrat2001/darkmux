@@ -161,8 +161,11 @@ pub const NODE: Runtime = Runtime {
         let request = super::node_version::declared_in(dirs)?;
         super::node_version::choose(request.as_ref(), pins)
     },
-    // A declaration darkmux cannot read (a link, `latest`) still says the
-    // project asked for Node: it is refused, never skipped.
+    // A version file darkmux cannot read (a link) or whose version it cannot
+    // use (`latest`), and an unusable `engines.node` in a readable
+    // `package.json`, still say the project asked for Node: refused, never
+    // skipped. A `package.json` darkmux cannot read at all declares nothing
+    // (`declared_in` passes over it; `unread_package_json` says why).
     declares: |dirs| !matches!(super::node_version::declared_in(dirs), Ok(None)),
     notice: super::node_version::unread_package_json,
     extras: &[Extra {

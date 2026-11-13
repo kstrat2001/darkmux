@@ -1342,6 +1342,13 @@ fn a_declared_node_that_cannot_be_had_refuses_the_sandbox() {
         &theirs,
         "not a Node install darkmux verified",
     );
+    let (_, records, _) = supplied(&[&ws], Some(PLATFORM), &theirs, &source);
+    let p = records[0].payload_json();
+    assert_eq!(
+        (p["version"].as_str(), p["url"].as_str()),
+        (Some("26.13.1"), Some(pin_of(&source, 26).url)),
+        "a refusal after a pin was chosen names it"
+    );
     // A declaration darkmux will not read at all (a link) still says the
     // project asked for Node: refused, never skipped.
     std::fs::remove_file(ws.join(".nvmrc")).unwrap();
@@ -1531,4 +1538,45 @@ fn an_unreadable_package_json_declares_nothing_and_says_why() {
     let (got, records, _) = supplied(&[&ws], Some(PLATFORM), &toolchains, &source);
     assert!(got.unwrap_err().contains("not a string"));
     assert_eq!(shapes(&records), ["toolchain.error error"]);
+}
+
+/// (#3561 re-review) The unreadable-`package.json` notice follows
+/// `declared_in` exactly: said only when the search reached that file. A
+/// version file that declares stops it before; an empty or comment-only
+/// one does not; a readable `package.json` that declares in an earlier
+/// folder stops it before a later unreadable one.
+#[test]
+fn the_package_json_notice_follows_the_declaration_search() {
+    let (_d, root) = a_dir();
+    let unreadable = |dir: &Path| {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("package.json"), "{ not json").unwrap();
+    };
+    let ws = root.join("a");
+    unreadable(&ws);
+    std::fs::write(ws.join(".nvmrc"), "22\n").unwrap();
+    assert_eq!(
+        unread_package_json(&[&ws]),
+        None,
+        "an .nvmrc that declares is found first"
+    );
+    std::fs::write(ws.join(".nvmrc"), "# just a comment\n\n").unwrap();
+    assert!(
+        unread_package_json(&[&ws]).is_some_and(|w| w.contains("does not parse")),
+        "a comment-only .nvmrc falls through to package.json"
+    );
+    let (near, far) = (root.join("b/pkg"), root.join("b"));
+    std::fs::create_dir_all(&near).unwrap();
+    std::fs::write(near.join("package.json"), r#"{"engines": {"node": "22"}}"#).unwrap();
+    unreadable(&far);
+    assert_eq!(
+        unread_package_json(&[&near, &far]),
+        None,
+        "the nearer package.json declares first"
+    );
+    std::fs::write(near.join("package.json"), r#"{"name": "no engines"}"#).unwrap();
+    assert!(
+        unread_package_json(&[&near, &far]).is_some(),
+        "the search goes on to the far one"
+    );
 }

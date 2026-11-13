@@ -167,13 +167,11 @@ impl Platform for LinuxPlatform {
         crate::linux_node_release_platform(std::env::consts::ARCH, self.c_library()?)
     }
 
-    /// Musl when its dynamic loader is in `/lib` (Alpine's
-    /// `ld-musl-<arch>.so.1`), else glibc.
+    /// From the dynamic loaders in `/lib` and `/lib64`: glibc wherever a
+    /// glibc loader is, musl only where musl's (Alpine's
+    /// `ld-musl-<arch>.so.1`) is the only one.
     fn c_library(&self) -> Option<crate::CLibrary> {
-        let entries: Vec<String> = std::fs::read_dir("/lib")
-            .map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
-            .unwrap_or_default();
-        Some(crate::c_library_from(&entries))
+        Some(crate::c_library_in(&lib_dirs()))
     }
 
     /// The CPU tiers [`Platform::cpu_clusters`] reads, one core per online
@@ -1038,4 +1036,30 @@ fn read_hwmon() -> Vec<HwmonInput> {
 #[cfg(not(target_os = "linux"))]
 fn read_hwmon() -> Vec<HwmonInput> {
     Vec::new()
+}
+
+/// The folders a Linux machine's dynamic loaders are in.
+const LIB_DIRS: [&str; 2] = ["/lib", "/lib64"];
+
+#[cfg(test)]
+thread_local! {
+    static LIB_DIRS_FOR_TEST: std::cell::RefCell<Option<Vec<std::path::PathBuf>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// [`LIB_DIRS`], or a test's own folders standing in for them.
+fn lib_dirs() -> Vec<std::path::PathBuf> {
+    #[cfg(test)]
+    if let Some(dirs) = LIB_DIRS_FOR_TEST.with(|d| d.borrow().clone()) {
+        return dirs;
+    }
+    LIB_DIRS.iter().map(std::path::PathBuf::from).collect()
+}
+
+/// Run `f` with `dirs` as this thread's library folders.
+#[cfg(test)]
+pub(crate) fn with_lib_dirs<T>(dirs: Vec<std::path::PathBuf>, f: impl FnOnce() -> T) -> T {
+    LIB_DIRS_FOR_TEST.with(|d| *d.borrow_mut() = Some(dirs));
+    let out = f();
+    LIB_DIRS_FOR_TEST.with(|d| *d.borrow_mut() = None);
+    out
 }

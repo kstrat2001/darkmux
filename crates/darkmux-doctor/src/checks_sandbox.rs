@@ -122,17 +122,25 @@ fn host_row(named: &str, what: &str, kind: BackendKind, host_runtime: Option<&Re
 pub(crate) fn managed_runtime_rows(
     selected: &Result<BackendKind, String>,
     statuses: impl FnOnce() -> Vec<(&'static darkmux_crew::managed_toolchain::Runtime, darkmux_crew::managed_toolchain::Status)>,
+    c_library: Option<darkmux_platform::CLibrary>,
 ) -> Vec<Check> {
     let names = || darkmux_crew::managed_toolchain::RUNTIMES.iter().map(|r| format!("managed {}", r.name));
     match selected {
-        Ok(kind) if kind.on_host() => statuses().into_iter().map(|(r, s)| runtime_row(*kind, r, s)).collect(),
+        Ok(kind) if kind.on_host() => statuses().into_iter().map(|(r, s)| runtime_row(*kind, r, s, c_library)).collect(),
         Ok(_) => names().map(|n| not_applicable(&n, "a container runs its image's own runtimes")).collect(),
         Err(_) => names().map(|n| not_applicable(&n, "no sandbox can run here (see `sandbox`)")).collect(),
     }
 }
 
 /// One managed runtime's row under the sandbox on the host `kind`.
-fn runtime_row(kind: BackendKind, runtime: &darkmux_crew::managed_toolchain::Runtime, status: darkmux_crew::managed_toolchain::Status) -> Check {
+/// `c_library`: this machine's, which names why no build is pinned when it
+/// is musl.
+fn runtime_row(
+    kind: BackendKind,
+    runtime: &darkmux_crew::managed_toolchain::Runtime,
+    status: darkmux_crew::managed_toolchain::Status,
+    c_library: Option<darkmux_platform::CLibrary>,
+) -> Check {
     use darkmux_crew::managed_toolchain::Status as Rt;
     let check = |status, message: String, hint: Option<String>| Check { name: format!("managed {}", runtime.name), status, message, hint };
     let display = runtime.display;
@@ -163,9 +171,13 @@ fn runtime_row(kind: BackendKind, runtime: &darkmux_crew::managed_toolchain::Run
         Rt::Unsupported => check(
             Status::Warn,
             format!(
-                "darkmux pins no {display} build for this machine's CPU: under `{}` a sandbox for a project that \
+                "darkmux pins no {display} build for this machine's {}: under `{}` a sandbox for a project that \
                  declares a {display} version is refused here, and one for a project that declares none runs without \
                  darkmux's {display}",
+                match c_library {
+                    Some(darkmux_platform::CLibrary::Musl) => "C library (musl: the official builds link glibc)",
+                    _ => "CPU",
+                },
                 darkmux_sandbox::setting_value(kind)
             ),
             Some(format!(
@@ -386,25 +398,28 @@ mod tests {
         let pin = NODE.pins[0];
         let seatbelt = Ok(BackendKind::Seatbelt);
         let installed = Installed { pin, dir: std::path::PathBuf::from("/h/.darkmux/toolchains/node-26.13.1-darwin-arm64"), env: Vec::new() };
-        let rows = managed_runtime_rows(&seatbelt, || vec![(&NODE, Rt::Installed(installed.clone()))]);
+        let rows = managed_runtime_rows(&seatbelt, || vec![(&NODE, Rt::Installed(installed.clone()))], None);
         assert_eq!(rows.len(), 1);
         assert_eq!((rows[0].name.as_str(), rows[0].status), ("managed node", Status::Pass));
         assert!(rows[0].message.contains("Node 26.13.1") && rows[0].message.contains("/h/.darkmux/toolchains/node-26.13.1-darwin-arm64") && rows[0].message.contains("verified"), "{}", rows[0].message);
-        let rows = managed_runtime_rows(&seatbelt, || vec![(&NODE, Rt::WillFetch(pin))]);
+        let rows = managed_runtime_rows(&seatbelt, || vec![(&NODE, Rt::WillFetch(pin))], None);
         assert_eq!(rows[0].status, Status::Pass);
         assert!(rows[0].message.contains("Node 26.13.1") && rows[0].message.contains("first use") && rows[0].message.contains("nodejs.org"), "{}", rows[0].message);
         assert!(rows[0].message.contains("declares no version") && rows[0].message.contains("runs without it"), "{}", rows[0].message);
-        let rows = managed_runtime_rows(&Ok(BackendKind::Landlock), || vec![(&NODE, Rt::Unsupported)]);
+        let rows = managed_runtime_rows(&Ok(BackendKind::Landlock), || vec![(&NODE, Rt::Unsupported)], Some(darkmux_platform::CLibrary::Glibc));
         assert_eq!(rows[0].status, Status::Warn, "only a project that declares Node is refused here");
         assert!(rows[0].message.contains("declares a Node version is refused") && rows[0].message.contains("declares none runs without"), "{}", rows[0].message);
+        assert!(rows[0].message.contains("CPU") && !rows[0].message.contains("musl"), "{}", rows[0].message);
+        let rows = managed_runtime_rows(&Ok(BackendKind::Landlock), || vec![(&NODE, Rt::Unsupported)], Some(darkmux_platform::CLibrary::Musl));
+        assert!(rows[0].message.contains("C library (musl") && !rows[0].message.contains("CPU"), "the reason is the C library: {}", rows[0].message);
         assert!(rows[0].hint.as_deref().unwrap_or("").contains("runtime.sandbox docker"), "{:?}", rows[0].hint);
         let asked = std::cell::Cell::new(false);
         let rows = managed_runtime_rows(&Ok(BackendKind::Docker), || {
             asked.set(true);
             Vec::new()
-        });
+        }, None);
         assert_eq!(rows.len(), 1, "one row per runtime even when not applicable");
         assert!(rows[0].message.contains("not applicable") && !asked.get(), "{}", rows[0].message);
-        assert!(managed_runtime_rows(&Err("no".into()), Vec::new)[0].message.contains("not applicable"));
+        assert!(managed_runtime_rows(&Err("no".into()), Vec::new, None)[0].message.contains("not applicable"));
     }
 }

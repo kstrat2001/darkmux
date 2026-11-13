@@ -29,8 +29,9 @@
 //!   `darkmux_sandbox::toolchain`). No other part of `~/.darkmux` is added to
 //!   what a sandbox reads.
 //! - **Required only when declared** (Kain's decision): a runtime the
-//!   project declares (for Node `.nvmrc`, `.node-version` or `engines.node`,
-//!   a declaration darkmux cannot read included) must be had, or the sandbox
+//!   project declares (for Node an `.nvmrc` or `.node-version`, even one
+//!   darkmux cannot read, or a readable `package.json`'s `engines.node`;
+//!   a `package.json` darkmux cannot read declares nothing) must be had, or the sandbox
 //!   is refused. One it does not declare is best effort: its default build,
 //!   or, when that cannot be had (a download or verify failure, no build
 //!   pinned for this machine), the sandbox runs without it, with a warning
@@ -58,7 +59,7 @@ pub use install::{
     UNUSED_FOR, USED, USE_STAMP_EVERY,
 };
 pub use node::NODE;
-pub use node_version::{choose, declared_in, Declared, Request};
+pub use node_version::{choose, declared_in, unread_package_json, Declared, Request};
 pub use pins::{Pin, Version};
 
 use darkmux_flow::payload::{ToolchainPayload, ToolchainUse};
@@ -88,9 +89,10 @@ pub struct Runtime {
     /// The pin (of this platform's, never empty) a project in these
     /// folders asks for, or why none answers it.
     pub pick: for<'p> fn(&[&Path], &'p [Pin]) -> Result<&'p Pin, String>,
-    /// Whether a project in these folders declares a version of it (a
-    /// declaration darkmux cannot read counts: the project asked). A
-    /// declared runtime is required; an undeclared one is best effort.
+    /// Whether a project in these folders declares a version of it, by the
+    /// runtime's own rules (Node: an `.nvmrc` or `.node-version`, even one
+    /// darkmux cannot read, or a readable `package.json`'s `engines.node`).
+    /// A declared runtime is required; an undeclared one is best effort.
     pub declares: fn(&[&Path]) -> bool,
     /// What the caller should say about the project's files before any
     /// fetch (Node: a `package.json` darkmux could not read).
@@ -163,6 +165,18 @@ pub fn provide(
     dirs: &[&Path],
     note: &mut dyn FnMut(&Note),
 ) -> Result<Installed, String> {
+    let pin = chosen(runtime, platform, source, dirs)?;
+    ensure(runtime, &pin, root, source, note)
+}
+
+/// The build of `runtime` the project in `dirs` gets on `platform`, from
+/// `source`'s pins, or why none is.
+fn chosen(
+    runtime: &Runtime,
+    platform: Option<&str>,
+    source: &Source,
+    dirs: &[&Path],
+) -> Result<Pin, String> {
     let pins = platform.map(|p| source.pins_for(p)).unwrap_or_default();
     if pins.is_empty() {
         return Err(format!(
@@ -172,8 +186,7 @@ pub fn provide(
             runtime.display,
         ));
     }
-    let pin = (runtime.pick)(dirs, &pins)?;
-    ensure(runtime, pin, root, source, note)
+    (runtime.pick)(dirs, &pins).copied()
 }
 
 /// Where a sandbox start gets its runtimes from: this host's platform, the
@@ -227,17 +240,20 @@ fn supply_one(
     }
     let mut recorded = false;
     let source = (ask.source)(runtime);
-    let got = provide(runtime, ask.platform, ask.root, &source, dirs, &mut |n| {
-        recorded |= matches!(n, Note::Failed { .. });
-        if let Some(r) = record(n, ask.needed_by, ask.session, required) {
-            sink(r);
-        }
-        stage(n);
+    let pin = chosen(runtime, ask.platform, &source, dirs);
+    let got = pin.clone().and_then(|pin| {
+        ensure(runtime, &pin, ask.root, &source, &mut |n| {
+            recorded |= matches!(n, Note::Failed { .. });
+            if let Some(r) = record(n, ask.needed_by, ask.session, required) {
+                sink(r);
+            }
+            stage(n);
+        })
     });
     let Err(why) = got else { return got.map(Some) };
     let unavailable = Note::Unavailable {
         runtime,
-        pin: None,
+        pin: pin.as_ref().ok(),
         platform: ask.platform.unwrap_or("unknown"),
         reason: &why,
         required,

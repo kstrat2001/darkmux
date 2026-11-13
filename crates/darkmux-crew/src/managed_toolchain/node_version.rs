@@ -76,25 +76,69 @@ const MAX_PACKAGE_JSON: u64 = 1024 * 1024;
 /// folder declares one; `Err` for a declaration darkmux will not read (a
 /// link, not a regular file, too large, not text).
 pub fn declared_in(dirs: &[&Path]) -> Result<Option<Request>, String> {
+    search(dirs).found
+}
+
+/// What the declaration search found, and why the first `package.json` it
+/// passed over (one darkmux cannot read) declares nothing.
+struct Search {
+    found: Result<Option<Request>, String>,
+    unread: Option<String>,
+}
+
+/// The one declaration search: in each folder `.nvmrc`, then
+/// `.node-version`, then `package.json`'s `engines.node`, stopping at the
+/// first declaration (or refusal).
+fn search(dirs: &[&Path]) -> Search {
+    let mut unread = None;
     for dir in dirs {
-        for from in [Declared::Nvmrc, Declared::NodeVersion] {
-            if let Some(text) = version_file(dir, from)? {
-                return Ok(Some(Request {
-                    from,
-                    dir: dir.to_path_buf(),
-                    text,
-                }));
+        let found = in_version_files(dir).and_then(|f| {
+            if f.is_some() {
+                Ok(f)
+            } else {
+                in_package_json(dir, &mut unread)
             }
+        });
+        if !matches!(found, Ok(None)) {
+            return Search { found, unread };
         }
-        if let Some(text) = engines_node(dir)? {
+    }
+    Search {
+        found: Ok(None),
+        unread,
+    }
+}
+
+/// `dir`'s `.nvmrc` or `.node-version` declaration, in that order.
+fn in_version_files(dir: &Path) -> Result<Option<Request>, String> {
+    for from in [Declared::Nvmrc, Declared::NodeVersion] {
+        if let Some(text) = version_file(dir, from)? {
             return Ok(Some(Request {
-                from: Declared::Engines,
+                from,
                 dir: dir.to_path_buf(),
                 text,
             }));
         }
     }
     Ok(None)
+}
+
+/// `dir`'s `package.json` `engines.node` declaration; one darkmux cannot
+/// read declares nothing, and the first such reason is kept in `unread`.
+fn in_package_json(dir: &Path, unread: &mut Option<String>) -> Result<Option<Request>, String> {
+    let json = match package_json(dir) {
+        Ok(Some(json)) => json,
+        Ok(None) => return Ok(None),
+        Err(why) => {
+            unread.get_or_insert(why);
+            return Ok(None);
+        }
+    };
+    Ok(engines_node(dir, &json)?.map(|text| Request {
+        from: Declared::Engines,
+        dir: dir.to_path_buf(),
+        text,
+    }))
 }
 
 /// `dir`'s `from` file as text, when it is there: a regular file (never
@@ -154,14 +198,9 @@ fn package_json(dir: &Path) -> Result<Option<serde_json::Value>, String> {
     })
 }
 
-/// `package.json`'s `engines.node`, when it has one. (#3561 re-review) A
-/// `package.json` darkmux cannot read declares nothing (a project's tools
-/// read it for much else); one whose `engines.node` is there but not a
-/// string is refused, since the project did name its Node there.
-fn engines_node(dir: &Path) -> Result<Option<String>, String> {
-    let Ok(Some(json)) = package_json(dir) else {
-        return Ok(None);
-    };
+/// `package.json`'s `engines.node`, when it has one: a string, or refused
+/// when it is there but not a string (the project did name its Node there).
+fn engines_node(dir: &Path, json: &serde_json::Value) -> Result<Option<String>, String> {
     match json.get("engines").and_then(|e| e.get("node")) {
         None | Some(serde_json::Value::Null) => Ok(None),
         Some(serde_json::Value::String(s)) => Ok(Some(s.trim().to_string())),
@@ -173,30 +212,12 @@ fn engines_node(dir: &Path) -> Result<Option<String>, String> {
 }
 
 /// (#3561 re-review) Why a `package.json` darkmux could not read was
-/// passed over, for the caller to say: the first one in `dirs` before any
-/// declaration, or `None`.
+/// passed over, for the caller to say: the first one the declaration
+/// search ([`declared_in`]) reached, or `None` when it reached none.
 pub fn unread_package_json(dirs: &[&Path]) -> Option<String> {
-    for dir in dirs {
-        let version_file = [Declared::Nvmrc, Declared::NodeVersion]
-            .iter()
-            .any(|d| std::fs::symlink_metadata(dir.join(d.file())).is_ok());
-        if version_file {
-            return None;
-        }
-        match package_json(dir) {
-            Err(why) => return Some(format!("{why}, so it declares no Node version here")),
-            Ok(Some(json))
-                if json
-                    .get("engines")
-                    .and_then(|e| e.get("node"))
-                    .is_some_and(|n| !n.is_null()) =>
-            {
-                return None
-            }
-            Ok(_) => {}
-        }
-    }
-    None
+    search(dirs)
+        .unread
+        .map(|why| format!("{why}, so it declares no Node version here"))
 }
 
 /// A version with any part left open (`22`, `22.x`, `*`): `None` is a

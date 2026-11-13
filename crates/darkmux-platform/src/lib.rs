@@ -612,14 +612,28 @@ pub enum CLibrary {
     Musl,
 }
 
-/// The C library a Linux machine with these entries in `/lib` uses: musl
-/// when its dynamic loader (`ld-musl-<arch>.so.1`) is there, else glibc.
+/// The C library a Linux machine whose library folders hold these entries
+/// uses: glibc wherever a glibc dynamic loader (`ld-linux-*`) is (musl's
+/// `ld-musl-*` can sit beside it: Debian's `musl` package installs it next
+/// to glibc); musl only where its loader is the only one; glibc when
+/// neither is found.
 pub(crate) fn c_library_from(lib_entries: &[String]) -> CLibrary {
-    if lib_entries.iter().any(|n| n.starts_with("ld-musl-")) {
+    let has = |prefix: &str| lib_entries.iter().any(|n| n.starts_with(prefix));
+    if has("ld-musl-") && !has("ld-linux") {
         CLibrary::Musl
     } else {
         CLibrary::Glibc
     }
+}
+
+/// [`c_library_from`] over the entries of `dirs` (a missing one has none).
+pub(crate) fn c_library_in(dirs: &[std::path::PathBuf]) -> CLibrary {
+    let entries: Vec<String> = dirs
+        .iter()
+        .filter_map(|d| std::fs::read_dir(d).ok())
+        .flat_map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect();
+    c_library_from(&entries)
 }
 
 /// The Node.js archive platform for a Linux machine on CPU `arch` with C

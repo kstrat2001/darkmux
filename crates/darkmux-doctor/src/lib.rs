@@ -224,7 +224,11 @@ fn run_with(configured: (Result<darkmux_sandbox::BackendKind, String>, darkmux_t
     // (#3561) A row per runtime darkmux supplies to every sandbox on the
     // host, beside the sandbox row.
     let after_sandbox = checks.iter().position(|c| c.name == checks_sandbox::SANDBOX_CHECK_NAME).map_or(checks.len(), |i| i + 1);
-    let runtimes: Vec<Check> = checks_sandbox::managed_runtime_rows(&sandbox, darkmux_crew::managed_toolchain::statuses);
+    let runtimes: Vec<Check> = checks_sandbox::managed_runtime_rows(
+        &sandbox,
+        darkmux_crew::managed_toolchain::statuses,
+        darkmux_platform::current().c_library(),
+    );
     checks.splice(after_sandbox..after_sandbox, runtimes);
     // (#2947) `None` when a thermal threshold is bad config; that value's
     // own enum-settings row reports it.

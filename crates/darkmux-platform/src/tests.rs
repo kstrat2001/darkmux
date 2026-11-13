@@ -2175,22 +2175,55 @@ fn another_users_open_files_are_no_answer() {
 }
 
 /// (#3561 re-review) Which C library a Linux machine's programs use, from
-/// the dynamic loaders in `/lib`: musl's `ld-musl-<arch>.so.1` (Alpine),
-/// else glibc. A musl machine has no official Node build darkmux pins (they
-/// link glibc), so it names none; a Mac has no such question.
+/// the dynamic loaders in its library folders: glibc wherever a glibc
+/// loader (`ld-linux-*`) is, even beside musl's (Debian's `musl` package
+/// installs `ld-musl-*` next to glibc); musl only where its loader
+/// (`ld-musl-<arch>.so.1`, Alpine) is the only one; glibc when neither is
+/// found, as nearly every distribution. A musl machine has no official Node
+/// build darkmux pins (they link glibc), so it names none; a Mac has no
+/// such question.
 #[test]
 fn a_musl_linux_names_no_node_build() {
     let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     assert_eq!(c_library_from(&names(&["ld-musl-x86_64.so.1", "libz.so.1"])), CLibrary::Musl);
     assert_eq!(c_library_from(&names(&["ld-linux-x86-64.so.2", "libc.so.6"])), CLibrary::Glibc);
-    assert_eq!(c_library_from(&names(&[])), CLibrary::Glibc, "no musl loader: glibc, as nearly every distribution");
+    assert_eq!(c_library_from(&names(&["ld-musl-x86_64.so.1", "ld-linux-x86-64.so.2"])), CLibrary::Glibc, "musl installed beside glibc");
+    assert_eq!(c_library_from(&names(&["ld-linux-aarch64.so.1", "ld-musl-aarch64.so.1"])), CLibrary::Glibc);
+    assert_eq!(c_library_from(&names(&[])), CLibrary::Glibc, "no loader found: glibc, as nearly every distribution");
     assert_eq!(linux_node_release_platform("x86_64", CLibrary::Musl), None);
     assert_eq!(linux_node_release_platform("aarch64", CLibrary::Musl), None);
     assert_eq!(linux_node_release_platform("x86_64", CLibrary::Glibc), Some("linux-x64"));
     assert_eq!(MacPlatform.c_library(), None);
     assert_eq!(OtherPlatform.c_library(), None);
-    assert!(LinuxPlatform.c_library().is_some());
     let fake = FakePlatform { c_library: Some(CLibrary::Musl), ..Default::default() };
     assert_eq!(fake.c_library(), Some(CLibrary::Musl));
     assert_eq!(FakePlatform::default().c_library(), None);
+}
+
+/// (#3561 re-review) `LinuxPlatform` itself reads its library folders
+/// (`/lib`, `/lib64`; here temp folders with fake loaders standing in): a
+/// glibc loader in either, musl's beside it or not, is glibc and names the
+/// glibc build; musl's alone names no build.
+#[test]
+fn the_linux_platform_reads_its_own_library_folders() {
+    let lib = tempfile::TempDir::new().unwrap();
+    let lib64 = tempfile::TempDir::new().unwrap();
+    let with = |files: &[(&tempfile::TempDir, &str)]| {
+        for d in [&lib, &lib64] {
+            for e in std::fs::read_dir(d.path()).unwrap().flatten() {
+                std::fs::remove_file(e.path()).unwrap();
+            }
+        }
+        for (d, f) in files {
+            std::fs::write(d.path().join(f), "").unwrap();
+        }
+        crate::linux::with_lib_dirs(vec![lib.path().to_path_buf(), lib64.path().to_path_buf()], || {
+            (LinuxPlatform.c_library(), LinuxPlatform.node_release_platform())
+        })
+    };
+    let glibc_build = node_release_platform_for(NodeOs::Linux, std::env::consts::ARCH);
+    assert_eq!(with(&[(&lib, "ld-musl-x86_64.so.1")]), (Some(CLibrary::Musl), None));
+    assert_eq!(with(&[(&lib, "ld-musl-x86_64.so.1"), (&lib64, "ld-linux-x86-64.so.2")]), (Some(CLibrary::Glibc), glibc_build));
+    assert_eq!(with(&[(&lib, "ld-linux-aarch64.so.1")]), (Some(CLibrary::Glibc), glibc_build));
+    assert_eq!(with(&[]), (Some(CLibrary::Glibc), glibc_build));
 }
