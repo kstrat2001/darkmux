@@ -563,9 +563,13 @@ mod tests {
     }
 
     /// A process's recorded start time matches itself: the check above
-    /// fails for a reused pid, not for every pid.
+    /// fails for a reused pid, not for every pid. The start time is read
+    /// from `/proc`, so a host without one has nothing to check.
     #[test]
     fn the_start_time_check_knows_a_live_launcher() {
+        if !Path::new("/proc/self/stat").exists() {
+            return;
+        }
         let root = tempfile::TempDir::new().unwrap();
         let d = root.path().join("darkmux-pr-2");
         std::fs::create_dir(&d).unwrap();
