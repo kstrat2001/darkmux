@@ -121,12 +121,12 @@
 //!   is left, so the heartbeat watchdog's end of the script ends the dev
 //!   server too. One left by a killed `client serve` is found by its labels
 //!   in the sandbox's state folder and removed at the next start, like a
-//!   container. **Unlike a container**, a process that moves to a process
-//!   group of its own, or to another existing group in its session
-//!   (`setsid`, `setpgid`; job control does it by itself), is not ended with
-//!   the sandbox. A stop kills only what darkmux can prove
-//!   is the sandbox's, its process group; nothing marks a process that left
-//!   the group as the sandbox's (the two ports come from the ephemeral range,
+//!   container. **Unlike a container**, a process that starts a session of
+//!   its own (`setsid`) is not ended with the sandbox (#3559: one that only
+//!   moves to a process group of its own is, since the sandbox is its
+//!   launcher's session). A stop kills only what darkmux can prove is the
+//!   sandbox's, its session; nothing marks a process that left it as the
+//!   sandbox's (the two ports come from the ephemeral range,
 //!   so another program may hold one by chance), so nothing else is killed.
 //!   What still listens on the two ports after a stop is reported in the
 //!   serve log, never killed. Such an escapee keeps the sandbox's rules (no

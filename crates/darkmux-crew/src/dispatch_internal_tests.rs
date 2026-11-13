@@ -24089,3 +24089,107 @@ fn container_reply_is_the_envelopes_final_assistant_or_the_text_output() {
     // `dispatch_unmanaged` scan's premise).
     #[path = "dispatch_lab_role_tests.rs"]
     mod lab_role_tests;
+
+/// (#3559) A process tree in a process group of its own that listens on
+/// `host` (Python, on this host), ended with its group when the test ends.
+#[cfg(unix)]
+struct Listening {
+    child: std::process::Child,
+    port: u16,
+}
+
+#[cfg(unix)]
+impl Listening {
+    fn on(host: &str) -> Self {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        let script = format!("import socket, time\ns = socket.socket(); s.bind(('{host}', 0)); s.listen()\nprint(s.getsockname()[1], flush=True)\ntime.sleep(30)");
+        let mut child = std::process::Command::new("/usr/bin/python3")
+            .args(["-c", &script])
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        Listening { port: line.trim().parse().unwrap(), child }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Listening {
+    fn drop(&mut self) {
+        // SAFETY: a signal to the process group this test started.
+        unsafe { libc::kill(-(self.child.id() as i32), libc::SIGKILL) };
+        let _ = self.child.wait();
+    }
+}
+
+/// (#3559) A dispatch in a sandbox on the host whose processes listen on
+/// every address is stopped with a reason naming the address and port (the
+/// `DispatchStop` the tailer kills on and the teardown reports); one that
+/// listens on the loopback only runs on. Read through this host's own
+/// platform, against a real process group.
+#[cfg(unix)]
+#[test]
+fn a_dispatch_on_the_host_listening_beyond_the_loopback_is_stopped() {
+    let seatbelt = |name: &str| darkmux_sandbox::SandboxHandle { backend: darkmux_sandbox::BackendKind::Seatbelt, id: name.into() };
+    let wide = Listening::on("0.0.0.0");
+    let stop = DispatchStop::new(seatbelt("darkmux-dispatch-b3559-wide"));
+    let watch = watch_dispatch_listeners(&stop.sandbox, wide.child.id(), &stop);
+    assert!(watch.is_some(), "a sandbox on the host is watched");
+    let deadline = Instant::now() + crate::sandbox_listeners::CHECK_EVERY * 5;
+    while !stop.is_requested() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    drop(watch);
+    let why = stop.reason().unwrap_or_default();
+    assert!(why.contains(&format!("0.0.0.0:{}", wide.port)), "{why}");
+
+    let near = Listening::on("127.0.0.1");
+    let stop = DispatchStop::new(seatbelt("darkmux-dispatch-b3559-near"));
+    let watch = watch_dispatch_listeners(&stop.sandbox, near.child.id(), &stop);
+    thread::sleep(crate::sandbox_listeners::CHECK_EVERY * 2 + Duration::from_millis(200));
+    drop(watch);
+    assert_eq!(stop.reason(), None, "a loopback listener stopped the dispatch");
+    assert!(watch_dispatch_listeners(&docker_sandbox("darkmux-dispatch-b3559"), near.child.id(), &stop).is_none(), "a container is not watched");
+}
+
+/// (#3559) `dispatch()` starts the listener watch once the sandbox and its
+/// stop exist, before it waits, and ends it right after the wait, before
+/// the stop's teardown reads the reason. Source-pinned: it needs a live
+/// sandbox.
+#[test]
+fn dispatch_watches_its_listeners_from_spawn_to_the_wait() {
+    let full = include_str!("dispatch_internal.rs");
+    let src = &full[..full.rfind("mod tests;").unwrap()];
+    let pos = |needle: &str| src.find(needle).unwrap_or_else(|| panic!("{needle}"));
+    let started = pos("let listener_watch = watch_dispatch_listeners(&launched.sandbox, launched.child.id(), &local_stop);");
+    assert!(pos("let local_stop = DispatchStop::new(launched.sandbox.clone());") < started);
+    assert!(started < pos("let output = match launched.child.wait_with_output() {"));
+    let ended = pos("drop(listener_watch);");
+    assert!(pos("let output = match launched.child.wait_with_output() {") < ended);
+    assert!(ended < pos("if run_was_killed(&local_stop, output.status.success()) {"));
+}
+
+/// (#3559) A dispatch the listener watch stopped closes as a `dispatch.error`
+/// whose error names the address and port it listened on: the watch's
+/// reason rides the dispatch's own stop into the error the teardown records,
+/// never the signal wording (it is not a run-wide interrupt).
+#[test]
+#[serial]
+fn a_dispatch_the_listener_watch_stopped_closes_as_an_error_naming_the_listener() {
+    darkmux_types::interrupt::reset_for_test();
+    let held = [(4321, darkmux_platform::PortListener { addr: Some("0.0.0.0".parse().unwrap()), text: "0.0.0.0".into(), scope: None, pid: Some(8) })];
+    let why = crate::sandbox_listeners::exposure_reason(darkmux_sandbox::BackendKind::Seatbelt, "a dispatch", &held).unwrap();
+    let stop = DispatchStop::new(docker_sandbox("darkmux-dispatch-b3559-record"));
+    stop.request(why);
+    assert!(run_was_killed(&stop, false), "a stopped dispatch that did not exit cleanly was killed");
+    let err = killed_mid_run_error("darkmux-dispatch-b3559-record", &stop);
+    let (payload, _) = super::ended_mid_run_terminal(&format!("{err:#}"), 10, &super::TrajectorySummary::default(), None, None);
+    assert_eq!(payload.action(), darkmux_flow::FlowAction::DispatchError);
+    let payload = serde_json::to_value(payload).unwrap();
+    let error = payload["error"].as_str().unwrap_or_default();
+    assert!(error.contains("0.0.0.0:4321 (pid 8)") && error.contains("#3559"), "{payload}");
+    assert!(!error.contains(darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL), "{error}");
+}

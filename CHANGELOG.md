@@ -136,21 +136,38 @@ darkmux release.
   ports, detection with a short window, not a kernel boundary (UDP on them is not watched). A
   dev server that opens internal listeners on ephemeral ports (Next.js-style workers) is refused
   under Seatbelt; run it with `runtime.sandbox docker`. A stop kills only the preview's own
-  process group; anything still listening on its ports afterwards is reported in the serve log,
+  session (its process group, and since #3559 every group in its session); anything still listening on its ports afterwards is reported in the serve log,
   never killed. A workspace installed in the other sandbox has its
   `install.unless_exists` path (Linux-built `node_modules`) deleted in darkmux's workspace copy
   and reinstalled, saying so in the logs. Previews stay off by default.
 - **Seatbelt: a sandbox's process group ends with its program (#3112).** Whatever the program
   left running in its process group is killed when it exits, over and over until none is left.
-  Unlike a container's init, it does not reach a process that moved to a group of its own, or to
-  another existing group in its session (`setsid`, `setpgid`).
+  Since #3559 the sandbox is its launcher's session, so a process that moved to a group of its
+  own (`setpgid`, as a runtime's tool command does) ends too. Unlike a container's init, it does
+  not reach one that started a session of its own (`setsid`).
 - **Seatbelt can hold a sandbox to named ports (#3112).** A policy naming ports binds and takes in
   traffic only on those: a bind to any other port and a `listen` with no bind are refused, and no
   socket on another port accepts connections or unsolicited datagrams; replies on connections it
   opened (TCP, connected UDP) arrive.
 - **Seatbelt does not hold a bind to the loopback (#3559).** The docs no longer claim it: a
-  dispatch under Seatbelt can listen on every address. Recorded by a conformance case; dispatches
-  are not watched yet.
+  dispatch under Seatbelt can listen on every address. Recorded by a conformance case.
+- **A dispatch in a sandbox on the host that listens beyond the loopback is stopped (#3559).**
+  Neither Seatbelt nor Landlock can hold a listener to the loopback (Landlock filters a bind by
+  port, and a `listen` with no bind binds every address without asking it). While a dispatch runs
+  under `seatbelt` or `landlock`, darkmux reads the TCP listeners its processes hold every second
+  (in-process, about half a millisecond of CPU a look) and stops it on one beyond the loopback
+  (`0.0.0.0`, `::`, a LAN address), or when that listing cannot be read twice running. The run
+  ends with a `dispatch.error` that names the address, port and pid and says a server in a
+  dispatch must listen on `127.0.0.1` (or localhost). Servers on the loopback (a test server, a
+  dev server a browser test drives) run as before. Each Seatbelt sandbox now leads a session of
+  its own, so nothing in one can join another's process group (and a dispatch has no controlling
+  terminal, as under Landlock), and its stop ends every process in that session: before, a
+  listener a tool command started (in a process group of its own) outlived the stop. The watch catches mistakes, not code trying to get past it: a
+  double-fork daemon under Seatbelt escapes it and outlives the dispatch. It is detection with a
+  window of about a second, not a kernel boundary; UDP sockets are not watched; under Seatbelt a process that left the sandbox's process
+  group and whose parents back to it have exited is not seen. Docker dispatches, client previews
+  (which watch their two ports) and runs with no network (a lab run's verify, the mods gate) are
+  unchanged.
 
   Under a sandbox on the host every model-facing path names where that sandbox sees it: the lab
   prompt, crawl unit briefs, split-gitdir notes, mod attachments, and the shipped `review` and

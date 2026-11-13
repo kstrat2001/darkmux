@@ -56,32 +56,10 @@ fn managed_runtimes(workdir: &Path, stage: &dyn Fn(Option<PreviewStage>)) -> Res
     })
 }
 
-/// Whether `l` is on the loopback: `127.x`, `::1`, `::ffff:127.x`, or an
-/// address scoped to the loopback interface (`fe80::1%lo0`). An address the
-/// platform could not read whole (cut short) is never loopback.
-fn on_loopback(l: &PortListener) -> bool {
-    let Some(addr) = l.addr else { return false };
-    let scoped = l.scope.as_deref().is_some_and(|s| s == "lo0" || s == "lo");
-    scoped
-        || match addr {
-            std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
-            v4 => v4.is_loopback(),
-        }
-}
-
-/// `l` on `port` as a message names it: `0.0.0.0:4100`, `[::]:4100`, or a
-/// cut IPv6 address with a note that it was cut.
-fn named_at(l: &PortListener, port: u16) -> String {
-    match l.addr {
-        Some(addr) => std::net::SocketAddr::new(addr, port).to_string(),
-        None => format!("[{}…]:{port} (an IPv6 address netstat cut short; not a loopback one)", l.text),
-    }
-}
-
 /// The listeners bound beyond the loopback: every address (`0.0.0.0`,
 /// `::`) or any other address not on it.
 pub(crate) fn beyond_loopback(listeners: &[PortListener]) -> Vec<PortListener> {
-    listeners.iter().filter(|l| !on_loopback(l)).cloned().collect()
+    listeners.iter().filter(|l| !l.on_loopback()).cloned().collect()
 }
 
 /// Why a preview on the host was stopped: each listener beyond the
@@ -90,7 +68,7 @@ pub(crate) fn exposure_reason(kind: BackendKind, exposed: &[(u16, PortListener)]
     let named: Vec<String> = exposed
         .iter()
         .map(|(on, l)| {
-            let at = named_at(l, *on);
+            let at = l.named_at(*on);
             let role = if *on == port { "the app port" } else if *on == hmr_port { "the HMR port" } else { "a port" };
             match l.pid {
                 Some(pid) => format!("{at} ({role}, pid {pid})"),
@@ -238,11 +216,10 @@ impl PreviewContainers for OnHost {
         let handle = self.handle(name);
         let mut cmd = darkmux_sandbox::for_handle(&handle).start(&handle);
         cmd.stdin(std::process::Stdio::null()).stdout(out).stderr(err);
-        // Its own process group, which the backend's launcher leads: a
-        // Ctrl-C at `client serve` reaches darkmux, which removes every
-        // preview itself.
-        #[cfg(unix)]
-        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        // The backend's launcher leads a process group of its own (under
+        // Seatbelt, a session of its own, #3559, so no group is set here: a
+        // group leader cannot start a session): a Ctrl-C at `client serve`
+        // reaches darkmux, which removes every preview itself.
         cmd.spawn().map_err(|e| format!("starting the preview's sandbox: {e}"))
     }
 

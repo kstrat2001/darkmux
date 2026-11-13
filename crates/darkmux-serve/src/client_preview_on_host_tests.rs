@@ -581,14 +581,14 @@ impl Drop for KillListener {
     }
 }
 
-/// (#3112 review, MAJOR E: a documented limit) A dev server that moves to
-/// a process group of its own (`setpgid`) is not ended by a stop: darkmux
-/// can prove only its group's members are the sandbox's, and it kills
-/// nothing else. It still answers on its old port after the stop (the only
-/// ports the kernel lets it bind or take in). The test kills it itself.
+/// (#3112 review, MAJOR E; #3559) A dev server that moves to a process
+/// group of its own (`setpgid`) is ended by a stop all the same: a Seatbelt
+/// sandbox leads a session of its own, and the stop ends every process in
+/// it. (Only one that starts a session of its own, `setsid`, outlives it.)
+/// Nothing answers on its old port after the stop.
 #[test]
 #[serial_test::serial]
-fn a_dev_server_that_leaves_the_group_outlives_the_stop() {
+fn a_dev_server_that_leaves_the_group_is_ended_by_the_stop() {
     if !darkmux_sandbox::SeatbeltBackend::available() || !host_lists_sockets() {
         return;
     }
@@ -605,7 +605,11 @@ fn a_dev_server_that_leaves_the_group_outlives_the_stop() {
     let _cleanup = KillListener { port, marker: "darkmux-test-escapee" };
     assert!(previews.stop("w"));
     std::thread::sleep(Duration::from_millis(500));
-    assert!(http_ok(port, "/"), "recorded limit: the escaped server outlives the stop on port {port}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while http_ok(port, "/") && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!http_ok(port, "/"), "the server that left the group outlived the stop on port {port}");
 }
 
 /// (#3112 review, BLOCKER C) A stop never kills a process outside the

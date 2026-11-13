@@ -5530,6 +5530,24 @@ impl DispatchStop {
     }
 }
 
+/// (#3559) A sandbox on the host can listen beyond the loopback, which its
+/// kernel sandbox cannot prevent ([`crate::sandbox_listeners`]): while the
+/// dispatch runs, its listeners are read every second, and one past the
+/// loopback (or a listing that cannot be read twice running) requests this
+/// dispatch's own stop with the reason. The tailer then kills the sandbox,
+/// and the stop's teardown closes the run with a `dispatch.error` naming
+/// the address and port, as any stop scoped to a dispatch does. `leader` is
+/// the process the backend's command started (its launcher, which leads
+/// the sandbox's process group). `None` for a container.
+fn watch_dispatch_listeners(
+    sandbox: &darkmux_sandbox::SandboxHandle,
+    leader: u32,
+    local_stop: &DispatchStop,
+) -> Option<crate::sandbox_listeners::ListenerWatch> {
+    let stop = local_stop.clone();
+    crate::sandbox_listeners::watch(sandbox, leader, "a dispatch", move |why| stop.request(why))
+}
+
 /// The terminal record's payload and level for a container dispatch: a clean
 /// exit is a `dispatch.complete` at info, any other a `dispatch.error`. The
 /// one rule is `ResultClass::of_exit`, which a `darkmux dispatch` run's own
@@ -8070,6 +8088,8 @@ fn run_container(opts: &DispatchOpts, execution: &ExecutionId, mut run: Containe
     // (#2925) This dispatch's own stop: see `DispatchStop`.
     let local_stop = DispatchStop::new(launched.sandbox.clone());
     let (_observer_guards, threads) = spawn_observers(opts, execution, &run, &launched, &local_stop)?;
+    // (#3559) Watched while it runs, ended right after the wait.
+    let listener_watch = watch_dispatch_listeners(&launched.sandbox, launched.child.id(), &local_stop);
     panic_after_guard_spawn_if_asked();
 
     let output = match launched.child.wait_with_output() {
@@ -8121,6 +8141,9 @@ fn run_container(opts: &DispatchOpts, execution: &ExecutionId, mut run: Containe
             return Err(err);
         }
     };
+
+    // (#3559) The sandbox is gone: a look now would read a reaped leader.
+    drop(listener_watch);
 
     // (#2233) Disarm ONLY on a proven-clean exit — and note this is the
     // opposite of where the first version of this fix put it.
