@@ -107,4 +107,7 @@ ts-export = ["dep:ts-rs"]
 # fixtures need to construct stale/dead-pid lock states directly). Mirrors
 # `darkmux-types`'s `test-support` feature — enabled only as a
 # dev-dependency, never pulled into a release build.
-test-support = []
+# (#3561) Also turns on `darkmux-types/test-support`: a test build's
+# managed runtimes come from a local fixture under the process's isolated
+# scratch folder (`managed_toolchain::fixture`), never from nodejs.org.
+test-support = ["darkmux-types/test-support"]

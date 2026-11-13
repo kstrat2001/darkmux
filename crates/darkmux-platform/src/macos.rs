@@ -161,6 +161,10 @@ impl Platform for MacPlatform {
     /// `hw.perflevelN.name` / `.physicalcpu` (level 0 is the fastest),
     /// `hw.model`, and the GPU's `gpu-core-count` from the AGX accelerator
     /// in the IORegistry. None of them needs root.
+    fn node_release_platform(&self) -> Option<&'static str> {
+        crate::node_release_platform_for(crate::NodeOs::Darwin, std::env::consts::ARCH)
+    }
+
     fn machine_config(&self) -> crate::MachineConfig {
         // Separate calls: sysctl exits non-zero when any one key is unknown.
         let model = command_stdout("sysctl", &["hw.model"]).unwrap_or_default();

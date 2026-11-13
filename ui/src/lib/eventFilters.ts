@@ -396,6 +396,10 @@ const ACTION_FACET: { readonly [K in keyof typeof ACTION]: ActivityFacet } = {
   ThermalStopUnresolved: { section: "OTHER", failure: false },
   ThermalTier5Eject: { section: "OTHER", failure: false },
   ThermalTier5EjectFailed: { section: "OTHER", failure: true },
+  // (#3561) A managed toolchain fetched for a sandbox on this machine.
+  ToolchainFetch: { section: "MACHINE", failure: false },
+  ToolchainReady: { section: "MACHINE", failure: false },
+  ToolchainError: { section: "MACHINE", failure: true },
   UtilityStart: { section: "OTHER", failure: false },
   UtilityError: { section: "OTHER", failure: true },
   UtilityEnd: { section: "OTHER", failure: false },

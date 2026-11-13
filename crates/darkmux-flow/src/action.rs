@@ -64,6 +64,7 @@ flow_scopes! {
     Telemetry => "telemetry";
     Thermal => "thermal";
     Tier => "tier";
+    Toolchain => "toolchain";
     Utility => "utility";
 }
 
@@ -374,6 +375,15 @@ flow_actions! {
     ThermalStopUnresolved => Thermal, "thermal.stop_unresolved";
     ThermalTier5Eject => Thermal, "thermal.tier5_eject";
     ThermalTier5EjectFailed => Thermal, "thermal.tier5_eject_failed";
+    /// (#3561) darkmux began fetching a toolchain it pins (Node.js) for a
+    /// sandbox on the host: the first sandbox that needs that version.
+    ToolchainFetch => Toolchain, "toolchain.fetch";
+    /// (#3561) The fetched archive matched its pinned SHA-256 and is
+    /// installed; every later sandbox uses it with no fetch.
+    ToolchainReady => Toolchain, "toolchain.ready";
+    /// (#3561) The fetch failed (download, hash mismatch, unpack): nothing
+    /// was installed and the sandbox was refused.
+    ToolchainError => Toolchain, "toolchain.error";
     UtilityStart => Utility, "utility.start";
     UtilityError => Utility, "utility.error";
 }

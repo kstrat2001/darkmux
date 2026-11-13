@@ -137,6 +137,12 @@ pub trait Platform: Send + Sync {
     /// when this machine is not one darkmux can say it of.
     fn gpu_api(&self) -> Option<&'static str>;
 
+    /// (#3561) The platform part of the official Node.js release archive
+    /// for this machine (`darwin-arm64`, `linux-x64`), the build darkmux
+    /// fetches for a sandbox on the host. `None` where Node publishes no
+    /// build darkmux has a pin for.
+    fn node_release_platform(&self) -> Option<&'static str>;
+
     /// What this machine was bought with beyond its chip and RAM: the CPU
     /// and GPU core counts and the model, the choices a buyer makes. What
     /// the OS does not say is left empty, never guessed.
@@ -580,6 +586,26 @@ pub enum ContainerHostAccess {
 }
 
 /// The strategy for the OS this binary was built for.
+/// (#3561) The two kernels Node.js publishes builds for that darkmux pins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NodeOs {
+    Darwin,
+    Linux,
+}
+
+/// The Node.js archive platform for `os` on CPU `arch` (Rust's
+/// `std::env::consts::ARCH` spelling): Node names Apple Silicon and 64-bit
+/// ARM `arm64` and x86-64 `x64`. Any other CPU has no build darkmux pins.
+pub(crate) fn node_release_platform_for(os: NodeOs, arch: &str) -> Option<&'static str> {
+    match (os, arch) {
+        (NodeOs::Darwin, "aarch64") => Some("darwin-arm64"),
+        (NodeOs::Darwin, "x86_64") => Some("darwin-x64"),
+        (NodeOs::Linux, "aarch64") => Some("linux-arm64"),
+        (NodeOs::Linux, "x86_64") => Some("linux-x64"),
+        _ => None,
+    }
+}
+
 pub fn current() -> &'static dyn Platform {
     #[cfg(target_os = "macos")]
     {

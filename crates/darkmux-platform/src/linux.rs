@@ -166,6 +166,10 @@ impl Platform for LinuxPlatform {
     /// CPU (Apple Silicon has no SMT; an offlined core is not counted), on
     /// Apple Silicon only. The GPU core count
     /// and the Mac's model identifier have no source read here yet.
+    fn node_release_platform(&self) -> Option<&'static str> {
+        crate::node_release_platform_for(crate::NodeOs::Linux, std::env::consts::ARCH)
+    }
+
     fn machine_config(&self) -> crate::MachineConfig {
         if self.gpu_api().is_none() {
             return crate::MachineConfig::default();

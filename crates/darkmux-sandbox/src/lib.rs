@@ -422,6 +422,15 @@ pub trait SandboxBackend: Send + Sync {
     /// from `at` (#3112 step 2).
     fn place(&self, mount: &Mount) -> String;
 
+    /// (#3561) The `PATH` a sandbox of this backend runs with when its
+    /// policy names none: a sandbox on the host's own (the system's
+    /// programs, and Homebrew's on a Mac), which a caller puts a managed
+    /// toolchain in front of; `None` for a container, which keeps its
+    /// image's.
+    fn default_path(&self) -> Option<&'static str> {
+        None
+    }
+
     /// (#3112) Whether a sandbox of this backend reads host path `path`
     /// with no mount: the OS and its system toolchain, for a sandbox on the
     /// host. A container sees only its image and mounts: `false`. A caller
@@ -622,6 +631,16 @@ mod tests {
     fn a_host_process_backend_is_on_host_and_docker_is_not() {
         assert!(BackendKind::Seatbelt.on_host() && BackendKind::Landlock.on_host());
         assert!(!BackendKind::Docker.on_host());
+    }
+
+    /// (#3561) A sandbox on the host names the PATH it runs with when its
+    /// policy names none, which a managed toolchain goes in front of; a
+    /// container keeps its image's own.
+    #[test]
+    fn a_host_sandbox_names_its_own_path_and_a_container_none() {
+        assert_eq!(SeatbeltBackend.default_path(), Some(seatbelt::DEFAULT_PATH));
+        assert_eq!(LandlockBackend.default_path(), Some(landlock::DEFAULT_PATH));
+        assert_eq!(DockerBackend.default_path(), None);
     }
 
     /// A handle is stored by a reaper or a resume record and read back as

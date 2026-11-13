@@ -28,11 +28,14 @@
 //! a known runtime ([`RUNTIMES`]), and that name is found on PATH exactly as
 //! a recipe program is.
 //!
-//! **One seam for managed toolchains.** [`search_path`] puts toolchain
-//! folders darkmux manages itself (#3561: a darkmux-verified Node.js under
-//! `~/.darkmux/toolchains/`) before the host's PATH, so they are found,
-//! granted and placed first through this same resolution, for a preview or
-//! (later) a dispatch.
+//! **One seam for managed toolchains (#3561).** A toolchain darkmux fetched
+//! and verified itself (a pinned Node.js under `~/.darkmux/toolchains/`) is
+//! a [`Managed`]: its whole release folder is granted read-only and its
+//! `bin` is searched first. A preview's recipe is resolved with it ahead of
+//! the host's PATH ([`Ask::managed`]), so its `npm` and `node` are darkmux's
+//! and a host install they shadow is granted nothing; a sandbox with no
+//! recipe (a dispatch, a contained command) gets it over its backend's own
+//! PATH ([`with_managed`]).
 
 use std::path::{Path, PathBuf};
 
@@ -47,6 +50,25 @@ pub struct Toolchain {
     /// Each program and where it really is, for a fingerprint that changes
     /// when the toolchain does.
     pub identity: String,
+    /// (#3561) What darkmux's own toolchains add to the sandbox's
+    /// environment, each value appended to the variable the policy already
+    /// carries, never replacing it ([`Toolchain::append_env`]).
+    pub env: Vec<(String, String)>,
+}
+
+impl Toolchain {
+    /// (#3561) `env` with this toolchain's additions: each value appended
+    /// (after a space) to the variable's last setting in `env`, or set when
+    /// `env` has none.
+    pub fn append_env(&self, env: &mut Vec<(String, String)>) {
+        for (key, value) in &self.env {
+            match env.iter_mut().rev().find(|(k, _)| k == key) {
+                Some((_, v)) if !v.trim().is_empty() => *v = format!("{v} {value}"),
+                Some((_, v)) => *v = value.clone(),
+                None => env.push((key.clone(), value.clone())),
+            }
+        }
+    }
 }
 
 /// The interpreters a workspace script's `#!` may have resolved.
@@ -63,6 +85,30 @@ const PREFIX_WORDS: &[&str] = &["exec", "env", "command", "nohup"];
 
 /// How many interpreters deep a `#!/usr/bin/env` is followed.
 const SHEBANG_DEPTH: usize = 3;
+
+/// (#3561) A toolchain darkmux installed and verified itself: its release
+/// folder (granted read-only, whole) and the `bin` folder in it (searched
+/// first).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Managed {
+    pub root: PathBuf,
+    pub bin: PathBuf,
+    /// What it adds to a sandbox's environment, appended to each variable
+    /// (Node's `NODE_OPTIONS=--require "<preload>"`).
+    pub env: Vec<(String, String)>,
+}
+
+/// (#3561) `managed` over `base_path` (a backend's own PATH): each `bin`
+/// first, each release folder granted read-only.
+pub fn with_managed(managed: &[Managed], base_path: &str) -> Toolchain {
+    let bins: Vec<PathBuf> = managed.iter().map(|m| m.bin.clone()).collect();
+    Toolchain {
+        path: Some(search_path(&bins, base_path)),
+        read_only: managed.iter().map(|m| m.root.clone()).collect(),
+        identity: managed.iter().map(|m| format!("managed={}", m.root.display())).collect::<Vec<_>>().join(";"),
+        env: managed.iter().flat_map(|m| m.env.iter().cloned()).collect(),
+    }
+}
 
 /// The PATH programs are looked up on: `managed` folders first (darkmux's
 /// own toolchains), then `host_path`.
@@ -253,8 +299,8 @@ fn executable(_m: &std::fs::Metadata) -> bool {
 /// A known layout's version folder, from the `bin` folder a program is in:
 /// `<..>/versions/<v>/bin` (pyenv), `<..>/{versions,installs,image}/<tool>/<v>/bin`
 /// (nvm, asdf, Volta), `<..>/node-versions/<v>/installation/bin` (fnm),
-/// `<..>/Cellar/<name>/<v>/bin` (Homebrew), and darkmux's own
-/// `<..>/toolchains/<tool>/<v>/bin` (#3561).
+/// and `<..>/Cellar/<name>/<v>/bin` (Homebrew). darkmux's own toolchains
+/// are not found by shape: they are [`Managed`], granted whole.
 fn version_folder(bin: &Path) -> Option<PathBuf> {
     let name = |p: &Path| p.file_name().and_then(|n| n.to_str()).map(str::to_string);
     if name(bin).as_deref() != Some("bin") {
@@ -267,7 +313,7 @@ fn version_folder(bin: &Path) -> Option<PathBuf> {
         (name(ver).as_deref(), name(up1).as_deref(), up2.and_then(name).as_deref()),
         (Some("installation"), _, Some("node-versions"))
             | (_, Some("versions"), _)
-            | (_, _, Some("versions" | "installs" | "image" | "Cellar" | "toolchains"))
+            | (_, _, Some("versions" | "installs" | "image" | "Cellar"))
     );
     known.then(|| ver.to_path_buf())
 }
@@ -345,6 +391,9 @@ pub struct Ask<'a> {
     pub path_var: &'a str,
     pub home: Option<&'a Path>,
     pub reads: &'a dyn Fn(&Path) -> bool,
+    /// (#3561) darkmux's own toolchains, searched before `path_var` and
+    /// granted whole.
+    pub managed: Vec<Managed>,
     /// Where it runs, as a message names it (`placed_in`).
     pub placed: String,
     /// Whose PATH it is (`` `darkmux client serve` ``).
@@ -367,7 +416,8 @@ struct Found<'a> {
 
 impl Found<'_> {
     /// Grants what [`grant_for`] allows for `file`, unless the sandbox
-    /// already reads it or an earlier grant covers it.
+    /// already reads it or an earlier grant (a managed toolchain's folder
+    /// among them) covers it.
     fn grant(&mut self, file: &Path) -> Result<(), Unresolved> {
         // A shim is refused wherever it is, granted or readable already.
         let target = grant_for(file, self.ask.home).map_err(Unresolved::Refused)?;
@@ -439,7 +489,9 @@ impl Found<'_> {
 /// in order, that it can read. A program not on PATH, or a shim, is
 /// refused, saying what was looked for and the fix.
 pub fn resolve(ask: &Ask) -> Result<Toolchain, String> {
-    let mut found = Found { ask, dirs: path_dirs(ask.path_var), read_only: Vec::new(), identity: Vec::new() };
+    let bins: Vec<PathBuf> = ask.managed.iter().map(|m| m.bin.clone()).collect();
+    let read_only = ask.managed.iter().map(|m| m.root.clone()).collect();
+    let mut found = Found { ask, dirs: path_dirs(&search_path(&bins, ask.path_var)), read_only, identity: Vec::new() };
     for command in &ask.commands {
         for program in programs_of(command) {
             found.run(&program).map_err(|why| match why {
@@ -455,7 +507,8 @@ pub fn resolve(ask: &Ask) -> Result<Toolchain, String> {
         .map(|d| d.display().to_string())
         .collect();
     found.identity.sort();
-    Ok(Toolchain { path: Some(inside.join(":")), read_only: found.read_only, identity: found.identity.join(";") })
+    let env = ask.managed.iter().flat_map(|m| m.env.iter().cloned()).collect();
+    Ok(Toolchain { path: Some(inside.join(":")), read_only: found.read_only, identity: found.identity.join(";"), env })
 }
 
 /// Why `name` (which `program` runs, or is) could not be found.

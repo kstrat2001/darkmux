@@ -26,6 +26,15 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.8.0";
 //           finding's `file` under it maps to its source like one under
 //           `/workspace`. ADDITIVE: absent on every record before 2.8.0 and on
 //           every Docker run's records.
+//           Also (#3561, unreleased with it) three actions under a new
+//           `toolchain` scope, `toolchain.fetch`, `.ready` and `.error`
+//           (payload `ToolchainPayload`: `tool`, `version`, `platform`,
+//           `url`, `needed_by` (`preview` | `dispatch` | `command`), and
+//           `elapsed_ms` on ready and error, `error` on error), written when
+//           darkmux fetches a pinned Node.js for a sandbox on the host: on
+//           the dispatch's session for a dispatch, with no session
+//           otherwise; never an execution's record. ADDITIVE: a reader that
+//           does not know them keeps them as unknown records.
 //   2.7.0 (#3448): three actions, `dispatch.model.start`, `.loading` and
 //           `.ready` (payload `DispatchModelPayload`: `engine`, `endpoint`,
 //           `model`, and `replacing`, `evicted` on start, `elapsed_ms` on

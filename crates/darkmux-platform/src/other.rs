@@ -96,6 +96,10 @@ impl Platform for OtherPlatform {
         None
     }
 
+    fn node_release_platform(&self) -> Option<&'static str> {
+        None
+    }
+
     fn machine_config(&self) -> crate::MachineConfig {
         crate::MachineConfig::default()
     }

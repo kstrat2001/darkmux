@@ -36,6 +36,7 @@ mod lifecycle;
 mod machine;
 mod telemetry;
 mod thermal;
+mod toolchain;
 mod usage;
 
 pub use audit::AuditWriteFailedPayload;
@@ -67,6 +68,7 @@ pub use thermal::{
     BatteryPauseUnsupportedPayload, EjectFailure, EjectedModel, StoppedServer, ThermalStopUnresolvedPayload, ThermalTier5EjectFailedPayload,
     ThermalTier5EjectPayload,
 };
+pub use toolchain::{ToolchainPayload, ToolchainUse};
 pub use usage::{CallKind, TokenSource, UsagePayload, UsagePurpose, UtilityErrorPayload, UtilityJobKind, UtilityStartPayload};
 
 use crate::FlowAction;
@@ -320,6 +322,9 @@ flow_payloads! {
     ThermalStopUnresolved => ThermalStopUnresolvedPayload;
     ThermalTier5Eject => ThermalTier5EjectPayload;
     ThermalTier5EjectFailed => ThermalTier5EjectFailedPayload;
+    ToolchainFetch => ToolchainPayload;
+    ToolchainReady => ToolchainPayload;
+    ToolchainError => ToolchainPayload;
     UtilityStart => UtilityStartPayload;
     UtilityError => UtilityErrorPayload;
 }

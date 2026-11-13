@@ -16,6 +16,34 @@ darkmux release.
 
 ### Added
 
+- **darkmux supplies a verified, pinned Node.js to every sandbox it starts on this machine (#3561).**
+  Under Seatbelt (macOS) and Landlock (Linux), a dispatch, a contained command (a lab run's tests, the
+  mods gate) and a client preview run Node from darkmux, first on the sandbox's PATH, its folder
+  granted read-only and nothing else of `~/.darkmux`. A fresh Mac needs no Node of its own. The version
+  is the project's own: `.nvmrc`, then `.node-version`, then `package.json`'s `engines.node`; with
+  none, Node 26 (the Active LTS line). darkmux reads an exact version, a partial one (`22`, `22.x`),
+  comparators, `^`, `~`, hyphen ranges and `||`, and `lts/*` or `lts/<codename>` in the version files;
+  it picks the newest pinned build that satisfies it and refuses, by name, anything else (`node`,
+  `latest`, a pre-release). Only a build pinned in the binary is ever downloaded: Node 26.13.1, 24.22.3
+  and 22.23.5 for macOS (Apple Silicon, Intel) and Linux (x64, arm64), each archive checked against its
+  pinned SHA-256 (never a checksum fetched at run time) and installed atomically under
+  `~/.darkmux/toolchains/node-<version>-<platform>/` on first use. A version no pin satisfies is refused
+  naming the nearest pinned one; a failed download or a hash mismatch refuses the sandbox with the
+  reason and the fix, never falling back to the host's Node. A first use writes `toolchain.fetch` and
+  then `toolchain.ready` or `toolchain.error` to the flow; a starting preview shows it as `stage`
+  (`{"code": "getting_node", "detail": "getting Node 26.13.1, first use only"}`), an additive field of
+  `PreviewState`. `darkmux doctor` has a row per managed runtime (`managed node`: the verified
+  install, or that it is fetched on first use). An install no longer pinned is removed by the next one.
+  **A server that names no host listens on the loopback:** the managed Node loads a preload darkmux
+  writes into its install (`NODE_OPTIONS=--require "<install>/darkmux/listen-loopback.cjs"`, appended
+  to any `NODE_OPTIONS` already set), so `listen(port)`, `listen(0)`, `listen(cb)` and an options
+  object with no `host`, `path`, `fd` or `handle` (Express's `app.listen`, supertest) listen on
+  `127.0.0.1`, which `fetch('http://localhost:<port>')` also reaches. An explicit host, `0.0.0.0` and
+  `::` included, a unix socket, an fd or a handle is left as asked, and darkmux's watch still stops a
+  server listening beyond the loopback (#3559). A project that replaces `NODE_OPTIONS` itself loses the
+  preload, and then the watch applies. Docker sandboxes are unchanged: they keep the image's Node and
+  get no preload.
+
 - **An app can add a picture to a workspace (#3545).** `POST /client/workspaces/{name}/image`
   takes `{"name", "data", "replace"?}`: the image's bytes as base64, never a path, so darkmux never
   reads a file a client names. darkmux takes only PNG, JPEG, GIF and WebP, recognized by their first

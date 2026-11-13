@@ -74,7 +74,7 @@ pub const HELPER_ARG: &str = "__darkmux-landlock";
 const SH: &str = "/bin/sh";
 
 /// `PATH` inside a sandbox whose policy names none.
-const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+pub(crate) const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// Host paths every sandbox may read where they exist: the OS's programs,
 /// libraries and data, and software installed beside them. A symbolic link
@@ -394,6 +394,10 @@ fn refused(name: &str) -> Command {
 impl SandboxBackend for LandlockBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::Landlock
+    }
+
+    fn default_path(&self) -> Option<&'static str> {
+        Some(DEFAULT_PATH)
     }
 
     /// A mount is seen where it is on the host.

@@ -6148,6 +6148,7 @@ S(("127.0.0.1", port), H).serve_forever()
             resume_checkpoint: false,
             container_host_access: darkmux_platform::ContainerHostAccess::Builtin,
             container_user: darkmux_platform::ContainerUser::Image,
+            toolchain: Default::default(),
         };
 
         let argv = build_docker_run_argv(&config);
@@ -6336,6 +6337,7 @@ S(("127.0.0.1", port), H).serve_forever()
             resume_checkpoint: false,
             container_host_access: darkmux_platform::ContainerHostAccess::Builtin,
             container_user: darkmux_platform::ContainerUser::Image,
+            toolchain: Default::default(),
         }
     }
 
@@ -6377,6 +6379,67 @@ S(("127.0.0.1", port), H).serve_forever()
         assert_eq!(env(&docker, "CARGO_HOME"), Some("/darkmux-cache/cargo".to_string()));
         assert_eq!(docker.entrypoint.as_deref(), Some("/darkmux-runtime"));
         assert_eq!(prompt(&docker).as_deref(), Some("/darkmux-out/.prompt.txt"));
+    }
+
+    /// (#3561) A dispatch on the host runs with its managed Node: the
+    /// toolchain's PATH, its folder read-only where it is. A container's
+    /// config carries none, so its policy names no PATH (the image's own).
+    #[test]
+    fn a_dispatch_on_the_host_gets_its_managed_node_on_path_and_read_only() {
+        use darkmux_sandbox::{Access, DockerBackend, SeatbeltBackend};
+        let root = tempfile::TempDir::new().unwrap();
+        let node = root.path().join("toolchains/node-v26.13.1-darwin-arm64");
+        std::fs::create_dir_all(node.join("bin")).unwrap();
+        let mut cfg = argv_config_with_base_url(None);
+        let docker = dispatch_policy_for(&cfg, &DockerBackend);
+        assert!(!docker.env.iter().any(|(k, _)| k == "PATH"), "{:?}", docker.env);
+        cfg.toolchain = darkmux_sandbox::toolchain::with_managed(
+            &[darkmux_sandbox::toolchain::Managed {
+                root: node.clone(),
+                bin: node.join("bin"),
+                env: vec![("NODE_OPTIONS".into(), "--require \"/n/preload.cjs\"".into())],
+            }],
+            "/usr/bin:/bin",
+        );
+        let seatbelt = dispatch_policy_for(&cfg, &SeatbeltBackend);
+        let path = seatbelt.env.iter().find(|(k, _)| k == "PATH").map(|(_, v)| v.clone());
+        assert_eq!(path, Some(format!("{}:/usr/bin:/bin", node.join("bin").display())));
+        let granted: Vec<_> = seatbelt.mounts.iter().filter(|m| m.host == node).collect();
+        assert_eq!(granted.len(), 1, "{:?}", seatbelt.mounts);
+        assert_eq!(granted[0].access, Access::ReadOnly);
+        let node_options: Vec<_> = seatbelt.env.iter().filter(|(k, _)| k == "NODE_OPTIONS").collect();
+        assert_eq!(node_options, [&("NODE_OPTIONS".to_string(), "--require \"/n/preload.cjs\"".to_string())], "the listen preload");
+        assert!(!docker.env.iter().any(|(k, _)| k == "NODE_OPTIONS"), "a container gets no preload");
+    }
+
+    /// (#3561) The toolchain a dispatch gets: under a sandbox on the host,
+    /// the verified Node its workspace declares (the test build's fixture),
+    /// fetched once, over the backend's own PATH; under Docker, none.
+    #[test]
+    #[serial_test::serial]
+    fn a_dispatch_toolchain_is_the_workspaces_managed_node_on_the_host_only() {
+        use darkmux_sandbox::BackendKind;
+        let home = tempfile::TempDir::new().unwrap();
+        let home_path = home.path().canonicalize().unwrap();
+        let ws = home_path.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join(".node-version"), "24\n").unwrap();
+        let prev = std::env::var_os("DARKMUX_HOME");
+        unsafe { std::env::set_var("DARKMUX_HOME", &home_path) };
+        let session = darkmux_types::session_id::SessionId::adhoc(darkmux_types::session_id::RunId::standalone("n3561").unwrap(), "coder", "1");
+        let docker = dispatch_toolchain(BackendKind::Docker, &ws, &session);
+        let seatbelt = dispatch_toolchain(BackendKind::Seatbelt, &ws, &session);
+        unsafe {
+            match prev { Some(v) => std::env::set_var("DARKMUX_HOME", v), None => std::env::remove_var("DARKMUX_HOME") }
+        }
+        assert_eq!(docker.unwrap(), darkmux_sandbox::toolchain::Toolchain::default());
+        let got = seatbelt.unwrap();
+        let platform = darkmux_platform::current().node_release_platform().unwrap();
+        let node = home_path.join(format!("toolchains/node-24.22.3-{platform}"));
+        assert_eq!(got.read_only, vec![node.clone()]);
+        assert_eq!(got.env, vec![("NODE_OPTIONS".to_string(), format!("--require \"{}\"", node.join("darkmux/listen-loopback.cjs").display()))]);
+        let want = format!("{}:{}", node.join("bin").display(), darkmux_sandbox::SandboxBackend::default_path(&darkmux_sandbox::SeatbeltBackend).unwrap());
+        assert_eq!(got.path.as_deref(), Some(want.as_str()));
     }
 
     /// An executable file (mode 755) at `path`, its directory created.
@@ -6999,6 +7062,7 @@ S(("127.0.0.1", port), H).serve_forever()
             resume_checkpoint: false,
             container_host_access: darkmux_platform::ContainerHostAccess::Builtin,
             container_user: darkmux_platform::ContainerUser::Image,
+            toolchain: Default::default(),
         };
 
         let argv = build_docker_run_argv(&config);
@@ -7130,6 +7194,7 @@ S(("127.0.0.1", port), H).serve_forever()
             resume_checkpoint: false,
             container_host_access: darkmux_platform::ContainerHostAccess::Builtin,
             container_user: darkmux_platform::ContainerUser::Image,
+            toolchain: Default::default(),
         };
 
         let argv = build_docker_run_argv(&config);
@@ -7317,6 +7382,7 @@ S(("127.0.0.1", port), H).serve_forever()
             resume_checkpoint: false,
             container_host_access: darkmux_platform::ContainerHostAccess::Builtin,
             container_user: darkmux_platform::ContainerUser::Image,
+            toolchain: Default::default(),
         }
     }
 
@@ -9246,6 +9312,7 @@ S(("127.0.0.1", port), H).serve_forever()
             resume_checkpoint: false,
             container_host_access: darkmux_platform::ContainerHostAccess::Builtin,
             container_user: darkmux_platform::ContainerUser::Image,
+            toolchain: Default::default(),
         };
         let argv = build_docker_run_argv(&config);
         let cmd = docker_command_from_argv(&argv);
@@ -16772,6 +16839,7 @@ S(("127.0.0.1", port), H).serve_forever()
             resume_checkpoint: false,
             container_host_access: darkmux_platform::ContainerHostAccess::Builtin,
             container_user: darkmux_platform::ContainerUser::Image,
+            toolchain: Default::default(),
         };
         let argv = build_docker_run_argv(&config);
         let flag = argv

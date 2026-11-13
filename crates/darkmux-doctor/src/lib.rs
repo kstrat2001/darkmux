@@ -221,6 +221,11 @@ fn run_with(configured: (Result<darkmux_sandbox::BackendKind, String>, darkmux_t
         check_liveness_retention(),
         check_generation_checkpoint_interval(),
     ];
+    // (#3561) A row per runtime darkmux supplies to every sandbox on the
+    // host, beside the sandbox row.
+    let after_sandbox = checks.iter().position(|c| c.name == checks_sandbox::SANDBOX_CHECK_NAME).map_or(checks.len(), |i| i + 1);
+    let runtimes: Vec<Check> = checks_sandbox::managed_runtime_rows(&sandbox, darkmux_crew::managed_toolchain::statuses);
+    checks.splice(after_sandbox..after_sandbox, runtimes);
     // (#2947) `None` when a thermal threshold is bad config; that value's
     // own enum-settings row reports it.
     checks.extend(check_thermal_governor());
@@ -12951,8 +12956,12 @@ mod tests {
         // (#3112) 79: `checks_sandbox::sandbox_row` joined before the
         // `docker runtime` row (the `runtime.sandbox` enum row is counted by
         // `ENUM_SETTINGS.len()`).
+        //
+        // (#3561) 82: `checks_sandbox::managed_runtime_rows` joined beside the
+        // sandbox row, one row per managed runtime (Node, the one darkmux
+        // ships).
         let expected =
-            81 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            82 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

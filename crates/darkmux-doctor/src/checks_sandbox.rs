@@ -111,6 +111,68 @@ fn host_row(named: &str, what: &str, kind: BackendKind, host_runtime: Option<&Re
     }
 }
 
+/// (#3561) Each runtime darkmux supplies to every sandbox it starts on the
+/// host (Node), one row each, named `managed <runtime>`, as `statuses`
+/// (from [`darkmux_crew::managed_toolchain::statuses`]) reads it: the
+/// default build for a project that declares no version, installed and
+/// verified (its version and path), or fetched on first use. A machine with
+/// no pinned build fails: every sandbox on the host is refused there. Under
+/// Docker the rows are not asked (the image carries its own runtimes).
+pub(crate) fn managed_runtime_rows(
+    selected: &Result<BackendKind, String>,
+    statuses: impl FnOnce() -> Vec<(&'static darkmux_crew::managed_toolchain::Runtime, darkmux_crew::managed_toolchain::Status)>,
+) -> Vec<Check> {
+    let names = || darkmux_crew::managed_toolchain::RUNTIMES.iter().map(|r| format!("managed {}", r.name));
+    match selected {
+        Ok(kind) if kind.on_host() => statuses().into_iter().map(|(r, s)| runtime_row(*kind, r, s)).collect(),
+        Ok(_) => names().map(|n| not_applicable(&n, "a container runs its image's own runtimes")).collect(),
+        Err(_) => names().map(|n| not_applicable(&n, "no sandbox can run here (see `sandbox`)")).collect(),
+    }
+}
+
+/// One managed runtime's row under the sandbox on the host `kind`.
+fn runtime_row(kind: BackendKind, runtime: &darkmux_crew::managed_toolchain::Runtime, status: darkmux_crew::managed_toolchain::Status) -> Check {
+    use darkmux_crew::managed_toolchain::Status as Rt;
+    let check = |status, message: String, hint: Option<String>| Check { name: format!("managed {}", runtime.name), status, message, hint };
+    let display = runtime.display;
+    let others = "a project's own declaration (for Node `.nvmrc`, `.node-version` or `engines.node`) picks another pinned \
+                  version, fetched on its first use";
+    match status {
+        Rt::Installed(i) => check(
+            Status::Pass,
+            format!(
+                "{display} {} at {} (verified against its pinned SHA-256 when installed): first on the PATH of every \
+                 sandbox darkmux starts here for a project that declares no version; {others}",
+                i.pin.version,
+                i.dir.display()
+            ),
+            None,
+        ),
+        Rt::WillFetch(pin) => check(
+            Status::Pass,
+            format!(
+                "{display} {} is fetched from {} and verified against its pinned SHA-256 on first use, then first on \
+                 the PATH of every sandbox darkmux starts here for a project that declares no version; {others}",
+                pin.version,
+                pin.url
+            ),
+            None,
+        ),
+        Rt::Unsupported => check(
+            Status::Fail,
+            format!(
+                "darkmux pins no {display} build for this machine's CPU, so `{}` refuses every sandbox it would start here",
+                darkmux_sandbox::setting_value(kind)
+            ),
+            Some(format!(
+                "to run in a container instead, `darkmux config set {} {}`",
+                darkmux_sandbox::SANDBOX_KEY,
+                darkmux_sandbox::setting_value(BackendKind::Docker)
+            )),
+        ),
+    }
+}
+
 /// (#3112 review) The row naming user mission configs whose step messages
 /// say the container's `/workspace`, read from `darkmux`'s own mission-config
 /// directory.
@@ -307,5 +369,36 @@ mod tests {
         let ran = docker_only(&Ok(BackendKind::Docker), "docker runtime", probe);
         assert_eq!(asked.get(), 1);
         assert_eq!(ran.message, "probed");
+    }
+
+    /// (#3561) A row per managed runtime: under a sandbox on the host, the
+    /// default build darkmux verified (version, path), or that it is
+    /// fetched on first use; a machine with no pinned build fails, naming
+    /// the way to a container; under Docker it is not applicable (the image
+    /// has its own runtimes) and the runtimes are never read.
+    #[test]
+    fn the_managed_runtime_rows_name_the_verified_install_or_the_first_use_fetch() {
+        use darkmux_crew::managed_toolchain::{Installed, Status as Rt, NODE};
+        let pin = NODE.pins[0];
+        let seatbelt = Ok(BackendKind::Seatbelt);
+        let installed = Installed { pin, dir: std::path::PathBuf::from("/h/.darkmux/toolchains/node-26.13.1-darwin-arm64"), env: Vec::new() };
+        let rows = managed_runtime_rows(&seatbelt, || vec![(&NODE, Rt::Installed(installed.clone()))]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].name.as_str(), rows[0].status), ("managed node", Status::Pass));
+        assert!(rows[0].message.contains("Node 26.13.1") && rows[0].message.contains("/h/.darkmux/toolchains/node-26.13.1-darwin-arm64") && rows[0].message.contains("verified"), "{}", rows[0].message);
+        let rows = managed_runtime_rows(&seatbelt, || vec![(&NODE, Rt::WillFetch(pin))]);
+        assert_eq!(rows[0].status, Status::Pass);
+        assert!(rows[0].message.contains("Node 26.13.1") && rows[0].message.contains("first use") && rows[0].message.contains("nodejs.org"), "{}", rows[0].message);
+        let rows = managed_runtime_rows(&Ok(BackendKind::Landlock), || vec![(&NODE, Rt::Unsupported)]);
+        assert_eq!(rows[0].status, Status::Fail);
+        assert!(rows[0].hint.as_deref().unwrap_or("").contains("runtime.sandbox docker"), "{:?}", rows[0].hint);
+        let asked = std::cell::Cell::new(false);
+        let rows = managed_runtime_rows(&Ok(BackendKind::Docker), || {
+            asked.set(true);
+            Vec::new()
+        });
+        assert_eq!(rows.len(), 1, "one row per runtime even when not applicable");
+        assert!(rows[0].message.contains("not applicable") && !asked.get(), "{}", rows[0].message);
+        assert!(managed_runtime_rows(&Err("no".into()), Vec::new)[0].message.contains("not applicable"));
     }
 }

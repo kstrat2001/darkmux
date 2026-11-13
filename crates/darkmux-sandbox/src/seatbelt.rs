@@ -56,7 +56,7 @@ const SH: &str = "/bin/sh";
 
 /// `PATH` inside a sandbox whose policy names none: Homebrew's programs,
 /// then the system's (whose `python3` and `git` are `xcrun` shims).
-const DEFAULT_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+pub(crate) const DEFAULT_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
 /// Env override of [`state_root`], for tests.
 pub const STATE_DIR_ENV: &str = "DARKMUX_SANDBOX_STATE_DIR";
@@ -424,6 +424,10 @@ pub(crate) fn sh_quote(s: &str) -> String {
 impl SandboxBackend for SeatbeltBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::Seatbelt
+    }
+
+    fn default_path(&self) -> Option<&'static str> {
+        Some(DEFAULT_PATH)
     }
 
     /// A mount is seen where it is on the host.

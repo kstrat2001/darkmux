@@ -61,7 +61,7 @@ impl FakeHost {
         let system = self.system.clone();
         let reads = move |p: &Path| p.starts_with(&system);
         let path = self.path_var();
-        resolve(&Ask { commands: commands.to_vec(), workdir, path_var: &path, home: Some(&self.home), reads: &reads, placed: "the `seatbelt` sandbox".into(), runs_with: "`darkmux client serve`" })
+        resolve(&Ask { commands: commands.to_vec(), workdir, path_var: &path, home: Some(&self.home), reads: &reads, managed: Vec::new(), placed: "the `seatbelt` sandbox".into(), runs_with: "`darkmux client serve`" })
     }
 }
 
@@ -144,7 +144,7 @@ fn a_version_managers_shim_is_refused() {
     let path = format!("{}:{}:{}", host.home.join(".pyenv/shims").display(), host.home.join(".volta/bin").display(), host.path_var());
     let reads = |_: &Path| false;
     for program in ["python3", "node"] {
-        let why = resolve(&Ask { commands: vec![program], workdir: None, path_var: &path, home: Some(&host.home), reads: &reads, placed: "x".into(), runs_with: "y" }).unwrap_err();
+        let why = resolve(&Ask { commands: vec![program], workdir: None, path_var: &path, home: Some(&host.home), reads: &reads, managed: Vec::new(), placed: "x".into(), runs_with: "y" }).unwrap_err();
         assert!(why.contains("shim") && why.contains("real install"), "{program}: {why}");
     }
 }
@@ -199,20 +199,77 @@ fn a_workspace_scripts_runtime_is_granted_and_nothing_else() {
     assert!(got.read_only.is_empty(), "a workspace script widened the grant: {:?}", got.read_only);
 }
 
-/// (#3561's seam) A managed toolchain folder put before the host's PATH is
-/// found first, granted (its version folder only) and first on the PATH.
+/// A darkmux-managed Node.js release folder under `home`, shaped like
+/// the official archive: `bin/node`, and npm a link into `lib`.
+fn a_managed_node(home: &Path) -> Managed {
+    let root = home.join(".darkmux/toolchains/node-v26.13.1-darwin-arm64");
+    program(&root.join("bin/node"), "\x7fELF");
+    program(&root.join("lib/node_modules/npm/bin/npm-cli.js"), "#!/usr/bin/env node\n");
+    link(Path::new("../lib/node_modules/npm/bin/npm-cli.js"), &root.join("bin/npm"));
+    Managed { bin: root.join("bin"), root, env: vec![("NODE_OPTIONS".into(), "--require \"/p.cjs\"".into())] }
+}
+
+/// (#3561) A managed toolchain is searched before the host's PATH: npm and
+/// the node its script asks for are found in it, its whole release folder is
+/// the one grant (npm's own files under `lib` included), its `bin` is first
+/// on the sandbox's PATH, and the host's nvm, shadowed, is granted nothing.
 #[test]
-fn a_managed_toolchain_folder_is_searched_first_and_granted_the_same_way() {
+fn a_managed_toolchain_is_found_first_and_granted_whole() {
     let host = a_fake_host();
-    let managed = host.home.join(".darkmux/toolchains/node/v24.11.0");
-    program(&managed.join("bin/node"), "\x7fELF");
-    let path = search_path(&[managed.join("bin")], &host.path_var());
+    let managed = a_managed_node(&host.home);
     let system = host.system.clone();
     let reads = move |p: &Path| p.starts_with(&system);
-    let got = resolve(&Ask { commands: vec!["node a.js"], workdir: None, path_var: &path, home: Some(&host.home), reads: &reads, placed: "x".into(), runs_with: "y" }).unwrap();
-    assert_eq!(got.read_only, vec![managed.clone()]);
-    assert!(got.path.as_deref().unwrap().starts_with(&managed.join("bin").display().to_string()), "{:?}", got.path);
-    assert!(got.identity.contains(&managed.join("bin/node").display().to_string()), "{}", got.identity);
+    let path = host.path_var();
+    let ask = |managed: &[Managed]| Ask {
+        commands: vec!["npm run dev"],
+        workdir: None,
+        path_var: &path,
+        home: Some(&host.home),
+        reads: &reads,
+        managed: managed.to_vec(),
+        placed: "x".into(),
+        runs_with: "y",
+    };
+    let got = resolve(&ask(std::slice::from_ref(&managed))).unwrap();
+    assert_eq!(got.read_only, vec![managed.root.clone()], "{:?}", got.read_only);
+    assert_eq!(got.env, managed.env, "the managed toolchain's environment rides with it");
+    let first = got.path.as_deref().unwrap().split(':').next().unwrap().to_string();
+    assert_eq!(first, managed.bin.display().to_string(), "{:?}", got.path);
+    assert!(got.identity.contains(&format!("npm={}", managed.root.join("lib/node_modules/npm/bin/npm-cli.js").display())), "{}", got.identity);
+    // Without it, the host's nvm answers as before.
+    let host_only = resolve(&ask(&[])).unwrap();
+    assert_eq!(host_only.read_only, vec![host.nvm.clone()]);
+}
+
+/// (#3561) A sandbox with no recipe to resolve (a dispatch, a contained
+/// command) gets the managed toolchain alone over its backend's own PATH:
+/// its `bin` first, its folder the one read-only grant.
+#[test]
+fn a_managed_toolchain_goes_over_a_backends_own_path() {
+    let host = a_fake_host();
+    let managed = a_managed_node(&host.home);
+    let got = with_managed(std::slice::from_ref(&managed), "/usr/bin:/bin");
+    assert_eq!(got.path.as_deref(), Some(format!("{}:/usr/bin:/bin", managed.bin.display()).as_str()));
+    assert_eq!(got.read_only, vec![managed.root.clone()]);
+    assert_eq!(got.identity, format!("managed={}", managed.root.display()));
+    assert_eq!(got.env, managed.env);
+    assert_eq!(with_managed(&[], "/usr/bin:/bin"), Toolchain { path: Some("/usr/bin:/bin".into()), ..Toolchain::default() });
+}
+
+/// (#3561) A managed toolchain's environment is appended to what the
+/// policy already carries, never replacing it; set where it carries none.
+#[test]
+fn a_managed_toolchains_env_is_appended_never_replacing() {
+    let t = Toolchain { env: vec![("NODE_OPTIONS".into(), "--require \"/p.cjs\"".into())], ..Toolchain::default() };
+    let mut env = vec![("NODE_OPTIONS".to_string(), "--max-old-space-size=4096".to_string()), ("A".into(), "1".into())];
+    t.append_env(&mut env);
+    assert_eq!(env[0].1, "--max-old-space-size=4096 --require \"/p.cjs\"");
+    let mut none = vec![("A".to_string(), "1".to_string())];
+    t.append_env(&mut none);
+    assert_eq!(none.last(), Some(&("NODE_OPTIONS".to_string(), "--require \"/p.cjs\"".to_string())));
+    let mut twice = vec![("NODE_OPTIONS".to_string(), "-a".to_string()), ("NODE_OPTIONS".to_string(), "".to_string())];
+    t.append_env(&mut twice);
+    assert_eq!(twice, vec![("NODE_OPTIONS".to_string(), "-a".to_string()), ("NODE_OPTIONS".to_string(), "--require \"/p.cjs\"".to_string())], "the last setting is the one that counts");
 }
 
 /// (#3112 review, BLOCKER B) Nothing a workspace file names is ever
@@ -289,7 +346,7 @@ fn a_workspace_script_that_is_a_fifo_never_hangs_the_resolution() {
     let (home, system, ws2) = (host.home.clone(), host.system.clone(), ws.clone());
     std::thread::spawn(move || {
         let reads = move |p: &Path| p.starts_with(&system);
-        let got = resolve(&Ask { commands: vec!["./node_modules/.bin/vite"], workdir: Some(&ws2), path_var: &path, home: Some(&home), reads: &reads, placed: "x".into(), runs_with: "y" });
+        let got = resolve(&Ask { commands: vec!["./node_modules/.bin/vite"], workdir: Some(&ws2), path_var: &path, home: Some(&home), reads: &reads, managed: Vec::new(), placed: "x".into(), runs_with: "y" });
         let _ = tx.send(got);
     });
     let got = rx.recv_timeout(std::time::Duration::from_secs(3));

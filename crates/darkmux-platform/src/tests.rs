@@ -1808,3 +1808,22 @@ fn a_bounded_command_with_more_output_than_a_pipe_holds_finishes() {
     assert_eq!(String::from_utf8_lossy(&out.stderr).trim(), "done");
     assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
 }
+
+/// (#3561) The Node.js build darkmux fetches for a sandbox on the host:
+/// the archive name's platform part for the two Mac and two Linux CPUs
+/// Node publishes, and nothing for a CPU or OS it has no pin for.
+#[test]
+fn the_node_release_platform_names_the_official_build_for_the_cpu() {
+    assert_eq!(node_release_platform_for(NodeOs::Darwin, "aarch64"), Some("darwin-arm64"));
+    assert_eq!(node_release_platform_for(NodeOs::Darwin, "x86_64"), Some("darwin-x64"));
+    assert_eq!(node_release_platform_for(NodeOs::Linux, "aarch64"), Some("linux-arm64"));
+    assert_eq!(node_release_platform_for(NodeOs::Linux, "x86_64"), Some("linux-x64"));
+    assert_eq!(node_release_platform_for(NodeOs::Linux, "riscv64"), None);
+    assert_eq!(OtherPlatform.node_release_platform(), None);
+    let fake = FakePlatform { node_release_platform: Some("linux-arm64"), ..Default::default() };
+    assert_eq!(fake.node_release_platform(), Some("linux-arm64"));
+    assert_eq!(FakePlatform::default().node_release_platform(), None);
+    let arch = std::env::consts::ARCH;
+    assert_eq!(MacPlatform.node_release_platform(), node_release_platform_for(NodeOs::Darwin, arch));
+    assert_eq!(LinuxPlatform.node_release_platform(), node_release_platform_for(NodeOs::Linux, arch));
+}
