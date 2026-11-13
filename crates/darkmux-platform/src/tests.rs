@@ -2357,6 +2357,20 @@ fn a_malformed_program_header_table_names_no_interpreter() {
     small[second + 8..second + 16].copy_from_slice(&path_at.to_le_bytes());
     small[second + 32..second + 40].copy_from_slice(&25u64.to_le_bytes());
     assert_eq!(elf_interpreter(&small), None, "an entry smaller than its class is not read");
+    // The same for ELF32, whose entries are 32 bytes: four 8-byte entries
+    // (a 32-byte table) hold the second entry's offset and size fields (4
+    // and 16 bytes past it).
+    let interp = "/lib/ld-musl-mips.so.1";
+    let mut small32 = an_elf(false, false, Some(interp));
+    let (ehsize32, real32) = (52usize, 32usize);
+    let path_at32 = (ehsize32 + 3 * real32) as u32;
+    small32[0x2A..0x2C].copy_from_slice(&8u16.to_le_bytes());
+    small32[0x2C..0x2E].copy_from_slice(&4u16.to_le_bytes());
+    let second32 = ehsize32 + 8;
+    small32[second32..second32 + 4].copy_from_slice(&3u32.to_le_bytes());
+    small32[second32 + 4..second32 + 8].copy_from_slice(&path_at32.to_le_bytes());
+    small32[second32 + 16..second32 + 20].copy_from_slice(&(interp.len() as u32 + 1).to_le_bytes());
+    assert_eq!(elf_interpreter(&small32), None, "an ELF32 entry smaller than 32 bytes is not read");
     let empty = an_elf(true, false, Some(""));
     assert_eq!(elf_interpreter(&empty), None, "an empty interpreter path is none");
 }

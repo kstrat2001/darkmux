@@ -628,8 +628,10 @@ pub(crate) fn c_library_of_interpreter(interp: Option<&str>) -> CLibrary {
 
 /// The most [`c_library_of_program`] reads of each part of a program: its
 /// ELF header, its program header table (wherever `e_phoff` puts it), and
-/// its interpreter's path (wherever `p_offset` puts it). A table or path
-/// larger than its bound names no interpreter.
+/// its interpreter's path (wherever `p_offset` puts it). A table larger
+/// than its bound names no interpreter. A path is read up to its bound and
+/// anything longer is cut there, which is harmless: the kernel refuses a
+/// `PT_INTERP` longer than `PATH_MAX`, so a shell naming one cannot run.
 const ELF_HEADER_BOUND: usize = 64;
 const PROGRAM_HEADERS_BOUND: usize = 64 * 1024;
 const INTERPRETER_BOUND: usize = 4096;
@@ -665,8 +667,12 @@ pub(crate) fn elf_interpreter(bytes: &[u8]) -> Option<String> {
 /// The interpreter (`PT_INTERP`) an ELF file names, 64- or 32-bit, either
 /// byte order, read through `read_at(offset, len)` (at most `len` bytes,
 /// fewer at the file's end). `None` for a file with none (static), one cut
-/// short where its header points, one whose table or path is past its
-/// bound, or one that is not ELF. All arithmetic is checked.
+/// short where its header points (a `p_filesz` larger than the bytes left
+/// in the file, up to the path's bound, included), one whose table is past
+/// its bound, or one that is not ELF. The path is read up to
+/// [`INTERPRETER_BOUND`], anything longer cut there (harmless: the kernel
+/// refuses a `PT_INTERP` longer than `PATH_MAX`). All arithmetic is
+/// checked.
 fn elf_interpreter_at(read_at: &mut ReadAt) -> Option<String> {
     let found = program_header_table(read_at)?;
     let table = Elf { bytes: &found.bytes, is64: found.is64, big: found.big };
