@@ -253,9 +253,11 @@ fn delimited(src: &str, open: &str, close: &str) -> Vec<(usize, usize)> {
     out
 }
 
-/// The `/* ... */` comments in `src[start..end]`.
+/// The `/* ... */` comments in `src[start..end]`, read from `start` only, so
+/// a `/*` in the page's text before a `<style>` never swallows one of its
+/// comments, and each element is read once.
 fn css_comments(src: &str, (start, end): (usize, usize)) -> Vec<(usize, usize)> {
-    delimited(&src[..end], "/*", "*/").into_iter().filter(|r| r.0 >= start).collect()
+    delimited(&src[start..end], "/*", "*/").into_iter().map(|(a, b)| (a + start, b + start)).collect()
 }
 
 /// What a JavaScript lexer is inside.
@@ -783,6 +785,7 @@ mod tests {
             ("page.html", "<script>\n// load(\"/hero.jpg\")\n</script>"),
             ("a.css", "/* .a { background: url(/hero.jpg); } */"),
             ("page.html", "<style>/* url(/hero.jpg) */</style>"),
+            ("page.html", "<p>a /* b</p><style>.a {} /* url(/hero.jpg) */</style>"),
         ] {
             assert!(spans(file, source, "/hero.jpg").is_empty(), "{file}: {source:?}");
         }
