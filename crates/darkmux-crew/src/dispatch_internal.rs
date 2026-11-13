@@ -1427,7 +1427,9 @@ pub(crate) fn claim_resume_origin(resume_from: &Path) -> Result<ExecutionLock> {
             let name = &sandbox.id;
             let stop = match sandbox.backend {
                 darkmux_sandbox::BackendKind::Docker => format!("`docker kill {name}`"),
-                darkmux_sandbox::BackendKind::Seatbelt => "end the darkmux runtime process running it".to_string(),
+                darkmux_sandbox::BackendKind::Seatbelt | darkmux_sandbox::BackendKind::Landlock => {
+                    "end the darkmux runtime process running it".to_string()
+                }
             };
             bail_resume!(
                 "darkmux dispatch: RESUME REFUSED: {named} (out-dir {}) still has its sandbox `{name}` \
@@ -2972,8 +2974,8 @@ pub(crate) fn agentic_brain_flags(
 }
 
 /// (#3112 step 2) `url` as the sandbox dials it: unchanged under a backend
-/// whose sandbox shares this host's loopback (Seatbelt runs on the host
-/// itself), else [`loopback_to_docker_host`].
+/// whose sandbox shares this host's loopback (Seatbelt and Landlock run on
+/// the host itself), else [`loopback_to_docker_host`].
 fn url_for_sandbox(url: &str) -> String {
     // A refused selection refuses the dispatch before any sandbox starts
     // (`resolve_runtime_image`), so this URL is then never dialed: it is
@@ -7121,12 +7123,12 @@ struct RuntimeImage {
     image: String,
     /// What `docker run` is given.
     run_image: String,
-    /// (#3112 step 2) The runtime a Seatbelt sandbox runs; `None` under
-    /// Docker.
+    /// (#3112 step 2) The runtime a Seatbelt or Landlock sandbox runs;
+    /// `None` under Docker.
     host_runtime: Option<HostRuntime>,
 }
 
-/// (#3112) The runtime a Seatbelt sandbox runs: a host program, the
+/// (#3112) The runtime an on-host sandbox runs: a host program, the
 /// arguments it takes before the runtime's own (`run …`), and, for this
 /// executable, which file it must still be when the command is built.
 #[derive(Debug, Clone, PartialEq)]
@@ -7161,7 +7163,7 @@ pub const RUNTIME_SUBCOMMAND: &str = "runtime";
 
 /// (#3112 step 2) For development: a standalone `darkmux-runtime` (built with
 /// `cargo build --release --manifest-path runtime/Cargo.toml`, at
-/// `runtime/target/release/darkmux-runtime`) a Seatbelt dispatch runs in
+/// `runtime/target/release/darkmux-runtime`) an on-host dispatch runs in
 /// place of this executable's own runtime.
 pub const SANDBOX_RUNTIME_ENV: &str = "DARKMUX_SANDBOX_RUNTIME";
 
@@ -7183,7 +7185,7 @@ fn file_identity(path: &Path) -> std::io::Result<FileIdentity> {
 }
 
 /// (#3112 review) This executable as the process started from it: its real
-/// path then, and which file was there. A Seatbelt dispatch runs that path,
+/// path then, and which file was there. An on-host dispatch runs that path,
 /// and only while the same file is still there: a process that was running
 /// when its install was replaced (a `mission launch` dispatching in-process)
 /// must never run a NEWER build's runtime against its own arguments and
@@ -7194,7 +7196,7 @@ pub struct ExecutableAtStart(std::result::Result<(PathBuf, FileIdentity), String
 /// What `exe` (this process's `current_exe()`) named, resolved now.
 fn executable_at_start(exe: std::io::Result<PathBuf>) -> ExecutableAtStart {
     let found = exe
-        .map_err(|e| format!("finding this darkmux executable, whose `runtime` subcommand the Seatbelt sandbox runs: {e}"))
+        .map_err(|e| format!("finding this darkmux executable, whose `runtime` subcommand an on-host sandbox runs: {e}"))
         .and_then(|exe| {
             let real = exe.canonicalize().map_err(|e| format!("resolving this darkmux executable's path ({}): {e}", exe.display()))?;
             let identity = file_identity(&real).map_err(|e| format!("reading this darkmux executable ({}): {e}", real.display()))?;
@@ -7207,12 +7209,12 @@ static EXECUTABLE_AT_START: std::sync::OnceLock<ExecutableAtStart> = std::sync::
 
 /// (#3112 review) Record this executable as the process starts from it. The
 /// darkmux binary calls this first thing; a process that never did records it
-/// at its first Seatbelt dispatch instead.
+/// at its first on-host dispatch instead.
 pub fn note_executable_at_start() {
     EXECUTABLE_AT_START.get_or_init(|| executable_at_start(std::env::current_exe()));
 }
 
-/// (#3112) The runtime a Seatbelt dispatch runs: the standalone build
+/// (#3112) The runtime an on-host dispatch runs: the standalone build
 /// `override_program` names ([`SANDBOX_RUNTIME_ENV`]), else this executable
 /// as the process started from it, whose `runtime` subcommand is the runtime
 /// itself, so nothing is built or downloaded. Each is named by its real path:
@@ -7242,7 +7244,7 @@ fn is_executable_file(path: &Path) -> bool {
 }
 
 /// (#3112) The runtime program a dispatch's sandbox runs, and the arguments
-/// it takes before the runtime's own: a Seatbelt dispatch's host runtime; the
+/// it takes before the runtime's own: an on-host dispatch's host runtime; the
 /// cached static binary injected into an operator's image; none for a
 /// darkmux image, which has its runtime baked in.
 fn runtime_program(image: &RuntimeImage) -> Result<(Option<PathBuf>, Vec<String>)> {
@@ -7257,44 +7259,44 @@ fn runtime_program(image: &RuntimeImage) -> Result<(Option<PathBuf>, Vec<String>
     }
 }
 
-/// (#3112 review) The way back from a Seatbelt refusal, for its last line.
-fn seatbelt_way_back() -> String {
-    darkmux_sandbox::way_back_to_docker()
-}
-
-/// (#3112 review) The runtime a Seatbelt dispatch runs ([`host_runtime`]),
-/// or a refusal that names the setting that chose Seatbelt and the way back:
-/// `--image` (a Seatbelt sandbox runs this host's own programs and has no
-/// image), and any runtime this process cannot run.
-fn seatbelt_runtime_for(
+/// (#3112 review) The runtime a dispatch on `kind`, a sandbox on the host
+/// (Seatbelt, Landlock), runs ([`host_runtime`]), or a refusal that names
+/// the setting that chose it and the way back: `--image` (such a sandbox
+/// runs this host's own programs and has no image), and any runtime this
+/// process cannot run.
+fn host_runtime_for(
+    kind: darkmux_sandbox::BackendKind,
     image_arg: Option<&str>,
     override_program: Option<std::ffi::OsString>,
     at_start: &ExecutableAtStart,
 ) -> Result<HostRuntime> {
+    let way_back = darkmux_sandbox::way_back_to_docker(kind);
     if let Some(image) = image_arg {
-        bail!("--image {image}: the Seatbelt sandbox runs this machine's own programs, not an image. {}", seatbelt_way_back());
+        bail!("--image {image}: the `{}` sandbox runs this machine's own programs, not an image. {way_back}", darkmux_sandbox::setting_value(kind));
     }
-    host_runtime(override_program, at_start).map_err(|e| anyhow!("{e:#}\n{}", seatbelt_way_back()))
+    host_runtime(override_program, at_start).map_err(|e| anyhow!("{e:#}\n{way_back}"))
 }
 
-/// (#3112) The runtime a Seatbelt dispatch would run, as `darkmux doctor`
-/// checks it: the same choice and identity check a dispatch makes
-/// ([`host_runtime`]), `Ok` naming the program, `Err` the refusal.
-pub fn seatbelt_runtime_status() -> std::result::Result<String, String> {
+/// (#3112) The runtime a dispatch on `kind` (a sandbox on the host) would
+/// run, as `darkmux doctor` checks it: the same choice and identity check a
+/// dispatch makes ([`host_runtime`]), `Ok` naming the program, `Err` the
+/// refusal.
+pub fn host_runtime_status(kind: darkmux_sandbox::BackendKind) -> std::result::Result<String, String> {
     let at_start = EXECUTABLE_AT_START.get_or_init(|| executable_at_start(std::env::current_exe()));
-    seatbelt_runtime_for(None, std::env::var_os(SANDBOX_RUNTIME_ENV), at_start)
+    host_runtime_for(kind, None, std::env::var_os(SANDBOX_RUNTIME_ENV), at_start)
         .map(|r| std::iter::once(r.program.display().to_string()).chain(r.leading_args).collect::<Vec<_>>().join(" "))
         .map_err(|e| format!("{e:#}"))
 }
 
-/// (#3112 step 2) What a Seatbelt dispatch runs in place of an image: the
-/// [`host_runtime`]. No image is checked or pulled, and `--image` is
-/// refused: there is no image to name.
-fn host_runtime_image(image_arg: Option<&str>) -> Result<RuntimeImage> {
+/// (#3112 step 2) What a dispatch on `kind`, a sandbox on the host, runs in
+/// place of an image: the [`host_runtime`]. No image is checked or pulled,
+/// and `--image` is refused: there is no image to name.
+fn host_runtime_image(kind: darkmux_sandbox::BackendKind, image_arg: Option<&str>) -> Result<RuntimeImage> {
     let at_start = EXECUTABLE_AT_START.get_or_init(|| executable_at_start(std::env::current_exe()));
-    let runtime = seatbelt_runtime_for(image_arg, std::env::var_os(SANDBOX_RUNTIME_ENV), at_start)?;
+    let runtime = host_runtime_for(kind, image_arg, std::env::var_os(SANDBOX_RUNTIME_ENV), at_start)?;
+    let sandbox = darkmux_sandbox::setting_value(kind);
     let shown = std::iter::once(runtime.program.display().to_string()).chain(runtime.leading_args.iter().cloned()).collect::<Vec<_>>().join(" ");
-    darkmux_types::diag_eprintln!("darkmux dispatch: runtime=internal, sandbox=seatbelt, runtime: {shown}");
+    darkmux_types::diag_eprintln!("darkmux dispatch: runtime=internal, sandbox={sandbox}, runtime: {shown}");
     Ok(RuntimeImage {
         inject: true,
         darkmux_image: crate::runtime_image::ResolvedImage { reference: shown.clone(), id: shown.clone() },
@@ -7307,8 +7309,9 @@ fn host_runtime_image(image_arg: Option<&str>) -> Result<RuntimeImage> {
 /// Resolve and check the runtime image, then say which one runs.
 fn resolve_runtime_image(image_arg: Option<&str>, skip_preflight: bool) -> Result<RuntimeImage> {
     // (#3112 step 2) A refused backend setting refuses the dispatch (contract 9).
-    if darkmux_sandbox::selected().map_err(|why| anyhow!(why))?.on_host() {
-        return host_runtime_image(image_arg);
+    let kind = darkmux_sandbox::selected().map_err(|why| anyhow!(why))?;
+    if kind.on_host() {
+        return host_runtime_image(kind, image_arg);
     }
     // (#703) `inject` is true only when the operator named a NON-darkmux image
     // (e.g. `rust:slim`) — then darkmux's static runtime binary is injected
@@ -8616,7 +8619,7 @@ fn container_run_config(
         resume_checkpoint: opts.resume_from.is_some(),
         container_host_access: darkmux_platform::current().container_host_access(),
         container_user: if run.image.host_runtime.is_some() {
-            // (#3112 step 2) Seatbelt runs as the caller; there is no user to switch to.
+            // (#3112 step 2) A host-process sandbox runs as the caller; there is no user to switch to.
             darkmux_platform::ContainerUser::Image
         } else {
             resolve_container_user(
@@ -8646,7 +8649,7 @@ fn container_run_config(
 
 /// (#3112 step 2) The backend's own `Command` for the dispatch, as it
 /// planned it: its environment, process group and stdin are part of the
-/// sandbox (a Seatbelt sandbox clears the host's environment), so it is
+/// sandbox (a Seatbelt or Landlock sandbox clears the host's environment), so it is
 /// never flattened to an argv and rebuilt, which would drop them.
 ///
 /// (#3112 review, round 3) The handle `run` returns is kept, not dropped:

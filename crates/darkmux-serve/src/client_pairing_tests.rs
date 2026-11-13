@@ -5710,13 +5710,18 @@ async fn previews_are_refused_while_clients_preview_enabled_is_off() {
     assert_eq!(code, 503, "{v}");
 }
 
-/// (#3112) A preview runs in every sandbox darkmux has: Docker and
-/// Seatbelt start it; only a refused setting refuses it, saying why.
+/// (#3112) Docker and Seatbelt start a preview; Landlock has no preview
+/// runner yet and refuses it, naming the setting that would allow it; a
+/// refused setting refuses it, saying why.
 #[test]
-fn a_preview_runs_in_every_sandbox_and_a_refused_setting_refuses_it() {
+fn a_preview_runs_under_docker_and_seatbelt_and_landlock_refuses_it() {
     use darkmux_sandbox::BackendKind;
     assert!(crate::client_pairing::preview_sandbox_refusal(&Ok(BackendKind::Docker)).is_none());
     assert!(crate::client_pairing::preview_sandbox_refusal(&Ok(BackendKind::Seatbelt)).is_none());
+    let landlock = crate::client_pairing::preview_sandbox_refusal(&Ok(BackendKind::Landlock)).expect("refused");
+    for part in ["previews need `runtime.sandbox` `docker` here for now", "this machine's sandbox is `landlock`", "darkmux config set runtime.sandbox docker"] {
+        assert!(landlock.contains(part), "missing `{part}` in: {landlock}");
+    }
     let bad = crate::client_pairing::preview_sandbox_refusal(&Err("`x` is not a valid sandbox".into())).expect("refused");
     assert!(bad.contains("`x` is not a valid sandbox"), "{bad}");
 }

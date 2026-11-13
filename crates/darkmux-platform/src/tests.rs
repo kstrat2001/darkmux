@@ -1666,11 +1666,15 @@ fn a_mac_with_sandbox_exec_defaults_to_seatbelt() {
     assert_eq!(MacPlatform.default_sandbox(), crate::macos::default_sandbox_given(present));
 }
 
-/// (#3112) Linux and every other OS keep Docker until they have a backend
-/// of their own (Landlock is the Linux step).
+/// (#3112) A Linux whose kernel can confine a process (Landlock ABI 6 and
+/// unprivileged user namespaces) runs Landlock and needs no Docker; one that
+/// cannot keeps Docker, as does every other OS.
 #[test]
-fn linux_and_other_default_to_docker_for_now() {
-    assert_eq!(LinuxPlatform.default_sandbox(), DefaultSandbox::Docker);
+fn a_linux_that_can_confine_defaults_to_landlock() {
+    assert_eq!(crate::linux::default_sandbox_given(true), DefaultSandbox::Landlock);
+    assert_eq!(crate::linux::default_sandbox_given(false), DefaultSandbox::Docker);
+    let confinable = LinuxPlatform.confine_support().refusal().is_none();
+    assert_eq!(LinuxPlatform.default_sandbox(), crate::linux::default_sandbox_given(confinable));
     assert_eq!(OtherPlatform.default_sandbox(), DefaultSandbox::Docker);
 }
 

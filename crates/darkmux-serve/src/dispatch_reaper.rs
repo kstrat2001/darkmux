@@ -253,9 +253,9 @@ mod tests {
                 None => std::env::remove_var("PATH"),
             }
         }
-        // (#3112 review) Seatbelt, where it runs, still answers: nothing to
-        // say. Where nothing runs, one line, then silence.
-        if darkmux_sandbox::SeatbeltBackend::available() {
+        // (#3112 review) Seatbelt or Landlock, where it runs, still answers:
+        // nothing to say. Where nothing runs, one line, then silence.
+        if darkmux_sandbox::SeatbeltBackend::available() || darkmux_sandbox::LandlockBackend::available().is_ok() {
             assert!(first.is_empty() && second.is_empty(), "{first:?} {second:?}");
             return;
         }

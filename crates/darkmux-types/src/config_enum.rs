@@ -1542,7 +1542,7 @@ mod tests {
     }
 
     /// (#3112) `runtime.sandbox` picks the sandbox every isolated run uses:
-    /// `DARKMUX_SANDBOX` over the key, `docker` or `seatbelt`, refused at
+    /// `DARKMUX_SANDBOX` over the key, `docker`, `seatbelt` or `landlock`, refused at
     /// every entry point (each one can start a sandbox), and absent it is
     /// this host's answer, never a fixed value.
     #[test]
@@ -1550,7 +1550,7 @@ mod tests {
         let s = setting("runtime.sandbox").expect("runtime.sandbox is registered");
         assert_eq!(s.env, Some("DARKMUX_SANDBOX"));
         assert_eq!(s.rust_name, "SandboxKind");
-        assert_eq!(s.tokens_joined(), "docker, seatbelt");
+        assert_eq!(s.tokens_joined(), "docker, seatbelt, landlock");
         assert_eq!(s.scopes, &Scope::ALL[..]);
         assert!(s.shipped_by_host(), "the default is the platform's answer");
         // A test build never depends on the host it runs on.

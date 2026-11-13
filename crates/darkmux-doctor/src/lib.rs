@@ -156,12 +156,12 @@ fn run_with(configured: (Result<darkmux_sandbox::BackendKind, String>, darkmux_t
         .as_ref()
         .ok()
         .filter(|k| k.on_host())
-        .map(|_| darkmux_crew::dispatch_internal::seatbelt_runtime_status());
+        .map(|k| darkmux_crew::dispatch_internal::host_runtime_status(*k));
     let sandbox_row = checks_sandbox::sandbox_row(
         &sandbox,
         sandbox_source,
         Some(&docker_runtime),
-        darkmux_sandbox::SeatbeltBackend::available(),
+        checks_sandbox::Here::now(),
         host_runtime.as_ref(),
     );
     let mut checks = vec![

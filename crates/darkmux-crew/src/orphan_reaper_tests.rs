@@ -326,7 +326,7 @@ fn a_tick_without_docker_lists_the_other_backends() {
             None => std::env::remove_var(darkmux_sandbox::seatbelt::STATE_DIR_ENV),
         }
     }
-    if darkmux_sandbox::SeatbeltBackend::available() {
+    if darkmux_sandbox::SeatbeltBackend::available() || darkmux_sandbox::LandlockBackend::available().is_ok() {
         assert!(matches!(&tick, ReapTick::Listed { reaped } if reaped.is_empty()), "{tick:?}");
     } else {
         assert!(matches!(tick, ReapTick::ListingUnavailable), "{tick:?}");

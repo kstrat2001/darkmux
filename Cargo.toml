@@ -101,6 +101,10 @@ darkmux-serve = { path = "crates/darkmux-serve" }
 # previously wired as a DIRECT dependency of the binary itself.
 darkmux-gestalt = { path = "crates/darkmux-gestalt" }
 darkmux-trajectory = { path = "crates/darkmux-trajectory", features = ["schemars"] }
+# (#3112) A Landlock sandbox's helper is a row of `src/multicall.rs`; and
+# `tests/runtime_parity.rs` runs `darkmux runtime` inside a real Seatbelt
+# sandbox (opt-in), through the backend dispatch uses.
+darkmux-sandbox = { path = "crates/darkmux-sandbox" }
 # (#3112) The agent runtime (`runtime/src/lib.rs`, linked by the package
 # below), run as the hidden `darkmux runtime` subcommand (src/multicall.rs):
 # what a Seatbelt sandbox runs, so no user builds or downloads a separate
@@ -166,9 +170,6 @@ darkmux-types = { path = "crates/darkmux-types", features = ["test-support"] }
 # (#2916) The fake identity provider for `machine trust`'s tests.
 darkmux-fleet = { path = "crates/darkmux-fleet", features = ["test-support"] }
 tempfile = "3.10"
-# (#3112) `tests/runtime_parity.rs` runs `darkmux runtime` inside a real
-# Seatbelt sandbox (opt-in), through the backend dispatch uses.
-darkmux-sandbox = { path = "crates/darkmux-sandbox" }
 assert_cmd = "2.0"
 tower = "0.5"
 predicates = "3.1"

@@ -16,11 +16,11 @@ impl Platform for LinuxPlatform {
         ContainerHostAccess::HostGateway
     }
 
-    /// Docker, for now. The seam for a sandbox that needs nothing installed
-    /// here (Landlock, #3112's Linux step): a `DefaultSandbox` variant for
-    /// it, answered here once its backend passes the conformance suite.
+    /// Landlock where this kernel can confine a process as its backend
+    /// needs ([`crate::confine::ConfineSupport::refusal`] says nothing),
+    /// else Docker.
     fn default_sandbox(&self) -> DefaultSandbox {
-        DefaultSandbox::Docker
+        default_sandbox_given(self.confine_support().refusal().is_none())
     }
 
     /// Docker Engine keeps the host's ownership on bind mounts, and darkmux
@@ -128,6 +128,12 @@ impl Platform for LinuxPlatform {
     /// Two processes see each other's pids only when this matches.
     fn pid_namespace(&self) -> Option<String> {
         pid_namespace_from_link(&read_link("/proc/self/ns/pid")?)
+    }
+
+    /// (#3112) The kernel's Landlock ABI, and what a sandbox needs (the
+    /// namespaces, then a root built in them) tried in short-lived children.
+    fn confine_support(&self) -> crate::confine::ConfineSupport {
+        crate::confine::support()
     }
 
     /// `/proc/meminfo`'s `MemAvailable`.
@@ -346,6 +352,17 @@ pub(crate) fn zenity_answer(code: Option<i32>) -> crate::AllowAnswer {
 }
 
 /// An M1 or M2 sold with 8, 16, 24, 32, 64, 96 or 128 GB: the next multiple of 8.
+/// The default sandbox on a Linux whose kernel can (`true`) or cannot
+/// confine a process as the Landlock backend needs: the answer's logic,
+/// apart from the probe.
+pub(crate) fn default_sandbox_given(confinable: bool) -> DefaultSandbox {
+    if confinable {
+        DefaultSandbox::Landlock
+    } else {
+        DefaultSandbox::Docker
+    }
+}
+
 pub(crate) fn sold_size_on_apple(gib: u64) -> u64 {
     gib.div_ceil(8) * 8
 }

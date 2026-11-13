@@ -3805,13 +3805,21 @@ fn previews_allowed(state: &ClientServerState) -> Result<(), Refused> {
 }
 
 /// (#3112) Why a preview cannot start under `selected` (the configured
-/// sandbox), or `None`: a preview runs in every sandbox darkmux has
-/// (Docker's container; Seatbelt on this Mac, its listeners watched,
-/// `client_preview`), so only a refused setting refuses it. A backend that
-/// cannot run one yet answers here, naming the fix.
+/// sandbox), or `None`: a preview runs in Docker's container and in
+/// Seatbelt on a Mac, its listeners watched (`client_preview`), so a
+/// refused setting refuses it. Landlock has no preview runner yet, so it
+/// answers here, naming the fix.
 pub(crate) fn preview_sandbox_refusal(selected: &Result<darkmux_sandbox::BackendKind, String>) -> Option<String> {
+    let docker = darkmux_sandbox::setting_value(darkmux_sandbox::BackendKind::Docker);
     match selected {
         Ok(darkmux_sandbox::BackendKind::Docker | darkmux_sandbox::BackendKind::Seatbelt) => None,
+        Ok(kind @ darkmux_sandbox::BackendKind::Landlock) => Some(format!(
+            "previews need `{key}` `{docker}` here for now: this machine's sandbox is `{}`, which \
+             runs no preview yet. To run previews here: `darkmux config set {key} {docker}` \
+             (Docker installed and running)",
+            darkmux_sandbox::setting_value(*kind),
+            key = darkmux_sandbox::SANDBOX_KEY,
+        )),
         Err(why) => Some(format!("no preview can start: {why}")),
     }
 }

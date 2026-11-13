@@ -140,6 +140,11 @@ impl Platform for MacPlatform {
         Some("macos".to_string())
     }
 
+    /// No namespaces or Landlock here.
+    fn confine_support(&self) -> crate::confine::ConfineSupport {
+        crate::confine::ConfineSupport::default()
+    }
+
     /// `sw_vers -productVersion`, installed when `system_profiler`'s install
     /// history last lists `macOS <version>`. The system files' own times are
     /// Apple's build times on the sealed volume, not when an update landed.

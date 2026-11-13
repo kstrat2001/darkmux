@@ -14,7 +14,9 @@ rust-version = "1.86"
 # the types crate (env > config.json > the platform's default); this crate
 # parses no config itself.
 darkmux-types = { path = "../darkmux-types" }
-# Where `sandbox-exec` lives: one constant, which the platform's default reads too.
+# Where `sandbox-exec` lives: one constant, which the platform's default reads
+# too; and (#3112) the kernel pieces the Landlock backend confines a process
+# with, which live with the other OS differences.
 darkmux-platform = { path = "../darkmux-platform" }
 # A handle is stored in records a reaper or a resume reads back.
 serde = { version = "1.0", features = ["derive"] }

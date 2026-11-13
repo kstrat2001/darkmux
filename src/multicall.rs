@@ -18,8 +18,7 @@
 //! One row in [`HELPERS`]: the first argument that selects it, and its entry.
 //! The entry reads its own arguments (everything after the first two, in the
 //! form it needs: `std::env::args` or `args_os`) and returns the process's
-//! exit code, which `main` returns unchanged. Nothing else changes. #3556
-//! (Landlock) adds `__darkmux-landlock` here.
+//! exit code, which `main` returns unchanged. Nothing else changes.
 
 use std::ffi::OsString;
 use std::process::{ExitCode, Termination};
@@ -32,6 +31,9 @@ type Entry = fn() -> ExitCode;
 const HELPERS: &[(&str, Entry)] = &[
     // The agent runtime (`runtime/src/lib.rs`), what a Seatbelt sandbox runs.
     ("runtime", runtime),
+    // A Landlock sandbox's helper (`crates/darkmux-sandbox/src/landlock.rs`):
+    // it confines itself, then execs what the sandbox runs.
+    (darkmux_sandbox::landlock::HELPER_ARG, landlock),
 ];
 
 /// `darkmux runtime …`: the runtime's own entry, given its arguments the way
@@ -40,6 +42,13 @@ const HELPERS: &[(&str, Entry)] = &[
 fn runtime() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(2).collect();
     darkmux_runtime::main_with(&args)
+}
+
+/// `darkmux __darkmux-landlock <dir> <program> [args]`: the Landlock helper,
+/// given its own arguments; it returns only when it cannot start.
+fn landlock() -> ExitCode {
+    let args: Vec<OsString> = std::env::args_os().skip(2).collect();
+    darkmux_sandbox::landlock::helper(&args)
 }
 
 /// The helper `argv` (the program name first) selects, if any: its row.
@@ -88,6 +97,8 @@ mod tests {
     fn only_a_helpers_name_as_the_first_argument_routes_to_it() {
         assert!(routes_to_runtime(&["darkmux", "runtime"]));
         assert!(routes_to_runtime(&["/opt/homebrew/bin/darkmux", "runtime", "run", "--model", "m"]));
+        let landlock = helper(&argv(&["darkmux", "__darkmux-landlock", "/d", "sh"]));
+        assert!(landlock.is_some_and(|(name, _)| *name == darkmux_sandbox::landlock::HELPER_ARG));
         for ordinary in [
             &["darkmux"][..],
             &["darkmux", "run", "list"],

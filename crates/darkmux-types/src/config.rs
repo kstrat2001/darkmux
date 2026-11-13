@@ -1174,10 +1174,11 @@ pub struct RuntimeBehaviorConfig {
     /// parse refuses the dispatch. Not written by `init`: the right value
     /// depends on the platform, so a literal would be wrong somewhere.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub container_user: Option<String>,
-    /// (#3112, 2.9) The sandbox every isolated run uses: `docker` or
-    /// `seatbelt` ([`SandboxKind`]). Unset, the platform decides
-    /// (`darkmux_platform::Platform::default_sandbox`): Seatbelt on a Mac
-    /// with `sandbox-exec`, Docker elsewhere. Resolved through
+    /// (#3112, 2.9) The sandbox every isolated run uses: `docker`,
+    /// `seatbelt` or `landlock` ([`SandboxKind`]). Unset, the platform
+    /// decides (`darkmux_platform::Platform::default_sandbox`): Seatbelt on a
+    /// Mac with `sandbox-exec`, Landlock on a Linux whose kernel has what it
+    /// needs, Docker elsewhere. Resolved through
     /// `config_access::sandbox()`; an unregistered value refuses every entry
     /// point. Not written by `init`, for the `container_user` reason.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub sandbox: Option<String>,
@@ -2273,6 +2274,7 @@ impl From<FleetMode> for DeclaredFleetMode {
 pub enum SandboxKind {
     Docker,
     Seatbelt,
+    Landlock,
 }
 
 impl SandboxKind {
@@ -2286,6 +2288,7 @@ impl From<darkmux_platform::DefaultSandbox> for SandboxKind {
         match d {
             darkmux_platform::DefaultSandbox::Docker => SandboxKind::Docker,
             darkmux_platform::DefaultSandbox::Seatbelt => SandboxKind::Seatbelt,
+            darkmux_platform::DefaultSandbox::Landlock => SandboxKind::Landlock,
         }
     }
 }
@@ -2293,6 +2296,7 @@ impl From<darkmux_platform::DefaultSandbox> for SandboxKind {
 crate::config_enum!(SandboxKind, "sandbox", [
     Docker = "docker" => "a Docker container: needs Docker installed and its daemon running",
     Seatbelt = "seatbelt" => "macOS Seatbelt (sandbox-exec): part of macOS, nothing to install",
+    Landlock = "landlock" => "Linux namespaces and Landlock: part of the kernel (Landlock ABI 6, Linux 6.12, and unprivileged user namespaces), nothing to install",
 ]);
 
 /// (#3538) `runtime.memory.pressure_gate`: the memory pressure at which
