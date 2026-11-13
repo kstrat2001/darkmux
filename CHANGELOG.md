@@ -19,15 +19,20 @@ darkmux release.
 - **darkmux supplies a verified, pinned Node.js to every sandbox it starts on this machine (#3561).**
   Under Seatbelt (macOS) and Landlock (Linux), a dispatch, a contained command (a lab run's tests, the
   mods gate) and a client preview run Node from darkmux, first on the sandbox's PATH, its folder
-  granted read-only and nothing else of `~/.darkmux`. A fresh Mac needs no Node of its own. The version
-  is the project's own: `.nvmrc`, then `.node-version`, then `package.json`'s `engines.node`; with
+  granted read-only, and no other part of `~/.darkmux` is added to what a sandbox reads (a dispatch's
+  existing `~/.darkmux/cache` mount is unchanged). A fresh Mac needs no Node of its own. The version
+  is the project's own: `.nvmrc`, then `.node-version`, then `package.json`'s `engines.node` (in the
+  workspace root for a dispatch or a preview; a contained command looks in its working folder, then
+  its tree's root); with
   none, Node 26 (the Active LTS line). darkmux reads an exact version, a partial one (`22`, `22.x`),
   comparators, `^`, `~`, hyphen ranges and `||`, and `lts/*` or `lts/<codename>` in the version files;
   it picks the newest pinned build that satisfies it and refuses, by name, anything else (`node`,
   `latest`, a pre-release). Only a build pinned in the binary is ever downloaded: Node 26.13.1, 24.22.3
   and 22.23.5 for macOS (Apple Silicon, Intel) and Linux (x64, arm64), each archive checked against its
   pinned SHA-256 (never a checksum fetched at run time) and installed atomically under
-  `~/.darkmux/toolchains/node-<version>-<platform>/` on first use. A version no pin satisfies is refused
+  `~/.darkmux/toolchains/node-<version>-<platform>/` on first use. A build this binary no longer pins is
+  removed only once nobody has used it for 7 days, so a daemon still running an older darkmux keeps its
+  Node. A version no pin satisfies is refused
   naming the nearest pinned one; a failed download or a hash mismatch refuses the sandbox with the
   reason and the fix, never falling back to the host's Node. A first use writes `toolchain.fetch` and
   then `toolchain.ready` or `toolchain.error` to the flow; a starting preview shows it as `stage`

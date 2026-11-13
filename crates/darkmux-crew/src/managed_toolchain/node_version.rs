@@ -117,8 +117,10 @@ fn read_declaration(dir: &Path, from: Declared, max: u64) -> Result<Option<Strin
             path.display()
         ));
     }
+    // (#3561 review) A leading UTF-8 byte order mark is not part of the
+    // declaration (npm strips it from `package.json` too).
     std::fs::read_to_string(&path)
-        .map(Some)
+        .map(|t| Some(t.strip_prefix('\u{feff}').map(str::to_string).unwrap_or(t)))
         .map_err(|e| format!("reading {}: {e}", path.display()))
 }
 
@@ -179,40 +181,45 @@ impl Partial {
 
     /// The first version past every one it allows, for a partial one
     /// (`22` -> `23.0.0`, `22.4` -> `22.5.0`); `None` for an exact version
-    /// or a bare wildcard, which have no such bound.
-    fn ceiling(self) -> Option<Version> {
-        match (self.major, self.minor, self.patch) {
-            (Some(m), None, _) => Some(Version::new(m + 1, 0, 0)),
-            (Some(m), Some(n), None) => Some(Version::new(m, n + 1, 0)),
+    /// or a bare wildcard, which have no such bound. [`Overflow`] when that
+    /// version is past what a version part holds.
+    fn ceiling(self) -> Result<Option<Version>, Overflow> {
+        Ok(match (self.major, self.minor, self.patch) {
+            (Some(m), None, _) => Some(Version::new(up(m)?, 0, 0)),
+            (Some(m), Some(n), None) => Some(Version::new(m, up(n)?, 0)),
             _ => None,
-        }
+        })
     }
+}
+
+/// (#3561 review) A bound past the largest version part (`~4294967295`):
+/// such a request is refused as unreadable, never wrapped around.
+#[derive(Debug)]
+struct Overflow;
+
+/// `n + 1`, or [`Overflow`].
+fn up(n: u32) -> Result<u32, Overflow> {
+    n.checked_add(1).ok_or(Overflow)
 }
 
 /// `s` as a partial version (an optional leading `v`), or `None` for any
 /// other spelling (a pre-release tag, a word).
 fn partial(s: &str) -> Option<Partial> {
     let s = s.strip_prefix(['v', 'V']).unwrap_or(s);
-    if s.is_empty() {
-        return Some(Partial {
-            major: None,
-            minor: None,
-            patch: None,
-        });
-    }
-    let parts: Vec<&str> = s.split('.').collect();
+    let parts: Vec<&str> = if s.is_empty() {
+        Vec::new()
+    } else {
+        s.split('.').collect()
+    };
     if parts.len() > 3 {
         return None;
     }
     let mut out = [None; 3];
     let mut open = false;
     for (i, part) in parts.iter().enumerate() {
-        match *part {
-            "x" | "X" | "*" => open = true,
-            digits if !open && !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) => {
-                out[i] = Some(digits.parse().ok()?)
-            }
-            _ => return None,
+        open |= is_wildcard(part);
+        if !is_wildcard(part) {
+            out[i] = Some(number(part).filter(|_| !open)?);
         }
     }
     Some(Partial {
@@ -220,6 +227,18 @@ fn partial(s: &str) -> Option<Partial> {
         minor: out[1],
         patch: out[2],
     })
+}
+
+/// A part that leaves its place open: `x`, `X` or `*`.
+fn is_wildcard(part: &str) -> bool {
+    matches!(part, "x" | "X" | "*")
+}
+
+/// A part that is a plain number (digits only, no sign or space).
+fn number(part: &str) -> Option<u32> {
+    (!part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| part.parse().ok())
+        .flatten()
 }
 
 /// One end of an interval.
@@ -291,73 +310,96 @@ impl Interval {
 
 /// A bare or `=` partial version: an exact one, or every release it leaves
 /// open.
-fn x_range(p: Partial) -> Interval {
-    match (p.exact(), p.ceiling()) {
+fn x_range(p: Partial) -> Result<Interval, Overflow> {
+    Ok(match (p.exact(), p.ceiling()?) {
         (Some(v), _) => Interval::at_least(v).below(v, true),
         (None, Some(c)) => Interval::at_least(p.floor()).below(c, false),
         (None, None) => Interval::default(),
-    }
+    })
 }
 
 /// `^p`: changes that keep its first nonzero part.
-fn caret(p: Partial) -> Interval {
+fn caret(p: Partial) -> Result<Interval, Overflow> {
     let Some(major) = p.major else {
-        return Interval::default();
+        return Ok(Interval::default());
     };
     let hi = match (major, p.minor, p.patch) {
         (0, None, _) => Version::new(1, 0, 0),
         (0, Some(0), None) => Version::new(0, 1, 0),
-        (0, Some(0), Some(z)) => Version::new(0, 0, z + 1),
-        (0, Some(n), _) => Version::new(0, n + 1, 0),
-        (m, _, _) => Version::new(m + 1, 0, 0),
+        (0, Some(0), Some(z)) => Version::new(0, 0, up(z)?),
+        (0, Some(n), _) => Version::new(0, up(n)?, 0),
+        (m, _, _) => Version::new(up(m)?, 0, 0),
     };
-    Interval::at_least(p.floor()).below(hi, false)
+    Ok(Interval::at_least(p.floor()).below(hi, false))
 }
 
 /// `~p`: patch releases, or minor ones when only a major is named.
-fn tilde(p: Partial) -> Interval {
+fn tilde(p: Partial) -> Result<Interval, Overflow> {
     let lo = Interval::at_least(p.floor());
-    match (p.major, p.minor) {
+    Ok(match (p.major, p.minor) {
         (None, _) => Interval::default(),
-        (Some(m), None) => lo.below(Version::new(m + 1, 0, 0), false),
-        (Some(m), Some(n)) => lo.below(Version::new(m, n + 1, 0), false),
-    }
+        (Some(m), None) => lo.below(Version::new(up(m)?, 0, 0), false),
+        (Some(m), Some(n)) => lo.below(Version::new(m, up(n)?, 0), false),
+    })
 }
 
+/// The operators a comparator may start with, longest first.
+const OPERATORS: [&str; 8] = [">=", "<=", "~>", ">", "<", "=", "^", "~"];
+
 /// One comparator (`>=20`, `^22.1`, `22.x`), or `None` for a spelling
-/// darkmux does not read.
+/// darkmux does not read (or a bound past the largest version part).
 fn comparator(token: &str) -> Option<Interval> {
-    let ops = [">=", "<=", "~>", ">", "<", "=", "^", "~"];
-    let (op, rest) = ops
+    let (op, rest) = OPERATORS
         .iter()
         .find_map(|op| token.strip_prefix(op).map(|r| (*op, r)))
         .unwrap_or(("", token));
     let p = partial(rest)?;
-    let any = p.major.is_none();
-    Some(match op {
-        "" | "=" => x_range(p),
-        "^" => caret(p),
-        "~" | "~>" => tilde(p),
-        ">=" => Interval::at_least(p.floor()),
-        ">" if any => NOTHING,
-        ">" => match (p.exact(), p.ceiling()) {
-            (Some(v), _) => Interval {
-                lo: Some(Bound {
-                    v,
-                    inclusive: false,
-                }),
-                hi: None,
-            },
-            (None, c) => Interval::at_least(c.unwrap_or(p.floor())),
+    match op {
+        "" | "=" => x_range(p).ok(),
+        "^" => caret(p).ok(),
+        "~" | "~>" => tilde(p).ok(),
+        ">=" => Some(Interval::at_least(p.floor())),
+        ">" => above(p),
+        "<" => Some(under(p)),
+        "<=" => at_most(p),
+        _ => None,
+    }
+}
+
+/// `<p`: before its lowest release; nothing is before `*`.
+fn under(p: Partial) -> Interval {
+    if p.major.is_none() {
+        NOTHING
+    } else {
+        Interval::default().below(p.floor(), false)
+    }
+}
+
+/// `>p`: past an exact version, or past every release a partial one
+/// allows; nothing is past `*`.
+fn above(p: Partial) -> Option<Interval> {
+    if p.major.is_none() {
+        return Some(NOTHING);
+    }
+    Some(match (p.exact(), p.ceiling().ok()?) {
+        (Some(v), _) => Interval {
+            lo: Some(Bound {
+                v,
+                inclusive: false,
+            }),
+            hi: None,
         },
-        "<" if any => NOTHING,
-        "<" => Interval::default().below(p.floor(), false),
-        "<=" => match (p.exact(), p.ceiling()) {
-            (Some(v), _) => Interval::default().below(v, true),
-            (None, Some(c)) => Interval::default().below(c, false),
-            (None, None) => Interval::default(),
-        },
-        _ => return None,
+        (None, c) => Interval::at_least(c.unwrap_or(p.floor())),
+    })
+}
+
+/// `<=p`, and a hyphen range's upper end: up to an exact version, or every
+/// release a partial one allows.
+fn at_most(p: Partial) -> Option<Interval> {
+    Some(match (p.exact(), p.ceiling().ok()?) {
+        (Some(v), _) => Interval::default().below(v, true),
+        (None, Some(c)) => Interval::default().below(c, false),
+        (None, None) => Interval::default(),
     })
 }
 
@@ -366,32 +408,31 @@ fn comparator(token: &str) -> Option<Interval> {
 fn comparator_set(set: &str) -> Option<Interval> {
     let words: Vec<&str> = set.split_whitespace().collect();
     if let [a, "-", b] = words[..] {
-        let (a, b) = (partial(a)?, partial(b)?);
-        let hi = match (b.exact(), b.ceiling()) {
-            (Some(v), _) => Interval::default().below(v, true),
-            (None, Some(c)) => Interval::default().below(c, false),
-            (None, None) => Interval::default(),
-        };
-        return Some(Interval::at_least(a.floor()).and(hi));
+        return Some(Interval::at_least(partial(a)?.floor()).and(at_most(partial(b)?)?));
     }
+    joined(&words)?
+        .iter()
+        .try_fold(Interval::default(), |acc, t| Some(acc.and(comparator(t)?)))
+}
+
+/// `words` with each operator standing apart joined to the version after
+/// it (`>=`, `20` -> `>=20`); `None` for two operators in a row or one at
+/// the end.
+fn joined(words: &[&str]) -> Option<Vec<String>> {
     let mut tokens: Vec<String> = Vec::new();
     let mut pending: Option<&str> = None;
     for w in words {
-        if [">=", "<=", ">", "<", "=", "^", "~", "~>"].contains(&w) {
-            if pending.is_some() {
-                return None;
-            }
-            pending = Some(w);
-            continue;
+        let operator = OPERATORS.contains(w);
+        if operator && pending.is_some() {
+            return None;
         }
-        tokens.push(format!("{}{w}", pending.take().unwrap_or("")));
+        if operator {
+            pending = Some(w);
+        } else {
+            tokens.push(format!("{}{w}", pending.take().unwrap_or("")));
+        }
     }
-    if pending.is_some() {
-        return None;
-    }
-    tokens
-        .iter()
-        .try_fold(Interval::default(), |acc, t| Some(acc.and(comparator(t)?)))
+    pending.is_none().then_some(tokens)
 }
 
 /// A whole range, its `||` alternatives each an interval.

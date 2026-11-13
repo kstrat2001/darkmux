@@ -14,8 +14,14 @@
 // Express's `app.listen(port)` and supertest's `app.listen(0)` listen on
 // 127.0.0.1, which `fetch('http://localhost:<port>')` also reaches.
 //
+// So `listen({ port, ipv6Only: true })`, which names no host, listens on
+// 127.0.0.1 too (IPv4 only, like every rewritten listen).
+//
 // Left alone: any explicit host (`0.0.0.0` and `::` included, which
 // darkmux's watch still stops), a unix socket or named pipe, an fd, a handle.
+// An empty host (`listen(0, '')`, `{ host: '' }`) is a host string, so it is
+// left alone too, and Node binds it to every address (`::`): the watch stops
+// that one as well.
 'use strict';
 
 const net = require('net');

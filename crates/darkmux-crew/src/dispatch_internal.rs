@@ -7914,34 +7914,50 @@ fn container_model_resident(
     })
 }
 
-/// (#3561) Give `run` the toolchain its sandbox gets ([`dispatch_toolchain`]:
+/// (#3561) What a dispatch's toolchain is resolved for: the sandbox it
+/// runs in (or why none can run here), its workspace, and for its terminal
+/// record the model and the hosted brain's route label.
+struct ToolchainFor<'a> {
+    kind: std::result::Result<darkmux_sandbox::BackendKind, String>,
+    workspace: &'a Path,
+    model: &'a str,
+    endpoint: Option<&'a str>,
+}
+
+/// (#3561) The sandbox `run` starts in: the selected one for a sandbox on
+/// the host, Docker otherwise (which gets no managed toolchain).
+fn sandbox_of(run: &ContainerRun) -> std::result::Result<darkmux_sandbox::BackendKind, String> {
+    if run.image.host_runtime.is_some() {
+        darkmux_sandbox::selected()
+    } else {
+        Ok(darkmux_sandbox::BackendKind::Docker)
+    }
+}
+
+/// (#3561) The toolchain the dispatch's sandbox gets ([`dispatch_toolchain`]:
 /// on the host, the workspace's verified Node, fetched on first use), or
-/// close `bookend` with the refusal (a fetch that failed, a declaration
-/// darkmux will not read) and return it.
+/// `bookend` closed with the refusal's own reason (no sandbox can run, a
+/// fetch failed, a declaration darkmux will not read) and that refusal.
 fn container_toolchain(
     opts: &DispatchOpts,
     execution: &ExecutionId,
-    run: &mut ContainerRun,
+    ask: ToolchainFor<'_>,
     bookend: &mut DispatchBookendGuard<'_>,
     started: std::time::Instant,
-) -> Result<()> {
-    let kind = if run.image.host_runtime.is_some() { darkmux_sandbox::selected().map_err(|why| anyhow!(why))? } else { darkmux_sandbox::BackendKind::Docker };
-    let refused = match dispatch_toolchain(kind, &run.workspace, &opts.session) {
-        Ok(toolchain) => {
-            run.toolchain = toolchain;
-            return Ok(());
-        }
+) -> Result<darkmux_sandbox::toolchain::Toolchain> {
+    let refused = match ask.kind.map_err(|why| anyhow!(why)).and_then(|kind| dispatch_toolchain(kind, ask.workspace, &opts.session)) {
+        Ok(toolchain) => return Ok(toolchain),
         Err(e) => e,
     };
     let (mut payload, level) = ended_mid_run_terminal(
         &format!("{refused:#}"),
         started.elapsed().as_millis() as u64,
         &TrajectorySummary::default(),
-        run.unmanaged_endpoint_raw_label.as_deref(),
+        ask.endpoint,
         opts.resume_from.as_deref(),
     );
     merge_record_context(&mut payload, &opts.record_context);
-    bookend.close(crate::dispatch::build_dispatch_record(level, &opts.role_id, &opts.session, execution, Some(&run.model), opts.phase_id.as_deref(), payload));
+    bookend.close(crate::dispatch::build_dispatch_record(level, &opts.role_id, &opts.session, execution, Some(ask.model), opts.phase_id.as_deref(), payload));
     Err(refused)
 }
 
@@ -8007,7 +8023,8 @@ fn run_container(opts: &DispatchOpts, execution: &ExecutionId, mut run: Containe
     let dispatch_start_instant = std::time::Instant::now();
     // (#3561) A sandbox on the host runs the workspace's verified Node,
     // settled before its model is made resident.
-    container_toolchain(opts, execution, &mut run, &mut bookend, dispatch_start_instant)?;
+    let ask = ToolchainFor { kind: sandbox_of(&run), workspace: &run.workspace, model: &run.model, endpoint: run.unmanaged_endpoint_raw_label.as_deref() };
+    run.toolchain = container_toolchain(opts, execution, ask, &mut bookend, dispatch_start_instant)?;
     // (#3121) A run that ended mid-way closes with the error that ended it
     // and the turns it finished, never the guard's "early return or panic".
     let close_ended_mid_run =

@@ -3,7 +3,7 @@
 //! runtime is its pins and its extras ([`Runtime`]).
 //!
 //! **Atomic.** The archive is downloaded into a fresh hidden sibling
-//! (`.<runtime>-<version>-<platform>.<pid>-<n>.partial`), hashed against its
+//! (`.<runtime>-<version>-<platform>.<pid>-<nanos>-<n>.partial`), hashed against its
 //! pin, unpacked there with the system `tar`, given the runtime's extras
 //! (read-only) and marked verified ([`MARKER`], naming the build and its
 //! pinned hash) before one `rename` moves the release folder into place. A
@@ -16,6 +16,14 @@
 //! content on every use: one an older darkmux wrote is replaced in place
 //! (written beside it, then renamed over it), so an upgrade never needs a
 //! new download.
+//!
+//! **Cleanup is by disuse.** Every use stamps its install ([`USED`]'s
+//! modified time, renewed at most once a [`USE_STAMP_EVERY`]), and a new
+//! install removes a darkmux install no longer pinned only once nobody has
+//! used it for [`UNUSED_FOR`]. So a still-running older darkmux (a
+//! `client serve` daemon from before an upgrade) keeps the build its
+//! sandboxes run on, and two binaries with different pins never delete
+//! each other's builds in turn.
 //!
 //! **Downloads** go through `curl`, darkmux's HTTPS client, held to https
 //! (redirects included) within [`DOWNLOAD_BOUND`].
@@ -40,6 +48,16 @@ const UNPACK_BOUND: Duration = Duration::from_secs(300);
 /// A staging folder older than this is a crashed install's, never a live
 /// one's (a live install ends within [`DOWNLOAD_BOUND`] plus the unpack).
 pub const STALE_PARTIAL: Duration = Duration::from_secs(24 * 3600);
+
+/// The file in an install whose modified time is its last use.
+pub const USED: &str = ".darkmux-used";
+
+/// How stale [`USED`] may be before a use renews it: a sandbox start
+/// writes it at most once a day.
+pub const USE_STAMP_EVERY: Duration = Duration::from_secs(24 * 3600);
+
+/// How long an unpinned install must go unused before cleanup removes it.
+pub const UNUSED_FOR: Duration = Duration::from_secs(7 * 24 * 3600);
 
 /// A verified install.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,7 +158,9 @@ fn write_extras(runtime: &Runtime, dir: &Path) -> Result<(), String> {
             .unwrap_or_default()
             .to_string_lossy()
             .into_owned();
-        let temp = parent.join(format!(".{name}.{}.new", std::process::id()));
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temp = parent.join(format!(".{name}.{}-{n}.new", std::process::id()));
         std::fs::write(&temp, x.content).map_err(|e| format!("writing {}: {e}", temp.display()))?;
         read_only(&temp)?;
         std::fs::rename(&temp, &path).map_err(|e| format!("writing {}: {e}", path.display()))?;
@@ -168,12 +188,48 @@ pub fn installed(runtime: &Runtime, pin: &Pin, root: &Path) -> Result<Option<Ins
     if !verified(&dir, pin) {
         return Ok(None);
     }
+    in_use(runtime, pin, dir).map(Some)
+}
+
+/// The verified install at `dir`, its extras current and its use stamped.
+fn in_use(runtime: &Runtime, pin: &Pin, dir: PathBuf) -> Result<Installed, String> {
     write_extras(runtime, &dir)?;
-    Ok(Some(Installed {
+    stamp_use(&dir, SystemTime::now());
+    Ok(Installed {
         pin: *pin,
         env: extras_env(runtime, &dir),
         dir,
-    }))
+    })
+}
+
+/// Renew `dir`'s [`USED`] stamp when it is missing or older than
+/// [`USE_STAMP_EVERY`] at `now`. Best effort: a stamp that cannot be
+/// written leaves the install looking unused sooner, nothing worse.
+fn stamp_use(dir: &Path, now: SystemTime) {
+    let path = dir.join(USED);
+    let fresh = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|at| now.duration_since(at).ok())
+        .is_some_and(|age| age < USE_STAMP_EVERY);
+    if !fresh {
+        let _ = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .and_then(|f| f.set_modified(now));
+    }
+}
+
+/// When `dir` was last used: its [`USED`] stamp, else its [`MARKER`]'s
+/// time (an install no use has stamped yet).
+fn last_use(dir: &Path) -> Option<SystemTime> {
+    [USED, MARKER].iter().find_map(|f| {
+        std::fs::metadata(dir.join(f))
+            .and_then(|m| m.modified())
+            .ok()
+    })
 }
 
 /// `pin`'s install under `root`: the verified one already there, else
@@ -187,11 +243,14 @@ pub fn ensure(
     source: &Source,
     note: &mut dyn FnMut(&Note),
 ) -> Result<Installed, String> {
-    if let Some(done) = installed(runtime, pin, root)? {
-        return Ok(done);
-    }
     let dir = root.join(pin.dir_name());
+    // (#3561 review) Whether anything is there first, then whether it is
+    // verified: an install a concurrent first use renames into place
+    // between the two is seen whole, never refused as half made.
     if std::fs::symlink_metadata(&dir).is_ok() {
+        if verified(&dir, pin) {
+            return in_use(runtime, pin, dir);
+        }
         return Err(format!(
             "{} is there but is not a {} install darkmux verified (it has no `{MARKER}` naming this build's pinned \
              SHA-256), so darkmux neither uses nor deletes it. Remove it (`rm -rf {}`) and run again: darkmux \
@@ -220,11 +279,7 @@ pub fn ensure(
                 elapsed,
             });
             remove_unpinned(root, &source.pins, SystemTime::now());
-            Ok(Installed {
-                pin: *pin,
-                env: extras_env(runtime, &dir),
-                dir,
-            })
+            in_use(runtime, pin, dir)
         }
         Err(reason) => {
             note(&Note::Failed {
@@ -385,9 +440,10 @@ fn unpack(archive: &Path, into: &Path) -> Result<(), String> {
     }
 }
 
-/// Remove from `root` what darkmux installed of a runtime and `pins` no
-/// longer names, and staging folders a crashed install left over
-/// [`STALE_PARTIAL`] before `now`; the paths removed. Only a real folder
+/// Remove from `root` what darkmux installed of a runtime, `pins` no
+/// longer names and nobody used for [`UNUSED_FOR`] before `now`, and
+/// staging folders a crashed install left over [`STALE_PARTIAL`] before
+/// `now`; the paths removed. Only a real folder
 /// (never a link) directly in `root` is touched: an install only when it
 /// holds darkmux's [`MARKER`] for the runtime its name starts with, a
 /// staging folder only by its own name. Anything else there is left alone.
@@ -401,31 +457,44 @@ pub fn remove_unpinned(root: &Path, pins: &[Pin], now: SystemTime) -> Vec<PathBu
             entry.path(),
             entry.file_name().to_string_lossy().into_owned(),
         );
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if !meta.is_dir() {
-            continue;
-        }
-        let stale_partial = super::RUNTIMES
-            .iter()
-            .any(|r| name.starts_with(&format!(".{}-", r.name)))
-            && name.ends_with(".partial")
-            && meta
-                .modified()
-                .ok()
-                .and_then(|m| now.duration_since(m).ok())
-                .is_some_and(|age| age >= STALE_PARTIAL);
-        let ours = |runtime: &str| {
-            name.starts_with(&format!("{runtime}-"))
-                && std::fs::read_to_string(path.join(MARKER))
-                    .is_ok_and(|t| t.starts_with(&format!("{runtime} ")))
-        };
-        let unpinned_install = !pins.iter().any(|p| p.dir_name() == name)
-            && super::RUNTIMES.iter().any(|r| ours(r.name));
-        if (stale_partial || unpinned_install) && std::fs::remove_dir_all(&path).is_ok() {
+        let real_dir = std::fs::symlink_metadata(&path).ok().filter(|m| m.is_dir());
+        let Some(meta) = real_dir else { continue };
+        let gone = stale_partial(&name, &meta, now) || unused_unpinned(&path, &name, pins, now);
+        if gone && std::fs::remove_dir_all(&path).is_ok() {
             removed.push(path);
         }
     }
     removed
+}
+
+/// A staging folder (`.<runtime>-...partial`) last written over
+/// [`STALE_PARTIAL`] before `now`.
+fn stale_partial(name: &str, meta: &std::fs::Metadata, now: SystemTime) -> bool {
+    let named = super::RUNTIMES
+        .iter()
+        .any(|r| name.starts_with(&format!(".{}-", r.name)))
+        && name.ends_with(".partial");
+    named
+        && meta
+            .modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age >= STALE_PARTIAL)
+}
+
+/// A darkmux install (its name a runtime's and its [`MARKER`] that
+/// runtime's) that `pins` does not name and nobody used for
+/// [`UNUSED_FOR`] before `now`.
+fn unused_unpinned(path: &Path, name: &str, pins: &[Pin], now: SystemTime) -> bool {
+    let ours = |runtime: &str| {
+        name.starts_with(&format!("{runtime}-"))
+            && std::fs::read_to_string(path.join(MARKER))
+                .is_ok_and(|t| t.starts_with(&format!("{runtime} ")))
+    };
+    let unused = last_use(path)
+        .and_then(|at| now.duration_since(at).ok())
+        .is_some_and(|idle| idle >= UNUSED_FOR);
+    !pins.iter().any(|p| p.dir_name() == name)
+        && super::RUNTIMES.iter().any(|r| ours(r.name))
+        && unused
 }

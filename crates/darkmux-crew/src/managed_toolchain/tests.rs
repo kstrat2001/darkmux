@@ -226,6 +226,64 @@ fn an_unreadable_form_is_refused_by_name() {
     );
 }
 
+/// (#3561 review) A version part at the largest a part holds is refused as
+/// unreadable wherever its bound would step past it: never a panic, and
+/// never a wrap-around (`>4294967295` read as `>=0.0.0` picked 26).
+#[test]
+fn a_bound_past_the_largest_version_part_is_refused_not_wrapped() {
+    for text in [
+        "4294967295",
+        "~4294967295",
+        ">4294967295",
+        "22.4294967295",
+        "^0.0.4294967295",
+        "<=4294967295",
+        "^4294967295",
+        "~22.4294967295",
+        "1 - 4294967295",
+    ] {
+        let why = pick(Declared::Nvmrc, text).unwrap_err();
+        assert!(
+            why.contains("cannot read") && why.contains(&format!("`{text}`")),
+            "{text}: {why}"
+        );
+    }
+    assert!(
+        pick(Declared::Engines, ">=4294967295")
+            .unwrap_err()
+            .contains("no version darkmux pins satisfies"),
+        "a bound that needs no step is read"
+    );
+}
+
+/// (#3561 review) A leading UTF-8 byte order mark (npm strips it from
+/// `package.json`) is not part of a declaration, in any of the three files.
+#[test]
+fn a_byte_order_mark_is_not_part_of_a_declaration() {
+    let (_d, root) = a_dir();
+    for (file, text, want) in [
+        (
+            "package.json",
+            "\u{feff}{\"engines\": {\"node\": \"^22\"}}",
+            "^22",
+        ),
+        (".nvmrc", "\u{feff}24\n", "24"),
+        (".node-version", "\u{feff}v22.23.5\n", "v22.23.5"),
+    ] {
+        let ws = root.join(file.trim_start_matches('.'));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join(file), text).unwrap();
+        let got = declared_in(&[&ws])
+            .unwrap()
+            .unwrap_or_else(|| panic!("{file} declared nothing"));
+        assert_eq!(got.text, want, "{file}");
+        assert!(
+            choose(Some(&got), &Source::official(&NODE).pins_for(PLATFORM)).is_ok(),
+            "{file}"
+        );
+    }
+}
+
 /// (#3561) Where a project declares its version: `.nvmrc`, then
 /// `.node-version`, then `engines.node`, in the first folder that has any;
 /// a comment and blank lines skipped; nothing declared is `None`.
@@ -560,12 +618,29 @@ fn a_lost_rename_uses_the_winners_install_only_when_verified() {
     assert!(why.contains("installing node 26.13.1"), "{why}");
 }
 
-/// (#3561) Cleanup removes only what darkmux installed and no longer pins,
-/// and staging folders a crashed install left a day ago; a pinned install,
-/// a folder without darkmux's marker, a link, a file and a fresh staging
-/// folder stay. Ages are measured from each folder's own modified time.
+/// The time `path` was last modified.
+fn mtime(path: &Path) -> std::time::SystemTime {
+    std::fs::metadata(path).unwrap().modified().unwrap()
+}
+
+/// Set `path`'s modified time to `at`.
+fn set_mtime(path: &Path, at: std::time::SystemTime) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(at)
+        .unwrap();
+}
+
+/// (#3561) Cleanup removes only what darkmux installed, no longer pins
+/// and nobody used for [`UNUSED_FOR`], and staging folders a crashed
+/// install left a day ago; a pinned install, an unpinned one used within
+/// the week, a folder without darkmux's marker, another runtime's, a link,
+/// a file and a fresh staging folder stay. Ages are measured from each
+/// folder's own stamp, never a fixed time.
 #[test]
-fn cleanup_removes_only_darkmux_installs_no_longer_pinned() {
+fn cleanup_removes_only_unused_darkmux_installs_no_longer_pinned() {
     let (_d, root) = a_dir();
     let (source, toolchains) = a_source(&root);
     let kept = install(&pin_of(&source, 26), &toolchains, &source).unwrap();
@@ -574,6 +649,7 @@ fn cleanup_removes_only_darkmux_installs_no_longer_pinned() {
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         if let Some(m) = marker {
             std::fs::write(dir.join(MARKER), m).unwrap();
+            std::fs::write(dir.join(USED), "").unwrap();
         }
         dir
     };
@@ -590,21 +666,31 @@ fn cleanup_removes_only_darkmux_installs_no_longer_pinned() {
     std::os::unix::fs::symlink(&outside, toolchains.join("node-1.0.0-x")).unwrap();
     std::fs::write(toolchains.join("node-9.0.0-x"), "a file").unwrap();
     let crashed = make(".node-26.13.1-darwin-arm64.1-a-0.partial", None);
-    let mtime = std::fs::metadata(&crashed).unwrap().modified().unwrap();
+    let (made, used) = (mtime(&crashed), mtime(&old.join(USED)));
     assert_eq!(
-        remove_unpinned(&toolchains, &source.pins, mtime + Duration::from_secs(60)),
-        vec![old.clone()]
+        remove_unpinned(&toolchains, &source.pins, made + Duration::from_secs(60)),
+        Vec::<PathBuf>::new()
+    );
+    assert_eq!(
+        remove_unpinned(
+            &toolchains,
+            &source.pins,
+            made + STALE_PARTIAL + Duration::from_secs(1)
+        ),
+        vec![crashed.clone()]
     );
     assert!(
-        crashed.exists(),
-        "a staging folder a live install may still be writing was removed"
+        old.exists(),
+        "an unpinned install used within the week was removed"
     );
-    let removed = remove_unpinned(
-        &toolchains,
-        &source.pins,
-        mtime + STALE_PARTIAL + Duration::from_secs(1),
+    assert_eq!(
+        remove_unpinned(
+            &toolchains,
+            &source.pins,
+            used + UNUSED_FOR + Duration::from_secs(1)
+        ),
+        vec![old.clone()]
     );
-    assert_eq!(removed, vec![crashed.clone()]);
     for stays in [
         &kept.dir,
         &foreign,
@@ -625,16 +711,65 @@ fn cleanup_removes_only_darkmux_installs_no_longer_pinned() {
     );
 }
 
-/// (#3561) A new install removes the builds this binary no longer pins.
+/// (#3561 review) A new install removes an unpinned build unused for a
+/// week, and keeps one a still-running older darkmux used today (its
+/// sandboxes run on it).
 #[test]
-fn a_new_install_removes_unpinned_builds() {
+fn a_new_install_removes_only_unpinned_builds_unused_for_a_week() {
     let (_d, root) = a_dir();
     let (source, toolchains) = a_source(&root);
-    let old = toolchains.join("node-20.20.2-darwin-arm64");
-    std::fs::create_dir_all(&old).unwrap();
-    std::fs::write(old.join(MARKER), "node 20.20.2 darwin-arm64 sha256 abc\n").unwrap();
+    let unpinned = |name: &str| {
+        let dir = toolchains.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(MARKER), "node 20.20.2 darwin-arm64 sha256 abc\n").unwrap();
+        std::fs::write(dir.join(USED), "").unwrap();
+        dir
+    };
+    let (stale, live) = (
+        unpinned("node-20.20.2-darwin-arm64"),
+        unpinned("node-20.19.0-darwin-arm64"),
+    );
+    set_mtime(
+        &stale.join(USED),
+        mtime(&stale.join(USED)) - UNUSED_FOR - Duration::from_secs(60),
+    );
     install(&pin_of(&source, 24), &toolchains, &source).unwrap();
-    assert!(!old.exists());
+    assert!(
+        !stale.exists(),
+        "an unpinned build unused for a week stayed"
+    );
+    assert!(live.exists(), "an unpinned build in use today was removed");
+}
+
+/// (#3561 review) Using an install stamps it, at most once a day: a stamp
+/// older than [`USE_STAMP_EVERY`] is renewed, a fresher one is left as it
+/// is (no write on every sandbox start).
+#[test]
+fn using_an_install_stamps_it_at_most_daily() {
+    let (_d, root) = a_dir();
+    let (source, toolchains) = a_source(&root);
+    let pin = pin_of(&source, 26);
+    let got = install(&pin, &toolchains, &source).unwrap();
+    let stamp = got.dir.join(USED);
+    let fresh = mtime(&stamp);
+    let recent = fresh - Duration::from_secs(3600);
+    set_mtime(&stamp, recent);
+    installed(&NODE, &pin, &toolchains).unwrap().unwrap();
+    assert_eq!(
+        mtime(&stamp),
+        recent,
+        "a stamp under a day old was rewritten"
+    );
+    let old = fresh - USE_STAMP_EVERY - Duration::from_secs(60);
+    set_mtime(&stamp, old);
+    installed(&NODE, &pin, &toolchains).unwrap().unwrap();
+    assert!(
+        mtime(&stamp) > old + USE_STAMP_EVERY,
+        "a day-old stamp was not renewed"
+    );
+    std::fs::remove_file(&stamp).unwrap();
+    installed(&NODE, &pin, &toolchains).unwrap().unwrap();
+    assert!(stamp.exists(), "a missing stamp was not written");
 }
 
 /// (#3561) `provide`: the project's declaration picks the pin, which is
@@ -820,6 +955,8 @@ function express() {
   out.explicit_any4 = (await on(add(http.createServer(handler)), 0, '0.0.0.0')).address;
   out.explicit_any6 = (await on(add(http.createServer(handler)), 0, '::')).address;
   out.options_any4 = (await on(add(http.createServer(handler)), { port: 0, host: '0.0.0.0' })).address;
+  out.ipv6_only = (await on(add(http.createServer(handler)), { port: 0, ipv6Only: true })).address;
+  out.empty_host = (await on(add(http.createServer(handler)), 0, '')).address;
   const sock = path.join(process.argv[2], 'n3561.sock');
   try { fs.unlinkSync(sock); } catch (_) {}
   out.unix = await on(add(http.createServer(handler)), sock);
@@ -904,6 +1041,7 @@ pub(super) fn check_listen_preload(node: &Path) {
         "undefined_host",
         "options",
         "express",
+        "ipv6_only",
     ] {
         assert_eq!(
             with[key],
@@ -934,6 +1072,10 @@ pub(super) fn check_listen_preload(node: &Path) {
         with["unix"],
         root.join("n3561.sock").display().to_string(),
         "{with}"
+    );
+    assert_eq!(
+        with["empty_host"], "::",
+        "an empty host is left as asked (every address, which the watch stops): {with}"
     );
     let esm = run_checks(node, &root, "server.mjs", LISTEN_CHECK_ESM, Some(&preload));
     assert_eq!(esm["esm"], "127.0.0.1", "{esm}");

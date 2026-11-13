@@ -6442,6 +6442,53 @@ S(("127.0.0.1", port), H).serve_forever()
         assert_eq!(got.path.as_deref(), Some(want.as_str()));
     }
 
+    /// (#3561 review) A dispatch whose toolchain is refused ends in one
+    /// `dispatch.error` carrying the refusal's own reason, never the guard's
+    /// generic early return: when no sandbox can run here, and when the
+    /// workspace declares a Node darkmux will not read (refused before any
+    /// fetch).
+    #[test]
+    #[serial_test::serial]
+    fn a_refused_toolchain_ends_the_dispatch_with_its_own_reason() {
+        let home = tempfile::TempDir::new().unwrap();
+        let ws = home.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join(".nvmrc"), "latest\n").unwrap();
+        let prev = std::env::var_os("DARKMUX_HOME");
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+        let opts = dispatch_preflight_probe_opts();
+        let mut terminals = Vec::new();
+        for kind in [Err("no sandbox runs here: n3561".to_string()), Ok(darkmux_sandbox::BackendKind::Seatbelt)] {
+            let execution = darkmux_types::execution_id::ExecutionId::mint();
+            let mut closed: Vec<darkmux_flow::FlowRecord> = Vec::new();
+            let err = {
+                let mut sink = |r: darkmux_flow::FlowRecord| closed.push(r);
+                let mut bookend = DispatchBookendGuard::new(&mut sink, opts.role_id.clone(), opts.session.clone(), execution.clone(), "m".into(), None, None);
+                bookend.open(crate::dispatch::build_dispatch_record(
+                    darkmux_flow::Level::Info,
+                    &opts.role_id,
+                    &opts.session,
+                    &execution,
+                    Some("m"),
+                    None,
+                    darkmux_flow::Payload::DispatchStart(DispatchStartPayload::default()),
+                ));
+                let ask = ToolchainFor { kind, workspace: &ws, model: "m", endpoint: None };
+                container_toolchain(&opts, &execution, ask, &mut bookend, std::time::Instant::now()).unwrap_err()
+            };
+            let records: Vec<serde_json::Value> = closed.iter().map(|r| serde_json::to_value(r).unwrap()).collect();
+            let actions: Vec<&str> = records.iter().filter_map(|r| r["action"].as_str()).collect();
+            assert_eq!(actions, ["dispatch.start", "dispatch.error"], "{records:?}");
+            assert_eq!(records[1]["payload"]["error"], format!("{err:#}"), "the terminal names the real reason: {}", records[1]);
+            terminals.push(format!("{err:#}"));
+        }
+        unsafe {
+            match prev { Some(v) => std::env::set_var("DARKMUX_HOME", v), None => std::env::remove_var("DARKMUX_HOME") }
+        }
+        assert!(terminals[0].contains("no sandbox runs here: n3561"), "{terminals:?}");
+        assert!(terminals[1].contains("cannot read"), "{terminals:?}");
+    }
+
     /// An executable file (mode 755) at `path`, its directory created.
     fn an_executable(path: &Path, body: &str) {
         use std::os::unix::fs::PermissionsExt;

@@ -25,8 +25,8 @@
 //!   `~/.darkmux/toolchains/<runtime>-<version>-<platform>/`.
 //! - **Sandbox:** each install's `bin` first on the PATH, its folder
 //!   granted read-only ([`Installed::managed`], through
-//!   `darkmux_sandbox::toolchain`). Nothing else of `~/.darkmux` becomes
-//!   readable.
+//!   `darkmux_sandbox::toolchain`). No other part of `~/.darkmux` is added to
+//!   what a sandbox reads.
 //! - **Reporting:** a fetch writes `toolchain.fetch`, then `toolchain.ready`
 //!   or `toolchain.error` ([`for_sandbox`]); a preview also shows it as a
 //!   stage. A failure refuses the sandbox with the reason and the fix, and
@@ -45,6 +45,7 @@ mod tests;
 
 pub use install::{
     ensure, installed, remove_unpinned, Installed, Note, DOWNLOAD_BOUND, MARKER, STALE_PARTIAL,
+    UNUSED_FOR, USED, USE_STAMP_EVERY,
 };
 pub use node::NODE;
 pub use node_version::{choose, declared_in, Declared, Request};

@@ -585,7 +585,6 @@ pub enum ContainerHostAccess {
     HostGateway,
 }
 
-/// The strategy for the OS this binary was built for.
 /// (#3561) The two kernels Node.js publishes builds for that darkmux pins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NodeOs {
@@ -606,6 +605,7 @@ pub(crate) fn node_release_platform_for(os: NodeOs, arch: &str) -> Option<&'stat
     }
 }
 
+/// The strategy for the OS this binary was built for.
 pub fn current() -> &'static dyn Platform {
     #[cfg(target_os = "macos")]
     {
