@@ -1037,7 +1037,7 @@ mod landlock_only {
         use std::os::fd::FromRawFd;
         let (mut leader, mut terminal) = (0, 0);
         // SAFETY: openpty writes the two descriptors it opens.
-        let opened = unsafe { libc::openpty(&mut leader, &mut terminal, std::ptr::null_mut(), std::ptr::null(), std::ptr::null()) };
+        let opened = unsafe { libc::openpty(&mut leader, &mut terminal, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) };
         assert_eq!(opened, 0, "no pseudo-terminal");
         // SAFETY: each descriptor was just opened and is owned once.
         let (_leader, terminal) = unsafe { (std::fs::File::from_raw_fd(leader), std::fs::File::from_raw_fd(terminal)) };
@@ -1142,7 +1142,8 @@ for label, name, args in (
     ('request_key', 'request_key', (0, 0, 0, 0)),
     ('bpf', 'bpf', (0, 0, 0)),
     ('perf_event_open', 'perf_event_open', (0, 0, -1, -1, 0)),
-    ('userfaultfd', 'userfaultfd', (0,)),
+    # UFFD_USER_MODE_ONLY: allowed unprivileged even where vm.unprivileged_userfaultfd is 0.
+    ('userfaultfd', 'userfaultfd', (1,)),
     ('clone3', 'clone3', (0, 0)),
     ('clone-newuser', 'clone', (CLONE_NEWUSER | SIGCHLD, 0, 0, 0, 0)),
     ('clone-fork', 'clone', (SIGCHLD, 0, 0, 0, 0)),

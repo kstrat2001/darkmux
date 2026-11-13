@@ -25,6 +25,9 @@
 //!   runs this host's programs, read-only, and `policy.image` is unused. It
 //!   needs an `entrypoint`. A toolchain installed under the user's home
 //!   (rustup's, mise's) is not visible; a mount can grant it.
+//! - **Run a 32-bit program.** The syscall filter ends a process that makes
+//!   a call under another architecture's numbers (arm32 on aarch64, i386 on
+//!   x86_64); Docker's default profile allows them.
 //! - **Limit memory or processes, or switch user.** `limits` and `user` are
 //!   unused; the process runs as the caller's user.
 //! - **Bind a port on the loopback only.** The default network is the
@@ -156,7 +159,8 @@ pub struct LandlockBackend;
 
 impl LandlockBackend {
     /// Whether this host can run one, or why not. The kernel is asked once
-    /// per process (a fork, about a millisecond); every later call, and
+    /// per process (two short-lived children that try the namespaces and a
+    /// root built in them, about a millisecond); every later call, and
     /// [`backend`](crate::backend) calls it often, reads that answer.
     pub fn available() -> Result<(), String> {
         static REFUSAL: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
@@ -564,7 +568,8 @@ mod tests {
         let prev = std::env::var_os(STATE_DIR_ENV);
         unsafe { std::env::set_var(STATE_DIR_ENV, root.path()) };
         let backend = LandlockBackend;
-        let lifecycle: [(&str, fn(&LandlockBackend, &SandboxHandle) -> Command); 3] = [
+        type Plan = fn(&LandlockBackend, &SandboxHandle) -> Command;
+        let lifecycle: [(&str, Plan); 3] = [
             ("kill", |b, h| b.kill(h)),
             ("stop", |b, h| b.stop(h, std::time::Duration::ZERO)),
             ("remove", |b, h| b.remove(h)),

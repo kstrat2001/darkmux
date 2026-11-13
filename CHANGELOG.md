@@ -18,14 +18,15 @@ darkmux release.
 
 - **On a Mac, darkmux needs no Docker: the sandbox is a setting, and macOS's own is the default
   (#3112).** New setting `runtime.sandbox` (env `DARKMUX_SANDBOX`, `config.json` schema 2.9):
-  `docker` or `seatbelt`, the sandbox every isolated run uses (a dispatch, a lab run's verify
+  `docker`, `seatbelt` or `landlock` (next entry), the sandbox every isolated run uses (a dispatch, a lab run's verify
   command and grader suites, the mods gate). Unset, the platform decides: `seatbelt` (macOS's
-  `sandbox-exec`) on a Mac that has it, `docker` on Linux and everywhere else. Any other value is
+  `sandbox-exec`) on a Mac that has it, `landlock` on a Linux that can confine a process (next
+  entry), `docker` everywhere else. Any other value is
   refused by every entry point, naming the key, and `darkmux doctor` fails it; `seatbelt` on a host
   without `sandbox-exec` is refused too. `darkmux doctor` gains a `sandbox` row (the sandbox in
   effect, where the value came from, and whether it can run here) and asks Docker's rows
   (`docker runtime`, `daemon docker`, `runtime image freshness`, `runtime binary cache`,
-  `container user`) only under Docker; under Seatbelt each says Docker is not needed. `/health`
+  `container user`) only under Docker; under Seatbelt or Landlock each says Docker is not needed. `/health`
   gains `sandbox` (the daemon's own) and `sandbox_configured` (the setting now; a running daemon
   keeps its own until it restarts, the processes it starts read the setting fresh), and answers
   `docker_on_path` only when either is Docker; doctor's `daemon sandbox` row warns when the two

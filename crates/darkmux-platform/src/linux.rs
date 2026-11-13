@@ -130,8 +130,8 @@ impl Platform for LinuxPlatform {
         pid_namespace_from_link(&read_link("/proc/self/ns/pid")?)
     }
 
-    /// (#3112) The kernel's Landlock ABI, and a user namespace tried in a
-    /// short-lived child.
+    /// (#3112) The kernel's Landlock ABI, and what a sandbox needs (the
+    /// namespaces, then a root built in them) tried in short-lived children.
     fn confine_support(&self) -> crate::confine::ConfineSupport {
         crate::confine::support()
     }
