@@ -839,7 +839,10 @@ mod tests {
             let took = started.elapsed();
             eprintln!("{file}: {} bytes, {} candidates checked: {took:?}", page.len(), page.matches('e').count());
             assert_eq!(found.len(), *want, "{file}: {found:?}");
-            assert!(took < std::time::Duration::from_secs(1), "{file}: took {took:?}");
+            // Linear is about 0.6 s per page in a debug build on a fast Mac,
+            // slower on a CI runner; quadratic is hours. 10 s keeps that gap
+            // without flaking on a loaded machine.
+            assert!(took < std::time::Duration::from_secs(10), "{file}: took {took:?}");
         }
     }
 
