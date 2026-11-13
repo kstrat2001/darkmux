@@ -199,6 +199,18 @@ impl Platform for MacPlatform {
         netstat_tcp().and_then(|out| crate::port_listeners_from_netstat(&out, port))
     }
 
+    /// (#3559) In-process, no command spawned: the process table from
+    /// libproc (`proc_listallpids`, then each process's `PROC_PIDTBSDINFO`,
+    /// which answers for this user's processes), then each member's own open
+    /// files (`PROC_PIDLISTFDS`, and `PROC_PIDFDSOCKETINFO` for each socket).
+    fn tcp_listeners_held_by(&self, leader: u32) -> Option<Vec<(u16, crate::PortListener)>> {
+        let mut held = Vec::new();
+        for pid in crate::sandbox_members(leader, &process_table()?) {
+            held.extend(listeners_held_by_pid(pid)?);
+        }
+        Some(held)
+    }
+
     fn process_group(&self, pid: u32) -> Option<u32> {
         crate::unix_process_group(pid)
     }
@@ -647,6 +659,240 @@ fn lsof_listen_pids(port: u16) -> Option<String> {
 
 #[cfg(not(target_os = "macos"))]
 fn lsof_listen_pids(_port: u16) -> Option<String> {
+    None
+}
+
+/// (#3559) What libproc's socket and process reads come to, compiled on
+/// every OS so its parsing is tested everywhere; only macOS calls it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) mod libproc {
+    /// (#3559) The size of `struct socket_fdinfo` (`<sys/proc_info.h>`), what
+    /// `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)` fills: measured with clang's
+    /// `sizeof` on macOS 26.6. A record of any other size is no answer. The
+    /// risk that follows, stated: should a later macOS grow the struct, the
+    /// kernel refuses this buffer (`ENOMEM`), every look at a sandbox holding
+    /// a socket cannot read, and every Seatbelt dispatch with one is stopped
+    /// after two looks (it fails closed, loudly, naming why). Re-measure
+    /// with `offsetof` then.
+    pub(crate) const SOCKET_FDINFO_SIZE: usize = 792;
+
+    /// (#3559) One socket's `struct socket_fdinfo`, held by `pid`, as a TCP
+    /// listener: `None` for any other socket.
+    pub(crate) fn listener_in_fdinfo(info: &[u8], pid: u32, scope_name: impl Fn(u32) -> Option<String>) -> Option<(u16, crate::PortListener)> {
+        let int = |at: usize| info.get(at..at + 4).map(|b| i32::from_ne_bytes([b[0], b[1], b[2], b[3]]));
+        if info.len() < SOCKET_FDINFO_SIZE || int(SOI_KIND)? != SOCKINFO_TCP || int(TCPSI_STATE)? != TSI_S_LISTEN {
+            return None;
+        }
+        let port = u16::from_be_bytes([info[INSI_LPORT], info[INSI_LPORT + 1]]);
+        let vflag = info[INSI_VFLAG];
+        let (addr, scope) = if vflag & INI_IPV6 != 0 {
+            let (v6, index) = local_v6(info);
+            (std::net::IpAddr::V6(v6), index.and_then(scope_name))
+        } else if vflag & INI_IPV4 != 0 {
+            let b = &info[INSI_LADDR4..INSI_LADDR4 + 4];
+            (std::net::IpAddr::from([b[0], b[1], b[2], b[3]]), None)
+        } else {
+            return None;
+        };
+        Some((port, crate::PortListener { addr: Some(addr), text: addr.to_string(), scope, pid: Some(pid) }))
+    }
+
+    /// Offsets in `struct socket_fdinfo`, measured with clang's `offsetof` on
+    /// macOS 26.6: `psi.soi_kind`, then in `psi.soi_proto.pri_tcp`:
+    /// `tcpsi_ini.insi_lport` (the port in network order, in an `int`),
+    /// `.insi_vflag`, `.insi_laddr` (an `in6_addr`, its IPv4 form 12 bytes in),
+    /// `.insi_v6.in6_ifindex`, and `tcpsi_state`.
+    const SOI_KIND: usize = 256;
+    const INSI_LPORT: usize = 268;
+    const INSI_VFLAG: usize = 288;
+    const INSI_LADDR6: usize = 312;
+    const INSI_LADDR4: usize = 324;
+    const IN6_IFINDEX: usize = 340;
+    const TCPSI_STATE: usize = 344;
+    /// `soi_kind` of a TCP socket, `tcpsi_state` of a listening one, and the
+    /// address family flags of `insi_vflag`.
+    const SOCKINFO_TCP: i32 = 2;
+    const TSI_S_LISTEN: i32 = 1;
+    const INI_IPV4: u8 = 1;
+    const INI_IPV6: u8 = 2;
+
+    /// A socket record's IPv6 local address, and for a link-local one its
+    /// scope's interface index: the kernel's own form embeds it in the second
+    /// 16-bit word (cleared here, as `lsof` does), else the socket's
+    /// `in6_ifindex` gives it.
+    fn local_v6(info: &[u8]) -> (std::net::Ipv6Addr, Option<u32>) {
+        let mut octets = [0u8; 16];
+        octets.copy_from_slice(&info[INSI_LADDR6..INSI_LADDR6 + 16]);
+        if !(octets[0] == 0xfe && octets[1] & 0xc0 == 0x80) {
+            return (octets.into(), None);
+        }
+        let embedded = u16::from_be_bytes([octets[2], octets[3]]);
+        octets[2..4].fill(0);
+        let index = if embedded != 0 { embedded } else { u16::from_ne_bytes([info[IN6_IFINDEX], info[IN6_IFINDEX + 1]]) };
+        (octets.into(), (index != 0).then_some(u32::from(index)))
+    }
+
+    /// (#3559) `proc_pidinfo` and `proc_pidfdinfo` flavors (`<sys/proc_info.h>`)
+    /// the libc crate does not name.
+    pub(crate) const PROC_PIDLISTFDS: i32 = 1;
+    pub(crate) const PROC_PIDFDSOCKETINFO: i32 = 3;
+
+    /// What one libproc read of a process came to: the whole record, nothing
+    /// because the process or the file is gone (`ESRCH`, `EBADF`, `ENOTSOCK`:
+    /// it exited, or closed the descriptor since it was listed, or reused it
+    /// for a file), or no answer.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(crate) enum LibprocRead {
+        Read,
+        Gone,
+        Unreadable,
+    }
+
+    /// A libproc call's result `got` (bytes, 0 on failure) against the `want`ed
+    /// size, and the `errno` it left (cleared before the call). A call that
+    /// reads nothing and sets no error read an empty answer.
+    pub(crate) fn libproc_read(got: i32, want: Option<i32>, errno: i32) -> LibprocRead {
+        const ESRCH: i32 = 3;
+        const EBADF: i32 = 9;
+        const ENOTSOCK: i32 = 38;
+        match (got, errno) {
+            (g, _) if g > 0 && want.is_none_or(|w| g == w) => LibprocRead::Read,
+            (0, 0) if want.is_none() => LibprocRead::Read,
+            (g, ESRCH | EBADF | ENOTSOCK) if g <= 0 => LibprocRead::Gone,
+            _ => LibprocRead::Unreadable,
+        }
+    }
+
+    /// (#3559) A process's TCP listeners from its socket descriptors `fds`,
+    /// each read by `read` (which fills the record and returns libproc's
+    /// result and the errno it left): `None` as soon as one read is refused
+    /// (it cannot be vouched for), never a partial answer. A descriptor gone
+    /// since it was listed is skipped.
+    pub(crate) fn listeners_in_records(
+        pid: u32,
+        fds: &[i32],
+        mut read: impl FnMut(i32, &mut [u8]) -> (i32, i32),
+        scope_name: impl Fn(u32) -> Option<String>,
+    ) -> Option<Vec<(u16, crate::PortListener)>> {
+        let mut held = Vec::new();
+        for &fd in fds {
+            let mut info = vec![0u8; SOCKET_FDINFO_SIZE];
+            let (got, errno) = read(fd, &mut info);
+            match libproc_read(got, Some(SOCKET_FDINFO_SIZE as i32), errno) {
+                LibprocRead::Read => held.extend(listener_in_fdinfo(&info, pid, &scope_name)),
+                LibprocRead::Gone => {}
+                LibprocRead::Unreadable => return None,
+            }
+        }
+        Some(held)
+    }
+
+    /// (#3559) The socket descriptors in a `PROC_PIDLISTFDS` answer of `got`
+    /// bytes (and the errno it left) over `entries` (`(fd, type)`): none for
+    /// a process that has exited, `None` when the list was refused.
+    pub(crate) fn socket_fds_in(got: i32, errno: i32, entries: &[(i32, u32)]) -> Option<Vec<i32>> {
+        /// `PROX_FDTYPE_SOCKET`, and the size of one `struct proc_fdinfo`.
+        const SOCKET: u32 = 2;
+        const ENTRY: usize = 8;
+        match libproc_read(got, None, errno) {
+            LibprocRead::Read => {}
+            LibprocRead::Gone => return Some(Vec::new()),
+            LibprocRead::Unreadable => return None,
+        }
+        let listed = usize::try_from(got).unwrap_or(0) / ENTRY;
+        Some(entries.iter().take(listed).filter(|(_, kind)| *kind == SOCKET).map(|(fd, _)| *fd).collect())
+    }
+}
+
+#[cfg(target_os = "macos")]
+use libproc::{listeners_in_records, socket_fds_in, PROC_PIDFDSOCKETINFO, PROC_PIDLISTFDS};
+
+/// `(pid, ppid, pgid, sid)` of every process this user's libproc reads
+/// answer for; `None` when the pid list cannot be read.
+#[cfg(target_os = "macos")]
+fn process_table() -> Option<Vec<(u32, u32, u32, u32)>> {
+    // SAFETY: a null buffer asks for the number of pids.
+    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    let mut pids: Vec<libc::pid_t> = vec![0; usize::try_from(count).ok()?.max(1) * 2];
+    // SAFETY: `pids` holds as many bytes as the size given.
+    let got = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int) };
+    // A full buffer may have left some out: no answer, never a partial one.
+    let got = usize::try_from(got).ok().filter(|g| *g > 0 && *g < pids.len())?;
+    Some(pids[..got].iter().filter_map(|&pid| bsd_ids(pid)).collect())
+}
+
+/// One process's `(pid, ppid, pgid, sid)` from `PROC_PIDTBSDINFO` and
+/// `getsid`, when it is one this user can read and still exists.
+#[cfg(target_os = "macos")]
+fn bsd_ids(pid: libc::pid_t) -> Option<(u32, u32, u32, u32)> {
+    // SAFETY: a plain C struct of integers, all-zero is a valid value.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `info` is a `proc_bsdinfo` of `size` bytes.
+    let got = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&mut info as *mut libc::proc_bsdinfo).cast(), size) };
+    // SAFETY: a plain query of a pid.
+    let sid = u32::try_from(unsafe { libc::getsid(pid) }).ok()?;
+    (pid > 0 && got == size).then_some((info.pbi_pid, info.pbi_ppid, info.pbi_pgid, sid))
+}
+
+/// The TCP listeners among `pid`'s open files; `None` when they cannot be
+/// read. A process that exited since it was listed holds none.
+#[cfg(target_os = "macos")]
+pub(crate) fn listeners_held_by_pid(pid: u32) -> Option<Vec<(u16, crate::PortListener)>> {
+    let p = libc::pid_t::try_from(pid).ok()?;
+    let read = |fd: i32, info: &mut [u8]| {
+        clear_errno();
+        // SAFETY: `info` holds as many bytes as the size given.
+        let got = unsafe { libc::proc_pidfdinfo(p, fd, PROC_PIDFDSOCKETINFO, info.as_mut_ptr().cast(), info.len() as libc::c_int) };
+        (got, errno())
+    };
+    listeners_in_records(pid, &socket_fds(p)?, read, interface_name)
+}
+
+/// `pid`'s socket file descriptors (`PROC_PIDLISTFDS`); empty when it has
+/// exited, `None` when they cannot be read.
+#[cfg(target_os = "macos")]
+fn socket_fds(pid: libc::pid_t) -> Option<Vec<i32>> {
+    let entry = std::mem::size_of::<libc::proc_fdinfo>();
+    // SAFETY: a null buffer asks for the size the list needs.
+    let need = unsafe { libc::proc_pidinfo(pid, PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+    let mut fds = vec![libc::proc_fdinfo { proc_fd: 0, proc_fdtype: 0 }; usize::try_from(need).unwrap_or(0) / entry + 16];
+    clear_errno();
+    // SAFETY: `fds` holds as many bytes as the size given.
+    let got = unsafe { libc::proc_pidinfo(pid, PROC_PIDLISTFDS, 0, fds.as_mut_ptr().cast(), (fds.len() * entry) as libc::c_int) };
+    let errno = errno();
+    socket_fds_in(got, errno, &fds.iter().map(|f| (f.proc_fd, f.proc_fdtype)).collect::<Vec<_>>())
+}
+
+/// The name of interface `index` (`lo0`), when it has one.
+#[cfg(target_os = "macos")]
+fn interface_name(index: u32) -> Option<String> {
+    // IFNAMSIZ on macOS.
+    let mut buf = [0 as libc::c_char; 16];
+    // SAFETY: `buf` is IFNAMSIZ bytes, what `if_indextoname` writes at most.
+    let name = unsafe { libc::if_indextoname(index, buf.as_mut_ptr()) };
+    // SAFETY: on success, a NUL-terminated name in `buf`.
+    (!name.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy().into_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn clear_errno() {
+    // SAFETY: this thread's errno slot.
+    unsafe { *libc::__error() = 0 };
+}
+
+#[cfg(target_os = "macos")]
+fn errno() -> i32 {
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn process_table() -> Option<Vec<(u32, u32, u32, u32)>> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn listeners_held_by_pid(_pid: u32) -> Option<Vec<(u16, crate::PortListener)>> {
     None
 }
 

@@ -190,6 +190,9 @@ pub mod runtime_image;
 /// sender's local dispatch and a fleet peer that runs it for the sender.
 pub mod radio_persona;
 pub mod select;
+/// (#3559) The watch that stops a sandbox on the host listening beyond the
+/// loopback, which its kernel sandbox cannot prevent.
+pub mod sandbox_listeners;
 // (#2112) The `PreventUserIdleSystemSleep` RAII assertion held for a
 // mission/crawl's life — see the module doc for why it does not override a
 // thermal-emergency sleep.

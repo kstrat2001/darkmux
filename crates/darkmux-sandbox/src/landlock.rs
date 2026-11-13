@@ -30,13 +30,20 @@
 //!   x86_64); Docker's default profile allows them.
 //! - **Limit memory or processes, or switch user.** `limits` and `user` are
 //!   unused; the process runs as the caller's user.
-//! - **Bind a port on the loopback only.** The default network is the
-//!   host's: Landlock lets it bind only the policy's `ports`, but at any
-//!   address, so a published port can answer beyond the loopback if the
-//!   program binds it there. It may reach any address, the host's own
-//!   loopback services included, but no unix socket outside its mounts and
-//!   no abstract one outside the sandbox. [`Network::None`] has a loopback
-//!   of its own and nothing else.
+//! - **Bind a port on the loopback only (#3559).** The default network is
+//!   the host's: Landlock lets it bind only the policy's `ports` (none, for
+//!   a dispatch), but at any address, so a published port can answer beyond
+//!   the loopback if the program binds it there. And a `listen` on a socket
+//!   with no bind is no bind Landlock sees: the kernel binds it to every
+//!   address, on a port of its choosing, so even a policy naming no ports
+//!   can listen beyond the loopback. UDP is not filtered at all. darkmux
+//!   watches a dispatch instead: the TCP listeners its processes hold are
+//!   read every second and one beyond the loopback stops it
+//!   (`darkmux-crew`'s `sandbox_listeners`; detection with a window, not a
+//!   boundary). It may reach any address, the host's own loopback services
+//!   included, but no unix socket outside its mounts and no abstract one
+//!   outside the sandbox. [`Network::None`] has a loopback of its own and
+//!   nothing else.
 //! - **Give a terminal or `/dev/shm`.** Neither is granted: started from a
 //!   terminal, it has no controlling one and cannot open `/dev/tty`, so it
 //!   cannot type into it (`TIOCSTI`). A terminal it inherits as stdout or

@@ -178,6 +178,20 @@ pub trait Platform: Send + Sync {
     /// not to the loopback, #3559) listening beyond this machine.
     fn tcp_port_listeners(&self, port: u16) -> Option<Vec<PortListener>>;
 
+    /// (#3559) Every TCP socket listening that a sandbox on the host holds,
+    /// each with its port: the sandbox being `leader` (its launcher, which
+    /// leads its process group, and under Seatbelt its session), every
+    /// process in that group or session, and every descendant of any of
+    /// those (`sandbox_members`). Each listener's
+    /// `pid` is a process holding it, read from that process's own open
+    /// files, never the socket table's last user (netstat's pid, which still
+    /// names an opener that handed the socket to its child and exited).
+    /// `Some(vec![])` when they hold none; `None` when this platform cannot
+    /// say (the process table, or a member's open files, cannot be read),
+    /// never "none". What tells a sandbox on the host, which cannot hold a
+    /// bind to the loopback, listening beyond this machine.
+    fn tcp_listeners_held_by(&self, leader: u32) -> Option<Vec<(u16, PortListener)>>;
+
     /// The process group `pid` is in; `None` for no such process, or where
     /// the platform has no reader.
     fn process_group(&self, pid: u32) -> Option<u32>;
@@ -627,6 +641,58 @@ pub struct PortListener {
     pub pid: Option<u32>,
 }
 
+impl PortListener {
+    /// (#3559) Whether it is bound on the loopback: `127.x`, `::1`,
+    /// `::ffff:127.x`, or an address scoped to the loopback interface
+    /// (`fe80::1%lo0`). An address the platform could not read whole (cut
+    /// short) is never the loopback.
+    pub fn on_loopback(&self) -> bool {
+        let Some(addr) = self.addr else { return false };
+        let scoped = self.scope.as_deref().is_some_and(|s| s == "lo0" || s == "lo");
+        scoped
+            || match addr {
+                std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
+                v4 => v4.is_loopback(),
+            }
+    }
+
+    /// It on `port` as a message names it: `0.0.0.0:4100`, `[::]:4100`, or
+    /// a cut IPv6 address with a note that it was cut.
+    pub fn named_at(&self, port: u16) -> String {
+        match self.addr {
+            Some(addr) => std::net::SocketAddr::new(addr, port).to_string(),
+            None => format!("[{}…]:{port} (an IPv6 address netstat cut short; not a loopback one)", self.text),
+        }
+    }
+}
+
+/// (#3559) A sandbox's processes in a process table of `(pid, ppid, pgid,
+/// sid)` rows: `leader`, every process in its group or its session (an
+/// orphan the leader left among them, one in a group of its own included),
+/// and every descendant of any of those (one that started a session of its
+/// own included), ascending. A process that started a session of its own
+/// and whose parents back to one of them have all exited is not found:
+/// nothing marks it as the sandbox's. Empty for pid 0 or 1, which lead
+/// everything.
+pub(crate) fn sandbox_members(leader: u32, table: &[(u32, u32, u32, u32)]) -> Vec<u32> {
+    if leader <= 1 {
+        return Vec::new();
+    }
+    let mut members: std::collections::BTreeSet<u32> =
+        table.iter().filter(|(_, _, group, session)| *group == leader || *session == leader).map(|(pid, ..)| *pid).collect();
+    members.insert(leader);
+    // Each pass adds the children of what is already in; a table is finite,
+    // so it settles.
+    loop {
+        let before = members.len();
+        let children: Vec<u32> = table.iter().filter(|(_, parent, ..)| members.contains(parent)).map(|(pid, ..)| *pid).collect();
+        members.extend(children);
+        if members.len() == before {
+            return members.into_iter().collect();
+        }
+    }
+}
+
 /// (#3112) The listeners on `port` in `netstat -anv -p tcp`'s answer. Its
 /// columns: proto, the two queues, the local address (`<addr>.<port>`, `*`
 /// for every address), the foreign one, the state, four counters, then
@@ -713,6 +779,26 @@ pub(crate) fn peers_from_lsof_fpn(out: &str, local: std::net::SocketAddr) -> Vec
         }
     }
     peers
+}
+
+/// (#3559) Starts `cmd` as the leader of a session of its own (`setsid`):
+/// its process group is its own pid, as `process_group(0)` would give, it
+/// has no controlling terminal, and no process it starts can move into a
+/// process group outside that session (`setpgid` across sessions is
+/// refused). Do not also set `process_group`: a group leader cannot start
+/// a session, so the spawn fails.
+pub fn in_a_session_of_its_own(cmd: &mut std::process::Command) {
+    #[cfg(unix)]
+    // SAFETY: the hook runs in the forked child before exec and calls only
+    // `setsid`, which is async-signal-safe.
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(cmd, || match libc::setsid() {
+            -1 => Err(std::io::Error::last_os_error()),
+            _ => Ok(()),
+        });
+    }
+    #[cfg(not(unix))]
+    let _ = cmd;
 }
 
 /// `getpgid(pid)`, shared by the Unix strategies.
