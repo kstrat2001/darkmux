@@ -8,9 +8,14 @@
 //! its secrets, a few device files, its mounts (read-only ones are read-only
 //! mounts, so renaming a directory above one does not free it), its own
 //! `tmp`, and a `/proc` that shows only its own processes. Everything else,
-//! the user's home included, does not exist there. Its first process is an
-//! init; when the program exits, everything left in the sandbox ends with
-//! it, a descendant that left the process group included.
+//! the user's home included, does not exist there. `/tmp` there is empty and
+//! read-only: its own `tmp` is `TMPDIR` (and `HOME`), the one place it may
+//! write outside its mounts. Its first process is an init; when the program
+//! exits, everything left in the sandbox ends with it, a descendant that
+//! left the process group included. The program leads a session of its own,
+//! with no controlling terminal, and a syscall filter refuses the kernel
+//! calls Docker's default seccomp profile refuses that a sandbox never needs
+//! ([`darkmux_platform::confine`] lists them).
 //!
 //! What it cannot do, against Docker:
 //! - **Place a mount elsewhere.** A mount is seen at its own (canonical)
@@ -29,7 +34,11 @@
 //!   loopback services included, but no unix socket outside its mounts and
 //!   no abstract one outside the sandbox. [`Network::None`] has a loopback
 //!   of its own and nothing else.
-//! - **Give a pty or `/dev/shm`.** Neither is granted.
+//! - **Give a terminal or `/dev/shm`.** Neither is granted: started from a
+//!   terminal, it has no controlling one and cannot open `/dev/tty`, so it
+//!   cannot type into it (`TIOCSTI`). A terminal it inherits as stdout or
+//!   stderr can still be written to, escape sequences included, as under
+//!   `docker run -t`.
 //!
 //! It needs Landlock ABI 6 (Linux 6.12) and unprivileged user namespaces;
 //! [`LandlockBackend::available`] says why not where either is missing, and
@@ -92,8 +101,9 @@ const DENIED_ETC: &[&str] = &[
 /// `/dev` describe the host, not the sandbox.
 const KERNEL_TREES: &[&str] = &["/proc", "/sys", "/dev"];
 
-/// Device files every sandbox may read and write.
-const DEVICES: &[&str] = &["/dev/null", "/dev/zero", "/dev/full", "/dev/random", "/dev/urandom", "/dev/tty"];
+/// Device files every sandbox may read and write. Not `/dev/tty`: the
+/// program has no controlling terminal.
+const DEVICES: &[&str] = &["/dev/null", "/dev/zero", "/dev/full", "/dev/random", "/dev/urandom"];
 
 /// Env override of [`state_root`], for tests (the same variable Seatbelt's
 /// state directory reads).
@@ -542,24 +552,48 @@ mod tests {
         helper_if_asked(Vec::new());
     }
 
-    /// A kill finds a sandbox only by its launcher's own pid and start
-    /// time: a recorded pid now held by another process (reused, or another
-    /// sandbox's launcher) is not killed.
+    /// A kill, a stop and a remove each find a sandbox only by its
+    /// launcher's own pid and start time: a recorded pid now held by another
+    /// live process (reused, or another sandbox's launcher), a group leader
+    /// like a launcher, is never signaled.
     #[test]
-    fn a_kill_never_signals_a_process_that_reused_the_pid() {
+    #[serial_test::serial]
+    fn kill_stop_and_remove_never_signal_a_process_that_reused_the_pid() {
+        use std::os::unix::process::CommandExt;
         let root = tempfile::TempDir::new().unwrap();
-        let d = root.path().join("darkmux-pr-1");
-        std::fs::create_dir(&d).unwrap();
-        std::fs::write(d.join("rules"), "net none\n").unwrap();
-        let mut other = Command::new("/bin/sleep").arg("30").spawn().unwrap();
-        std::fs::write(d.join("pid"), other.id().to_string()).unwrap();
-        std::fs::write(d.join("started"), "1\n").unwrap();
-        let kill = Command::new(SH).arg("-c").arg(format!("d=$1\n{OURS} && {ALIVE} || exit 1\nkill -KILL -- \"$pid\"")).arg("sh").arg(&d).status().unwrap();
-        let survived = other.try_wait().unwrap().is_none();
-        let _ = other.kill();
-        let _ = other.wait();
-        assert!(!kill.success(), "a kill claimed a process it did not start");
-        assert!(survived, "a kill signaled a process that reused the pid");
+        let prev = std::env::var_os(STATE_DIR_ENV);
+        unsafe { std::env::set_var(STATE_DIR_ENV, root.path()) };
+        let backend = LandlockBackend;
+        let lifecycle: [(&str, fn(&LandlockBackend, &SandboxHandle) -> Command); 3] = [
+            ("kill", |b, h| b.kill(h)),
+            ("stop", |b, h| b.stop(h, std::time::Duration::ZERO)),
+            ("remove", |b, h| b.remove(h)),
+        ];
+        let mut signaled = Vec::new();
+        for (verb, command) in lifecycle {
+            let name = format!("darkmux-reused-{verb}");
+            let d = root.path().join(&name);
+            std::fs::create_dir(&d).unwrap();
+            std::fs::write(d.join("rules"), "net none\n").unwrap();
+            let mut other = Command::new("/bin/sleep").arg("30").process_group(0).spawn().unwrap();
+            std::fs::write(d.join("pid"), other.id().to_string()).unwrap();
+            std::fs::write(d.join("started"), "1\n").unwrap();
+            let handle = SandboxHandle { backend: BackendKind::Landlock, id: name };
+            let _ = command(&backend, &handle).status().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if other.try_wait().unwrap().is_some() {
+                signaled.push(verb);
+            }
+            let _ = other.kill();
+            let _ = other.wait();
+        }
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(STATE_DIR_ENV, v),
+                None => std::env::remove_var(STATE_DIR_ENV),
+            }
+        }
+        assert!(signaled.is_empty(), "signaled a process that reused the pid: {signaled:?}");
     }
 
     /// A process's recorded start time matches itself: the check above

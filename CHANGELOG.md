@@ -32,6 +32,22 @@ darkmux release.
   differ. `init`'s next steps, the guide
   and the README ask for Docker only under Docker.
 
+- **On Linux, darkmux needs no Docker either: Landlock is the default sandbox where the kernel
+  can confine a process (#3112).** New `runtime.sandbox` value `landlock`: the kernel's own user,
+  mount, pid and network namespaces with Landlock on top, nothing to install. Unset, the platform
+  decides: `landlock` on a Linux with Landlock ABI 6 (Linux 6.12) and unprivileged user
+  namespaces where a sandbox's root can be built (an unprivileged container that forbids the
+  `/proc` mount is not one), `docker` on any other Linux. `darkmux doctor`'s `sandbox` row names
+  the ABI. A sandbox sees only what its policy grants, at its own host path: the system's programs
+  read-only, `/etc` without its secrets, its mounts; `/tmp` is read-only there and its own `TMPDIR`
+  is the writable one. The program has no controlling terminal (started from a terminal, it
+  cannot type into it), starts with every signal at its default, and a syscall filter refuses
+  what Docker's default seccomp profile refuses that a sandbox never needs (a namespace of its
+  own, the kernel's key store, `bpf`, `perf_event_open`, `userfaultfd`). It runs the host's
+  toolchain, so `--image` is refused, and it cannot hold a bind to the loopback (as Seatbelt,
+  #3559). **Upgrading:** a Linux user who never set `runtime.sandbox` moves from Docker to
+  Landlock, and with it loses client previews (refused under Landlock for now), `--image`, and the
+  runtime image's toolchain in a dispatch, until `darkmux config set runtime.sandbox docker`.
 - **Client previews run in the selected sandbox: Seatbelt previews, no Docker needed (#3112).**
   A preview starts in the sandbox `runtime.sandbox` names at that request, and is stopped in the
   one it started in. Under Seatbelt its dev server runs this Mac's own toolchain: each program the

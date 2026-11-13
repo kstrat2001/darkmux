@@ -14823,6 +14823,9 @@ fn init_under_seatbelt_asks_for_no_docker() {
 #[cfg(unix)]
 #[test]
 fn init_under_landlock_asks_for_no_docker() {
+    if darkmux_sandbox::LandlockBackend::available().is_err() {
+        return;
+    }
     let (home, dm) = isolated_roots();
     let lms = init_lms_stub(&home.join("stub"), r#"[{"modelKey":"only-llm","sizeBytes":2000000000,"type":"llm"}]"#);
     let out = init_with(&home, &dm, &lms, &[], &[("DARKMUX_SANDBOX", "landlock")]);
@@ -14830,6 +14833,23 @@ fn init_under_landlock_asks_for_no_docker() {
     assert!(out.contains("  3. A first dispatch, in the kernel's own sandbox (no Docker needed): `darkmux dispatch code-reviewer"), "{out}");
     let steps = &out[out.find("Next steps:").unwrap()..];
     assert!(!steps.contains("Docker running") && !steps.contains("image"), "{steps}");
+}
+
+/// (#3112) Under a sandbox that cannot run here (Seatbelt off a Mac,
+/// Landlock on one), `init` offers no first dispatch in it: it says the
+/// setting cannot run here and names the way to Docker.
+#[cfg(unix)]
+#[test]
+fn init_under_a_sandbox_that_cannot_run_here_offers_no_dispatch_in_it() {
+    let refused = if std::path::Path::new("/usr/bin/sandbox-exec").is_file() { "landlock" } else { "seatbelt" };
+    let (home, dm) = isolated_roots();
+    let lms = init_lms_stub(&home.join("stub"), r#"[{"modelKey":"only-llm","sizeBytes":2000000000,"type":"llm"}]"#);
+    let out = init_with(&home, &dm, &lms, &[], &[("DARKMUX_SANDBOX", refused)]);
+    let out = stdout_of(&out);
+    let steps = &out[out.find("Next steps:").unwrap()..];
+    let want = format!("  3. No first dispatch yet: `runtime.sandbox` `{refused}` cannot run here (`darkmux doctor` says why); `darkmux config set runtime.sandbox docker` uses Docker");
+    assert!(steps.contains(&want), "{steps}");
+    assert!(!steps.contains("own sandbox"), "{steps}");
 }
 
 #[cfg(unix)]

@@ -1026,4 +1026,135 @@ mod landlock_only {
         let p = SandboxPolicy { network: Network::Default, ports: vec![published], ..policy(&LandlockBackend, "unused", tree.path(), &script) };
         assert_eq!(run_ok(&LandlockBackend, &p).trim(), format!("bound-{published}"));
     }
+
+    /// A sandbox started from a terminal cannot type into it: the program
+    /// has no controlling terminal, so `TIOCSTI` on the terminal it
+    /// inherited is refused (where `dev.tty.legacy_tiocsti` still allows
+    /// it), and `/dev/tty` does not open.
+    #[test]
+    #[ignore = "needs Linux with Landlock ABI 6 and unprivileged user namespaces"]
+    fn a_sandbox_started_from_a_terminal_cannot_type_into_it() {
+        use std::os::fd::FromRawFd;
+        let (mut leader, mut terminal) = (0, 0);
+        // SAFETY: openpty writes the two descriptors it opens.
+        let opened = unsafe { libc::openpty(&mut leader, &mut terminal, std::ptr::null_mut(), std::ptr::null(), std::ptr::null()) };
+        assert_eq!(opened, 0, "no pseudo-terminal");
+        // SAFETY: each descriptor was just opened and is owned once.
+        let (_leader, terminal) = unsafe { (std::fs::File::from_raw_fd(leader), std::fs::File::from_raw_fd(terminal)) };
+        let path = std::fs::read_link(format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&terminal))).unwrap();
+        let script = "python3 -c \"
+import fcntl, termios
+try:
+    fcntl.ioctl(0, termios.TIOCSTI, b'X'); print('typed')
+except OSError as e:
+    print('no-typing', e.errno)
+try:
+    open('/dev/tty', 'rb'); print('tty-opened')
+except OSError as e:
+    print('no-tty', e.errno)
+\"";
+        let tree = tempfile::TempDir::new().unwrap();
+        let p = SandboxPolicy { stdin: true, ..policy(&LandlockBackend, "unused", tree.path(), script) };
+        let (planned, handle) = LandlockBackend.run(&p);
+        let _removed = Removed(&LandlockBackend, handle);
+        // The launcher as a terminal starts it: a session of its own, the
+        // terminal its controlling one and its stdin (`setsid --ctty`).
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg(r#"t=$0; exec setsid -w --ctty "$@" <"$t""#).arg(&path);
+        cmd.arg(planned.get_program()).args(planned.get_args()).env_clear();
+        cmd.envs(planned.get_envs().filter_map(|(k, v)| v.map(|v| (k, v))));
+        let ran = run_bounded(cmd, Duration::from_secs(60));
+        let said = match &ran {
+            Bounded::Finished { stdout, .. } => String::from_utf8_lossy(stdout).into_owned(),
+            other => panic!("{}", describe(other)),
+        };
+        assert!(said.contains("no-typing") && said.contains("no-tty"), "{}", describe(&ran));
+    }
+
+    /// A program starts with no signal ignored or blocked, whatever its
+    /// launcher had: `darkmux`'s own runtime ignores SIGPIPE before its
+    /// multi-call entry runs the helper, and an ignored SIGPIPE survives
+    /// exec (`cmd | head` would print "Broken pipe" and fail a pipefail
+    /// script). A test binary runs the helper before that runtime starts,
+    /// so the launcher ignores SIGPIPE (and blocks SIGUSR1) here instead.
+    #[test]
+    #[ignore = "needs Linux with Landlock ABI 6 and unprivileged user namespaces"]
+    fn a_program_starts_with_no_signal_ignored_or_blocked() {
+        use std::os::unix::process::CommandExt;
+        let tree = tempfile::TempDir::new().unwrap();
+        let p = policy(&LandlockBackend, "unused", tree.path(), "grep -E '^Sig(Blk|Ign)' /proc/self/status");
+        let (mut cmd, handle) = LandlockBackend.run(&p);
+        let _removed = Removed(&LandlockBackend, handle);
+        // SAFETY: only async-signal-safe calls between fork and exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, libc::SIGUSR1);
+                libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+                Ok(())
+            });
+        }
+        let said = match run_bounded(cmd, Duration::from_secs(60)) {
+            Bounded::Finished { success: true, stdout, .. } => String::from_utf8_lossy(&stdout).into_owned(),
+            other => panic!("{}", describe(&other)),
+        };
+        assert_eq!(said, "SigBlk:\t0000000000000000\nSigIgn:\t0000000000000000\n");
+    }
+
+    /// The kernel calls a sandbox never needs are refused, as Docker's
+    /// default seccomp profile refuses them: a namespace of its own (a new
+    /// user namespace would hand it every capability there, and with a
+    /// network namespace the kernel's packet filtering), the kernel's key
+    /// store (darkmux's own session keyring), BPF, perf events and
+    /// userfaultfd, each with EPERM; `clone3` with ENOSYS, so a C library
+    /// falls back to `clone`, whose namespace flags are refused too. A plain
+    /// fork still works.
+    #[test]
+    #[ignore = "needs Linux with Landlock ABI 6 and unprivileged user namespaces"]
+    fn the_kernel_calls_a_sandbox_never_needs_are_refused() {
+        // Each call's number on the two architectures darkmux runs on.
+        let script = r#"python3 -c "
+import ctypes, os, platform
+NR = {'aarch64': dict(unshare=97, setns=268, keyctl=219, add_key=217, request_key=218, bpf=280, perf_event_open=241, userfaultfd=282, clone=220, clone3=435),
+      'x86_64': dict(unshare=272, setns=308, keyctl=250, add_key=248, request_key=249, bpf=321, perf_event_open=298, userfaultfd=323, clone=56, clone3=435)}[platform.machine()]
+libc = ctypes.CDLL(None, use_errno=True)
+CLONE_NEWUSER, CLONE_NEWNET, SIGCHLD = 0x10000000, 0x40000000, 17
+# Each call in a child of its own: one that succeeds (a new namespace)
+# changes what the next one sees. A child exits with the call's errno.
+def errno_of(name, *args):
+    child = os.fork()
+    if child == 0:
+        r = libc.syscall(ctypes.c_long(NR[name]), *[ctypes.c_long(a) for a in args])
+        if r == 0 and name == 'clone':
+            os._exit(0)
+        if r > 0 and name == 'clone':
+            os.waitpid(r, 0)
+        os._exit(0 if r >= 0 else ctypes.get_errno())
+    return os.waitstatus_to_exitcode(os.waitpid(child, 0)[1])
+for label, name, args in (
+    ('unshare', 'unshare', (CLONE_NEWUSER,)),
+    ('unshare-net', 'unshare', (CLONE_NEWUSER | CLONE_NEWNET,)),
+    ('setns', 'setns', (0, 0)),
+    ('keyctl', 'keyctl', (0, -3, 0)),
+    ('add_key', 'add_key', (0, 0, 0, 0, -3)),
+    ('request_key', 'request_key', (0, 0, 0, 0)),
+    ('bpf', 'bpf', (0, 0, 0)),
+    ('perf_event_open', 'perf_event_open', (0, 0, -1, -1, 0)),
+    ('userfaultfd', 'userfaultfd', (0,)),
+    ('clone3', 'clone3', (0, 0)),
+    ('clone-newuser', 'clone', (CLONE_NEWUSER | SIGCHLD, 0, 0, 0, 0)),
+    ('clone-fork', 'clone', (SIGCHLD, 0, 0, 0, 0)),
+):
+    print(label, errno_of(name, *args))
+""#;
+        let said = run_script(Network::None, script);
+        let (eperm, enosys) = (libc::EPERM, libc::ENOSYS);
+        let want = format!(
+            "unshare {eperm}\nunshare-net {eperm}\nsetns {eperm}\nkeyctl {eperm}\nadd_key {eperm}\nrequest_key {eperm}\nbpf {eperm}\n\
+             perf_event_open {eperm}\nuserfaultfd {eperm}\nclone3 {enosys}\nclone-newuser {eperm}\nclone-fork 0\n"
+        );
+        assert_eq!(said, want);
+    }
 }

@@ -14,16 +14,30 @@
 //!   a read-only tmpfs holding only the granted paths, each bound at its own
 //!   path (read-only ones made read-only, recursively), the granted device
 //!   files, and a `/proc` of the new pid namespace, then pivots into it. It
-//!   reaps orphans, and when the program exits it exits with its status,
+//!   reaps orphans, passes a SIGTERM, SIGINT or SIGHUP on to the program's
+//!   process group, and when the program exits it exits with its status,
 //!   which ends every process left in the namespace, `setsid` or not.
-//! - **The program** sets no-new-privileges, restricts itself with Landlock,
-//!   and execs.
+//! - **The program** starts a session of its own (no controlling terminal,
+//!   so a sandbox started from a terminal cannot type into it), sets
+//!   no-new-privileges, restricts itself with Landlock and a syscall filter,
+//!   resets every signal to its default, unblocked, and execs.
 //!
 //! The namespaces carry the filesystem view and the no-network case; Landlock
 //! carries what they cannot: no signal or abstract unix socket reaches past
 //! the sandbox, no outside process can be traced, a pathname unix socket
 //! resolves only inside a granted tree (ABI 9), TCP binds only the granted
-//! ports, and the granted paths are restricted a second time.
+//! ports, and no path outside the granted ones is reachable. Inside the
+//! granted ones it is the mounts that hold a read-only path, since Landlock's
+//! rules add up: a read-only path nested in a writable one is writable to
+//! Landlock and read-only as a mount.
+//!
+//! The syscall filter refuses what a sandbox never needs and Docker's default
+//! seccomp profile refuses too: a namespace of its own (`unshare`, `setns`,
+//! `clone` with a namespace flag; a new user namespace would hand it every
+//! capability there, and with a network namespace the kernel's packet
+//! filtering), the kernel's key store (`keyctl`, `add_key`, `request_key`),
+//! `bpf`, `perf_event_open` and `userfaultfd`, each with EPERM. `clone3`
+//! answers ENOSYS, so a C library falls back to `clone`.
 //!
 //! [`support`] says whether this host can do it. Only Linux can; elsewhere
 //! [`enter`] fails as unsupported.
@@ -77,16 +91,27 @@ pub struct Confinement {
 /// What this host offers [`enter`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ConfineSupport {
+    /// Whether the kernel is Linux, the only one with Landlock.
+    pub linux: bool,
     /// The kernel's Landlock ABI; `None` when Landlock is off or absent.
     pub landlock_abi: Option<u32>,
     /// Whether an unprivileged process may make user namespaces and mount
     /// in them (some distributions forbid it).
     pub user_namespaces: bool,
+    /// Whether, in them, it can build a sandbox's root: a tmpfs, a `/proc`
+    /// of its own pid namespace, `mount_setattr` and `pivot_root`. An
+    /// unprivileged container (LXC, Incus) forbids the `/proc` mount.
+    pub sandbox_root: bool,
+    /// Whether darkmux has a syscall filter for this CPU architecture.
+    pub syscall_filter: bool,
 }
 
 impl ConfineSupport {
     /// Why [`enter`] cannot run here, or `None` when it can.
     pub fn refusal(&self) -> Option<String> {
+        if !self.linux {
+            return Some("Landlock is part of the Linux kernel, and this host is not running Linux".to_string());
+        }
         let landlock = match self.landlock_abi {
             None => Some("this kernel has no Landlock (it is off, or older than Linux 5.13)".to_string()),
             Some(abi) if abi < LANDLOCK_ABI_NEEDED => Some(format!(
@@ -94,12 +119,20 @@ impl ConfineSupport {
             )),
             Some(_) => None,
         };
-        let namespaces = (!self.user_namespaces).then(|| "this host does not let an unprivileged process make a user namespace and mount in it".to_string());
-        match (landlock, namespaces) {
-            (None, None) => None,
-            (Some(a), None) | (None, Some(a)) => Some(a),
-            (Some(a), Some(b)) => Some(format!("{a}; and {b}")),
-        }
+        let namespaces = if !self.user_namespaces {
+            Some("this host does not let an unprivileged process make a user namespace and mount in it".to_string())
+        } else if !self.sandbox_root {
+            Some(
+                "this host lets an unprivileged process make a user namespace but it cannot build a sandbox's root there \
+                 (a tmpfs, a /proc of its own, pivot_root): an unprivileged container forbids the /proc mount"
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+        let filter = (!self.syscall_filter).then(|| "darkmux has no syscall filter for this CPU architecture (it has aarch64's and x86_64's)".to_string());
+        let missing: Vec<String> = [landlock, namespaces, filter].into_iter().flatten().collect();
+        (!missing.is_empty()).then(|| missing.join("; and "))
     }
 }
 
@@ -278,30 +311,87 @@ mod imp {
     }
 
     pub fn support() -> ConfineSupport {
-        // A child tries what `enter` needs first: the namespaces, and a
-        // mount in them. Only async-signal-safe calls run after the fork.
-        // SAFETY: the child calls only unshare, open, write, mount, _exit.
-        let user_namespaces = unsafe {
-            let (uid, gid) = (libc::getuid(), libc::getgid());
-            let uid_map = CString::new(format!("{uid} {uid} 1")).unwrap();
-            let gid_map = CString::new(format!("{gid} {gid} 1")).unwrap();
-            let child = libc::fork();
-            if child == 0 {
-                let write = |path: &[u8], text: &CString| {
-                    let fd = libc::open(path.as_ptr().cast(), libc::O_WRONLY);
-                    fd >= 0 && libc::write(fd, text.as_ptr().cast(), text.as_bytes().len()) >= 0
-                };
-                let ok = libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWPID | libc::CLONE_NEWNET) == 0
-                    && write(b"/proc/self/setgroups\0", &CString::from(c"deny"))
-                    && write(b"/proc/self/uid_map\0", &uid_map)
-                    && write(b"/proc/self/gid_map\0", &gid_map)
-                    && libc::mount(std::ptr::null(), c"/".as_ptr(), std::ptr::null(), libc::MS_REC | libc::MS_PRIVATE, std::ptr::null()) == 0;
-                libc::_exit(if ok { 0 } else { 1 });
-            }
-            let mut status = 0;
-            child > 0 && libc::waitpid(child, &mut status, 0) == child && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+        // SAFETY: getuid and getgid take nothing.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        // Everything the probe writes is made before it forks: after the
+        // fork only async-signal-safe calls run.
+        let uid_map = CString::new(format!("{uid} {uid} 1")).unwrap();
+        let gid_map = CString::new(format!("{gid} {gid} 1")).unwrap();
+        // SAFETY: the probe's children call only async-signal-safe functions.
+        let probed = unsafe { probe(&uid_map, &gid_map) };
+        ConfineSupport {
+            linux: true,
+            landlock_abi: landlock_abi(),
+            user_namespaces: probed != PROBE_NO_NAMESPACES,
+            sandbox_root: probed == 0,
+            syscall_filter: AUDIT_ARCH.is_some(),
+        }
+    }
+
+    /// The probe's exit when it cannot make the namespaces, and when it can
+    /// but cannot build a root in them.
+    const PROBE_NO_NAMESPACES: i32 = 1;
+    const PROBE_NO_ROOT: i32 = 2;
+
+    /// Try what [`enter`] needs in a short-lived child: the namespaces, then,
+    /// as pid 1 of the new pid namespace, what `build_root` does. Returns 0
+    /// when all of it worked.
+    unsafe fn probe(uid_map: &std::ffi::CStr, gid_map: &std::ffi::CStr) -> i32 {
+        let child = libc::fork();
+        if child == 0 {
+            libc::_exit(probe_namespaces(uid_map, gid_map));
+        }
+        exit_of(child).unwrap_or(PROBE_NO_NAMESPACES)
+    }
+
+    /// A child's exit code, when it exited.
+    unsafe fn exit_of(child: libc::pid_t) -> Option<i32> {
+        let mut status = 0;
+        (child > 0 && libc::waitpid(child, &mut status, 0) == child && libc::WIFEXITED(status)).then(|| libc::WEXITSTATUS(status))
+    }
+
+    unsafe fn probe_namespaces(uid_map: &std::ffi::CStr, gid_map: &std::ffi::CStr) -> i32 {
+        if !make_namespaces(uid_map, gid_map) {
+            return PROBE_NO_NAMESPACES;
+        }
+        let init = libc::fork();
+        if init == 0 {
+            libc::_exit(if probe_root() { 0 } else { PROBE_NO_ROOT });
+        }
+        match exit_of(init) {
+            Some(0) => 0,
+            _ => PROBE_NO_ROOT,
+        }
+    }
+
+    /// What [`unshare`] does, in async-signal-safe calls: the namespaces,
+    /// this user mapped to itself, and mounts private to them.
+    unsafe fn make_namespaces(uid_map: &std::ffi::CStr, gid_map: &std::ffi::CStr) -> bool {
+        libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWPID | libc::CLONE_NEWNET) == 0
+            && map_to_self(uid_map, gid_map)
+            && libc::mount(std::ptr::null(), c"/".as_ptr(), std::ptr::null(), libc::MS_REC | libc::MS_PRIVATE, std::ptr::null()) == 0
+    }
+
+    /// This user and group mapped to themselves in the new user namespace.
+    unsafe fn map_to_self(uid_map: &std::ffi::CStr, gid_map: &std::ffi::CStr) -> bool {
+        let write = |path: &std::ffi::CStr, text: &std::ffi::CStr| {
+            let fd = libc::open(path.as_ptr(), libc::O_WRONLY);
+            fd >= 0 && libc::write(fd, text.as_ptr().cast(), text.to_bytes().len()) >= 0
         };
-        ConfineSupport { landlock_abi: landlock_abi(), user_namespaces }
+        write(c"/proc/self/setgroups", c"deny") && write(c"/proc/self/uid_map", uid_map) && write(c"/proc/self/gid_map", gid_map)
+    }
+
+    /// What `build_root` needs, on a tmpfs over `/tmp` that only this mount
+    /// namespace sees: a tmpfs, a `/proc` of this pid namespace,
+    /// `mount_setattr` and `pivot_root`.
+    unsafe fn probe_root() -> bool {
+        let read_only = MountAttr { attr_set: libc::MOUNT_ATTR_RDONLY, attr_clr: 0, propagation: 0, userns_fd: 0 };
+        libc::mount(c"none".as_ptr(), c"/tmp".as_ptr(), c"tmpfs".as_ptr(), libc::MS_NOSUID | libc::MS_NODEV, c"mode=0755,size=64k".as_ptr().cast()) == 0
+            && libc::mkdir(c"/tmp/proc".as_ptr(), 0o755) == 0
+            && libc::mount(c"proc".as_ptr(), c"/tmp/proc".as_ptr(), c"proc".as_ptr(), libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, std::ptr::null()) == 0
+            && libc::syscall(libc::SYS_mount_setattr, libc::AT_FDCWD, c"/tmp".as_ptr(), 0, &read_only, std::mem::size_of::<MountAttr>()) == 0
+            && libc::chdir(c"/tmp".as_ptr()) == 0
+            && libc::syscall(libc::SYS_pivot_root, c".".as_ptr(), c".".as_ptr()) == 0
     }
 
     extern "C" fn ignore(_: libc::c_int) {}
@@ -385,25 +475,61 @@ mod imp {
                 return 125;
             }
         }
-        // SAFETY: still single-threaded; the child execs or _exits.
+        // SAFETY: still single-threaded; the child execs or _exits. The
+        // stop signals are blocked across the fork, so one that arrives
+        // before the program's pid is known is passed on once it is.
         unsafe {
+            let mut stops: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut stops);
+            for sig in STOP_SIGNALS {
+                libc::sigaddset(&mut stops, sig);
+            }
+            let mut before: libc::sigset_t = std::mem::zeroed();
+            libc::sigprocmask(libc::SIG_BLOCK, &stops, &mut before);
             let program = libc::fork();
             if program < 0 {
                 return 125;
             }
             if program == 0 {
-                for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
-                    libc::signal(sig, libc::SIG_DFL);
-                }
                 libc::_exit(as_program(c, abi, argv));
             }
+            PROGRAM.store(program, std::sync::atomic::Ordering::SeqCst);
+            for sig in STOP_SIGNALS {
+                libc::signal(sig, pass_on as *const () as libc::sighandler_t);
+            }
+            libc::sigprocmask(libc::SIG_SETMASK, &before, std::ptr::null_mut());
             wait_code(program)
         }
     }
 
-    /// The program: its working directory, no new privileges, Landlock,
-    /// then exec. Returns only the status to exit with when it cannot.
+    /// The signals a stop sends the sandbox's process group, which the init
+    /// passes on to the program's own.
+    const STOP_SIGNALS: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP];
+
+    /// The program's pid, for [`pass_on`].
+    static PROGRAM: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+    /// The init's stop-signal handler: the program leads a session of its
+    /// own, so a stop's signal to the sandbox's group reaches it only
+    /// through here; to the program alone while its session is not made yet.
+    extern "C" fn pass_on(sig: libc::c_int) {
+        let program = PROGRAM.load(std::sync::atomic::Ordering::SeqCst);
+        // SAFETY: kill is async-signal-safe.
+        if program > 0 && unsafe { libc::kill(-program, sig) } != 0 {
+            unsafe { libc::kill(program, sig) };
+        }
+    }
+
+    /// The program: a session of its own, its working directory, no new
+    /// privileges, Landlock, the syscall filter, every signal at its default
+    /// and unblocked, then exec. Returns only the status to exit with when
+    /// it cannot.
     fn as_program(c: &Confinement, abi: u32, argv: &[CString]) -> i32 {
+        // SAFETY: setsid takes nothing.
+        if unsafe { libc::setsid() } < 0 {
+            eprintln!("landlock: a session of its own: {}", Error::last_os_error());
+            return 125;
+        }
         if let Some(dir) = &c.workdir {
             if let Err(e) = std::env::set_current_dir(dir) {
                 eprintln!("landlock: working directory {}: {e}", dir.display());
@@ -415,10 +541,11 @@ mod imp {
             eprintln!("landlock: no_new_privs: {}", Error::last_os_error());
             return 125;
         }
-        if let Err(e) = restrict(c, abi) {
+        if let Err(e) = restrict(c, abi).and_then(|()| filter_syscalls()) {
             eprintln!("landlock: {e}");
             return 125;
         }
+        signals_at_default();
         let mut ptrs: Vec<*const libc::c_char> = argv.iter().map(|a| a.as_ptr()).collect();
         ptrs.push(std::ptr::null());
         // SAFETY: a NUL-terminated argv of live CStrings.
@@ -430,6 +557,102 @@ mod imp {
         } else {
             126
         }
+    }
+
+    /// Every signal at its default and none blocked, as a program expects
+    /// to start: an ignored one survives exec, and this process's runtime
+    /// ignores SIGPIPE (`cmd | head` would print "Broken pipe" and fail).
+    fn signals_at_default() {
+        // SAFETY: dispositions and the mask of this process, which execs next.
+        unsafe {
+            for sig in 1..libc::SIGRTMAX() + 1 {
+                libc::signal(sig, libc::SIG_DFL);
+            }
+            let mut none: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut none);
+            libc::sigprocmask(libc::SIG_SETMASK, &none, std::ptr::null_mut());
+        }
+    }
+
+    // seccomp's UAPI (linux/seccomp.h, linux/filter.h, linux/audit.h).
+    const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+    const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+    const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+    /// BPF_LD | BPF_W | BPF_ABS (the first two are 0).
+    const BPF_LD_W_ABS: u16 = 0x20;
+    const BPF_JEQ_K: u16 = 0x05 | 0x10;
+    const BPF_JGE_K: u16 = 0x05 | 0x30;
+    const BPF_JSET_K: u16 = 0x05 | 0x40;
+    const BPF_RET_K: u16 = 0x06;
+    /// `seccomp_data`'s offsets: the call's number, its architecture, and
+    /// the low half of its first argument (both architectures are
+    /// little-endian).
+    const DATA_NR: u32 = 0;
+    const DATA_ARCH: u32 = 4;
+    const DATA_ARG0_LOW: u32 = 16;
+    #[cfg(target_arch = "aarch64")]
+    const AUDIT_ARCH: Option<u32> = Some(0xc000_00b7);
+    #[cfg(target_arch = "x86_64")]
+    const AUDIT_ARCH: Option<u32> = Some(0xc000_003e);
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    const AUDIT_ARCH: Option<u32> = None;
+
+    /// The calls refused with EPERM (the module doc says why).
+    const REFUSED: [libc::c_long; 8] = [
+        libc::SYS_unshare,
+        libc::SYS_setns,
+        libc::SYS_keyctl,
+        libc::SYS_add_key,
+        libc::SYS_request_key,
+        libc::SYS_bpf,
+        libc::SYS_perf_event_open,
+        libc::SYS_userfaultfd,
+    ];
+
+    /// The `clone` flags that make a namespace.
+    const NAMESPACE_FLAGS: libc::c_int = libc::CLONE_NEWNS
+        | libc::CLONE_NEWCGROUP
+        | libc::CLONE_NEWUTS
+        | libc::CLONE_NEWIPC
+        | libc::CLONE_NEWUSER
+        | libc::CLONE_NEWPID
+        | libc::CLONE_NEWNET;
+
+    /// The filter: another architecture's calls end the process (no call
+    /// reaches the kernel under a number this filter does not mean), the
+    /// refused calls answer EPERM, `clone3` ENOSYS, `clone` with a namespace
+    /// flag EPERM; everything else is allowed.
+    fn syscall_filter(arch: u32) -> Vec<libc::sock_filter> {
+        let stmt = |code, k| libc::sock_filter { code, jt: 0, jf: 0, k };
+        let jump = |code, k, jt, jf| libc::sock_filter { code, jt, jf, k };
+        let errno = |e: libc::c_int| stmt(BPF_RET_K, SECCOMP_RET_ERRNO | e as u32);
+        let mut f = vec![stmt(BPF_LD_W_ABS, DATA_ARCH), jump(BPF_JEQ_K, arch, 1, 0), stmt(BPF_RET_K, SECCOMP_RET_KILL_PROCESS), stmt(BPF_LD_W_ABS, DATA_NR)];
+        // x86_64's x32 calls are the same calls under other numbers.
+        if cfg!(target_arch = "x86_64") {
+            f.extend([jump(BPF_JGE_K, 0x4000_0000, 0, 1), errno(libc::EPERM)]);
+        }
+        for nr in REFUSED {
+            f.extend([jump(BPF_JEQ_K, nr as u32, 0, 1), errno(libc::EPERM)]);
+        }
+        f.extend([jump(BPF_JEQ_K, libc::SYS_clone3 as u32, 0, 1), errno(libc::ENOSYS)]);
+        f.extend([
+            jump(BPF_JEQ_K, libc::SYS_clone as u32, 0, 3),
+            stmt(BPF_LD_W_ABS, DATA_ARG0_LOW),
+            jump(BPF_JSET_K, NAMESPACE_FLAGS as u32, 0, 1),
+            errno(libc::EPERM),
+        ]);
+        f.push(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
+        f
+    }
+
+    /// Install [`syscall_filter`] on this process and what it starts. Needs
+    /// no-new-privileges, set first.
+    fn filter_syscalls() -> Result<(), Error> {
+        let arch = AUDIT_ARCH.ok_or_else(|| Error::other("no syscall filter for this CPU architecture"))?;
+        let filter = syscall_filter(arch);
+        let program = libc::sock_fprog { len: filter.len() as libc::c_ushort, filter: filter.as_ptr().cast_mut() };
+        // SAFETY: a live filter program of the length given.
+        check(unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program) } as libc::c_long, "installing the syscall filter")
     }
 
     /// `path` inside `root`.
@@ -609,6 +832,33 @@ mod imp {
 
     #[cfg(test)]
     mod tests {
+        /// A host that lets a process make a user namespace but not mount a
+        /// `/proc` in it (an unprivileged container, whose `/proc` has a
+        /// locked mount over part of it) cannot confine one: every sandbox
+        /// would fail building its root. util-linux `unshare` makes such a
+        /// host here; the probe runs in it as this test, asked by
+        /// `CONFINE_PROBE_CHILD`.
+        #[test]
+        fn a_host_that_refuses_a_proc_mount_cannot_confine() {
+            if std::env::var_os("CONFINE_PROBE_CHILD").is_some() {
+                println!("refusal: {:?}", super::support().refusal());
+                return;
+            }
+            if super::support().refusal().is_some() || !std::path::Path::new("/usr/bin/unshare").exists() {
+                return;
+            }
+            let me = std::env::current_exe().unwrap();
+            let out = std::process::Command::new("/usr/bin/unshare")
+                .args(["-Urm", "/bin/sh", "-c", r#"mount -t tmpfs none /proc/sys && exec /usr/bin/unshare -Urm "$0" --exact "$1" --nocapture"#])
+                .arg(&me)
+                .arg("confine::imp::tests::a_host_that_refuses_a_proc_mount_cannot_confine")
+                .env("CONFINE_PROBE_CHILD", "1")
+                .output()
+                .unwrap();
+            let said = String::from_utf8_lossy(&out.stdout);
+            assert!(said.contains("refusal: Some(") && said.contains("cannot build a sandbox's root"), "{said}{}", String::from_utf8_lossy(&out.stderr));
+        }
+
         /// Each ABI handles the rights it knows and none it does not: a
         /// ruleset naming an unknown right is refused by the kernel.
         #[test]
@@ -624,16 +874,29 @@ mod imp {
 mod tests {
     use super::*;
 
-    /// Each missing piece is named; a host with both runs.
+    /// Each missing piece is named; a host with all of them runs.
     #[test]
     fn a_refusal_names_what_is_missing() {
-        let ok = ConfineSupport { landlock_abi: Some(LANDLOCK_ABI_NEEDED), user_namespaces: true };
+        let ok = ConfineSupport { linux: true, landlock_abi: Some(LANDLOCK_ABI_NEEDED), user_namespaces: true, sandbox_root: true, syscall_filter: true };
         assert_eq!(ok.refusal(), None);
         let old = ConfineSupport { landlock_abi: Some(4), ..ok };
         assert!(old.refusal().unwrap().contains("ABI is 4"), "{:?}", old.refusal());
-        let none = ConfineSupport { landlock_abi: None, user_namespaces: false };
+        let none = ConfineSupport { landlock_abi: None, user_namespaces: false, sandbox_root: false, ..ok };
         let why = none.refusal().unwrap();
-        assert!(why.contains("no Landlock") && why.contains("user namespace"), "{why}");
+        assert!(why.contains("no Landlock") && why.contains("user namespace") && !why.contains("root"), "{why}");
+        let contained = ConfineSupport { sandbox_root: false, ..ok };
+        let why = contained.refusal().unwrap();
+        assert!(why.contains("cannot build a sandbox's root") && why.contains("/proc"), "{why}");
+        let unfiltered = ConfineSupport { syscall_filter: false, ..ok };
+        assert!(unfiltered.refusal().unwrap().contains("no syscall filter for this CPU"), "{:?}", unfiltered.refusal());
+    }
+
+    /// Off Linux the answer is that Landlock is Linux's, not that the
+    /// kernel is old.
+    #[test]
+    fn off_linux_the_refusal_says_landlock_needs_linux() {
+        let why = ConfineSupport::default().refusal().unwrap();
+        assert_eq!(why, "Landlock is part of the Linux kernel, and this host is not running Linux");
     }
 
     #[test]

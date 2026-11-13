@@ -2122,16 +2122,18 @@ fn cmd_init(opts: init::InitOptions) -> Result<i32> {
                 .unwrap_or_else(|| "the profile registry".to_string());
             step(&format!("Edit {path} to point at a downloaded model (`lms ls` lists them)"));
         }
-        first_steps(darkmux_types::config_access::sandbox().ok()).into_iter().for_each(&mut step);
+        first_steps(darkmux_types::config_access::sandbox().ok(), darkmux_sandbox::selected().is_ok()).into_iter().for_each(&mut step);
     }
     Ok(0)
 }
 
 /// (#3112) `init`'s last three next steps. The first dispatch runs in the
-/// configured sandbox (`sandbox`, `None` when the setting is refused): Docker
-/// is named only when that is Docker.
-fn first_steps(sandbox: Option<darkmux_types::config::SandboxKind>) -> [&'static str; 3] {
-    match sandbox {
+/// configured sandbox (`sandbox`, `None` when the setting does not parse):
+/// Docker is named only when that is Docker. A sandbox that cannot run here
+/// (`runs_here` false: Seatbelt off a Mac, Landlock on a kernel without what
+/// it needs) is offered no dispatch; the step names the way to Docker.
+fn first_steps(sandbox: Option<darkmux_types::config::SandboxKind>, runs_here: bool) -> [&'static str; 3] {
+    match sandbox.filter(|_| runs_here) {
         Some(darkmux_types::config::SandboxKind::Seatbelt) => [
             "First answer: `darkmux radio \"do you have a brain?\"`",
             "Check the setup: `darkmux doctor`",
@@ -2141,6 +2143,18 @@ fn first_steps(sandbox: Option<darkmux_types::config::SandboxKind>) -> [&'static
             "First answer: `darkmux radio \"do you have a brain?\"`",
             "Check the setup: `darkmux doctor`",
             "A first dispatch, in the kernel's own sandbox (no Docker needed): `darkmux dispatch code-reviewer \"What do you do?\"`",
+        ],
+        None if sandbox.is_some_and(|k| k != darkmux_types::config::SandboxKind::Docker) => [
+            "First answer, no Docker needed: `darkmux radio \"do you have a brain?\"`",
+            "Check the setup: `darkmux doctor`",
+            match sandbox {
+                Some(darkmux_types::config::SandboxKind::Seatbelt) => {
+                    "No first dispatch yet: `runtime.sandbox` `seatbelt` cannot run here (`darkmux doctor` says why); `darkmux config set runtime.sandbox docker` uses Docker"
+                }
+                _ => {
+                    "No first dispatch yet: `runtime.sandbox` `landlock` cannot run here (`darkmux doctor` says why); `darkmux config set runtime.sandbox docker` uses Docker"
+                }
+            },
         ],
         _ => [
             "First answer, no Docker needed: `darkmux radio \"do you have a brain?\"`",
