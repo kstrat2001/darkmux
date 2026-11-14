@@ -17,7 +17,7 @@ darkmux release.
 ### Added
 
 - **A paired app can see why Flint can't start, and stop rec's own server after its person approves (#3574).**
-  A model's `availability` in `GET /client/profiles` (and on a machine card) now carries an optional
+  A model's `availability` in `GET /client/profiles`, `darkmux machine list --json` and the machine card (card schema 1.5) now carries an optional
   `code`, the same client code a dispatch refusing for that reason gives: `engine_in_use` while rec's
   own server runs, so an app branches on the code instead of the wording. The new
   `POST /client/engines/{engine}/stop-own-server` (answering `StatusWord`, `stopped`) runs `rec stop`

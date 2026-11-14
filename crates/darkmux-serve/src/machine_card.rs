@@ -74,7 +74,11 @@ use std::time::Duration;
 /// has answered yet, and `specs.engine_servers` lists the servers darkmux
 /// started that are running now (Tensorfold, rec's Flint), darkmux's own
 /// residents beside `specs.loaded_models`. A 1.3 reader ignores both.
-pub const CARD_SCHEMA_VERSION: &str = "1.4";
+///
+/// 1.5 (#3574): additive. An `availability` may carry a `code`, the client
+/// code a dispatch refusing for that reason gives (`engine_in_use` while an
+/// engine's own server runs), absent otherwise. A 1.4 reader ignores it.
+pub const CARD_SCHEMA_VERSION: &str = "1.5";
 
 /// What darkmux does at an endpoint (darkmux's own action, never a location
 /// or a cost), for a model, and for a profile as the sum of its models.
