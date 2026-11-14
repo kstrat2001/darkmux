@@ -19808,6 +19808,27 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         );
     }
 
+    /// (#3581 review) Each attempt's error names the step it ran: past the
+    /// escalation the step is the remove, so a silent failure there names
+    /// `docker rm -f`, never the kill.
+    #[test]
+    #[serial]
+    fn a_silent_failure_names_the_step_that_failed() {
+        let dir = TempDir::new().unwrap();
+        let fake = dir.path().join("docker");
+        std::fs::write(&fake, "#!/bin/sh\nexit 1\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let prev_path = std::env::var("PATH").ok();
+        unsafe { std::env::set_var("PATH", format!("{}:{}", dir.path().display(), prev_path.clone().unwrap_or_default())) };
+        let outcome = kill_container_persistently(&docker_sandbox("darkmux-test-container-3581-silent"), TEST_BACKOFF);
+        restore_path(prev_path);
+        let KillOutcome::Unconfirmed { last_error, .. } = &outcome else { panic!("{outcome:?}") };
+        assert_eq!(last_error, "`docker rm -f darkmux-test-container-3581-silent` exited without a message (exit status: 1)");
+    }
+
     /// The un-overridden budget the disposition tests are about — they
     /// assert WHICH kill story the text tells, not where the number came
     /// from (that is
@@ -19978,6 +19999,23 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             warning.contains("darkmux-dispatch-finalize-absent-2232"),
             "the warning must name the container the operator has to deal with: {warning}"
         );
+    }
+
+    /// (#3581 review) The watchdog's give-up for a sandbox on the host names
+    /// that sandbox: `watchdog_finalize_kill` hands the warning the dispatch's
+    /// own handle, never a container's.
+    #[test]
+    #[serial]
+    fn watchdog_finalize_kill_warns_about_an_on_host_sandbox_in_its_own_words() {
+        let sandbox = darkmux_sandbox::SandboxHandle {
+            backend: darkmux_sandbox::BackendKind::Seatbelt,
+            id: "darkmux-dispatch-finalize-on-host-3581".into(),
+        };
+        let disposition = AtomicU8::new(0);
+        let warning = watchdog_finalize_kill(&sandbox, TEST_BACKOFF, &disposition)
+            .expect("a sandbox that was never seen is not a confirmed kill");
+        assert!(warning.contains("the `seatbelt` sandbox `darkmux-dispatch-finalize-on-host-3581`"), "{warning}");
+        assert!(!warning.contains("container") && !warning.contains("docker"), "{warning}");
     }
 
     #[test]

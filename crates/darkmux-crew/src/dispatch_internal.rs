@@ -5574,7 +5574,7 @@ fn run_was_killed(local_stop: &DispatchStop, exited_cleanly: bool) -> bool {
 /// container, or for a sandbox on the host the sandbox (#3567).
 fn killed_mid_run_error(sandbox: &darkmux_sandbox::SandboxHandle, local_stop: &DispatchStop) -> anyhow::Error {
     let (what, ended) = if sandbox.backend.on_host() {
-        (format!("the `{}` sandbox `{}`", darkmux_sandbox::setting_value(sandbox.backend), sandbox.id), "ended")
+        (on_host_named(sandbox), "ended")
     } else {
         (format!("the container `{}`", sandbox.id), "killed")
     };
@@ -5926,41 +5926,6 @@ fn probe_container_liveness(sandbox: &darkmux_sandbox::SandboxHandle) -> Livenes
     }
 }
 
-/// (#2232) Stop `container_name` and keep trying until it is confirmed
-/// stopped or the attempts run out — the persistent replacement for the
-/// watchdog's single fire-and-forget `docker kill`.
-///
-/// Why a failed kill is not simply retried with the same verb: `docker kill`
-/// fails for two very different reasons that share an exit code — a daemon
-/// problem (retry helps) and "container is not running / no such container"
-/// (retrying is pointless and would end in a false alarm). The liveness probe
-/// after each failure is what separates them, so a container that was seen
-/// running and then exits in the watchdog's final race window settles as soon
-/// as the probe says so instead of burning the whole budget and crying wolf.
-///
-/// Why the loop tracks whether it EVER OBSERVED the container (#2232, round
-/// 2): every "the container is gone" signal docker offers is also emitted for
-/// a container that has never been created, so none of them is proof on its
-/// own. Measured on docker 29.1.3:
-///
-/// - `docker ps --quiet --filter name=^X$` → exit 0, empty stdout, whether X
-///   exited, is still in `created`, or has never existed.
-/// - `docker rm -f X` → **exit 0** for a container that never existed (empty
-///   stdout; the name is echoed on stdout only when something was removed).
-/// - `docker kill X` → exit 1 unless X is genuinely running, which is what
-///   makes ITS success an observation.
-///
-/// Treating any of those as "confirmed stopped" retires the watchdog over a
-/// container that may be seconds from starting — the case where `docker run`
-/// is pulling a BYO `--image` inline while the inactivity deadline is already
-/// armed. So `Confirmed` requires an observation; without one the loop keeps
-/// watching for the whole budget and reports `Absent`.
-///
-/// `base_backoff` is a parameter rather than a read of the constant so tests
-/// pin the retry BEHAVIOR without paying its production CADENCE; the one
-/// production call site passes `CONTAINER_KILL_BASE_BACKOFF`. It is
-/// deliberately not an operator knob — nothing about a transient dockerd
-/// failure is engagement-specific.
 /// (#3567) A step of the watchdog's kill: the kill, or the remove it
 /// escalates to.
 #[derive(Clone, Copy)]
@@ -6005,6 +5970,41 @@ fn on_host_named(sandbox: &darkmux_sandbox::SandboxHandle) -> String {
     format!("the `{}` sandbox `{}`", darkmux_sandbox::setting_value(sandbox.backend), sandbox.id)
 }
 
+/// (#2232) Stop `container_name` and keep trying until it is confirmed
+/// stopped or the attempts run out — the persistent replacement for the
+/// watchdog's single fire-and-forget `docker kill`.
+///
+/// Why a failed kill is not simply retried with the same verb: `docker kill`
+/// fails for two very different reasons that share an exit code — a daemon
+/// problem (retry helps) and "container is not running / no such container"
+/// (retrying is pointless and would end in a false alarm). The liveness probe
+/// after each failure is what separates them, so a container that was seen
+/// running and then exits in the watchdog's final race window settles as soon
+/// as the probe says so instead of burning the whole budget and crying wolf.
+///
+/// Why the loop tracks whether it EVER OBSERVED the container (#2232, round
+/// 2): every "the container is gone" signal docker offers is also emitted for
+/// a container that has never been created, so none of them is proof on its
+/// own. Measured on docker 29.1.3:
+///
+/// - `docker ps --quiet --filter name=^X$` → exit 0, empty stdout, whether X
+///   exited, is still in `created`, or has never existed.
+/// - `docker rm -f X` → **exit 0** for a container that never existed (empty
+///   stdout; the name is echoed on stdout only when something was removed).
+/// - `docker kill X` → exit 1 unless X is genuinely running, which is what
+///   makes ITS success an observation.
+///
+/// Treating any of those as "confirmed stopped" retires the watchdog over a
+/// container that may be seconds from starting — the case where `docker run`
+/// is pulling a BYO `--image` inline while the inactivity deadline is already
+/// armed. So `Confirmed` requires an observation; without one the loop keeps
+/// watching for the whole budget and reports `Absent`.
+///
+/// `base_backoff` is a parameter rather than a read of the constant so tests
+/// pin the retry BEHAVIOR without paying its production CADENCE; the one
+/// production call site passes `CONTAINER_KILL_BASE_BACKOFF`. It is
+/// deliberately not an operator knob — nothing about a transient dockerd
+/// failure is engagement-specific.
 fn kill_container_persistently(sandbox: &darkmux_sandbox::SandboxHandle, base_backoff: Duration) -> KillOutcome {
     let backend = darkmux_sandbox::for_handle(sandbox);
     let mut last_error = String::new();
