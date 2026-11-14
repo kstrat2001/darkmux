@@ -212,6 +212,20 @@ darkmux release.
   same `~/.darkmux` first: an older binary refuses the new key). Linux is unchanged. The Homebrew
   formula's caveats still say dispatches need Docker; they change with the next release.
 
+### Fixed
+
+- **A dispatch under Landlock can start a server on the loopback (#3567).** With no ports named
+  (every dispatch), Landlock refused every bind, so a test server or dev server on `127.0.0.1`
+  failed with `Permission denied`, on a fixed port and on one the kernel picks, while a `listen`
+  with no bind still reached every address. Under the default network a dispatch now binds any
+  port, as under Seatbelt, and the listener watch (#3559) stops one beyond the loopback; a client
+  preview stays held to its app and HMR ports. A server a dispatch binds on every address answers
+  there until the watch's next look, about a second, as one that listens with no bind already did.
+  As under Seatbelt, a dispatch can also hold a chosen `127.0.0.1` port for its whole run, the
+  port of a host service that is down or restarting included. When the listener watch, a stop or
+  the inactivity watchdog ends an on-host dispatch, the error names the sandbox instead of a
+  container or a `docker` command.
+
 ## [5.10.0] - 2026-11-11
 
 The Mux Bot release: darkmux starts the Tensorfold and Flint servers it dispatches to, and a paired

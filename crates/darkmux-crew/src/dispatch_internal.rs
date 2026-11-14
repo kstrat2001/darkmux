@@ -5567,19 +5567,22 @@ fn run_was_killed(local_stop: &DispatchStop, exited_cleanly: bool) -> bool {
     !exited_cleanly && (darkmux_types::interrupt::is_set() || local_stop.is_requested())
 }
 
-/// The error for a container dispatch ended mid-run: by a signal (the
-/// launcher reads [`darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL`] as "the
-/// whole run was interrupted"), or by a stop scoped to this dispatch, which is
-/// reported as itself, because a phase stop is not a run-wide interrupt.
-fn killed_mid_run_error(container_name: &str, local_stop: &DispatchStop) -> anyhow::Error {
+/// The error for a dispatch ended mid-run: by a signal (the launcher reads
+/// [`darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL`] as "the whole run was
+/// interrupted"), or by a stop scoped to this dispatch, which is reported as
+/// itself, because a phase stop is not a run-wide interrupt. It names the
+/// container, or for a sandbox on the host the sandbox (#3567).
+fn killed_mid_run_error(sandbox: &darkmux_sandbox::SandboxHandle, local_stop: &DispatchStop) -> anyhow::Error {
+    let (what, ended) = if sandbox.backend.on_host() {
+        (on_host_named(sandbox), "ended")
+    } else {
+        (format!("the container `{}`", sandbox.id), "killed")
+    };
+    let dispatch = if sandbox.backend.on_host() { "darkmux-runtime dispatch" } else { "darkmux-runtime container dispatch" };
     match (darkmux_types::interrupt::is_set(), local_stop.reason()) {
-        (false, Some(reason)) => anyhow!(
-            "darkmux-runtime container dispatch was stopped ({reason}) \
-             : the container `{container_name}` was killed mid-run"
-        ),
+        (false, Some(reason)) => anyhow!("{dispatch} was stopped ({reason}) : {what} was {ended} mid-run"),
         _ => anyhow!(
-            "darkmux-runtime container dispatch {} \
-             (SIGINT/SIGTERM/SIGHUP): the container `{container_name}` was killed mid-run",
+            "{dispatch} {} (SIGINT/SIGTERM/SIGHUP): {what} was {ended} mid-run",
             darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL
         ),
     }
@@ -5777,7 +5780,37 @@ impl KillOutcome {
     /// confirmed. Giving up is allowed; giving up QUIETLY is the failure mode
     /// #2232 is about, so the give-up path carries its own message as a value
     /// rather than trusting a call site to remember to print one. (#2232)
-    fn warning(&self, container_name: &str) -> Option<String> {
+    fn warning(&self, sandbox: &darkmux_sandbox::SandboxHandle) -> Option<String> {
+        if sandbox.backend.on_host() {
+            self.on_host_warning(sandbox)
+        } else {
+            self.container_warning(&sandbox.id)
+        }
+    }
+
+    /// (#3567) [`KillOutcome::warning`] for a sandbox on the host: no
+    /// container and no docker command.
+    fn on_host_warning(&self, sandbox: &darkmux_sandbox::SandboxHandle) -> Option<String> {
+        let named = on_host_named(sandbox);
+        match self {
+            KillOutcome::Confirmed { .. } => None,
+            KillOutcome::Absent { attempts } => Some(format!(
+                "darkmux dispatch: ⚠ the inactivity watchdog did not find {named} across {attempts} \
+                 attempts — nothing was ended. It may not have started yet, or have ended as the \
+                 deadline fired, so the watchdog re-arms for a full budget and keeps watching it. \
+                 (#2232, #2252)"
+            )),
+            KillOutcome::Unconfirmed { attempts, last_error } => Some(format!(
+                "darkmux dispatch: ⚠ the inactivity watchdog could not confirm {named} stopped \
+                 after {attempts} attempts (its kill, then its remove) — it may still be running \
+                 and holding its model load. Stop its processes by hand. Last error: {last_error} \
+                 (#2232)"
+            )),
+        }
+    }
+
+    /// [`KillOutcome::warning`] for the container `container_name`.
+    fn container_warning(&self, container_name: &str) -> Option<String> {
         match self {
             KillOutcome::Confirmed { .. } => None,
             // Deliberately NOT the "may still be running and holding its
@@ -5893,6 +5926,50 @@ fn probe_container_liveness(sandbox: &darkmux_sandbox::SandboxHandle) -> Livenes
     }
 }
 
+/// (#3567) A step of the watchdog's kill: the kill, or the remove it
+/// escalates to.
+#[derive(Clone, Copy)]
+enum KillStep {
+    Kill,
+    Remove,
+}
+
+impl KillStep {
+    /// How the step is named: `docker`'s own verb for a container, the
+    /// backend's for a sandbox on the host.
+    fn name(self, on_host: bool) -> &'static str {
+        match (self, on_host) {
+            (KillStep::Kill, _) => "kill",
+            (KillStep::Remove, true) => "remove",
+            (KillStep::Remove, false) => "rm -f",
+        }
+    }
+
+    /// The error for a step that failed and said nothing.
+    fn exited_silently(self, sandbox: &darkmux_sandbox::SandboxHandle, status: &std::process::ExitStatus) -> String {
+        let on_host = sandbox.backend.on_host();
+        if on_host {
+            format!("the {} of {} exited without a message ({status})", self.name(on_host), on_host_named(sandbox))
+        } else {
+            format!("`docker {} {}` exited without a message ({status})", self.name(on_host), sandbox.id)
+        }
+    }
+
+    /// The error for a step whose program could not be run.
+    fn could_not_run(self, sandbox: &darkmux_sandbox::SandboxHandle, e: &std::io::Error) -> String {
+        if sandbox.backend.on_host() {
+            format!("could not run the {} of {}: {e}", self.name(true), on_host_named(sandbox))
+        } else {
+            format!("could not run `docker`: {e}")
+        }
+    }
+}
+
+/// (#3567) A sandbox on the host, as a message names it.
+fn on_host_named(sandbox: &darkmux_sandbox::SandboxHandle) -> String {
+    format!("the `{}` sandbox `{}`", darkmux_sandbox::setting_value(sandbox.backend), sandbox.id)
+}
+
 /// (#2232) Stop `container_name` and keep trying until it is confirmed
 /// stopped or the attempts run out — the persistent replacement for the
 /// watchdog's single fire-and-forget `docker kill`.
@@ -5929,7 +6006,6 @@ fn probe_container_liveness(sandbox: &darkmux_sandbox::SandboxHandle) -> Livenes
 /// deliberately not an operator knob — nothing about a transient dockerd
 /// failure is engagement-specific.
 fn kill_container_persistently(sandbox: &darkmux_sandbox::SandboxHandle, base_backoff: Duration) -> KillOutcome {
-    let container_name = sandbox.id.as_str();
     let backend = darkmux_sandbox::for_handle(sandbox);
     let mut last_error = String::new();
     // Has anything in THIS loop proved the container actually exists?
@@ -5941,7 +6017,7 @@ fn kill_container_persistently(sandbox: &darkmux_sandbox::SandboxHandle, base_ba
     for attempt in 1..=CONTAINER_KILL_MAX_ATTEMPTS {
         let killing = attempt <= CONTAINER_KILL_ESCALATE_AFTER;
         let (verb, mut cmd) =
-            if killing { ("kill", backend.kill(sandbox)) } else { ("rm -f", backend.remove(sandbox)) };
+            if killing { (KillStep::Kill, backend.kill(sandbox)) } else { (KillStep::Remove, backend.remove(sandbox)) };
         match cmd.output() {
             Ok(o) if o.status.success() => {
                 // A successful `docker kill` is itself an observation — it
@@ -5959,14 +6035,10 @@ fn kill_container_persistently(sandbox: &darkmux_sandbox::SandboxHandle, base_ba
             Ok(o) => {
                 last_error = String::from_utf8_lossy(&o.stderr).trim().to_string();
                 if last_error.is_empty() {
-                    last_error = format!(
-                        "`docker {} {container_name}` exited without a message ({})",
-                        verb,
-                        o.status
-                    );
+                    last_error = verb.exited_silently(sandbox, &o.status);
                 }
             }
-            Err(e) => last_error = format!("could not run `docker`: {e}"),
+            Err(e) => last_error = verb.could_not_run(sandbox, &e),
         }
         // The attempt settled nothing — and "already gone", "not created
         // yet" and "daemon trouble" all look identical from the exit code
@@ -6027,13 +6099,35 @@ fn kill_container_persistently(sandbox: &darkmux_sandbox::SandboxHandle, base_ba
 /// changed the number they just watched expire — `--timeout` outranks it.
 /// The remedy has to name the mechanism that actually set the value.
 fn inactivity_timeout_stderr(
-    container_name: &str,
+    sandbox: &darkmux_sandbox::SandboxHandle,
     inactivity_secs: u64,
     source: InactivityBudgetSource,
     kill: KillDisposition,
     stderr: &str,
 ) -> String {
-    let disposition = match kill {
+    let disposition = if sandbox.backend.on_host() { on_host_kill_disposition(sandbox, kill) } else { container_kill_disposition(&sandbox.id, kill) };
+    inactivity_marker(inactivity_secs, source, &disposition, stderr)
+}
+
+/// (#3567) What the watchdog's kill of a sandbox on the host came to, named
+/// as that sandbox: no container and no docker command.
+fn on_host_kill_disposition(sandbox: &darkmux_sandbox::SandboxHandle, kill: KillDisposition) -> String {
+    let named = on_host_named(sandbox);
+    match kill {
+        KillDisposition::Confirmed => format!("{named} was ended by the watchdog"),
+        KillDisposition::Absent => format!(
+            "the watchdog did not find {named} to end across {CONTAINER_KILL_MAX_ATTEMPTS} attempts — nothing was stopped"
+        ),
+        KillDisposition::Unconfirmed => format!(
+            "the watchdog COULD NOT CONFIRM {named} stopped after {CONTAINER_KILL_MAX_ATTEMPTS} attempts — it may \
+             still be running and holding its model load"
+        ),
+    }
+}
+
+/// What the watchdog's kill of the container `container_name` came to.
+fn container_kill_disposition(container_name: &str, kill: KillDisposition) -> String {
+    match kill {
         KillDisposition::Confirmed => {
             format!("container `{container_name}` was killed by the watchdog")
         }
@@ -6050,7 +6144,12 @@ fn inactivity_timeout_stderr(
              {CONTAINER_KILL_MAX_ATTEMPTS} attempts (`docker kill`, then `docker rm -f`) — it \
              may still be running and holding its model load; check `docker ps`"
         ),
-    };
+    }
+}
+
+/// The inactivity-timeout marker and its remedy, before the run's own
+/// stderr, given what the kill came to.
+fn inactivity_marker(inactivity_secs: u64, source: InactivityBudgetSource, disposition: &str, stderr: &str) -> String {
     // (#2480 review, finding 5) Name the knob that set THIS budget, and say
     // where it came from — an operator told to raise an env var they already
     // set to 1200 has been sent to the wrong place.
@@ -6112,7 +6211,7 @@ fn watchdog_finalize_kill(
 ) -> Option<String> {
     let outcome = kill_container_persistently(sandbox, base_backoff);
     kill_disposition.store(outcome.disposition().code(), Ordering::SeqCst);
-    outcome.warning(&sandbox.id)
+    outcome.warning(sandbox)
 }
 
 /// Why `run_watchdog` stopped waiting, and therefore what it did next. The
@@ -8234,7 +8333,7 @@ fn supervise_container(
         // (#2925) A stop scoped to this dispatch is reported as itself,
         // not as a signal: the launcher reads the signal wording as "the
         // whole run was interrupted", which a phase stop is not.
-        let err = killed_mid_run_error(&launched.container_name, &local_stop);
+        let err = killed_mid_run_error(&launched.sandbox, &local_stop);
         close_ended_mid_run(bookend, &err, &trajectory_summary);
         return Err(err);
     }
@@ -8245,7 +8344,7 @@ fn supervise_container(
         output,
         dispatch_start_instant,
         &run.host_out,
-        &launched.container_name,
+        &launched.sandbox,
         (launched.inactivity_timeout_seconds, launched.inactivity_timeout_seconds_source),
     );
     close_container_run(opts, execution, run, bookend, outcome)
@@ -8359,7 +8458,6 @@ struct LaunchedContainer {
     /// (#2131 review round 2) The child's pid, registered for `kill_all`.
     container_child_registration: PidRegistration,
     child: ReapedChild,
-    container_name: String,
     /// (#3112 review, round 3) The handle the backend returned at spawn,
     /// which every stop, probe and watchdog kill of this dispatch uses.
     sandbox: darkmux_sandbox::SandboxHandle,
@@ -8495,7 +8593,6 @@ fn launch_container(
         container_kill_guard,
         container_child_registration,
         child,
-        container_name,
         sandbox,
         compaction,
         utility_model,
@@ -9225,7 +9322,7 @@ fn collect_container_outcome(
     output: std::process::Output,
     dispatch_start_instant: Instant,
     host_out: &Path,
-    container_name: &str,
+    sandbox: &darkmux_sandbox::SandboxHandle,
     inactivity: (u64, InactivityBudgetSource),
 ) -> ContainerOutcome {
     let (inactivity_secs, inactivity_timeout_seconds_source) = inactivity;
@@ -9294,7 +9391,7 @@ fn collect_container_outcome(
         // so `kill_disposition` is final — and it decides whether this text
         // may claim the container was killed.
         stderr = inactivity_timeout_stderr(
-            container_name,
+            sandbox,
             inactivity_secs,
             // (#2480 review, finding 5) The SAME resolved pair the container
             // and the watchdog ran on — so the remedy sentence names the knob

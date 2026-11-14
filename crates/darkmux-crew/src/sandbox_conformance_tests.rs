@@ -75,6 +75,12 @@ pub struct Host {
     /// what a backend refuses shows. Today every backend does (a container
     /// on its own network; a sandbox on the host on this machine's).
     pub listens_beyond: bool,
+    /// (#3567) With the default network and no ports named (a dispatch's
+    /// shape): binds a socket to `127.0.0.1:port` (`0`: a port the kernel
+    /// picks), writes `listening <port>` to `said` in its working directory
+    /// (or `refused` when the bind or listen failed), then serves `served`
+    /// on it, over and over.
+    pub listen_loopback: fn(u16) -> String,
     /// (#3559) Writes `joined` to `said` when it could move itself into
     /// host process group `group` (another sandbox's), else `refused`.
     /// `None` for a container: its processes cannot name a host group.
@@ -667,6 +673,60 @@ fn a_loopback_listener_is_never_stopped(backend: &dyn SandboxBackend, host: &Hos
     assert!(served, "the loopback server stopped answering");
 }
 
+/// (#3567) A server a dispatch starts on the loopback works, on a port the
+/// policy never named and on one the kernel picks (`bind(('127.0.0.1', 0))`),
+/// and the listener watch never stops it: a sandbox on the host is reached
+/// at this host's `127.0.0.1`; a container's loopback is its own.
+fn a_loopback_server_on_an_unnamed_port_works_and_is_never_stopped(backend: &dyn SandboxBackend, host: &Host) {
+    let unnamed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    for asked in [unnamed, 0] {
+        let tree = tempfile::TempDir::new().unwrap();
+        let p = SandboxPolicy { network: Network::Default, ..policy(backend, host.image, tree.path(), &(host.listen_loopback)(asked)) };
+        assert!(p.ports.is_empty(), "a dispatch's shape names no ports");
+        let (mut cmd, handle) = backend.run(&p);
+        let _removed = Removed(backend, handle.clone());
+        let mut client = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+        let stopped = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let watch = {
+            let stopped = std::sync::Arc::clone(&stopped);
+            crate::sandbox_listeners::watch(&handle, client.id(), "a conformance sandbox", move |why| *stopped.lock().unwrap() = Some(why))
+        };
+        let said_at = tree.path().join("said");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while len(&said_at) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let said = std::fs::read_to_string(&said_at).unwrap_or_default();
+        let listening = said.trim().strip_prefix("listening ").and_then(|p| p.parse::<u16>().ok());
+        let served = match listening {
+            Some(port) if backend.kind().on_host() => {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                let mut got = String::new();
+                while got.trim() != "served" && Instant::now() < deadline {
+                    use std::io::Read;
+                    got.clear();
+                    if let Ok(mut conn) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+                        let _ = conn.set_read_timeout(Some(Duration::from_secs(2)));
+                        let _ = conn.read_to_string(&mut got);
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                got.trim() == "served"
+            }
+            _ => true,
+        };
+        std::thread::sleep(crate::sandbox_listeners::CHECK_EVERY * 3);
+        drop(watch);
+        let _ = client.kill();
+        let _ = client.wait();
+        let at = if asked == 0 { "a port the kernel picks".to_string() } else { format!("unnamed port {asked}") };
+        assert!(listening.is_some(), "a bind to 127.0.0.1 on {at} was refused: {said:?}");
+        assert!(asked == 0 || listening == Some(asked), "listening on {listening:?}, asked for {asked}");
+        assert!(served, "the loopback server on {at} did not answer at 127.0.0.1");
+        assert_eq!(stopped.lock().unwrap().clone(), None, "a loopback server on {at} was stopped");
+    }
+}
+
 /// A sandbox ends with its program, as a container ends with its init's
 /// child: a background process the program left behind is gone once the
 /// program exits, so it neither writes again nor keeps a port; so is one
@@ -1000,6 +1060,11 @@ macro_rules! conformance {
             }
             #[test]
             #[ignore = $needs]
+            fn a_loopback_server_on_an_unnamed_port_works_and_is_never_stopped() {
+                super::a_loopback_server_on_an_unnamed_port_works_and_is_never_stopped(&$make, &$host)
+            }
+            #[test]
+            #[ignore = $needs]
             fn a_sandbox_ends_with_its_program() {
                 super::a_sandbox_ends_with_its_program(&$make, &$host)
             }
@@ -1051,6 +1116,18 @@ conformance!(
              i=0; until cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | grep -Eq '^ *[0-9]+: 0+:{port:04X} 0+:0000 0A' || [ $i -ge 100 ]; do sleep 0.1; i=$((i + 1)); done; \
              cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | grep -Eq '^ *[0-9]+: 0+:{port:04X} 0+:0000 0A' && echo listening {port} > said || echo refused > said; wait"
         ),
+        // The port from the kernel's own table, once a socket listens on
+        // 127.0.0.1 (`0100007F`, state `0A`). With no `-p`, busybox `nc`
+        // binds a port the kernel picks.
+        listen_loopback: |port| {
+            let at = if port == 0 { String::new() } else { format!("-p {port}") };
+            format!(
+                "(while :; do echo served | nc -l -s 127.0.0.1 {at} || sleep 1; done) & \
+                 i=0; until grep -Eq '^ *[0-9]+: 0100007F:[0-9A-F]{{4}} 0+:0000 0A' /proc/net/tcp || [ $i -ge 100 ]; do sleep 0.1; i=$((i + 1)); done; \
+                 h=$(grep -E '^ *[0-9]+: 0100007F:[0-9A-F]{{4}} 0+:0000 0A' /proc/net/tcp | head -n 1 | sed 's/^ *[0-9]*: 0100007F:\\([0-9A-F]*\\) .*/\\1/'); \
+                 [ -n \"$h\" ] && echo listening $((0x$h)) > said || echo refused > said; wait"
+            )
+        },
         new_group: |script| format!("setsid sh -c '{script}' &"),
         a_new_group_outlives_the_program: false,
         host_group: |_| None,
@@ -1079,6 +1156,12 @@ conformance!(
         listen_beyond: |port| format!(
             "/usr/bin/perl -MSocket -e 'setpgrp(0, 0); socket(S, PF_INET, SOCK_STREAM, 0) or die; setsockopt(S, SOL_SOCKET, SO_REUSEADDR, 1); \
              bind(S, sockaddr_in({port}, INADDR_ANY)); $ok = listen(S, 5); $at = $ok ? (sockaddr_in(getsockname(S)))[0] : 0; \
+             open(F, \">said\"); print F ($ok ? \"listening $at\" : \"refused\"); close(F); \
+             while ($ok && accept(C, S)) {{ print C \"served\\n\"; close(C); }}'"
+        ),
+        listen_loopback: |port| format!(
+            "/usr/bin/perl -MSocket -e 'socket(S, PF_INET, SOCK_STREAM, 0) or die; setsockopt(S, SOL_SOCKET, SO_REUSEADDR, 1); \
+             $ok = bind(S, sockaddr_in({port}, INADDR_LOOPBACK)) && listen(S, 5); $at = $ok ? (sockaddr_in(getsockname(S)))[0] : 0; \
              open(F, \">said\"); print F ($ok ? \"listening $at\" : \"refused\"); close(F); \
              while ($ok && accept(C, S)) {{ print C \"served\\n\"; close(C); }}'"
         ),
@@ -1125,10 +1208,13 @@ conformance!(
         // The program leads a session of its own here, and `sh -c` may exec
         // python as it, so moving to a group of its own can be refused
         // (EPERM for a session leader): that is not the listen's answer.
-        // With no ports named Landlock refuses the bind, but a `listen` with
-        // no bind is not a bind it sees: the kernel binds every address.
+        // With no ports named any bind is allowed (#3567), and a `listen`
+        // with no bind would reach every address as well.
         listen_beyond: |port| format!(
             "python3 -c \"import os, socket\ntry:\n    os.setpgid(0, 0)\nexcept OSError:\n    pass\ns = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ntry:\n    s.bind(('0.0.0.0', {port}))\nexcept OSError:\n    pass\ntry:\n    s.listen(5); said = 'listening %d' % s.getsockname()[1]\nexcept OSError:\n    said = 'refused'\nopen('said', 'w').write(said)\nwhile said != 'refused':\n    c, _ = s.accept(); c.sendall(b'served\\n'); c.close()\""
+        ),
+        listen_loopback: |port| format!(
+            "python3 -c \"import socket\ns = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ntry:\n    s.bind(('127.0.0.1', {port})); s.listen(5); said = 'listening %d' % s.getsockname()[1]\nexcept OSError:\n    said = 'refused'\nopen('said', 'w').write(said)\nwhile said != 'refused':\n    c, _ = s.accept(); c.sendall(b'served\\n'); c.close()\""
         ),
         new_group: |script| format!("setsid sh -c '{script}' &"),
         // A pid namespace of its own: its init's exit ends every process in
@@ -1276,6 +1362,26 @@ mod landlock_only {
         let script = format!("{}{}true", bind(published), bind(other));
         let p = SandboxPolicy { network: Network::Default, ports: vec![published], ..policy(&LandlockBackend, "unused", tree.path(), &script) };
         assert_eq!(run_ok(&LandlockBackend, &p).trim(), format!("bound-{published}"));
+    }
+
+    /// (#3567 review) Recorded, not wanted: a policy naming ports holds a
+    /// bind to them, but a `listen` with no bind is no bind Landlock sees,
+    /// so it listens anyway, on every address and a port the kernel picks.
+    /// Nothing watches that today because Landlock runs no preview
+    /// (`preview_sandbox_refusal`); a dispatch names no ports and is
+    /// watched. A change in what the kernel holds shows here.
+    #[test]
+    #[ignore = "needs Linux with Landlock ABI 6 and unprivileged user namespaces"]
+    fn a_policy_naming_ports_cannot_hold_a_listen_with_no_bind() {
+        let published = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let tree = tempfile::TempDir::new().unwrap();
+        let script = "python3 -c \"import socket; s = socket.socket(); s.listen(); a, p = s.getsockname(); print('listening', a, p)\"";
+        let p = SandboxPolicy { network: Network::Default, ports: vec![published], ..policy(&LandlockBackend, "unused", tree.path(), script) };
+        let said = run_ok(&LandlockBackend, &p);
+        let mut words = said.split_whitespace();
+        assert_eq!((words.next(), words.next()), (Some("listening"), Some("0.0.0.0")), "{said}");
+        let port: u16 = words.next().and_then(|p| p.parse().ok()).unwrap_or_else(|| panic!("{said}"));
+        assert_ne!(port, published, "{said}");
     }
 
     /// A sandbox started from a terminal cannot type into it: the program
