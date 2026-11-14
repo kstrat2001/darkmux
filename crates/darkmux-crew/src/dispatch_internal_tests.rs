@@ -19583,7 +19583,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             last_error: "Error response from daemon: dockerd is busy".to_string(),
         };
         let warning = gave_up
-            .warning("darkmux-test-container-2232-hung")
+            .warning(&docker_sandbox("darkmux-test-container-2232-hung"))
             .expect("giving up must produce an operator-facing warning, never silence");
         assert!(
             warning.contains("darkmux-test-container-2232-hung"),
@@ -19603,7 +19603,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
              {warning}"
         );
         assert_eq!(
-            KillOutcome::Confirmed { attempts: 1 }.warning("darkmux-test-container-2232-hung"),
+            KillOutcome::Confirmed { attempts: 1 }.warning(&docker_sandbox("darkmux-test-container-2232-hung")),
             None,
             "a confirmed kill must NOT warn"
         );
@@ -19769,7 +19769,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
 
         // Same split on the watchdog's own stderr line.
         let warning = outcome
-            .warning("darkmux-dispatch-absent-2232")
+            .warning(&docker_sandbox("darkmux-dispatch-absent-2232"))
             .expect("a watchdog that found nothing to kill must still say so, never go silent");
         assert!(
             warning.contains("darkmux-dispatch-absent-2232"),
@@ -19801,7 +19801,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             matches!(outcome, KillOutcome::Unconfirmed { .. }),
             "an unreachable daemon is not evidence of absence: {outcome:?}"
         );
-        let warning = outcome.warning("darkmux-test-container-2232-mute").unwrap();
+        let warning = outcome.warning(&docker_sandbox("darkmux-test-container-2232-mute")).unwrap();
         assert!(
             warning.to_lowercase().contains("still be running"),
             "…so the alarm must survive: {warning}"
@@ -24220,6 +24220,64 @@ fn an_on_host_inactivity_timeout_names_its_sandbox_not_a_container() {
     assert!(marker(&docker, KillDisposition::Confirmed).contains("container `darkmux-dispatch-b3567` was killed by the watchdog"));
     assert!(marker(&docker, KillDisposition::Absent).contains("while `docker run` was still pulling the image"));
     assert!(marker(&docker, KillDisposition::Unconfirmed).contains("(`docker kill`, then `docker rm -f`) — it may still be running and holding its model load; check `docker ps`"));
+}
+
+/// (#3567 re-review) The watchdog's give-up warning and its step errors
+/// name a sandbox on the host as itself, never a container or docker; a
+/// Docker dispatch's are byte for byte what they were.
+#[test]
+fn an_on_host_watchdog_give_up_names_its_sandbox_not_a_container() {
+    use std::os::unix::process::ExitStatusExt;
+    let landlock = darkmux_sandbox::SandboxHandle { backend: darkmux_sandbox::BackendKind::Landlock, id: "darkmux-dispatch-b3567".to_string() };
+    let named = "the `landlock` sandbox `darkmux-dispatch-b3567`";
+    let absent = KillOutcome::Absent { attempts: 5 }.warning(&landlock).unwrap();
+    let unconfirmed = KillOutcome::Unconfirmed { attempts: 5, last_error: "it went wrong".into() }.warning(&landlock).unwrap();
+    for text in [&absent, &unconfirmed] {
+        assert!(!text.contains("container") && !text.contains("docker"), "{text}");
+    }
+    assert!(absent.contains(&format!("found NO {named} across 5 attempts — nothing was ended")), "{absent}");
+    assert!(unconfirmed.contains(&format!("could not confirm {named} stopped after 5 attempts")), "{unconfirmed}");
+    assert!(unconfirmed.contains("may still be running and holding its model load") && unconfirmed.contains("Last error: it went wrong"), "{unconfirmed}");
+    assert_eq!(KillOutcome::Confirmed { attempts: 1 }.warning(&landlock), None);
+
+    let status = std::process::ExitStatus::from_raw(1 << 8);
+    let e = std::io::Error::from(std::io::ErrorKind::NotFound);
+    assert_eq!(KillStep::Kill.exited_silently(&landlock, &status), format!("the kill of {named} exited without a message (exit status: 1)"));
+    assert_eq!(KillStep::Remove.exited_silently(&landlock, &status), format!("the remove of {named} exited without a message (exit status: 1)"));
+    assert_eq!(KillStep::Remove.could_not_run(&landlock, &e), format!("could not run the remove of {named}: entity not found"));
+
+    let docker = docker_sandbox("c");
+    assert_eq!(KillStep::Kill.exited_silently(&docker, &status), "`docker kill c` exited without a message (exit status: 1)");
+    assert_eq!(KillStep::Remove.exited_silently(&docker, &status), "`docker rm -f c` exited without a message (exit status: 1)");
+    assert_eq!(KillStep::Kill.could_not_run(&docker, &e), "could not run `docker`: entity not found");
+    assert_eq!(
+        KillOutcome::Absent { attempts: 5 }.warning(&docker).unwrap(),
+        "darkmux dispatch: ⚠ the inactivity watchdog found NO container named `c` across 5 attempts — nothing was killed. \
+         Its container is probably still being created (an `--image` pulled inline by `docker run` can take longer than \
+         the inactivity budget), so the watchdog re-arms for a full budget and keeps watching it. (#2232, #2252)"
+    );
+    assert_eq!(
+        KillOutcome::Unconfirmed { attempts: 5, last_error: "it went wrong".into() }.warning(&docker).unwrap(),
+        "darkmux dispatch: ⚠ the inactivity watchdog could not confirm container `c` stopped after 5 attempts \
+         (`docker kill`, then `docker rm -f`) — it may still be running and holding its model load. Check `docker ps` \
+         and stop it by hand. Last docker error: it went wrong (#2232)"
+    );
+}
+
+/// (#3567 re-review) Docker's three kill dispositions, pinned whole.
+#[test]
+fn a_containers_kill_dispositions_are_as_they_were() {
+    assert_eq!(container_kill_disposition("c", KillDisposition::Confirmed), "container `c` was killed by the watchdog");
+    assert_eq!(
+        container_kill_disposition("c", KillDisposition::Absent),
+        "the watchdog found NO container named `c` to kill across 5 attempts — nothing was stopped, and the deadline \
+         may have fired while `docker run` was still pulling the image"
+    );
+    assert_eq!(
+        container_kill_disposition("c", KillDisposition::Unconfirmed),
+        "the watchdog COULD NOT CONFIRM container `c` stopped after 5 attempts (`docker kill`, then `docker rm -f`) — \
+         it may still be running and holding its model load; check `docker ps`"
+    );
 }
 
 /// (#3567) A dispatch in a sandbox on the host that was ended mid-run (a
