@@ -19750,7 +19750,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         // its model load" alarm either — docker said, repeatedly and
         // conclusively, that there was no such container.
         let marker = inactivity_timeout_stderr(
-            "darkmux-dispatch-absent-2232",
+            &docker_sandbox("darkmux-dispatch-absent-2232"),
             600,
             builtin_budget_source(),
             outcome.disposition(),
@@ -19827,7 +19827,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
     #[test]
     fn inactivity_timeout_stderr_names_the_knob_that_set_the_budget() {
         let from_cli = inactivity_timeout_stderr(
-            "darkmux-test-container-2480",
+            &docker_sandbox("darkmux-test-container-2480"),
             45,
             crate::dispatch_internal::InactivityBudgetSource::Cli,
             KillDisposition::Confirmed,
@@ -19843,7 +19843,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         );
 
         let from_env = inactivity_timeout_stderr(
-            "darkmux-test-container-2480",
+            &docker_sandbox("darkmux-test-container-2480"),
             1200,
             crate::dispatch_internal::InactivityBudgetSource::Resolved(
                 darkmux_types::config_access::Source::Env,
@@ -19858,7 +19858,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         );
 
         let from_config = inactivity_timeout_stderr(
-            "darkmux-test-container-2480",
+            &docker_sandbox("darkmux-test-container-2480"),
             900,
             crate::dispatch_internal::InactivityBudgetSource::Resolved(
                 darkmux_types::config_access::Source::Config,
@@ -19879,7 +19879,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         // false in exactly the case that matters. When the kill could not be
         // confirmed the operator-visible text must say so.
         let confirmed = inactivity_timeout_stderr(
-            "darkmux-test-container-2232-x",
+            &docker_sandbox("darkmux-test-container-2232-x"),
             600,
             builtin_budget_source(),
             KillDisposition::Confirmed,
@@ -19893,7 +19893,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         );
 
         let unconfirmed = inactivity_timeout_stderr(
-            "darkmux-test-container-2232-x",
+            &docker_sandbox("darkmux-test-container-2232-x"),
             600,
             builtin_budget_source(),
             KillDisposition::Unconfirmed,
@@ -19911,7 +19911,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         );
 
         let absent = inactivity_timeout_stderr(
-            "darkmux-test-container-2232-x",
+            &docker_sandbox("darkmux-test-container-2232-x"),
             600,
             builtin_budget_source(),
             KillDisposition::Absent,
@@ -24194,6 +24194,34 @@ fn a_dispatch_the_listener_watch_stopped_closes_as_an_error_naming_the_listener(
     assert!(!error.contains(darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL), "{error}");
 }
 
+/// (#3567 review) A dispatch in a sandbox on the host that the watchdog
+/// ended names its sandbox, for each way the end went, never a container or
+/// a docker command; a Docker dispatch's text is as it was.
+#[test]
+fn an_on_host_inactivity_timeout_names_its_sandbox_not_a_container() {
+    let marker = |sandbox: &darkmux_sandbox::SandboxHandle, kill| inactivity_timeout_stderr(sandbox, 600, builtin_budget_source(), kill, "boom");
+    for kind in [darkmux_sandbox::BackendKind::Landlock, darkmux_sandbox::BackendKind::Seatbelt] {
+        let sandbox = darkmux_sandbox::SandboxHandle { backend: kind, id: "darkmux-dispatch-b3567".to_string() };
+        let named = format!("the `{}` sandbox `darkmux-dispatch-b3567`", darkmux_sandbox::setting_value(kind));
+        let confirmed = marker(&sandbox, KillDisposition::Confirmed);
+        let absent = marker(&sandbox, KillDisposition::Absent);
+        let unconfirmed = marker(&sandbox, KillDisposition::Unconfirmed);
+        for text in [&confirmed, &absent, &unconfirmed] {
+            assert!(text.contains(super::INACTIVITY_TIMEOUT_MARKER) && text.contains("boom"), "{text}");
+            assert!(!text.contains("container") && !text.contains("docker"), "{text}");
+        }
+        assert!(confirmed.contains(&format!("{named} was ended by the watchdog")), "{confirmed}");
+        assert!(absent.contains(&format!("the watchdog found NO {named} to end")) && absent.contains("nothing was stopped"), "{absent}");
+        assert!(!absent.to_lowercase().contains("still be running and holding"), "{absent}");
+        assert!(unconfirmed.contains(&format!("COULD NOT CONFIRM {named} stopped")), "{unconfirmed}");
+        assert!(unconfirmed.contains("may still be running and holding its model load"), "{unconfirmed}");
+    }
+    let docker = docker_sandbox("darkmux-dispatch-b3567");
+    assert!(marker(&docker, KillDisposition::Confirmed).contains("container `darkmux-dispatch-b3567` was killed by the watchdog"));
+    assert!(marker(&docker, KillDisposition::Absent).contains("while `docker run` was still pulling the image"));
+    assert!(marker(&docker, KillDisposition::Unconfirmed).contains("(`docker kill`, then `docker rm -f`) — it may still be running and holding its model load; check `docker ps`"));
+}
+
 /// (#3567) A dispatch in a sandbox on the host that was ended mid-run (a
 /// scoped stop, the listener watch's, or a signal) names its sandbox, never
 /// a container; a Docker dispatch's error is as it was.
@@ -24214,11 +24242,18 @@ fn an_on_host_dispatch_ended_mid_run_names_its_sandbox_not_a_container() {
             assert!(err.contains(&format!("the `{}` sandbox `darkmux-dispatch-b3567`", darkmux_sandbox::setting_value(kind))), "{err}");
         }
         assert!(stopped.contains("was stopped (the program listened on 0.0.0.0:4321)"), "{stopped}");
+        for err in [&stopped, &signaled] {
+            assert!(err.ends_with("was ended mid-run"), "{err}");
+        }
         assert!(signaled.contains(darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL), "{signaled}");
     }
     let docker = docker_sandbox("c");
     let stop = DispatchStop::new(docker.clone());
     stop.request("a phase stop".to_string());
+    darkmux_types::interrupt::raise_for_test();
+    let signaled = format!("{:#}", killed_mid_run_error(&docker, &DispatchStop::new(docker.clone())));
+    darkmux_types::interrupt::reset_for_test();
+    assert_eq!(signaled, format!("darkmux-runtime container dispatch {} (SIGINT/SIGTERM/SIGHUP): the container `c` was killed mid-run", darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL));
     assert_eq!(
         format!("{:#}", killed_mid_run_error(&docker, &stop)),
         "darkmux-runtime container dispatch was stopped (a phase stop) : the container `c` was killed mid-run"

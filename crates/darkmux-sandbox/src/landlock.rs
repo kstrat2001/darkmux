@@ -32,20 +32,28 @@
 //!   unused; the process runs as the caller's user.
 //! - **Bind a port on the loopback only (#3559).** The default network is
 //!   the host's, and Landlock grants a bind by port, never by address. A
-//!   policy naming `ports` (a preview's) binds only those, at any address,
-//!   so a published port can answer beyond the loopback if the program
-//!   binds it there. A policy naming none (a dispatch's) binds any port, as
-//!   under Seatbelt (#3567): holding it to no port would refuse a loopback
-//!   server too, while a `listen` on a socket with no bind, which the kernel
-//!   binds to every address, is no bind Landlock sees. UDP is not filtered
-//!   at all. darkmux
-//!   watches a dispatch instead: the TCP listeners its processes hold are
-//!   read every second and one beyond the loopback stops it
-//!   (`darkmux-crew`'s `sandbox_listeners`; detection with a window, not a
-//!   boundary). It may reach any address, the host's own loopback services
-//!   included, but no unix socket outside its mounts and no abstract one
-//!   outside the sandbox. [`Network::None`] has a loopback of its own and
-//!   nothing else.
+//!   policy naming `ports` binds only those, at any address, so a published
+//!   port can answer beyond the loopback if the program binds it there; and
+//!   a `listen` on a socket with no bind is no bind Landlock sees, so even
+//!   such a policy listens on every address, on a port the kernel picks
+//!   (`a_policy_naming_ports_cannot_hold_a_listen_with_no_bind`). Landlock
+//!   runs no client preview yet, so no policy naming ports reaches a user.
+//!   A policy naming none (a dispatch's) binds any port, as under Seatbelt
+//!   (#3567): holding it to no port would refuse a loopback server too.
+//!   UDP is not filtered at all. darkmux watches a dispatch instead: the TCP
+//!   listeners its processes hold are read every second and one beyond the
+//!   loopback stops it (`darkmux-crew`'s `sandbox_listeners`; detection with
+//!   a window, not a boundary). It may reach any address, the host's own
+//!   loopback services included, but no unix socket outside its mounts and
+//!   no abstract one outside the sandbox. [`Network::None`] has a loopback of
+//!   its own and nothing else.
+//! - **Keep a dispatch off a host service's loopback port (#3567).** As
+//!   under Seatbelt, a dispatch may bind a port of its choosing on
+//!   `127.0.0.1` and hold it for its whole run, and the watch never stops a
+//!   loopback listener. One that takes the port of a host service that is
+//!   down or restarting (a Tensorfold or Flint server darkmux starts, LM
+//!   Studio, `darkmux serve`) keeps that service from starting there, and
+//!   answers in its place until the dispatch ends.
 //! - **Give a terminal or `/dev/shm`.** Neither is granted: started from a
 //!   terminal, it has no controlling one and cannot open `/dev/tty`, so it
 //!   cannot type into it (`TIOCSTI`). A terminal it inherits as stdout or

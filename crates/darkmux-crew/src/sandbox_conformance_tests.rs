@@ -1364,6 +1364,26 @@ mod landlock_only {
         assert_eq!(run_ok(&LandlockBackend, &p).trim(), format!("bound-{published}"));
     }
 
+    /// (#3567 review) Recorded, not wanted: a policy naming ports holds a
+    /// bind to them, but a `listen` with no bind is no bind Landlock sees,
+    /// so it listens anyway, on every address and a port the kernel picks.
+    /// Nothing watches that today because Landlock runs no preview
+    /// (`preview_sandbox_refusal`); a dispatch names no ports and is
+    /// watched. A change in what the kernel holds shows here.
+    #[test]
+    #[ignore = "needs Linux with Landlock ABI 6 and unprivileged user namespaces"]
+    fn a_policy_naming_ports_cannot_hold_a_listen_with_no_bind() {
+        let published = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let tree = tempfile::TempDir::new().unwrap();
+        let script = "python3 -c \"import socket; s = socket.socket(); s.listen(); a, p = s.getsockname(); print('listening', a, p)\"";
+        let p = SandboxPolicy { network: Network::Default, ports: vec![published], ..policy(&LandlockBackend, "unused", tree.path(), script) };
+        let said = run_ok(&LandlockBackend, &p);
+        let mut words = said.split_whitespace();
+        assert_eq!((words.next(), words.next()), (Some("listening"), Some("0.0.0.0")), "{said}");
+        let port: u16 = words.next().and_then(|p| p.parse().ok()).unwrap_or_else(|| panic!("{said}"));
+        assert_ne!(port, published, "{said}");
+    }
+
     /// A sandbox started from a terminal cannot type into it: the program
     /// has no controlling terminal, so `TIOCSTI` on the terminal it
     /// inherited is refused (where `dev.tty.legacy_tiocsti` still allows

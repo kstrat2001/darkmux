@@ -6030,13 +6030,35 @@ fn kill_container_persistently(sandbox: &darkmux_sandbox::SandboxHandle, base_ba
 /// changed the number they just watched expire — `--timeout` outranks it.
 /// The remedy has to name the mechanism that actually set the value.
 fn inactivity_timeout_stderr(
-    container_name: &str,
+    sandbox: &darkmux_sandbox::SandboxHandle,
     inactivity_secs: u64,
     source: InactivityBudgetSource,
     kill: KillDisposition,
     stderr: &str,
 ) -> String {
-    let disposition = match kill {
+    let disposition = if sandbox.backend.on_host() { on_host_kill_disposition(sandbox, kill) } else { container_kill_disposition(&sandbox.id, kill) };
+    inactivity_marker(inactivity_secs, source, &disposition, stderr)
+}
+
+/// (#3567) What the watchdog's kill of a sandbox on the host came to, named
+/// as that sandbox: no container and no docker command.
+fn on_host_kill_disposition(sandbox: &darkmux_sandbox::SandboxHandle, kill: KillDisposition) -> String {
+    let named = format!("the `{}` sandbox `{}`", darkmux_sandbox::setting_value(sandbox.backend), sandbox.id);
+    match kill {
+        KillDisposition::Confirmed => format!("{named} was ended by the watchdog"),
+        KillDisposition::Absent => format!(
+            "the watchdog found NO {named} to end across {CONTAINER_KILL_MAX_ATTEMPTS} attempts — nothing was stopped"
+        ),
+        KillDisposition::Unconfirmed => format!(
+            "the watchdog COULD NOT CONFIRM {named} stopped after {CONTAINER_KILL_MAX_ATTEMPTS} attempts — it may \
+             still be running and holding its model load"
+        ),
+    }
+}
+
+/// What the watchdog's kill of the container `container_name` came to.
+fn container_kill_disposition(container_name: &str, kill: KillDisposition) -> String {
+    match kill {
         KillDisposition::Confirmed => {
             format!("container `{container_name}` was killed by the watchdog")
         }
@@ -6053,7 +6075,12 @@ fn inactivity_timeout_stderr(
              {CONTAINER_KILL_MAX_ATTEMPTS} attempts (`docker kill`, then `docker rm -f`) — it \
              may still be running and holding its model load; check `docker ps`"
         ),
-    };
+    }
+}
+
+/// The inactivity-timeout marker and its remedy, before the run's own
+/// stderr, given what the kill came to.
+fn inactivity_marker(inactivity_secs: u64, source: InactivityBudgetSource, disposition: &str, stderr: &str) -> String {
     // (#2480 review, finding 5) Name the knob that set THIS budget, and say
     // where it came from — an operator told to raise an env var they already
     // set to 1200 has been sent to the wrong place.
@@ -8229,7 +8256,7 @@ fn run_container(opts: &DispatchOpts, execution: &ExecutionId, mut run: Containe
         output,
         dispatch_start_instant,
         &run.host_out,
-        &launched.container_name,
+        &launched.sandbox,
         (launched.inactivity_timeout_seconds, launched.inactivity_timeout_seconds_source),
     );
     close_container_run(opts, execution, &mut run, &mut bookend, outcome)
@@ -9209,7 +9236,7 @@ fn collect_container_outcome(
     output: std::process::Output,
     dispatch_start_instant: Instant,
     host_out: &Path,
-    container_name: &str,
+    sandbox: &darkmux_sandbox::SandboxHandle,
     inactivity: (u64, InactivityBudgetSource),
 ) -> ContainerOutcome {
     let (inactivity_secs, inactivity_timeout_seconds_source) = inactivity;
@@ -9278,7 +9305,7 @@ fn collect_container_outcome(
         // so `kill_disposition` is final — and it decides whether this text
         // may claim the container was killed.
         stderr = inactivity_timeout_stderr(
-            container_name,
+            sandbox,
             inactivity_secs,
             // (#2480 review, finding 5) The SAME resolved pair the container
             // and the watchdog ran on — so the remedy sentence names the knob

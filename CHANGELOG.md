@@ -221,7 +221,10 @@ darkmux release.
   port, as under Seatbelt, and the listener watch (#3559) stops one beyond the loopback; a client
   preview stays held to its app and HMR ports. A server a dispatch binds on every address answers
   there until the watch's next look, about a second, as one that listens with no bind already did.
-  When the watch stops an on-host dispatch, the error names the sandbox instead of a container.
+  As under Seatbelt, a dispatch can also hold a chosen `127.0.0.1` port for its whole run, the
+  port of a host service that is down or restarting included. When the listener watch, a stop or
+  the inactivity watchdog ends an on-host dispatch, the error names the sandbox instead of a
+  container or a `docker` command.
 
 ## [5.10.0] - 2026-11-11
 
