@@ -797,8 +797,8 @@ fn a_stopped_flint_server_is_startable() {
 }
 
 /// rec's own server running is `unavailable` (dispatch's `engine_in_use`),
-/// saying to run `rec stop`: darkmux never stops or takes over a server it
-/// did not start.
+/// saying to run `rec stop`, and (#3574) carries the code `engine_in_use`,
+/// so a client branches on it instead of the wording.
 #[test]
 fn recs_own_server_running_is_unavailable() {
     let dir = tempfile::tempdir().unwrap();
@@ -806,6 +806,7 @@ fn recs_own_server_running_is_unavailable() {
     let a = flint_answer(&dir, Ok("0.1.0"), Ok(Some("http://127.0.0.1:8090/v1")))
         .judge(&flint_model(free_port()));
     assert_eq!(a.state, AvailabilityState::Unavailable, "{a:?}");
+    assert_eq!(a.code.as_deref(), Some("engine_in_use"), "{a:?}");
     assert!(a.reason.unwrap().contains("rec stop"));
 }
 

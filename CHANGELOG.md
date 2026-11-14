@@ -16,6 +16,15 @@ darkmux release.
 
 ### Added
 
+- **A paired app can see why Flint can't start, and stop rec's own server after its person approves (#3574).**
+  A model's `availability` in `GET /client/profiles`, `darkmux machine list --json` and the machine card (card schema 1.5) now carries an optional
+  `code`, the same client code a dispatch refusing for that reason gives: `engine_in_use` while rec's
+  own server runs, so an app branches on the code instead of the wording. The new
+  `POST /client/engines/{engine}/stop-own-server` (answering `StatusWord`, `stopped`) runs `rec stop`
+  for `flint` so darkmux can start its managed Flint. It is the one exception to "darkmux never stops
+  a server it did not start", for a paired app that asks only after its person approved it. It never
+  stops a server darkmux runs, and answers 409 when rec's own server isn't running or the one running
+  is darkmux's, and 404 for an engine with no own server.
 - **A workspace cloned from a repo URL can run a preview (#3571).** darkmux records the commit it
   cloned and reads `.darkmux/preview.json` as it was there, the way a template project's first commit
   is read: a run's commit or a work-tree edit never changes it, and `env_from_source` is refused (a

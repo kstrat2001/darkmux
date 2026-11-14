@@ -100,6 +100,13 @@ pub enum AvailabilityState {
 pub struct Availability {
     pub state: AvailabilityState,
     pub reason: Option<String>,
+    /// (#3574) The client code (`ClientCode`'s wire spelling) of a reason a
+    /// client can branch on, the code a dispatch refusing for the same
+    /// reason carries: `engine_in_use` for an engine's own server. Absent
+    /// otherwise; additive, so an older reader ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub code: Option<String>,
 }
 
 impl Availability {
@@ -107,12 +114,14 @@ impl Availability {
         Availability {
             state,
             reason: None,
+            code: None,
         }
     }
     fn because(state: AvailabilityState, reason: impl Into<String>) -> Self {
         Availability {
             state,
             reason: Some(reason.into()),
+            code: None,
         }
     }
     pub fn resident() -> Self {
@@ -129,6 +138,11 @@ impl Availability {
     }
     pub fn unknown(reason: impl Into<String>) -> Self {
         Self::because(AvailabilityState::Unknown, reason)
+    }
+    /// The same availability, carrying a client `code` (#3574).
+    pub fn with_code(mut self, code: &str) -> Self {
+        self.code = Some(code.to_string());
+        self
     }
 }
 
@@ -588,7 +602,8 @@ impl FlintAnswer {
                 "rec could not say whether its own server runs: {e}"
             ))),
             Ok(Some(address)) if !super::flint::own_server_is_darkmuxs(address, darkmuxs) => Some(
-                Availability::unavailable(super::flint::own_server_refusal(address)),
+                Availability::unavailable(super::flint::own_server_refusal(address))
+                    .with_code(super::flint::OWN_SERVER_CODE),
             ),
             Ok(_) => None,
         }

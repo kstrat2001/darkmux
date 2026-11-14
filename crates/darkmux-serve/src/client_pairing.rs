@@ -929,6 +929,9 @@ pub type CloneRepo = dyn Fn(&str, Option<&str>, &Path, &Path) -> Result<(), Stri
 /// with a fake clock and a fake executor.
 /// A yes/no about a name (a role, a profile); `Err` when it can't be told.
 pub type NameCheck = Arc<dyn Fn(&str) -> Result<bool, String> + Send + Sync>;
+/// (#3574) engine -> what stopping its own server found and did.
+pub type StopOwnServer =
+    Arc<dyn Fn(&str) -> Result<Option<darkmux_profiles::engine::flint::OwnServerStop>, String> + Send + Sync>;
 /// (role, requested profile) -> the profile that would run.
 pub type ResolveProfile = Arc<dyn Fn(&str, Option<&str>) -> Result<String, String> + Send + Sync>;
 /// `clients.profiles`: `Ok(None)` when unset.
@@ -1099,6 +1102,10 @@ pub struct ClientServerState {
     pub ask_allow: crate::client_trust::AskAllow,
     /// (#3544) A notice nobody waits on.
     pub notify: crate::client_trust::Notify,
+    /// (#3574) Stop the named engine's own server (one darkmux did not
+    /// start), blocking: `POST /client/engines/{engine}/stop-own-server`.
+    /// `Ok(None)` for an engine that has no own server darkmux can stop.
+    pub stop_own_server: StopOwnServer,
     /// (#3544) The Allow dialogs open now.
     pub dialogs: Arc<crate::client_trust::DialogSlots>,
     /// (#3545) How long a body may take to arrive, and the turns for
@@ -1175,6 +1182,7 @@ impl ClientServerState {
             signed_app: Arc::new(|pid| darkmux_platform::current().signed_app(pid)),
             ask_allow: Arc::new(|message, icon, timeout| darkmux_platform::current().ask_allow(message, icon, timeout)),
             notify: Arc::new(|message| darkmux_platform::current().notify(message)),
+            stop_own_server: Arc::new(stop_own_server_here),
             dialogs: Arc::new(crate::client_trust::DialogSlots::default()),
             body_limits: BodyLimits::default(),
         })
@@ -4586,6 +4594,58 @@ pub(crate) async fn cancel_handler(
             _ => err(StatusCode::CONFLICT, ClientCode::Conflict, "not running"),
         },
         _ => not_found(),
+    }
+}
+
+// ─── An engine's own server (#3574) ──────────────────────────────────────
+
+/// Production [`StopOwnServer`]: Flint's is rec's own server, stopped with
+/// `rec stop` unless it is one darkmux runs; no other engine has one.
+fn stop_own_server_here(engine: &str) -> Result<Option<darkmux_profiles::engine::flint::OwnServerStop>, String> {
+    use darkmux_profiles::engine::{flint, server};
+    if engine != "flint" {
+        return Ok(None);
+    }
+    let dirs = server::Dirs::under_home();
+    let darkmuxs: Vec<_> = darkmux_types::engine_record::list_in(&dirs.records)
+        .0
+        .into_iter()
+        .filter(server::alive)
+        .collect();
+    flint::stop_own_server(&flint::Rec::installed(), &darkmuxs).map(Some).map_err(|e| format!("{e:#}"))
+}
+
+/// `POST /client/engines/{engine}/stop-own-server`: stop the engine's own
+/// server (one darkmux did not start) so darkmux can start its managed one.
+/// The one exception to "darkmux never stops a server it did not start",
+/// for a paired app that asks only after its person approved it (#3574).
+/// Never darkmux's own server; 409 when there is nothing to stop.
+pub(crate) async fn stop_own_server_handler(
+    State(state): State<ClientServerState>,
+    ClientPath(engine): ClientPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    use darkmux_profiles::engine::flint::OwnServerStop;
+    if let Err(r) = authenticate(&state, &headers) {
+        return *r;
+    }
+    let stop = state.stop_own_server.clone();
+    let asked = engine.clone();
+    let outcome = tokio::task::spawn_blocking(move || stop(&asked))
+        .await
+        .unwrap_or_else(|e| Err(format!("stopping the server panicked: {e}")));
+    match outcome {
+        Ok(Some(OwnServerStop::Stopped(_))) => Json(StatusWord { status: "stopped".to_string() }).into_response(),
+        Ok(Some(OwnServerStop::NotRunning)) => {
+            err(StatusCode::CONFLICT, ClientCode::Conflict, format!("{engine}'s own server is not running"))
+        }
+        Ok(Some(OwnServerStop::Darkmuxs)) => err(
+            StatusCode::CONFLICT,
+            ClientCode::Conflict,
+            format!("the {engine} server running is darkmux's own, not the engine's"),
+        ),
+        Ok(None) => err(StatusCode::NOT_FOUND, ClientCode::NotFound, format!("no engine {engine} with its own server")),
+        Err(why) => err(StatusCode::INTERNAL_SERVER_ERROR, ClientCode::Internal, &why),
     }
 }
 
