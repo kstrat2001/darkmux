@@ -2311,6 +2311,38 @@ fn model_ctx_label(m: &types::ProfileModel, registry: &darkmux_types::ProfileReg
 mod tests {
     use super::*;
 
+    /// (#3112) `init`'s last three steps for every sandbox setting, whether
+    /// or not it can run here: a sandbox on the host that runs here gets its
+    /// own first dispatch and no Docker; one that cannot run here gets no
+    /// dispatch and the way to Docker; Docker, or a setting that does not
+    /// parse, gets the Docker dispatch. The first answer (`radio`) says it
+    /// needs no Docker only where the first dispatch is not in the host's
+    /// own sandbox.
+    #[test]
+    fn inits_first_steps_follow_the_sandbox_and_whether_it_runs_here() {
+        use darkmux_types::config::SandboxKind::{Docker, Landlock, Seatbelt};
+        let docker = "With Docker running, a first dispatch: `darkmux dispatch code-reviewer \"What do you do?\"` (the runtime image is pulled on first use; `runtime.sandbox` is `docker`)";
+        let cases = [
+            (Some(Seatbelt), true, "A first dispatch, in macOS's own sandbox (no Docker needed): `darkmux dispatch code-reviewer \"What do you do?\"`"),
+            (Some(Landlock), true, "A first dispatch, in the kernel's own sandbox (no Docker needed): `darkmux dispatch code-reviewer \"What do you do?\"`"),
+            (Some(Seatbelt), false, "No first dispatch yet: `runtime.sandbox` `seatbelt` cannot run here (`darkmux doctor` says why); `darkmux config set runtime.sandbox docker` uses Docker"),
+            (Some(Landlock), false, "No first dispatch yet: `runtime.sandbox` `landlock` cannot run here (`darkmux doctor` says why); `darkmux config set runtime.sandbox docker` uses Docker"),
+            (Some(Docker), true, docker),
+            (Some(Docker), false, docker),
+            (None, true, docker),
+            (None, false, docker),
+        ];
+        for (sandbox, runs_here, third) in cases {
+            let on_host = matches!(sandbox, Some(Seatbelt | Landlock)) && runs_here;
+            let first = if on_host {
+                "First answer: `darkmux radio \"do you have a brain?\"`"
+            } else {
+                "First answer, no Docker needed: `darkmux radio \"do you have a brain?\"`"
+            };
+            assert_eq!(first_steps(sandbox, runs_here), [first, "Check the setup: `darkmux doctor`", third], "{sandbox:?} runs_here={runs_here}");
+        }
+    }
+
     /// (#3505) A refused dispatch's code is read off its error wherever it
     /// came from: this machine's refusal (through context, and through a
     /// crew-of-one run's error), a receiver's `error` reply, or a seat the
