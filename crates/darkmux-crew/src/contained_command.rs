@@ -668,7 +668,9 @@ mod tests {
         let toolchains = darkmux_types::config_access::toolchains_dir();
         let beside = toolchains.parent().unwrap().to_path_buf();
         std::fs::create_dir_all(&beside).unwrap();
-        std::fs::write(beside.join("config-secret"), "secret").unwrap();
+        std::fs::write(beside.join("config-secret"), "scratch-secret").unwrap();
+        // And one in the darkmux root the run is given (`DARKMUX_HOME`).
+        std::fs::write(home_path.join("config-secret"), "home-secret").unwrap();
         let root = tempfile::TempDir::new().unwrap();
         let tree = root.path().join("tree");
         std::fs::create_dir_all(tree.join("pkg")).unwrap();
@@ -681,11 +683,13 @@ mod tests {
             std::env::set_var(darkmux_sandbox::seatbelt::STATE_DIR_ENV, state.path());
         }
         let secret = beside.join("config-secret");
+        let home_secret = home_path.join("config-secret");
         let platform = darkmux_platform::current().node_release_platform().unwrap();
         let preload = toolchains.join(format!("node-22.23.5-{platform}/darkmux/listen-loopback.cjs"));
         let command = format!(
-            "node; echo \"$PATH\"; cat {} && echo READ; test -r {} && echo 'PRELOAD READABLE'",
+            "node; echo \"$PATH\"; cat {} {}; echo; test -r {} && echo 'PRELOAD READABLE'",
             secret.display(),
+            home_secret.display(),
             preload.display()
         );
         let r = Run { command: &command, tree: &tree, workdir: "pkg", mounts: &[], user: None, name_prefix: "darkmux-test" };
@@ -704,7 +708,10 @@ mod tests {
         assert_eq!(lines[1], format!("--require \"{}\"", preload.display()), "the fixture node prints its NODE_OPTIONS: {out}");
         assert_eq!(lines[2].split(':').next(), install.join("bin").to_str(), "{out}");
         assert!(lines.contains(&"PRELOAD READABLE"), "the sandbox cannot read the preload: {out}");
-        assert!(!lines.contains(&"READ"), "the sandbox read darkmux state beside the toolchain: {out}");
+        // (#3575 review) On the text itself: `cat`'s output has no newline
+        // of its own, so a line-equality check could never fire.
+        assert!(!out.contains("scratch-secret"), "the sandbox read darkmux state beside the toolchain: {out}");
+        assert!(!out.contains("home-secret"), "the sandbox read the darkmux root: {out}");
     }
 
     /// On the host the command runs in the tree's working directory.
