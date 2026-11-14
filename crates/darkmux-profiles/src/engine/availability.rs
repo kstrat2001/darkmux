@@ -370,6 +370,10 @@ pub struct LmStudioAnswer {
     /// a connection. `lms` answers from the app while the server is off, so
     /// a model can be loaded and still not answer a dispatch (#3578).
     pub server_up: bool,
+    /// Whether darkmux starts that server when a dispatch needs it (it is
+    /// on this machine): a model then reads `startable`, never `resident`,
+    /// while the server is off.
+    pub server_startable: bool,
 }
 
 impl LmStudioAnswer {
@@ -388,10 +392,11 @@ impl LmStudioAnswer {
                     super::lmstudio().catalog().map_err(msg)
                 })
             });
-            let server_up = s.spawn(|| {
-                server_accepts(&darkmux_types::config_access::lmstudio_url())
-            });
+            let url = darkmux_types::config_access::lmstudio_url();
+            let probe = url.clone();
+            let server_up = s.spawn(move || server_accepts(&probe));
             LmStudioAnswer {
+                server_startable: crate::lms::is_loopback_url(&url),
                 server_up: server_up.join().unwrap_or(false),
                 loaded: loaded
                     .join()
@@ -443,7 +448,7 @@ impl EngineAnswer for LmStudioAnswer {
             Ok(l) => l,
             Err(e) => return Availability::unknown(format!("LM Studio did not answer: {e}")),
         };
-        if !self.server_up {
+        if !self.server_up && !self.server_startable {
             return Availability::unavailable(LMSTUDIO_SERVER_OFF);
         }
         // The planner's own residency rule: darkmux's instance of the model,
@@ -470,7 +475,8 @@ impl EngineAnswer for LmStudioAnswer {
             darkmux_gestalt::decide_residency(&residents, &placement),
             darkmux_gestalt::ResidencyDecision::Reuse { .. }
         ) {
-            return Availability::resident();
+            // Off but on this machine: a dispatch starts the server (#3578).
+            return if self.server_up { Availability::resident() } else { Availability::startable() };
         }
         match &self.catalog {
             Err(e) => {

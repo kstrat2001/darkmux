@@ -330,6 +330,7 @@ fn lms_model() -> ProfileModel {
 fn lm_studio_judges_by_darkmuxs_own_instance_and_its_catalog() {
     let answer = |loaded: Vec<LoadedModel>, catalog: &[&str]| LmStudioAnswer {
         server_up: true,
+        server_startable: false,
         loaded: Ok(loaded),
         catalog: Ok(catalog.iter().map(|s| meta(s)).collect()),
     };
@@ -359,12 +360,27 @@ fn lm_studio_judges_by_darkmuxs_own_instance_and_its_catalog() {
 fn lm_studio_with_its_server_off_is_unavailable() {
     let off = LmStudioAnswer {
         server_up: false,
+        server_startable: false,
         loaded: Ok(vec![lm("darkmux:qwen", "qwen", 65536)]),
         catalog: Ok(vec![meta("qwen")]),
     };
     let a = off.judge(&lms_model());
     assert_eq!(state(&a), AvailabilityState::Unavailable, "{a:?}");
     assert!(a.reason.unwrap().starts_with("LM Studio's local server is off"));
+    // On this machine darkmux starts it for the dispatch: `startable`.
+    let here = LmStudioAnswer { server_startable: true, ..off };
+    assert_eq!(here.judge(&lms_model()), Availability::startable());
+}
+
+/// Only a server on this machine is started.
+#[test]
+fn only_a_loopback_lm_studio_is_started() {
+    assert!(crate::lms::is_loopback_url("http://localhost:1234"));
+    assert!(crate::lms::is_loopback_url("localhost:1234"));
+    assert!(crate::lms::is_loopback_url("http://127.0.0.1:1234/v1"));
+    assert!(crate::lms::is_loopback_url("http://[::1]:1234"));
+    assert!(!crate::lms::is_loopback_url("http://192.0.2.10:1234"));
+    assert!(!crate::lms::is_loopback_url("http://example-host:1234"));
 }
 
 /// A base URL's server is found by host and port, with or without a scheme.
@@ -384,6 +400,7 @@ fn server_accepts_reads_the_base_url() {
 fn lm_studio_down_is_unknown() {
     let down = LmStudioAnswer {
         server_up: true,
+        server_startable: false,
         loaded: Err("running `lms ps --json`: exited 1".into()),
         catalog: Ok(vec![meta("qwen")]),
     };
@@ -392,6 +409,7 @@ fn lm_studio_down_is_unknown() {
     assert!(a.reason.unwrap().contains("LM Studio did not answer"));
     let no_catalog = LmStudioAnswer {
         server_up: true,
+        server_startable: false,
         loaded: Ok(vec![]),
         catalog: Err("`lms ls --json` exited with status 1".into()),
     };
@@ -574,6 +592,7 @@ fn a_model_with_no_context_or_port_is_unavailable() {
     no_ctx.n_ctx = None;
     let lms = LmStudioAnswer {
         server_up: true,
+        server_startable: false,
         loaded: Ok(vec![]),
         catalog: Ok(vec![meta("qwen")]),
     }
