@@ -726,8 +726,10 @@ fn source_record(base: &Path, name: &str) -> PathBuf {
 /// link.
 pub fn record_source(base: &Path, name: &str, checkout: &Path) -> Result<(), String> {
     use std::io::Write;
-    // A worktree of the user's checkout is no template project.
+    // A worktree of the user's checkout is no template project, nor a
+    // clone (#3571): a record an earlier workspace of the name left goes.
     forget_template_commit(base, name);
+    forget_cloned(base, name);
     let path = source_record(base, name);
     let _ = std::fs::remove_file(&path);
     std::fs::OpenOptions::new()
@@ -743,6 +745,7 @@ pub fn record_source(base: &Path, name: &str, checkout: &Path) -> Result<(), Str
 pub fn forget_source(base: &Path, name: &str) {
     let _ = std::fs::remove_file(source_record(base, name));
     let _ = std::fs::remove_file(template_record(base, name));
+    forget_cloned(base, name);
     let _ = std::fs::remove_file(install_record(base, name));
 }
 
@@ -814,6 +817,89 @@ pub fn record_template_commit(base: &Path, name: &str, commit: &str) -> Result<(
 /// Forget that workspace `name` was made from a template.
 pub fn forget_template_commit(base: &Path, name: &str) {
     let _ = std::fs::remove_file(template_record(base, name));
+}
+
+/// (#3571) Where darkmux records the commit it cloned for workspace `name`
+/// (a clone of a repo URL): beside the workspace, outside anything a run
+/// can write.
+fn cloned_record(base: &Path, name: &str) -> PathBuf {
+    base.join(format!(".{name}.cloned"))
+}
+
+/// Record that clone `name` was made at `commit` (the repo's own, as
+/// fetched). Its preview's recipe is read there, never from the work tree.
+pub fn record_cloned_commit(base: &Path, name: &str, commit: &str) -> Result<(), String> {
+    use std::io::Write;
+    if !is_commit_sha(commit) {
+        return Err(format!("{commit:?} is not a full commit SHA"));
+    }
+    let path = cloned_record(base, name);
+    let _ = std::fs::remove_file(&path);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .and_then(|mut f| writeln!(f, "{commit}"))
+        .map_err(|e| format!("recording the commit {} was cloned at: {e}", path.display()))
+}
+
+/// The commit recorded for clone `name`, if any: a plain file (a link is no
+/// record) holding a full commit SHA.
+pub fn cloned_commit_of(base: &Path, name: &str) -> Option<String> {
+    let path = cloned_record(base, name);
+    if !std::fs::symlink_metadata(&path).ok()?.is_file() {
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    let commit = text.trim_end_matches('\n');
+    is_commit_sha(commit).then(|| commit.to_string())
+}
+
+/// Forget clone `name`'s commit and approved recipe.
+pub fn forget_cloned(base: &Path, name: &str) {
+    let _ = std::fs::remove_file(cloned_record(base, name));
+    let _ = std::fs::remove_file(approved_recipe_record(base, name));
+}
+
+/// (#3571) Where darkmux keeps the recipe the user approved for clone
+/// `name` (its repo has none): beside the workspace, never in it.
+fn approved_recipe_record(base: &Path, name: &str) -> PathBuf {
+    base.join(format!(".{name}.recipe"))
+}
+
+/// Keep `text` (already parsed as a recipe) as clone `name`'s approved
+/// recipe. Replaces any earlier one whole (written beside it under a name
+/// no other write uses, then renamed over it, so a preview starting
+/// meanwhile reads the old or the new one, and of two writes at once the
+/// later rename wins), never through a link.
+pub fn record_approved_recipe(base: &Path, name: &str, text: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static WRITES: AtomicU64 = AtomicU64::new(0);
+    let path = approved_recipe_record(base, name);
+    let n = WRITES.fetch_add(1, Ordering::Relaxed);
+    let next = base.join(format!(".{name}.recipe.next-{}-{n}", std::process::id()));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&next)
+        .and_then(|mut f| f.write_all(text.as_bytes()))
+        .and_then(|()| std::fs::rename(&next, &path))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&next);
+            format!("keeping the approved recipe {}: {e}", path.display())
+        })
+}
+
+/// Clone `name`'s approved recipe, if any: a plain file (a link is none)
+/// within the recipe size cap.
+pub fn approved_recipe_of(base: &Path, name: &str) -> Option<String> {
+    let path = approved_recipe_record(base, name);
+    let meta = std::fs::symlink_metadata(&path).ok()?;
+    if !meta.is_file() || meta.len() > crate::client_preview::MAX_RECIPE_BYTES {
+        return None;
+    }
+    std::fs::read_to_string(&path).ok()
 }
 
 /// The first commit recorded for template project `name`, if any: a plain
@@ -948,16 +1034,17 @@ fn recorded_source(base: &Path, name: &str) -> Option<PathBuf> {
 /// The user's own checkout workspace `name` (at `dir`) was made from: as
 /// darkmux recorded it when it made the workspace, still a checkout of the
 /// user's ([`check_source`]), and still the repository the workspace is a
-/// worktree of. `Err` says why not, and what to do. This is the only place
-/// a preview recipe is read from: never the workspace, which a run writes.
+/// worktree of. `Err` says why not, and what to do. A worktree's preview
+/// recipe is read only there: never the workspace, which a run writes.
 pub fn own_checkout_of(base: &Path, name: &str, dir: &Path) -> Result<PathBuf, Coded> {
     let held = crate::client_git::work_copy_of(base, name, dir);
     let repo = held.as_ref().and_then(origin_of).unwrap_or_else(|| "this repo".to_string());
     let gone = |message: String| Coded::new(ClientCode::NoSourceCheckout, message);
     let Some(source) = recorded_source(base, name) else {
         return Err(gone(format!(
-            "workspace {name} was not made from a checkout of yours (it was cloned), so it has no \
-             preview: a preview runs only from .darkmux/preview.json in your own checkout. Make the \
+            "workspace {name} was not made from a checkout of yours, so it has no \
+             preview: a worktree's preview runs only from .darkmux/preview.json in your own checkout darkmux \
+             recorded for it. Make the \
              workspace from your checkout (`source_path`), and add .darkmux/preview.json to your own \
              checkout of {repo}"
         )));
@@ -1187,6 +1274,13 @@ fn remove_entry(path: &Path) -> std::io::Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+/// (#3571) Whether workspace `name` (its repository `wc`) is a clone of a
+/// repo URL: read from where darkmux keeps its repository, never from a
+/// record an earlier workspace of the name could have left.
+pub fn is_clone(base: &Path, name: &str, wc: &crate::client_git::WorkCopy) -> bool {
+    matches!(kind_of(base, name, wc), Ok(WorkspaceKind::Clone))
 }
 
 /// What a workspace darkmux made is, read from where it keeps its

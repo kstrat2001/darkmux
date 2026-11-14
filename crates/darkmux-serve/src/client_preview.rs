@@ -162,11 +162,19 @@
 //! the user's own checkout: the `source_path` checkout the workspace's
 //! worktree was made from, as darkmux recorded it when it made the workspace
 //! (`client_workspace::own_checkout_of`), never from the workspace itself. A
-//! file a Coder run wrote in the workspace is never read. A workspace cloned
-//! from a URL has no checkout of the user's, so it gets no preview; neither
-//! does one whose checkout has no recipe (a copy in the workspace does not
-//! count). Each refusal says why and what to do: add
-//! `.darkmux/preview.json` to your own checkout of the repo.
+//! file a Coder run wrote in the workspace is never read. A workspace whose
+//! checkout has no recipe gets no preview (a copy in the workspace does not
+//! count); the refusal says why and what to do: add `.darkmux/preview.json`
+//! to your own checkout of the repo.
+//!
+//! (#3571) A workspace cloned from a URL has no checkout of the user's: its
+//! recipe is read as it was in the commit darkmux cloned (recorded beside the
+//! workspace, `.<name>.cloned`), like a template's first commit below, else
+//! the recipe the user approved for it through the app
+//! (`PUT /client/workspaces/{name}/recipe`, kept as `.<name>.recipe`). A
+//! clone with no recorded commit (an empty repo, or one cloned before the
+//! record) previews only from an approved recipe. A run's commit or
+//! work-tree edit changes neither ([`RecipeSource::ClonedCommit`]).
 //!
 //! A project darkmux made from a template (#3460) has no checkout of the
 //! user's either, but its first commit is darkmux's own (`start_fresh`).
@@ -470,6 +478,13 @@ pub enum RecipeSource {
     /// host git from the repository darkmux holds, never from the work tree.
     /// A later commit (a run's) never changes what is trusted.
     TemplateCommit { git_dir: PathBuf, commit: String },
+    /// (#3571) A clone of a repo URL: the recipe as it was in `commit`, the
+    /// one darkmux cloned (read like a template's), else `approved`, the
+    /// recipe the user approved for it, kept beside the workspace. `commit`
+    /// is `None` when darkmux recorded none (the repo was empty, or the clone
+    /// predates the record): only an approved recipe runs then. A run's
+    /// commit or work-tree edit changes neither.
+    ClonedCommit { git_dir: PathBuf, commit: Option<String>, approved: Option<String> },
 }
 
 impl RecipeSource {
@@ -480,14 +495,14 @@ impl RecipeSource {
         match self {
             RecipeSource::Checkout(checkout) => load_recipe(checkout),
             RecipeSource::TemplateCommit { git_dir, commit } => {
-                let recipe = parse_recipe(&read_recipe_at_commit(git_dir, commit)?)?;
-                if recipe.env_from_source.is_empty() {
-                    return Ok(recipe);
-                }
-                Err(RecipeRefusal::Invalid(format!(
-                    "{RECIPE_PATH}: `env_from_source` names files to copy from a checkout of yours, and a \
-                     project made from a template has none; remove `env_from_source` from the template's recipe"
-                )))
+                without_checkout_files(parse_recipe(&read_recipe_at_commit(git_dir, commit)?)?, "a project made from a template", "the template's recipe")
+            }
+            RecipeSource::ClonedCommit { git_dir, commit, approved } => {
+                let text = match (cloned_recipe_text(git_dir, commit.as_deref()), approved) {
+                    (Err(RecipeRefusal::NotFound(_)), Some(approved)) => approved.clone(),
+                    (read, _) => read?,
+                };
+                without_checkout_files(parse_recipe(&text)?, "a clone", "the recipe")
             }
         }
     }
@@ -496,9 +511,30 @@ impl RecipeSource {
     pub fn checkout(&self) -> Option<&Path> {
         match self {
             RecipeSource::Checkout(c) => Some(c),
-            RecipeSource::TemplateCommit { .. } => None,
+            RecipeSource::TemplateCommit { .. } | RecipeSource::ClonedCommit { .. } => None,
         }
     }
+}
+
+/// (#3571) The recipe's text in the commit darkmux cloned, when it recorded
+/// one: no recorded commit is no recipe there.
+fn cloned_recipe_text(git_dir: &Path, commit: Option<&str>) -> Result<String, RecipeRefusal> {
+    match commit {
+        Some(commit) => read_recipe_at_commit(git_dir, commit),
+        None => Err(RecipeRefusal::NotFound(format!("no commit recorded for this clone, so no {RECIPE_PATH} in one"))),
+    }
+}
+
+/// A recipe from a source with no checkout of the user's (`what`) to copy
+/// `env_from_source` files from: refused naming the key when it lists any.
+fn without_checkout_files(recipe: Recipe, what: &str, whose: &str) -> Result<Recipe, RecipeRefusal> {
+    if recipe.env_from_source.is_empty() {
+        return Ok(recipe);
+    }
+    Err(RecipeRefusal::Invalid(format!(
+        "{RECIPE_PATH}: `env_from_source` names files to copy from a checkout of yours, and {what} has \
+         none; remove `env_from_source` from {whose}"
+    )))
 }
 
 /// (#3460) The recipe's text as it is in `commit` of the repository at
@@ -508,7 +544,7 @@ impl RecipeSource {
 pub fn read_recipe_at_commit(git_dir: &Path, commit: &str) -> Result<String, RecipeRefusal> {
     if !crate::client_workspace::is_commit_sha(commit) {
         return Err(RecipeRefusal::Invalid(format!(
-            "{commit:?} is not a full commit SHA; refusing the template's recipe"
+            "{commit:?} is not a full commit SHA; refusing the recipe"
         )));
     }
     let git = darkmux_types::host_git::HostGit::held_git_dir(git_dir);
@@ -516,23 +552,32 @@ pub fn read_recipe_at_commit(git_dir: &Path, commit: &str) -> Result<String, Rec
     // its id (git does not check a loose object's hash when it reads it), so
     // what `ls-tree` reports below comes from objects that are what their
     // ids say. Replace refs are off in every `HostGit` call.
-    let commit_body = verified_object(&git, "commit", commit)?;
+    let root = verified_root_tree(&git, commit)?;
+    // (#3573 review) One verified tree at a time: `.darkmux` is listed in
+    // the verified root, and the recipe in the verified `.darkmux`, so a
+    // forged folder can never make a recipe read as missing.
+    let top = git_stdout(&git, &["ls-tree", "-l", &root, "--", ".darkmux"])?;
+    let folder = recipe_folder_entry(&top, commit)?;
+    verified_object(&git, "tree", &folder)?;
+    let inside = git_stdout(&git, &["ls-tree", "-l", &folder, "--", RECIPE_FILE])?;
+    let blob = recipe_file_entry(&inside, commit)?;
+    // The size was checked on the tree entry, before reading the blob.
+    String::from_utf8(verified_object(&git, "blob", &blob)?)
+        .map_err(|_| RecipeRefusal::Invalid(format!("{RECIPE_PATH} at {commit} is not UTF-8")))
+}
+
+/// The root tree of `commit`, the commit and the tree each checked against
+/// its id ([`verified_object`]).
+fn verified_root_tree(git: &darkmux_types::host_git::HostGit, commit: &str) -> Result<String, RecipeRefusal> {
+    let commit_body = verified_object(git, "commit", commit)?;
     let root = String::from_utf8_lossy(&commit_body)
         .lines()
         .next()
         .and_then(|l| l.strip_prefix("tree "))
         .map(str::to_string)
         .ok_or_else(|| RecipeRefusal::Invalid(format!("commit {commit} names no tree")))?;
-    verified_object(&git, "tree", &root)?;
-    let listed = git_stdout(
-        &git,
-        &["ls-tree", "-l", "-t", commit, "--", ".darkmux", RECIPE_PATH],
-    )?;
-    let (folder, blob) = check_recipe_entries(&listed, commit)?;
-    verified_object(&git, "tree", &folder)?;
-    // The size was checked on the tree entry, before reading the blob.
-    String::from_utf8(verified_object(&git, "blob", &blob)?)
-        .map_err(|_| RecipeRefusal::Invalid(format!("{RECIPE_PATH} at {commit} is not UTF-8")))
+    verified_object(git, "tree", &root)?;
+    Ok(root)
 }
 
 /// `git <args>`'s stdout, through host git; a failure is unreadable.
@@ -542,10 +587,10 @@ fn git_stdout(
 ) -> Result<String, RecipeRefusal> {
     let out = git
         .output(args)
-        .map_err(|e| RecipeRefusal::Unreadable(format!("reading the template's recipe: {e}")))?;
+        .map_err(|e| RecipeRefusal::Unreadable(format!("reading the recipe: {e}")))?;
     if !out.status.success() {
         return Err(RecipeRefusal::Unreadable(format!(
-            "reading the template's recipe: {}",
+            "reading the recipe: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
@@ -587,34 +632,42 @@ fn verified_object(
         .map_err(|e| unreadable(e.to_string()))?;
     if String::from_utf8_lossy(&hashed.stdout).trim() != oid {
         return Err(RecipeRefusal::Invalid(format!(
-            "{kind} {oid} in the template's repository does not match its content; refusing its recipe"
+            "{kind} {oid} in the repository darkmux holds does not match its content; refusing its recipe"
         )));
     }
     Ok(read.stdout)
 }
 
-/// `git ls-tree -l` lines for `.darkmux` and the recipe in `commit`: no
-/// symlink on the way, `.darkmux` a folder, and the recipe a regular file
-/// within the size cap. Returns the folder's and the recipe's object ids.
-fn check_recipe_entries(listed: &str, commit: &str) -> Result<(String, String), RecipeRefusal> {
-    let entries: Vec<LsTreeEntry> = listed.lines().filter_map(ls_tree_entry).collect();
-    if let Some(e) = entries.iter().find(|e| e.mode == "120000") {
-        return Err(RecipeRefusal::Symlink(format!(
-            "{} is a symlink in the template's first commit {commit}; refusing",
-            e.path
-        )));
+/// The recipe's file name inside `.darkmux`.
+const RECIPE_FILE: &str = "preview.json";
+
+/// The root tree's `git ls-tree -l` line for `.darkmux` in `commit`: a
+/// folder (never a symlink). Returns its object id; none (or not a folder)
+/// is no recipe.
+fn recipe_folder_entry(listed: &str, commit: &str) -> Result<String, RecipeRefusal> {
+    let not_found = || RecipeRefusal::NotFound(format!("no {RECIPE_PATH} in commit {commit}"));
+    let entry = listed.lines().filter_map(ls_tree_entry).find(|e| e.path == ".darkmux").ok_or_else(not_found)?;
+    match entry.mode {
+        "120000" => Err(RecipeRefusal::Symlink(format!(".darkmux is a symlink in commit {commit}; refusing"))),
+        "040000" => Ok(entry.oid.to_string()),
+        _ => Err(not_found()),
     }
-    let Some(recipe) = entries.iter().find(|e| e.path == RECIPE_PATH) else {
-        return Err(RecipeRefusal::NotFound(format!(
-            "no {RECIPE_PATH} in the template's first commit {commit}"
-        )));
-    };
-    check_recipe_blob(recipe.mode, recipe.size, commit)?;
-    let folder = entries
-        .iter()
-        .find(|e| e.path == ".darkmux" && e.mode == "040000")
-        .ok_or_else(|| RecipeRefusal::Invalid(format!(".darkmux is not a folder in {commit}")))?;
-    Ok((folder.oid.to_string(), recipe.oid.to_string()))
+}
+
+/// The `.darkmux` tree's `git ls-tree -l` line for the recipe in `commit`:
+/// a regular file within the size cap (never a symlink). Returns its
+/// object id.
+fn recipe_file_entry(listed: &str, commit: &str) -> Result<String, RecipeRefusal> {
+    let entry = listed
+        .lines()
+        .filter_map(ls_tree_entry)
+        .find(|e| e.path == RECIPE_FILE)
+        .ok_or_else(|| RecipeRefusal::NotFound(format!("no {RECIPE_PATH} in commit {commit}")))?;
+    if entry.mode == "120000" {
+        return Err(RecipeRefusal::Symlink(format!("{RECIPE_PATH} is a symlink in commit {commit}; refusing")));
+    }
+    check_recipe_blob(entry.mode, entry.size, commit)?;
+    Ok(entry.oid.to_string())
 }
 
 /// One `git ls-tree -l` line.
@@ -641,7 +694,7 @@ fn ls_tree_entry(line: &str) -> Option<LsTreeEntry<'_>> {
 fn check_recipe_blob(mode: &str, size: &str, commit: &str) -> Result<(), RecipeRefusal> {
     if mode != "100644" && mode != "100755" {
         return Err(RecipeRefusal::Invalid(format!(
-            "{RECIPE_PATH} in the template's first commit {commit} is not a regular file"
+            "{RECIPE_PATH} in commit {commit} is not a regular file"
         )));
     }
     match size.parse::<u64>() {
@@ -4263,6 +4316,39 @@ mod tests {
     /// (#3460 review) An object overwritten in place (git does not check a
     /// loose object's hash when it reads it) is refused: every object on the
     /// recipe's path must hash to its id.
+    /// (#3573 review) A `.darkmux` that is a file (or a submodule, listed
+    /// the same way) holds no recipe: none, never a read of it as a tree.
+    #[test]
+    fn a_darkmux_that_is_not_a_folder_is_no_recipe() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, first) = a_repo_with(dir.path(), &[(".darkmux", "not a folder")]);
+        let r = read_recipe_at_commit(&repo.join(".git"), &first);
+        assert!(matches!(r, Err(RecipeRefusal::NotFound(_))), "{r:?}");
+    }
+
+    /// (#3573 review) A commit object that is not what its id says (here,
+    /// one whose tree has no `.darkmux`) is refused, never read as "no
+    /// recipe": the root tree id is taken from darkmux's own read of it.
+    #[test]
+    fn a_forged_commit_is_refused_not_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, first) = a_repo_with(dir.path(), &[(RECIPE_PATH, TEMPLATE_RECIPE), ("README", "x")]);
+        std::fs::remove_dir_all(repo.join(".darkmux")).unwrap();
+        git(&repo, &["add", "-A"]);
+        let tree = git(&repo, &["write-tree"]);
+        let forged = git(&repo, &["commit-tree", &tree, "-m", "first"]);
+        let object = |oid: &str| repo.join(".git/objects").join(&oid[..2]).join(&oid[2..]);
+        let bytes = std::fs::read(object(&forged)).unwrap();
+        let at = object(&first);
+        let mut perms = std::fs::metadata(&at).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&at, perms).unwrap();
+        std::fs::write(&at, bytes).unwrap();
+        let r = read_recipe_at_commit(&repo.join(".git"), &first);
+        assert!(matches!(r, Err(RecipeRefusal::Invalid(ref m)) if m.contains("does not match")), "{r:?}");
+    }
+
     #[test]
     fn an_overwritten_object_is_refused() {
         // Overwrites `which`'s object with a valid object of the same type
