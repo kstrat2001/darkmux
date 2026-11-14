@@ -2150,7 +2150,7 @@ fn machine_list_builds_this_machines_row_from_a_local_card_and_never_dials_its_a
     assert_eq!(row["is_this_machine"], true);
     assert_eq!(row["liveness"], "live");
     assert_eq!(row["card"]["state"], "available", "{row}");
-    assert_eq!(row["card"]["card"]["card_schema_version"], "1.4");
+    assert_eq!(row["card"]["card"]["card_schema_version"], "1.5");
     assert_eq!(v["cache_ttl_ms"], 0, "the CLI's gather is not cached");
 }
 
