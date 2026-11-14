@@ -644,7 +644,13 @@ const INTERPRETER_BOUND: usize = 4096;
 /// where it says reads as having none: glibc.
 pub(crate) fn c_library_of_program(path: &std::path::Path) -> CLibrary {
     use std::io::{Read, Seek, SeekFrom};
-    let Ok(mut file) = std::fs::File::open(path) else { return CLibrary::Glibc };
+    // (#3568) Opened without blocking: a FIFO with no writer would hang a
+    // plain open. A FIFO cannot seek, so it then names no interpreter.
+    let mut open = std::fs::OpenOptions::new();
+    open.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open, libc::O_NONBLOCK);
+    let Ok(mut file) = open.open(path) else { return CLibrary::Glibc };
     let mut read_at = |at: u64, len: usize| -> Option<Vec<u8>> {
         file.seek(SeekFrom::Start(at)).ok()?;
         let mut out = Vec::with_capacity(len);

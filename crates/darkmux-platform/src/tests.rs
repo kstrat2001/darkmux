@@ -2226,6 +2226,41 @@ fn an_elf(is64: bool, big: bool, interp: Option<&str>) -> Vec<u8> {
     b
 }
 
+/// (#3568) A `/bin/sh` that is not a regular file reads as glibc without
+/// blocking: a FIFO with no writer would hang a plain open forever (every
+/// sandbox start and `darkmux doctor` with it).
+#[cfg(unix)]
+#[test]
+fn a_shell_that_is_a_fifo_reads_as_glibc_without_blocking() {
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("sh");
+    let path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0, "mkfifo");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(c_library_of_program(&fifo));
+    });
+    let read = rx.recv_timeout(std::time::Duration::from_secs(5));
+    assert_eq!(read, Ok(CLibrary::Glibc), "the read blocked on a FIFO with no writer, or misread it");
+
+    // A FIFO already holding a musl ELF is still no musl shell: it cannot
+    // seek, so nothing is read from it (the bytes stay in the pipe).
+    use std::io::{Read, Write};
+    let busybox = an_elf(true, false, Some("/lib/ld-musl-x86_64.so.1"));
+    let fifo = dir.path().join("sh");
+    let mut held = std::fs::OpenOptions::new().read(true).write(true).open(&fifo).unwrap();
+    held.write_all(&busybox).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let at = fifo.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(c_library_of_program(&at));
+    });
+    assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)), Ok(CLibrary::Glibc));
+    let mut left = vec![0u8; busybox.len()];
+    held.read_exact(&mut left).unwrap();
+    assert_eq!(left, busybox, "nothing was taken from the pipe");
+}
+
 /// (#3561 re-review) A Linux machine's C library is its `/bin/sh`'s ELF
 /// interpreter: musl where it is `ld-musl-*` (Alpine's busybox, also with
 /// `gcompat` installed beside it), glibc for any other (Debian with the
