@@ -1110,6 +1110,8 @@ mod imp {
             let refused = |abi, args: &[&str]| ready(abi, &os(args)).unwrap_err().to_string();
             assert!(refused(None, &["true"]).contains("ABI 6 or later"));
             assert!(refused(Some(super::super::LANDLOCK_ABI_NEEDED - 1), &["true"]).contains("ABI 6 or later"));
+            // (#3575 review) The floor itself is enough.
+            assert!(ready(Some(super::super::LANDLOCK_ABI_NEEDED), &os(&["true"])).is_ok());
             assert!(refused(Some(9), &[]).contains("no program to run"));
             assert!(refused(Some(9), &["tr\0ue"]).contains("holds a NUL"));
             let (abi, argv) = ready(Some(9), &os(&["sh", "-c", "true"])).unwrap();
@@ -1140,13 +1142,17 @@ mod imp {
             let arch = 0xc000_00b7;
             let f = syscall_filter(arch);
             let at = |i: usize| (f[i].code, f[i].k);
+            // (#3575 review) Where each test jumps is what the program does.
+            let jumps = |i: usize| (f[i].jt, f[i].jf);
             assert_eq!(at(0), (BPF_LD_W_ABS, DATA_ARCH));
             assert_eq!(at(1), (BPF_JEQ_K, arch));
+            assert_eq!(jumps(1), (1, 0), "another arch falls through to the kill");
             assert_eq!(at(2), (BPF_RET_K, SECCOMP_RET_KILL_PROCESS));
             assert_eq!(at(3), (BPF_LD_W_ABS, DATA_NR));
             assert_eq!(*f.last().map(|i| (i.code, i.k)).as_ref().unwrap(), (BPF_RET_K, SECCOMP_RET_ALLOW));
             let answers = |nr: libc::c_long| {
                 let i = f.iter().position(|i| i.code == BPF_JEQ_K && i.k == nr as u32).unwrap_or_else(|| panic!("call {nr} not matched"));
+                assert_eq!(jumps(i), (0, 1), "call {nr}: matched runs its answer, else skips it");
                 f[i + 1].k
             };
             for nr in REFUSED {
@@ -1154,7 +1160,9 @@ mod imp {
             }
             assert_eq!(answers(libc::SYS_clone3), SECCOMP_RET_ERRNO | libc::ENOSYS as u32);
             let clone = f.iter().position(|i| i.code == BPF_JEQ_K && i.k == libc::SYS_clone as u32).unwrap();
+            assert_eq!(jumps(clone), (0, 3), "clone checks its flags, else skips them");
             assert_eq!(at(clone + 1), (BPF_LD_W_ABS, DATA_ARG0_LOW));
+            assert_eq!(jumps(clone + 2), (0, 1), "namespace flags are refused, else allowed");
             assert_eq!(at(clone + 2), (BPF_JSET_K, NAMESPACE_FLAGS as u32));
             assert_eq!(at(clone + 3), (BPF_RET_K, SECCOMP_RET_ERRNO | libc::EPERM as u32));
         }
