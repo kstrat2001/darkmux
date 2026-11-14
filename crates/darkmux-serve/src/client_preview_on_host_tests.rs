@@ -773,7 +773,7 @@ fn a_preview_on_the_host_runs_the_managed_node_its_workspace_declares() {
     }
     let first = first.unwrap();
     let platform = darkmux_platform::current().node_release_platform().unwrap();
-    let node = home_path.join(format!("toolchains/node-24.22.3-{platform}"));
+    let node = darkmux_types::config_access::toolchains_dir().join(format!("node-24.22.3-{platform}"));
     assert_eq!(first.read_only.first(), Some(&node), "{:?}", first.read_only);
     assert_eq!(first.path.as_deref().unwrap().split(':').next(), node.join("bin").to_str(), "{:?}", first.path);
     assert!(first.identity.contains(&node.display().to_string()), "{}", first.identity);

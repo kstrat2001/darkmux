@@ -654,8 +654,12 @@ mod tests {
         }
         let home = tempfile::TempDir::new().unwrap();
         let home_path = home.path().canonicalize().unwrap();
-        std::fs::create_dir_all(&home_path).unwrap();
-        std::fs::write(home_path.join("config-secret"), "secret").unwrap();
+        // A test build installs toolchains in its isolated folder
+        // (`toolchains_dir`): the secret sits beside them there.
+        let toolchains = darkmux_types::config_access::toolchains_dir();
+        let beside = toolchains.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&beside).unwrap();
+        std::fs::write(beside.join("config-secret"), "secret").unwrap();
         let root = tempfile::TempDir::new().unwrap();
         let tree = root.path().join("tree");
         std::fs::create_dir_all(tree.join("pkg")).unwrap();
@@ -667,9 +671,9 @@ mod tests {
             std::env::set_var("DARKMUX_HOME", &home_path);
             std::env::set_var(darkmux_sandbox::seatbelt::STATE_DIR_ENV, state.path());
         }
-        let secret = home_path.join("config-secret");
+        let secret = beside.join("config-secret");
         let platform = darkmux_platform::current().node_release_platform().unwrap();
-        let preload = home_path.join(format!("toolchains/node-22.23.5-{platform}/darkmux/listen-loopback.cjs"));
+        let preload = toolchains.join(format!("node-22.23.5-{platform}/darkmux/listen-loopback.cjs"));
         let command = format!(
             "node; echo \"$PATH\"; cat {} && echo READ; test -r {} && echo 'PRELOAD READABLE'",
             secret.display(),
@@ -686,7 +690,7 @@ mod tests {
         let out = String::from_utf8_lossy(&stdout).into_owned();
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.first(), Some(&"v22.23.5"), "{out}");
-        let install = home_path.join(format!("toolchains/node-22.23.5-{platform}"));
+        let install = toolchains.join(format!("node-22.23.5-{platform}"));
         let preload = install.join("darkmux/listen-loopback.cjs");
         assert_eq!(lines[1], format!("--require \"{}\"", preload.display()), "the fixture node prints its NODE_OPTIONS: {out}");
         assert_eq!(lines[2].split(':').next(), install.join("bin").to_str(), "{out}");

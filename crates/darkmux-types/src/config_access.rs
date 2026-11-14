@@ -2607,22 +2607,21 @@ pub fn cache_dir() -> std::path::PathBuf {
 /// (#3561) Where darkmux keeps the toolchains it fetches and verifies
 /// itself for a sandbox on the host (a pinned Node.js):
 /// `<darkmux root>/toolchains`. Internal state, no override tier: the root
-/// follows `DARKMUX_HOME` like every other directory. Carries the same
-/// test-build redirect as [`runtime_cache_dir`], since a sandbox start
-/// writes an install here.
+/// follows `DARKMUX_HOME` like every other directory.
 #[cfg(not(any(test, feature = "test-support")))]
 pub fn toolchains_dir() -> std::path::PathBuf {
     crate::paths::resolve(crate::paths::ResolveScope::ForceUser).root.join("toolchains")
 }
 
+/// In a test build, always the process's isolated scratch folder, whatever
+/// `DARKMUX_HOME` says: a test build installs a fixture standing in for
+/// Node.js (`managed_toolchain::fixture`), marked verified, and a real
+/// darkmux reading that root would then trust it (#3575: the leak check
+/// found one in its pinned root, from any Seatbelt preview or dispatch
+/// test that sets no `DARKMUX_HOME`).
 #[cfg(any(test, feature = "test-support"))]
 pub fn toolchains_dir() -> std::path::PathBuf {
-    let resolved = crate::paths::resolve(crate::paths::ResolveScope::ForceUser);
-    let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
-    if real_user_root.as_ref() == Some(&resolved.root) {
-        return crate::paths::test_isolated_dir("toolchains");
-    }
-    resolved.root.join("toolchains")
+    crate::paths::test_isolated_dir("toolchains")
 }
 
 /// The fleet roster file: `env(DARKMUX_FLEET_FILE) > config.dirs.fleet_file >
@@ -4285,6 +4284,12 @@ mod tests {
             }
         }
         for (name, path) in got {
+            // A test build's toolchains are fixtures: never under any real
+            // root, `DARKMUX_HOME` included (see `toolchains_dir`).
+            if name == "toolchains" {
+                assert!(path.starts_with(crate::paths::test_isolated_root()), "{}", path.display());
+                continue;
+            }
             assert!(path.starts_with(tmp.path()), "{name} default {} escapes DARKMUX_HOME {}", path.display(), tmp.path().display());
         }
     }

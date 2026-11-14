@@ -6435,7 +6435,7 @@ S(("127.0.0.1", port), H).serve_forever()
         assert_eq!(docker.unwrap(), darkmux_sandbox::toolchain::Toolchain::default());
         let got = seatbelt.unwrap();
         let platform = darkmux_platform::current().node_release_platform().unwrap();
-        let node = home_path.join(format!("toolchains/node-24.22.3-{platform}"));
+        let node = darkmux_types::config_access::toolchains_dir().join(format!("node-24.22.3-{platform}"));
         assert_eq!(got.read_only, vec![node.clone()]);
         assert_eq!(got.env, vec![("NODE_OPTIONS".to_string(), format!("--require \"{}\"", node.join("darkmux/listen-loopback.cjs").display()))]);
         let want = format!("{}:{}", node.join("bin").display(), darkmux_sandbox::SandboxBackend::default_path(&darkmux_sandbox::SeatbeltBackend).unwrap());
