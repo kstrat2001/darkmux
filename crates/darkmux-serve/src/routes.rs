@@ -168,6 +168,7 @@ pub(crate) fn client_table() -> Vec<ClientRoute> {
         client_json!(get, PreviewState, "/client/workspaces/:name/preview", preview_status_handler),
         client_json!(delete, StatusWord, "/client/workspaces/:name/preview", preview_stop_handler),
         client_json!(put, RecipeReply, "/client/workspaces/:name/recipe", recipe_set_handler),
+        client_json!(post, StatusWord, "/client/engines/:engine/stop-own-server", stop_own_server_handler),
     ]
 }
 

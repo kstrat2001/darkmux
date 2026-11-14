@@ -52,8 +52,10 @@ POST /client/workspaces/:name/preview  json PreviewState (client listener: 127.0
 GET /client/workspaces/:name/preview  json PreviewState (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
 DELETE /client/workspaces/:name/preview  json StatusWord (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
 PUT /client/workspaces/:name/recipe  json RecipeReply (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
+POST /client/engines/:engine/stop-own-server  json StatusWord (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
 
 # client listener response types: Type.field: type, from the JSON schema (every refusal is ClientError)
+Availability.code?: string | null
 Availability.reason?: string | null
 Availability.state: AvailabilityState
 AvailabilityState = "resident" | "startable" | "unavailable" | "external" | "unknown"

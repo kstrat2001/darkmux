@@ -5,4 +5,11 @@ import type { AvailabilityState } from "./AvailabilityState";
  * A model's availability and, for every state but `resident`, `startable`
  * and `external`, a one-line reason.
  */
-export type Availability = { state: AvailabilityState, reason: string | null, };
+export type Availability = { state: AvailabilityState, reason: string | null, 
+/**
+ * (#3574) The client code (`ClientCode`'s wire spelling) of a reason a
+ * client can branch on, the code a dispatch refusing for the same
+ * reason carries: `engine_in_use` for an engine's own server. Absent
+ * otherwise; additive, so an older reader ignores it.
+ */
+code?: string, };

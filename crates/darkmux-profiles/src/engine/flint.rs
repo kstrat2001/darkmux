@@ -87,6 +87,35 @@ pub fn own_server_refusal(address: &str) -> String {
     )
 }
 
+/// (#3574) The client code of [`own_server_refusal`], on a listing's
+/// availability as on a dispatch's refusal (`ClientCode::EngineInUse`).
+pub const OWN_SERVER_CODE: &str = "engine_in_use";
+
+/// (#3574) What [`stop_own_server`] found and did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnServerStop {
+    /// rec's own server is not up: nothing to stop.
+    NotRunning,
+    /// The server rec reports is darkmux's own: never stopped this way.
+    Darkmuxs,
+    /// rec's own server at this address was stopped (`rec stop`).
+    Stopped(String),
+}
+
+/// (#3574) Stop rec's own server so darkmux can start its managed one: the
+/// one exception to "darkmux never stops a server it did not start", taken
+/// only when a person asked for it (a paired app's Approve). It stops only
+/// rec's own server, never darkmux's (`own_server_is_darkmuxs` against
+/// every server darkmux runs), and only through rec itself.
+pub fn stop_own_server(rec: &Rec, darkmuxs: &[darkmux_types::engine_record::EngineRecord]) -> Result<OwnServerStop> {
+    let Some(address) = rec.own_server()? else { return Ok(OwnServerStop::NotRunning) };
+    if darkmuxs.iter().any(|r| own_server_is_darkmuxs(&address, Some(r))) {
+        return Ok(OwnServerStop::Darkmuxs);
+    }
+    rec.stop()?;
+    Ok(OwnServerStop::Stopped(address))
+}
+
 /// The port of `http://host:port/...`.
 pub fn endpoint_port(address: &str) -> Option<u16> {
     let rest = address.split_once("://").map_or(address, |(_, r)| r);
@@ -210,6 +239,15 @@ impl Rec {
         // A host that cannot say who listens counts as someone listening.
         let listening = |port: u16| host.tcp_listeners(port).is_none_or(|pids| !pids.is_empty());
         Ok(if run.status.success() { parse_status(&run.stdout, &listening) } else { None })
+    }
+
+    /// `rec stop`: stops rec's own server. Only [`stop_own_server`] calls it.
+    fn stop(&self) -> Result<()> {
+        let run = self.call(&["stop"])?;
+        if !run.status.success() {
+            bail!("`{} stop` exited with {}", self.label(), run.status);
+        }
+        Ok(())
     }
 
     fn data(&self) -> Result<&Path> {
@@ -357,6 +395,39 @@ mod tests {
 
     fn model(id: &str, args: &[&str]) -> darkmux_types::ProfileModel {
         serde_json::from_value(serde_json::json!({"id": id, "n_ctx": 262144, "engine_args": args})).unwrap()
+    }
+
+    /// (#3574) rec's own server up and not darkmux's: `rec stop` runs and the
+    /// address is reported. No server: nothing is run. A failing `rec stop`
+    /// is an error.
+    #[test]
+    fn stopping_recs_own_server_runs_rec_stop_only_when_it_is_up() {
+        let fake = |dir: &Path, status: &str, stop_exit: u8| {
+            let bin = dir.join("rec");
+            let marker = dir.join("stopped");
+            std::fs::write(
+                &bin,
+                format!(
+                    "#!/bin/sh\ncase \"$1\" in\n  status) echo '{status}' ;;\n  stop) touch '{}'; exit {stop_exit} ;;\nesac\n",
+                    marker.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            (Rec::at(bin.to_string_lossy().into_owned(), None), marker)
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (rec, marker) = fake(dir.path(), RUNNING, 0);
+        assert_eq!(stop_own_server(&rec, &[]).unwrap(), OwnServerStop::Stopped("http://127.0.0.1:11500/v1".into()));
+        assert!(marker.exists(), "rec stop ran");
+        let dir = tempfile::tempdir().unwrap();
+        let (rec, marker) = fake(dir.path(), r#"{"ready":false}"#, 0);
+        assert_eq!(stop_own_server(&rec, &[]).unwrap(), OwnServerStop::NotRunning);
+        assert!(!marker.exists(), "nothing to stop, nothing run");
+        let dir = tempfile::tempdir().unwrap();
+        let (rec, _) = fake(dir.path(), RUNNING, 3);
+        assert!(stop_own_server(&rec, &[]).unwrap_err().to_string().contains("rec stop"));
+        assert_eq!(OWN_SERVER_CODE, "engine_in_use");
     }
 
     /// Only rec 0.1.0 is verified; another release is refused naming both.

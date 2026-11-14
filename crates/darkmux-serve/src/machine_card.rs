@@ -1162,7 +1162,7 @@ pub(crate) mod tests {
     }
 
     fn listing_of(state: AvailabilityState) -> impl Fn(&[ProfileModel]) -> Vec<Availability> + Send + Sync + 'static {
-        move |models: &[ProfileModel]| models.iter().map(|_| Availability { state, reason: None }).collect()
+        move |models: &[ProfileModel]| models.iter().map(|_| Availability { state, reason: None, code: None }).collect()
     }
 
     /// The promise: the card never waits on a listing. Inside the TTL the

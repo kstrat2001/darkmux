@@ -382,6 +382,7 @@ fn harness() -> Harness {
         signed_app: Arc::new(|_| Err("wired below".to_string())),
         ask_allow: Arc::new(|_, _, _| darkmux_platform::AllowAnswer::NoAnswer),
         notify: Arc::new(|_| {}),
+        stop_own_server: Arc::new(|_| Ok(Some(darkmux_profiles::engine::flint::OwnServerStop::NotRunning))),
         dialogs: Arc::new(crate::client_trust::DialogSlots::default()),
         body_limits: BodyLimits::default(),
     };
@@ -9977,4 +9978,43 @@ async fn an_auto_approval_is_the_approval_client_approve_makes() {
     assert!(p.auto_approved.is_some());
     assert!(revoke(&h.store, p.client_name.as_deref().unwrap()).unwrap(), "revocable like any approval");
     assert_eq!(poll(&h, &id, SECRET).await.1["status"], "denied");
+}
+
+// ─── An engine's own server (#3574) ──────────────────────────────────────
+
+/// A paired app stops an engine's own server: 200 `stopped` when it was
+/// stopped, 409 when none runs or the one running is darkmux's, 404 for an
+/// engine without one, and 401 unpaired, before anything is stopped.
+#[tokio::test]
+async fn a_paired_app_stops_an_engines_own_server_and_nothing_else() {
+    use darkmux_profiles::engine::flint::OwnServerStop;
+    let mut h = harness();
+    let token = paired(&h).await;
+    let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+    let outcome = Arc::new(Mutex::new(Some(OwnServerStop::Stopped("http://127.0.0.1:11500/v1".into()))));
+    let (a, o) = (asked.clone(), outcome.clone());
+    h.state = ClientServerState {
+        stop_own_server: Arc::new(move |engine| {
+            a.lock().unwrap().push(engine.to_string());
+            Ok(if engine == "flint" { o.lock().unwrap().clone() } else { None })
+        }),
+        ..h.state.clone()
+    };
+    let path = |engine: &str| format!("/client/engines/{engine}/stop-own-server");
+    let (code, _) = call(&h, post(&path("flint"), None, Value::Null)).await;
+    assert_eq!(code, 401);
+    assert!(asked.lock().unwrap().is_empty(), "nothing is stopped for an unpaired caller");
+    assert_eq!(
+        call(&h, post(&path("flint"), Some(&token), Value::Null)).await,
+        (200, serde_json::json!({"status": "stopped"}))
+    );
+    for (now, why) in [(OwnServerStop::NotRunning, "not running"), (OwnServerStop::Darkmuxs, "darkmux's own")] {
+        *outcome.lock().unwrap() = Some(now);
+        let (code, v) = call(&h, post(&path("flint"), Some(&token), Value::Null)).await;
+        assert_eq!((code, v["code"].as_str()), (409, Some("conflict")), "{v}");
+        assert!(v["error"].as_str().unwrap().contains(why), "{v}");
+    }
+    let (code, v) = call(&h, post(&path("lmstudio"), Some(&token), Value::Null)).await;
+    assert_eq!((code, v["code"].as_str()), (404, Some("not_found")), "{v}");
+    assert_eq!(asked.lock().unwrap().as_slice(), ["flint", "flint", "flint", "lmstudio"]);
 }
